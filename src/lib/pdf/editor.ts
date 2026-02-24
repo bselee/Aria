@@ -140,6 +140,31 @@ export class PDFEditor {
 
         return outputBuffers;
     }
+
+    /**
+     * Removes specific pages from a PDF (0-indexed).
+     * Returns a new PDF buffer with the specified pages removed.
+     */
+    async removePages(buffer: Buffer, pageIndicesToRemove: number[]): Promise<Buffer> {
+        const sourcePdf = await PDFDocument.load(buffer);
+        const totalPages = sourcePdf.getPageCount();
+        const removeSet = new Set(pageIndicesToRemove);
+
+        // Build list of pages to KEEP
+        const keepIndices: number[] = [];
+        for (let i = 0; i < totalPages; i++) {
+            if (!removeSet.has(i)) keepIndices.push(i);
+        }
+
+        if (keepIndices.length === 0) throw new Error("Cannot remove all pages");
+
+        const newPdf = await PDFDocument.create();
+        const copiedPages = await newPdf.copyPages(sourcePdf, keepIndices);
+        copiedPages.forEach(page => newPdf.addPage(page));
+
+        const pdfBytes = await newPdf.save();
+        return Buffer.from(pdfBytes);
+    }
 }
 
 export const pdfEditor = new PDFEditor();
