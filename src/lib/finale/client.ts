@@ -2,47 +2,54 @@
  * @file    client.ts
  * @purpose Lean Finale Inventory API client for Aria.
  *          Direct SKU lookups ONLY — no catalog loading.
- *          Finale has 400K+ products, so we NEVER load the catalog.
- *          Instead we use the detail endpoint (/api/product/{sku}) which
- *          returns accurate status, lead time, and supplier info.
+ *          Returns: status, suppliers, lead time, cost, PO history, BOM flag.
  * @author  Antigravity / Aria
  * @created 2026-02-24
  * @updated 2026-02-24
  * @deps    (none — uses native fetch)
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH, FINALE_BASE_URL
  *
- * DECISION(2026-02-24): The list endpoint (/api/product) returns bogus status
- * (PRODUCT_INACTIVE for everything) and there are 400K+ products. Loading the
- * catalog is impossible and the list data is unreliable anyway. We ONLY use
- * the individual product endpoint which returns accurate data.
+ * DECISION(2026-02-24): Supplier names require resolving partygroup URLs.
+ * This adds 1-2 extra API calls per lookup but gives us real vendor names.
+ * We cache resolved party names to avoid repeated lookups.
  *
- * COST CONTROL: Each query = 1 API call. No bulk fetching, no polling.
+ * DOMAIN RULE: If supplier name starts with "BuildASoil" or "Manufacturing",
+ * the product is manufactured (has a BOM), not purchased.
  */
 
 // ──────────────────────────────────────────────────
 // TYPES
 // ──────────────────────────────────────────────────
 
+export interface SupplierInfo {
+    name: string;
+    role: string;        // "MAIN" | "ALT1" | "ALT2" etc.
+    cost: number | null;
+    partyUrl: string;
+}
+
+export interface POInfo {
+    orderId: string;
+    status: string;
+    orderDate: string;
+    supplier: string;
+    quantityOnOrder: number;
+    total: number;
+}
+
 export interface FinaleProductDetail {
     productId: string;
     name: string;
-    statusId: string;         // "PRODUCT_ACTIVE" or "PRODUCT_INACTIVE"
+    statusId: string;
     leadTimeDays: number | null;
-    cost: number | null;
-    casePrice: number | null;
-    supplier: string | null;
-    category: string | null;
-    weight: string | null;
     packing: string | null;
-    reorderGuidelines: ReorderGuideline[];
+    category: string | null;
     lastUpdated: string | null;
+    suppliers: SupplierInfo[];
+    isManufactured: boolean;
+    hasBOM: boolean;
     finaleUrl: string;
-}
-
-export interface ReorderGuideline {
-    facilityName: string;
-    reorderPoint: number | null;
-    reorderQuantity: number | null;
+    openPOs: POInfo[];             // Committed POs containing this product
 }
 
 export interface ProductReport {
@@ -57,8 +64,9 @@ export interface ProductReport {
 
 export class FinaleClient {
     private authHeader: string;
-    private baseUrl: string;
+    private apiBase: string;
     private accountPath: string;
+    private partyNameCache = new Map<string, string>();  // party URL → name
 
     constructor() {
         const apiKey = process.env.FINALE_API_KEY || "";
@@ -66,7 +74,7 @@ export class FinaleClient {
         this.accountPath = process.env.FINALE_ACCOUNT_PATH || "";
         const baseUrl = process.env.FINALE_BASE_URL || "https://app.finaleinventory.com";
 
-        this.baseUrl = `${baseUrl}/${this.accountPath}/api`;
+        this.apiBase = baseUrl;
         this.authHeader = `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString("base64")}`;
     }
 
@@ -75,7 +83,7 @@ export class FinaleClient {
      */
     async testConnection(): Promise<boolean> {
         try {
-            await this.get("/facility");
+            await this.get(`/${this.accountPath}/api/facility`);
             console.log("✅ Finale API connected");
             return true;
         } catch (err: any) {
@@ -85,16 +93,19 @@ export class FinaleClient {
     }
 
     /**
-     * Look up a product by exact SKU/productId.
-     * This is the ONLY reliable way to get data from Finale.
-     * Returns null if product doesn't exist.
+     * Look up a product by exact SKU and resolve all enrichment data.
+     * Total API calls: 1 (product) + 1 per supplier to resolve names (cached).
      */
     async lookupProduct(sku: string): Promise<FinaleProductDetail | null> {
         try {
-            const data = await this.get(`/product/${encodeURIComponent(sku.trim())}`);
-            return this.parseProductDetail(data);
+            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku.trim())}`);
+            const product = await this.parseProductDetail(data);
+
+            // Check for committed POs containing this product (GraphQL)
+            product.openPOs = await this.findCommittedPOsForProduct(sku.trim());
+
+            return product;
         } catch (err: any) {
-            // 404 = product doesn't exist, not an error
             if (err.message.includes("404")) return null;
             console.error(`❌ Finale lookup failed for ${sku}:`, err.message);
             return null;
@@ -102,8 +113,87 @@ export class FinaleClient {
     }
 
     /**
-     * Generate a formatted Telegram report for a product.
-     * This is the main function Aria calls when you ask about a product.
+     * Find committed POs that contain a specific product.
+     * Uses GraphQL — REST doesn't support PO filtering.
+     *
+     * DECISION(2026-02-24): The `product` filter requires the full URL path
+     * format (e.g. "/buildasoilorganics/api/product/SKU") NOT just the productId.
+     * Also, `status` + `product` filters conflict — so we query by product only
+     * and filter for Committed status client-side.
+     */
+    private async findCommittedPOsForProduct(productId: string): Promise<POInfo[]> {
+        try {
+            const productUrl = `/${this.accountPath}/api/product/${productId}`;
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 20
+                            type: ["PURCHASE_ORDER"]
+                            product: ["${productUrl}"]
+                            sort: [{ field: "orderDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    orderId
+                                    status
+                                    orderDate
+                                    supplier { name }
+                                    total
+                                    itemList(first: 100) {
+                                        edges {
+                                            node {
+                                                product { productId }
+                                                quantity
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            if (result.errors) return [];
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            return edges
+                .filter((edge: any) => edge.node.status === "Committed")
+                .map((edge: any) => {
+                    const po = edge.node;
+                    const items = po.itemList?.edges || [];
+                    const matchingItem = items.find(
+                        (item: any) => item.node.product?.productId === productId
+                    );
+                    return {
+                        orderId: po.orderId,
+                        status: po.status,
+                        orderDate: po.orderDate,
+                        supplier: po.supplier?.name || "Unknown",
+                        quantityOnOrder: matchingItem?.node.quantity || 0,
+                        total: po.total || 0,
+                    };
+                });
+        } catch (err: any) {
+            console.error("PO lookup error:", err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Generate a rich Telegram report for a product.
      */
     async productReport(sku: string): Promise<ProductReport> {
         const product = await this.lookupProduct(sku);
@@ -114,56 +204,58 @@ export class FinaleClient {
                 product: null,
                 telegramMessage:
                     `❌ *Product Not Found*\n\n` +
-                    `SKU \`${sku}\` was not found in Finale.\n\n` +
-                    `_Try the exact SKU from Finale (e.g. S-12527, BC101, PU102)_`,
+                    `SKU \`${sku}\` was not found in Finale.\n` +
+                    `_Try the exact SKU (e.g. S-12527, BC101, PU102)_`,
             };
         }
 
         // Build the Telegram message
         const statusEmoji = product.statusId === "PRODUCT_ACTIVE" ? "🟢" : "🔴";
         const statusLabel = product.statusId === "PRODUCT_ACTIVE" ? "Active" : "Inactive";
+        const typeEmoji = product.isManufactured ? "🔨" : "📦";
+        const typeLabel = product.isManufactured ? "Manufactured (BOM)" : "Purchased";
 
-        let msg = `📦 *Product Report*\n\n`;
-        msg += `*${product.name}*\n`;
+        let msg = `${typeEmoji} *${product.name}*\n`;
         msg += `SKU: \`${product.productId}\`\n`;
-        msg += `${statusEmoji} Status: *${statusLabel}*\n`;
+        msg += `${statusEmoji} ${statusLabel} · ${typeLabel}\n`;
         msg += `━━━━━━━━━━━━━━━━━━━━\n`;
 
-        if (product.supplier) {
-            msg += `🏭 Supplier: ${product.supplier}\n`;
-        }
-        if (product.leadTimeDays !== null) {
-            msg += `⏱️ Lead Time: ${product.leadTimeDays} days\n`;
-        }
-        if (product.cost !== null) {
-            msg += `💰 Cost: $${product.cost.toFixed(2)}\n`;
-        }
-        if (product.casePrice !== null) {
-            msg += `📦 Case Price: $${product.casePrice.toFixed(2)}\n`;
-        }
-        if (product.packing) {
-            msg += `📐 Packing: ${product.packing}\n`;
-        }
-        if (product.weight) {
-            msg += `⚖️ Weight: ${product.weight}\n`;
-        }
-        if (product.category) {
-            msg += `🏷️ Category: ${product.category}\n`;
-        }
-
-        // Reorder guidelines
-        if (product.reorderGuidelines.length > 0) {
-            msg += `\n📊 *Reorder Guidelines*\n`;
-            for (const rg of product.reorderGuidelines) {
-                const facilityName = rg.facilityName || "Default";
-                const rp = rg.reorderPoint !== null ? rg.reorderPoint : "—";
-                const rq = rg.reorderQuantity !== null ? rg.reorderQuantity : "—";
-                msg += `  ${facilityName}: Reorder @ ${rp} | Qty: ${rq}\n`;
+        // Suppliers
+        if (product.suppliers.length > 0) {
+            msg += `\n🏭 *Suppliers*\n`;
+            for (const s of product.suppliers) {
+                const roleLabel = s.role === "MAIN" ? "★ Primary" : `Alt`;
+                const costStr = s.cost !== null ? ` · $${s.cost.toFixed(2)}` : "";
+                msg += `  ${roleLabel}: ${s.name}${costStr}\n`;
             }
         }
 
-        msg += `\n🔗 [View in Finale](https://app.finaleinventory.com/${this.accountPath}/app#product?productUrl=${encodeURIComponent(product.finaleUrl)})`;
-        msg += `\n_Last updated: ${product.lastUpdated || "unknown"}_`;
+        if (product.leadTimeDays !== null) {
+            msg += `\n⏱️ Lead Time: ${product.leadTimeDays} days`;
+        }
+        if (product.packing) {
+            msg += `\n📐 Packing: ${product.packing}`;
+        }
+
+        // On Order section
+        if (product.openPOs.length > 0) {
+            msg += `\n\n📋 *On Order*\n`;
+            for (const po of product.openPOs) {
+                msg += `  ✅ PO ${po.orderId}: ${po.quantityOnOrder} units`;
+                msg += ` from ${po.supplier} (${po.orderDate})\n`;
+            }
+        } else {
+            msg += `\n\n⚠️ *Not on any open PO*`;
+        }
+
+        if (product.isManufactured) {
+            msg += `\n🔨 _Manufactured item — needs to be built, not ordered._`;
+        }
+
+        // Direct Finale link
+        const encodedUrl = encodeURIComponent(`/${this.accountPath}/api/product/${product.productId}`);
+        msg += `\n\n🔗 [Open in Finale](https://app.finaleinventory.com/${this.accountPath}/app#product?productUrl=${encodedUrl})`;
+        msg += `\n_Updated: ${product.lastUpdated?.split("T")[0] || "unknown"}_`;
 
         return {
             found: true,
@@ -177,7 +269,7 @@ export class FinaleClient {
     // ──────────────────────────────────────────────────
 
     private async get(endpoint: string): Promise<any> {
-        const url = `${this.baseUrl}${endpoint}`;
+        const url = `${this.apiBase}${endpoint}`;
 
         const response = await fetch(url, {
             method: "GET",
@@ -197,68 +289,69 @@ export class FinaleClient {
     }
 
     /**
-     * Parse the raw Finale product detail response into our clean type.
+     * Resolve a partygroup URL to the supplier name.
+     * Caches results so we don't re-fetch for the same vendor.
      */
-    private parseProductDetail(data: any): FinaleProductDetail {
-        // Extract primary supplier
-        let supplier: string | null = null;
-        if (data.supplierList?.length > 0) {
-            // Find the primary/first supplier with a name
-            for (const s of data.supplierList) {
-                if (s.partyName) {
-                    supplier = s.partyName;
-                    break;
-                }
-            }
+    private async resolvePartyName(partyUrl: string): Promise<string> {
+        if (this.partyNameCache.has(partyUrl)) {
+            return this.partyNameCache.get(partyUrl)!;
         }
 
-        // Extract cost (LIST_PRICE)
-        let cost: number | null = null;
-        let casePrice: number | null = null;
-        if (data.priceList) {
-            for (const p of data.priceList) {
-                if (p.productPriceTypeId === "LIST_PRICE" && p.price) {
-                    cost = p.price;
-                }
-                if (p.productPriceTypeId === "LIST_CASE_PRICE" && p.price) {
-                    casePrice = p.price;
-                }
-            }
+        try {
+            const data = await this.get(partyUrl);
+            const name = data.groupName || data.partyId || "Unknown";
+            this.partyNameCache.set(partyUrl, name);
+            return name;
+        } catch {
+            return "Unknown";
+        }
+    }
+
+    /**
+     * Parse raw product detail and resolve supplier names.
+     */
+    private async parseProductDetail(data: any): Promise<FinaleProductDetail> {
+        // Resolve suppliers (1 API call each, cached)
+        const suppliers: SupplierInfo[] = [];
+        for (const sup of data.supplierList || []) {
+            if (!sup.supplierPartyUrl) continue;
+
+            const name = await this.resolvePartyName(sup.supplierPartyUrl);
+            const roleRaw = sup.supplierPrefOrderId || "";
+
+            let role = "ALT";
+            if (roleRaw.includes("MAIN")) role = "MAIN";
+
+            suppliers.push({
+                name,
+                role,
+                cost: sup.price ?? null,
+                partyUrl: sup.supplierPartyUrl,
+            });
         }
 
-        // Extract reorder guidelines
-        const reorderGuidelines: ReorderGuideline[] = [];
-        if (data.reorderGuidelineList) {
-            for (const rg of data.reorderGuidelineList) {
-                reorderGuidelines.push({
-                    facilityName: rg.facilityName || rg.facilityId || "",
-                    reorderPoint: rg.reorderPoint ?? null,
-                    reorderQuantity: rg.reorderQuantity ?? null,
-                });
-            }
-        }
+        // Determine if manufactured
+        // DOMAIN RULE: If primary supplier starts with "BuildASoil" or "Manufacturing"
+        const mainSupplier = suppliers.find(s => s.role === "MAIN");
+        const isManufactured = mainSupplier
+            ? /^(buildasoil|manufacturing)/i.test(mainSupplier.name)
+            : false;
 
-        // Extract weight
-        let weight: string | null = null;
-        if (data.weight) {
-            const unit = data.weightUomId === "WT_lb" ? "lbs" : data.weightUomId || "";
-            weight = `${data.weight} ${unit}`.trim();
-        }
+        const hasBOM = !!data.expandBillOfMaterialsPolicy;
 
         return {
             productId: data.productId,
             name: data.internalName || data.productId,
             statusId: data.statusId || "UNKNOWN",
             leadTimeDays: data.leadTime ?? null,
-            cost,
-            casePrice,
-            supplier,
-            category: data.userCategory || null,
-            weight,
             packing: data.normalizedPackingString || null,
-            reorderGuidelines,
+            category: data.userCategory || null,
             lastUpdated: data.lastUpdatedDate || null,
-            finaleUrl: data.productUrl || `/api/product/${data.productId}`,
+            suppliers,
+            isManufactured,
+            hasBOM,
+            finaleUrl: data.productUrl || "",
+            openPOs: [],  // Populated later by lookupProduct()
         };
     }
 }
