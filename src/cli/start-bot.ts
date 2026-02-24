@@ -107,6 +107,48 @@ bot.command('product', async (ctx) => {
     }
 });
 
+// /receivings — post today's received POs to Telegram + Slack #purchasing
+bot.command('receivings', async (ctx) => {
+    ctx.sendChatAction('typing');
+
+    try {
+        const received = await finale.getTodaysReceivedPOs();
+        const digest = finale.formatReceivingsDigest(received);
+
+        // Send to Telegram (convert Slack mrkdwn to Telegram Markdown)
+        const telegramMsg = digest
+            .replace(/:package:/g, '📦')
+            .replace(/:white_check_mark:/g, '✅')
+            .replace(/<([^|]+)\|([^>]+)>/g, '[$2]($1)');  // Slack links → Markdown
+
+        await ctx.reply(telegramMsg, {
+            parse_mode: 'Markdown',
+            // @ts-ignore
+            disable_web_page_preview: true,
+        });
+
+        // Post to Slack #purchasing if token available
+        if (process.env.SLACK_BOT_TOKEN) {
+            try {
+                const { WebClient } = await import('@slack/web-api');
+                const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+                await slack.chat.postMessage({
+                    channel: '#purchasing',
+                    text: digest,
+                    mrkdwn: true,
+                });
+                await ctx.reply('✅ _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
+            } catch (slackErr: any) {
+                console.error('Slack post error:', slackErr.message);
+                await ctx.reply('⚠️ _Telegram only — Slack post failed_', { parse_mode: 'Markdown' });
+            }
+        }
+    } catch (err: any) {
+        console.error('Receivings error:', err.message);
+        ctx.reply(`❌ Error fetching receivings: ${err.message}`);
+    }
+});
+
 // /voice
 bot.command('voice', async (ctx) => {
     if (!elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
@@ -198,7 +240,99 @@ bot.command('populate', async (ctx) => {
 });
 
 // ──────────────────────────────────────────────────
-// MESSAGE HANDLERS
+// DOCUMENT/FILE HANDLER — PDFs, images, Word docs
+// ──────────────────────────────────────────────────
+
+bot.on('document', async (ctx) => {
+    const doc = ctx.message.document;
+    const filename = doc.file_name || 'unknown';
+    const mimeType = doc.mime_type || '';
+    const caption = ctx.message.caption || '';
+
+    // Only process supported file types
+    const SUPPORTED = ['application/pdf', 'application/x-pdf', 'image/png', 'image/jpeg',
+        'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+
+    if (!SUPPORTED.some(m => mimeType.includes(m.split('/')[1]))) {
+        await ctx.reply(`📎 Got *${filename}* but I can't process \`${mimeType}\` files yet.\n_I handle: PDF, PNG, JPEG, DOC/DOCX_`, { parse_mode: 'Markdown' });
+        return;
+    }
+
+    // Size check (Telegram max is 20MB for bots)
+    if (doc.file_size && doc.file_size > 20_000_000) {
+        await ctx.reply('⚠️ File too large (>20MB). Try emailing it to me instead.');
+        return;
+    }
+
+    ctx.sendChatAction('typing');
+    await ctx.reply(`📎 Processing *${filename}*... one moment.`, { parse_mode: 'Markdown' });
+
+    try {
+        // Download file from Telegram
+        const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+        const response = await fetch(fileLink.href);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        // Import PDF tools
+        const { extractPDF } = await import('../lib/pdf/extractor');
+        const { classifyDocument } = await import('../lib/pdf/classifier');
+
+        // Extract text
+        ctx.sendChatAction('typing');
+        const extraction = await extractPDF(buffer);
+
+        // Classify document type
+        const classification = await classifyDocument(extraction);
+
+        // Build response
+        const typeEmoji: Record<string, string> = {
+            INVOICE: '🧾', PURCHASE_ORDER: '📋', VENDOR_STATEMENT: '📊',
+            BILL_OF_LADING: '🚚', PACKING_SLIP: '📦', FREIGHT_QUOTE: '🏷️',
+            CREDIT_MEMO: '💳', COA: '🔬', SDS: '⚠️', CONTRACT: '📜',
+            PRODUCT_SPEC: '📐', TRACKING_NOTIFICATION: '📍', UNKNOWN: '📄',
+        };
+
+        const emoji = typeEmoji[classification.type] || '📄';
+        const typeLabel = classification.type.replace(/_/g, ' ');
+
+        let reply = `${emoji} *${typeLabel}* — _${classification.confidence} confidence_\n`;
+        reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+        reply += `📄 Pages: ${extraction.metadata.pageCount}\n`;
+
+        if (extraction.tables.length > 0) {
+            reply += `📊 Tables detected: ${extraction.tables.length}\n`;
+        }
+
+        // Extract key info using LLM
+        if (extraction.rawText.length > 50) {
+            ctx.sendChatAction('typing');
+            const summary = await unifiedTextGeneration({
+                system: `You are Aria, summarizing a business document for Will at BuildASoil.
+Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any action needed.`,
+                prompt: `Document type: ${typeLabel}
+Caption from user: ${caption || '(none)'}
+
+Document text (first 3000 chars):
+${extraction.rawText.slice(0, 3000)}`
+            });
+
+            reply += `\n━━━━━━━━━━━━━━━━━━━━\n${summary}`;
+        } else {
+            reply += `\n⚠️ _Very little text extracted. This might be a scanned/image PDF._`;
+        }
+
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
+
+    } catch (err: any) {
+        console.error(`Document processing error (${filename}):`, err.message);
+        await ctx.reply(`❌ Failed to process *${filename}*: ${err.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
+// ──────────────────────────────────────────────────
+// TEXT MESSAGE HANDLER
 // ──────────────────────────────────────────────────
 
 bot.on('text', async (ctx) => {
@@ -338,12 +472,22 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// Boot — dropPendingUpdates avoids conflict when restarting
-bot.launch({ dropPendingUpdates: true }).then(() => {
-    console.log('✅ ARIA IS LIVE AND LISTENING');
-    const ops = new OpsManager(bot);
-    ops.start();
-});
+// Boot — clear any competing session first, then start long-polling
+(async () => {
+    try {
+        // Force-clear any existing long-poll session
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+        console.log('🔄 Cleared previous Telegram session');
+    } catch (err: any) {
+        console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
+    }
+
+    bot.launch({ dropPendingUpdates: true }).then(() => {
+        console.log('✅ ARIA IS LIVE AND LISTENING');
+        const ops = new OpsManager(bot);
+        ops.start();
+    });
+})();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

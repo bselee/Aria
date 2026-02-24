@@ -58,6 +58,16 @@ export interface ProductReport {
     telegramMessage: string;
 }
 
+export interface ReceivedPO {
+    orderId: string;
+    orderDate: string;
+    receiveDate: string;
+    supplier: string;
+    total: number;
+    items: Array<{ productId: string; quantity: number }>;
+    finaleUrl: string;
+}
+
 // ──────────────────────────────────────────────────
 // CLIENT
 // ──────────────────────────────────────────────────
@@ -90,6 +100,128 @@ export class FinaleClient {
             console.error("❌ Finale connection failed:", err.message);
             return false;
         }
+    }
+
+    /**
+     * Fetch POs received today via GraphQL.
+     * Uses `receiveDate: { begin, end }` filter.
+     * DECISION(2026-02-24): status + receiveDate filters conflict in Finale's
+     * GraphQL API, so we filter for Completed client-side.
+     */
+    async getTodaysReceivedPOs(): Promise<ReceivedPO[]> {
+        try {
+            // Get today's date in YYYY-MM-DD format (Mountain Time)
+            const now = new Date();
+            const today = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const tomorrow = new Date(now);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 100
+                            type: ["PURCHASE_ORDER"]
+                            receiveDate: { begin: "${today}", end: "${tomorrowStr}" }
+                            sort: [{ field: "receiveDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    orderId
+                                    orderUrl
+                                    status
+                                    orderDate
+                                    receiveDate
+                                    total
+                                    supplier { name }
+                                    itemList(first: 50) {
+                                        edges {
+                                            node {
+                                                product { productId }
+                                                quantity
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            if (result.errors) {
+                console.error("Receivings GraphQL error:", result.errors[0].message);
+                return [];
+            }
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            return edges
+                .filter((edge: any) => edge.node.status === "Completed")
+                .map((edge: any) => {
+                    const po = edge.node;
+                    const encodedUrl = encodeURIComponent(po.orderUrl || "");
+                    return {
+                        orderId: po.orderId,
+                        orderDate: po.orderDate || "",
+                        receiveDate: po.receiveDate || "",
+                        supplier: po.supplier?.name || "Unknown",
+                        total: parseFloat(po.total) || 0,
+                        items: (po.itemList?.edges || []).map((ie: any) => ({
+                            productId: ie.node.product?.productId || "?",
+                            quantity: parseFloat(ie.node.quantity) || 0,
+                        })),
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                    };
+                });
+        } catch (err: any) {
+            console.error("Failed to fetch receivings:", err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Format today's received POs as a Slack message.
+     * Clean, informative, links to each PO.
+     */
+    formatReceivingsDigest(receivedPOs: ReceivedPO[]): string {
+        if (receivedPOs.length === 0) {
+            return ":package: *No receivings today* — nothing received yet.";
+        }
+
+        const totalValue = receivedPOs.reduce((sum, po) => sum + (po.total || 0), 0);
+        const totalItems = receivedPOs.reduce((sum, po) =>
+            sum + po.items.reduce((s, i) => s + i.quantity, 0), 0
+        );
+
+        let msg = `:package: *Today's Receivings* — ${receivedPOs.length} PO${receivedPOs.length > 1 ? "s" : ""}`;
+        msg += ` · ${totalItems.toLocaleString()} units · $${totalValue.toLocaleString()}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const po of receivedPOs) {
+            const itemCount = po.items.reduce((s, i) => s + i.quantity, 0);
+            const skuList = po.items.map(i => `\`${i.productId}\``).join(", ");
+            const truncatedSkus = skuList.length > 80
+                ? skuList.substring(0, 77) + "..."
+                : skuList;
+
+            msg += `\n:white_check_mark: *<${po.finaleUrl}|PO ${po.orderId}>*`;
+            msg += ` — _${po.supplier}_\n`;
+            msg += `      ${itemCount} units · $${po.total.toLocaleString()} · ${truncatedSkus}\n`;
+        }
+
+        return msg;
     }
 
     /**

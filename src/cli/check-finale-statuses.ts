@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
-async function debugPOFilter() {
+async function testFeb20() {
     const apiKey = process.env.FINALE_API_KEY || "";
     const apiSecret = process.env.FINALE_API_SECRET || "";
     const accountPath = process.env.FINALE_ACCOUNT_PATH || "";
@@ -17,32 +17,83 @@ async function debugPOFilter() {
         return res.json();
     };
 
-    // Try product filter with ID 
-    console.log("Test 1: product: [\"RAWFISHBONE\"]");
-    let r = await gql(`{ orderViewConnection(first: 5, type: ["PURCHASE_ORDER"], status: ["Committed"], product: ["RAWFISHBONE"]) { edges { node { orderId status } } } }`);
-    console.log(`  Result: ${r.data?.orderViewConnection?.edges?.length || 0} POs`, r.errors ? r.errors[0].message : "");
+    // Try a recent date that had completed POs
+    console.log("═══ Completed POs received on 2/20/2026 ═══\n");
+    const result = await gql(`
+        query {
+            orderViewConnection(
+                first: 20
+                type: ["PURCHASE_ORDER"]
+                receiveDate: { begin: "2026-02-20", end: "2026-02-21" }
+                sort: [{ field: "receiveDate", mode: "desc" }]
+            ) {
+                edges {
+                    node {
+                        orderId
+                        orderUrl
+                        status
+                        orderDate
+                        receiveDate
+                        total
+                        supplier { name }
+                        itemList(first: 20) {
+                            edges {
+                                node {
+                                    product { productId }
+                                    quantity
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    `);
 
-    // Try with product URL format
-    console.log("\nTest 2: product: [\"/buildasoilorganics/api/product/RAWFISHBONE\"]");
-    r = await gql(`{ orderViewConnection(first: 5, type: ["PURCHASE_ORDER"], status: ["Committed"], product: ["/buildasoilorganics/api/product/RAWFISHBONE"]) { edges { node { orderId status } } } }`);
-    console.log(`  Result: ${r.data?.orderViewConnection?.edges?.length || 0} POs`, r.errors ? r.errors[0].message : "");
-
-    // Try without status filter but with product
-    console.log("\nTest 3: product: [\"RAWFISHBONE\"] (no status filter)");
-    r = await gql(`{ orderViewConnection(first: 5, type: ["PURCHASE_ORDER"], product: ["RAWFISHBONE"]) { edges { node { orderId status orderDate } } } }`);
-    console.log(`  Result: ${r.data?.orderViewConnection?.edges?.length || 0} POs`, r.errors ? r.errors[0].message : "");
-    for (const e of (r.data?.orderViewConnection?.edges || [])) {
-        console.log(`    PO ${e.node.orderId}: ${e.node.status} | ${e.node.orderDate}`);
+    if (result.errors) {
+        console.log("Error:", result.errors[0].message);
+        process.exit(1);
     }
 
-    // Try with URL and no status
-    console.log("\nTest 4: product URL (no status filter)");
-    r = await gql(`{ orderViewConnection(first: 5, type: ["PURCHASE_ORDER"], product: ["/buildasoilorganics/api/product/RAWFISHBONE"]) { edges { node { orderId status orderDate } } } }`);
-    console.log(`  Result: ${r.data?.orderViewConnection?.edges?.length || 0} POs`, r.errors ? r.errors[0].message : "");
-    for (const e of (r.data?.orderViewConnection?.edges || [])) {
-        console.log(`    PO ${e.node.orderId}: ${e.node.status} | ${e.node.orderDate}`);
+    const edges = result.data?.orderViewConnection?.edges || [];
+    console.log(`All POs with receiveDate on 2/20: ${edges.length}`);
+
+    // Filter completed client-side
+    const completed = edges.filter((e: any) => e.node.status === "Completed");
+    console.log(`Completed only: ${completed.length}\n`);
+
+    for (const e of completed) {
+        const po = e.node;
+        const items = po.itemList?.edges || [];
+        const skus = items.map((i: any) => `${i.node.product?.productId}(${i.node.quantity})`).join(", ");
+        console.log(`PO ${po.orderId}: ${po.supplier?.name} | $${po.total} | recv ${po.receiveDate}`);
+        console.log(`  ${skus}`);
     }
+
+    // Now simulate Slack digest
+    console.log("\n\n═══ Simulated Slack Digest ═══\n");
+    const { FinaleClient } = await import('../lib/finale/client');
+    const client = new FinaleClient();
+
+    // Manual receivings for test date
+    const receivedPOs = completed.map((e: any) => {
+        const po = e.node;
+        return {
+            orderId: po.orderId,
+            orderDate: po.orderDate,
+            receiveDate: po.receiveDate,
+            supplier: po.supplier?.name || "Unknown",
+            total: po.total || 0,
+            items: (po.itemList?.edges || []).map((ie: any) => ({
+                productId: ie.node.product?.productId || "?",
+                quantity: ie.node.quantity || 0,
+            })),
+            finaleUrl: `https://app.finaleinventory.com/${accountPath}/app#order?orderUrl=${encodeURIComponent(po.orderUrl)}`,
+        };
+    });
+
+    console.log(client.formatReceivingsDigest(receivedPOs));
 
     process.exit(0);
 }
-debugPOFilter();
+testFeb20();

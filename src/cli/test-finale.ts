@@ -4,16 +4,23 @@ import { FinaleClient } from '../lib/finale/client';
 
 async function test() {
     const client = new FinaleClient();
+    await client.testConnection();
 
-    // Test product that IS on a committed PO (RAWFISHBONE on PO 124400)
-    console.log("═══ Product ON a committed PO ═══\n");
-    const report1 = await client.productReport("RAWFISHBONE");
-    console.log(report1.telegramMessage);
+    console.log("\n═══ Today's Received POs ═══\n");
+    const received = await client.getTodaysReceivedPOs();
+    console.log(`Found ${received.length} received POs today`);
 
-    // Test product NOT on any PO
-    console.log("\n\n═══ Product NOT on any PO ═══\n");
-    const report2 = await client.productReport("S-12527");
-    console.log(report2.telegramMessage);
+    if (received.length > 0) {
+        for (const po of received) {
+            console.log(`  PO ${po.orderId}: ${po.supplier} | $${po.total} | ${po.items.length} line items`);
+            for (const item of po.items.slice(0, 3)) {
+                console.log(`    ${item.productId}: qty=${item.quantity}`);
+            }
+        }
+    }
+
+    console.log("\n═══ Formatted Digest ═══\n");
+    console.log(client.formatReceivingsDigest(received));
 
     process.exit(0);
 }
