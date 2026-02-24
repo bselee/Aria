@@ -149,6 +149,66 @@ bot.command('receivings', async (ctx) => {
     }
 });
 
+// /remember — store something in Aria's memory
+bot.command('remember', async (ctx) => {
+    const text = ctx.message.text.replace(/^\/remember\s*/, '').trim();
+    if (!text) {
+        return ctx.reply('Usage: `/remember AAACooper sends multi-page invoices as statements`', { parse_mode: 'Markdown' });
+    }
+
+    try {
+        const { remember } = await import('../lib/intelligence/memory');
+        await remember({
+            category: 'general',
+            content: text,
+            source: 'telegram',
+            priority: 'normal',
+        });
+        await ctx.reply(`🧠 Got it. I'll remember that.`, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        ctx.reply(`❌ Memory error: ${err.message}`);
+    }
+});
+
+// /recall — search Aria's memory
+bot.command('recall', async (ctx) => {
+    const query = ctx.message.text.replace(/^\/recall\s*/, '').trim();
+    if (!query) {
+        return ctx.reply('Usage: `/recall AAACooper invoices`', { parse_mode: 'Markdown' });
+    }
+
+    ctx.sendChatAction('typing');
+    try {
+        const { recall } = await import('../lib/intelligence/memory');
+        const memories = await recall(query, { topK: 5 });
+
+        if (memories.length === 0) {
+            return ctx.reply('🧠 No relevant memories found.');
+        }
+
+        let reply = `🧠 *${memories.length} memories found:*\n\n`;
+        for (const mem of memories) {
+            const score = (mem.score * 100).toFixed(0);
+            reply += `• \\[${mem.category}\\] ${mem.content.slice(0, 150)}\n  _${score}% match · ${mem.storedAt?.slice(0, 10) || 'unknown'}_\n\n`;
+        }
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        ctx.reply(`❌ Recall error: ${err.message}`);
+    }
+});
+
+// /seed — initialize Aria's memory with known vendor patterns
+bot.command('seed', async (ctx) => {
+    ctx.sendChatAction('typing');
+    try {
+        const { seedMemories } = await import('../lib/intelligence/memory');
+        await seedMemories();
+        await ctx.reply('🌱 ✅ Memory seeded with known vendor patterns and processes.');
+    } catch (err: any) {
+        ctx.reply(`❌ Seed error: ${err.message}`);
+    }
+});
+
 // /voice
 bot.command('voice', async (ctx) => {
     if (!elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
@@ -240,7 +300,51 @@ bot.command('populate', async (ctx) => {
 });
 
 // ──────────────────────────────────────────────────
+// REUSABLE: Send email with PDF attachment via Gmail API
+// ──────────────────────────────────────────────────
+
+async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer: Buffer, pdfFilename: string): Promise<void> {
+    const { getAuthenticatedClient: getGmailAuth } = await import('../lib/gmail/auth');
+    const { google } = await import('googleapis');
+    const auth = await getGmailAuth('default');
+    const gmail = google.gmail({ version: 'v1', auth });
+
+    const boundary = '----=_Part_' + Date.now();
+    const mimeMessage = [
+        `To: ${to}`,
+        `Subject: ${subject}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
+        ``,
+        `--${boundary}`,
+        `Content-Type: text/plain; charset="UTF-8"`,
+        ``,
+        body,
+        ``,
+        `--${boundary}`,
+        `Content-Type: application/pdf; name="${pdfFilename}"`,
+        `Content-Disposition: attachment; filename="${pdfFilename}"`,
+        `Content-Transfer-Encoding: base64`,
+        ``,
+        pdfBuffer.toString('base64'),
+        `--${boundary}--`,
+    ].join('\r\n');
+
+    const encodedMessage = Buffer.from(mimeMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+    await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: { raw: encodedMessage },
+    });
+}
+
+// ──────────────────────────────────────────────────
 // DOCUMENT/FILE HANDLER — PDFs, images, Word docs
+// Memory-aware: checks Pinecone for vendor patterns
 // ──────────────────────────────────────────────────
 
 bot.on('document', async (ctx) => {
@@ -258,7 +362,6 @@ bot.on('document', async (ctx) => {
         return;
     }
 
-    // Size check (Telegram max is 20MB for bots)
     if (doc.file_size && doc.file_size > 20_000_000) {
         await ctx.reply('⚠️ File too large (>20MB). Try emailing it to me instead.');
         return;
@@ -272,156 +375,194 @@ bot.on('document', async (ctx) => {
         const fileLink = await ctx.telegram.getFileLink(doc.file_id);
         const response = await fetch(fileLink.href);
         if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        const buffer = Buffer.from(await response.arrayBuffer());
 
-        // Import PDF tools
+        // Import tools
         const { extractPDF } = await import('../lib/pdf/extractor');
         const { classifyDocument } = await import('../lib/pdf/classifier');
         const { pdfEditor } = await import('../lib/pdf/editor');
+        const { recall, remember } = await import('../lib/intelligence/memory');
 
-        // Extract text
+        // Extract text & classify
         ctx.sendChatAction('typing');
         const extraction = await extractPDF(buffer);
-
-        // Classify document type
         const classification = await classifyDocument(extraction);
 
-        // Build response
         const typeEmoji: Record<string, string> = {
             INVOICE: '🧾', PURCHASE_ORDER: '📋', VENDOR_STATEMENT: '📊',
             BILL_OF_LADING: '🚚', PACKING_SLIP: '📦', FREIGHT_QUOTE: '🏷️',
             CREDIT_MEMO: '💳', COA: '🔬', SDS: '⚠️', CONTRACT: '📜',
             PRODUCT_SPEC: '📐', TRACKING_NOTIFICATION: '📍', UNKNOWN: '📄',
         };
-
         const emoji = typeEmoji[classification.type] || '📄';
         const typeLabel = classification.type.replace(/_/g, ' ');
 
         let reply = `${emoji} *${typeLabel}* — _${classification.confidence} confidence_\n`;
         reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
         reply += `📄 Pages: ${extraction.metadata.pageCount}\n`;
-
         if (extraction.tables.length > 0) {
             reply += `📊 Tables detected: ${extraction.tables.length}\n`;
         }
 
-        // ── VENDOR STATEMENT WORKFLOW ──
-        // If it's a statement (or user mentions invoice/bill.com), do the full workflow
-        const isStatementWorkflow = classification.type === 'VENDOR_STATEMENT'
+        // ── CHECK MEMORY: Do we know this vendor's pattern? ──
+        const docPreview = extraction.rawText.slice(0, 500);
+        let vendorMemories: Awaited<ReturnType<typeof recall>> = [];
+        try {
+            vendorMemories = await recall(`vendor document pattern ${docPreview}`, {
+                category: 'vendor_pattern',
+                topK: 2,
+                minScore: 0.5,
+            });
+        } catch (err: any) {
+            console.warn('Memory lookup skipped:', err.message);
+        }
+
+        const hasVendorPattern = vendorMemories.length > 0;
+        const isSplitPattern = hasVendorPattern &&
+            vendorMemories[0].content.toLowerCase().includes('split');
+
+        if (hasVendorPattern) {
+            reply += `\n🧠 _Memory: ${vendorMemories[0].content.slice(0, 100)}..._\n`;
+        }
+
+        // ── Analyze pages with LLM ──
+        const isInvoiceWorkflow = classification.type === 'VENDOR_STATEMENT'
+            || classification.type === 'INVOICE'
             || caption.toLowerCase().includes('invoice')
             || caption.toLowerCase().includes('bill.com')
-            || caption.toLowerCase().includes('remove');
+            || caption.toLowerCase().includes('remove')
+            || isSplitPattern;
 
-        if (isStatementWorkflow && extraction.pages.length > 1) {
+        if (isInvoiceWorkflow && extraction.pages.length >= 1) {
             ctx.sendChatAction('typing');
 
-            // Analyze each page to find invoice vs statement pages
+            // Per-page analysis
             const pageAnalysis = await unifiedTextGeneration({
-                system: `You analyze multi-page vendor documents. For each page, determine if it is:
-- STATEMENT: An account statement showing a list of invoices, balances, aging
-- INVOICE: An individual invoice with line items, quantities, prices
-- OTHER: Cover page, terms, etc.
+                system: `You analyze business documents page by page. For each page, determine:
+- INVOICE: An individual invoice with line items, quantities, amounts, invoice number
+- STATEMENT: An account statement summary showing list of invoices, aging, balances
+- OTHER: Cover page, terms, remittance slip, etc.
 
-Return JSON array with one object per page: [{"page": 1, "type": "STATEMENT|INVOICE|OTHER", "invoiceNumber": "INV-123 or null"}]`,
-                prompt: `Document has ${extraction.pages.length} pages. Here is text from each page:\n\n${extraction.pages.map(p =>
+Return ONLY a JSON array: [{"page":1,"type":"INVOICE","invoiceNumber":"INV-123"}]
+If no invoice number found, use null for invoiceNumber.`,
+                prompt: `${extraction.pages.length} pages:\n\n${extraction.pages.map(p =>
                     `=== PAGE ${p.pageNumber} ===\n${p.text.slice(0, 800)}\n`
-                ).join('\n')
-                    }`
+                ).join('\n')}`
             });
 
-            // Parse the LLM response
-            let pages: Array<{ page: number; type: string; invoiceNumber?: string }> = [];
+            let pages: Array<{ page: number; type: string; invoiceNumber?: string | null }> = [];
             try {
-                const jsonMatch = pageAnalysis.match(/\[[\s\S]*\]/);
+                const jsonMatch = pageAnalysis.match(/\[[\s\S]*?\]/);
                 if (jsonMatch) pages = JSON.parse(jsonMatch[0]);
-            } catch {
-                // If JSON parse fails, just show summary
-            }
+            } catch { /* fall through to default */ }
 
             if (pages.length > 0) {
                 const invoicePages = pages.filter(p => p.type === 'INVOICE');
                 const statementPages = pages.filter(p => p.type === 'STATEMENT');
-                const invoiceNums = invoicePages
-                    .map(p => p.invoiceNumber)
-                    .filter(Boolean);
+                const otherPages = pages.filter(p => p.type === 'OTHER');
+                const invoiceNums = invoicePages.map(p => p.invoiceNumber).filter(Boolean) as string[];
 
                 reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
-                reply += `📊 Statement pages: ${statementPages.map(p => p.page).join(', ')}\n`;
+                if (statementPages.length > 0) reply += `📊 Statement pages: ${statementPages.map(p => p.page).join(', ')}\n`;
+                if (invoicePages.length > 0) reply += `🧾 Invoice pages: ${invoicePages.map(p => p.page).join(', ')}\n`;
+                if (invoiceNums.length > 0) reply += `📝 Invoice #: ${invoiceNums.join(', ')}\n`;
 
-                if (invoicePages.length > 0) {
-                    reply += `🧾 Invoice pages: ${invoicePages.map(p => p.page).join(', ')}\n`;
-                    if (invoiceNums.length > 0) {
-                        reply += `📝 Invoice #: ${invoiceNums.join(', ')}\n`;
-                    }
-
-                    // Remove invoice pages
-                    const pagesToRemove = invoicePages.map(p => p.page - 1); // 0-indexed
-                    const cleanedBuffer = await pdfEditor.removePages(buffer, pagesToRemove);
-
-                    reply += `\n✂️ Removed ${invoicePages.length} invoice page(s) — ${statementPages.length} page(s) remain`;
-
+                // ── SPLIT WORKFLOW (AAACooper-style): each page → separate PDF → email ──
+                if (isSplitPattern || (invoicePages.length > 1 && statementPages.length === 0)) {
+                    reply += `\n✂️ Splitting ${invoicePages.length} invoices into individual PDFs...`;
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
-                    // Send cleaned PDF back
-                    await ctx.replyWithDocument({
-                        source: cleanedBuffer,
-                        filename: filename.replace('.PDF', '_STATEMENT_ONLY.PDF').replace('.pdf', '_statement_only.pdf'),
-                    }, { caption: `📊 Statement only (invoices removed)` });
+                    const splitBuffers = await pdfEditor.splitPdf(buffer);
+                    let emailsSent = 0;
 
-                    // Email to bill.com
-                    try {
-                        const { getAuthenticatedClient } = await import('../lib/gmail/auth');
-                        const { google } = await import('googleapis');
-                        const auth = await getAuthenticatedClient('default');
-                        const gmail = google.gmail({ version: 'v1', auth });
+                    for (const invPage of invoicePages) {
+                        const pageIdx = invPage.page - 1;
+                        if (pageIdx >= splitBuffers.length) continue;
 
-                        // Build MIME message with attachment
-                        const boundary = '----=_Part_' + Date.now();
-                        const subject = `Vendor Statement - ${invoiceNums.join(', ') || filename}`;
-                        const cleanFilename = filename.replace('.PDF', '_STATEMENT_ONLY.PDF').replace('.pdf', '_statement_only.pdf');
+                        const pageBuffer = splitBuffers[pageIdx];
+                        const invNum = invPage.invoiceNumber || `page${invPage.page}`;
+                        const invFilename = `${invNum.replace(/[^a-zA-Z0-9-]/g, '_')}.pdf`;
 
-                        const mimeMessage = [
-                            `To: buildasoilap@bill.com`,
-                            `Subject: ${subject}`,
-                            `MIME-Version: 1.0`,
-                            `Content-Type: multipart/mixed; boundary="${boundary}"`,
-                            ``,
-                            `--${boundary}`,
-                            `Content-Type: text/plain; charset="UTF-8"`,
-                            ``,
-                            `Vendor statement attached. Invoice pages removed.`,
-                            `Original file: ${filename}`,
-                            `Invoice numbers found: ${invoiceNums.join(', ') || 'N/A'}`,
-                            ``,
-                            `--${boundary}`,
-                            `Content-Type: application/pdf; name="${cleanFilename}"`,
-                            `Content-Disposition: attachment; filename="${cleanFilename}"`,
-                            `Content-Transfer-Encoding: base64`,
-                            ``,
-                            cleanedBuffer.toString('base64'),
-                            `--${boundary}--`,
-                        ].join('\r\n');
+                        // Send each invoice PDF back to chat
+                        await ctx.replyWithDocument({
+                            source: pageBuffer,
+                            filename: invFilename,
+                        }, { caption: `🧾 Invoice ${invNum}` });
 
-                        const encodedMessage = Buffer.from(mimeMessage)
-                            .toString('base64')
-                            .replace(/\+/g, '-')
-                            .replace(/\//g, '_')
-                            .replace(/=+$/, '');
-
-                        await gmail.users.messages.send({
-                            userId: 'me',
-                            requestBody: { raw: encodedMessage },
-                        });
-
-                        await ctx.reply(`📧 ✅ Sent to \`buildasoilap@bill.com\`\n_Subject: ${subject}_`, { parse_mode: 'Markdown' });
-
-                    } catch (emailErr: any) {
-                        console.error('Bill.com email error:', emailErr.message);
-                        await ctx.reply(`⚠️ PDF cleaned but email failed: ${emailErr.message}\n_Download the file above and forward manually._`, { parse_mode: 'Markdown' });
+                        // Email each to bill.com
+                        try {
+                            await sendPdfEmail(
+                                'buildasoilap@bill.com',
+                                `Invoice ${invNum}`,
+                                `Invoice ${invNum} attached.\nExtracted from: ${filename}`,
+                                pageBuffer,
+                                invFilename,
+                            );
+                            emailsSent++;
+                        } catch (emailErr: any) {
+                            console.error(`Email failed for ${invNum}:`, emailErr.message);
+                            await ctx.reply(`⚠️ Email failed for ${invNum}: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                        }
                     }
 
-                    return; // Done with statement workflow
+                    if (emailsSent > 0) {
+                        await ctx.reply(`📧 ✅ Sent ${emailsSent} invoice(s) to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
+                    }
+
+                    return; // Done
+                }
+
+                // ── REMOVE workflow: strip invoice pages, keep statement ──
+                if (invoicePages.length > 0 && statementPages.length > 0) {
+                    const pagesToRemove = invoicePages.map(p => p.page - 1);
+                    const cleanedBuffer = await pdfEditor.removePages(buffer, pagesToRemove);
+
+                    reply += `\n✂️ Removed ${invoicePages.length} invoice page(s) — ${statementPages.length} statement page(s) remain`;
+                    await ctx.reply(reply, { parse_mode: 'Markdown' });
+
+                    const cleanFilename = filename.replace(/\.(pdf|PDF)$/, '_STATEMENT_ONLY.$1');
+                    await ctx.replyWithDocument({
+                        source: cleanedBuffer,
+                        filename: cleanFilename,
+                    }, { caption: `📊 Statement only (invoices removed)` });
+
+                    try {
+                        await sendPdfEmail(
+                            'buildasoilap@bill.com',
+                            `Vendor Statement - ${invoiceNums.join(', ') || filename}`,
+                            `Vendor statement attached. Invoice pages removed.\nOriginal: ${filename}\nInvoices: ${invoiceNums.join(', ') || 'N/A'}`,
+                            cleanedBuffer,
+                            cleanFilename,
+                        );
+                        await ctx.reply(`📧 ✅ Sent statement to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
+                    } catch (emailErr: any) {
+                        console.error('Bill.com email error:', emailErr.message);
+                        await ctx.reply(`⚠️ PDF cleaned but email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                    }
+
+                    return;
+                }
+
+                // Single invoice — forward as-is
+                if (invoicePages.length === 1 && statementPages.length === 0) {
+                    const invNum = invoiceNums[0] || 'unknown';
+                    reply += `\n📧 Forwarding to bill.com...`;
+                    await ctx.reply(reply, { parse_mode: 'Markdown' });
+
+                    try {
+                        await sendPdfEmail(
+                            'buildasoilap@bill.com',
+                            `Invoice ${invNum}`,
+                            `Invoice ${invNum} attached.\nFile: ${filename}`,
+                            buffer,
+                            filename,
+                        );
+                        await ctx.reply(`📧 ✅ Sent to \`buildasoilap@bill.com\` — Invoice ${invNum}`, { parse_mode: 'Markdown' });
+                    } catch (emailErr: any) {
+                        await ctx.reply(`⚠️ Email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                    }
+
+                    return;
                 }
             }
         }
@@ -432,17 +573,22 @@ Return JSON array with one object per page: [{"page": 1, "type": "STATEMENT|INVO
             const summary = await unifiedTextGeneration({
                 system: `You are Aria, summarizing a business document for Will at BuildASoil.
 Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any action needed.`,
-                prompt: `Document type: ${typeLabel}
-Caption from user: ${caption || '(none)'}
-
-Document text (first 3000 chars):
-${extraction.rawText.slice(0, 3000)}`
+                prompt: `Document type: ${typeLabel}\nCaption: ${caption || '(none)'}\n\n${extraction.rawText.slice(0, 3000)}`
             });
-
             reply += `\n━━━━━━━━━━━━━━━━━━━━\n${summary}`;
         } else {
             reply += `\n⚠️ _Very little text extracted. This might be a scanned/image PDF._`;
         }
+
+        // Store this interaction as a memory
+        try {
+            await remember({
+                category: 'general',
+                content: `Processed document: ${filename} (${typeLabel}). ${extraction.metadata.pageCount} pages.`,
+                tags: [typeLabel.toLowerCase(), filename],
+                source: 'telegram',
+            });
+        } catch { /* non-critical */ }
 
         await ctx.reply(reply, { parse_mode: 'Markdown' });
 
@@ -461,10 +607,12 @@ bot.on('text', async (ctx) => {
     ctx.sendChatAction('typing');
 
     try {
-        // We use unifiedTextGeneration for the initial reply,
-        // BUT for tool use we currently rely on the OpenAI path in gpt-4o 
-        // because Claude SDK tool usage is slightly different than OpenAI's.
-        // For now, I will improve the OpenAI tool choice and add the weather tool.
+        // ── Retrieve relevant memories for context ──
+        let memoryContext = '';
+        try {
+            const { getRelevantContext } = await import('../lib/intelligence/memory');
+            memoryContext = await getRelevantContext(userText);
+        } catch { /* memory unavailable, continue without */ }
 
         let reply = "";
 
@@ -523,7 +671,7 @@ bot.on('text', async (ctx) => {
             const response = await openai.chat.completions.create({
                 model: "gpt-4o",
                 messages: [
-                    { role: "system", content: SYSTEM_PROMPT + "\n\nYou have access to tools. Use 'get_weather' for weather requests. Use 'lookup_product' when Will asks about a product, inventory item, or SKU. The sku parameter should be the Finale product ID (e.g. S-12527, BC101)." },
+                    { role: "system", content: SYSTEM_PROMPT + memoryContext + "\n\nYou have access to tools. Use 'get_weather' for weather requests. Use 'lookup_product' when Will asks about a product, inventory item, or SKU. The sku parameter should be the Finale product ID (e.g. S-12527, BC101)." },
                     { role: "user", content: userText }
                 ],
                 tools,
@@ -580,7 +728,7 @@ bot.on('text', async (ctx) => {
         } else {
             // No OpenAI, just use Unified (which will try Anthropic)
             reply = await unifiedTextGeneration({
-                system: SYSTEM_PROMPT,
+                system: SYSTEM_PROMPT + memoryContext,
                 prompt: userText
             });
         }
