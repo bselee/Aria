@@ -1,8 +1,12 @@
-import Anthropic from "@anthropic-ai/sdk";
+/**
+ * @file    statement-parser.ts
+ * @purpose Handles parsing and reconciliation of vendor account statements.
+ * @deps    supabase, llm-service
+ */
+
 import { z } from "zod";
 import { createClient } from "@/lib/supabase";
-
-const anthropic = new Anthropic();
+import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const StatementLineSchema = z.object({
     date: z.string(),
@@ -35,18 +39,18 @@ export const VendorStatementSchema = z.object({
 export type StatementData = z.infer<typeof VendorStatementSchema>;
 
 export async function parseVendorStatement(rawText: string): Promise<StatementData> {
-    const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
-        system: `Parse this vendor account statement. Extract every transaction line — invoices, payments, credits, adjustments. Return only valid JSON.`,
-        messages: [{ role: "user", content: rawText.slice(0, 8000) }],
+    return await unifiedObjectGeneration({
+        system: `Parse this vendor account statement. Extract every transaction line — invoices, payments, credits, adjustments.`,
+        prompt: rawText.slice(0, 8000),
+        schema: VendorStatementSchema,
+        schemaName: "VendorStatement"
     });
-
-    const text = response.content[0].type === "text" ? response.content[0].text : "{}";
-    return VendorStatementSchema.parse(JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()));
 }
 
-// Reconcile statement against our records in Supabase
+/**
+ * Reconciles a parsed statement against our local records in Supabase.
+ * Identifies missing invoices, payment discrepancies, and balance offsets.
+ */
 export async function reconcileStatement(statement: StatementData) {
     const supabase = createClient();
 
@@ -110,5 +114,9 @@ export async function reconcileStatement(statement: StatementData) {
         status: discrepancies.length === 0 ? "RECONCILED" : "DISCREPANCIES",
     });
 
-    return { reconciliationLines, discrepancies, totalDiscrepancyAmount: discrepancies.reduce((sum, d) => sum + Math.abs(d.discrepancy ?? 0), 0) };
+    return {
+        reconciliationLines,
+        discrepancies,
+        totalDiscrepancyAmount: discrepancies.reduce((sum, d) => sum + Math.abs(d.discrepancy ?? 0), 0)
+    };
 }

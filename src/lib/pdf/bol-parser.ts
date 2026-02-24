@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getAnthropicClient } from "../anthropic";
+import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const BOLSchema = z.object({
     documentType: z.literal("bill_of_lading"),
@@ -34,21 +34,19 @@ export const BOLSchema = z.object({
 
 export type BillOfLadingData = z.infer<typeof BOLSchema>;
 
-export async function parseBOL(rawText: string): Promise<BillOfLadingData> {
-    const anthropic = getAnthropicClient();
-    const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2048,
-        system: `Extract all Bill of Lading data. Pay attention to:
+const BOL_SYSTEM_PROMPT = `Extract all Bill of Lading data. Pay attention to:
 - Both BOL number and PRO number (they are different — BOL is shipper-assigned, PRO is carrier-assigned)
 - SCAC codes for carrier identification
 - All PO numbers referenced (often multiple)
 - Commodity descriptions and freight class
 - Any hazmat declarations
-Return only valid JSON.`,
-        messages: [{ role: "user", content: rawText.slice(0, 6000) }],
-    });
+`;
 
-    const text = response.content[0].type === "text" ? response.content[0].text : "{}";
-    return BOLSchema.parse(JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()));
+export async function parseBOL(rawText: string): Promise<BillOfLadingData> {
+    return await unifiedObjectGeneration({
+        system: BOL_SYSTEM_PROMPT,
+        prompt: rawText.slice(0, 6000),
+        schema: BOLSchema,
+        schemaName: "BillOfLading"
+    });
 }

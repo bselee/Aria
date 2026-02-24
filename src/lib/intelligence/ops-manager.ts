@@ -3,6 +3,7 @@
  * @purpose Handles background operations: PO tracking, email filtering, and summaries.
  * @author  Will / Antigravity
  * @created 2026-02-20
+ * @updated 2026-02-20
  * @deps    googleapis, node-cron, telegraf
  */
 
@@ -12,22 +13,8 @@ import { createClient } from "../supabase";
 import cron from "node-cron";
 import { Telegraf } from "telegraf";
 import { SYSTEM_PROMPT } from "../../config/persona";
-import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
 import { indexOperationalContext } from "./pinecone";
-
-let anthropic: Anthropic | null = null;
-let openai: OpenAI | null = null;
-
-function getAnthropic() {
-    if (!anthropic) anthropic = new Anthropic();
-    return anthropic;
-}
-
-function getOpenAI() {
-    if (!openai) openai = new OpenAI();
-    return openai;
-}
+import { unifiedTextGeneration } from "./llm";
 
 const TRACKING_PATTERNS = {
     ups: /1Z[0-9A-Z]{16}/i,
@@ -117,7 +104,7 @@ export class OpsManager {
             const gmail = google.gmail({ version: "v1", auth });
             const supabase = createClient();
 
-            // Search for PO emails sent yesterday or today
+            // Search for PO emails sent recently
             const { data: search } = await gmail.users.messages.list({
                 userId: "me",
                 q: "label:PO after:2026/01/01",
@@ -146,7 +133,6 @@ export class OpsManager {
                 const sentAt = parseInt(firstMsg.internalDate!);
                 let responseAt: number | null = null;
 
-                // Find first reply from someone other than BuildASoil
                 for (const msg of thread.messages.slice(1)) {
                     const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "";
                     if (!from.includes("buildasoil.com")) {
@@ -157,7 +143,7 @@ export class OpsManager {
 
                 const responseTimeMins = responseAt ? Math.round((responseAt - sentAt) / 60000) : null;
 
-                // 🔍 Extract Tracking Numbers
+                // 🔍 Extract Tracking Numbers from Snippets
                 let trackingNumbers: string[] = [];
                 for (const msg of thread.messages) {
                     const body = msg.snippet || "";
@@ -182,16 +168,6 @@ export class OpsManager {
                             { parse_mode: "Markdown" }
                         );
                     }
-                }
-
-                // Track "Needs Response"
-                const lastMsg = thread.messages[thread.messages.length - 1];
-                const lastMsgFrom = lastMsg.payload?.headers?.find(h => h.name === 'From')?.value || "";
-                const isWaitingOnVendor = lastMsgFrom.includes("buildasoil.com");
-                const hoursWait = Math.round((Date.now() - parseInt(lastMsg.internalDate!)) / 3600000);
-
-                if (isWaitingOnVendor && hoursWait > 24) {
-                    console.log(`⚠️ PO ${poNumber} waiting on vendor for ${hoursWait}h`);
                 }
 
                 // Index to Pinecone for RAG
@@ -253,12 +229,16 @@ export class OpsManager {
         if (timeframe === "yesterday") date.setDate(date.getDate() - 1);
         else date.setDate(date.getDate() - 7);
 
-        const { data: pos } = await supabase
-            .from("purchase_orders")
-            .select("*")
-            .gte("issue_date", date.toISOString().split("T")[0]);
+        try {
+            const { data: pos } = await supabase
+                .from("purchase_orders")
+                .select("*")
+                .gte("issue_date", date.toISOString().split("T")[0]);
 
-        return pos || [];
+            return pos || [];
+        } catch (err) {
+            return [];
+        }
     }
 
     private async generateLLMSummary(title: string, data: any[]) {
@@ -269,31 +249,10 @@ export class OpsManager {
         Data: ${JSON.stringify(data.slice(0, 10))}`;
 
         try {
-            // Try Anthropic
-            try {
-                const response = await getAnthropic().messages.create({
-                    model: "claude-3-5-sonnet-20241022",
-                    max_tokens: 500,
-                    system: SYSTEM_PROMPT,
-                    messages: [{ role: "user", content: prompt }]
-                });
-                return response.content[0].type === 'text' ? response.content[0].text : "Error generating summary.";
-            } catch (claudeErr: any) {
-                if (claudeErr.message.includes('credit balance')) {
-                    // Fallback to OpenAI
-                    console.log("🔄 Summary: Falling back to OpenAI...");
-                    const response = await getOpenAI().chat.completions.create({
-                        model: "gpt-4o",
-                        messages: [
-                            { role: "system", content: SYSTEM_PROMPT },
-                            { role: "user", content: prompt }
-                        ],
-                        max_tokens: 500
-                    });
-                    return response.choices[0].message.content || "Error generating summary.";
-                }
-                throw claudeErr;
-            }
+            return await unifiedTextGeneration({
+                system: SYSTEM_PROMPT,
+                prompt: prompt
+            });
         } catch (err) {
             return "Unable to generate intelligent summary at this time.";
         }

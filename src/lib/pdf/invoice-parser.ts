@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getAnthropicClient } from "../anthropic";
+import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const LineItemSchema = z.object({
     lineNumber: z.number().optional(),
@@ -59,34 +59,35 @@ Pay special attention to:
 - PO numbers, order numbers, BOL numbers, PRO numbers, tracking numbers
 - Ship-to vs bill-to addresses if different
 - Due date: calculate from invoice date + terms if not explicitly stated
-
-Return ONLY valid JSON matching the schema. Use null for missing optional fields.`;
+`;
 
 export async function parseInvoice(rawText: string, tables?: string[][]): Promise<InvoiceData> {
-    const anthropic = getAnthropicClient();
     // Provide both raw text and any extracted tables for best accuracy
     const tableContext = tables?.length
         ? `\n\nExtracted tables:\n${tables.map(t => t.join(" | ")).join("\n")}`
         : "";
 
-    const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
-        system: INVOICE_SYSTEM_PROMPT,
-        messages: [{
-            role: "user",
-            content: `Invoice text:\n${rawText.slice(0, 8000)}${tableContext}`,
-        }],
-    });
-
-    const text = response.content[0].type === "text" ? response.content[0].text : "{}";
-    const cleaned = text.replace(/```json\n?|\n?```/g, "").trim();
-
     try {
-        return InvoiceSchema.parse(JSON.parse(cleaned));
-    } catch (err) {
-        // Retry with relaxed parsing if Zod validation fails
-        const relaxed = JSON.parse(cleaned);
-        return { ...relaxed, confidence: "low" } as InvoiceData;
+        const data = await unifiedObjectGeneration({
+            system: INVOICE_SYSTEM_PROMPT,
+            prompt: `Invoice text:\n${rawText.slice(0, 8000)}${tableContext}`,
+            schema: InvoiceSchema,
+            schemaName: "Invoice"
+        });
+        return data;
+    } catch (err: any) {
+        console.error("❌ parseInvoice failed even with fallback:", err.message);
+        // Fallback to empty structure if everything fails
+        return {
+            documentType: "invoice",
+            invoiceNumber: "error",
+            vendorName: "error",
+            invoiceDate: new Date().toISOString().split('T')[0],
+            lineItems: [],
+            subtotal: 0,
+            total: 0,
+            amountDue: 0,
+            confidence: "low"
+        } as InvoiceData;
     }
 }

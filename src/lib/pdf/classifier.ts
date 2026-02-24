@@ -1,17 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { DocumentType } from "@/types/documents";
 import { PDFExtractionResult } from "./extractor";
-
-let anthropicClient: Anthropic | null = null;
-
-function getAnthropic() {
-    if (!anthropicClient) {
-        anthropicClient = new Anthropic({
-            apiKey: process.env.ANTHROPIC_API_KEY,
-        });
-    }
-    return anthropicClient;
-}
+import { unifiedObjectGeneration } from "../intelligence/llm";
+import { z } from "zod";
 
 // Fast keyword-based pre-classifier before expensive LLM call
 const KEYWORD_SIGNALS: Record<DocumentType, string[]> = {
@@ -30,6 +20,16 @@ const KEYWORD_SIGNALS: Record<DocumentType, string[]> = {
     TRACKING_NOTIFICATION: ["tracking number", "shipped", "in transit", "out for delivery", "estimated delivery", "delivered"],
     UNKNOWN: [],
 };
+
+const ClassificationSchema = z.object({
+    type: z.enum([
+        "INVOICE", "PURCHASE_ORDER", "VENDOR_STATEMENT", "BILL_OF_LADING",
+        "PACKING_SLIP", "FREIGHT_QUOTE", "REMITTANCE_ADVICE", "CREDIT_MEMO",
+        "CONTRACT", "PRODUCT_SPEC", "SDS", "COA", "TRACKING_NOTIFICATION", "UNKNOWN"
+    ]),
+    confidence: z.enum(["high", "medium", "low"]),
+    reasoning: z.string(),
+});
 
 export async function classifyDocument(extraction: PDFExtractionResult): Promise<{
     type: DocumentType;
@@ -56,22 +56,17 @@ export async function classifyDocument(extraction: PDFExtractionResult): Promise
 
     // LLM classification for ambiguous documents
     const preview = extraction.rawText.slice(0, 1500);
-    const anthropic = getAnthropic();
-    const response = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001",    // Fast + cheap for classification
-        max_tokens: 256,
-        messages: [{
-            role: "user",
-            content: `Classify this business document. Return JSON only:
-{"type": "INVOICE"|"PURCHASE_ORDER"|"VENDOR_STATEMENT"|"BILL_OF_LADING"|"PACKING_SLIP"|"FREIGHT_QUOTE"|"REMITTANCE_ADVICE"|"CREDIT_MEMO"|"CONTRACT"|"PRODUCT_SPEC"|"SDS"|"COA"|"TRACKING_NOTIFICATION"|"UNKNOWN", "confidence": "high"|"medium"|"low", "reasoning": string}
 
-Document preview:
-${preview}`,
-        }],
-    });
-
-    const content = response.content[0];
-    return content.type === "text"
-        ? JSON.parse(content.text)
-        : { type: "UNKNOWN", confidence: "low", reasoning: "Parse error" };
+    try {
+        const result = await unifiedObjectGeneration({
+            system: `Classify this business document.`,
+            prompt: `Document preview:\n${preview}`,
+            schema: ClassificationSchema,
+            schemaName: "Classification"
+        });
+        return result as any;
+    } catch (err: any) {
+        console.error("❌ classifyDocument failed even with fallback:", err.message);
+        return { type: "UNKNOWN", confidence: "low", reasoning: "Model failure" };
+    }
 }

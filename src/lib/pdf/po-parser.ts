@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getAnthropicClient } from "../anthropic";
+import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const POLineItemSchema = z.object({
     lineNumber: z.number(),
@@ -42,17 +42,10 @@ export const PurchaseOrderSchema = z.object({
 export type POData = z.infer<typeof PurchaseOrderSchema>;
 
 export async function parsePurchaseOrder(rawText: string): Promise<POData> {
-    const anthropic = getAnthropicClient();
-    const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
-        system: `Extract purchase order data. Return only valid JSON. Be precise with line item quantities and prices. Include all line items even if they span multiple pages.`,
-        messages: [{
-            role: "user",
-            content: rawText.slice(0, 8000),
-        }],
+    return await unifiedObjectGeneration({
+        system: `Extract purchase order data. Be precise with line item quantities and prices. Include all line items even if they span multiple pages.`,
+        prompt: rawText.slice(0, 8000),
+        schema: PurchaseOrderSchema,
+        schemaName: "PurchaseOrder"
     });
-
-    const text = response.content[0].type === "text" ? response.content[0].text : "{}";
-    return PurchaseOrderSchema.parse(JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()));
 }
