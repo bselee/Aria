@@ -271,15 +271,17 @@ export class SlackWatchdog {
         );
 
         for (const msg of humanMessages) {
-            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName);
+            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName, msg.ts!);
         }
     }
 
     // ──────────────────────────────────────────────────
     // MESSAGE ANALYSIS
+    // IMPORTANT: Aria NEVER posts in Slack. Eyes-only mode.
+    // The only Slack action is adding a 👀 reaction from Will's account.
     // ──────────────────────────────────────────────────
 
-    private async processMessage(text: string, userId: string, channelId: string, channelName: string) {
+    private async processMessage(text: string, userId: string, channelId: string, channelName: string, messageTs: string) {
         // Step 1: LLM intent analysis — is this a product request?
         const analysis = await this.analyzeIntent(text);
 
@@ -288,10 +290,15 @@ export class SlackWatchdog {
 
         console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
 
-        // Step 2: Fuzzy match against product catalog
+        // Step 2: React with 👀 from Will's account (user token) to signal "looking into it"
+        // DECISION(2026-02-24): Reaction comes from Will's user token, NOT a bot.
+        // This looks natural — like Will saw it himself. Aria stays invisible.
+        await this.addEyesReaction(channelId, messageTs);
+
+        // Step 3: Fuzzy match against product catalog
         const match = this.fuzzyMatch(analysis.itemDescription);
 
-        // Step 3: Check for active POs if we have a match
+        // Step 4: Check for active POs if we have a match
         let activePO: string | null = null;
         let eta: string | null = null;
 
@@ -301,10 +308,10 @@ export class SlackWatchdog {
             eta = poInfo?.eta || null;
         }
 
-        // Step 4: Resolve user name
+        // Step 5: Resolve user name
         const userName = await this.resolveUserName(userId);
 
-        // Step 5: Queue the detected request
+        // Step 6: Queue the detected request (Telegram digest only — NO Slack posting)
         const request: DetectedRequest = {
             channel: channelName,
             channelId,
@@ -321,6 +328,25 @@ export class SlackWatchdog {
 
         this.pendingRequests.push(request);
         console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
+    }
+
+    /**
+     * Reacts with 👀 on a Slack message using Will's user token.
+     * This is the ONLY action Aria takes in Slack — she never posts.
+     */
+    private async addEyesReaction(channelId: string, messageTs: string) {
+        try {
+            await this.client.reactions.add({
+                channel: channelId,
+                timestamp: messageTs,
+                name: "eyes",
+            });
+        } catch (err: any) {
+            // "already_reacted" is fine — just means we already saw it
+            if (!err.data?.error?.includes("already_reacted")) {
+                console.warn(`  ⚠️ Could not react: ${err.data?.error || err.message}`);
+            }
+        }
     }
 
     private async analyzeIntent(text: string): Promise<RequestExtraction> {
