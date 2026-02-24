@@ -16,6 +16,8 @@
     "@octokit/rest": "^21.0.0",
     "@pinecone-database/pinecone": "^3.0.0",
     "@ricky0123/vad-react": "^0.0.19",
+    "@slack/bolt": "^4.6.0",
+    "@slack/web-api": "^7.14.1",
     "@supabase/supabase-js": "^2.97.0",
     "@types/node-cron": "^3.0.11",
     "aftership": "^8.1.0",

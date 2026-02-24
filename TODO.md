@@ -35,3 +35,11 @@
 - [ ] Verify Supabase bucket `aria-documents` is established and correctly permissive/restrictive based on roles.
 - [ ] Sync up with Firebase/Gmail token states so the `attachment-handler.ts` isn't dropping incoming files on authentication bounces.
 - [ ] Test invoice discrepancy triggers manually edge cases.
+
+## 🦊 Slack Watchdog Agent
+- [x] Install `@slack/bolt` and setup event listeners.
+- [x] Implement `src/lib/slack/watchdog.ts` with intent analysis.
+- [x] Implement SKU/MuRP mapping logic (fuzzy matching).
+- [x] Create standalone launcher `src/cli/start-slack.ts`.
+- [ ] Implement Telegram "Bridge" to notify Will of new Slack requests.
+- [ ] Connect tracking ETAs to Slack feedback loop.
