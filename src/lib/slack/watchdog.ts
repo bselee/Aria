@@ -1,173 +1,405 @@
 /**
  * @file    watchdog.ts
- * @purpose Monitors Slack for requests, maps them to MuRP SKUs, and handles automated follow-ups.
+ * @purpose Monitors Will's Slack for product/SKU requests from individual users.
+ *          Laser-focused on detecting when someone needs something ordered.
+ *          Uses fuzzy matching (Fuse.js) against known products from PO history.
+ *          Cross-references active POs for instant ETA lookups.
+ *          Reports actionable findings to Will on Telegram.
  * @author  Antigravity / Aria
  * @created 2026-02-24
- * @deps    @slack/bolt, @slack/web-api, intelligence/llm, supabase
+ * @updated 2026-02-24
+ * @deps    @slack/web-api, fuse.js, intelligence/llm, supabase, axios
  */
 
-import { App, LogLevel } from "@slack/bolt";
+import { WebClient } from "@slack/web-api";
 import { unifiedObjectGeneration } from "../intelligence/llm";
 import { z } from "zod";
 import { createClient } from "../supabase";
+import axios from "axios";
+import Fuse from "fuse.js";
+
+// ──────────────────────────────────────────────────
+// SCHEMAS
+// ──────────────────────────────────────────────────
 
 const RequestExtractionSchema = z.object({
-    itemDescription: z.string(),
-    quantity: z.number().optional(),
-    urgency: z.enum(["low", "medium", "high"]),
-    intent: z.enum(["request", "status_check", "inquiry", "other"]),
-    category: z.string().optional(),
+    isProductRequest: z.boolean().describe("True ONLY if someone is asking for a product, material, supply, or inventory item to be ordered, restocked, or procured"),
+    itemDescription: z.string().describe("The product, material, or supply being requested — use the most specific name possible"),
+    quantity: z.number().optional().describe("How many units requested, if mentioned"),
+    urgency: z.enum(["low", "medium", "high"]).describe("low = general mention, medium = clearly needs it, high = urgent/ASAP language"),
+    confidence: z.number().min(0).max(1).describe("How confident you are this is a real product request (0.0-1.0)"),
+    requesterIntent: z.string().describe("One sentence summary of what the person actually needs"),
 });
 
 type RequestExtraction = z.infer<typeof RequestExtractionSchema>;
 
-/**
- * Aria's Slack Watchdog Agent
- */
+// Known product from PO history or catalog
+interface KnownProduct {
+    name: string;
+    sku: string;
+    vendor?: string;
+    lastOrdered?: string;
+}
+
+// A detected request ready for reporting
+interface DetectedRequest {
+    channel: string;
+    channelId: string;
+    userId: string;
+    userName: string;
+    originalText: string;
+    analysis: RequestExtraction;
+    matchedProduct: KnownProduct | null;
+    matchScore: number;
+    activePO: string | null;
+    eta: string | null;
+    timestamp: string;
+}
+
+// ──────────────────────────────────────────────────
+// WATCHDOG
+// ──────────────────────────────────────────────────
+
 export class SlackWatchdog {
-    private app: App;
+    private client: WebClient;
+    private lastChecked: Map<string, string> = new Map();
+    private channelNames: Map<string, string> = new Map();
+    private userNames: Map<string, string> = new Map(); // userId -> display name
+    private productCatalog: KnownProduct[] = [];
+    private fuse: Fuse<KnownProduct> | null = null;
+    private pendingRequests: DetectedRequest[] = []; // buffer for batch reporting
+    private pollIntervalMs: number;
 
-    constructor() {
-        this.app = new App({
-            token: process.env.SLACK_BOT_TOKEN,
-            signingSecret: process.env.SLACK_SIGNING_SECRET,
-            appToken: process.env.SLACK_APP_TOKEN,
-            socketMode: true,
-            logLevel: LogLevel.INFO,
-        });
+    constructor(pollIntervalSeconds: number = 60) {
+        const token = process.env.SLACK_ACCESS_TOKEN;
+        if (!token) throw new Error("SLACK_ACCESS_TOKEN is required");
+
+        this.client = new WebClient(token);
+        this.pollIntervalMs = pollIntervalSeconds * 1000;
     }
 
-    /**
-     * Start the Slack listener
-     */
+    // ──────────────────────────────────────────────────
+    // LIFECYCLE
+    // ──────────────────────────────────────────────────
+
     async start() {
-        console.log("🦊 Aria Slack Watchdog: Ready and watching...");
+        console.log("🦊 Aria Slack Watchdog v2: SILENT MONITOR mode");
+        console.log(`📡 Polling every ${this.pollIntervalMs / 1000}s`);
 
-        // Listen for all messages in channels the bot is in
-        this.app.message(async ({ message, say, body }) => {
-            // Only process text messages from humans
-            if (!("text" in message) || message.subtype || message.bot_id) return;
+        // 1. Build product catalog from PO history
+        await this.buildProductCatalog();
 
-            const text = message.text;
-            const userId = message.user;
+        // 2. Discover channels
+        await this.discoverChannels();
 
-            // 1. Analyze intent immediately using Aria's brain
-            const analysis = await this.analyzeIntent(text);
+        // 3. First poll — establish baseline (don't alert on old messages)
+        await this.pollAllChannels();
 
-            if (analysis.intent === "request") {
-                console.log(`📡 Request detected from ${userId}: ${analysis.itemDescription}`);
+        // 4. Start polling loop
+        setInterval(async () => {
+            try {
+                await this.pollAllChannels();
 
-                // 2. Map to SKU/Item in MuRP
-                const skuMapping = await this.mapToSKU(analysis.itemDescription);
-
-                if (skuMapping) {
-                    // 3. Check for existing POs or ETAs
-                    const etaInfo = await this.getETAInfo(skuMapping);
-
-                    // 4. Reply with intelligence
-                    await say({
-                        text: `I've logged your request for **${skuMapping.name}** (SKU: \`${skuMapping.sku}\`).\n\n` +
-                            `${etaInfo ? `🛰️ **Latest Status:** ${etaInfo}` : "I'll nudge Will and the procurement team to get this ordered immediately."}\n\n` +
-                            `_Log ID: ${Math.random().toString(36).substring(7).toUpperCase()}_`,
-                        thread_ts: (message as any).ts,
-                    });
-
-                    // 5. Nudge Will on Telegram (Bridge)
-                    this.nudgeWillTelegram(userId, skuMapping, analysis);
-                } else {
-                    await say({
-                        text: `I heard your request for "${analysis.itemDescription}", but I'm having trouble matching it to an exact SKU in MuRP. I've flagged this for Will to review.`,
-                        thread_ts: (message as any).ts,
-                    });
+                // Flush any pending requests to Telegram
+                if (this.pendingRequests.length > 0) {
+                    await this.sendDigestToTelegram();
                 }
-            } else if (analysis.intent === "status_check") {
-                // Handle status checks logic...
+            } catch (err: any) {
+                console.error("❌ Poll cycle error:", err.message);
             }
-        });
+        }, this.pollIntervalMs);
 
-        await this.app.start();
+        // 5. Refresh product catalog every 30 minutes
+        setInterval(() => this.buildProductCatalog(), 30 * 60 * 1000);
+
+        console.log("🦊 Aria Slack Watchdog: LIVE and hunting for requests.");
     }
 
     /**
-     * Extracts structured request data from natural language
+     * Returns pending requests (for Telegram /requests command)
      */
+    getRecentRequests(): DetectedRequest[] {
+        return [...this.pendingRequests];
+    }
+
+    // ──────────────────────────────────────────────────
+    // PRODUCT CATALOG (Fuzzy Matching Source)
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Builds a searchable product catalog from PO line item history.
+     * This is Aria's "memory" of what BuildASoil buys.
+     */
+    private async buildProductCatalog() {
+        const supabase = createClient();
+        if (!supabase) {
+            console.warn("⚠️ No Supabase connection — using empty catalog");
+            return;
+        }
+
+        try {
+            // Pull line items from recent POs
+            const { data: pos } = await supabase
+                .from("purchase_orders")
+                .select("line_items, vendor_name, created_at")
+                .order("created_at", { ascending: false })
+                .limit(100);
+
+            const seen = new Set<string>();
+            const products: KnownProduct[] = [];
+
+            for (const po of (pos || [])) {
+                for (const item of (po.line_items || [])) {
+                    const key = (item.sku || item.description || "").toLowerCase();
+                    if (key && !seen.has(key)) {
+                        seen.add(key);
+                        products.push({
+                            name: item.description || item.name || key,
+                            sku: item.sku || "N/A",
+                            vendor: po.vendor_name,
+                            lastOrdered: po.created_at,
+                        });
+                    }
+                }
+            }
+
+            this.productCatalog = products;
+
+            // Build Fuse.js index for fuzzy search
+            this.fuse = new Fuse(products, {
+                keys: ["name", "sku"],
+                threshold: 0.4,       // Tolerant fuzzy matching
+                includeScore: true,
+                minMatchCharLength: 3,
+            });
+
+            console.log(`📦 Product catalog loaded: ${products.length} unique items from PO history`);
+        } catch (err: any) {
+            console.warn("⚠️ Catalog build error:", err.message);
+        }
+    }
+
+    /**
+     * Fuzzy matches a description against the product catalog
+     */
+    private fuzzyMatch(description: string): { product: KnownProduct; score: number } | null {
+        if (!this.fuse) return null;
+
+        const results = this.fuse.search(description);
+        if (results.length === 0) return null;
+
+        const best = results[0];
+        return {
+            product: best.item,
+            score: 1 - (best.score || 1), // Fuse score is 0=perfect, convert to 0-1 confidence
+        };
+    }
+
+    // ──────────────────────────────────────────────────
+    // CHANNEL DISCOVERY
+    // ──────────────────────────────────────────────────
+
+    private async discoverChannels() {
+        const channelTypes = [
+            { type: "public_channel", label: "Public Channels" },
+            { type: "private_channel", label: "Private Channels" },
+            { type: "im", label: "Direct Messages" },
+        ];
+
+        for (const { type, label } of channelTypes) {
+            try {
+                const result = await this.client.conversations.list({
+                    types: type,
+                    exclude_archived: true,
+                    limit: 200,
+                });
+
+                let count = 0;
+                for (const ch of (result.channels || [])) {
+                    if (ch.is_member || ch.is_im) {
+                        this.channelNames.set(ch.id!, ch.name || ch.id || "dm");
+                        count++;
+                    }
+                }
+                console.log(`  ✅ ${label}: ${count}`);
+            } catch (err: any) {
+                console.warn(`  ⚠️ ${label}: skipped (${err.data?.error || err.message})`);
+            }
+        }
+
+        console.log(`📋 Monitoring ${this.channelNames.size} channels total`);
+    }
+
+    // ──────────────────────────────────────────────────
+    // POLLING
+    // ──────────────────────────────────────────────────
+
+    private async pollAllChannels() {
+        for (const [channelId, channelName] of this.channelNames) {
+            try {
+                await this.pollChannel(channelId, channelName);
+            } catch (err: any) {
+                if (!err.message?.includes("not_in_channel") && !err.message?.includes("channel_not_found")) {
+                    // Silently skip non-critical errors
+                }
+            }
+        }
+    }
+
+    private async pollChannel(channelId: string, channelName: string) {
+        const oldest = this.lastChecked.get(channelId);
+
+        const result = await this.client.conversations.history({
+            channel: channelId,
+            oldest: oldest || undefined,
+            limit: 20,
+        });
+
+        const messages = result.messages || [];
+        if (messages.length === 0) return;
+
+        // Update bookmark
+        const newestTs = messages[0]?.ts;
+        if (newestTs) this.lastChecked.set(channelId, newestTs);
+
+        // Skip first poll (baseline)
+        if (!oldest) return;
+
+        // Only human messages (no bots, no system)
+        const humanMessages = messages.filter(
+            (m) => m.type === "message" && !m.subtype && !m.bot_id && m.text && m.text.length > 10
+        );
+
+        for (const msg of humanMessages) {
+            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName);
+        }
+    }
+
+    // ──────────────────────────────────────────────────
+    // MESSAGE ANALYSIS
+    // ──────────────────────────────────────────────────
+
+    private async processMessage(text: string, userId: string, channelId: string, channelName: string) {
+        // Step 1: LLM intent analysis — is this a product request?
+        const analysis = await this.analyzeIntent(text);
+
+        // Only proceed if the LLM is confident this is a real product request
+        if (!analysis.isProductRequest || analysis.confidence < 0.6) return;
+
+        console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
+
+        // Step 2: Fuzzy match against product catalog
+        const match = this.fuzzyMatch(analysis.itemDescription);
+
+        // Step 3: Check for active POs if we have a match
+        let activePO: string | null = null;
+        let eta: string | null = null;
+
+        if (match) {
+            const poInfo = await this.checkActivePOs(match.product);
+            activePO = poInfo?.poNumber || null;
+            eta = poInfo?.eta || null;
+        }
+
+        // Step 4: Resolve user name
+        const userName = await this.resolveUserName(userId);
+
+        // Step 5: Queue the detected request
+        const request: DetectedRequest = {
+            channel: channelName,
+            channelId,
+            userId,
+            userName,
+            originalText: text,
+            analysis,
+            matchedProduct: match?.product || null,
+            matchScore: match?.score || 0,
+            activePO,
+            eta,
+            timestamp: new Date().toISOString(),
+        };
+
+        this.pendingRequests.push(request);
+        console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
+    }
+
     private async analyzeIntent(text: string): Promise<RequestExtraction> {
         return await unifiedObjectGeneration({
-            system: `Analyze the user's message to see if they are requesting an item, checking status on an order, or just chatting. 
-            Identify the item they need and how many if specified.`,
+            system: `You are Aria, analyzing Slack messages at BuildASoil (premium living soil & organic growing supply company).
+
+Your ONLY job: determine if the message is someone requesting a product, material, or supply that needs ordering.
+
+POSITIVE signals (mark as product request):
+- "We need more X"
+- "Can we order Y?"  
+- "Running low on Z"
+- "Are we out of [product]?"
+- "I need [X] for [project]"
+- "When is [product] coming in?"
+
+NEGATIVE signals (NOT a product request):
+- General status updates
+- Questions about processes
+- Social chat
+- Technical discussions
+- Meeting scheduling
+
+Be STRICT. Only flag messages where someone clearly needs a physical product or supply.
+Use the most specific product name possible in itemDescription.`,
             prompt: text,
             schema: RequestExtractionSchema,
-            schemaName: "SlackRequestAnalysis"
+            schemaName: "ProductRequestAnalysis",
+            temperature: 0.1, // Low temperature for consistent classification
         });
     }
 
-    /**
-     * Fuzzy maps a description to a MuRP SKU/Item
-     * DECISION: Using fuzzy match against Supabase 'products' or 'purchase_orders' line items.
-     */
-    private async mapToSKU(description: string): Promise<{ sku: string, name: string } | null> {
-        const supabase = createClient();
-        if (!supabase) return null;
+    // ──────────────────────────────────────────────────
+    // PO CROSS-REFERENCE
+    // ──────────────────────────────────────────────────
 
-        // Try matching against common product names/SKUs
-        // For now, we'll fuzzy match in JS or use Supabase FTS if available
-        // Placeholder implementation:
-        try {
-            const { data: pos } = await supabase
-                .from("purchase_orders")
-                .select("line_items")
-                .limit(50);
-
-            // Extract all unique item names from last 50 POs as a "warm" cache of what we buy
-            const items = pos?.flatMap(po => po.line_items || []) || [];
-
-            // Simple fuzzy check (can be improved with fuse.js)
-            const match = items.find((item: any) =>
-                item.description.toLowerCase().includes(description.toLowerCase()) ||
-                description.toLowerCase().includes(item.description.toLowerCase())
-            );
-
-            if (match) {
-                return { sku: match.sku || "N/A", name: match.description };
-            }
-
-            return null;
-        } catch (err) {
-            console.error("Mapping error:", err);
-            return null;
-        }
-    }
-
-    /**
-     * Cross-references tracking and PO data to find an ETA
-     */
-    private async getETAInfo(item: { sku: string, name: string }): Promise<string | null> {
+    private async checkActivePOs(product: KnownProduct): Promise<{ poNumber: string; eta: string | null } | null> {
         const supabase = createClient();
         if (!supabase) return null;
 
         try {
-            // Find the most recent open PO containing this item
+            // Find open POs
             const { data: pos } = await supabase
                 .from("purchase_orders")
-                .select("po_number, status, created_at")
+                .select("po_number, line_items, status, created_at")
                 .eq("status", "open")
-                .order("created_at", { ascending: false });
+                .order("created_at", { ascending: false })
+                .limit(20);
 
-            // In a real MuRP environment, we'd check line_items JSON column
-            // For now, let's assume we found one if the POs exist
-            if (pos && pos.length > 0) {
-                // Get shipment details for these POs
-                const { data: shipments } = await supabase
-                    .from("shipments")
-                    .select("status, estimated_delivery, tracking_number")
-                    .contains("po_numbers", [pos[0].po_number])
-                    .single();
+            if (!pos) return null;
 
-                if (shipments) {
-                    return `This appears to be part of PO #${pos[0].po_number}. Status: ${shipments.status}. ETA: ${shipments.estimated_delivery || 'Not yet updated'}. Tracking: ${shipments.tracking_number}`;
+            // Check if any open PO contains this product
+            for (const po of pos) {
+                const items = po.line_items || [];
+                const hasItem = items.some((item: any) => {
+                    const itemName = (item.description || item.name || "").toLowerCase();
+                    const itemSku = (item.sku || "").toLowerCase();
+                    const productName = product.name.toLowerCase();
+                    const productSku = product.sku.toLowerCase();
+
+                    return itemName.includes(productName) ||
+                        productName.includes(itemName) ||
+                        (productSku !== "n/a" && itemSku === productSku);
+                });
+
+                if (hasItem) {
+                    // Check for shipment tracking
+                    const { data: shipment } = await supabase
+                        .from("shipments")
+                        .select("status, estimated_delivery, tracking_number")
+                        .contains("po_numbers", [po.po_number])
+                        .single();
+
+                    const eta = shipment
+                        ? `${shipment.status} — ETA: ${shipment.estimated_delivery || "TBD"}`
+                        : "No tracking yet";
+
+                    return { poNumber: po.po_number, eta };
                 }
-
-                return `PO #${pos[0].po_number} is open, but tracking hasn't been detected yet. I'm monitoring vendor responses.`;
             }
 
             return null;
@@ -176,16 +408,80 @@ export class SlackWatchdog {
         }
     }
 
-    /**
-     * Bridges Slack requests to Will's Telegram inbox
-     */
-    private nudgeWillTelegram(slackUser: string, item: any, analysis: any) {
-        // We'll use the existing OpsManager or a direct webhook if available
-        // Placeholder: Post to the Telegram chat ID
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if (!chatId) return;
+    // ──────────────────────────────────────────────────
+    // USER RESOLUTION
+    // ──────────────────────────────────────────────────
 
-        console.log(`🚀 Nudging Will on Telegram about ${item.name}`);
-        // This will be handled by the main start-bot.ts or a shared event bus
+    private async resolveUserName(userId: string): Promise<string> {
+        if (this.userNames.has(userId)) return this.userNames.get(userId)!;
+
+        try {
+            const result = await this.client.users.info({ user: userId });
+            const name = result.user?.real_name || result.user?.name || userId;
+            this.userNames.set(userId, name);
+            return name;
+        } catch {
+            return userId;
+        }
+    }
+
+    // ──────────────────────────────────────────────────
+    // TELEGRAM REPORTING
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Sends a batched digest of all pending requests to Will on Telegram.
+     * Groups by urgency, includes PO status, and provides actionable next steps.
+     */
+    private async sendDigestToTelegram() {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return;
+
+        const requests = this.pendingRequests;
+        if (requests.length === 0) return;
+
+        // Sort by urgency (high first)
+        const urgencyOrder = { high: 0, medium: 1, low: 2 };
+        requests.sort((a, b) => urgencyOrder[a.analysis.urgency] - urgencyOrder[b.analysis.urgency]);
+
+        let message = `🦊 *Aria Slack Digest* — ${requests.length} request${requests.length > 1 ? "s" : ""} detected\n\n`;
+
+        for (const req of requests) {
+            const urgencyEmoji = req.analysis.urgency === "high" ? "🔴" :
+                req.analysis.urgency === "medium" ? "🟡" : "🟢";
+
+            const matchLine = req.matchedProduct
+                ? `✅ Matched: \`${req.matchedProduct.sku}\` — ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
+                : `⚠️ No exact SKU match — may need manual lookup`;
+
+            const poLine = req.activePO
+                ? `📋 Active PO: #${req.activePO} — ${req.eta}`
+                : `📭 No active PO found`;
+
+            message +=
+                `${urgencyEmoji} *${req.userName}* in #${req.channel}\n` +
+                `💬 _"${req.originalText.substring(0, 120)}"_\n` +
+                `📦 Wants: ${req.analysis.itemDescription}` +
+                `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
+                `${matchLine}\n` +
+                `${poLine}\n\n`;
+        }
+
+        message += `_Reply /requests for full details_`;
+
+        try {
+            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+                chat_id: chatId,
+                text: message,
+                parse_mode: "Markdown",
+            });
+            console.log(`🚀 Telegram digest sent: ${requests.length} requests`);
+
+            // Clear the buffer after sending
+            this.pendingRequests = [];
+        } catch (err: any) {
+            console.error("❌ Telegram digest failed:", err.message);
+        }
     }
 }
