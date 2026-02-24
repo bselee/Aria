@@ -22,6 +22,7 @@ import { OpsManager } from '../lib/intelligence/ops-manager';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { google } from 'googleapis';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
+import { FinaleClient } from '../lib/finale/client';
 
 // ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
@@ -43,11 +44,15 @@ const perplexity = perplexityKey ? new OpenAI({
     baseURL: 'https://api.perplexity.ai'
 }) : null;
 
+// Finale Inventory client
+const finale = new FinaleClient();
+
 console.log('🚀 ARIA BOT BOOTING...');
 console.log(`🤖 Telegram: ✅ Connected`);
 console.log(`🧠 Unified LLM: ✅ Ready (Anthropic + OpenAI Fallback)`);
 console.log(`🔍 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configured'}`);
 console.log(`🎙️ ElevenLabs: ${elevenLabsKey ? '✅ Loaded' : '❌ Not Configured'}`);
+console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not Configured'}`);
 
 // ──────────────────────────────────────────────────
 // COMMANDS
@@ -68,6 +73,38 @@ bot.command('status', (ctx) => {
         `_"Efficiency is doing things right; effectiveness is doing the right things."_`,
         { parse_mode: 'Markdown' }
     );
+});
+
+// /product <SKU> — Look up a product in Finale Inventory
+bot.command('product', async (ctx) => {
+    const sku = ctx.message.text.replace('/product', '').trim();
+
+    if (!sku) {
+        return ctx.reply(
+            `📦 *Finale Product Lookup*\n\n` +
+            `Usage: \`/product <SKU>\`\n\n` +
+            `Examples:\n` +
+            `  \`/product S-12527\`\n` +
+            `  \`/product BC101\`\n` +
+            `  \`/product PU102\`\n\n` +
+            `_Use the exact SKU from Finale._`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    ctx.sendChatAction('typing');
+
+    try {
+        const report = await finale.productReport(sku);
+        await ctx.reply(report.telegramMessage, {
+            parse_mode: 'Markdown',
+            // @ts-ignore — Telegraf types don't include disable_web_page_preview
+            disable_web_page_preview: true,
+        });
+    } catch (err: any) {
+        console.error(`Product lookup error for ${sku}:`, err.message);
+        ctx.reply(`❌ Error looking up \`${sku}\`: ${err.message}`);
+    }
 });
 
 // /voice
@@ -211,13 +248,27 @@ bot.on('text', async (ctx) => {
                             required: ["query"]
                         }
                     }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "lookup_product",
+                        description: "Look up a product in Finale Inventory by SKU. Returns stock status, lead time, supplier, cost, and reorder info. Use this when Will asks about a product, item, SKU, or inventory.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                sku: { type: "string", description: "The product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
+                            },
+                            required: ["sku"]
+                        }
+                    }
                 }
             ];
 
             const response = await openai.chat.completions.create({
                 model: "gpt-4o",
                 messages: [
-                    { role: "system", content: SYSTEM_PROMPT + "\n\nYou have access to tools. Use 'get_weather' for weather requests." },
+                    { role: "system", content: SYSTEM_PROMPT + "\n\nYou have access to tools. Use 'get_weather' for weather requests. Use 'lookup_product' when Will asks about a product, inventory item, or SKU. The sku parameter should be the Finale product ID (e.g. S-12527, BC101)." },
                     { role: "user", content: userText }
                 ],
                 tools,
@@ -248,6 +299,11 @@ bot.on('text', async (ctx) => {
                         const gmail = google.gmail({ version: "v1", auth });
                         const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
                         result = JSON.stringify(data.messages);
+                    } else if (toolCall.function.name === "lookup_product") {
+                        const report = await finale.productReport(args.sku);
+                        result = report.found
+                            ? JSON.stringify(report.product)
+                            : `Product ${args.sku} not found in Finale.`;
                     }
 
                     toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
@@ -282,8 +338,8 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// Boot
-bot.launch().then(() => {
+// Boot — dropPendingUpdates avoids conflict when restarting
+bot.launch({ dropPendingUpdates: true }).then(() => {
     console.log('✅ ARIA IS LIVE AND LISTENING');
     const ops = new OpsManager(bot);
     ops.start();

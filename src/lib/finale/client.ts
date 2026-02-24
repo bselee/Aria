@@ -1,49 +1,54 @@
 /**
  * @file    client.ts
  * @purpose Lean Finale Inventory API client for Aria.
- *          Does NOT display data. Only answers two questions:
- *          1. "Do we have this in stock?"
- *          2. "Is it already on an open PO?"
- *          Ported from MuRP's finaleBasicAuthClient.ts — same auth, same transforms.
+ *          Direct SKU lookups ONLY — no catalog loading.
+ *          Finale has 400K+ products, so we NEVER load the catalog.
+ *          Instead we use the detail endpoint (/api/product/{sku}) which
+ *          returns accurate status, lead time, and supplier info.
  * @author  Antigravity / Aria
  * @created 2026-02-24
  * @updated 2026-02-24
  * @deps    (none — uses native fetch)
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH, FINALE_BASE_URL
  *
- * DECISION(2026-02-24): The list endpoint (/api/product) returns PRODUCT_INACTIVE
- * for ALL products — this is a known Finale API quirk. The individual endpoint
- * (/api/product/{id}) returns the real status. So we use the list for name/SKU
- * matching, then hit the detail endpoint for accurate stock/status data.
+ * DECISION(2026-02-24): The list endpoint (/api/product) returns bogus status
+ * (PRODUCT_INACTIVE for everything) and there are 400K+ products. Loading the
+ * catalog is impossible and the list data is unreliable anyway. We ONLY use
+ * the individual product endpoint which returns accurate data.
+ *
+ * COST CONTROL: Each query = 1 API call. No bulk fetching, no polling.
  */
 
 // ──────────────────────────────────────────────────
-// TYPES (minimal — only what Aria needs)
+// TYPES
 // ──────────────────────────────────────────────────
-
-export interface FinaleProductSummary {
-    productId: string;    // This IS the SKU
-    name: string;
-}
 
 export interface FinaleProductDetail {
     productId: string;
     name: string;
-    statusId: string;     // "PRODUCT_ACTIVE" or "PRODUCT_INACTIVE"
-    leadTime?: number;
-    cost?: number;
-    defaultSupplier?: string;
-    // Stock data comes from the detail endpoint, not the list
+    statusId: string;         // "PRODUCT_ACTIVE" or "PRODUCT_INACTIVE"
+    leadTimeDays: number | null;
+    cost: number | null;
+    casePrice: number | null;
+    supplier: string | null;
+    category: string | null;
+    weight: string | null;
+    packing: string | null;
+    reorderGuidelines: ReorderGuideline[];
+    lastUpdated: string | null;
+    finaleUrl: string;
 }
 
-export interface StockAssessment {
+export interface ReorderGuideline {
+    facilityName: string;
+    reorderPoint: number | null;
+    reorderQuantity: number | null;
+}
+
+export interface ProductReport {
     found: boolean;
-    sku: string;
-    name: string;
-    status: string;
-    leadTimeDays: number | null;
-    supplier: string | null;
-    recommendation: string;
+    product: FinaleProductDetail | null;
+    telegramMessage: string;
 }
 
 // ──────────────────────────────────────────────────
@@ -53,17 +58,15 @@ export interface StockAssessment {
 export class FinaleClient {
     private authHeader: string;
     private baseUrl: string;
-    private catalogCache: FinaleProductSummary[] = [];
-    private cacheTimestamp: number = 0;
-    private readonly CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+    private accountPath: string;
 
     constructor() {
         const apiKey = process.env.FINALE_API_KEY || "";
         const apiSecret = process.env.FINALE_API_SECRET || "";
-        const accountPath = process.env.FINALE_ACCOUNT_PATH || "";
+        this.accountPath = process.env.FINALE_ACCOUNT_PATH || "";
         const baseUrl = process.env.FINALE_BASE_URL || "https://app.finaleinventory.com";
 
-        this.baseUrl = `${baseUrl}/${accountPath}/api`;
+        this.baseUrl = `${baseUrl}/${this.accountPath}/api`;
         this.authHeader = `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString("base64")}`;
     }
 
@@ -82,161 +85,90 @@ export class FinaleClient {
     }
 
     /**
-     * Fetch the product catalog for name/SKU matching.
-     * IMPORTANT: Do NOT trust statusId from this endpoint — it's always INACTIVE.
-     * We only use this for fuzzy matching by name and SKU.
+     * Look up a product by exact SKU/productId.
+     * This is the ONLY reliable way to get data from Finale.
+     * Returns null if product doesn't exist.
      */
-    async getCatalog(): Promise<FinaleProductSummary[]> {
-        const now = Date.now();
-        if (this.catalogCache.length > 0 && (now - this.cacheTimestamp) < this.CACHE_TTL_MS) {
-            return this.catalogCache;
-        }
-
+    async lookupProduct(sku: string): Promise<FinaleProductDetail | null> {
         try {
-            const data = await this.get("/product?limit=5000");
-            const productIds = data.productId;
-            if (!Array.isArray(productIds)) return [];
-
-            const catalog: FinaleProductSummary[] = [];
-            for (let i = 0; i < productIds.length; i++) {
-                catalog.push({
-                    productId: productIds[i],
-                    name: data.internalName?.[i] || "",
-                });
-            }
-
-            this.catalogCache = catalog;
-            this.cacheTimestamp = now;
-            console.log(`📦 Finale catalog loaded: ${catalog.length} products`);
-            return catalog;
+            const data = await this.get(`/product/${encodeURIComponent(sku.trim())}`);
+            return this.parseProductDetail(data);
         } catch (err: any) {
-            console.error("❌ Failed to fetch catalog:", err.message);
-            return this.catalogCache;
-        }
-    }
-
-    /**
-     * Get detailed info for a specific product by SKU/productId.
-     * This is the ONLY endpoint that returns accurate status and data.
-     */
-    async getProductDetail(productId: string): Promise<FinaleProductDetail | null> {
-        try {
-            const data = await this.get(`/product/${encodeURIComponent(productId)}`);
-
-            // Extract supplier from supplierList if available
-            let supplier = "";
-            if (data.supplierList?.length > 0) {
-                supplier = data.supplierList[0].partyName || data.supplierList[0].partyId || "";
-            }
-
-            return {
-                productId: data.productId,
-                name: data.internalName || data.productId,
-                statusId: data.statusId,
-                leadTime: data.leadTime || undefined,
-                cost: data.priceList?.find((p: any) => p.productPriceTypeId === "LIST_PRICE")?.price,
-                defaultSupplier: supplier,
-            };
-        } catch (err: any) {
+            // 404 = product doesn't exist, not an error
+            if (err.message.includes("404")) return null;
+            console.error(`❌ Finale lookup failed for ${sku}:`, err.message);
             return null;
         }
     }
 
     /**
-     * Search the catalog by name/SKU — returns best matching productId.
-     * Uses Fuse.js for fuzzy matching so "3 gallon pots" finds the right product.
+     * Generate a formatted Telegram report for a product.
+     * This is the main function Aria calls when you ask about a product.
      */
-    async searchProduct(query: string): Promise<string | null> {
-        const catalog = await this.getCatalog();
-        const q = query.toLowerCase().trim();
+    async productReport(sku: string): Promise<ProductReport> {
+        const product = await this.lookupProduct(sku);
 
-        // 1. Exact SKU match (case-insensitive)
-        const exactSku = catalog.find(p =>
-            p.productId.toLowerCase() === q
-        );
-        if (exactSku) return exactSku.productId;
-
-        // 2. SKU contains query or query contains SKU (min 3 chars to avoid false positives)
-        if (q.length >= 3) {
-            const skuContains = catalog.find(p =>
-                p.productId.toLowerCase().includes(q) ||
-                (p.productId.length >= 3 && q.includes(p.productId.toLowerCase()))
-            );
-            if (skuContains) return skuContains.productId;
-        }
-
-        // 3. Fuse.js fuzzy search on product names
-        const Fuse = (await import("fuse.js")).default;
-        const fuse = new Fuse(catalog, {
-            keys: ["name", "productId"],
-            threshold: 0.4,
-            includeScore: true,
-            minMatchCharLength: 3,
-        });
-
-        const results = fuse.search(q);
-        if (results.length > 0 && results[0].score! < 0.5) {
-            return results[0].item.productId;
-        }
-
-        return null;
-    }
-
-    /**
-     * THE KEY FUNCTION: Assess a product request.
-     * 1. Search catalog for the product (fuzzy match by name)
-     * 2. Fetch the REAL detail from the individual endpoint
-     * 3. Return a clear recommendation
-     */
-    async assess(query: string): Promise<StockAssessment> {
-        // Step 1: Find the product in the catalog
-        const productId = await this.searchProduct(query);
-
-        if (!productId) {
+        if (!product) {
             return {
                 found: false,
-                sku: "",
-                name: "",
-                status: "NOT_FOUND",
-                leadTimeDays: null,
-                supplier: null,
-                recommendation: `No product found matching "${query}" in Finale. Manual lookup needed.`,
+                product: null,
+                telegramMessage:
+                    `❌ *Product Not Found*\n\n` +
+                    `SKU \`${sku}\` was not found in Finale.\n\n` +
+                    `_Try the exact SKU from Finale (e.g. S-12527, BC101, PU102)_`,
             };
         }
 
-        // Step 2: Get the REAL detail (status, lead time, supplier)
-        const detail = await this.getProductDetail(productId);
+        // Build the Telegram message
+        const statusEmoji = product.statusId === "PRODUCT_ACTIVE" ? "🟢" : "🔴";
+        const statusLabel = product.statusId === "PRODUCT_ACTIVE" ? "Active" : "Inactive";
 
-        if (!detail) {
-            return {
-                found: true,
-                sku: productId,
-                name: "",
-                status: "UNKNOWN",
-                leadTimeDays: null,
-                supplier: null,
-                recommendation: `Found SKU ${productId} but couldn't fetch details. Check Finale manually.`,
-            };
+        let msg = `📦 *Product Report*\n\n`;
+        msg += `*${product.name}*\n`;
+        msg += `SKU: \`${product.productId}\`\n`;
+        msg += `${statusEmoji} Status: *${statusLabel}*\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (product.supplier) {
+            msg += `🏭 Supplier: ${product.supplier}\n`;
+        }
+        if (product.leadTimeDays !== null) {
+            msg += `⏱️ Lead Time: ${product.leadTimeDays} days\n`;
+        }
+        if (product.cost !== null) {
+            msg += `💰 Cost: $${product.cost.toFixed(2)}\n`;
+        }
+        if (product.casePrice !== null) {
+            msg += `📦 Case Price: $${product.casePrice.toFixed(2)}\n`;
+        }
+        if (product.packing) {
+            msg += `📐 Packing: ${product.packing}\n`;
+        }
+        if (product.weight) {
+            msg += `⚖️ Weight: ${product.weight}\n`;
+        }
+        if (product.category) {
+            msg += `🏷️ Category: ${product.category}\n`;
         }
 
-        // Step 3: Build recommendation
-        let recommendation: string;
-        if (detail.statusId === "PRODUCT_INACTIVE") {
-            recommendation = `⚠️ Product ${productId} is INACTIVE in Finale. May be discontinued.`;
-        } else {
-            const supplierInfo = detail.defaultSupplier ? ` from ${detail.defaultSupplier}` : "";
-            const leadInfo = detail.leadTime ? ` (lead time: ${detail.leadTime} days)` : "";
-            recommendation = `✅ Active product${supplierInfo}${leadInfo}. Check Finale for current stock.`;
+        // Reorder guidelines
+        if (product.reorderGuidelines.length > 0) {
+            msg += `\n📊 *Reorder Guidelines*\n`;
+            for (const rg of product.reorderGuidelines) {
+                const facilityName = rg.facilityName || "Default";
+                const rp = rg.reorderPoint !== null ? rg.reorderPoint : "—";
+                const rq = rg.reorderQuantity !== null ? rg.reorderQuantity : "—";
+                msg += `  ${facilityName}: Reorder @ ${rp} | Qty: ${rq}\n`;
+            }
         }
+
+        msg += `\n🔗 [View in Finale](https://app.finaleinventory.com/${this.accountPath}/app#product?productUrl=${encodeURIComponent(product.finaleUrl)})`;
+        msg += `\n_Last updated: ${product.lastUpdated || "unknown"}_`;
 
         return {
             found: true,
-            sku: detail.productId,
-            name: detail.name,
-            status: detail.statusId,
-            leadTimeDays: detail.leadTime || null,
-            supplier: detail.defaultSupplier || null,
-            recommendation,
+            product,
+            telegramMessage: msg,
         };
     }
 
@@ -262,5 +194,71 @@ export class FinaleClient {
         }
 
         return response.json();
+    }
+
+    /**
+     * Parse the raw Finale product detail response into our clean type.
+     */
+    private parseProductDetail(data: any): FinaleProductDetail {
+        // Extract primary supplier
+        let supplier: string | null = null;
+        if (data.supplierList?.length > 0) {
+            // Find the primary/first supplier with a name
+            for (const s of data.supplierList) {
+                if (s.partyName) {
+                    supplier = s.partyName;
+                    break;
+                }
+            }
+        }
+
+        // Extract cost (LIST_PRICE)
+        let cost: number | null = null;
+        let casePrice: number | null = null;
+        if (data.priceList) {
+            for (const p of data.priceList) {
+                if (p.productPriceTypeId === "LIST_PRICE" && p.price) {
+                    cost = p.price;
+                }
+                if (p.productPriceTypeId === "LIST_CASE_PRICE" && p.price) {
+                    casePrice = p.price;
+                }
+            }
+        }
+
+        // Extract reorder guidelines
+        const reorderGuidelines: ReorderGuideline[] = [];
+        if (data.reorderGuidelineList) {
+            for (const rg of data.reorderGuidelineList) {
+                reorderGuidelines.push({
+                    facilityName: rg.facilityName || rg.facilityId || "",
+                    reorderPoint: rg.reorderPoint ?? null,
+                    reorderQuantity: rg.reorderQuantity ?? null,
+                });
+            }
+        }
+
+        // Extract weight
+        let weight: string | null = null;
+        if (data.weight) {
+            const unit = data.weightUomId === "WT_lb" ? "lbs" : data.weightUomId || "";
+            weight = `${data.weight} ${unit}`.trim();
+        }
+
+        return {
+            productId: data.productId,
+            name: data.internalName || data.productId,
+            statusId: data.statusId || "UNKNOWN",
+            leadTimeDays: data.leadTime ?? null,
+            cost,
+            casePrice,
+            supplier,
+            category: data.userCategory || null,
+            weight,
+            packing: data.normalizedPackingString || null,
+            reorderGuidelines,
+            lastUpdated: data.lastUpdatedDate || null,
+            finaleUrl: data.productUrl || `/api/product/${data.productId}`,
+        };
     }
 }
