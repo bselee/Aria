@@ -19,6 +19,7 @@ import { SYSTEM_PROMPT } from "../../config/persona";
 import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
 import { runBuildRiskAnalysis } from "../builds/build-risk";
+import { APAgent } from "./ap-agent";
 
 const TRACKING_PATTERNS = {
     ups: /1Z[0-9A-Z]{16}/i,
@@ -34,6 +35,7 @@ export class OpsManager {
     private bot: Telegraf;
     private slack: WebClient | null;
     private slackChannel: string;
+    private apAgent: APAgent;
 
     constructor(bot: Telegraf) {
         this.bot = bot;
@@ -48,6 +50,9 @@ export class OpsManager {
         if (!this.slack) {
             console.warn("⚠️ OpsManager: SLACK_BOT_TOKEN not set — Slack cross-posting disabled.");
         }
+
+        // Initialize dedicated AP inbox agent
+        this.apAgent = new APAgent(bot);
     }
 
     /**
@@ -62,6 +67,11 @@ export class OpsManager {
         cron.schedule("30 7 * * 1-5", () => {
             this.sendBuildRiskReport();
         }, { timezone: "America/Denver" });
+
+        // AP Agent checks for new invoices every 15 minutes
+        cron.schedule("*/15 * * * *", () => {
+            this.apAgent.processUnreadInvoices();
+        });
 
         // Daily Summary @ 8:00 AM
         cron.schedule("0 8 * * *", () => {
@@ -350,6 +360,22 @@ export class OpsManager {
                 supabase.from("documents").select("type, status, email_from, email_subject, action_required").gte("created_at", isoDate).limit(10)
             ]);
 
+            // Grab Finale received and committed PO data independently
+            let finaleReceivedDataText = "No direct receivings data from Finale.";
+            let finaleCommittedDataText = "No direct committed PO data from Finale.";
+            try {
+                const { FinaleClient } = await import("../finale/client");
+                const finale = new FinaleClient();
+                const [receivedPOs, committedPOs] = await Promise.all([
+                    finale.getTodaysReceivedPOs(),
+                    finale.getTodaysCommittedPOs()
+                ]);
+                finaleReceivedDataText = finale.formatReceivingsDigest(receivedPOs);
+                finaleCommittedDataText = await finale.formatCommittedDigest(committedPOs);
+            } catch (err) {
+                console.warn("Could not fetch Finale PO activity for summary", err);
+            }
+
             // Attempt to grab unread actionable emails
             let unreadCount = 0;
             let unreadSubjects: string[] = [];
@@ -375,7 +401,9 @@ export class OpsManager {
             }
 
             return {
-                purchase_orders: pos.data || [],
+                purchase_orders_db: pos.data || [],
+                finale_receivings_digest: finaleReceivedDataText,
+                finale_committed_digest: finaleCommittedDataText,
                 invoices: invoices.data || [],
                 documents: documents.data || [],
                 unread_emails: {
@@ -384,17 +412,17 @@ export class OpsManager {
                 }
             };
         } catch (err) {
-            return { purchase_orders: [], invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
+            return { purchase_orders_db: [], finale_receivings_digest: "Error", finale_committed_digest: "Error", invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
         }
     }
 
     private async generateLLMSummary(title: string, data: any) {
-        const isEmpty = !data.purchase_orders.length && !data.invoices.length && !data.documents.length && data.unread_emails.count === 0;
+        const isEmpty = !data.purchase_orders_db.length && !data.invoices.length && !data.documents.length && data.unread_emails.count === 0 && data.finale_receivings_digest.includes("No direct");
         if (isEmpty) return "No operations tracked in the system for this timeframe.";
 
         const prompt = `Summarize the following operations activity for the ${title} report. 
-        Focus on total spend/amount due, vendors contacted or invoiced, highlight incoming documents that need attention, and mention the unread email count/subjects.
-        Format cleanly with markdown bullets. If a section has no data, skip it without mentioning it.
+        Focus on total spend/amount due, vendors contacted or invoiced. Mention both 'finale_receivings_digest' and 'finale_committed_digest' including anomalies found. Highlight incoming documents and mention the unread email count/subjects.
+        Format cleanly with markdown bullets. Be concise but actionable. If a section has no data, skip it without mentioning it.
         Data: ${JSON.stringify(data)}`;
 
         try {

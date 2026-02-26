@@ -242,6 +242,131 @@ export class FinaleClient {
     }
 
     /**
+     * Fetch POs committed today via GraphQL.
+     */
+    async getTodaysCommittedPOs(): Promise<ReceivedPO[]> {
+        try {
+            const now = new Date();
+            const today = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const tomorrow = new Date(now);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 100
+                            type: ["PURCHASE_ORDER"]
+                            orderDate: { begin: "${today}", end: "${tomorrowStr}" }
+                            sort: [{ field: "orderDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    orderId
+                                    orderUrl
+                                    status
+                                    orderDate
+                                    total
+                                    supplier { name }
+                                    itemList(first: 50) {
+                                        edges {
+                                            node {
+                                                product { productId }
+                                                quantity
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            if (result.errors) return [];
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            return edges
+                .filter((edge: any) => edge.node.status === "Committed")
+                .map((edge: any) => {
+                    const po = edge.node;
+                    const encodedUrl = encodeURIComponent(po.orderUrl || "");
+                    return {
+                        orderId: po.orderId,
+                        orderDate: po.orderDate || "",
+                        receiveDate: "",  // Not received yet
+                        supplier: po.supplier?.name || "Unknown",
+                        total: parseFloat(po.total) || 0,
+                        items: (po.itemList?.edges || []).map((ie: any) => ({
+                            productId: ie.node.product?.productId || "?",
+                            quantity: parseFloat(ie.node.quantity) || 0,
+                        })),
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                    };
+                });
+        } catch (err: any) {
+            console.error("Failed to fetch committed POs:", err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Format today's committed POs as a message, including basic anomaly checking.
+     */
+    async formatCommittedDigest(committedPOs: ReceivedPO[]): Promise<string> {
+        if (committedPOs.length === 0) {
+            return "📝 *No POs Committed today*";
+        }
+
+        const totalValue = committedPOs.reduce((sum, po) => sum + (po.total || 0), 0);
+        let msg = `📝 *Today's Committed POs* — ${committedPOs.length} New PO${committedPOs.length > 1 ? "s" : ""}`;
+        msg += ` · $${totalValue.toLocaleString()}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const po of committedPOs) {
+            const itemCount = po.items.reduce((s, i) => s + i.quantity, 0);
+            msg += `\n:inbox_tray: *<${po.finaleUrl}|PO ${po.orderId}>* — _${po.supplier}_\n`;
+            msg += `      ${itemCount} units total · $${po.total.toLocaleString()}\n`;
+
+            // Limit deep component checking to core items to avoid API rate limiting
+            // In a full implementation, we would check all items
+            const majorItems = po.items.filter(i => i.quantity > 50).slice(0, 3);
+            for (const item of majorItems) {
+                // Verify if this quantity covers the upcoming timeframe
+                try {
+                    const profile = await this.getComponentStockProfile(item.productId);
+                    if (profile.hasFinaleData) {
+                        const dailyDemand = (profile.demandQuantity || 0) / 90; // Approx 90 day view
+                        const incomingDaysCovered = dailyDemand > 0 ? Math.round(item.quantity / dailyDemand) : 999;
+
+                        if (incomingDaysCovered < 14) {
+                            msg += `      ⚠️ Anomaly: Order for \`${item.productId}\` (${item.quantity} qty) only covers ~${incomingDaysCovered} days demand.\n`;
+                        } else {
+                            msg += `      ✅ \`${item.productId}\` order qty covers ~${incomingDaysCovered} days.\n`;
+                        }
+                    }
+                } catch {
+                    // skip
+                }
+            }
+        }
+
+        return msg;
+    }
+
+    /**
      * Look up a product by exact SKU and resolve all enrichment data.
      * Total API calls: 1 (product) + 1 per supplier to resolve names (cached).
      */
