@@ -1,13 +1,18 @@
 import { google } from "googleapis";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { extractPDF } from "../pdf/extractor";
 import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 import { matchInvoiceToPO, MatchResult } from "../matching/invoice-po-matcher";
 import { FinaleClient } from "../finale/client";
-import { reconcileInvoiceToPO, applyReconciliation, ReconciliationResult } from "../finale/reconciler";
+import {
+    reconcileInvoiceToPO,
+    applyReconciliation,
+    ReconciliationResult,
+    storePendingApproval,
+} from "../finale/reconciler";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 
@@ -374,11 +379,11 @@ Classify carefully based on the sender, subject and text snippet.`;
     /**
      * Reconcile a parsed invoice against a Finale PO.
      * Compares line prices, fees (freight/tax/tariff/labor), and tracking.
-     * Auto-applies safe changes (≤3% variance); escalates risky ones to Slack.
+     * Auto-applies safe changes (≤3% variance); sends Telegram approval buttons for risky ones.
      *
      * DECISION(2026-02-26): Multi-layer safety guardrails per Will's requirement:
      *   - ≤3% price change → auto-approve, apply, notify
-     *   - >3% but <10x → flag for Slack approval
+     *   - >3% but <10x → Telegram bot approval (inline keyboard buttons)
      *   - >10x magnitude shift → REJECT (likely decimal error: $2.60 → $26,000)
      *   - Total PO impact >$500 → require manual approval regardless
      */
@@ -393,23 +398,44 @@ Classify carefully based on the sender, subject and text snippet.`;
 
             console.log(`   📊 Reconciliation: ${result.overallVerdict} | Impact: $${result.totalDollarImpact.toFixed(2)}`);
 
-            // Auto-apply if safe
-            if (result.autoApplicable && (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate)) {
-                const applyResult = await applyReconciliation(result, finaleClient);
+            if (result.overallVerdict === "auto_approve") {
+                // Safe to auto-apply
+                if (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate) {
+                    const applyResult = await applyReconciliation(result, finaleClient);
 
-                if (applyResult.applied.length > 0) {
-                    console.log(`   ✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${orderId}`);
-                }
-                if (applyResult.errors.length > 0) {
-                    console.error(`   ❌ ${applyResult.errors.length} error(s) applying to Finale:`, applyResult.errors);
-                }
+                    if (applyResult.applied.length > 0) {
+                        console.log(`   ✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${orderId}`);
+                    }
+                    if (applyResult.errors.length > 0) {
+                        console.error(`   ❌ ${applyResult.errors.length} error(s) applying to Finale:`, applyResult.errors);
+                    }
 
-                // Log the reconciliation result to Supabase
-                await this.logReconciliation(supabase, result, applyResult);
+                    await this.logReconciliation(supabase, result, applyResult);
+                }
+                await this.sendReconciliationNotification(result);
+
+            } else if (result.overallVerdict === "needs_approval") {
+                // Store for Telegram bot approval and send inline keyboard
+                const approvalId = storePendingApproval(result, finaleClient);
+                await this.sendApprovalRequest(result, approvalId);
+
+            } else if (result.overallVerdict === "rejected") {
+                // Magnitude error — alert but do NOT apply
+                await this.sendReconciliationNotification(result);
+
+            } else if (result.overallVerdict === "duplicate") {
+                // Already reconciled — alert Will but do NOT re-apply
+                console.log(`   🔁 Duplicate: Invoice #${result.invoiceNumber} already reconciled against PO ${orderId}`);
+                await this.sendReconciliationNotification(result);
+
+            } else {
+                // no_change — log so checkDuplicateReconciliation fires on re-processing
+                // (prevents repeated "no change" notifications if the same invoice arrives again)
+                if (result.overallVerdict === "no_change") {
+                    await this.logReconciliation(supabase, result, { applied: [], skipped: [], errors: [] });
+                }
+                await this.sendReconciliationNotification(result);
             }
-
-            // Always send the reconciliation summary to Slack/Telegram
-            await this.sendReconciliationNotification(result);
 
         } catch (err: any) {
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
@@ -451,7 +477,7 @@ Classify carefully based on the sender, subject and text snippet.`;
      * Send reconciliation summary to Slack and Telegram.
      */
     private async sendReconciliationNotification(result: ReconciliationResult): Promise<void> {
-        if (result.overallVerdict === "no_change") return; // Nothing to report
+        if (result.overallVerdict === "no_change") return;
 
         const msg = result.summary;
 
@@ -477,6 +503,41 @@ Classify carefully based on the sender, subject and text snippet.`;
             } catch (err: any) {
                 console.error("Slack reconciliation notification failed:", err.message);
             }
+        }
+    }
+
+    /**
+     * Send a Telegram message with inline Approve/Reject buttons.
+     * When Will taps a button, the bot.action handler processes the response.
+     *
+     * DECISION(2026-02-26): Using Telegram (not Slack) for approvals per Will.
+     * This keeps the approval flow in the same chat where Will already operates.
+     */
+    private async sendApprovalRequest(result: ReconciliationResult, approvalId: string): Promise<void> {
+        const msg = result.summary + "\n\n☝️ *Tap to approve or reject these changes:*";
+
+        try {
+            await this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || "",
+                msg,
+                {
+                    parse_mode: "Markdown",
+                    ...Markup.inlineKeyboard([
+                        Markup.button.callback("✅ Approve & Apply", `approve_${approvalId}`),
+                        Markup.button.callback("❌ Reject", `reject_${approvalId}`),
+                    ])
+                }
+            );
+        } catch (err: any) {
+            console.error("Telegram approval request failed:", err.message);
+            // Fallback: send without buttons
+            try {
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || "",
+                    msg + "\n\n(Buttons failed — reply /approve or /reject to this PO)",
+                    { parse_mode: "Markdown" }
+                );
+            } catch { /* swallow */ }
         }
     }
 

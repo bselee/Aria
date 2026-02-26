@@ -24,6 +24,10 @@ import { google } from 'googleapis';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
 import { FinaleClient } from '../lib/finale/client';
 import { SlackWatchdog } from '../lib/slack/watchdog';
+import {
+    approvePendingReconciliation,
+    rejectPendingReconciliation,
+} from '../lib/finale/reconciler';
 
 // ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
@@ -419,6 +423,37 @@ bot.command('requests', async (ctx) => {
         await ctx.reply(reply, { parse_mode: 'Markdown' });
     } catch (err: any) {
         await ctx.reply(`❌ Error: ${err.message}`);
+    }
+});
+
+// /correlate — Cross-inbox PO ↔ Invoice correlation and vendor intelligence
+bot.command('correlate', async (ctx) => {
+    ctx.sendChatAction('typing');
+    await ctx.reply('🔗 Running cross-inbox PO correlation...\n_Scanning bill.selee label:PO → matching with AP invoices_', { parse_mode: 'Markdown' });
+
+    try {
+        const { runCorrelationPipeline } = await import('../lib/intelligence/po-correlator');
+        const result = await runCorrelationPipeline();
+
+        // Split long messages if needed (Telegram 4096 char limit)
+        const report = result.formattedReport;
+        if (report.length > 4000) {
+            const lines = report.split('\n');
+            let chunk = '';
+            for (const line of lines) {
+                if (chunk.length + line.length > 3900) {
+                    await ctx.reply(chunk, { parse_mode: 'Markdown' });
+                    chunk = '';
+                }
+                chunk += line + '\n';
+            }
+            if (chunk.trim()) await ctx.reply(chunk, { parse_mode: 'Markdown' });
+        } else {
+            await ctx.reply(report, { parse_mode: 'Markdown' });
+        }
+    } catch (err: any) {
+        console.error('Correlation error:', err.message);
+        await ctx.reply(`❌ Correlation failed: ${err.message}`, { parse_mode: 'Markdown' });
     }
 });
 
@@ -1270,7 +1305,8 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 model: "gpt-4o",
                 messages: [
                     {
-                        role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules },
+                        role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules
+                    },
                     ...chatHistory[chatId]
                 ],
                 tools,
@@ -1425,9 +1461,9 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                         const firstTool = message.tool_calls![0].function.name;
                         const category =
                             firstTool.includes('vendor') ? 'vendor_pattern' :
-                            firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
-                            firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
-                            'conversation';
+                                firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
+                                    firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
+                                        'conversation';
                         // Extract any SKU-like tags from the user message + results
                         const tagMatches = (userText + ' ' + resultSummary).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
                         const tags = [...new Set(tagMatches)].slice(0, 5);
@@ -1475,8 +1511,46 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
     }
 
-    // DECISION(2026-02-25): bot.launch() returns a promise that resolves on
-    // SHUTDOWN, not on boot. OpsManager must start immediately — not in .then().
+    // ──────────────────────────────────────────────────
+    // RECONCILIATION APPROVAL INLINE BUTTONS
+    // ──────────────────────────────────────────────────
+    // DECISION(2026-02-26): Using Telegram bot (not Slack) for approvals per Will.
+    // When AP Agent detects a price change >3%, it sends inline keyboard buttons.
+    // These handlers capture the button taps and apply/reject changes.
+
+    bot.action(/^approve_(.+)$/, async (ctx) => {
+        const approvalId = ctx.match[1];
+        console.log(`🔑 Approval button tapped: ${approvalId}`);
+
+        await ctx.answerCbQuery('Processing approval...');
+
+        try {
+            const result = await approvePendingReconciliation(approvalId);
+            const responseMsg = result.success
+                ? `${result.message}\n\nApplied:\n${result.applied.map(a => `  ✅ ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map(e => `  ❌ ${e}`).join('\n')}` : ''}`
+                : `⚠️ ${result.message}`;
+
+            await ctx.editMessageText(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text + '\n\n' + responseMsg
+                : responseMsg);
+        } catch (err: any) {
+            await ctx.reply(`❌ Approval failed: ${err.message}`);
+        }
+    });
+
+    bot.action(/^reject_(.+)$/, async (ctx) => {
+        const approvalId = ctx.match[1];
+        console.log(`🔒 Rejection button tapped: ${approvalId}`);
+
+        await ctx.answerCbQuery('Changes rejected');
+
+        const message = await rejectPendingReconciliation(approvalId);
+
+        await ctx.editMessageText(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text + '\n\n' + message
+            : message);
+    });
+
     // Fire-and-forget the launch, then start OpsManager right away.
     bot.launch({ dropPendingUpdates: true })
         .catch((err: any) => console.error('❌ Bot launch error:', err.message));

@@ -24,11 +24,12 @@ import { FinaleClient } from "../finale/client";
 // ──────────────────────────────────────────────────
 
 const RequestExtractionSchema = z.object({
-    isProductRequest: z.boolean().describe("True ONLY if someone is asking for a product, material, supply, or inventory item to be ordered, restocked, or procured"),
+    isProductRequest: z.boolean().describe("True ONLY if someone is explicitly asking for a product to be ordered, restocked, or procured — NOT mere wishes, casual mentions, or hypothetical desires"),
+    hasExplicitAsk: z.boolean().describe("True only if the message contains an actual directive or ask (e.g. 'can we order', 'we need to get', 'please order', 'can you grab') — NOT just an expression of wanting or liking something"),
     itemDescription: z.string().describe("The product, material, or supply being requested — use the most specific name possible"),
     quantity: z.number().optional().describe("How many units requested, if mentioned"),
     urgency: z.enum(["low", "medium", "high"]).describe("low = general mention, medium = clearly needs it, high = urgent/ASAP language"),
-    confidence: z.number().min(0).max(1).describe("How confident you are this is a real product request (0.0-1.0)"),
+    confidence: z.number().min(0).max(1).describe("How confident you are this is a real, actionable product request (0.0-1.0)"),
     requesterIntent: z.string().describe("One sentence summary of what the person actually needs"),
 });
 
@@ -367,8 +368,9 @@ export class SlackWatchdog {
         // Step 1: LLM intent analysis — is this a product request?
         const analysis = await this.analyzeIntent(text);
 
-        // Only proceed if the LLM is confident this is a real product request
-        if (!analysis.isProductRequest || analysis.confidence < 0.6) return;
+        // Only proceed if the LLM is confident this is a real, actionable product request
+        // hasExplicitAsk filters out casual wishes like "I'd like X" or "it'd be nice to have X"
+        if (!analysis.isProductRequest || !analysis.hasExplicitAsk || analysis.confidence < 0.65) return;
 
         console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
 
@@ -456,25 +458,32 @@ export class SlackWatchdog {
         return await unifiedObjectGeneration({
             system: `You are Aria, analyzing Slack messages at BuildASoil (premium living soil & organic growing supply company).
 
-Your ONLY job: determine if the message is someone requesting a product, material, or supply that needs ordering.
+Your ONLY job: determine if the message is an EXPLICIT REQUEST for a product to be ordered or procured.
 
-POSITIVE signals (mark as product request):
-- "We need more X"
-- "Can we order Y?"  
-- "Running low on Z"
-- "Are we out of [product]?"
-- "I need [X] for [project]"
-- "When is [product] coming in?"
+POSITIVE — isProductRequest=true AND hasExplicitAsk=true:
+- "We need more X" / "We're out of X, can we order more?"
+- "Can we order Y?" / "Please order Z"
+- "Running low on Z — need to restock"
+- "I need [X] for [project] by [date]"
+- "Can you grab some X?"
+- Messages with a clear directive directed at a buyer/manager
 
-NEGATIVE signals (NOT a product request):
-- General status updates
-- Questions about processes
-- Social chat
-- Technical discussions
+PARTIAL — isProductRequest=true BUT hasExplicitAsk=false (do NOT alert):
+- "I'd like some X" / "It would be nice to have X" — desire, not a request
+- "X would be great" / "X would help" — wishful thinking
+- "Really I'd like X in here... but..." — trailing 'but' = they're NOT actually asking
+- "I was thinking about getting X" — hypothetical, no ask
+- Casual mention of a product in passing conversation
+
+NEGATIVE — isProductRequest=false:
+- General status updates or process questions
+- Social chat / greetings
+- Technical discussions not about ordering
 - Meeting scheduling
+- Anything without a specific product mentioned
 
-Be STRICT. Only flag messages where someone clearly needs a physical product or supply.
-Use the most specific product name possible in itemDescription.`,
+KEY RULE: If the message trails off ("but...", "though...", "maybe...") or uses hedging language without a clear ask, set hasExplicitAsk=false. A real request has someone directing action.
+Set confidence < 0.5 for anything ambiguous.`,
             prompt: text,
             schema: RequestExtractionSchema,
             schemaName: "ProductRequestAnalysis",

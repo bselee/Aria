@@ -56,7 +56,8 @@ All LLM calls go through `unifiedTextGeneration()` and `unifiedObjectGeneration(
 |------|---------|
 | `src/config/persona.ts` | Central personality/system prompt config — edit here to change Aria's tone everywhere |
 | `src/lib/intelligence/ops-manager.ts` | Cron scheduler: 7:30 AM build risk, 8:00 AM daily summary, 8:01 AM Friday weekly, AP invoice polling every 15 min |
-| `src/lib/intelligence/ap-agent.ts` | Monitors `ap@buildasoil.com` Gmail inbox, classifies emails (INVOICE/STATEMENT/ADVERTISEMENT/HUMAN_INTERACTION), parses PDFs, matches to POs |
+| `src/lib/intelligence/ap-agent.ts` | Monitors `ap@buildasoil.com` Gmail inbox, classifies emails (INVOICE/STATEMENT/ADVERTISEMENT/HUMAN_INTERACTION), parses PDFs, matches to POs, forwards invoices to `buildasoilap@bill.com`, and runs the reconciliation pipeline |
+| `src/lib/finale/reconciler.ts` | Invoice→PO reconciliation engine. Compares parsed invoice data against Finale PO, applies safety guardrails, and either auto-applies changes or queues them for Telegram approval (in-memory store, 24h TTL) |
 | `src/lib/intelligence/build-parser.ts` | LLM parses Google Calendar events to extract builds/BOMs |
 | `src/lib/builds/build-risk.ts` | Calendar BOM risk engine — queries Finale for component stock/PO status, emits CRITICAL/WARNING/WATCH/OK per component |
 | `src/lib/slack/watchdog.ts` | Polls Slack every 60s; monitors DMs + `#purchase`/`#purchase-orders` only; reacts with 👀; never posts in Slack |
@@ -68,8 +69,24 @@ All LLM calls go through `unifiedTextGeneration()` and `unifiedObjectGeneration(
 | `src/lib/supabase.ts` | Singleton Supabase client (lazy init — returns null if env vars missing) |
 | `src/lib/intelligence/pinecone.ts` | Pinecone vector store for operational context + deduplication state (index: `gravity-memory`, 1024d) |
 
+### AP Invoice Pipeline
+When an invoice arrives at `ap@buildasoil.com`, the AP agent does two independent things:
+1. **Forwards** the raw email to `buildasoilap@bill.com` immediately (bill.com handles payment)
+2. **Reconciles** against Finale: parses the PDF → matches to a Finale PO → runs `reconcileInvoiceToPO()` → auto-applies safe changes or sends a Telegram approval request
+
+Reconciliation safety thresholds (defined in `reconciler.ts`, do not change without Will's input):
+- **≤3% price change** → auto-approve and apply
+- **>3% but <10× magnitude** → flag for Telegram bot approval before applying
+- **≥10× magnitude shift** → REJECT outright (OCR/decimal error)
+- **Total PO impact >$500** → require manual approval regardless of per-line %
+
+### Finale Write Pattern
+All Finale PO mutations use **GET → Modify → POST**. If the PO status is `ORDER_LOCKED`, call `actionUrlEdit` first to unlock it, then re-fetch, modify, and POST. See `FinaleClient.addOrderAdjustment()` and `updateOrderItemPrice()`.
+
+Finale fee types map to `productpromo` IDs: FREIGHT=10007, TAX=10008, TARIFF=10014, LABOR=10016, SHIPPING=10017. These feed into landed cost automatically.
+
 ### Database Schema (Supabase)
-Key tables: `documents`, `vendors`, `invoices`, `purchase_orders`, `shipments`. See `migrations/001_documents.sql` for full schema.
+Key tables: `documents`, `vendors`, `invoices`, `purchase_orders`, `shipments`. See `supabase/migrations/` for schema. Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `tracking_numbers TEXT[]` (GIN-indexed for overlap queries).
 
 ### Slack Watchdog Behavior
 - **Eyes-only mode** — Aria NEVER posts in Slack. The only Slack action is adding a 👀 reaction using Will's user token (`SLACK_ACCESS_TOKEN`).
