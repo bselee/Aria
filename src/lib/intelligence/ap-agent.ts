@@ -132,6 +132,7 @@ Classify carefully based on the sender, subject and text snippet.`;
                             removeLabelIds: ["INBOX", "UNREAD"]
                         }
                     });
+                    await this.logActivity(supabase, from, subject, "ADVERTISEMENT", "Archived and marked read");
                     continue;
                 }
 
@@ -145,11 +146,13 @@ Classify carefully based on the sender, subject and text snippet.`;
                             removeLabelIds: ["UNREAD"]
                         }
                     });
+                    await this.logActivity(supabase, from, subject, "STATEMENT", "Labeled as Statement, marked read");
                     continue;
                 }
 
                 if (intent === "HUMAN_INTERACTION") {
                     // We just leave it unread in the inbox so the user is forced to engage.
+                    await this.logActivity(supabase, from, subject, "HUMAN_INTERACTION", "Left unread for human review");
                     continue;
                 }
 
@@ -196,9 +199,12 @@ Classify carefully based on the sender, subject and text snippet.`;
                             removeLabelIds: ["UNREAD"]
                         }
                     });
+                    const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
+                    await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, { attachments: pdfNames });
                 } else {
                     // It was classified as an Invoice but had no PDF, so leave unread for human interaction.
                     console.log(`     ⚠️ No PDF found on INVOICE. Leaving unread for human check.`);
+                    await this.logActivity(supabase, from, subject, "INVOICE", "No PDF found — left unread for human review");
                 }
             }
 
@@ -349,6 +355,124 @@ Classify carefully based on the sender, subject and text snippet.`;
                 });
             } catch (err: any) {
                 console.error("Slack post failed for AP Agent:", err.message);
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────
+    // ACTIVITY LOGGING
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Logs every AP Agent action to the ap_activity_log table.
+     * This powers the daily recap and provides an audit trail.
+     */
+    private async logActivity(
+        supabase: any,
+        emailFrom: string,
+        emailSubject: string,
+        intent: string,
+        actionTaken: string,
+        metadata?: Record<string, any>
+    ) {
+        if (!supabase) return;
+        try {
+            await supabase.from("ap_activity_log").insert({
+                email_from: emailFrom,
+                email_subject: emailSubject,
+                intent,
+                action_taken: actionTaken,
+                metadata: metadata || null
+            });
+        } catch (err: any) {
+            console.warn("⚠️ Failed to log AP activity:", err.message);
+        }
+    }
+
+    /**
+     * Sends a daily recap of all AP Agent actions to Telegram and Slack.
+     * Groups by intent category for easy scanning.
+     *
+     * DECISION(2026-02-26): This provides a monitoring layer so Will can
+     * spot-check the agent's decisions daily, especially during the early
+     * rollout period. Trust but verify.
+     */
+    async sendDailyRecap() {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        // Get today's activity (UTC day)
+        const todayStart = new Date();
+        todayStart.setUTCHours(0, 0, 0, 0);
+
+        const { data: logs, error } = await supabase
+            .from("ap_activity_log")
+            .select("*")
+            .gte("created_at", todayStart.toISOString())
+            .order("created_at", { ascending: true });
+
+        if (error) {
+            console.error("❌ Failed to fetch AP activity log:", error.message);
+            return;
+        }
+
+        if (!logs || logs.length === 0) {
+            console.log("📭 No AP activity today — skipping recap.");
+            return;
+        }
+
+        // Group by intent
+        const grouped: Record<string, typeof logs> = {};
+        for (const log of logs) {
+            if (!grouped[log.intent]) grouped[log.intent] = [];
+            grouped[log.intent].push(log);
+        }
+
+        const intentEmoji: Record<string, string> = {
+            INVOICE: "🧾",
+            STATEMENT: "📑",
+            ADVERTISEMENT: "🗑️",
+            HUMAN_INTERACTION: "👤"
+        };
+
+        let msg = `📊 *AP Agent Daily Recap* — ${logs.length} email${logs.length > 1 ? 's' : ''} processed\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        for (const [intent, items] of Object.entries(grouped)) {
+            const emoji = intentEmoji[intent] || "📧";
+            msg += `${emoji} *${intent}* (${items.length})\n`;
+            for (const item of items) {
+                const from = (item.email_from || "Unknown").replace(/<.*>/, "").trim();
+                msg += `  • ${from}: _${item.email_subject.substring(0, 60)}_\n`;
+                msg += `    → ${item.action_taken}\n`;
+            }
+            msg += `\n`;
+        }
+
+        msg += `_Review any misclassifications and let me know — I learn from your feedback._`;
+
+        // Send to Telegram
+        try {
+            await this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || "",
+                msg,
+                { parse_mode: "Markdown" }
+            );
+            console.log("📊 AP Daily Recap sent to Telegram.");
+        } catch (err: any) {
+            console.error("❌ Telegram recap failed:", err.message);
+        }
+
+        // Send to Slack
+        if (this.slack) {
+            try {
+                await this.slack.chat.postMessage({
+                    channel: this.slackChannel,
+                    text: msg.replace(/\*/g, "*"),
+                    mrkdwn: true
+                });
+            } catch (err: any) {
+                console.error("❌ Slack recap failed:", err.message);
             }
         }
     }

@@ -92,6 +92,14 @@ export class OpsManager {
         cron.schedule("*/30 * * * *", () => {
             this.syncPOConversations();
         });
+
+        // AP Agent Daily Recap @ 5:00 PM MST weekdays
+        // DECISION(2026-02-26): End-of-day recap provides a monitoring layer
+        // so Will can review all AP Agent decisions daily. Critical during
+        // early rollout to catch any misclassifications.
+        cron.schedule("0 17 * * 1-5", () => {
+            this.apAgent.sendDailyRecap();
+        }, { timezone: "America/Denver" });
     }
 
     /**

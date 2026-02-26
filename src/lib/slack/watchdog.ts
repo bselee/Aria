@@ -63,6 +63,14 @@ interface DetectedRequest {
 // WATCHDOG
 // ──────────────────────────────────────────────────
 
+// DECISION(2026-02-26): Only monitor channels where legitimate purchasing
+// requests come in. #inventory-management was too noisy with general chatter.
+// DMs are always monitored for direct requests to Will.
+const MONITORED_CHANNEL_NAMES = new Set([
+    "purchase",
+    "purchase-orders",
+]);
+
 export class SlackWatchdog {
     private client: WebClient;
     private lastChecked: Map<string, string> = new Map();
@@ -74,6 +82,7 @@ export class SlackWatchdog {
     private pollIntervalMs: number;
     private finaleClient: FinaleClient;
     private pc: Pinecone | null = null;
+    private ownerUserId: string | null = null; // Will's Slack ID — we skip his messages
 
     constructor(pollIntervalSeconds: number = 60) {
         const token = process.env.SLACK_ACCESS_TOKEN;
@@ -92,6 +101,10 @@ export class SlackWatchdog {
         if (pineconeKey) {
             this.pc = new Pinecone({ apiKey: pineconeKey });
         }
+
+        // DECISION(2026-02-26): Will's own messages should never trigger alerts.
+        // He's the one who does the ordering — alerting himself is noise.
+        this.ownerUserId = process.env.SLACK_OWNER_USER_ID || null;
     }
 
     // ──────────────────────────────────────────────────
@@ -232,18 +245,25 @@ export class SlackWatchdog {
 
                 let count = 0;
                 for (const ch of (result.channels || [])) {
-                    if (ch.is_member || ch.is_im) {
-                        this.channelNames.set(ch.id!, ch.name || ch.id || "dm");
+                    if (!ch.is_member && !ch.is_im) continue;
+
+                    const name = ch.name || ch.id || "dm";
+                    const isDM = ch.is_im === true;
+
+                    // DECISION(2026-02-26): Only register DMs and explicitly
+                    // allowlisted channels. Everything else is ignored.
+                    if (isDM || MONITORED_CHANNEL_NAMES.has(name)) {
+                        this.channelNames.set(ch.id!, name);
                         count++;
                     }
                 }
-                console.log(`  ✅ ${label}: ${count}`);
+                console.log(`  ✅ ${label}: ${count} monitored`);
             } catch (err: any) {
                 console.warn(`  ⚠️ ${label}: skipped (${err.data?.error || err.message})`);
             }
         }
 
-        console.log(`📋 Monitoring ${this.channelNames.size} channels total`);
+        console.log(`📋 Monitoring ${this.channelNames.size} channels total (allowlist: DMs + ${[...MONITORED_CHANNEL_NAMES].join(', ')})`);
     }
 
     // ──────────────────────────────────────────────────
@@ -281,9 +301,10 @@ export class SlackWatchdog {
         // Skip first poll (baseline)
         if (!oldest) return;
 
-        // Only human messages (no bots, no system)
+        // Only human messages (no bots, no system, not from Will himself)
         const humanMessages = messages.filter(
             (m) => m.type === "message" && !m.subtype && !m.bot_id && m.text && m.text.length > 10
+                && m.user !== this.ownerUserId // Skip Will's own messages
         );
 
         for (const msg of humanMessages) {
