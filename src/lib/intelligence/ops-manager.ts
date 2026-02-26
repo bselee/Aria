@@ -1,10 +1,12 @@
 /**
  * @file    ops-manager.ts
- * @purpose Handles background operations: PO tracking, email filtering, and summaries.
+ * @purpose Handles background operations: PO tracking, email filtering, summaries,
+ *          and daily Calendar BOM build risk analysis.
+ *          Cross-posts daily/weekly summaries to both Telegram and Slack #purchasing.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-02-20
- * @deps    googleapis, node-cron, telegraf
+ * @updated 2026-02-25
+ * @deps    googleapis, node-cron, telegraf, @slack/web-api, builds/build-risk
  */
 
 import { google } from "googleapis";
@@ -12,9 +14,11 @@ import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import cron from "node-cron";
 import { Telegraf } from "telegraf";
+import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
 import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
+import { runBuildRiskAnalysis } from "../builds/build-risk";
 
 const TRACKING_PATTERNS = {
     ups: /1Z[0-9A-Z]{16}/i,
@@ -28,9 +32,22 @@ const TRACKING_PATTERNS = {
  */
 export class OpsManager {
     private bot: Telegraf;
+    private slack: WebClient | null;
+    private slackChannel: string;
 
     constructor(bot: Telegraf) {
         this.bot = bot;
+
+        // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
+        // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
+        // gracefully skip Slack without blocking the Telegram message.
+        const slackToken = process.env.SLACK_BOT_TOKEN;
+        this.slack = slackToken ? new WebClient(slackToken) : null;
+        this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
+
+        if (!this.slack) {
+            console.warn("⚠️ OpsManager: SLACK_BOT_TOKEN not set — Slack cross-posting disabled.");
+        }
     }
 
     /**
@@ -38,6 +55,13 @@ export class OpsManager {
      */
     start() {
         console.log("🚀 Starting Ops Manager Scheduler...");
+
+        // DECISION(2026-02-25): Build Risk Analysis @ 7:30 AM, 30 min before
+        // the daily summary. This gives Will actionable stockout warnings
+        // first, so the daily PO summary that follows has full context.
+        cron.schedule("30 7 * * 1-5", () => {
+            this.sendBuildRiskReport();
+        }, { timezone: "America/Denver" });
 
         // Daily Summary @ 8:00 AM
         cron.schedule("0 8 * * *", () => {
@@ -192,35 +216,124 @@ export class OpsManager {
     }
 
     /**
-     * Generate and send the daily summary
+     * Posts a message to Slack #purchasing (best-effort).
+     * Failures are logged but never block the Telegram path.
+     *
+     * @param text   - Slack mrkdwn formatted message
+     * @param label  - Human label for log messages (e.g. "Daily Summary")
+     */
+    private async postToSlack(text: string, label: string): Promise<void> {
+        if (!this.slack) return;
+
+        try {
+            await this.slack.chat.postMessage({
+                channel: this.slackChannel,
+                text,
+                mrkdwn: true,
+            });
+            console.log(`✅ ${label} posted to Slack ${this.slackChannel}`);
+        } catch (err: any) {
+            // Non-fatal: Telegram message was already sent
+            console.error(`❌ Slack post failed (${label}):`, err.data?.error || err.message);
+        }
+    }
+
+    /**
+     * Generate and send the daily summary to Telegram + Slack.
      */
     async sendDailySummary() {
         console.log("📊 Preparing Daily PO Summary...");
         const poData = await this.getPOStatsForTimeframe("yesterday");
 
         const summary = await this.generateLLMSummary("Daily", poData);
+        const telegramMsg = `📊 **Morning Operations Summary**\n\n${summary}`;
 
+        // 1. Always send to Telegram first (primary channel)
         this.bot.telegram.sendMessage(
             process.env.TELEGRAM_CHAT_ID || "",
-            `📊 **Morning Operations Summary**\n\n${summary}`,
+            telegramMsg,
             { parse_mode: "Markdown" }
         );
+
+        // 2. Cross-post to Slack #purchasing
+        const slackMsg = `:chart_with_upwards_trend: *Morning Operations Summary*\n\n${summary}`;
+        await this.postToSlack(slackMsg, "Daily Summary");
     }
 
     /**
-     * Generate and send the weekly summary (Friday)
+     * Generate and send the weekly summary (Friday) to Telegram + Slack.
      */
     async sendWeeklySummary() {
         console.log("📅 Preparing Weekly PO Summary...");
         const poData = await this.getPOStatsForTimeframe("week");
 
         const summary = await this.generateLLMSummary("Weekly", poData);
+        const telegramMsg = `🗓️ **Friday Weekly Operations Review**\n\n${summary}`;
 
+        // 1. Always send to Telegram first (primary channel)
         this.bot.telegram.sendMessage(
             process.env.TELEGRAM_CHAT_ID || "",
-            `🗓️ **Friday Weekly Operations Review**\n\n${summary}`,
+            telegramMsg,
             { parse_mode: "Markdown" }
         );
+
+        // 2. Cross-post to Slack #purchasing
+        const slackMsg = `:calendar: *Friday Weekly Operations Review*\n\n${summary}`;
+        await this.postToSlack(slackMsg, "Weekly Summary");
+    }
+
+    /**
+     * Run the Calendar BOM build risk analysis and post results.
+     * Fetches production calendars → parses events → explodes BOMs → checks stock.
+     * Posts to both Telegram and Slack #purchasing.
+     *
+     * DECISION(2026-02-25): This runs at 7:30 AM weekdays, 30 min before
+     * the daily summary. Errors are caught and reported but never block
+     * the rest of the OpsManager schedule.
+     */
+    async sendBuildRiskReport() {
+        console.log("🏭 Running daily Calendar BOM Build Risk Analysis...");
+
+        try {
+            const report = await runBuildRiskAnalysis(30, (msg) => {
+                console.log(`[build-risk-cron] ${msg}`);
+            });
+
+            // 1. Send Telegram version
+            const telegramMsg = report.telegramMessage;
+            this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || "",
+                telegramMsg,
+                { parse_mode: "Markdown" }
+            );
+
+            // 2. Cross-post Slack version to #purchasing
+            await this.postToSlack(report.slackMessage, "Build Risk Report");
+
+            // 3. If critical items exist, send a follow-up with action items
+            if (report.criticalCount > 0) {
+                const urgentMsg = `🚨 *${report.criticalCount} CRITICAL stockout risk(s) detected!*\n` +
+                    `_These components will stock out within 14 days and have no incoming POs._\n` +
+                    `_Check the build risk report above for details, or run \`/buildrisk\` for the full analysis._`;
+
+                this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || "",
+                    urgentMsg,
+                    { parse_mode: "Markdown" }
+                );
+            }
+
+            console.log(`✅ Build risk report sent: 🔴 ${report.criticalCount} · 🟡 ${report.warningCount} · 👀 ${report.watchCount} · ✅ ${report.okCount}`);
+        } catch (err: any) {
+            console.error("❌ Build risk analysis failed:", err.message);
+
+            // Report the failure to Telegram so Will knows
+            this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || "",
+                `⚠️ _Daily build risk analysis failed: ${err.message}_\n_Run \`/buildrisk\` manually to troubleshoot._`,
+                { parse_mode: "Markdown" }
+            );
+        }
     }
 
     private async getPOStatsForTimeframe(timeframe: "yesterday" | "week") {

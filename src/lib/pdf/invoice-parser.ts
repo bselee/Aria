@@ -74,7 +74,7 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
             schema: InvoiceSchema,
             schemaName: "Invoice"
         });
-        return data;
+        return data as InvoiceData;
     } catch (err: any) {
         console.error("❌ parseInvoice failed even with fallback:", err.message);
         // Fallback to empty structure if everything fails
@@ -88,6 +88,6 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
             total: 0,
             amountDue: 0,
             confidence: "low"
-        } as InvoiceData;
+        } as unknown as InvoiceData;
     }
 }

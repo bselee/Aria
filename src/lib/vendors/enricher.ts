@@ -1,6 +1,7 @@
 import FirecrawlApp from "@mendable/firecrawl-js";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/lib/supabase";
+import { z } from "zod";
 
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! });
 const anthropic = new Anthropic();
@@ -48,16 +49,13 @@ export async function enrichVendorFromWeb(vendorId: string, vendorName: string) 
         const crawlResult = await firecrawl.scrapeUrl(vendorWebsite, {
             formats: ["extract"],
             extract: {
-                schema: {
-                    type: "object",
-                    properties: {
-                        paymentPortalUrl: { type: "string" },
-                        remitToAddress: { type: "string" },
-                        arEmail: { type: "string" },
-                        contactPhone: { type: "string" },
-                        paymentTerms: { type: "string" },
-                    }
-                }
+                schema: z.object({
+                    paymentPortalUrl: z.string().optional(),
+                    remitToAddress: z.string().optional(),
+                    arEmail: z.string().optional(),
+                    contactPhone: z.string().optional(),
+                    paymentTerms: z.string().optional(),
+                })
             }
         });
 
@@ -70,8 +68,8 @@ export async function enrichVendorFromWeb(vendorId: string, vendorName: string) 
                 content: `Extract vendor contact and payment information from this content for ${vendorName}.
 Return JSON: {paymentPortalUrl, remitToAddress, arEmail, contactPhone, paymentTerms, website}
 
-Content: ${JSON.stringify(crawlResult.extract ?? {}).slice(0, 3000)}
-Search results: ${searchResults.data?.slice(0, 3).map(r => r.description).join("\n")}`,
+Content: ${JSON.stringify(((crawlResult as any).data || (crawlResult as any).extract) ?? {}).slice(0, 3000)}
+Search results: ${(searchResults as any).data?.slice(0, 3).map((r: any) => r.description).join("\n")}`,
             }],
         });
 
@@ -103,17 +101,17 @@ export async function computeVendorStats(vendorId: string) {
 
     if (!invoices?.length) return;
 
-    const totalSpend = invoices.reduce((sum, inv) => sum + (inv.total ?? 0), 0);
-    const paidInvoices = invoices.filter(inv => inv.status === "paid");
+    const totalSpend = invoices.reduce((sum: number, inv: any) => sum + (inv.total ?? 0), 0);
+    const paidInvoices = invoices.filter((inv: any) => inv.status === "paid");
     const avgPaymentDays = paidInvoices.length > 0
-        ? paidInvoices.reduce((sum, inv) => {
+        ? paidInvoices.reduce((sum: number, inv: any) => {
             const invoiceDate = new Date(inv.invoice_date);
             const dueDate = new Date(inv.due_date ?? inv.invoice_date);
             return sum + ((dueDate.getTime() - invoiceDate.getTime()) / 86400000);
         }, 0) / paidInvoices.length
         : 0;
 
-    const lastOrder = invoices.sort((a, b) =>
+    const lastOrder = invoices.sort((a: any, b: any) =>
         new Date(b.invoice_date).getTime() - new Date(a.invoice_date).getTime()
     )[0]?.invoice_date;
 

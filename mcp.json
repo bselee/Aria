@@ -9,6 +9,15 @@
             "env": {
                 "FIRECRAWL_API_KEY": "fc-28c96214a19e41edb09b06dfa0ea576d"
             }
+        },
+        "elevenlabs-mcp": {
+            "command": "C:\\Users\\BuildASoil\\.local\\bin\\uvx.exe",
+            "args": [
+                "elevenlabs-mcp"
+            ],
+            "env": {
+                "ELEVENLABS_API_KEY": "sk_f23e90c201268414d5d4cca7a3051ae39a1a442418a9a94a"
+            }
         }
     }
 }

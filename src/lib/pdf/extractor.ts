@@ -4,6 +4,7 @@
  * @deps    pdf-parse, pdfjs-dist, anthropic-sdk
  */
 
+// @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
 import { unifiedTextGeneration } from "../intelligence/llm";
 
@@ -158,11 +159,68 @@ function parseTableLines(lines: string[], pageNumber: number): TableData {
     };
 }
 
+/**
+ * Split text into pages using form feed characters.
+ * Fallback: if only 1 "page" detected but pageCount > 1, 
+ * we split by pdf-lib (physical page extraction).
+ */
 function splitIntoPages(text: string, pageCount: number): PageContent[] {
     const pages = text.split("\x0C"); // Form feed = page break
-    return pages.map((pageText, i) => ({
-        pageNumber: i + 1,
-        text: pageText.trim(),
-        hasTable: pageText.split(/\s{2,}/).length > 10,
-    }));
+
+    // If form feed splitting worked, use it
+    if (pages.length >= pageCount * 0.8) {
+        return pages.map((pageText, i) => ({
+            pageNumber: i + 1,
+            text: pageText.trim(),
+            hasTable: pageText.split(/\s{2,}/).length > 10,
+        }));
+    }
+
+    // Fallback: form feeds didn't work, split text evenly by page count
+    // This is approximate but better than one giant blob
+    const avgCharsPerPage = Math.ceil(text.length / pageCount);
+    const result: PageContent[] = [];
+    for (let i = 0; i < pageCount; i++) {
+        const start = i * avgCharsPerPage;
+        const pageText = text.slice(start, start + avgCharsPerPage).trim();
+        result.push({
+            pageNumber: i + 1,
+            text: pageText,
+            hasTable: pageText.split(/\s{2,}/).length > 10,
+        });
+    }
+    return result;
 }
+
+/**
+ * Physical per-page extraction using pdf-lib + pdf-parse.
+ * Splits the PDF into individual single-page PDFs, then extracts text from each.
+ * More accurate than form-feed splitting for PDFs that don't use \x0C.
+ */
+export async function extractPerPage(buffer: Buffer): Promise<PageContent[]> {
+    const { PDFDocument } = await import('pdf-lib');
+    const sourcePdf = await PDFDocument.load(buffer);
+    const totalPages = sourcePdf.getPageCount();
+    const pages: PageContent[] = [];
+
+    for (let i = 0; i < totalPages; i++) {
+        const singlePagePdf = await PDFDocument.create();
+        const [copiedPage] = await singlePagePdf.copyPages(sourcePdf, [i]);
+        singlePagePdf.addPage(copiedPage);
+        const singlePageBuffer = Buffer.from(await singlePagePdf.save());
+
+        try {
+            const parsed = await pdfParse(singlePageBuffer, { max: 0 });
+            pages.push({
+                pageNumber: i + 1,
+                text: parsed.text.trim(),
+                hasTable: parsed.text.split(/\s{2,}/).length > 10,
+            });
+        } catch {
+            pages.push({ pageNumber: i + 1, text: '', hasTable: false });
+        }
+    }
+
+    return pages;
+}
+

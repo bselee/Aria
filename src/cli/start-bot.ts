@@ -209,6 +209,111 @@ bot.command('seed', async (ctx) => {
     }
 });
 
+// /consumption — BOM consumption report for raw material SKUs
+bot.command('consumption', async (ctx) => {
+    const args = ctx.message.text.replace(/^\/consumption\s*/, '').trim().split(/\s+/);
+    const sku = args[0];
+    const days = parseInt(args[1]) || 90;
+
+    if (!sku) {
+        return ctx.reply('Usage: `/consumption 3.0BAGCF` or `/consumption 3.0BAGCF 60`\n_Default: last 90 days_', { parse_mode: 'Markdown' });
+    }
+
+    ctx.sendChatAction('typing');
+    await ctx.reply(`👀📊 Pulling consumption data for \`${sku}\` (last ${days} days)...`, { parse_mode: 'Markdown' });
+
+    try {
+        const { FinaleClient } = await import('../lib/finale/client');
+        const finale = new FinaleClient();
+        const report = await finale.getBOMConsumption(sku, days);
+        await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        console.error('Consumption error:', err.message);
+        await ctx.reply(`❌ Failed to get consumption for \`${sku}\`: ${err.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
+// /simulate (or /build) — simulate a production build explosion
+bot.command(['simulate', 'build'], async (ctx) => {
+    const rawArgs = ctx.message.text.split(' ');
+    // Remove the command part (first element)
+    rawArgs.shift();
+
+    // We want to handle strings like `CRAFT8 15`, `CRAFT8 = 15`, `CRAFT8 x 15`
+    const argsStr = rawArgs.join(' ').replace(/=|x|X/g, ' ').trim();
+    const cleanArgs = argsStr.split(/\s+/).filter(Boolean);
+
+    const sku = cleanArgs[0];
+    const qty = parseInt(cleanArgs[1]) || 1;
+
+    if (!sku || isNaN(qty)) {
+        return ctx.reply('Usage: `/simulate CRAFT8 15` or `/build CRAFT8 = 15`', { parse_mode: 'Markdown' });
+    }
+
+    ctx.sendChatAction('typing');
+    try {
+        const { simulateBuild } = await import('../lib/builds/build-risk');
+        const report = await simulateBuild(sku, qty, (msg) => {
+            console.log(`[simulate] ${msg}`);
+        });
+        await ctx.reply(report, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        console.error('Simulation error:', err.message);
+        await ctx.reply(`❌ Simulation failed for \`${sku}\`: ${err.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
+// /buildrisk — 30-day build risk analysis (Calendar → BOM → Stock + POs)
+bot.command('buildrisk', async (ctx) => {
+    ctx.sendChatAction('typing');
+    await ctx.reply('🏭 Running 30-Day Build Risk Analysis...\n_Fetching calendars, parsing builds, exploding BOMs, checking stock + POs (now 5x parallel)..._', { parse_mode: 'Markdown' });
+
+    try {
+        const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
+        const report = await runBuildRiskAnalysis(30, (msg) => {
+            console.log(`[buildrisk] ${msg}`);
+        });
+
+        await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
+
+        // Follow-up: Ask about unrecognized SKUs
+        if (report.unrecognizedSkus.length > 0) {
+            let askMsg = `❓ *I couldn't find these SKUs in Finale:*\n\n`;
+            for (const u of report.unrecognizedSkus) {
+                askMsg += `• \`${u.sku}\` (${u.totalQty} units, needed ${u.earliestDate})\n`;
+                if (u.suggestions.length > 0) {
+                    askMsg += `  → Similar items found: ${u.suggestions.slice(0, 3).map(s => `\`${s}\``).join(', ')}\n`;
+                    askMsg += `  _Is one of these what you meant?_\n`;
+                } else {
+                    askMsg += `  _No similar SKUs found. What's the correct product name?_\n`;
+                }
+                askMsg += `\n`;
+            }
+            askMsg += `_Reply with the correct SKU mappings and I'll update the analysis._`;
+            await ctx.reply(askMsg, { parse_mode: 'Markdown' });
+        }
+
+        // Also post to Slack if configured
+        if (process.env.SLACK_BOT_TOKEN) {
+            try {
+                const { WebClient } = await import('@slack/web-api');
+                const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+                await slack.chat.postMessage({
+                    channel: '#purchasing',
+                    text: report.slackMessage,
+                    mrkdwn: true,
+                });
+                await ctx.reply('📤 _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
+            } catch (slackErr: any) {
+                console.error('Slack post error:', slackErr.message);
+            }
+        }
+    } catch (err: any) {
+        console.error('Build risk error:', err.message);
+        await ctx.reply(`❌ Build risk analysis failed: ${err.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
 // /voice
 bot.command('voice', async (ctx) => {
     if (!elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
@@ -355,10 +460,12 @@ bot.on('document', async (ctx) => {
 
     // Only process supported file types
     const SUPPORTED = ['application/pdf', 'application/x-pdf', 'image/png', 'image/jpeg',
-        'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+        'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/csv', 'text/plain', 'application/csv',
+        'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
 
     if (!SUPPORTED.some(m => mimeType.includes(m.split('/')[1]))) {
-        await ctx.reply(`📎 Got *${filename}* but I can't process \`${mimeType}\` files yet.\n_I handle: PDF, PNG, JPEG, DOC/DOCX_`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📎 Got *${filename}* but I can't process \`${mimeType}\` files yet.\n_I handle: PDF, PNG, JPEG, DOC/DOCX, CSV, TXT, XLS/XLSX_`, { parse_mode: 'Markdown' });
         return;
     }
 
@@ -377,7 +484,40 @@ bot.on('document', async (ctx) => {
         if (!response.ok) throw new Error(`Download failed: ${response.status}`);
         const buffer = Buffer.from(await response.arrayBuffer());
 
-        // Import tools
+        // ── CSV / TEXT files: skip PDF pipeline, go straight to LLM ──
+        const isTextFile = mimeType.includes('csv') || mimeType.includes('text/plain')
+            || filename.endsWith('.csv') || filename.endsWith('.txt');
+
+        if (isTextFile) {
+            const textContent = buffer.toString('utf-8');
+            const lineCount = textContent.split('\n').length;
+            const preview = textContent.slice(0, 500);
+
+            let reply = `📊 *CSV/Text File*\n`;
+            reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+            reply += `📝 Lines: ${lineCount}\n`;
+            reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+
+            ctx.sendChatAction('typing');
+            const analysis = await unifiedTextGeneration({
+                system: `You are Aria, an operations assistant for BuildASoil. The user has uploaded a CSV/text file. Analyze the data and answer their question directly. Be specific with numbers and SKUs. Format your response for Telegram (use markdown).
+
+IMPORTANT CONTEXT about BuildASoil's inventory:
+- Some items are RAW MATERIALS consumed through BOM (Bill of Materials) production builds, NOT through direct sales.
+- If an item shows 0 "Sales Velocity" or 0 consumption, it may be a BOM component (bags, labels, inputs, soil amendments).
+- True consumption for BOM components comes from build orders, not sales data.
+- If you see 0 velocity for items that clearly are consumables (bags, packaging, raw ingredients), flag this and explain that consumption comes from production builds, not sales.
+- Look for columns like "Build Usage", "BOM Consumption", "Production Usage" if available.
+- Stock levels are still accurate — they reflect current on-hand after all builds and receipts.`,
+                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total):\n${textContent.slice(0, 30000)}`
+            });
+
+            reply += analysis;
+            await ctx.reply(reply, { parse_mode: 'Markdown' });
+            return;
+        }
+
+        // ── PDF / Image / Word pipeline ──
         const { extractPDF } = await import('../lib/pdf/extractor');
         const { classifyDocument } = await import('../lib/pdf/classifier');
         const { pdfEditor } = await import('../lib/pdf/editor');
@@ -436,6 +576,15 @@ bot.on('document', async (ctx) => {
         if (isInvoiceWorkflow && extraction.pages.length >= 1) {
             ctx.sendChatAction('typing');
 
+            // Use physical per-page extraction for accurate page text
+            // (form-feed splitting often fails — this splits via pdf-lib)
+            let analysisPages = extraction.pages;
+            if (extraction.metadata.pageCount > 1 && extraction.pages.length < extraction.metadata.pageCount * 0.8) {
+                const { extractPerPage } = await import('../lib/pdf/extractor');
+                analysisPages = await extractPerPage(buffer);
+                reply += `🔬 Using per-page extraction (${analysisPages.length} pages)...\n`;
+            }
+
             // Per-page analysis
             const pageAnalysis = await unifiedTextGeneration({
                 system: `You analyze business documents page by page. For each page, determine:
@@ -445,7 +594,7 @@ bot.on('document', async (ctx) => {
 
 Return ONLY a JSON array: [{"page":1,"type":"INVOICE","invoiceNumber":"INV-123"}]
 If no invoice number found, use null for invoiceNumber.`,
-                prompt: `${extraction.pages.length} pages:\n\n${extraction.pages.map(p =>
+                prompt: `${analysisPages.length} pages:\n\n${analysisPages.map(p =>
                     `=== PAGE ${p.pageNumber} ===\n${p.text.slice(0, 800)}\n`
                 ).join('\n')}`
             });
@@ -602,8 +751,25 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 // TEXT MESSAGE HANDLER
 // ──────────────────────────────────────────────────
 
+const chatHistory: Record<string, any[]> = {};
+
 bot.on('text', async (ctx) => {
     const userText = ctx.message.text;
+    const chatId = ctx.from?.id || ctx.chat.id;
+
+    // Initialize history for this chat if it doesn't exist
+    if (!chatHistory[chatId]) {
+        chatHistory[chatId] = [];
+    }
+
+    // Add user's message to history
+    chatHistory[chatId].push({ role: "user", content: userText });
+
+    // Keep history reasonably sized (last 10 messages)
+    if (chatHistory[chatId].length > 10) {
+        chatHistory[chatId] = chatHistory[chatId].slice(-10);
+    }
+
     ctx.sendChatAction('typing');
 
     try {
@@ -656,14 +822,52 @@ bot.on('text', async (ctx) => {
                     type: "function",
                     function: {
                         name: "lookup_product",
-                        description: "Look up a product in Finale Inventory by SKU. Returns stock status, lead time, supplier, cost, and reorder info. Use this when Will asks about a product, item, SKU, or inventory.",
+                        description: "Look up a SPECIFIC product in Finale Inventory by EXACT SKU. Returns stock, lead time, supplier, cost, and reorder info. Only use this when you know the exact SKU.",
                         parameters: {
                             type: "object",
                             properties: {
-                                sku: { type: "string", description: "The product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
+                                sku: { type: "string", description: "The exact product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
                             },
                             required: ["sku"]
                         }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "search_products",
+                        description: "Search Finale Inventory for products by keyword in name or description. Use this when Will asks to find, list, or search for products by name, ingredient, vendor, or description — e.g. 'kashi skus', 'kelp products', 'find castings items'. Returns matching SKUs with stock levels.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                keyword: { type: "string", description: "Search keyword to match against product names and SKUs (e.g. 'kashi', 'kelp', 'castings', 'bag')" },
+                                limit: { type: "number", description: "Max results to return (default 20)" }
+                            },
+                            required: ["keyword"]
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "get_consumption",
+                        description: "Get BOM consumption and stock info for a specific SKU over a number of days. Use this when the user asks for consumption of a SKU, e.g., 'consumption for KM106' or '/consumption KM106'.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                sku: { type: "string", description: "The exact product SKU/ID (e.g. KM106, S-12527)" },
+                                days: { type: "number", description: "Number of days to analyze (default 90)" }
+                            },
+                            required: ["sku"]
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "build_risk_analysis",
+                        description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
+                        parameters: { type: "object", properties: {} }
                     }
                 }
             ];
@@ -671,8 +875,25 @@ bot.on('text', async (ctx) => {
             const response = await openai.chat.completions.create({
                 model: "gpt-4o",
                 messages: [
-                    { role: "system", content: SYSTEM_PROMPT + memoryContext + "\n\nYou have access to tools. Use 'get_weather' for weather requests. Use 'lookup_product' when Will asks about a product, inventory item, or SKU. The sku parameter should be the Finale product ID (e.g. S-12527, BC101)." },
-                    { role: "user", content: userText }
+                    {
+                        role: "system", content: SYSTEM_PROMPT + memoryContext + `
+
+## CRITICAL: BIAS TO ACTION
+You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
+
+### Tool selection rules:
+- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
+- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
+- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
+- Weather → use get_weather
+- Emails → use list_recent_emails
+
+### Anti-clarification rules:
+- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
+- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
+- If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
+- If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.` },
+                    ...chatHistory[chatId]
                 ],
                 tools,
                 tool_choice: "auto",
@@ -703,10 +924,20 @@ bot.on('text', async (ctx) => {
                         const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
                         result = JSON.stringify(data.messages);
                     } else if (toolCall.function.name === "lookup_product") {
-                        const report = await finale.productReport(args.sku);
-                        result = report.found
-                            ? JSON.stringify(report.product)
+                        const report = await finale.getBOMConsumption(args.sku);
+                        result = report.productId
+                            ? report.telegramMessage
                             : `Product ${args.sku} not found in Finale.`;
+                    } else if (toolCall.function.name === "search_products") {
+                        const searchResult = await finale.searchProducts(args.keyword, args.limit || 20);
+                        result = searchResult.telegramMessage;
+                    } else if (toolCall.function.name === "get_consumption") {
+                        const report = await finale.getBOMConsumption(args.sku, args.days || 90);
+                        result = report.telegramMessage;
+                    } else if (toolCall.function.name === "build_risk_analysis") {
+                        const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
+                        const report = await runBuildRiskAnalysis(30, () => { });
+                        result = report.slackMessage;
                     }
 
                     toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
@@ -716,14 +947,22 @@ bot.on('text', async (ctx) => {
                     model: "gpt-4o",
                     messages: [
                         { role: "system", content: SYSTEM_PROMPT },
-                        { role: "user", content: userText },
+                        ...chatHistory[chatId],
                         message,
                         ...toolResults
                     ]
                 });
                 reply = finalRes.choices[0].message.content || "";
+
+                // Save AI reply to history
+                chatHistory[chatId].push(message);
+                chatHistory[chatId].push(...toolResults);
+                chatHistory[chatId].push({ role: "assistant", content: reply });
             } else {
                 reply = message.content || "";
+
+                // Save AI reply to history
+                chatHistory[chatId].push({ role: "assistant", content: reply });
             }
         } else {
             // No OpenAI, just use Unified (which will try Anthropic)
@@ -751,11 +990,23 @@ bot.on('text', async (ctx) => {
         console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
     }
 
-    bot.launch({ dropPendingUpdates: true }).then(() => {
-        console.log('✅ ARIA IS LIVE AND LISTENING');
-        const ops = new OpsManager(bot);
-        ops.start();
-    });
+    // DECISION(2026-02-25): bot.launch() returns a promise that resolves on
+    // SHUTDOWN, not on boot. OpsManager must start immediately — not in .then().
+    // Fire-and-forget the launch, then start OpsManager right away.
+    bot.launch({ dropPendingUpdates: true })
+        .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+
+    console.log('✅ ARIA IS LIVE AND LISTENING');
+
+    const ops = new OpsManager(bot);
+    ops.start();
+
+    console.log('📅 Cron schedules registered:');
+    console.log('   🏭 Build Risk Report: 7:30 AM MT (Mon-Fri)');
+    console.log('   📊 Daily PO Summary:  8:00 AM MT (Daily)');
+    console.log('   🗓️  Weekly Review:     8:01 AM MT (Fridays)');
+    console.log('   📦 PO Sync:           Every 30 min');
+    console.log('   🧹 Ad Cleanup:        Every hour');
 })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

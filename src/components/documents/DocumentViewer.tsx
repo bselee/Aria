@@ -80,7 +80,7 @@ export function DocumentViewer({
             <div className="w-96 flex flex-col overflow-hidden">
                 {/* Match Status Header */}
                 <div className={`px-4 py-3 border-b border-zinc-800 flex items-center gap-2 ${canAutoApprove ? "bg-emerald-950/40" :
-                        matchResult?.matched ? "bg-amber-950/40" : "bg-zinc-900"
+                    matchResult?.matched ? "bg-amber-950/40" : "bg-zinc-900"
                     }`}>
                     {canAutoApprove ? (
                         <><CheckCircle size={16} className="text-emerald-400" />
@@ -104,8 +104,8 @@ export function DocumentViewer({
                             <h3 className="text-xs font-mono text-zinc-500 uppercase tracking-wider">Discrepancies</h3>
                             {matchResult.discrepancies.map((d, i) => (
                                 <div key={i} className={`px-3 py-2 rounded-lg border text-sm ${d.severity === "blocking" ? "border-red-800 bg-red-950/30 text-red-300" :
-                                        d.severity === "warning" ? "border-amber-800 bg-amber-950/30 text-amber-300" :
-                                            "border-zinc-700 bg-zinc-900 text-zinc-400"
+                                    d.severity === "warning" ? "border-amber-800 bg-amber-950/30 text-amber-300" :
+                                        "border-zinc-700 bg-zinc-900 text-zinc-400"
                                     }`}>
                                     <div className="font-mono">{d.field}</div>
                                     {d.delta != null && (
@@ -133,6 +133,17 @@ export function DocumentViewer({
                     </button>
                 </div>
             </div>
+        </div>
+    );
+}
+
+function ExtractedDataPanel({ data, type }: { data: Record<string, unknown>, type: string }) {
+    return (
+        <div className="space-y-2">
+            <h3 className="text-xs font-mono text-zinc-500 uppercase tracking-wider">{type} Data</h3>
+            <pre className="text-xs text-zinc-300 font-mono bg-zinc-900 p-2 rounded-lg overflow-x-auto">
+                {JSON.stringify(data, null, 2)}
+            </pre>
         </div>
     );
 }

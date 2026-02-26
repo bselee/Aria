@@ -11,8 +11,8 @@ export async function POST(req: Request) {
         const results = await github.processPRDocuments(body.pull_request.number);
         if (results.length > 0) {
             await github.commentOnPR(body.pull_request.number, results.map(r => ({
-                type: (r as Record<string, Record<string, string>>)?.classification?.type ?? "UNKNOWN",
-                summary: (r as Record<string, Record<string, string>>)?.document?.action_summary ?? "Processed",
+                type: (r as any)?.classification?.type ?? "UNKNOWN",
+                summary: (r as any)?.document?.action_summary ?? "Processed",
             })));
         }
     }

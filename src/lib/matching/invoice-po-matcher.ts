@@ -58,7 +58,7 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
 
     // Fuzzy vendor name match
     const fuse = new Fuse(vendorPOs, { keys: ["vendor_name"], threshold: 0.3 });
-    const vendorMatches = fuse.search(invoice.vendorName).map(r => r.item);
+    const vendorMatches: any[] = fuse.search(invoice.vendorName).map(r => r.item);
 
     if (!vendorMatches.length) {
         return { matched: false, confidence: "none", matchedPO: null, matchStrategy: "No POs for vendor", discrepancies: [], autoApprove: false };
@@ -66,7 +66,7 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
 
     // Among vendor matches, find by amount proximity
     const amountMatch = vendorMatches.find(
-        po => Math.abs(po.total - invoice.total) / invoice.total < 0.02  // Within 2%
+        (po: any) => Math.abs(po.total - invoice.total) / invoice.total < 0.02  // Within 2%
     );
 
     if (amountMatch) {
@@ -83,8 +83,8 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
 
     // Strategy 3: Line item matching (if amounts don't match, try SKU overlap)
     const lineItemMatch = vendorMatches.find(po => {
-        const poSkus = new Set(po.raw_data?.lineItems?.map((l: { sku: string }) => l.sku).filter(Boolean));
-        const invoiceSkus = new Set(invoice.lineItems?.map(l => l.sku).filter(Boolean));
+        const poSkus = new Set<string>(po.raw_data?.lineItems?.map((l: { sku: string }) => l.sku).filter((s: string | undefined): s is string => !!s) || []);
+        const invoiceSkus = new Set<string>(invoice.lineItems?.map(l => l.sku).filter((s: string | undefined): s is string => !!s) || []);
         const overlap = [...poSkus].filter(sku => invoiceSkus.has(sku)).length;
         return overlap >= 2;
     });

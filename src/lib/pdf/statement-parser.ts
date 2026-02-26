@@ -117,6 +117,6 @@ export async function reconcileStatement(statement: StatementData) {
     return {
         reconciliationLines,
         discrepancies,
-        totalDiscrepancyAmount: discrepancies.reduce((sum, d) => sum + Math.abs(d.discrepancy ?? 0), 0)
+        totalDiscrepancyAmount: discrepancies.reduce((sum, d) => sum + Math.abs((d as any).discrepancy ?? 0), 0)
     };
 }

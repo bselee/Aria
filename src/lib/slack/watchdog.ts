@@ -7,8 +7,8 @@
  *          Reports actionable findings to Will on Telegram.
  * @author  Antigravity / Aria
  * @created 2026-02-24
- * @updated 2026-02-24
- * @deps    @slack/web-api, fuse.js, intelligence/llm, supabase, axios
+ * @updated 2026-02-25
+ * @deps    @slack/web-api, fuse.js, intelligence/llm, supabase, axios, finale/client
  */
 
 import { WebClient } from "@slack/web-api";
@@ -17,6 +17,8 @@ import { z } from "zod";
 import { createClient } from "../supabase";
 import axios from "axios";
 import Fuse from "fuse.js";
+import { FinaleClient } from "../finale/client";
+import { Pinecone } from "@pinecone-database/pinecone";
 
 // ──────────────────────────────────────────────────
 // SCHEMAS
@@ -54,6 +56,7 @@ interface DetectedRequest {
     activePO: string | null;
     eta: string | null;
     timestamp: string;
+    finaleContext: string | null;  // Real-time stock/risk context from Finale
 }
 
 // ──────────────────────────────────────────────────
@@ -69,6 +72,8 @@ export class SlackWatchdog {
     private fuse: Fuse<KnownProduct> | null = null;
     private pendingRequests: DetectedRequest[] = []; // buffer for batch reporting
     private pollIntervalMs: number;
+    private finaleClient: FinaleClient;
+    private pc: Pinecone | null = null;
 
     constructor(pollIntervalSeconds: number = 60) {
         const token = process.env.SLACK_ACCESS_TOKEN;
@@ -76,6 +81,17 @@ export class SlackWatchdog {
 
         this.client = new WebClient(token);
         this.pollIntervalMs = pollIntervalSeconds * 1000;
+
+        // DECISION(2026-02-25): Initialize Finale client to cross-reference
+        // detected Slack requests with real-time stock data. If Finale keys
+        // are missing, we still work — just without stock context.
+        this.finaleClient = new FinaleClient();
+
+        // Initialize Pinecone for State Management to avoid duplicate alerts
+        const pineconeKey = process.env.PINECONE_API_KEY;
+        if (pineconeKey) {
+            this.pc = new Pinecone({ apiKey: pineconeKey });
+        }
     }
 
     // ──────────────────────────────────────────────────
@@ -271,7 +287,7 @@ export class SlackWatchdog {
         );
 
         for (const msg of humanMessages) {
-            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName, msg.ts!);
+            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName, msg.ts!, msg.thread_ts);
         }
     }
 
@@ -281,7 +297,7 @@ export class SlackWatchdog {
     // The only Slack action is adding a 👀 reaction from Will's account.
     // ──────────────────────────────────────────────────
 
-    private async processMessage(text: string, userId: string, channelId: string, channelName: string, messageTs: string) {
+    private async processMessage(text: string, userId: string, channelId: string, channelName: string, messageTs: string, threadTs?: string) {
         // Step 1: LLM intent analysis — is this a product request?
         const analysis = await this.analyzeIntent(text);
 
@@ -311,7 +327,30 @@ export class SlackWatchdog {
         // Step 5: Resolve user name
         const userName = await this.resolveUserName(userId);
 
-        // Step 6: Queue the detected request (Telegram digest only — NO Slack posting)
+        // Step 6: Query Finale for real-time stock context on matched product
+        let finaleContext: string | null = null;
+        if (match && match.product.sku !== 'N/A') {
+            finaleContext = await this.getFinaleStockContext(match.product.sku);
+        }
+
+        // Step 6b: State Management with Pinecone to prevent repeat alerts
+        let pineconeStateId: string | null = null;
+        const uniqueThreadContext = threadTs || messageTs;
+        if (this.pc && match && match.product.sku !== 'N/A') {
+            try {
+                const stateIndex = this.pc.index(process.env.PINECONE_INDEX || 'gravity-memory');
+                pineconeStateId = `req_${channelId}_${uniqueThreadContext}_${match.product.sku}`;
+                const existing = await stateIndex.fetch([pineconeStateId]);
+                if (existing && existing.records && existing.records[pineconeStateId]) {
+                    console.log(`  💤 Skipping repeated request (already handled): ${pineconeStateId}`);
+                    return; // Silently ignore as we already notified Will about this request in this thread
+                }
+            } catch (err: any) {
+                console.warn("⚠️ Pinecone state check error:", err.message);
+            }
+        }
+
+        // Step 7: Queue the detected request (Telegram digest only — NO Slack posting)
         const request: DetectedRequest = {
             channel: channelName,
             channelId,
@@ -324,10 +363,32 @@ export class SlackWatchdog {
             activePO,
             eta,
             timestamp: new Date().toISOString(),
+            finaleContext,
         };
 
         this.pendingRequests.push(request);
         console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
+
+        // Step 8: Upsert to Pinecone State Memory to avoid duplicate alerts
+        if (this.pc && pineconeStateId) {
+            try {
+                const stateIndex = this.pc.index(process.env.PINECONE_INDEX || 'gravity-memory');
+                const vector = new Array(1024).fill(0.0001); // Safe dummy vector for gravity-memory (1024d)
+                await stateIndex.upsert([{
+                    id: pineconeStateId,
+                    values: vector,
+                    metadata: {
+                        text,
+                        channelId,
+                        threadTs: uniqueThreadContext,
+                        sku: match!.product.sku,
+                        processedAt: new Date().toISOString()
+                    }
+                }]);
+            } catch (err: any) {
+                console.warn("⚠️ Pinecone state upsert error:", err.message);
+            }
+        }
     }
 
     /**
@@ -435,6 +496,45 @@ Use the most specific product name possible in itemDescription.`,
     }
 
     // ──────────────────────────────────────────────────
+    // FINALE STOCK CONTEXT
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Query Finale for a concise stock summary of a matched product.
+     * Returns a one-liner like: "Stock: 450 on hand · Stockout in 23d · 1 PO incoming"
+     * Returns null if Finale data is unavailable or the SKU isn't tracked.
+     */
+    private async getFinaleStockContext(sku: string): Promise<string | null> {
+        try {
+            // Using getBOMConsumption to pull exact velocity, stockout, and on-hand
+            const report = await this.finaleClient.getBOMConsumption(sku, 30);
+            if (!report || report.currentStock === null) return null;
+
+            const parts: string[] = [];
+
+            parts.push(`Stock: ${report.currentStock.toLocaleString()}`);
+
+            if (report.dailyRate > 0) {
+                parts.push(`Velocity: ~${report.dailyRate.toFixed(1)}/day`);
+            }
+
+            if (report.estimatedDaysLeft !== null) {
+                if (report.estimatedDaysLeft <= 14) {
+                    parts.push(`\u26a0\ufe0f Stockout in ${report.estimatedDaysLeft}d!`);
+                } else if (report.estimatedDaysLeft <= 30) {
+                    parts.push(`Stockout in ${report.estimatedDaysLeft}d`);
+                } else {
+                    parts.push(`${report.estimatedDaysLeft}d runway`);
+                }
+            }
+
+            return parts.length > 0 ? parts.join(' · ') : null;
+        } catch {
+            return null;
+        }
+    }
+
+    // ──────────────────────────────────────────────────
     // USER RESOLUTION
     // ──────────────────────────────────────────────────
 
@@ -491,7 +591,14 @@ Use the most specific product name possible in itemDescription.`,
                 `📦 Wants: ${req.analysis.itemDescription}` +
                 `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
                 `${matchLine}\n` +
-                `${poLine}\n\n`;
+                `${poLine}\n`;
+
+            // Add Finale stock context if available
+            if (req.finaleContext) {
+                message += `📈 ${req.finaleContext}\n`;
+            }
+
+            message += `\n`;
         }
 
         message += `_Reply /requests for full details_`;

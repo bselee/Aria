@@ -42,10 +42,10 @@ export const PurchaseOrderSchema = z.object({
 export type POData = z.infer<typeof PurchaseOrderSchema>;
 
 export async function parsePurchaseOrder(rawText: string): Promise<POData> {
-    return await unifiedObjectGeneration({
+    return (await unifiedObjectGeneration({
         system: `Extract purchase order data. Be precise with line item quantities and prices. Include all line items even if they span multiple pages.`,
         prompt: rawText.slice(0, 8000),
         schema: PurchaseOrderSchema,
         schemaName: "PurchaseOrder"
-    });
+    })) as POData;
 }

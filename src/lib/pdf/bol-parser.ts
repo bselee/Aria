@@ -43,10 +43,11 @@ const BOL_SYSTEM_PROMPT = `Extract all Bill of Lading data. Pay attention to:
 `;
 
 export async function parseBOL(rawText: string): Promise<BillOfLadingData> {
-    return await unifiedObjectGeneration({
+    const data = await unifiedObjectGeneration({
         system: BOL_SYSTEM_PROMPT,
         prompt: rawText.slice(0, 6000),
         schema: BOLSchema,
         schemaName: "BillOfLading"
     });
+    return data as BillOfLadingData;
 }

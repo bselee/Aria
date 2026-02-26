@@ -41,5 +41,14 @@
 - [x] Implement `src/lib/slack/watchdog.ts` with intent analysis.
 - [x] Implement SKU/MuRP mapping logic (fuzzy matching).
 - [x] Create standalone launcher `src/cli/start-slack.ts`.
-- [ ] Implement Telegram "Bridge" to notify Will of new Slack requests.
+- [x] Implement Telegram "Bridge" to notify Will of new Slack requests.
+- [x] Cross-reference Slack requests with Finale stock data (real-time context).
 - [ ] Connect tracking ETAs to Slack feedback loop.
+
+## 🏭 Calendar BOM Build Risk
+- [x] Google Calendar integration (`src/lib/google/calendar.ts`).
+- [x] LLM build parser (`src/lib/intelligence/build-parser.ts`).
+- [x] Build risk engine (`src/lib/builds/build-risk.ts`).
+- [x] `/buildrisk` command in Telegram bot.
+- [x] Daily 7:30 AM cron in OpsManager (Telegram + Slack #purchasing).
+- [x] Refined product search with fuzzy matching + enriched results.
