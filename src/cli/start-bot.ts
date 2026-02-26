@@ -314,6 +314,32 @@ bot.command('buildrisk', async (ctx) => {
     }
 });
 
+// /requests — Show recent Slack product requests detected by the watchdog
+bot.command('requests', async (ctx) => {
+    ctx.sendChatAction('typing');
+
+    try {
+        // The OpsManager doesn't expose the watchdog directly to the bot,
+        // so we import and format the data ourselves from the Slack module
+        const { createClient } = await import('../lib/supabase');
+        const supabase = createClient();
+
+        // No formal command yet — just tell Will what we know
+        // For now, this is a placeholder until Slack watchdog state is shared
+        await ctx.reply(
+            `🦊 *Slack Request Tracker*\n\n` +
+            `The watchdog monitors *#purchase* and *#purchase-orders* for product requests.\n\n` +
+            `Recent requests are sent as digests directly to this chat.\n` +
+            `Look for 🦊 *Aria Slack Digest* messages above.\n\n` +
+            `_Channels monitored: DMs, #purchase, #purchase-orders_\n` +
+            `_Your own messages are now filtered out._`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (err: any) {
+        await ctx.reply(`❌ Error: ${err.message}`);
+    }
+});
+
 // /voice
 bot.command('voice', async (ctx) => {
     if (!elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
