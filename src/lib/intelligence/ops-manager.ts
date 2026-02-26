@@ -243,9 +243,9 @@ export class OpsManager {
      */
     async sendDailySummary() {
         console.log("📊 Preparing Daily PO Summary...");
-        const poData = await this.getPOStatsForTimeframe("yesterday");
+        const opsData = await this.getOperationsStatsForTimeframe("yesterday");
 
-        const summary = await this.generateLLMSummary("Daily", poData);
+        const summary = await this.generateLLMSummary("Daily", opsData);
         const telegramMsg = `📊 **Morning Operations Summary**\n\n${summary}`;
 
         // 1. Always send to Telegram first (primary channel)
@@ -265,9 +265,9 @@ export class OpsManager {
      */
     async sendWeeklySummary() {
         console.log("📅 Preparing Weekly PO Summary...");
-        const poData = await this.getPOStatsForTimeframe("week");
+        const opsData = await this.getOperationsStatsForTimeframe("week");
 
-        const summary = await this.generateLLMSummary("Weekly", poData);
+        const summary = await this.generateLLMSummary("Weekly", opsData);
         const telegramMsg = `🗓️ **Friday Weekly Operations Review**\n\n${summary}`;
 
         // 1. Always send to Telegram first (primary channel)
@@ -336,30 +336,66 @@ export class OpsManager {
         }
     }
 
-    private async getPOStatsForTimeframe(timeframe: "yesterday" | "week") {
+    private async getOperationsStatsForTimeframe(timeframe: "yesterday" | "week") {
         const supabase = createClient();
         const date = new Date();
         if (timeframe === "yesterday") date.setDate(date.getDate() - 1);
         else date.setDate(date.getDate() - 7);
+        const isoDate = date.toISOString().split("T")[0];
 
         try {
-            const { data: pos } = await supabase
-                .from("purchase_orders")
-                .select("*")
-                .gte("issue_date", date.toISOString().split("T")[0]);
+            const [pos, invoices, documents] = await Promise.all([
+                supabase.from("purchase_orders").select("po_number, vendor_name, total, status").gte("created_at", isoDate).limit(10),
+                supabase.from("invoices").select("invoice_number, vendor_name, amount_due, status").gte("created_at", isoDate).limit(10),
+                supabase.from("documents").select("type, status, email_from, email_subject, action_required").gte("created_at", isoDate).limit(10)
+            ]);
 
-            return pos || [];
+            // Attempt to grab unread actionable emails
+            let unreadCount = 0;
+            let unreadSubjects: string[] = [];
+            try {
+                const auth = await getAuthenticatedClient("default");
+                const gmail = google.gmail({ version: "v1", auth });
+                const { data } = await gmail.users.messages.list({
+                    userId: "me",
+                    q: "is:unread -label:Advertisements -label:SPAM INBOX",
+                    maxResults: 5
+                });
+                unreadCount = data.resultSizeEstimate || (data.messages ? data.messages.length : 0);
+
+                if (data.messages && data.messages.length > 0) {
+                    for (const m of data.messages) {
+                        const msg = await gmail.users.messages.get({ userId: "me", id: m.id! });
+                        const subject = msg.data.payload?.headers?.find(h => h.name === 'Subject')?.value || "No Subject";
+                        unreadSubjects.push(subject);
+                    }
+                }
+            } catch (gmailErr) {
+                console.warn("Could not fetch unread emails for summary:", gmailErr);
+            }
+
+            return {
+                purchase_orders: pos.data || [],
+                invoices: invoices.data || [],
+                documents: documents.data || [],
+                unread_emails: {
+                    count: unreadCount,
+                    subjects: unreadSubjects
+                }
+            };
         } catch (err) {
-            return [];
+            return { purchase_orders: [], invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
         }
     }
 
-    private async generateLLMSummary(title: string, data: any[]) {
-        if (!data.length) return "No POs processed in this timeframe.";
+    private async generateLLMSummary(title: string, data: any) {
+        const isEmpty = !data.purchase_orders.length && !data.invoices.length && !data.documents.length && data.unread_emails.count === 0;
+        if (isEmpty) return "No operations tracked in the system for this timeframe.";
 
-        const prompt = `Summarize the following PO activity for the ${title} report. 
-        Focus on total spend, vendors contacted, and highlight any slow vendor responses.
-        Data: ${JSON.stringify(data.slice(0, 10))}`;
+        const prompt = `Summarize the following operations activity for the ${title} report. 
+        Focus on total spend/amount due, vendors contacted or invoiced, highlight incoming documents that need attention, and mention the unread email count/subjects.
+        Format cleanly with markdown bullets. If a section has no data, skip it without mentioning it.
+        Data: ${JSON.stringify(data)}`;
 
         try {
             return await unifiedTextGeneration({
