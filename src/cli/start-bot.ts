@@ -23,6 +23,7 @@ import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { google } from 'googleapis';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
 import { FinaleClient } from '../lib/finale/client';
+import { SlackWatchdog } from '../lib/slack/watchdog';
 
 // ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
@@ -54,6 +55,10 @@ console.log(`🔍 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configur
 console.log(`🎙️ ElevenLabs: ${elevenLabsKey ? '✅ Loaded' : '❌ Not Configured'}`);
 console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not Configured'}`);
 
+// DECISION(2026-02-26): Run the Slack watchdog inside the bot process so
+// /requests can read live pending requests. Eliminates need for IPC/shared DB.
+let globalWatchdog: SlackWatchdog | null = null;
+
 // ──────────────────────────────────────────────────
 // COMMANDS
 // ──────────────────────────────────────────────────
@@ -63,16 +68,76 @@ bot.start((ctx) => {
     ctx.reply(TELEGRAM_CONFIG.welcomeMessage(username), { parse_mode: 'Markdown' });
 });
 
-bot.command('status', (ctx) => {
+const BOT_START_TIME = new Date();
+
+bot.command('status', async (ctx) => {
+    const chatId = ctx.from?.id || ctx.chat.id;
+    const uptimeMs = Date.now() - BOT_START_TIME.getTime();
+    const uptimeMin = Math.floor(uptimeMs / 60000);
+    const uptimeHrs = Math.floor(uptimeMin / 60);
+    const uptimeStr = uptimeHrs > 0
+        ? `${uptimeHrs}h ${uptimeMin % 60}m`
+        : `${uptimeMin}m`;
+
+    const historyLen = chatHistory[chatId]?.length || 0;
+
+    // Check Supabase connectivity
+    let dbStatus = '❓ Not checked';
+    try {
+        const { createClient } = await import('../lib/supabase');
+        const db = createClient();
+        if (!db) {
+            dbStatus = '❌ Not configured';
+        } else {
+            const { error } = await db.from('vendors').select('id').limit(1);
+            dbStatus = error ? `❌ ${error.message}` : '✅ Connected';
+        }
+    } catch (e: any) {
+        dbStatus = `❌ ${e.message}`;
+    }
+
+    // Check memory/Pinecone
+    let memStatus = '❓ Not checked';
+    try {
+        const { recall } = await import('../lib/intelligence/memory');
+        const mems = await recall('vendor', { topK: 1 });
+        memStatus = mems.length > 0 ? `✅ ${mems.length} result(s) (seeded)` : '⚠️ No memories (run /seed)';
+    } catch (e: any) {
+        memStatus = `❌ ${e.message}`;
+    }
+
+    const recentHistory = (chatHistory[chatId] || [])
+        .slice(-4)
+        .map((m: any) => `  ${m.role === 'user' ? '👤' : '🤖'} ${String(m.content).slice(0, 60).replace(/\n/g, ' ')}...`)
+        .join('\n') || '  (empty)';
+
     ctx.reply(
-        `🛰️ **Aria Internal Diagnostics**\n\n` +
-        `Status: Operational\n` +
-        `Telegram: ✅ Online\n` +
-        `Intelligence: ✅ Unified (Sonnet 3.5 + GPT-4o)\n` +
-        `Voice: ${elevenLabsKey ? '✅ Loaded' : '❌ Missing'}\n\n` +
-        `_"Efficiency is doing things right; effectiveness is doing the right things."_`,
+        `🛰️ *Aria Runtime Status*\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `⏱️ Uptime: \`${uptimeStr}\`\n` +
+        `🚀 Started: \`${BOT_START_TIME.toLocaleTimeString('en-US', { timeZone: 'America/Denver' })} MT\`\n\n` +
+        `*Integrations:*\n` +
+        `🤖 OpenAI: ${openai ? '✅ GPT-4o' : '❌ Not configured'}\n` +
+        `🗄️ Supabase: ${dbStatus}\n` +
+        `🧠 Memory (Pinecone): ${memStatus}\n` +
+        `📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not configured'}\n` +
+        `🔍 Perplexity: ${perplexityKey ? '✅ Ready' : '❌ Not configured'}\n` +
+        `🦊 Slack Watchdog: ${globalWatchdog ? '✅ Running' : '❌ Not started'}\n` +
+        `🎙️ Voice: ${elevenLabsKey ? '✅ ElevenLabs' : '❌ Not configured'}\n\n` +
+        `*Conversation:*\n` +
+        `💬 History: \`${historyLen} messages\` in context\n` +
+        `${recentHistory}\n\n` +
+        `_/clear to reset conversation context_`,
         { parse_mode: 'Markdown' }
     );
+});
+
+// /clear — reset conversation history for this chat
+bot.command('clear', (ctx) => {
+    const chatId = ctx.from?.id || ctx.chat.id;
+    const count = chatHistory[chatId]?.length || 0;
+    chatHistory[chatId] = [];
+    ctx.reply(`🗑️ Cleared ${count} messages from context. Fresh start.`, { parse_mode: 'Markdown' });
 });
 
 // /product <SKU> — Look up a product in Finale Inventory
@@ -319,22 +384,39 @@ bot.command('requests', async (ctx) => {
     ctx.sendChatAction('typing');
 
     try {
-        // The OpsManager doesn't expose the watchdog directly to the bot,
-        // so we import and format the data ourselves from the Slack module
-        const { createClient } = await import('../lib/supabase');
-        const supabase = createClient();
+        // Try to pull recent requests from the shared watchdog instance
+        const pending = globalWatchdog?.getRecentRequests() || [];
 
-        // No formal command yet — just tell Will what we know
-        // For now, this is a placeholder until Slack watchdog state is shared
-        await ctx.reply(
-            `🦊 *Slack Request Tracker*\n\n` +
-            `The watchdog monitors *#purchase* and *#purchase-orders* for product requests.\n\n` +
-            `Recent requests are sent as digests directly to this chat.\n` +
-            `Look for 🦊 *Aria Slack Digest* messages above.\n\n` +
-            `_Channels monitored: DMs, #purchase, #purchase-orders_\n` +
-            `_Your own messages are now filtered out._`,
-            { parse_mode: 'Markdown' }
-        );
+        if (pending.length === 0) {
+            await ctx.reply(
+                `🦊 *Slack Request Tracker*\n\n` +
+                `✅ No pending product requests right now.\n\n` +
+                `Monitoring: *#purchasing*, *#purchase-orders*, DMs\n` +
+                `Thread replies: ✅ Included\n` +
+                `_New requests appear as 🦊 Aria Slack Digest messages._`,
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        let reply = `🦊 *Slack Request Tracker* — ${pending.length} pending\n\n`;
+        for (const req of pending) {
+            const urgencyEmoji = req.analysis.urgency === 'high' ? '🔴' :
+                req.analysis.urgency === 'medium' ? '🟡' : '🟢';
+            reply += `${urgencyEmoji} *${req.userName}* in #${req.channel}\n`;
+            reply += `  📦 ${req.analysis.itemDescription}`;
+            if (req.analysis.quantity) reply += ` (×${req.analysis.quantity})`;
+            reply += `\n`;
+            if (req.matchedProduct) {
+                reply += `  ✅ SKU: \`${req.matchedProduct.sku}\`\n`;
+            }
+            if (req.activePO) {
+                reply += `  📋 PO: #${req.activePO} — ${req.eta}\n`;
+            }
+            reply += `\n`;
+        }
+        reply += `_Channels: #purchasing, #purchase-orders, DMs + thread replies_`;
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
     } catch (err: any) {
         await ctx.reply(`❌ Error: ${err.message}`);
     }
@@ -474,6 +556,12 @@ async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer
 }
 
 // ──────────────────────────────────────────────────
+// CONVERSATION HISTORY (shared across text + document handlers)
+// ──────────────────────────────────────────────────
+
+const chatHistory: Record<string, any[]> = {};
+
+// ──────────────────────────────────────────────────
 // DOCUMENT/FILE HANDLER — PDFs, images, Word docs
 // Memory-aware: checks Pinecone for vendor patterns
 // ──────────────────────────────────────────────────
@@ -514,32 +602,176 @@ bot.on('document', async (ctx) => {
         const isTextFile = mimeType.includes('csv') || mimeType.includes('text/plain')
             || filename.endsWith('.csv') || filename.endsWith('.txt');
 
-        if (isTextFile) {
-            const textContent = buffer.toString('utf-8');
-            const lineCount = textContent.split('\n').length;
-            const preview = textContent.slice(0, 500);
+        // ── Excel (XLS/XLSX): convert to CSV text, then analyze with LLM ──
+        const isExcelFile = mimeType.includes('spreadsheet') || mimeType.includes('ms-excel')
+            || filename.endsWith('.xlsx') || filename.endsWith('.xls');
 
-            let reply = `📊 *CSV/Text File*\n`;
+        if (isTextFile || isExcelFile) {
+            let textContent: string;
+            let fileLabel: string;
+
+            if (isExcelFile) {
+                // DECISION(2026-02-26): Use xlsx library to convert Excel → CSV text.
+                // This avoids the PDF extraction pipeline which fails on non-PDF binaries.
+                const XLSX = await import('xlsx');
+                const workbook = XLSX.read(buffer, { type: 'buffer' });
+                const sheetNames = workbook.SheetNames;
+                const parts: string[] = [];
+
+                for (const name of sheetNames) {
+                    const sheet = workbook.Sheets[name];
+                    const csv = XLSX.utils.sheet_to_csv(sheet);
+                    if (sheetNames.length > 1) {
+                        parts.push(`\n=== Sheet: ${name} ===\n${csv}`);
+                    } else {
+                        parts.push(csv);
+                    }
+                }
+                textContent = parts.join('\n');
+                fileLabel = `📊 *Excel File* (${sheetNames.length} sheet${sheetNames.length > 1 ? 's' : ''}: ${sheetNames.join(', ')})`;
+            } else {
+                textContent = buffer.toString('utf-8');
+                fileLabel = `📊 *CSV/Text File*`;
+            }
+
+            const lineCount = textContent.split('\n').length;
+
+            // DECISION(2026-02-26): Auto-enrich with Finale data when Excel contains SKUs.
+            // Extract product IDs from the data, query Finale for consumption/demand/BOM data,
+            // and append to the LLM prompt so Aria can give real answers instead of guessing.
+            let finaleContext = '';
+            try {
+                // Look for product IDs/SKUs in the CSV data (column headers like "Product ID", "SKU", "ProductId")
+                const lines = textContent.split('\n');
+                const header = lines[0]?.toLowerCase() || '';
+                const skuColIndex = header.split(',').findIndex(col =>
+                    col.includes('product id') || col.includes('productid') ||
+                    col.includes('sku') || col.includes('item id') || col.includes('itemid')
+                );
+
+                if (skuColIndex >= 0) {
+                    const skus = lines.slice(1)
+                        .map(line => line.split(',')[skuColIndex]?.trim().replace(/"/g, ''))
+                        .filter(sku => sku && sku.length > 1 && sku.length < 30);
+
+                    // Limit to 10 SKUs to avoid overwhelming the API
+                    const uniqueSkus = [...new Set(skus)].slice(0, 10);
+
+                    if (uniqueSkus.length > 0) {
+                        ctx.sendChatAction('typing');
+                        const enrichments: string[] = [];
+
+                        for (const sku of uniqueSkus) {
+                            try {
+                                const profile = await finale.getComponentStockProfile(sku);
+                                if (profile.hasFinaleData) {
+                                    let entry = `  ${sku}:`;
+                                    if (profile.onHand !== null) entry += ` QoH=${profile.onHand} units.`;
+
+                                    // DECISION(2026-02-26): Finale's demandQuantity and consumptionQuantity
+                                    // are TOTALS over ~90 days, NOT daily rates. We must pre-calculate
+                                    // daily rate here to prevent the LLM from misinterpreting them.
+                                    const totalDemand = profile.demandQuantity ?? profile.consumptionQuantity ?? 0;
+                                    if (totalDemand > 0) {
+                                        const dailyRate = totalDemand / 90;
+                                        entry += ` Consumption: ${totalDemand.toFixed(1)} units over 90 days (${dailyRate.toFixed(2)} units/day).`;
+                                        if (profile.onHand !== null && dailyRate > 0) {
+                                            const daysOfSupply = Math.round(profile.onHand / dailyRate);
+                                            entry += ` Days of supply: ~${daysOfSupply} days.`;
+                                            // Annualize for "last year" type questions
+                                            const annualUsage = Math.round(dailyRate * 365);
+                                            entry += ` Estimated annual usage: ~${annualUsage} units/year.`;
+                                        }
+                                    } else {
+                                        entry += ` No consumption/demand data in Finale — may need to check BOM explosion or build calendar.`;
+                                    }
+
+                                    if (profile.stockoutDays !== null) entry += ` Finale stockout estimate: ${profile.stockoutDays} days.`;
+                                    if (profile.onOrder !== null && profile.onOrder > 0) entry += ` On order: ${profile.onOrder} units.`;
+                                    if (profile.incomingPOs.length > 0) {
+                                        entry += ` Open POs: ${profile.incomingPOs.map(po => `PO#${po.orderId} (${po.quantity} units from ${po.supplier})`).join(', ')}.`;
+                                    }
+                                    // DECISION(2026-02-26): Also fetch actual purchase/receiving history
+                                    // so the LLM can give exact "total purchased last year" answers
+                                    // instead of extrapolating from consumption.
+                                    try {
+                                        const purchased = await finale.getPurchasedQty(sku, 365);
+                                        if (purchased.totalQty > 0) {
+                                            entry += ` PURCHASED last 365 days: ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s).`;
+                                        }
+                                    } catch { /* non-critical */ }
+
+                                    enrichments.push(entry);
+                                }
+                            } catch { /* skip individual failures */ }
+                        }
+
+                        if (enrichments.length > 0) {
+                            finaleContext = `\n\n--- FINALE INVENTORY DATA (LIVE) ---\nReal-time data from Finale Inventory. "PURCHASED last 365 days" is the EXACT received quantity from Finale POs — use this to answer purchase questions directly. "Consumption" figures are TOTALS over 90 days, daily rates are pre-calculated.\n${enrichments.join('\n')}\n--- END FINALE DATA ---`;
+                        }
+                    }
+                }
+            } catch (err: any) {
+                console.warn('Excel Finale enrichment failed:', err.message);
+            }
+
+            let reply = `${fileLabel}\n`;
             reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
             reply += `📝 Lines: ${lineCount}\n`;
+            if (finaleContext) reply += `🔗 _Enriched with live Finale inventory data_\n`;
             reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
 
             ctx.sendChatAction('typing');
             const analysis = await unifiedTextGeneration({
-                system: `You are Aria, an operations assistant for BuildASoil. The user has uploaded a CSV/text file. Analyze the data and answer their question directly. Be specific with numbers and SKUs. Format your response for Telegram (use markdown).
+                system: `You are Aria, an operations assistant for BuildASoil — a soil and growing supply manufacturer. You know this business deeply. Analyze uploaded data files and give DECISIVE, ACTIONABLE answers. Be specific with numbers, SKUs, and recommendations. Format for Telegram (markdown).
 
-IMPORTANT CONTEXT about BuildASoil's inventory:
-- Some items are RAW MATERIALS consumed through BOM (Bill of Materials) production builds, NOT through direct sales.
-- If an item shows 0 "Sales Velocity" or 0 consumption, it may be a BOM component (bags, labels, inputs, soil amendments).
-- True consumption for BOM components comes from build orders, not sales data.
-- If you see 0 velocity for items that clearly are consumables (bags, packaging, raw ingredients), flag this and explain that consumption comes from production builds, not sales.
-- Look for columns like "Build Usage", "BOM Consumption", "Production Usage" if available.
-- Stock levels are still accurate — they reflect current on-hand after all builds and receipts.`,
-                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total):\n${textContent.slice(0, 30000)}`
+CRITICAL RULES:
+1. **ANSWER THE QUESTION DIRECTLY.** Never say "you would need to check records" or "refer to purchase orders." YOU are the one who checks. If you have data, CALCULATE and ANSWER. If the data supports an estimate, give it clearly labeled as an estimate.
+
+2. **ALWAYS DO THE MATH.** When consumption data is available:
+   - If you have 90-day consumption, extrapolate: annual = (90-day value / 90) × 365
+   - If asked about "last year" purchases, estimate from consumption rate: items consumed ≈ items purchased for BOM components
+   - Show your calculation so Will can verify
+
+3. **BOM Components**: If a product shows 0 sales velocity but has stock, it IS a BOM input consumed through production builds. State this as fact.
+   - For BOM items, purchasing ≈ consumption over time (what goes in must be bought)
+   - Use the FINALE INVENTORY DATA section (if present) for real consumption rates
+
+4. **Be specific, not generic**: Use actual SKUs, quantities, and product names. Never give vague summaries when you have real numbers.
+
+5. **Format answers as direct responses.** Example of GOOD response:
+   "PLQ101 - Quillaja Extract Powder 20: Purchased ~223 kg last year (based on 55 kg consumed over 90 days → 0.61 kg/day × 365 days)"
+   
+   Example of BAD response:
+   "To determine purchases, you would need to check purchase records."`,
+                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total):\n${textContent.slice(0, 30000)}${finaleContext}`
             });
 
             reply += analysis;
             await ctx.reply(reply, { parse_mode: 'Markdown' });
+
+            // Store in conversation history so follow-up questions have context
+            const chatId = ctx.from?.id || ctx.chat.id;
+            if (!chatHistory[chatId]) chatHistory[chatId] = [];
+            chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
+            chatHistory[chatId].push({ role: "assistant", content: reply });
+            if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
+
+            // Auto-learn: store key conclusions from the file analysis
+            setImmediate(async () => {
+                try {
+                    const { remember } = await import('../lib/intelligence/memory');
+                    const tagMatches = (caption + ' ' + analysis).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                    const tags = [...new Set(tagMatches)].slice(0, 6);
+                    await remember({
+                        category: 'conversation',
+                        content: `File analysis: "${filename}"${caption ? ' (' + caption + ')' : ''}. Key findings: "${analysis.slice(0, 400)}"`,
+                        tags: [filename, ...tags],
+                        source: 'telegram_auto',
+                        priority: 'low',
+                    });
+                } catch { /* non-critical */ }
+            });
             return;
         }
 
@@ -767,6 +999,13 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 
         await ctx.reply(reply, { parse_mode: 'Markdown' });
 
+        // Store in conversation history so follow-up questions have context
+        const chatId = ctx.from?.id || ctx.chat.id;
+        if (!chatHistory[chatId]) chatHistory[chatId] = [];
+        chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
+        chatHistory[chatId].push({ role: "assistant", content: reply });
+        if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
+
     } catch (err: any) {
         console.error(`Document processing error (${filename}):`, err.message);
         await ctx.reply(`❌ Failed to process *${filename}*: ${err.message}`, { parse_mode: 'Markdown' });
@@ -776,8 +1015,6 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 // ──────────────────────────────────────────────────
 // TEXT MESSAGE HANDLER
 // ──────────────────────────────────────────────────
-
-const chatHistory: Record<string, any[]> = {};
 
 bot.on('text', async (ctx) => {
     const userText = ctx.message.text;
@@ -791,9 +1028,9 @@ bot.on('text', async (ctx) => {
     // Add user's message to history
     chatHistory[chatId].push({ role: "user", content: userText });
 
-    // Keep history reasonably sized (last 10 messages)
-    if (chatHistory[chatId].length > 10) {
-        chatHistory[chatId] = chatHistory[chatId].slice(-10);
+    // Keep last 20 messages (shared with document handler limit)
+    if (chatHistory[chatId].length > 20) {
+        chatHistory[chatId] = chatHistory[chatId].slice(-20);
     }
 
     ctx.sendChatAction('typing');
@@ -805,6 +1042,65 @@ bot.on('text', async (ctx) => {
             const { getRelevantContext } = await import('../lib/intelligence/memory');
             memoryContext = await getRelevantContext(userText);
         } catch { /* memory unavailable, continue without */ }
+
+        // Runtime rules shared across ALL LLM paths (GPT-4o, Claude, OpenAI fallback)
+        const runtimeRules = `
+
+## CRITICAL: BIAS TO ACTION
+You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
+
+### Tool selection rules:
+- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
+- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
+- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
+- Weather → use get_weather
+- Emails → use list_recent_emails
+
+### Anti-clarification rules:
+- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
+- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
+- If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
+- If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.
+
+### Follow-up conversation rules:
+- When the previous message analyzed a file or returned data, ALL follow-up questions refer to THAT context.
+- "product amount not money or cost" after a PO analysis = asking about unit quantities, not dollar amounts. Answer from the prior data.
+- "this sku" / "this one" / "that product" = the SKU most recently discussed or visible in the prior message. Use it.
+- "how many" / "what quantity" / "units" after a file analysis = re-interpret the prior analysis for quantity metrics.
+- NEVER say "It sounds like you're looking for..." — just answer directly from context.
+- NEVER say "Just provide the product name or SKU" if one was already discussed in this conversation.
+- NEVER say "let me handle it" or "I'll dive right in" without actually doing something.
+- If the user's message is short and ambiguous, look at the prior assistant message — it almost certainly provides the missing context.
+
+### LIVE DATA RULE — always validate with tools:
+Memory context (above) is BACKGROUND ONLY — it tells you patterns, processes, and history, NOT current values.
+For ANYTHING that can change, you MUST call the appropriate tool to get live data. Do NOT answer from memory alone.
+- Prices / costs / unit cost → call lookup_product or get_purchase_history
+- Stock levels / on-hand / on-order → call lookup_product
+- PO status / open POs / what's in transit → call query_purchase_orders
+- Consumption rates / demand → call get_consumption
+- Vendor payment terms / contacts → call query_vendors
+- Invoice status → call query_invoices
+Rule: if the answer could be stale (anything numeric, status-based, or date-based), CALL THE TOOL. Always.
+
+### When a tool returns no result:
+- If lookup_product returns nothing: say "Not found in Finale — tried SKU [X]." Stop there.
+- If search returns no match: say "No match in Finale for [X]." Stop there.
+- NEVER suggest Will go check something himself. You are the one who checks.
+
+### HOLLOW FILLER — never use these (they add zero value):
+- "What's next on the agenda?" / "What's our next task?" / "What's next?" — only reference next steps if you have a SPECIFIC, concrete one to name
+- "Let me know if you need anything else" — empty, skip it
+- "Hope that helps!" — never
+- "It might be worth double-checking" — you checked. Report what you found, that's it.
+- "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
+- Any generic offer that could apply to ANY response (if it has no specifics, cut it)
+
+### Persona — always ON:
+- Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
+- End responses with genuine engagement when there's something real to engage with — a specific observation, a risk you noticed, a quick recommendation.
+- If a tool result reveals something interesting or concerning, comment on it briefly. That's not filler, that's signal.
+- Will likes directness. Get to the answer first, then add color.`;
 
         let reply = "";
 
@@ -895,6 +1191,78 @@ bot.on('text', async (ctx) => {
                         description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
                         parameters: { type: "object", properties: {} }
                     }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "get_purchase_history",
+                        description: "Get the total quantity purchased/received for a specific SKU over a time period. Use this when the user asks 'how much was purchased', 'total received', 'purchase history', or 'how much did we buy' for a product. Returns exact PO quantities from Finale.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                sku: { type: "string", description: "The exact product SKU/ID (e.g. PLQ101, KM106)" },
+                                days: { type: "number", description: "Number of days back to search (default 365)" }
+                            },
+                            required: ["sku"]
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "query_vendors",
+                        description: "Look up vendor info from our database by name. Returns payment terms, contact, AR email, total spend, last order date. Use when Will asks about a specific vendor, payment terms, who to contact, or vendor history.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                name: { type: "string", description: "Partial or full vendor name to search (e.g. 'AAA Cooper', 'Kashi', 'BioAg')" }
+                            },
+                            required: ["name"]
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "query_invoices",
+                        description: "Query invoices from our database. Use when Will asks about invoice status, unmatched invoices, overdue invoices, or invoice amounts. Filter by status: 'pending', 'matched', 'unmatched', 'paid', 'overdue'.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
+                                status: { type: "string", description: "Filter by status: pending, matched, unmatched, paid, overdue" },
+                                limit: { type: "number", description: "Max results (default 10)" }
+                            }
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "query_purchase_orders",
+                        description: "Query purchase orders from our database. Use when Will asks about open POs, PO status, what's on order, or expected deliveries. Filter by status: 'open', 'received', 'closed', 'partial'.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
+                                status: { type: "string", description: "Filter by status: open, received, closed, partial" },
+                                limit: { type: "number", description: "Max results (default 10)" }
+                            }
+                        }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "query_action_items",
+                        description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for follow-up. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                limit: { type: "number", description: "Max results (default 10)" }
+                            }
+                        }
+                    }
                 }
             ];
 
@@ -902,23 +1270,7 @@ bot.on('text', async (ctx) => {
                 model: "gpt-4o",
                 messages: [
                     {
-                        role: "system", content: SYSTEM_PROMPT + memoryContext + `
-
-## CRITICAL: BIAS TO ACTION
-You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
-
-### Tool selection rules:
-- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
-- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
-- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
-- Weather → use get_weather
-- Emails → use list_recent_emails
-
-### Anti-clarification rules:
-- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
-- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
-- If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
-- If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.` },
+                        role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules },
                     ...chatHistory[chatId]
                 ],
                 tools,
@@ -950,10 +1302,15 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
                         const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
                         result = JSON.stringify(data.messages);
                     } else if (toolCall.function.name === "lookup_product") {
-                        const report = await finale.getBOMConsumption(args.sku);
-                        result = report.productId
-                            ? report.telegramMessage
-                            : `Product ${args.sku} not found in Finale.`;
+                        const report = await finale.productReport(args.sku);
+                        result = report.telegramMessage;
+                    } else if (toolCall.function.name === "get_purchase_history") {
+                        const purchased = await finale.getPurchasedQty(args.sku, args.days || 365);
+                        if (purchased.totalQty > 0) {
+                            result = `${args.sku}: Purchased ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s) in the last ${args.days || 365} days.`;
+                        } else {
+                            result = `${args.sku}: No purchase/receiving records found in the last ${args.days || 365} days.`;
+                        }
                     } else if (toolCall.function.name === "search_products") {
                         const searchResult = await finale.searchProducts(args.keyword, args.limit || 20);
                         result = searchResult.telegramMessage;
@@ -964,6 +1321,76 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
                         const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
                         const report = await runBuildRiskAnalysis(30, () => { });
                         result = report.slackMessage;
+                    } else if (toolCall.function.name === "query_vendors") {
+                        const { createClient } = await import('../lib/supabase');
+                        const db = createClient();
+                        if (!db) {
+                            result = "Supabase not configured.";
+                        } else {
+                            const { data, error } = await db.from('vendors')
+                                .select('name, aliases, payment_terms, contact_name, contact_email, ar_email, category, total_spend, last_order_date, average_payment_days')
+                                .ilike('name', `%${args.name}%`)
+                                .limit(5);
+                            if (error) result = `DB error: ${error.message}`;
+                            else if (!data?.length) result = `No vendors found matching "${args.name}".`;
+                            else result = JSON.stringify(data, null, 2);
+                        }
+                    } else if (toolCall.function.name === "query_invoices") {
+                        const { createClient } = await import('../lib/supabase');
+                        const db = createClient();
+                        if (!db) {
+                            result = "Supabase not configured.";
+                        } else {
+                            let q = db.from('invoices')
+                                .select('invoice_number, po_number, total_amount, due_date, status, discrepancies, created_at, vendors(name)')
+                                .order('created_at', { ascending: false })
+                                .limit(args.limit || 10);
+                            if (args.status) q = q.eq('status', args.status);
+                            if (args.vendor_name) {
+                                // Join-filter via vendor name requires a subquery; approximate with vendor id lookup
+                                const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
+                                if (vd?.length) q = q.eq('vendor_id', vd[0].id);
+                            }
+                            const { data, error } = await q;
+                            if (error) result = `DB error: ${error.message}`;
+                            else if (!data?.length) result = `No invoices found${args.status ? ` with status "${args.status}"` : ''}.`;
+                            else result = JSON.stringify(data, null, 2);
+                        }
+                    } else if (toolCall.function.name === "query_purchase_orders") {
+                        const { createClient } = await import('../lib/supabase');
+                        const db = createClient();
+                        if (!db) {
+                            result = "Supabase not configured.";
+                        } else {
+                            let q = db.from('purchase_orders')
+                                .select('po_number, issue_date, required_date, status, total_amount, line_items, vendors(name)')
+                                .order('issue_date', { ascending: false })
+                                .limit(args.limit || 10);
+                            if (args.status) q = q.eq('status', args.status);
+                            if (args.vendor_name) {
+                                const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
+                                if (vd?.length) q = q.eq('vendor_id', vd[0].id);
+                            }
+                            const { data, error } = await q;
+                            if (error) result = `DB error: ${error.message}`;
+                            else if (!data?.length) result = `No purchase orders found${args.status ? ` with status "${args.status}"` : ''}.`;
+                            else result = JSON.stringify(data, null, 2);
+                        }
+                    } else if (toolCall.function.name === "query_action_items") {
+                        const { createClient } = await import('../lib/supabase');
+                        const db = createClient();
+                        if (!db) {
+                            result = "Supabase not configured.";
+                        } else {
+                            const { data, error } = await db.from('documents')
+                                .select('type, vendor_ref, action_summary, confidence, source, created_at')
+                                .eq('action_required', true)
+                                .order('created_at', { ascending: false })
+                                .limit(args.limit || 10);
+                            if (error) result = `DB error: ${error.message}`;
+                            else if (!data?.length) result = "No pending action items found.";
+                            else result = JSON.stringify(data, null, 2);
+                        }
                     }
 
                     toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
@@ -984,6 +1411,35 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
                 chatHistory[chatId].push(message);
                 chatHistory[chatId].push(...toolResults);
                 chatHistory[chatId].push({ role: "assistant", content: reply });
+
+                // Auto-learn: store the Q→A pattern so future identical/similar questions
+                // get instant answers from memory context instead of re-calling tools.
+                setImmediate(async () => {
+                    try {
+                        const { remember } = await import('../lib/intelligence/memory');
+                        const toolsUsed = message.tool_calls!.map(tc => tc.function.name).join(', ');
+                        const resultSummary = toolResults
+                            .map(tr => String(tr.content).slice(0, 300))
+                            .join(' | ');
+                        // Determine memory category from tool type
+                        const firstTool = message.tool_calls![0].function.name;
+                        const category =
+                            firstTool.includes('vendor') ? 'vendor_pattern' :
+                            firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
+                            firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
+                            'conversation';
+                        // Extract any SKU-like tags from the user message + results
+                        const tagMatches = (userText + ' ' + resultSummary).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                        const tags = [...new Set(tagMatches)].slice(0, 5);
+                        await remember({
+                            category,
+                            content: `Q: "${userText.slice(0, 150)}" → Tool: ${toolsUsed} → A: "${reply.slice(0, 300)}"`,
+                            tags,
+                            source: 'telegram_auto',
+                            priority: 'low',
+                        });
+                    } catch { /* non-critical, never block the response */ }
+                });
             } else {
                 reply = message.content || "";
 
@@ -991,11 +1447,14 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
                 chatHistory[chatId].push({ role: "assistant", content: reply });
             }
         } else {
-            // No OpenAI, just use Unified (which will try Anthropic)
+            // No OpenAI — use Unified with full conversation history
             reply = await unifiedTextGeneration({
-                system: SYSTEM_PROMPT + memoryContext,
-                prompt: userText
+                system: SYSTEM_PROMPT + memoryContext + runtimeRules,
+                messages: chatHistory[chatId]
+                    .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+                    .map((m: any) => ({ role: m.role, content: m.content })) as any,
             });
+            chatHistory[chatId].push({ role: 'assistant', content: reply });
         }
 
         ctx.reply(reply, { parse_mode: 'Markdown' });
@@ -1024,8 +1483,33 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
 
     console.log('✅ ARIA IS LIVE AND LISTENING');
 
+    // Seed memory with vendor patterns and known processes on every boot
+    // (seedMemories uses upsert so this is idempotent)
+    try {
+        const { seedMemories } = await import('../lib/intelligence/memory');
+        const { seedKnownVendorPatterns } = await import('../lib/intelligence/vendor-memory');
+        await Promise.all([seedMemories(), seedKnownVendorPatterns()]);
+        console.log('🧠 Memory: ✅ Vendor patterns seeded');
+    } catch (err: any) {
+        console.warn('⚠️ Memory seed failed (non-fatal):', err.message);
+    }
+
     const ops = new OpsManager(bot);
     ops.start();
+
+    // Start Slack Watchdog in-process (so /requests can access pending data)
+    if (process.env.SLACK_ACCESS_TOKEN) {
+        try {
+            const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
+            globalWatchdog = new SlackWatchdog(pollInterval);
+            await globalWatchdog.start();
+            console.log('🦊 Slack Watchdog: ✅ Running in-process');
+        } catch (err: any) {
+            console.warn('⚠️ Slack Watchdog failed to start:', err.message);
+        }
+    } else {
+        console.log('🦊 Slack Watchdog: ❌ SLACK_ACCESS_TOKEN not set');
+    }
 
     console.log('📅 Cron schedules registered:');
     console.log('   🏭 Build Risk Report: 7:30 AM MT (Mon-Fri)');

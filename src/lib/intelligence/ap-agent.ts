@@ -6,6 +6,8 @@ import { WebClient } from "@slack/web-api";
 import { extractPDF } from "../pdf/extractor";
 import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 import { matchInvoiceToPO, MatchResult } from "../matching/invoice-po-matcher";
+import { FinaleClient } from "../finale/client";
+import { reconcileInvoiceToPO, applyReconciliation, ReconciliationResult } from "../finale/reconciler";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 
@@ -306,6 +308,16 @@ Classify carefully based on the sender, subject and text snippet.`;
             // 5. Build and send notifications
             await this.sendNotification(invoiceData, matchResult, subject, from);
 
+            // 6. Reconcile against Finale (Phase 1)
+            // If we matched to a PO, run the full reconciliation pipeline:
+            // compare prices, detect fees, verify tracking, apply safe changes
+            if (matchResult.matched && (invoiceData.poNumber || matchResult.matchedPO?.poNumber)) {
+                const finalePONumber = invoiceData.poNumber || matchResult.matchedPO?.poNumber;
+                if (finalePONumber) {
+                    await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase);
+                }
+            }
+
         } catch (err: any) {
             console.error(`   Error processing buffer for ${filename}:`, err.message);
         }
@@ -355,6 +367,115 @@ Classify carefully based on the sender, subject and text snippet.`;
                 });
             } catch (err: any) {
                 console.error("Slack post failed for AP Agent:", err.message);
+            }
+        }
+    }
+
+    /**
+     * Reconcile a parsed invoice against a Finale PO.
+     * Compares line prices, fees (freight/tax/tariff/labor), and tracking.
+     * Auto-applies safe changes (≤3% variance); escalates risky ones to Slack.
+     *
+     * DECISION(2026-02-26): Multi-layer safety guardrails per Will's requirement:
+     *   - ≤3% price change → auto-approve, apply, notify
+     *   - >3% but <10x → flag for Slack approval
+     *   - >10x magnitude shift → REJECT (likely decimal error: $2.60 → $26,000)
+     *   - Total PO impact >$500 → require manual approval regardless
+     */
+    private async reconcileAndUpdate(
+        invoice: InvoiceData,
+        orderId: string,
+        supabase: any
+    ): Promise<void> {
+        try {
+            const finaleClient = new FinaleClient();
+            const result: ReconciliationResult = await reconcileInvoiceToPO(invoice, orderId, finaleClient);
+
+            console.log(`   📊 Reconciliation: ${result.overallVerdict} | Impact: $${result.totalDollarImpact.toFixed(2)}`);
+
+            // Auto-apply if safe
+            if (result.autoApplicable && (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate)) {
+                const applyResult = await applyReconciliation(result, finaleClient);
+
+                if (applyResult.applied.length > 0) {
+                    console.log(`   ✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${orderId}`);
+                }
+                if (applyResult.errors.length > 0) {
+                    console.error(`   ❌ ${applyResult.errors.length} error(s) applying to Finale:`, applyResult.errors);
+                }
+
+                // Log the reconciliation result to Supabase
+                await this.logReconciliation(supabase, result, applyResult);
+            }
+
+            // Always send the reconciliation summary to Slack/Telegram
+            await this.sendReconciliationNotification(result);
+
+        } catch (err: any) {
+            console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
+        }
+    }
+
+    /**
+     * Log reconciliation results to Supabase for audit trail.
+     */
+    private async logReconciliation(
+        supabase: any,
+        result: ReconciliationResult,
+        applyResult: { applied: string[]; skipped: string[]; errors: string[] }
+    ): Promise<void> {
+        try {
+            await supabase.from("ap_activity_log").insert({
+                email_from: result.vendorName,
+                email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
+                intent: "RECONCILIATION",
+                action_taken: result.autoApplicable
+                    ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
+                    : `Flagged for review: ${result.overallVerdict}`,
+                metadata: {
+                    orderId: result.orderId,
+                    invoiceNumber: result.invoiceNumber,
+                    verdict: result.overallVerdict,
+                    totalImpact: result.totalDollarImpact,
+                    applied: applyResult.applied,
+                    skipped: applyResult.skipped,
+                    errors: applyResult.errors,
+                }
+            });
+        } catch (err: any) {
+            console.warn("⚠️ Failed to log reconciliation:", err.message);
+        }
+    }
+
+    /**
+     * Send reconciliation summary to Slack and Telegram.
+     */
+    private async sendReconciliationNotification(result: ReconciliationResult): Promise<void> {
+        if (result.overallVerdict === "no_change") return; // Nothing to report
+
+        const msg = result.summary;
+
+        // Telegram
+        try {
+            await this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || "",
+                msg,
+                { parse_mode: "Markdown" }
+            );
+        } catch (err: any) {
+            console.error("Telegram reconciliation notification failed:", err.message);
+        }
+
+        // Slack
+        if (this.slack) {
+            try {
+                await this.slack.chat.postMessage({
+                    channel: this.slackChannel,
+                    text: msg,
+                    mrkdwn: true
+                });
+            } catch (err: any) {
+                console.error("Slack reconciliation notification failed:", err.message);
             }
         }
     }

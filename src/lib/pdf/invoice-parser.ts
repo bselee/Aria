@@ -34,6 +34,8 @@ export const InvoiceSchema = z.object({
     freight: z.number().optional(),
     fuelSurcharge: z.number().optional(),
     tax: z.number().optional(),
+    tariff: z.number().optional(),            // Duties, tariffs, import fees
+    labor: z.number().optional(),             // Labor, handling, processing fees
     discount: z.number().optional(),
     total: z.number(),
     amountPaid: z.number().optional(),
@@ -56,6 +58,8 @@ Pay special attention to:
 - Line items: every line including charges, fees, and credits
 - Payment terms: exact text as written (Net 30, 2/10 Net 30, Due on Receipt, etc.)
 - Any freight, fuel surcharge, or shipping charges as separate line items
+- Tariffs, duties, import fees — extract as the "tariff" field
+- Labor, handling, or processing charges — extract as the "labor" field
 - PO numbers, order numbers, BOL numbers, PRO numbers, tracking numbers
 - Ship-to vs bill-to addresses if different
 - Due date: calculate from invoice date + terms if not explicitly stated

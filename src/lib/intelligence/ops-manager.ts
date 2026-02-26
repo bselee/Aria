@@ -20,13 +20,90 @@ import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
 import { runBuildRiskAnalysis } from "../builds/build-risk";
 import { APAgent } from "./ap-agent";
+import FirecrawlApp from "@mendable/firecrawl-js";
 
 const TRACKING_PATTERNS = {
-    ups: /1Z[0-9A-Z]{16}/i,
-    fedex: /\b\d{12,15}\b/i,
-    usps: /\b94\d{20}\b/i,
-    generic: /\b(tracking|track|carrier|waybill)\s*[#:]?\s*([0-9A-Z]{10,25})\b/i
+    ups:     /\b1Z[0-9A-Z]{16}\b/i,
+    // FedEx: 12-digit express, 15-digit ground, or 96XXXXXXXXXXXXXXXXXX (20-digit SmartPost)
+    fedex:   /\b(96\d{18}|\d{15}|\d{12})\b/,
+    usps:    /\b(94|92|93|95)\d{20}\b/,
+    dhl:     /\bJD\d{18}\b/i,
+    generic: /\b(tracking|track|waybill)\s*[#:]?\s*([0-9A-Z]{10,25})\b/i
 };
+
+type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
+interface TrackingStatus { category: TrackingCategory; display: string; }
+
+
+function carrierUrl(trackingNumber: string): string {
+    if (/^1Z/i.test(trackingNumber))   return `https://www.ups.com/track?tracknum=${trackingNumber}`;
+    if (/^(94|92|93|95)/.test(trackingNumber)) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${trackingNumber}`;
+    if (/^JD/i.test(trackingNumber))   return `https://www.dhl.com/us-en/home/tracking.html?tracking-id=${trackingNumber}`;
+    return `https://www.fedex.com/fedextrack/?tracknumbers=${trackingNumber}`;
+}
+
+/**
+ * Parse delivery status from carrier page markdown using regex — no LLM.
+ */
+function parseTrackingContent(content: string): TrackingStatus | null {
+    // Delivered — check first; most definitive
+    const deliveredDate = content.match(
+        /delivered\s+(?:on\s+)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i
+    );
+    if (deliveredDate) return { category: 'delivered', display: `Delivered ${deliveredDate[1]}` };
+    if (/\bdelivered\b/i.test(content)) return { category: 'delivered', display: 'Delivered' };
+
+    // Out for delivery
+    if (/out\s+for\s+delivery/i.test(content))
+        return { category: 'out_for_delivery', display: 'Out for delivery' };
+
+    // Exception / delay
+    if (/\bexception\b|\bdelay(ed)?\b|unable to deliver/i.test(content))
+        return { category: 'exception', display: 'Delivery exception' };
+
+    // Estimated / scheduled / expected delivery date
+    const eta = content.match(
+        /(?:estimated|scheduled|expected)\s+delivery[:\s]+([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i
+    );
+    if (eta) return { category: 'in_transit', display: `Expected ${eta[1]}` };
+
+    // "by end of day <date>"
+    const eod = content.match(/by\s+end\s+of\s+(?:business\s+)?day[,\s]+([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})/i);
+    if (eod) return { category: 'in_transit', display: `Expected by ${eod[1]}` };
+
+    // Generic in-transit signals
+    if (/in\s+transit|on\s+the\s+way|picked\s+up|departed/i.test(content))
+        return { category: 'in_transit', display: 'In transit' };
+
+    return null;
+}
+
+/**
+ * Scrape a carrier tracking page via Firecrawl and return structured delivery status.
+ * Pure regex parsing — no LLM. Times out after 20s; returns null on any failure.
+ */
+async function scrapeTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    const apiKey = process.env.FIRECRAWL_API_KEY;
+    if (!apiKey) return null;
+
+    try {
+        const firecrawl = new FirecrawlApp({ apiKey });
+        const result = await Promise.race([
+            firecrawl.scrapeUrl(carrierUrl(trackingNumber), { formats: ["markdown"] }),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("Firecrawl timeout")), 20000)
+            ),
+        ]) as any;
+
+        const content: string = result?.markdown || result?.content || "";
+        if (content.length < 50) return null;
+
+        return parseTrackingContent(content);
+    } catch (err: any) {
+        console.warn(`[tracking-scrape] ${trackingNumber}: ${err.message}`);
+        return null;
+    }
+}
 
 /**
  * Main Operations Manager Class
@@ -146,10 +223,14 @@ export class OpsManager {
             const gmail = google.gmail({ version: "v1", auth });
             const supabase = createClient();
 
-            // Search for PO emails sent recently
+            // Only scan POs from the last 14 days — tracking arrives well within that window
+            const since = new Date();
+            since.setDate(since.getDate() - 14);
+            const sinceStr = since.toISOString().slice(0, 10).replace(/-/g, '/');
+
             const { data: search } = await gmail.users.messages.list({
                 userId: "me",
-                q: "label:PO after:2026/01/01",
+                q: `label:PO after:${sinceStr}`,
                 maxResults: 50
             });
 
@@ -191,8 +272,12 @@ export class OpsManager {
                     const body = msg.snippet || "";
                     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
                         const match = body.match(regex);
-                        if (match && !trackingNumbers.includes(match[0])) {
-                            trackingNumbers.push(match[0]);
+                        if (!match) continue;
+                        // For the generic pattern, capture group [2] is the number itself.
+                        // All other patterns are direct matches with no prefix in [0].
+                        const trackingNum = carrier === "generic" ? match[2] : match[0];
+                        if (trackingNum && !trackingNumbers.includes(trackingNum)) {
+                            trackingNumbers.push(trackingNum);
                         }
                     }
                 }
@@ -204,10 +289,44 @@ export class OpsManager {
                     const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
 
                     if (newTracking.length > 0) {
+                        // Extract vendor name from subject: "BuildASoil PO # 124350 - Vendor Name - date"
+                        const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
+                        const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
+
+                        // Format PO sent date
+                        const sentDate = new Date(sentAt).toLocaleDateString('en-US', {
+                            month: 'short', day: 'numeric', year: 'numeric',
+                            timeZone: 'America/Denver'
+                        });
+
+                        // Fetch PO line items + Finale deep-link
+                        const { FinaleClient } = await import("../finale/client");
+                        const finale = new FinaleClient();
+                        const poDetails = await finale.getPOLineItems(poNumber);
+
+                        const poLine = poDetails
+                            ? `PO: <a href="${poDetails.finaleUrl}">#${poNumber}</a>`
+                            : `PO: #${poNumber}`;
+
+                        const itemsLine = poDetails?.lineItems.length
+                            ? `Items: ${poDetails.lineItems.map(i => `<code>${i.sku}</code> ×${i.qty}`).join(', ')}`
+                            : "";
+
+                        // Scrape delivery status + build message lines per tracking number
+                        const trackingLines = await Promise.all(newTracking.map(async t => {
+                            const ts = await scrapeTrackingStatus(t);
+                            const statusStr = ts ? `  ${ts.display}` : "";
+                            return `<a href="${carrierUrl(t)}">${t}</a><i>${statusStr}</i>`;
+                        }));
+
+                        let msg = `<b>Tracking Alert</b>\n\n${poLine}\nVendor: ${vendorName}\nSent: ${sentDate}`;
+                        if (itemsLine) msg += `\n${itemsLine}`;
+                        msg += `\n\n${trackingLines.join('\n')}`;
+
                         this.bot.telegram.sendMessage(
                             process.env.TELEGRAM_CHAT_ID || "",
-                            `🚚 **New Tracking Detected!**\n\nPO: #${poNumber}\nVendor: ${subject}\nNumbers: ${newTracking.join(", ")}\n\n_Correlation logic in effect._`,
-                            { parse_mode: "Markdown" }
+                            msg,
+                            { parse_mode: "HTML" }
                         );
                     }
                 }

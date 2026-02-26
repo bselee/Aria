@@ -33,7 +33,10 @@ module.exports = {
             name: "aria-bot",
             script: path.join(__dirname, "src", "cli", "start-bot.ts"),
             interpreter: "node",
-            interpreter_args: "--import tsx",
+            // DECISION(2026-02-26): --dns-result-order=ipv4first forces IPv4 for all
+            // DNS lookups. Node 18+ prefers IPv6 by default, but Supabase (and most
+            // cloud services) don't respond on IPv6 → fetch() hangs indefinitely.
+            interpreter_args: "--dns-result-order=ipv4first --import tsx",
             cwd: __dirname,
             env: {
                 // DECISION(2026-02-25): Load .env.local via dotenv inside the scripts.
@@ -57,6 +60,11 @@ module.exports = {
             // Graceful shutdown: give the bot 5s to clean up Telegram polling
             kill_timeout: 5000,
         },
+        // DECISION(2026-02-26): aria-slack is now DISABLED as a separate process.
+        // The Slack Watchdog runs inside aria-bot so that /requests can access
+        // live pending request data without IPC or shared DB.
+        // To re-enable standalone mode, uncomment below and remove watchdog from start-bot.ts.
+        /*
         {
             // ─── Aria Slack Watchdog (Silent Monitor) ───
             // Polls Will's Slack channels every 60s for product requests.
@@ -82,5 +90,6 @@ module.exports = {
             merge_logs: true,
             kill_timeout: 3000,
         },
+        */
     ],
 };

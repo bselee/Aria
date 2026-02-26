@@ -18,7 +18,6 @@ import { createClient } from "../supabase";
 import axios from "axios";
 import Fuse from "fuse.js";
 import { FinaleClient } from "../finale/client";
-import { Pinecone } from "@pinecone-database/pinecone";
 
 // ──────────────────────────────────────────────────
 // SCHEMAS
@@ -67,13 +66,14 @@ interface DetectedRequest {
 // requests come in. #inventory-management was too noisy with general chatter.
 // DMs are always monitored for direct requests to Will.
 const MONITORED_CHANNEL_NAMES = new Set([
-    "purchase",
+    "purchasing",
     "purchase-orders",
 ]);
 
 export class SlackWatchdog {
     private client: WebClient;
     private lastChecked: Map<string, string> = new Map();
+    private lastCheckedThreads: Map<string, string> = new Map(); // threadKey -> last reply ts
     private channelNames: Map<string, string> = new Map();
     private userNames: Map<string, string> = new Map(); // userId -> display name
     private productCatalog: KnownProduct[] = [];
@@ -81,7 +81,7 @@ export class SlackWatchdog {
     private pendingRequests: DetectedRequest[] = []; // buffer for batch reporting
     private pollIntervalMs: number;
     private finaleClient: FinaleClient;
-    private pc: Pinecone | null = null;
+    private processedRequests: Set<string> = new Set(); // In-memory dedup for request alerts
     private ownerUserId: string | null = null; // Will's Slack ID — we skip his messages
 
     constructor(pollIntervalSeconds: number = 60) {
@@ -96,11 +96,10 @@ export class SlackWatchdog {
         // are missing, we still work — just without stock context.
         this.finaleClient = new FinaleClient();
 
-        // Initialize Pinecone for State Management to avoid duplicate alerts
-        const pineconeKey = process.env.PINECONE_API_KEY;
-        if (pineconeKey) {
-            this.pc = new Pinecone({ apiKey: pineconeKey });
-        }
+        // DECISION(2026-02-26): Dedup is now in-memory (Set) instead of Pinecone.
+        // The old approach wrote 1024-dim dummy vectors to PINECONE_INDEX (email-embeddings),
+        // which is a different dimension → silent failures. In-memory dedup is fine because
+        // the watchdog re-establishes baselines on every restart anyway.
 
         // DECISION(2026-02-26): Will's own messages should never trigger alerts.
         // He's the one who does the ordering — alerting himself is noise.
@@ -302,13 +301,59 @@ export class SlackWatchdog {
         if (!oldest) return;
 
         // Only human messages (no bots, no system, not from Will himself)
-        const humanMessages = messages.filter(
-            (m) => m.type === "message" && !m.subtype && !m.bot_id && m.text && m.text.length > 10
-                && m.user !== this.ownerUserId // Skip Will's own messages
-        );
+        const isHumanMessage = (m: any) =>
+            m.type === "message" && !m.subtype && !m.bot_id && m.text && m.text.length > 10
+            && m.user !== this.ownerUserId;
+
+        const humanMessages = messages.filter(isHumanMessage);
 
         for (const msg of humanMessages) {
             await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName, msg.ts!, msg.thread_ts);
+        }
+
+        // DECISION(2026-02-26): Also fetch replies from threads that had new activity.
+        // conversations.history only returns parent messages — thread replies are invisible
+        // without calling conversations.replies. This caused Krystal's Uline supply list
+        // (a thread reply) to be completely missed.
+        const threadedMessages = messages.filter(
+            (m) => m.thread_ts && m.reply_count && m.reply_count > 0
+        );
+
+        for (const parent of threadedMessages) {
+            try {
+                const threadKey = `${channelId}:${parent.thread_ts}`;
+                const lastReplyTs = this.lastCheckedThreads.get(threadKey);
+
+                const replies = await this.client.conversations.replies({
+                    channel: channelId,
+                    ts: parent.thread_ts!,
+                    oldest: lastReplyTs || oldest, // Only get new replies
+                    limit: 20,
+                });
+
+                const replyMessages = (replies.messages || [])
+                    // Skip the parent message itself (it's always first in replies)
+                    .filter((r) => r.ts !== parent.thread_ts && isHumanMessage(r));
+
+                if (replyMessages.length > 0) {
+                    // Update thread bookmark
+                    const newestReplyTs = replyMessages[replyMessages.length - 1]?.ts;
+                    if (newestReplyTs) this.lastCheckedThreads.set(threadKey, newestReplyTs);
+
+                    for (const reply of replyMessages) {
+                        await this.processMessage(
+                            reply.text!, reply.user || "unknown",
+                            channelId, channelName,
+                            reply.ts!, parent.thread_ts
+                        );
+                    }
+                }
+            } catch (err: any) {
+                // Thread may have been deleted or we lack access — non-fatal
+                if (!err.message?.includes("thread_not_found")) {
+                    console.warn(`  ⚠️ Thread reply fetch failed: ${err.message}`);
+                }
+            }
         }
     }
 
@@ -354,21 +399,15 @@ export class SlackWatchdog {
             finaleContext = await this.getFinaleStockContext(match.product.sku);
         }
 
-        // Step 6b: State Management with Pinecone to prevent repeat alerts
-        let pineconeStateId: string | null = null;
+        // Step 6b: In-memory dedup to prevent repeat alerts for the same request
         const uniqueThreadContext = threadTs || messageTs;
-        if (this.pc && match && match.product.sku !== 'N/A') {
-            try {
-                const stateIndex = this.pc.index(process.env.PINECONE_INDEX || 'gravity-memory');
-                pineconeStateId = `req_${channelId}_${uniqueThreadContext}_${match.product.sku}`;
-                const existing = await stateIndex.fetch([pineconeStateId]);
-                if (existing && existing.records && existing.records[pineconeStateId]) {
-                    console.log(`  💤 Skipping repeated request (already handled): ${pineconeStateId}`);
-                    return; // Silently ignore as we already notified Will about this request in this thread
-                }
-            } catch (err: any) {
-                console.warn("⚠️ Pinecone state check error:", err.message);
-            }
+        const dedupKey = match && match.product.sku !== 'N/A'
+            ? `req_${channelId}_${uniqueThreadContext}_${match.product.sku}`
+            : `req_${channelId}_${messageTs}`;
+
+        if (this.processedRequests.has(dedupKey)) {
+            console.log(`  💤 Skipping repeated request (already handled): ${dedupKey}`);
+            return;
         }
 
         // Step 7: Queue the detected request (Telegram digest only — NO Slack posting)
@@ -390,26 +429,8 @@ export class SlackWatchdog {
         this.pendingRequests.push(request);
         console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
 
-        // Step 8: Upsert to Pinecone State Memory to avoid duplicate alerts
-        if (this.pc && pineconeStateId) {
-            try {
-                const stateIndex = this.pc.index(process.env.PINECONE_INDEX || 'gravity-memory');
-                const vector = new Array(1024).fill(0.0001); // Safe dummy vector for gravity-memory (1024d)
-                await stateIndex.upsert([{
-                    id: pineconeStateId,
-                    values: vector,
-                    metadata: {
-                        text,
-                        channelId,
-                        threadTs: uniqueThreadContext,
-                        sku: match!.product.sku,
-                        processedAt: new Date().toISOString()
-                    }
-                }]);
-            } catch (err: any) {
-                console.warn("⚠️ Pinecone state upsert error:", err.message);
-            }
-        }
+        // Step 8: Mark as processed in dedup set
+        this.processedRequests.add(dedupKey);
     }
 
     /**

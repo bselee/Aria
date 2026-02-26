@@ -21,6 +21,17 @@
         },
         "notion": {
             "url": "https://mcp.notion.com/mcp"
+        },
+        "supabase": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@supabase/mcp-server-supabase@latest",
+                "--project-ref",
+                "wvpgkyrbhvywdxnuxymn",
+                "--access-token",
+                "sbp_cd8eced425c4e9ae6f43d70207164bec78c9ba1f"
+            ]
         }
     }
 }

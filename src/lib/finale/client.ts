@@ -209,6 +209,93 @@ export class FinaleClient {
     }
 
     /**
+     * Returns total quantity received (purchased) for a SKU over a rolling date range.
+     * Uses orderViewConnection with receiveDate filter + client-side SKU match.
+     * Designed for answering "how much did we buy last year" questions.
+     */
+    async getPurchasedQty(sku: string, daysBack: number = 365): Promise<{
+        sku: string;
+        totalQty: number;
+        orderCount: number;
+        orders: Array<{ orderId: string; receiveDate: string; supplier: string; qty: number }>;
+    }> {
+        const end = new Date();
+        const begin = new Date();
+        begin.setDate(begin.getDate() - daysBack);
+
+        const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+        const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+        const query = {
+            query: `
+                query {
+                    orderViewConnection(
+                        first: 200
+                        type: ["PURCHASE_ORDER"]
+                        receiveDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "receiveDate", mode: "desc" }]
+                    ) {
+                        edges {
+                            node {
+                                orderId
+                                status
+                                receiveDate
+                                supplier { name }
+                                itemList(first: 100) {
+                                    edges {
+                                        node {
+                                            product { productId }
+                                            quantity
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            `
+        };
+
+        try {
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return { sku, totalQty: 0, orderCount: 0, orders: [] };
+            const result = await res.json();
+            const edges = result.data?.orderViewConnection?.edges || [];
+
+            // Filter to Completed POs that contain this SKU
+            const matchingOrders: Array<{ orderId: string; receiveDate: string; supplier: string; qty: number }> = [];
+
+            for (const edge of edges) {
+                const po = edge.node;
+                if (po.status !== "Completed") continue;
+
+                for (const ie of (po.itemList?.edges || [])) {
+                    if (ie.node.product?.productId === sku) {
+                        matchingOrders.push({
+                            orderId: po.orderId,
+                            receiveDate: po.receiveDate || "",
+                            supplier: po.supplier?.name || "Unknown",
+                            qty: parseFloat(ie.node.quantity) || 0,
+                        });
+                        break; // one entry per PO
+                    }
+                }
+            }
+
+            const totalQty = matchingOrders.reduce((sum, o) => sum + o.qty, 0);
+            return { sku, totalQty, orderCount: matchingOrders.length, orders: matchingOrders };
+        } catch (err: any) {
+            console.error(`getPurchasedQty failed for ${sku}:`, err.message);
+            return { sku, totalQty: 0, orderCount: 0, orders: [] };
+        }
+    }
+
+    /**
      * Format today's received POs as a Slack message.
      * Clean, informative, links to each PO.
      */
@@ -364,6 +451,76 @@ export class FinaleClient {
         }
 
         return msg;
+    }
+
+    /**
+     * Fetch line items and Finale deep-link for a PO by its order number.
+     * Queries the last 30 days of POs via GraphQL and filters client-side by orderId.
+     * Only called when new tracking is detected — infrequent, cost is fine.
+     */
+    async getPOLineItems(poNumber: string): Promise<{
+        finaleUrl: string;
+        lineItems: Array<{ sku: string; qty: number }>;
+    } | null> {
+        try {
+            const now = new Date();
+            const from = new Date(now);
+            from.setDate(from.getDate() - 30);
+            const fromStr = from.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const toStr = new Date(now.getTime() + 86400000).toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 100
+                            type: ["PURCHASE_ORDER"]
+                            orderDate: { begin: "${fromStr}", end: "${toStr}" }
+                            sort: [{ field: "orderDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    orderId
+                                    orderUrl
+                                    itemList(first: 50) {
+                                        edges {
+                                            node {
+                                                product { productId }
+                                                quantity
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return null;
+            const result = await res.json();
+            const edges = result.data?.orderViewConnection?.edges || [];
+            const match = edges.find((e: any) => String(e.node.orderId) === String(poNumber));
+            if (!match) return null;
+
+            const encodedUrl = encodeURIComponent(match.node.orderUrl || "");
+            return {
+                finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                lineItems: (match.node.itemList?.edges || []).map((ie: any) => ({
+                    sku: ie.node.product?.productId || "?",
+                    qty: parseFloat(ie.node.quantity) || 0,
+                })),
+            };
+        } catch (err: any) {
+            console.warn(`[getPOLineItems] PO ${poNumber}: ${err.message}`);
+            return null;
+        }
     }
 
     /**
@@ -1195,6 +1352,350 @@ export class FinaleClient {
         }
 
         return response.json();
+    }
+
+    /**
+     * POST to Finale REST API (used for all write/modification operations).
+     * Finale uses POST for both creates and updates (full document replacement).
+     * 
+     * DECISION(2026-02-26): Finale's API uses POST for modifications, not PUT/PATCH.
+     * The entire document is sent back with modifications.
+     */
+    private async post(endpoint: string, body: any): Promise<any> {
+        const url = `${this.apiBase}${endpoint}`;
+
+        const response = await fetch(url, {
+            method: "POST",
+            headers: {
+                Authorization: this.authHeader,
+                Accept: "application/json",
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Finale API POST ${response.status}: ${response.statusText} — ${errorText.substring(0, 200)}`);
+        }
+
+        return response.json();
+    }
+
+    // ──────────────────────────────────────────────────
+    // WRITE OPERATIONS (Phase 1 — Invoice Reconciliation)
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Fee type IDs from Finale's productpromo system.
+     * These map invoice charge types to Finale's native fee/discount/tax entries
+     * which automatically feed into landed cost per unit and COGS.
+     * 
+     * Discovered via Phase 0 API inspection (2026-02-26).
+     */
+    static readonly FINALE_FEE_TYPES = {
+        FREIGHT: { id: "10007", url: "/buildasoilorganics/api/productpromo/10007", name: "Freight" },
+        TAX: { id: "10008", url: "/buildasoilorganics/api/productpromo/10008", name: "Tax" },
+        ESTIMATED_MAN: { id: "10009", url: "/buildasoilorganics/api/productpromo/10009", name: "Estimated Manual" },
+        ESTIMATED_PCT: { id: "10010", url: "/buildasoilorganics/api/productpromo/10010", name: "Estimated 15%" },
+        DISCOUNT_20: { id: "10011", url: "/buildasoilorganics/api/productpromo/10011", name: "Discount 20%" },
+        DISCOUNT_10: { id: "10012", url: "/buildasoilorganics/api/productpromo/10012", name: "Discount 10%" },
+        FREE: { id: "10013", url: "/buildasoilorganics/api/productpromo/10013", name: "Free" },
+        TARIFF: { id: "10014", url: "/buildasoilorganics/api/productpromo/10014", name: "Duties/Tariff" },
+        ALAN_TO_BAS: { id: "10015", url: "/buildasoilorganics/api/productpromo/10015", name: "Alan to BAS" },
+        LABOR: { id: "10016", url: "/buildasoilorganics/api/productpromo/10016", name: "Labor" },
+        SHIPPING: { id: "10017", url: "/buildasoilorganics/api/productpromo/10017", name: "Shipping" },
+    } as const;
+
+    /**
+     * Fetch full PO details via REST API.
+     * Returns the raw JSON document exactly as Finale stores it.
+     * Used as the basis for GET → Modify → POST write operations.
+     * 
+     * @param orderId - The Finale orderId (e.g., "124409" or "23339077-DropshipPO")
+     */
+    async getOrderDetails(orderId: string): Promise<any> {
+        return this.get(`/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`);
+    }
+
+    /**
+     * Add a fee/charge adjustment to a PO's orderAdjustmentList.
+     * This uses Finale's native fee system and automatically affects landed cost per unit.
+     * 
+     * DECISION(2026-02-26): Uses GET → Modify → POST pattern. Must call actionUrlEdit
+     * first if the PO is in Committed status to unlock it for editing.
+     * 
+     * @param orderId    - Finale order ID
+     * @param feeType    - One of FINALE_FEE_TYPES keys (FREIGHT, TAX, TARIFF, etc.)
+     * @param amount     - Dollar amount of the fee
+     * @param description - Optional override for the description (defaults to fee type name)
+     * @returns The updated order JSON, or throws on error
+     */
+    async addOrderAdjustment(
+        orderId: string,
+        feeType: keyof typeof FinaleClient.FINALE_FEE_TYPES,
+        amount: number,
+        description?: string
+    ): Promise<any> {
+        const fee = FinaleClient.FINALE_FEE_TYPES[feeType];
+        const encodedId = encodeURIComponent(orderId);
+
+        // 1. Fetch current PO state
+        const currentPO = await this.getOrderDetails(orderId);
+
+        // 2. If PO is committed (ORDER_LOCKED), unlock it for editing
+        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
+            await this.post(currentPO.actionUrlEdit, {});
+            // Re-fetch after unlocking — status and available actions change
+            const unlocked = await this.getOrderDetails(orderId);
+            Object.assign(currentPO, unlocked);
+        }
+
+        // 3. Add the new adjustment to the existing list
+        const adjustments = [...(currentPO.orderAdjustmentList || [])];
+        adjustments.push({
+            amount,
+            description: description || fee.name,
+            productPromoUrl: `/${this.accountPath}/api/productpromo/${fee.id}`,
+        });
+
+        // 4. POST the updated PO with the new adjustment
+        const updated = await this.post(
+            `/${this.accountPath}/api/order/${encodedId}`,
+            { ...currentPO, orderAdjustmentList: adjustments }
+        );
+
+        // 5. Re-commit if it was committed before
+        if (updated.actionUrlComplete) {
+            // Note: we don't auto-recommit — leave in editable state
+            // so the user can review in Finale UI if desired.
+        }
+
+        return updated;
+    }
+
+    /**
+     * Update a specific line item's unit price on a PO.
+     * Used when invoice price differs from PO price within auto-approval threshold.
+     * 
+     * @param orderId     - Finale order ID
+     * @param productId   - SKU of the line item to update
+     * @param newUnitPrice - New unit price from the invoice
+     * @returns Updated order JSON with the price change applied
+     */
+    async updateOrderItemPrice(
+        orderId: string,
+        productId: string,
+        newUnitPrice: number
+    ): Promise<{ updated: boolean; oldPrice: number; newPrice: number; orderData: any }> {
+        const encodedId = encodeURIComponent(orderId);
+        const currentPO = await this.getOrderDetails(orderId);
+
+        // Unlock if committed
+        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
+            await this.post(currentPO.actionUrlEdit, {});
+            const unlocked = await this.getOrderDetails(orderId);
+            Object.assign(currentPO, unlocked);
+        }
+
+        // Find the matching line item
+        const items = currentPO.orderItemList || [];
+        const targetItem = items.find((item: any) => item.productId === productId);
+
+        if (!targetItem) {
+            throw new Error(`Product ${productId} not found in PO ${orderId}`);
+        }
+
+        const oldPrice = targetItem.unitPrice;
+        targetItem.unitPrice = newUnitPrice;
+
+        // POST the full document back
+        const updated = await this.post(
+            `/${this.accountPath}/api/order/${encodedId}`,
+            currentPO
+        );
+
+        return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated };
+    }
+
+    /**
+     * Fetch full shipment details via REST API.
+     * @param shipmentUrl - Full shipment URL path (e.g., "/buildasoilorganics/api/shipment/577917")
+     */
+    async getShipmentDetails(shipmentUrl: string): Promise<any> {
+        return this.get(shipmentUrl);
+    }
+
+    /**
+     * Update tracking information on a shipment.
+     * Non-destructive: only modifies the fields you provide.
+     * 
+     * @param shipmentUrl  - Full shipment URL path from the PO's shipmentUrlList
+     * @param updates      - Fields to update
+     */
+    async updateShipmentTracking(
+        shipmentUrl: string,
+        updates: {
+            trackingCode?: string;
+            shipDate?: string;
+            receiveDateEstimated?: string;
+            privateNotes?: string;
+        }
+    ): Promise<any> {
+        // GET → Modify → POST
+        const current = await this.get(shipmentUrl);
+
+        if (updates.trackingCode !== undefined) current.trackingCode = updates.trackingCode;
+        if (updates.shipDate !== undefined) current.shipDate = updates.shipDate;
+        if (updates.receiveDateEstimated !== undefined) current.receiveDateEstimated = updates.receiveDateEstimated;
+        if (updates.privateNotes !== undefined) {
+            // Append to existing notes rather than overwrite
+            const existing = current.privateNotes || "";
+            current.privateNotes = existing
+                ? `${existing}\n${updates.privateNotes}`
+                : updates.privateNotes;
+        }
+
+        return this.post(shipmentUrl, current);
+    }
+
+    /**
+     * Resolve a Finale PO by its orderId and return a summary for matching.
+     * Enriches the raw data with supplier name for easier correlation.
+     */
+    async getOrderSummary(orderId: string): Promise<{
+        orderId: string;
+        orderDate: string;
+        status: string;
+        supplier: string;
+        total: number;
+        items: Array<{ productId: string; unitPrice: number; quantity: number; description: string }>;
+        adjustments: Array<{ description: string; amount: number }>;
+        shipmentUrls: string[];
+        orderUrl: string;
+    } | null> {
+        try {
+            const po = await this.getOrderDetails(orderId);
+
+            // Resolve supplier name from role list
+            let supplier = "Unknown";
+            const supplierRole = (po.orderRoleList || []).find((r: any) => r.roleTypeId === "SUPPLIER");
+            if (supplierRole?.partyId) {
+                try {
+                    supplier = await this.resolvePartyName(
+                        `/${this.accountPath}/api/partygroup/${supplierRole.partyId}`
+                    );
+                } catch {
+                    supplier = `Party#${supplierRole.partyId}`;
+                }
+            }
+
+            return {
+                orderId: po.orderId,
+                orderDate: po.orderDate || "",
+                status: po.statusId || "",
+                supplier,
+                total: po.orderItemListTotal || 0,
+                items: (po.orderItemList || [])
+                    .filter((item: any) => item.productId)
+                    .map((item: any) => ({
+                        productId: item.productId,
+                        unitPrice: item.unitPrice || 0,
+                        quantity: item.quantity || 0,
+                        description: item.itemDescription || "",
+                    })),
+                adjustments: (po.orderAdjustmentList || []).map((adj: any) => ({
+                    description: adj.description || "",
+                    amount: adj.amount || 0,
+                })),
+                shipmentUrls: po.shipmentUrlList || [],
+                orderUrl: po.orderUrl,
+            };
+        } catch (err: any) {
+            console.error(`Failed to get order summary for ${orderId}:`, err.message);
+            return null;
+        }
+    }
+
+    /**
+     * Resolve a Finale PO by supplier name and approximate date.
+     * Used for fuzzy matching when invoice doesn't include a PO number.
+     * Returns the best matching PO from recent orders.
+     */
+    async findPOByVendorAndDate(
+        vendorName: string,
+        invoiceDate: string,
+        dayWindow: number = 30
+    ): Promise<Array<{
+        orderId: string;
+        orderDate: string;
+        supplier: string;
+        total: number;
+        status: string;
+    }>> {
+        try {
+            const targetDate = new Date(invoiceDate);
+            const beginDate = new Date(targetDate);
+            beginDate.setDate(beginDate.getDate() - dayWindow);
+            const endDate = new Date(targetDate);
+            endDate.setDate(endDate.getDate() + 7); // Small forward window
+
+            const begin = beginDate.toISOString().split("T")[0];
+            const end = endDate.toISOString().split("T")[0];
+
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 50
+                        type: ["PURCHASE_ORDER"]
+                        orderDate: { begin: "${begin}", end: "${end}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges {
+                            node {
+                                orderId
+                                orderUrl
+                                status
+                                orderDate
+                                total
+                                supplier { name }
+                            }
+                        }
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            const edges = result.data?.orderViewConnection?.edges || [];
+
+            // Filter by vendor name (case-insensitive partial match)
+            const vendorLower = vendorName.toLowerCase();
+            return edges
+                .filter((e: any) => {
+                    const supplierName = (e.node.supplier?.name || "").toLowerCase();
+                    return supplierName.includes(vendorLower) || vendorLower.includes(supplierName);
+                })
+                .map((e: any) => ({
+                    orderId: e.node.orderId,
+                    orderDate: e.node.orderDate || "",
+                    supplier: e.node.supplier?.name || "Unknown",
+                    total: parseFloat(e.node.total) || 0,
+                    status: e.node.status || "",
+                }));
+        } catch (err: any) {
+            console.error(`Failed vendor+date PO search:`, err.message);
+            return [];
+        }
     }
 
     /**
