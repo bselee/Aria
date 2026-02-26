@@ -172,12 +172,16 @@ Classify carefully based on the sender, subject and text snippet.`;
                         if (base64Data) {
                             processedAnyPDF = true;
 
-                            // 1. Process Database & Extraction matching
-                            const buffer = Buffer.from(base64Data, "base64");
-                            await this.processInvoiceBuffer(buffer, part.filename!, subject, from, supabase);
-
-                            // 2. Forward strictly to buildasoilap@bill.com
+                            // 1. Forward strictly to buildasoilap@bill.com IMMEDIATELY
+                            // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
                             await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+
+                            // 2. Process Database & Extraction matching in the background
+                            // We do this non-blocking so it doesn't hold up the pipeline if it fails
+                            const buffer = Buffer.from(base64Data, "base64");
+                            this.processInvoiceBuffer(buffer, part.filename!, subject, from, supabase).catch(err => {
+                                console.error(`     ❌ Background matching failed for ${part.filename!}:`, err);
+                            });
                         }
                     }
                 }
