@@ -26,7 +26,8 @@ import { FinaleClient } from "../finale/client";
 const RequestExtractionSchema = z.object({
     isProductRequest: z.boolean().describe("True ONLY if someone is explicitly asking for a product to be ordered, restocked, or procured — NOT mere wishes, casual mentions, or hypothetical desires"),
     hasExplicitAsk: z.boolean().describe("True only if the message contains an actual directive or ask (e.g. 'can we order', 'we need to get', 'please order', 'can you grab') — NOT just an expression of wanting or liking something"),
-    itemDescription: z.string().describe("The product, material, or supply being requested — use the most specific name possible"),
+    itemDescription: z.string().describe("The PRIMARY product, material, or supply being requested — use the most specific name or SKU possible"),
+    allItems: z.array(z.string()).describe("ALL distinct products, materials, or SKUs mentioned in the request. If multiple SKUs or products are listed (e.g. 'BLM207, BLM209, ALK101'), include each one separately. Always includes itemDescription as the first entry."),
     quantity: z.number().optional().describe("How many units requested, if mentioned"),
     urgency: z.enum(["low", "medium", "high"]).describe("low = general mention, medium = clearly needs it, high = urgent/ASAP language"),
     confidence: z.number().min(0).max(1).describe("How confident you are this is a real, actionable product request (0.0-1.0)"),
@@ -395,10 +396,28 @@ export class SlackWatchdog {
         // Step 5: Resolve user name
         const userName = await this.resolveUserName(userId);
 
-        // Step 6: Query Finale for real-time stock context on matched product
+        // Step 6: Query Finale for real-time stock context on ALL items in the request.
+        // If message contained explicit SKU codes (e.g. BLM207, S-445), look each up directly.
+        // Fall back to fuzzy-matched product if no explicit SKUs found.
+        // Regex covers: BLM207, ALK101, NC104, DOM101 (letters+digits) AND S-445 (letter-digits)
         let finaleContext: string | null = null;
-        if (match && match.product.sku !== 'N/A') {
-            finaleContext = await this.getFinaleStockContext(match.product.sku);
+        const skuPattern = /\b([A-Z]{1,6}-?[0-9]{2,5}(?:-[A-Z0-9]+)?)\b/g;
+        const explicitSkus = [...new Set(
+            [...text.matchAll(skuPattern)].map(m => m[1])
+        )];
+
+        const skusToLookup = explicitSkus.length > 0
+            ? explicitSkus.slice(0, 6) // cap at 6 to avoid hammering Finale
+            : (match && match.product.sku !== 'N/A' ? [match.product.sku] : []);
+
+        if (skusToLookup.length > 0) {
+            const contexts: string[] = [];
+            for (const sku of skusToLookup) {
+                const ctx = await this.getFinaleStockContext(sku);
+                if (ctx) contexts.push(`  *${sku}*: ${ctx}`);
+                else contexts.push(`  *${sku}*: not found in Finale`);
+            }
+            if (contexts.length > 0) finaleContext = contexts.join('\n');
         }
 
         // Step 6b: In-memory dedup to prevent repeat alerts for the same request
@@ -483,7 +502,9 @@ NEGATIVE — isProductRequest=false:
 - Anything without a specific product mentioned
 
 KEY RULE: If the message trails off ("but...", "though...", "maybe...") or uses hedging language without a clear ask, set hasExplicitAsk=false. A real request has someone directing action.
-Set confidence < 0.5 for anything ambiguous.`,
+Set confidence < 0.5 for anything ambiguous.
+
+MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, BLM209, ALK101, NC104"), set itemDescription to the first/primary one AND populate allItems with EVERY item mentioned as separate entries. Preserve exact SKU codes (like BLM207, S-445) as-is.`,
             prompt: text,
             schema: RequestExtractionSchema,
             schemaName: "ProductRequestAnalysis",
@@ -551,35 +572,37 @@ Set confidence < 0.5 for anything ambiguous.`,
     // ──────────────────────────────────────────────────
 
     /**
-     * Query Finale for a concise stock summary of a matched product.
-     * Returns a one-liner like: "Stock: 450 on hand · Stockout in 23d · 1 PO incoming"
-     * Returns null if Finale data is unavailable or the SKU isn't tracked.
+     * Query Finale for a concise stock summary of any SKU.
+     * Uses getComponentStockProfile (GraphQL productViewConnection) — works for ALL Finale
+     * products regardless of whether they have a BOM or are pure purchased items.
+     * Returns a one-liner like: "450 on hand · Stockout in 23d · PO incoming"
+     * Returns null if Finale has no data for the SKU.
      */
     private async getFinaleStockContext(sku: string): Promise<string | null> {
         try {
-            // Using getBOMConsumption to pull exact velocity, stockout, and on-hand
-            const report = await this.finaleClient.getBOMConsumption(sku, 30);
-            if (!report || report.currentStock === null) return null;
+            const profile = await this.finaleClient.getComponentStockProfile(sku);
+            if (!profile.hasFinaleData) return null;
 
             const parts: string[] = [];
 
-            parts.push(`Stock: ${report.currentStock.toLocaleString()}`);
+            if (profile.onHand !== null) parts.push(`${profile.onHand.toLocaleString()} on hand`);
+            if (profile.onOrder !== null && profile.onOrder > 0) parts.push(`${profile.onOrder} on order`);
 
-            if (report.dailyRate > 0) {
-                parts.push(`Velocity: ~${report.dailyRate.toFixed(1)}/day`);
-            }
-
-            if (report.estimatedDaysLeft !== null) {
-                if (report.estimatedDaysLeft <= 14) {
-                    parts.push(`\u26a0\ufe0f Stockout in ${report.estimatedDaysLeft}d!`);
-                } else if (report.estimatedDaysLeft <= 30) {
-                    parts.push(`Stockout in ${report.estimatedDaysLeft}d`);
+            if (profile.stockoutDays !== null) {
+                if (profile.stockoutDays <= 14) {
+                    parts.push(`⚠️ Stockout in ${profile.stockoutDays}d!`);
+                } else if (profile.stockoutDays <= 30) {
+                    parts.push(`Stockout in ${profile.stockoutDays}d`);
                 } else {
-                    parts.push(`${report.estimatedDaysLeft}d runway`);
+                    parts.push(`${profile.stockoutDays}d runway`);
                 }
             }
 
-            return parts.length > 0 ? parts.join(' · ') : null;
+            if (profile.incomingPOs.length > 0) {
+                parts.push(`${profile.incomingPOs.length} PO incoming`);
+            }
+
+            return parts.length > 0 ? parts.join(' · ') : `in Finale, no stock data`;
         } catch {
             return null;
         }
@@ -629,24 +652,29 @@ Set confidence < 0.5 for anything ambiguous.`,
                 req.analysis.urgency === "medium" ? "🟡" : "🟢";
 
             const matchLine = req.matchedProduct
-                ? `✅ Matched: \`${req.matchedProduct.sku}\` — ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
-                : `⚠️ No exact SKU match — may need manual lookup`;
+                ? `✅ Catalog match: \`${req.matchedProduct.sku}\` — ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
+                : `⚠️ No catalog match — see Finale data below`;
 
             const poLine = req.activePO
                 ? `📋 Active PO: #${req.activePO} — ${req.eta}`
                 : `📭 No active PO found`;
 
+            // Show all requested items (multi-SKU aware)
+            const allItems = req.analysis.allItems?.length > 1
+                ? req.analysis.allItems.join(', ')
+                : req.analysis.itemDescription;
+
             message +=
                 `${urgencyEmoji} *${req.userName}* in #${req.channel}\n` +
                 `💬 _"${req.originalText.substring(0, 120)}"_\n` +
-                `📦 Wants: ${req.analysis.itemDescription}` +
+                `📦 Wants: ${allItems}` +
                 `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
                 `${matchLine}\n` +
                 `${poLine}\n`;
 
-            // Add Finale stock context if available
+            // Add Finale stock context (per-SKU breakdown if multiple)
             if (req.finaleContext) {
-                message += `📈 ${req.finaleContext}\n`;
+                message += `📈 Finale:\n${req.finaleContext}\n`;
             }
 
             message += `\n`;

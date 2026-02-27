@@ -165,8 +165,21 @@ Classify carefully based on the sender, subject and text snippet.`;
 
                 // --- INVOICE PROCESSING ---
                 let processedAnyPDF = false;
-                const parts = payload?.parts || [];
-                const pdfParts = parts.filter((p: any) => p.mimeType === "application/pdf" && p.filename);
+                // Recursive part walker: vendors using Outlook/Gmail sometimes nest
+                // PDFs under multipart/mixed → multipart/related → attachment.
+                // A flat .parts scan misses these.
+                const pdfParts: any[] = [];
+                function walkParts(parts: any[]): void {
+                    for (const part of parts) {
+                        if (part.mimeType === "application/pdf" && part.filename) {
+                            pdfParts.push(part);
+                        }
+                        if (part.parts?.length) {
+                            walkParts(part.parts);
+                        }
+                    }
+                }
+                walkParts(payload?.parts || []);
 
                 for (const part of pdfParts) {
                     if (part.body?.attachmentId) {
@@ -298,6 +311,9 @@ Classify carefully based on the sender, subject and text snippet.`;
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
                 tax: invoiceData.tax || 0,
+                tariff: invoiceData.tariff || 0,
+                labor: invoiceData.labor || 0,
+                tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
                 status: matchResult.matched ? (matchResult.autoApprove ? "matched_approved" : "matched_review") : "unmatched",
@@ -458,6 +474,7 @@ Classify carefully based on the sender, subject and text snippet.`;
                 action_taken: result.autoApplicable
                     ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
                     : `Flagged for review: ${result.overallVerdict}`,
+                notified_slack: !!this.slack,
                 metadata: {
                     orderId: result.orderId,
                     invoiceNumber: result.invoiceNumber,
@@ -555,7 +572,8 @@ Classify carefully based on the sender, subject and text snippet.`;
         emailSubject: string,
         intent: string,
         actionTaken: string,
-        metadata?: Record<string, any>
+        metadata?: Record<string, any>,
+        notifiedSlack: boolean = false
     ) {
         if (!supabase) return;
         try {
@@ -564,6 +582,7 @@ Classify carefully based on the sender, subject and text snippet.`;
                 email_subject: emailSubject,
                 intent,
                 action_taken: actionTaken,
+                notified_slack: notifiedSlack,
                 metadata: metadata || null
             });
         } catch (err: any) {

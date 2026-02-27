@@ -125,14 +125,14 @@ export class FinaleClient {
      * DECISION(2026-02-24): status + receiveDate filters conflict in Finale's
      * GraphQL API, so we filter for Completed client-side.
      */
-    async getTodaysReceivedPOs(): Promise<ReceivedPO[]> {
+    async getTodaysReceivedPOs(startDate?: string, endDate?: string): Promise<ReceivedPO[]> {
         try {
             // Get today's date in YYYY-MM-DD format (Mountain Time)
             const now = new Date();
-            const today = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const today = startDate || now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const tomorrow = new Date(now);
             tomorrow.setDate(tomorrow.getDate() + 1);
-            const tomorrowStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
             const query = {
                 query: `
@@ -331,13 +331,13 @@ export class FinaleClient {
     /**
      * Fetch POs committed today via GraphQL.
      */
-    async getTodaysCommittedPOs(): Promise<ReceivedPO[]> {
+    async getTodaysCommittedPOs(startDate?: string, endDate?: string): Promise<ReceivedPO[]> {
         try {
             const now = new Date();
-            const today = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const today = startDate || now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const tomorrow = new Date(now);
             tomorrow.setDate(tomorrow.getDate() + 1);
-            const tomorrowStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
             const query = {
                 query: `
@@ -465,7 +465,7 @@ export class FinaleClient {
         try {
             const now = new Date();
             const from = new Date(now);
-            from.setDate(from.getDate() - 30);
+            from.setDate(from.getDate() - 90);
             const fromStr = from.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const toStr = new Date(now.getTime() + 86400000).toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
@@ -506,7 +506,7 @@ export class FinaleClient {
             if (!res.ok) return null;
             const result = await res.json();
             const edges = result.data?.orderViewConnection?.edges || [];
-            const match = edges.find((e: any) => String(e.node.orderId) === String(poNumber));
+            const match = edges.find((e: any) => String(e.node.orderId).replace(/^PO-/i, '') === String(poNumber));
             if (!match) return null;
 
             const encodedUrl = encodeURIComponent(match.node.orderUrl || "");
