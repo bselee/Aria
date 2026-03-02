@@ -2,51 +2,51 @@ import { z } from "zod";
 import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const LineItemSchema = z.object({
-    lineNumber: z.number().optional(),
-    sku: z.string().optional(),
+    lineNumber: z.number().nullable().optional(),
+    sku: z.string().nullable().optional(),
     description: z.string(),
     qty: z.number(),
-    unit: z.string().optional(),         // "EA", "LB", "BAG", "PALLET"
+    unit: z.string().nullable().optional(),   // "EA", "LB", "BAG", "PALLET"
     unitPrice: z.number(),
-    discount: z.number().optional(),
+    discount: z.number().nullable().optional(),
     total: z.number(),
-    poLineRef: z.string().optional(),         // Reference back to PO line
+    poLineRef: z.string().nullable().optional(),  // Reference back to PO line
 });
 
 export const InvoiceSchema = z.object({
     documentType: z.literal("invoice"),
     invoiceNumber: z.string(),
-    poNumber: z.string().optional(),
-    orderNumber: z.string().optional(),
+    poNumber: z.string().nullable().optional(),
+    orderNumber: z.string().nullable().optional(),
     vendorName: z.string(),
-    vendorAddress: z.string().optional(),
-    vendorPhone: z.string().optional(),
-    vendorEmail: z.string().optional(),
-    vendorWebsite: z.string().optional(),
-    billTo: z.string().optional(),
-    shipTo: z.string().optional(),
+    vendorAddress: z.string().nullable().optional(),
+    vendorPhone: z.string().nullable().optional(),
+    vendorEmail: z.string().nullable().optional(),
+    vendorWebsite: z.string().nullable().optional(),
+    billTo: z.string().nullable().optional(),
+    shipTo: z.string().nullable().optional(),
     invoiceDate: z.string(),               // YYYY-MM-DD
-    dueDate: z.string().optional(),
-    shipDate: z.string().optional(),
-    paymentTerms: z.string().optional(),    // "Net 30", "2/10 Net 30", etc.
+    dueDate: z.string().nullable().optional(),
+    shipDate: z.string().nullable().optional(),
+    paymentTerms: z.string().nullable().optional(),  // "Net 30", "2/10 Net 30", etc.
     lineItems: z.array(LineItemSchema),
     subtotal: z.number(),
-    freight: z.number().optional(),
-    fuelSurcharge: z.number().optional(),
-    tax: z.number().optional(),
-    tariff: z.number().optional(),            // Duties, tariffs, import fees
-    labor: z.number().optional(),             // Labor, handling, processing fees
-    discount: z.number().optional(),
+    freight: z.number().nullable().optional(),
+    fuelSurcharge: z.number().nullable().optional(),
+    tax: z.number().nullable().optional(),
+    tariff: z.number().nullable().optional(),         // Duties, tariffs, import fees
+    labor: z.number().nullable().optional(),          // Labor, handling, processing fees
+    discount: z.number().nullable().optional(),
     total: z.number(),
-    amountPaid: z.number().optional(),
+    amountPaid: z.number().nullable().optional(),
     amountDue: z.number(),
-    currency: z.string().default("USD"),
-    trackingNumbers: z.array(z.string()).optional(),
-    proNumber: z.string().optional(),     // LTL PRO number
-    bolNumber: z.string().optional(),
-    carrierName: z.string().optional(),
-    remitTo: z.string().optional(),
-    notes: z.string().optional(),
+    currency: z.string().nullable().optional(),
+    trackingNumbers: z.array(z.string()).nullable().optional(),
+    proNumber: z.string().nullable().optional(),  // LTL PRO number
+    bolNumber: z.string().nullable().optional(),
+    carrierName: z.string().nullable().optional(),
+    remitTo: z.string().nullable().optional(),
+    notes: z.string().nullable().optional(),
     confidence: z.enum(["high", "medium", "low"]),
 });
 
@@ -74,7 +74,7 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
     try {
         const data = await unifiedObjectGeneration({
             system: INVOICE_SYSTEM_PROMPT,
-            prompt: `Invoice text:\n${rawText.slice(0, 8000)}${tableContext}`,
+            prompt: `Invoice text:\n${rawText.slice(0, 20000)}${tableContext}`,
             schema: InvoiceSchema,
             schemaName: "Invoice"
         });

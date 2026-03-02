@@ -125,6 +125,17 @@ export async function approvePendingReconciliation(id: string): Promise<{
                     errors: applyResult.errors,
                 },
             });
+
+            // LEARNING: Write vendor_name back to the purchase_orders row so that
+            // future exact PO# matches (Strategy 1 in matcher) have vendor data.
+            // Also helps watchdog product catalog builds that rely on this table.
+            if (entry.result.vendorName && entry.result.orderId) {
+                await supabase.from("purchase_orders").upsert({
+                    po_number: entry.result.orderId,
+                    vendor_name: entry.result.vendorName,
+                    status: "open",
+                }, { onConflict: "po_number", ignoreDuplicates: false });
+            }
         }
     } catch (logErr: any) {
         console.warn(`⚠️ Failed to log approval to activity log: ${logErr.message}`);
@@ -593,7 +604,7 @@ function reconcileLineItems(
 
     for (const invLine of invoice.lineItems) {
         // Try to match by SKU first, then by fuzzy description
-        const poLine = findMatchingPOLine(invLine, po.items);
+        const poLine = findMatchingPOLine({ ...invLine, sku: invLine.sku ?? undefined }, po.items);
 
         if (!poLine) {
             // Invoice has a line item not found in PO — info only, don't block
@@ -831,8 +842,8 @@ function reconcileTracking(invoice: InvoiceData): TrackingUpdate | null {
 
     return {
         trackingNumbers,
-        shipDate: invoice.shipDate,
-        carrierName: invoice.carrierName,
+        shipDate: invoice.shipDate ?? undefined,
+        carrierName: invoice.carrierName ?? undefined,
     };
 }
 

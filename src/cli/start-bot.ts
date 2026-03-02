@@ -10,6 +10,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
+import * as http from 'http';
 import { Telegraf } from 'telegraf';
 import axios from 'axios';
 import OpenAI from 'openai';
@@ -27,7 +28,19 @@ import { SlackWatchdog } from '../lib/slack/watchdog';
 import {
     approvePendingReconciliation,
     rejectPendingReconciliation,
+    reconcileInvoiceToPO,
+    applyReconciliation,
+    storePendingApproval,
 } from '../lib/finale/reconciler';
+
+// Tracks chats where we're waiting for Will to type a Finale PO# for a manual match.
+// chatId → dropship store ID. Cleared after use (or on next text message).
+const pendingPoEntry = new Map<number, string>();
+import {
+    getPendingDropship,
+    removePendingDropship,
+    getAllPendingDropships,
+} from '../lib/intelligence/dropship-store';
 
 // ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
@@ -344,6 +357,12 @@ bot.command('buildrisk', async (ctx) => {
         });
 
         await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
+
+        // Persist snapshot to Supabase for dashboard (fire-and-forget)
+        setImmediate(async () => {
+            const { saveBuildRiskSnapshot } = await import('../lib/builds/build-risk-logger');
+            await saveBuildRiskSnapshot(report);
+        });
 
         // Follow-up: Ask about unrecognized SKUs
         if (report.unrecognizedSkus.length > 0) {
@@ -1048,6 +1067,427 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 });
 
 // ──────────────────────────────────────────────────
+// SHARED LLM PROCESSING — Telegram handler + Dashboard HTTP bridge
+// ──────────────────────────────────────────────────
+
+async function processTextMessage(text: string, chatId: number): Promise<string> {
+    if (!chatHistory[chatId]) chatHistory[chatId] = [];
+    chatHistory[chatId].push({ role: "user", content: text });
+    if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
+
+    let memoryContext = '';
+    try {
+        const { getRelevantContext } = await import('../lib/intelligence/memory');
+        memoryContext = await getRelevantContext(text);
+    } catch { /* memory unavailable, continue without */ }
+
+    const runtimeRules = `
+
+## CRITICAL: BIAS TO ACTION
+You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
+
+### Tool selection rules:
+- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
+- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
+- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
+- Weather → use get_weather
+- Emails → use list_recent_emails
+
+### Anti-clarification rules:
+- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
+- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
+- If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
+- If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.
+
+### Follow-up conversation rules:
+- When the previous message analyzed a file or returned data, ALL follow-up questions refer to THAT context.
+- "product amount not money or cost" after a PO analysis = asking about unit quantities, not dollar amounts. Answer from the prior data.
+- "this sku" / "this one" / "that product" = the SKU most recently discussed or visible in the prior message. Use it.
+- "how many" / "what quantity" / "units" after a file analysis = re-interpret the prior analysis for quantity metrics.
+- NEVER say "It sounds like you're looking for..." — just answer directly from context.
+- NEVER say "Just provide the product name or SKU" if one was already discussed in this conversation.
+- NEVER say "let me handle it" or "I'll dive right in" without actually doing something.
+- If the user's message is short and ambiguous, look at the prior assistant message — it almost certainly provides the missing context.
+
+### LIVE DATA RULE — always validate with tools:
+Memory context (above) is BACKGROUND ONLY — it tells you patterns, processes, and history, NOT current values.
+For ANYTHING that can change, you MUST call the appropriate tool to get live data. Do NOT answer from memory alone.
+- Prices / costs / unit cost → call lookup_product or get_purchase_history
+- Stock levels / on-hand / on-order → call lookup_product
+- PO status / open POs / what's in transit → call query_purchase_orders
+- Consumption rates / demand → call get_consumption
+- Vendor payment terms / contacts → call query_vendors
+- Invoice status → call query_invoices
+Rule: if the answer could be stale (anything numeric, status-based, or date-based), CALL THE TOOL. Always.
+
+### When a tool returns no result:
+- If lookup_product returns nothing: say "Not found in Finale — tried SKU [X]." Stop there.
+- If search returns no match: say "No match in Finale for [X]." Stop there.
+- NEVER suggest Will go check something himself. You are the one who checks.
+
+### HOLLOW FILLER — never use these (they add zero value):
+- "What's next on the agenda?" / "What's our next task?" / "What's next?" — only reference next steps if you have a SPECIFIC, concrete one to name
+- "Let me know if you need anything else" — empty, skip it
+- "Hope that helps!" — never
+- "It might be worth double-checking" — you checked. Report what you found, that's it.
+- "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
+- Any generic offer that could apply to ANY response (if it has no specifics, cut it)
+
+### Persona — always ON:
+- Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
+- End responses with genuine engagement when there's something real to engage with — a specific observation, a risk you noticed, a quick recommendation.
+- If a tool result reveals something interesting or concerning, comment on it briefly. That's not filler, that's signal.
+- Will likes directness. Get to the answer first, then add color.`;
+
+    let reply = "";
+
+    if (openai) {
+        const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+            {
+                type: "function",
+                function: {
+                    name: "get_weather",
+                    description: "Get real-time weather information for a specific location.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            location: { type: "string", description: "City and State, e.g. Montrose, CO" }
+                        },
+                        required: ["location"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "list_recent_emails",
+                    description: "List the 5 most recent emails from the inbox.",
+                    parameters: { type: "object", properties: {} }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "perplexity_search",
+                    description: "Search the internet for real-time information.",
+                    parameters: {
+                        type: "object",
+                        properties: { query: { type: "string" } },
+                        required: ["query"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "lookup_product",
+                    description: "Look up a SPECIFIC product in Finale Inventory by EXACT SKU. Returns stock, lead time, supplier, cost, and reorder info. Only use this when you know the exact SKU.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            sku: { type: "string", description: "The exact product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
+                        },
+                        required: ["sku"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "search_products",
+                    description: "Search Finale Inventory for products by keyword in name or description. Use this when Will asks to find, list, or search for products by name, ingredient, vendor, or description — e.g. 'kashi skus', 'kelp products', 'find castings items'. Returns matching SKUs with stock levels.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            keyword: { type: "string", description: "Search keyword to match against product names and SKUs (e.g. 'kashi', 'kelp', 'castings', 'bag')" },
+                            limit: { type: "number", description: "Max results to return (default 20)" }
+                        },
+                        required: ["keyword"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "get_consumption",
+                    description: "Get BOM consumption and stock info for a specific SKU over a number of days. Use this when the user asks for consumption of a SKU, e.g., 'consumption for KM106' or '/consumption KM106'.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            sku: { type: "string", description: "The exact product SKU/ID (e.g. KM106, S-12527)" },
+                            days: { type: "number", description: "Number of days to analyze (default 90)" }
+                        },
+                        required: ["sku"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "build_risk_analysis",
+                    description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
+                    parameters: { type: "object", properties: {} }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "get_purchase_history",
+                    description: "Get the total quantity purchased/received for a specific SKU over a time period. Use this when the user asks 'how much was purchased', 'total received', 'purchase history', or 'how much did we buy' for a product. Returns exact PO quantities from Finale.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            sku: { type: "string", description: "The exact product SKU/ID (e.g. PLQ101, KM106)" },
+                            days: { type: "number", description: "Number of days back to search (default 365)" }
+                        },
+                        required: ["sku"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "query_vendors",
+                    description: "Look up vendor info from our database by name. Returns payment terms, contact, AR email, total spend, last order date. Use when Will asks about a specific vendor, payment terms, who to contact, or vendor history.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            name: { type: "string", description: "Partial or full vendor name to search (e.g. 'AAA Cooper', 'Kashi', 'BioAg')" }
+                        },
+                        required: ["name"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "query_invoices",
+                    description: "Query invoices from our database. Use when Will asks about invoice status, unmatched invoices, overdue invoices, or invoice amounts. Filter by status: 'pending', 'matched', 'unmatched', 'paid', 'overdue'.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
+                            status: { type: "string", description: "Filter by status: pending, matched, unmatched, paid, overdue" },
+                            limit: { type: "number", description: "Max results (default 10)" }
+                        }
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "query_purchase_orders",
+                    description: "Query purchase orders from our database. Use when Will asks about open POs, PO status, what's on order, or expected deliveries. Filter by status: 'open', 'received', 'closed', 'partial'.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
+                            status: { type: "string", description: "Filter by status: open, received, closed, partial" },
+                            limit: { type: "number", description: "Max results (default 10)" }
+                        }
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "query_action_items",
+                    description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for follow-up. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            limit: { type: "number", description: "Max results (default 10)" }
+                        }
+                    }
+                }
+            }
+        ];
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-4o",
+            messages: [
+                { role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules },
+                ...chatHistory[chatId]
+            ],
+            tools,
+            tool_choice: "auto",
+        });
+
+        const message = response.choices[0].message;
+
+        if (message.tool_calls) {
+            const toolResults: any[] = [];
+            for (const toolCall of message.tool_calls) {
+                const args = JSON.parse(toolCall.function.arguments);
+                let result = "";
+
+                if (toolCall.function.name === "get_weather") {
+                    const Firecrawl = require('@mendable/firecrawl-js').default;
+                    const app = new Firecrawl({ apiKey: process.env.FIRECRAWL_API_KEY });
+                    const scrape = await app.scrapeUrl(`https://duckduckgo.com/?q=weather+in+${encodeURIComponent(args.location)}`, { formats: ['markdown'] });
+                    result = scrape.success ? scrape.markdown : "Could not retrieve weather.";
+                } else if (toolCall.function.name === "perplexity_search" && perplexity) {
+                    const res = await perplexity.chat.completions.create({
+                        model: "sonar-reasoning",
+                        messages: [{ role: "user", content: args.query }]
+                    });
+                    result = res.choices[0].message.content || "";
+                } else if (toolCall.function.name === "list_recent_emails") {
+                    const auth = await getAuthenticatedClient("default");
+                    const gmail = google.gmail({ version: "v1", auth });
+                    const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
+                    result = JSON.stringify(data.messages);
+                } else if (toolCall.function.name === "lookup_product") {
+                    const report = await finale.productReport(args.sku);
+                    result = report.telegramMessage;
+                } else if (toolCall.function.name === "get_purchase_history") {
+                    const purchased = await finale.getPurchasedQty(args.sku, args.days || 365);
+                    if (purchased.totalQty > 0) {
+                        result = `${args.sku}: Purchased ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s) in the last ${args.days || 365} days.`;
+                    } else {
+                        result = `${args.sku}: No purchase/receiving records found in the last ${args.days || 365} days.`;
+                    }
+                } else if (toolCall.function.name === "search_products") {
+                    const searchResult = await finale.searchProducts(args.keyword, args.limit || 20);
+                    result = searchResult.telegramMessage;
+                } else if (toolCall.function.name === "get_consumption") {
+                    const report = await finale.getBOMConsumption(args.sku, args.days || 90);
+                    result = report.telegramMessage;
+                } else if (toolCall.function.name === "build_risk_analysis") {
+                    const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
+                    const report = await runBuildRiskAnalysis(30, () => { });
+                    result = report.slackMessage;
+                } else if (toolCall.function.name === "query_vendors") {
+                    const { createClient } = await import('../lib/supabase');
+                    const db = createClient();
+                    if (!db) {
+                        result = "Supabase not configured.";
+                    } else {
+                        const { data, error } = await db.from('vendors')
+                            .select('name, aliases, payment_terms, contact_name, contact_email, ar_email, category, total_spend, last_order_date, average_payment_days')
+                            .ilike('name', `%${args.name}%`)
+                            .limit(5);
+                        if (error) result = `DB error: ${error.message}`;
+                        else if (!data?.length) result = `No vendors found matching "${args.name}".`;
+                        else result = JSON.stringify(data, null, 2);
+                    }
+                } else if (toolCall.function.name === "query_invoices") {
+                    const { createClient } = await import('../lib/supabase');
+                    const db = createClient();
+                    if (!db) {
+                        result = "Supabase not configured.";
+                    } else {
+                        let q = db.from('invoices')
+                            .select('invoice_number, po_number, total_amount, due_date, status, discrepancies, created_at, vendors(name)')
+                            .order('created_at', { ascending: false })
+                            .limit(args.limit || 10);
+                        if (args.status) q = q.eq('status', args.status);
+                        if (args.vendor_name) {
+                            const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
+                            if (vd?.length) q = q.eq('vendor_id', vd[0].id);
+                        }
+                        const { data, error } = await q;
+                        if (error) result = `DB error: ${error.message}`;
+                        else if (!data?.length) result = `No invoices found${args.status ? ` with status "${args.status}"` : ''}.`;
+                        else result = JSON.stringify(data, null, 2);
+                    }
+                } else if (toolCall.function.name === "query_purchase_orders") {
+                    const { createClient } = await import('../lib/supabase');
+                    const db = createClient();
+                    if (!db) {
+                        result = "Supabase not configured.";
+                    } else {
+                        let q = db.from('purchase_orders')
+                            .select('po_number, issue_date, required_date, status, total_amount, line_items, vendors(name)')
+                            .order('issue_date', { ascending: false })
+                            .limit(args.limit || 10);
+                        if (args.status) q = q.eq('status', args.status);
+                        if (args.vendor_name) {
+                            const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
+                            if (vd?.length) q = q.eq('vendor_id', vd[0].id);
+                        }
+                        const { data, error } = await q;
+                        if (error) result = `DB error: ${error.message}`;
+                        else if (!data?.length) result = `No purchase orders found${args.status ? ` with status "${args.status}"` : ''}.`;
+                        else result = JSON.stringify(data, null, 2);
+                    }
+                } else if (toolCall.function.name === "query_action_items") {
+                    const { createClient } = await import('../lib/supabase');
+                    const db = createClient();
+                    if (!db) {
+                        result = "Supabase not configured.";
+                    } else {
+                        const { data, error } = await db.from('documents')
+                            .select('type, vendor_ref, action_summary, confidence, source, created_at')
+                            .eq('action_required', true)
+                            .order('created_at', { ascending: false })
+                            .limit(args.limit || 10);
+                        if (error) result = `DB error: ${error.message}`;
+                        else if (!data?.length) result = "No pending action items found.";
+                        else result = JSON.stringify(data, null, 2);
+                    }
+                }
+
+                toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
+            }
+
+            const finalRes = await openai.chat.completions.create({
+                model: "gpt-4o",
+                messages: [
+                    { role: "system", content: SYSTEM_PROMPT },
+                    ...chatHistory[chatId],
+                    message,
+                    ...toolResults
+                ]
+            });
+            reply = finalRes.choices[0].message.content || "";
+
+            chatHistory[chatId].push(message);
+            chatHistory[chatId].push(...toolResults);
+            chatHistory[chatId].push({ role: "assistant", content: reply });
+
+            setImmediate(async () => {
+                try {
+                    const { remember } = await import('../lib/intelligence/memory');
+                    const toolsUsed = message.tool_calls!.map(tc => tc.function.name).join(', ');
+                    const resultSummary = toolResults
+                        .map(tr => String(tr.content).slice(0, 300))
+                        .join(' | ');
+                    const firstTool = message.tool_calls![0].function.name;
+                    const category =
+                        firstTool.includes('vendor') ? 'vendor_pattern' :
+                            firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
+                                firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
+                                    'conversation';
+                    const tagMatches = (text + ' ' + resultSummary).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                    const tags = [...new Set(tagMatches)].slice(0, 5);
+                    await remember({
+                        category,
+                        content: `Q: "${text.slice(0, 150)}" → Tool: ${toolsUsed} → A: "${reply.slice(0, 300)}"`,
+                        tags,
+                        source: 'telegram_auto',
+                        priority: 'low',
+                    });
+                } catch { /* non-critical, never block the response */ }
+            });
+        } else {
+            reply = message.content || "";
+            chatHistory[chatId].push({ role: "assistant", content: reply });
+        }
+    } else {
+        reply = await unifiedTextGeneration({
+            system: SYSTEM_PROMPT + memoryContext + runtimeRules,
+            messages: chatHistory[chatId]
+                .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+                .map((m: any) => ({ role: m.role, content: m.content })) as any,
+        });
+        chatHistory[chatId].push({ role: 'assistant', content: reply });
+    }
+
+    return reply;
+}
+
+// ──────────────────────────────────────────────────
 // TEXT MESSAGE HANDLER
 // ──────────────────────────────────────────────────
 
@@ -1058,6 +1498,103 @@ bot.on('text', async (ctx) => {
     // Initialize history for this chat if it doesn't exist
     if (!chatHistory[chatId]) {
         chatHistory[chatId] = [];
+    }
+
+    // Mirror to dashboard (fire-and-forget)
+    setImmediate(async () => {
+        const { logChatMessage } = await import('../lib/intelligence/chat-logger');
+        await logChatMessage({ source: 'telegram', role: 'user', content: userText });
+    });
+
+    // ── "Please forward" shortcut — check for pending unmatched invoices ──────
+    // If Will says "forward" and there are pending dropship invoices, offer buttons
+    if (/\bforward\b/i.test(userText)) {
+        const pending = getAllPendingDropships();
+        if (pending.length > 0) {
+            const { Markup } = await import('telegraf');
+            const lines = pending.map(p =>
+                `• ${p.vendorName} — Invoice ${p.invoiceNumber} ($${p.total.toLocaleString()})`
+            ).join('\n');
+            const buttons = pending.slice(0, 3).map(p =>
+                [Markup.button.callback(`📦 Forward ${p.invoiceNumber}`, `dropship_fwd_${p.id}`)]
+            );
+            await ctx.reply(
+                `${pending.length} unmatched invoice(s) pending:\n${lines}\n\nForward one to bill.com?`,
+                Markup.inlineKeyboard(buttons)
+            );
+            return;
+        }
+    }
+
+    // ── Manual PO# entry intercept ────────────────────────────────────────────
+    // When Will tapped "This Has a PO — Enter PO#", we're waiting for the number.
+    // Intercept it here, run reconciliation, and skip the LLM entirely.
+    if (pendingPoEntry.has(chatId)) {
+        const dropId = pendingPoEntry.get(chatId)!;
+        pendingPoEntry.delete(chatId); // Clear state regardless of outcome
+
+        const poNumber = userText.trim().toUpperCase();
+        const pending = getPendingDropship(dropId);
+
+        if (!pending) {
+            await ctx.reply(`⚠️ Invoice session expired — the 48-hour window passed. Start a fresh AP scan if needed.`);
+            return;
+        }
+        if (!poNumber || poNumber.length < 2) {
+            await ctx.reply(`That doesn't look like a PO number. Tap the button again to retry.`);
+            return;
+        }
+
+        ctx.sendChatAction('typing');
+        try {
+            const { extractPDF } = await import('../lib/pdf/extractor');
+            const { parseInvoice } = await import('../lib/pdf/invoice-parser');
+
+            const buffer = Buffer.from(pending.base64Pdf, 'base64');
+            const extracted = await extractPDF(buffer);
+            const invoiceData = await parseInvoice(extracted.rawText);
+
+            // Force-inject the user-supplied PO number regardless of what the parser found
+            invoiceData.poNumber = poNumber;
+
+            await ctx.reply(`🔍 Running reconciliation for *${pending.invoiceNumber}* against Finale PO *${poNumber}*...`, { parse_mode: 'Markdown' });
+
+            const recon = await reconcileInvoiceToPO(invoiceData, poNumber, finale);
+
+            if (recon.overallVerdict === 'no_match') {
+                await ctx.reply(`❌ PO *${poNumber}* not found in Finale. Double-check the number and tap the button to try again.`, { parse_mode: 'Markdown' });
+                return;
+            }
+
+            const { Markup } = await import('telegraf');
+
+            if (recon.overallVerdict === 'auto_approve') {
+                const applyResult = await applyReconciliation(recon, finale);
+                removePendingDropship(dropId);
+                await ctx.reply(
+                    recon.summary + `\n\n✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${poNumber}.`,
+                    { parse_mode: 'Markdown' }
+                );
+            } else if (recon.overallVerdict === 'needs_approval') {
+                const approvalId = storePendingApproval(recon, finale);
+                await ctx.reply(
+                    recon.summary + '\n\n☝️ Tap to approve or reject:',
+                    {
+                        parse_mode: 'Markdown',
+                        ...Markup.inlineKeyboard([
+                            Markup.button.callback('✅ Approve & Apply', `approve_${approvalId}`),
+                            Markup.button.callback('❌ Reject', `reject_${approvalId}`),
+                        ])
+                    }
+                );
+            } else {
+                // no_change, duplicate, rejected — just show summary
+                await ctx.reply(recon.summary, { parse_mode: 'Markdown' });
+            }
+        } catch (err: any) {
+            await ctx.reply(`❌ Reconciliation failed: ${err.message}`);
+        }
+        return; // Do NOT fall through to LLM
     }
 
     // Add user's message to history
@@ -1493,6 +2030,12 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             chatHistory[chatId].push({ role: 'assistant', content: reply });
         }
 
+        // Mirror to dashboard (fire-and-forget)
+        setImmediate(async () => {
+            const { logChatMessage } = await import('../lib/intelligence/chat-logger');
+            await logChatMessage({ source: 'telegram', role: 'assistant', content: reply });
+        });
+
         ctx.reply(reply, { parse_mode: 'Markdown' });
 
     } catch (err: any) {
@@ -1549,6 +2092,98 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         await ctx.editMessageText(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text + '\n\n' + message
             : message);
+    });
+
+    // DROPSHIP INVOICE INLINE BUTTONS
+    // ──────────────────────────────────────────────────
+    // When an unmatched invoice arrives, AP agent sends three buttons.
+    // These handlers forward to bill.com, prompt for a PO#, or skip.
+
+    bot.action(/^dropship_fwd_(.+)$/, async (ctx) => {
+        const dropId = ctx.match[1];
+        await ctx.answerCbQuery('Forwarding to bill.com...');
+
+        const pending = getPendingDropship(dropId);
+        if (!pending) {
+            await ctx.editMessageText(
+                (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
+                '\n\n❌ Invoice data expired. Re-run the AP agent to reprocess.'
+            );
+            return;
+        }
+
+        try {
+            // Build MIME email and send via Gmail (use ap token, fall back to default)
+            let authClient: any;
+            try {
+                authClient = await getAuthenticatedClient('ap');
+            } catch {
+                authClient = await getAuthenticatedClient('default');
+            }
+            const gmail = google.gmail({ version: 'v1', auth: authClient });
+
+            const boundary = 'b_aria_drop_' + Math.random().toString(36).substring(2);
+            const mime = [
+                `To: buildasoilap@bill.com`,
+                `Subject: Fwd: ${pending.subject}`,
+                `MIME-Version: 1.0`,
+                `Content-Type: multipart/mixed; boundary="${boundary}"`,
+                ``,
+                `--${boundary}`,
+                `Content-Type: text/plain; charset="UTF-8"`,
+                ``,
+                `Dropship invoice forwarded via Aria AP Agent.`,
+                `Vendor: ${pending.vendorName} | Invoice: ${pending.invoiceNumber} | Total: $${pending.total}`,
+                ``,
+                `--${boundary}`,
+                `Content-Type: application/pdf; name="${pending.filename}"`,
+                `Content-Transfer-Encoding: base64`,
+                `Content-Disposition: attachment; filename="${pending.filename}"`,
+                ``,
+                pending.base64Pdf,
+                `--${boundary}--`,
+            ].join('\r\n');
+
+            await gmail.users.messages.send({
+                userId: 'me',
+                requestBody: { raw: Buffer.from(mime).toString('base64url') },
+            });
+
+            removePendingDropship(dropId);
+
+            const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text : '';
+            await ctx.editMessageText(
+                original + `\n\n✅ Forwarded to buildasoilap@bill.com as dropship.\nAdding ${pending.vendorName} to known dropship list.`
+            );
+            console.log(`📦 Dropship forwarded: ${pending.invoiceNumber} (${pending.vendorName})`);
+        } catch (err: any) {
+            await ctx.reply(`❌ Forward failed: ${err.message}`);
+        }
+    });
+
+    bot.action(/^invoice_has_po_(.+)$/, async (ctx) => {
+        const dropId = ctx.match[1];
+        const pending = getPendingDropship(dropId);
+        await ctx.answerCbQuery('Enter the PO number in chat');
+        const name = pending ? pending.invoiceNumber : dropId;
+
+        // Register state so the text handler knows to intercept the next message
+        const chatId = ctx.chat?.id;
+        if (chatId) pendingPoEntry.set(chatId, dropId);
+
+        await ctx.reply(
+            `What's the Finale PO number for invoice ${name}?\nReply with just the PO# and I'll run the match.`
+        );
+    });
+
+    bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
+        const dropId = ctx.match[1];
+        await ctx.answerCbQuery('Skipped');
+        removePendingDropship(dropId);
+        const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text : '';
+        await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched in Supabase.');
     });
 
     // Fire-and-forget the launch, then start OpsManager right away.

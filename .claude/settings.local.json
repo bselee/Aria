@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node --import tsx -e \":*)"
+      "Bash(node --import tsx -e \":*)",
+      "Bash(node --import tsx src/test/check-po-table.ts)"
     ]
   }
 }

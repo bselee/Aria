@@ -138,7 +138,7 @@ export class FinaleClient {
                 query: `
                     query {
                         orderViewConnection(
-                            first: 100
+                            first: 500
                             type: ["PURCHASE_ORDER"]
                             receiveDate: { begin: "${today}", end: "${tomorrowStr}" }
                             sort: [{ field: "receiveDate", mode: "desc" }]
@@ -185,10 +185,10 @@ export class FinaleClient {
 
             const edges = result.data?.orderViewConnection?.edges || [];
             return edges
-                .filter((edge: any) => edge.node.status === "Completed")
+                // receiveDate filter already ensures receipt in range; don't restrict by status
                 .map((edge: any) => {
                     const po = edge.node;
-                    const encodedUrl = encodeURIComponent(po.orderUrl || "");
+                    const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
                     return {
                         orderId: po.orderId,
                         orderDate: po.orderDate || "",
@@ -199,7 +199,7 @@ export class FinaleClient {
                             productId: ie.node.product?.productId || "?",
                             quantity: parseFloat(ie.node.quantity) || 0,
                         })),
-                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                     };
                 });
         } catch (err: any) {
@@ -389,7 +389,7 @@ export class FinaleClient {
                 .filter((edge: any) => edge.node.status === "Committed")
                 .map((edge: any) => {
                     const po = edge.node;
-                    const encodedUrl = encodeURIComponent(po.orderUrl || "");
+                    const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
                     return {
                         orderId: po.orderId,
                         orderDate: po.orderDate || "",
@@ -400,7 +400,7 @@ export class FinaleClient {
                             productId: ie.node.product?.productId || "?",
                             quantity: parseFloat(ie.node.quantity) || 0,
                         })),
-                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                     };
                 });
         } catch (err: any) {
@@ -509,9 +509,9 @@ export class FinaleClient {
             const match = edges.find((e: any) => String(e.node.orderId).replace(/^PO-/i, '') === String(poNumber));
             if (!match) return null;
 
-            const encodedUrl = encodeURIComponent(match.node.orderUrl || "");
+            const encodedUrl = Buffer.from(match.node.orderUrl || "").toString("base64");
             return {
-                finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/app#order?orderUrl=${encodedUrl}`,
+                finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                 lineItems: (match.node.itemList?.edges || []).map((ie: any) => ({
                     sku: ie.node.product?.productId || "?",
                     qty: parseFloat(ie.node.quantity) || 0,

@@ -150,8 +150,8 @@ export class OpsManager {
             this.apAgent.processUnreadInvoices();
         });
 
-        // Daily Summary @ 8:00 AM
-        cron.schedule("0 8 * * *", () => {
+        // Daily Summary @ 8:00 AM weekdays only
+        cron.schedule("0 8 * * 1-5", () => {
             this.sendDailySummary();
         }, { timezone: "America/Denver" });
 
@@ -502,6 +502,12 @@ export class OpsManager {
                     { parse_mode: "Markdown" }
                 );
             }
+
+            // Persist snapshot to Supabase for dashboard (fire-and-forget)
+            setImmediate(async () => {
+                const { saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
+                await saveBuildRiskSnapshot(report);
+            });
 
             console.log(`✅ Build risk report sent: 🔴 ${report.criticalCount} · 🟡 ${report.warningCount} · 👀 ${report.watchCount} · ✅ ${report.okCount}`);
         } catch (err: any) {

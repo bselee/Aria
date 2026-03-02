@@ -3,30 +3,30 @@
  * @purpose Unified LLM entry point with automatic fallback chain.
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-02-26
+ * @updated 2026-02-27
  * @deps    @ai-sdk/google, @ai-sdk/openai, @ai-sdk/anthropic, ai, zod
- * @env     GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY
+ * @env     GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY
  *
- * DECISION(2026-02-26): Fallback chain is Gemini Flash → OpenAI GPT-4o → Anthropic.
- * Gemini 2.5 Flash is fast + cheap. OpenAI is reliable fallback.
- * Anthropic is disabled until credits are added (was causing timeouts on every call).
+ * DECISION(2026-02-27): Chain is Gemini (direct) → GPT-4o (direct) → OpenRouter (Gemini 2.5 Flash Lite → Mistral Small 3.2).
+ * Direct APIs first for lowest latency. OpenRouter as cost-effective fallback ($0.10/M and $0.06/M).
+ * Anthropic re-enabled — add ANTHROPIC_API_KEY when credits are restored.
  * The chain auto-skips any provider without an API key configured.
  */
 
 import { google } from '@ai-sdk/google';
-import { openai } from '@ai-sdk/openai';
+import { openai, createOpenAI } from '@ai-sdk/openai';
 import { anthropic } from '@ai-sdk/anthropic';
-import { generateText, generateObject, CoreMessage } from 'ai';
+import { generateText, generateObject, ModelMessage } from 'ai';
 import { z } from 'zod';
 
 export type LLMOptions = {
     system?: string;
     prompt?: string;
-    messages?: CoreMessage[];
+    messages?: ModelMessage[];
     temperature?: number;
 };
 
-// DECISION(2026-02-26): Build provider chain dynamically based on available API keys.
+// DECISION(2026-02-27): Build provider chain dynamically based on available API keys.
 // This prevents wasted time trying providers that will definitely fail.
 type ProviderEntry = {
     name: string;
@@ -34,11 +34,33 @@ type ProviderEntry = {
     available: boolean;
 };
 
+// OpenRouter speaks the OpenAI API — reuse @ai-sdk/openai with a custom base URL.
+// Routes: Gemini 2.5 Flash Lite ($0.10/M input) → Mistral Small 3.2 ($0.06/M input)
+function getOpenRouterProvider() {
+    if (!process.env.OPENROUTER_API_KEY) return [];
+    const openrouter = createOpenAI({
+        baseURL: 'https://openrouter.ai/api/v1',
+        apiKey: process.env.OPENROUTER_API_KEY,
+    });
+    return [
+        {
+            name: 'OpenRouter Gemini 2.5 Flash Lite',
+            model: () => openrouter('google/gemini-2.5-flash-lite'),
+            available: true,
+        },
+        {
+            name: 'OpenRouter Mistral Small 3.2',
+            model: () => openrouter('mistralai/mistral-small-3.2-24b-instruct'),
+            available: true,
+        },
+    ];
+}
+
 function getProviderChain(): ProviderEntry[] {
     return [
         {
-            name: 'Gemini 2.5 Flash',
-            model: () => google('gemini-2.5-flash'),
+            name: 'Gemini 2.0 Flash',
+            model: () => google('gemini-2.0-flash'),
             available: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
         },
         {
@@ -47,10 +69,11 @@ function getProviderChain(): ProviderEntry[] {
             available: !!process.env.OPENAI_API_KEY,
         },
         {
-            name: 'Anthropic Claude 3.5 Sonnet',
-            model: () => anthropic('claude-3-5-sonnet-20241022'),
+            name: 'Anthropic Claude Sonnet 4.6',
+            model: () => anthropic('claude-sonnet-4-6'),
             available: !!process.env.ANTHROPIC_API_KEY,
         },
+        ...getOpenRouterProvider(),
     ].filter(p => p.available);
 }
 
@@ -62,7 +85,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
     const providers = getProviderChain();
 
     if (providers.length === 0) {
-        throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.');
+        throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
     }
 
     let lastError: Error | null = null;
@@ -73,10 +96,9 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
             const { text } = await generateText({
                 model: provider.model(),
                 system: options.system,
-                prompt: options.prompt,
-                messages: options.messages,
                 temperature: options.temperature,
-            });
+                ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
+            } as any);
             return text;
         } catch (err: any) {
             lastError = err;
@@ -101,7 +123,7 @@ export async function unifiedObjectGeneration<T>(
     const providers = getProviderChain();
 
     if (providers.length === 0) {
-        throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.');
+        throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
     }
 
     let lastError: Error | null = null;
@@ -109,15 +131,16 @@ export async function unifiedObjectGeneration<T>(
     for (let i = 0; i < providers.length; i++) {
         const provider = providers[i];
         try {
-            const { object } = await generateObject({
+            const { object } = await (generateObject({
                 model: provider.model(),
                 schema: options.schema,
                 schemaName: options.schemaName,
                 system: options.system,
-                prompt: options.prompt,
-                messages: options.messages,
                 temperature: options.temperature,
-            });
+                // Disable strict JSON schema for OpenAI-compatible endpoints (allows optional/nullable fields)
+                providerOptions: { openai: { strictJsonSchema: false } },
+                ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
+            } as any) as Promise<{ object: T }>);
             return object;
         } catch (err: any) {
             lastError = err;

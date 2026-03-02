@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase";
 import { InvoiceData } from "@/lib/pdf/invoice-parser";
 import { POData } from "@/lib/pdf/po-parser";
+import { FinaleClient } from "@/lib/finale/client";
 import Fuse from "fuse.js";
 
 export interface MatchResult {
@@ -20,10 +21,29 @@ export interface Discrepancy {
     severity: "blocking" | "warning" | "info";
 }
 
+/**
+ * Build a minimal POData stub for cases where we know the PO number but don't
+ * have the full Supabase record. The reconciler will fetch live data from Finale
+ * and validate — this stub just carries the orderId forward.
+ */
+function stubPOData(poNumber: string, vendorName: string): POData {
+    return {
+        documentType: "purchase_order",
+        poNumber,
+        vendorName: vendorName || "Unknown",
+        status: "sent",
+        issueDate: new Date().toISOString().split("T")[0],
+        lineItems: [],
+        subtotal: 0,
+        total: 0,
+        confidence: "medium",
+    };
+}
+
 export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResult> {
     const supabase = createClient();
 
-    // Strategy 1: Exact PO number match
+    // ── Strategy 1: Exact PO number match in Supabase ─────────────────────────
     if (invoice.poNumber) {
         const { data: exactPO } = await supabase
             .from("purchase_orders")
@@ -43,78 +63,130 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
                 autoApprove: discrepancies.filter(d => d.severity === "blocking").length === 0,
             };
         }
-    }
 
-    // Strategy 2: Fuzzy vendor name + amount match
-    const { data: vendorPOs } = await supabase
-        .from("purchase_orders")
-        .select("*")
-        .eq("status", "open")
-        .gte("created_at", new Date(Date.now() - 90 * 86400000).toISOString()); // Last 90 days
-
-    if (!vendorPOs?.length) {
-        return { matched: false, confidence: "none", matchedPO: null, matchStrategy: "No open POs found", discrepancies: [], autoApprove: false };
-    }
-
-    // Fuzzy vendor name match
-    const fuse = new Fuse(vendorPOs, { keys: ["vendor_name"], threshold: 0.3 });
-    const vendorMatches: any[] = fuse.search(invoice.vendorName).map(r => r.item);
-
-    if (!vendorMatches.length) {
-        return { matched: false, confidence: "none", matchedPO: null, matchStrategy: "No POs for vendor", discrepancies: [], autoApprove: false };
-    }
-
-    // Among vendor matches, find by amount proximity
-    const amountMatch = vendorMatches.find(
-        (po: any) => Math.abs(po.total - invoice.total) / invoice.total < 0.02  // Within 2%
-    );
-
-    if (amountMatch) {
-        const discrepancies = compareInvoiceToPO(invoice, amountMatch.raw_data);
+        // ── Strategy 1b: PO# on invoice but not in Supabase ──────────────────
+        // Supabase is sparse (~18 rows, mostly vendor_name: null).
+        // If the invoice explicitly references a PO#, trust it and pass directly
+        // to the Finale reconciler which will validate the PO live.
+        // autoApprove is always false — let the reconciler's guardrails decide.
         return {
             matched: true,
             confidence: "high",
-            matchedPO: amountMatch.raw_data,
-            matchStrategy: "Vendor + amount fuzzy match",
-            discrepancies,
-            autoApprove: false,    // Require human confirmation for fuzzy matches
-        };
-    }
-
-    // Strategy 3: Line item matching (if amounts don't match, try SKU overlap)
-    const lineItemMatch = vendorMatches.find(po => {
-        const poSkus = new Set<string>(po.raw_data?.lineItems?.map((l: { sku: string }) => l.sku).filter((s: string | undefined): s is string => !!s) || []);
-        const invoiceSkus = new Set<string>(invoice.lineItems?.map(l => l.sku).filter((s: string | undefined): s is string => !!s) || []);
-        const overlap = [...poSkus].filter(sku => invoiceSkus.has(sku)).length;
-        return overlap >= 2;
-    });
-
-    if (lineItemMatch) {
-        return {
-            matched: true,
-            confidence: "medium",
-            matchedPO: lineItemMatch.raw_data,
-            matchStrategy: "SKU line item overlap",
-            discrepancies: compareInvoiceToPO(invoice, lineItemMatch.raw_data),
+            matchedPO: stubPOData(invoice.poNumber, invoice.vendorName),
+            matchStrategy: "PO number on invoice — Finale live validation",
+            discrepancies: [],
             autoApprove: false,
         };
     }
 
+    // ── Strategy 2: Fuzzy vendor name + amount match in Supabase ──────────────
+    // (Only useful when vendor_name is populated — currently sparse)
+    const { data: vendorPOs } = await supabase
+        .from("purchase_orders")
+        .select("*")
+        .eq("status", "open")
+        .not("vendor_name", "is", null)
+        .gte("created_at", new Date(Date.now() - 90 * 86400000).toISOString()); // Last 90 days
+
+    if (vendorPOs?.length) {
+        const fuse = new Fuse(vendorPOs, { keys: ["vendor_name"], threshold: 0.3 });
+        const vendorMatches: any[] = fuse.search(invoice.vendorName).map(r => r.item);
+
+        if (vendorMatches.length) {
+            const amountMatch = vendorMatches.find(
+                (po: any) => Math.abs(po.total - invoice.total) / Math.max(invoice.total, 1) < 0.02
+            );
+
+            if (amountMatch) {
+                const discrepancies = compareInvoiceToPO(invoice, amountMatch.raw_data);
+                return {
+                    matched: true,
+                    confidence: "high",
+                    matchedPO: amountMatch.raw_data,
+                    matchStrategy: "Vendor + amount fuzzy match",
+                    discrepancies,
+                    autoApprove: false, // Require human confirmation for fuzzy matches
+                };
+            }
+
+            // Strategy 3: SKU line item overlap
+            const lineItemMatch = vendorMatches.find(po => {
+                const poSkus = new Set<string>(po.raw_data?.lineItems?.map((l: { sku: string }) => l.sku).filter((s: string | undefined): s is string => !!s) || []);
+                const invoiceSkus = new Set<string>(invoice.lineItems?.map(l => l.sku).filter((s): s is string => s != null) || []);
+                const overlap = [...poSkus].filter(sku => invoiceSkus.has(sku)).length;
+                return overlap >= 2;
+            });
+
+            if (lineItemMatch) {
+                return {
+                    matched: true,
+                    confidence: "medium",
+                    matchedPO: lineItemMatch.raw_data,
+                    matchStrategy: "SKU line item overlap",
+                    discrepancies: compareInvoiceToPO(invoice, lineItemMatch.raw_data),
+                    autoApprove: false,
+                };
+            }
+        }
+    }
+
+    // ── Strategy 4: Finale vendor+date fallback ────────────────────────────────
+    // Used when invoice has no PO# and Supabase has no useful vendor data.
+    // Queries Finale GraphQL directly — always routes to needs_approval (never auto-applies).
+    // When Will approves, the vendor_name is written back to Supabase for future matches.
+    if (invoice.vendorName && invoice.invoiceDate) {
+        try {
+            const finaleClient = new FinaleClient();
+            const candidates = await finaleClient.findPOByVendorAndDate(
+                invoice.vendorName,
+                invoice.invoiceDate,
+                30  // 30-day window around invoice date
+            );
+
+            // Filter to "Committed" or open POs within 10% of invoice total
+            const plausible = candidates.filter(c =>
+                (c.status === "Committed" || c.status === "Open") &&
+                invoice.total > 0 &&
+                Math.abs(c.total - invoice.total) / invoice.total < 0.10
+            );
+
+            if (plausible.length > 0) {
+                // Pick the closest amount match
+                plausible.sort((a, b) =>
+                    Math.abs(a.total - invoice.total) - Math.abs(b.total - invoice.total)
+                );
+                const best = plausible[0];
+                return {
+                    matched: true,
+                    confidence: "medium",
+                    matchedPO: stubPOData(best.orderId, best.supplier),
+                    matchStrategy: `Finale vendor+date fallback (${best.supplier}, ${best.orderDate}) — REQUIRES APPROVAL`,
+                    discrepancies: [],
+                    autoApprove: false,
+                };
+            }
+        } catch (err: any) {
+            // Finale fallback is best-effort — don't block the pipeline
+            console.warn(`[matchInvoiceToPO] Finale fallback failed: ${err.message}`);
+        }
+    }
+
     return {
         matched: false,
-        confidence: "low",
-        matchedPO: vendorMatches[0]?.raw_data ?? null,
-        matchStrategy: "Unconfirmed — closest vendor PO suggested",
+        confidence: "none",
+        matchedPO: null,
+        matchStrategy: "No PO found — Supabase and Finale both exhausted",
         discrepancies: [],
         autoApprove: false,
     };
 }
 
 function compareInvoiceToPO(invoice: InvoiceData, po: POData): Discrepancy[] {
+    if (!po) return [];
     const discrepancies: Discrepancy[] = [];
 
     // Total amount check
-    if (Math.abs(invoice.total - po.total) > 0.01) {
+    if (po.total && Math.abs(invoice.total - po.total) > 0.01) {
         const delta = invoice.total - po.total;
         discrepancies.push({
             field: "total",

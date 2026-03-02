@@ -88,7 +88,7 @@ async function testFeb20() {
                 productId: ie.node.product?.productId || "?",
                 quantity: ie.node.quantity || 0,
             })),
-            finaleUrl: `https://app.finaleinventory.com/${accountPath}/app#order?orderUrl=${encodeURIComponent(po.orderUrl)}`,
+            finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || "").toString("base64")}`,
         };
     });
 

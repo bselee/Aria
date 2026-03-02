@@ -5,7 +5,8 @@ import { Telegraf, Markup } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { extractPDF } from "../pdf/extractor";
 import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
-import { matchInvoiceToPO, MatchResult } from "../matching/invoice-po-matcher";
+// matchInvoiceToPO kept for manual re-match flow in start-bot.ts invoice_has_po_ handler
+// but is no longer in the hot path — ap-agent queries Finale directly
 import { FinaleClient } from "../finale/client";
 import {
     reconcileInvoiceToPO,
@@ -14,7 +15,24 @@ import {
     storePendingApproval,
 } from "../finale/reconciler";
 import { unifiedObjectGeneration } from "./llm";
+import { storePendingDropship, getAllPendingDropships } from "./dropship-store";
 import { z } from "zod";
+
+// ──────────────────────────────────────────────────
+// KNOWN DROPSHIP VENDORS
+// ──────────────────────────────────────────────────
+// DECISION(2026-02-27): These vendors always ship directly to customers —
+// there is NEVER a matching Finale PO for them. Skip LLM classification and
+// auto-route as DROPSHIP_INVOICE (forward to bill.com, no reconciliation).
+// Add vendor name or email fragments (case-insensitive) as needed.
+const KNOWN_DROPSHIP_KEYWORDS = [
+    "autopot",
+    "logan labs",
+    "loganlab",
+    "evergreen growers",
+    "evergreengrow",
+    // add more: "vendor name fragment" or "emaildomain.com"
+];
 
 /**
  * @file    ap-agent.ts
@@ -35,9 +53,14 @@ export class APAgent {
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
     }
 
+    private isKnownDropshipVendor(from: string, subject: string): boolean {
+        const haystack = `${from} ${subject}`.toLowerCase();
+        return KNOWN_DROPSHIP_KEYWORDS.some(kw => haystack.includes(kw.toLowerCase()));
+    }
+
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         const schema = z.object({
-            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "DROPSHIP_INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
             reasoning: z.string()
         });
 
@@ -47,7 +70,8 @@ Subject: ${subject}
 Snippet: ${snippet}
 
 CATEGORIES:
-INVOICE - Vendor submitting a bill or invoice requiring payment.
+INVOICE - Vendor submitting a bill for goods we ordered via a standard purchase order (warehouse stock, bulk orders).
+DROPSHIP_INVOICE - Vendor billing us for a DROPSHIP order shipped directly to a customer. Signals: "dropship", "ship to customer", a customer address on the invoice, or order type is clearly a customer fulfillment. No Finale PO reconciliation needed — just forward to bill.com.
 STATEMENT - Vendor sending an account statement, aging summary, or reconciliation.
 ADVERTISEMENT - Marketing, promotional spam, newsletters, or sales pitches.
 HUMAN_INTERACTION - Payment questions, order issues, or generic emails that a human must read and reply to.
@@ -127,7 +151,10 @@ Classify carefully based on the sender, subject and text snippet.`;
 
                 console.log(`   Evaluating Email: "${subject}" from ${from}`);
 
-                const intent = await this.classifyEmailIntent(subject, from, snippet);
+                // Fast-path: skip LLM for known dropship vendors
+                const intent = this.isKnownDropshipVendor(from, subject)
+                    ? "DROPSHIP_INVOICE"
+                    : await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent}`);
 
                 if (intent === "ADVERTISEMENT") {
@@ -163,7 +190,8 @@ Classify carefully based on the sender, subject and text snippet.`;
                     continue;
                 }
 
-                // --- INVOICE PROCESSING ---
+                // --- INVOICE / DROPSHIP PROCESSING ---
+                const isDropship = intent === "DROPSHIP_INVOICE";
                 let processedAnyPDF = false;
                 // Recursive part walker: vendors using Outlook/Gmail sometimes nest
                 // PDFs under multipart/mixed → multipart/related → attachment.
@@ -202,7 +230,7 @@ Classify carefully based on the sender, subject and text snippet.`;
                             // 2. Process Database & Extraction matching in the background
                             // We do this non-blocking so it doesn't hold up the pipeline if it fails
                             const buffer = Buffer.from(base64Data, "base64");
-                            this.processInvoiceBuffer(buffer, part.filename!, subject, from, supabase).catch(err => {
+                            this.processInvoiceBuffer(buffer, part.filename!, subject, from, supabase, isDropship).catch(err => {
                                 console.error(`     ❌ Background matching failed for ${part.filename!}:`, err);
                             });
                         }
@@ -220,11 +248,16 @@ Classify carefully based on the sender, subject and text snippet.`;
                         }
                     });
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, { attachments: pdfNames });
+                    const logIntent = isDropship ? "DROPSHIP_INVOICE" : "INVOICE";
+                    const logNote = isDropship
+                        ? `Dropship — forwarded to Bill.com (${pdfNames}), no Finale reconciliation`
+                        : `Forwarded to Bill.com (${pdfNames})`;
+                    await this.logActivity(supabase, from, subject, logIntent, logNote, { attachments: pdfNames });
                 } else {
                     // It was classified as an Invoice but had no PDF, so leave unread for human interaction.
-                    console.log(`     ⚠️ No PDF found on INVOICE. Leaving unread for human check.`);
-                    await this.logActivity(supabase, from, subject, "INVOICE", "No PDF found — left unread for human review");
+                    const logIntent = isDropship ? "DROPSHIP_INVOICE" : "INVOICE";
+                    console.log(`     ⚠️ No PDF found on ${logIntent}. Leaving unread for human check.`);
+                    await this.logActivity(supabase, from, subject, logIntent, "No PDF found — left unread for human review");
                 }
             }
 
@@ -268,45 +301,79 @@ Classify carefully based on the sender, subject and text snippet.`;
         }
     }
 
-    private async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any) {
+    private async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, isDropship = false) {
         try {
-            // 1. Extract text and detect tables/images
+            // 1. Extract + parse
             const extracted = await extractPDF(buffer);
-
-            // 2. Parse invoice schema via unified LLM
             const invoiceData: InvoiceData = await parseInvoice(extracted.rawText);
 
-            // 3. Attempt to match to an open PO
-            const matchResult: MatchResult = await matchInvoiceToPO(invoiceData);
+            // 1b. Low-confidence guard — garbled PDF, skip reconciliation entirely
+            if (invoiceData.confidence === "low") {
+                console.warn(`     ⚠️ Low-confidence parse for ${filename} — alerting Will.`);
+                const chatId = process.env.TELEGRAM_CHAT_ID || "";
+                await this.bot.telegram.sendMessage(chatId,
+                    `⚠️ *Low-confidence invoice parse*\nFile: \`${filename}\`\nVendor: ${invoiceData.vendorName}\nForwarded to Bill.com but no Finale reconciliation attempted. Please review manually.`,
+                    { parse_mode: "Markdown" }
+                );
+                await this.logActivity(supabase, from, subject, "INVOICE", `Low-confidence parse — reconciliation skipped for ${filename}`);
+                return;
+            }
 
-            // 4. Save to Database
-            // Create corresponding document record first to track the generic file
-            const { data: docData, error: docError } = await supabase.from("documents").insert({
+            // 2. Find matching PO — Finale direct, no Supabase middle layer
+            // If invoice has a PO# printed on it, use it. Otherwise query Finale by
+            // vendor name + invoice date to find the most plausible open PO.
+            let finalePONumber: string | null = invoiceData.poNumber || null;
+            let matchSource = "PO# on invoice";
+
+            if (!finalePONumber && !isDropship) {
+                try {
+                    const finaleClient = new FinaleClient();
+                    const candidates = await finaleClient.findPOByVendorAndDate(
+                        invoiceData.vendorName,
+                        invoiceData.invoiceDate,
+                        30 // ±30-day window
+                    );
+                    // Filter to open/committed POs within 10% of invoice total
+                    const plausible = candidates.filter(c =>
+                        (c.status === "Committed" || c.status === "Open") &&
+                        invoiceData.total > 0 &&
+                        Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10
+                    );
+                    if (plausible.length > 0) {
+                        plausible.sort((a, b) =>
+                            Math.abs(a.total - invoiceData.total) - Math.abs(b.total - invoiceData.total)
+                        );
+                        finalePONumber = plausible[0].orderId;
+                        matchSource = `Finale vendor+date match (${plausible[0].supplier}, ${plausible[0].orderDate}) — REQUIRES APPROVAL`;
+                        console.log(`     → Finale fallback matched PO ${finalePONumber} for ${invoiceData.vendorName}`);
+                    }
+                } catch (err: any) {
+                    console.warn(`     ⚠️ Finale fallback lookup failed: ${err.message}`);
+                }
+            }
+
+            const matched = !!finalePONumber;
+            console.log(`     → PO match: ${matched ? finalePONumber + " (" + matchSource + ")" : "none"}`);
+
+            // 3. Save to DB — audit trail and daily recap source
+            const { data: docData } = await supabase.from("documents").insert({
                 type: "invoice",
                 status: "PROCESSED",
                 source: "email",
-                source_ref: from, // Email sender
+                source_ref: from,
                 email_from: from,
                 email_subject: subject,
                 raw_text: extracted.rawText,
-                action_required: !matchResult.matched || matchResult.discrepancies.length > 0,
-                action_summary: `Invoice from ${from} for ${invoiceData.total}`
+                action_required: !matched,
+                action_summary: `Invoice from ${from} for $${invoiceData.total}`
             }).select("id").single();
 
-            let documentId = null;
-            if (docData && !docError) {
-                documentId = docData.id;
-            } else if (docError) {
-                console.error("   Error saving document:", docError.message);
-            }
-
-            // Upsert the specific invoice data
-            const { data: invData, error: invError } = await supabase.from("invoices").upsert({
+            await supabase.from("invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
-                po_number: invoiceData.poNumber || matchResult.matchedPO?.poNumber || null,
+                po_number: finalePONumber,
                 invoice_date: invoiceData.invoiceDate,
-                due_date: invoiceData.dueDate || invoiceData.invoiceDate, // fallback
+                due_date: invoiceData.dueDate || invoiceData.invoiceDate,
                 payment_terms: invoiceData.paymentTerms,
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
@@ -316,27 +383,31 @@ Classify carefully based on the sender, subject and text snippet.`;
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
-                status: matchResult.matched ? (matchResult.autoApprove ? "matched_approved" : "matched_review") : "unmatched",
-                discrepancies: matchResult.discrepancies,
-                document_id: documentId,
+                status: matched ? "matched_review" : "unmatched",
+                document_id: docData?.id || null,
                 raw_data: invoiceData
-            }, { onConflict: "invoice_number" }).select("id").single();
+            }, { onConflict: "invoice_number" });
 
-            if (invError) {
-                console.error("   Error saving invoice to DB:", invError.message);
+            // 4. Notify Will — unmatched gets action buttons
+            let pendingDropshipId: string | null = null;
+            if (!matched) {
+                pendingDropshipId = storePendingDropship({
+                    invoiceNumber: invoiceData.invoiceNumber,
+                    vendorName: invoiceData.vendorName,
+                    total: invoiceData.total,
+                    subject,
+                    from,
+                    filename,
+                    base64Pdf: buffer.toString("base64"),
+                });
             }
+            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, subject, from, isDropship, pendingDropshipId);
 
-            // 5. Build and send notifications
-            await this.sendNotification(invoiceData, matchResult, subject, from);
-
-            // 6. Reconcile against Finale (Phase 1)
-            // If we matched to a PO, run the full reconciliation pipeline:
-            // compare prices, detect fees, verify tracking, apply safe changes
-            if (matchResult.matched && (invoiceData.poNumber || matchResult.matchedPO?.poNumber)) {
-                const finalePONumber = invoiceData.poNumber || matchResult.matchedPO?.poNumber;
-                if (finalePONumber) {
-                    await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase);
-                }
+            // 5. Reconcile against Finale
+            // Reconciler fetches the live PO, runs all guardrails, and either
+            // auto-applies safe changes or sends a Telegram approval request.
+            if (!isDropship && matched && finalePONumber) {
+                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase);
             }
 
         } catch (err: any) {
@@ -344,46 +415,55 @@ Classify carefully based on the sender, subject and text snippet.`;
         }
     }
 
-    private async sendNotification(invoice: InvoiceData, match: MatchResult, subject: string, from: string) {
-        let msg = `🧾 *New Invoice Processed*\n`;
+    private async sendNotification(
+        invoice: InvoiceData,
+        matched: boolean,
+        poNumber: string | null,
+        matchSource: string,
+        subject: string,
+        from: string,
+        isDropship = false,
+        pendingDropshipId: string | null = null
+    ) {
+        let msg = isDropship
+            ? `📦 *Dropship Invoice — Forwarded to Bill.com*\n`
+            : `🧾 *New Invoice Processed*\n`;
         msg += `From: ${from}\n`;
         msg += `Vendor: ${invoice.vendorName}\n`;
         msg += `Total: $${invoice.total.toLocaleString()} (Due: $${invoice.amountDue.toLocaleString()})\n`;
         msg += `━━━━━\n`;
 
-        if (match.matched) {
-            const poNum = match.matchedPO?.poNumber || invoice.poNumber || "Unknown";
-            msg += `✅ Matched to PO #${poNum} (${match.confidence} confidence)\n`;
-
-            if (match.autoApprove) {
-                msg += `✨ *Auto-Approved* - No discrepancies found.\n`;
-            } else if (match.discrepancies.length > 0) {
-                msg += `⚠️ *Action Required - Discrepancies:*\n`;
-                for (const d of match.discrepancies) {
-                    msg += `  • [${d.severity.toUpperCase()}] ${d.field}: Inv=${d.invoiceValue} vs PO=${d.poValue} (Δ ${d.delta})\n`;
-                }
-            } else {
-                msg += `⚠️ *Manual Review Required* - ${match.matchStrategy}\n`;
-            }
+        if (matched && poNumber) {
+            msg += `✅ Matched to PO *#${poNumber}*\n`;
+            msg += `_${matchSource}_\n`;
+            msg += `Running reconciliation against Finale...\n`;
         } else {
-            msg += `❌ *Unmatched Invoice*\n`;
-            msg += `Could not confidently match to an open PO.\n`;
-            msg += `Strategy: ${match.matchStrategy}\n`;
+            msg += `❌ *No PO found*\n`;
+            msg += `Invoice #: ${invoice.invoiceNumber}\n`;
+            if (!isDropship) msg += `_Searched Finale by vendor name + date_\n`;
         }
 
-        // Send to Telegram
-        this.bot.telegram.sendMessage(
-            process.env.TELEGRAM_CHAT_ID || "",
-            msg,
-            { parse_mode: "Markdown" }
-        );
+        const chatId = process.env.TELEGRAM_CHAT_ID || "";
+        if (!matched && pendingDropshipId) {
+            this.bot.telegram.sendMessage(chatId, msg, {
+                parse_mode: "Markdown",
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback("📦 Dropship — Forward to bill.com", `dropship_fwd_${pendingDropshipId}`)],
+                    [
+                        Markup.button.callback("📋 This Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
+                        Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
+                    ],
+                ])
+            });
+        } else {
+            this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+        }
 
-        // Send to Slack
         if (this.slack) {
             try {
                 await this.slack.chat.postMessage({
                     channel: this.slackChannel,
-                    text: msg.replace(/\*/g, "*"), // Slack formatting
+                    text: msg.replace(/\*/g, "*"),
                     mrkdwn: true
                 });
             } catch (err: any) {

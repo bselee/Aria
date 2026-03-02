@@ -14,3 +14,14 @@ export function createClient() {
     }
     return supabase;
 }
+
+let browserClient: any = null;
+export function createBrowserClient() {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://mock.supabase.co';
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || 'mock-key';
+
+    if (!browserClient) {
+        browserClient = createSupabaseClient(url, key);
+    }
+    return browserClient;
+}

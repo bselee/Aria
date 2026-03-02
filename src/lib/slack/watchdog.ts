@@ -28,7 +28,7 @@ const RequestExtractionSchema = z.object({
     hasExplicitAsk: z.boolean().describe("True only if the message contains an actual directive or ask (e.g. 'can we order', 'we need to get', 'please order', 'can you grab') — NOT just an expression of wanting or liking something"),
     itemDescription: z.string().describe("The PRIMARY product, material, or supply being requested — use the most specific name or SKU possible"),
     allItems: z.array(z.string()).describe("ALL distinct products, materials, or SKUs mentioned in the request. If multiple SKUs or products are listed (e.g. 'BLM207, BLM209, ALK101'), include each one separately. Always includes itemDescription as the first entry."),
-    quantity: z.number().optional().describe("How many units requested, if mentioned"),
+    quantity: z.number().nullable().optional().describe("How many units requested, if mentioned"),
     urgency: z.enum(["low", "medium", "high"]).describe("low = general mention, medium = clearly needs it, high = urgent/ASAP language"),
     confidence: z.number().min(0).max(1).describe("How confident you are this is a real, actionable product request (0.0-1.0)"),
     requesterIntent: z.string().describe("One sentence summary of what the person actually needs"),
@@ -74,6 +74,7 @@ const MONITORED_CHANNEL_NAMES = new Set([
 
 export class SlackWatchdog {
     private client: WebClient;
+    private botClient: WebClient | null = null; // Bot token — used for users.info (has users:read scope)
     private lastChecked: Map<string, string> = new Map();
     private lastCheckedThreads: Map<string, string> = new Map(); // threadKey -> last reply ts
     private channelNames: Map<string, string> = new Map();
@@ -91,6 +92,10 @@ export class SlackWatchdog {
         if (!token) throw new Error("SLACK_ACCESS_TOKEN is required");
 
         this.client = new WebClient(token);
+        // Bot token has users:read scope — used for resolving user display names
+        if (process.env.SLACK_BOT_TOKEN) {
+            this.botClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+        }
         this.pollIntervalMs = pollIntervalSeconds * 1000;
 
         // DECISION(2026-02-25): Initialize Finale client to cross-reference
@@ -272,6 +277,10 @@ export class SlackWatchdog {
     // ──────────────────────────────────────────────────
 
     private async pollAllChannels() {
+        // Skip weekends — no point alerting Will on Saturday/Sunday
+        const day = new Date().getDay();
+        if (day === 0 || day === 6) return;
+
         for (const [channelId, channelName] of this.channelNames) {
             try {
                 await this.pollChannel(channelId, channelName);
@@ -371,7 +380,7 @@ export class SlackWatchdog {
 
         // Only proceed if the LLM is confident this is a real, actionable product request
         // hasExplicitAsk filters out casual wishes like "I'd like X" or "it'd be nice to have X"
-        if (!analysis.isProductRequest || !analysis.hasExplicitAsk || analysis.confidence < 0.65) return;
+        if (!analysis.isProductRequest || !analysis.hasExplicitAsk || analysis.confidence < 0.75) return;
 
         console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
 
@@ -449,6 +458,23 @@ export class SlackWatchdog {
 
         this.pendingRequests.push(request);
         console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
+
+        // Mirror to dashboard (fire-and-forget)
+        setImmediate(async () => {
+            const { logChatMessage } = await import('../intelligence/chat-logger');
+            await logChatMessage({
+                source: 'slack',
+                role: 'user',
+                content: text,
+                metadata: {
+                    channel: channelName,
+                    userName,
+                    confidence: analysis.confidence,
+                    matchedProduct: match?.product?.name || null,
+                    activePO,
+                },
+            });
+        });
 
         // Step 8: Mark as processed in dedup set
         this.processedRequests.add(dedupKey);
@@ -615,9 +641,11 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
     private async resolveUserName(userId: string): Promise<string> {
         if (this.userNames.has(userId)) return this.userNames.get(userId)!;
 
+        // Prefer bot token (has users:read scope); fall back to user token
+        const lookupClient = this.botClient || this.client;
         try {
-            const result = await this.client.users.info({ user: userId });
-            const name = result.user?.real_name || result.user?.name || userId;
+            const result = await lookupClient.users.info({ user: userId });
+            const name = result.user?.real_name || result.user?.profile?.display_name || result.user?.name || userId;
             this.userNames.set(userId, name);
             return name;
         } catch {
