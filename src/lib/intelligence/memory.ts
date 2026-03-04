@@ -78,7 +78,11 @@ function getIndex() {
         if (!apiKey) throw new Error("PINECONE_API_KEY not set");
         pc = new Pinecone({ apiKey });
     }
-    return pc.index(process.env.PINECONE_INDEX || 'email-embeddings');
+    // gravity-memory is 1024d — matches text-embedding-3-small dimensions: 1024
+    // Explicit host bypasses control-plane lookup on every call
+    const indexName = process.env.PINECONE_INDEX || 'gravity-memory';
+    const indexHost = process.env.PINECONE_MEMORY_HOST;
+    return indexHost ? pc.index(indexName, indexHost) : pc.index(indexName);
 }
 
 /**

@@ -834,12 +834,13 @@ export class OpsManager {
                 const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/view/build/${Buffer.from(buildApiPath).toString('base64')}`;
 
                 if (matched?.eventId && matched.calendarId) {
-                    // Include scheduled vs actual if they differ — "192 of 200 scheduled (96%)"
                     const scheduledQty = matched.quantity;
                     let completionNote: string;
                     if (scheduledQty && scheduledQty !== build.quantity) {
                         const pct = Math.round((build.quantity / scheduledQty) * 100);
-                        completionNote = `✅ Completed: ${timeStr} — ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
+                        // 🟡 partial if under scheduled, ✅ if met or exceeded
+                        const icon = build.quantity < scheduledQty ? '🟡' : '✅';
+                        completionNote = `${icon} Completed: ${timeStr} — ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
                     } else {
                         completionNote = `✅ Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
                     }
