@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(node --import tsx -e \":*)",
-      "Bash(node --import tsx src/test/check-po-table.ts)"
+      "Bash(node --import tsx src/test/check-po-table.ts)",
+      "Bash(ls:*)",
+      "Bash(done)",
+      "Bash(du:*)",
+      "Bash(wc:*)",
+      "Skill(typecheck)"
     ]
   }
 }

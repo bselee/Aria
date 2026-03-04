@@ -1,10 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node -e \":*)",
-      "Bash(node --import tsx src/test/test-ap-agent-live.ts)",
-      "Bash(xxd .env.local)",
-      "Bash(python3 -c \":*)"
-    ]
+      "Bash(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Read(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "NotebookEdit(*)",
+      "Agent(*)"
+    ],
+    "deny": []
   }
 }
