@@ -42,3 +42,11 @@ logs/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Local scratch files
+tmp_*.ts
+tmp_*.json
+tmp_*.txt
+test-explore.ts
+test-search.ts
+test-stock.ts
