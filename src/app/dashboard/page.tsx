@@ -27,6 +27,7 @@ import BuildSchedulePanel from "@/components/dashboard/BuildSchedulePanel";
 import ChatMirror from "@/components/dashboard/ChatMirror";
 import InvoiceQueuePanel from "@/components/dashboard/InvoiceQueuePanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
+import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 
@@ -53,6 +54,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
     ),
     "invoice-queue": <InvoiceQueuePanel key="invoice-queue" />,
     "reorder": <ReorderPanel key="reorder" />,
+    "purchasing": <PurchasingPanel key="purchasing" />,
     "build-schedule": <BuildSchedulePanel key="build-schedule" />,
     "chat-mirror": (
         <div key="chat-mirror" className="flex flex-col flex-1 overflow-hidden min-h-[400px]">
@@ -66,7 +68,7 @@ type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings", "activity"],
-    mid: ["invoice-queue", "reorder", "build-schedule"],
+    mid: ["invoice-queue", "reorder", "purchasing", "build-schedule"],
     right: ["chat-mirror"]
 };
 
@@ -101,9 +103,19 @@ export default function DashboardPage() {
         if (mw) setMidW(Math.max(200, Math.min(600, parseInt(mw))));
         if (ly) {
             try {
-                const parsed = JSON.parse(ly);
-                // Basic validation
-                if (parsed.left && parsed.mid && parsed.right) setLayout(parsed);
+                const restored = JSON.parse(ly);
+                if (restored.left && restored.mid && restored.right) {
+                    // Merge any panels that exist in DEFAULT_LAYOUT but are missing from
+                    // the saved layout (prevents new panels from being silently dropped
+                    // by stale localStorage saves).
+                    for (const [col, ids] of Object.entries(DEFAULT_LAYOUT) as [ColumnId, string[]][]) {
+                        for (const id of ids) {
+                            const inSaved = (Object.values(restored) as string[][]).flat().includes(id);
+                            if (!inSaved) restored[col].push(id);
+                        }
+                    }
+                    setLayout(restored);
+                }
             } catch (e) { }
         }
     }, []);

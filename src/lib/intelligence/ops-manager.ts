@@ -3,9 +3,10 @@
  * @purpose Handles background operations: PO tracking, email filtering, summaries,
  *          and daily Calendar BOM build risk analysis.
  *          Cross-posts daily/weekly summaries to both Telegram and Slack #purchasing.
+ *          Posts completed build notifications to the MFG Google Calendar.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-02-25
+ * @updated 2026-03-04
  * @deps    googleapis, node-cron, telegraf, @slack/web-api, builds/build-risk
  */
 
@@ -148,6 +149,10 @@ export class OpsManager {
     // In-memory dedup for PO receiving alerts.
     // Hydrated from today's received POs on startup to prevent replay after restart.
     private seenReceivedPOIds = new Set<string>();
+    // In-memory dedup for outside-PO-thread email alerts.
+    // Prevents the same vendor email from triggering a Telegram notification on every sync cycle.
+    // Hydrated from Supabase on startup.
+    private seenOutsideThreadMsgIds = new Set<string>();
 
     constructor(bot: Telegraf) {
         this.bot = bot;
@@ -179,10 +184,10 @@ export class OpsManager {
             console.warn('[ops-manager] hydrateSeenSets failed (non-fatal):', err.message)
         );
 
-        // DECISION(2026-02-25): Build Risk Analysis @ 7:30 AM, 30 min before
-        // the daily summary. This gives Will actionable stockout warnings
-        // first, so the daily PO summary that follows has full context.
-        cron.schedule("30 7 * * 1-5", () => {
+        // DECISION(2026-03-04): Build Risk Analysis @ 5:00 AM — team starts early.
+        // Fires before the crew arrives so calendar annotations and stockout
+        // warnings are visible when they check the build schedule.
+        cron.schedule("0 5 * * 1-5", () => {
             this.sendBuildRiskReport();
         }, { timezone: "America/Denver" });
 
@@ -512,6 +517,8 @@ export class OpsManager {
                             });
                             for (const outsideMsg of outsideSearch?.messages || []) {
                                 if (outsideMsg.threadId === m.threadId) continue;
+                                // DEDUP: Skip messages we've already alerted on (persisted across restarts)
+                                if (this.seenOutsideThreadMsgIds.has(outsideMsg.id!)) continue;
                                 const { data: msgData } = await gmail.users.messages.get({
                                     userId: 'me', id: outsideMsg.id!, format: 'metadata',
                                     metadataHeaders: ['Subject', 'From'],
@@ -526,6 +533,16 @@ export class OpsManager {
                                     if (t) outsideTracking.push(t);
                                 }
                                 if (hasEta || outsideTracking.length > 0) {
+                                    // Mark as seen BEFORE sending to prevent duplicates on concurrent runs
+                                    this.seenOutsideThreadMsgIds.add(outsideMsg.id!);
+                                    // Persist to Supabase so restarts don't re-alert
+                                    supabase.from('outside_thread_alerts').upsert({
+                                        gmail_message_id: outsideMsg.id!,
+                                        po_number: poNumber,
+                                        vendor_name: vendorName,
+                                        created_at: new Date().toISOString(),
+                                    }, { onConflict: 'gmail_message_id' }).then(() => { }).catch(() => { });
+
                                     const outsideSubject = msgData.payload?.headers?.find((h: any) => h.name === 'Subject')?.value || '(no subject)';
                                     this.bot.telegram.sendMessage(
                                         process.env.TELEGRAM_CHAT_ID || "",
@@ -667,6 +684,23 @@ export class OpsManager {
         } catch (err: any) {
             console.warn('[ops-manager] PO receivings hydration failed:', err.message);
         }
+
+        // Hydrate outside-thread email dedup: load recently alerted message IDs from Supabase
+        try {
+            const db = createClient();
+            if (db) {
+                const { data } = await db
+                    .from('outside_thread_alerts')
+                    .select('gmail_message_id')
+                    .gte('created_at', new Date(Date.now() - 14 * 86_400_000).toISOString());
+                if (data) {
+                    for (const row of data) this.seenOutsideThreadMsgIds.add(row.gmail_message_id);
+                    console.log(`[ops-manager] Hydrated ${data.length} outside-thread alerts into dedup set.`);
+                }
+            }
+        } catch (err: any) {
+            console.warn('[ops-manager] Outside-thread alerts hydration failed:', err.message);
+        }
     }
 
     /**
@@ -728,7 +762,7 @@ export class OpsManager {
                             `Items:\n${itemLines}${moreStr}\n` +
                             `Total: $${po.total.toLocaleString()}\n` +
                             `Status: Received\n` +
-                            `→ Finale: ${calRow.calendar_id.includes('http') ? calRow.calendar_id : `https://app.finaleinventory.com/${process.env.FINALE_ACCOUNT_PATH}/order/${po.orderId}`}`;
+                            `→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`;
 
                         const calendar = new CalendarClient();
                         await calendar.updateEventTitleAndDescription(calRow.calendar_id, calRow.event_id, title, description);
@@ -785,16 +819,6 @@ export class OpsManager {
                     timeZone: 'America/Denver',
                 });
 
-                // Telegram notification
-                const msg = `🏭 *Build Complete*\n` +
-                    `SKU: \`${build.sku}\`  |  Qty: ${build.quantity.toLocaleString()}\n` +
-                    `Completed: ${timeStr}`;
-                this.bot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID || '',
-                    msg,
-                    { parse_mode: 'Markdown' }
-                ).catch((e: any) => console.warn('[build-watcher] Telegram send failed:', e.message));
-
                 // Match to a calendar event (same SKU, within ±1 day of build date)
                 const buildDate = completedAt.toISOString().split('T')[0];
                 const matched = parsedBuilds.find(p =>
@@ -802,6 +826,12 @@ export class OpsManager {
                     p.eventId !== null &&
                     Math.abs(new Date(p.buildDate).getTime() - completedAt.getTime()) < 2 * 86400000
                 );
+
+                // Build the Finale deep-link URL for this build
+                const accountPath = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+                // VERIFIED(2026-03-04): buildUrl comes from GraphQL; Finale route uses build/view/build/{base64}
+                const buildApiPath = build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`;
+                const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/view/build/${Buffer.from(buildApiPath).toString('base64')}`;
 
                 if (matched?.eventId && matched.calendarId) {
                     // Include scheduled vs actual if they differ — "192 of 200 scheduled (96%)"
@@ -813,6 +843,7 @@ export class OpsManager {
                     } else {
                         completionNote = `✅ Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
                     }
+                    completionNote += `\n→ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
                     await calendar.appendToEventDescription(
                         matched.calendarId,
                         matched.eventId,
@@ -833,6 +864,10 @@ export class OpsManager {
                         calendar_id: matched?.calendarId ?? null,
                     }, { onConflict: 'build_id', ignoreDuplicates: true });
                 });
+
+                // DECISION(2026-03-04): Removed the separate MFG calendar event creation.
+                // Build completions are now annotated directly onto the existing build plan
+                // event (above) to avoid duplicate entries on the same calendar day.
 
                 console.log(`✅ [build-watcher] Build complete: ${build.sku} × ${build.quantity} @ ${timeStr}`);
             }
@@ -925,6 +960,111 @@ export class OpsManager {
                             }
                         }
                     }
+                }
+
+                // ── Blocked-build calendar annotations ──
+                // DECISION(2026-03-04): For each CRITICAL/WARNING component, annotate
+                // the affected calendar build events with a concise warning showing the
+                // blocking component, any PO on order + ETA, and whether it arrives in
+                // time. Zero LLM tokens. Deduped via proactive_alerts so we don't
+                // re-annotate the same build for the same shortage every day.
+                try {
+                    const cal = new CalendarClient();
+                    const bp = new BuildParser();
+                    const ev = await cal.getAllUpcomingBuilds(60);
+                    const builds = await bp.extractBuildPlan(ev);
+                    const todayLabel = new Date().toLocaleDateString('en-US', {
+                        month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
+                    });
+
+                    // Dedup: check which (componentSku, buildEventId) pairs we've already annotated
+                    const db = createClient();
+                    const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+                    const { data: recentAlerts } = db
+                        ? await db.from('proactive_alerts').select('sku,risk_level').gte('alerted_at', cutoff24h)
+                        : { data: [] };
+                    const alertedSet = new Set((recentAlerts ?? []).map((r: any) => `${r.sku}:${r.risk_level}`));
+
+                    const atRisk = Array.from(report.components.entries()).filter(
+                        ([, d]) => d.riskLevel === 'CRITICAL' || d.riskLevel === 'WARNING'
+                    );
+
+                    let annotated = 0;
+                    for (const [compSku, demand] of atRisk) {
+                        // Skip if we already annotated this component today
+                        if (alertedSet.has(`${compSku}:cal-block`)) continue;
+
+                        for (const fgSku of demand.usedIn) {
+                            const build = builds.find(p => p.sku === fgSku && p.eventId !== null);
+                            if (!build?.eventId || !build.calendarId) continue;
+
+                            // ── Build the annotation ──
+                            const icon = demand.riskLevel === 'CRITICAL' ? '🔴' : '🟡';
+                            const daysLabel = demand.stockoutDays !== null
+                                ? `${demand.stockoutDays}d to stockout`
+                                : 'low stock';
+
+                            let note = `${icon} ${compSku} — ${daysLabel}`;
+
+                            if (demand.incomingPOs.length > 0) {
+                                const po = demand.incomingPOs[0]; // most relevant PO
+                                // Estimate arrival: orderDate + leadTimeDays
+                                let etaStr = '';
+                                let arrivesBefore = false;
+                                if (demand.leadTimeDays !== null && po.orderDate) {
+                                    const orderMs = new Date(po.orderDate).getTime();
+                                    const etaMs = orderMs + demand.leadTimeDays * 86400000;
+                                    const eta = new Date(etaMs);
+                                    etaStr = eta.toLocaleDateString('en-US', {
+                                        month: 'short', day: 'numeric', timeZone: 'America/Denver',
+                                    });
+                                    const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
+                                    arrivesBefore = etaMs <= buildMs;
+                                }
+
+                                const poLabel = `PO#${po.orderId} from ${po.supplier} (${po.quantity.toLocaleString()} units)`;
+                                if (etaStr) {
+                                    note += `\n   ${arrivesBefore ? '✅' : '⚠️'} ${poLabel} ETA ~${etaStr}`;
+                                    if (!arrivesBefore) {
+                                        const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
+                                        const etaMs = new Date(po.orderDate).getTime() + (demand.leadTimeDays ?? 0) * 86400000;
+                                        const daysLate = Math.ceil((etaMs - buildMs) / 86400000);
+                                        note += ` — arrives ~${daysLate}d after build`;
+                                    }
+                                } else {
+                                    note += `\n   📦 ${poLabel} on order`;
+                                }
+
+                                if (demand.incomingPOs.length > 1) {
+                                    note += ` (+${demand.incomingPOs.length - 1} more PO${demand.incomingPOs.length > 2 ? 's' : ''})`;
+                                }
+                            } else {
+                                note += '\n   ⛔ No PO on order';
+                            }
+
+                            note += ` (${todayLabel})`;
+
+                            await cal.appendToEventDescription(build.calendarId, build.eventId, note);
+                            annotated++;
+                        }
+
+                        // Mark as annotated so we don't repeat tomorrow
+                        if (db) {
+                            await db.from('proactive_alerts').upsert({
+                                sku: compSku,
+                                alert_type: 'cal-block',
+                                risk_level: 'cal-block',
+                                stockout_days: demand.stockoutDays,
+                                alerted_at: new Date().toISOString(),
+                            }, { onConflict: 'sku,alert_type' });
+                        }
+                    }
+
+                    if (annotated > 0) {
+                        console.log(`📅 [build-risk] Annotated ${annotated} calendar event(s) with component shortage warnings.`);
+                    }
+                } catch (err: any) {
+                    console.warn('[build-risk] Calendar block annotation failed (non-fatal):', err.message);
                 }
 
                 await saveBuildRiskSnapshot(report);
@@ -1177,7 +1317,7 @@ Data: ${JSON.stringify(data)}`;
 
         const statusLabel = isReceived ? 'Received' : isCancelled ? 'Cancelled' : 'In Transit';
         lines.push(`Status: ${statusLabel}`);
-        lines.push(`→ Finale: ${po.finaleUrl}`);
+        lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
 
         return lines.join('\n');
     }
@@ -1249,7 +1389,7 @@ Data: ${JSON.stringify(data)}`;
                 const description = this.buildPOEventDescription(po, expectedDate, leadProvenance);
                 const newStatus = (po.status || '').toLowerCase() === 'completed' ? 'received'
                     : (po.status || '').toLowerCase() === 'cancelled' ? 'cancelled'
-                    : 'open';
+                        : 'open';
 
                 const existingRow = existing.get(po.orderId);
 

@@ -86,6 +86,34 @@ export interface ExternalReorderGroup {
     items: ExternalReorderItem[];
 }
 
+export interface PurchasingItem {
+    productId: string;
+    productName: string;
+    supplierName: string;
+    supplierPartyId: string;
+    unitPrice: number;
+    stockOnHand: number;
+    stockOnOrder: number;
+    purchaseVelocity: number;      // units/day from 90d purchase receipts
+    salesVelocity: number;         // units/day from 90d outbound shipments
+    dailyRate: number;             // max(purchaseVelocity, salesVelocity)
+    runwayDays: number;            // stockOnHand / dailyRate
+    adjustedRunwayDays: number;    // (stockOnHand + stockOnOrder) / dailyRate
+    leadTimeDays: number;
+    leadTimeProvenance: string;    // e.g. "14d (Finale)" | "14d default"
+    openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
+    urgency: 'critical' | 'warning' | 'watch' | 'ok';
+    explanation: string;           // natural language, computed server-side
+    suggestedQty: number;
+}
+
+export interface PurchasingGroup {
+    vendorName: string;
+    vendorPartyId: string;
+    urgency: 'critical' | 'warning' | 'watch' | 'ok';  // worst of all items
+    items: PurchasingItem[];
+}
+
 export interface FullPO {
     orderId: string;
     vendorName: string;
@@ -246,9 +274,13 @@ export class FinaleClient {
     }
 
     /**
-     * Returns total quantity received (purchased) for a SKU over a rolling date range.
-     * Uses orderViewConnection with receiveDate filter + client-side SKU match.
-     * Designed for answering "how much did we buy last year" questions.
+     * Returns total quantity purchased for a SKU over a rolling date range.
+     * Uses orderViewConnection with orderDate filter + client-side SKU match.
+     *
+     * DECISION(2026-03-04): Finale often leaves receiveDate empty on Completed POs
+     * (confirmed on ULINE — all Completed POs have blank receiveDate). Using orderDate
+     * ensures these show up. Status filter ("Completed") is applied client-side.
+     * Designed for answering "how much did we buy last N days" questions.
      */
     async getPurchasedQty(sku: string, daysBack: number = 365): Promise<{
         sku: string;
@@ -263,22 +295,28 @@ export class FinaleClient {
         const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
         const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
+        // product filter narrows response to POs containing this SKU only — avoids fetching
+        // all 500+ POs in the window and scanning client-side (20-50x less data per call).
+        // first: 100 handles items ordered weekly over a 12-month window (~52 POs).
+        const productUrl = `/${this.accountPath}/api/product/${sku}`;
         const query = {
             query: `
                 query {
                     orderViewConnection(
-                        first: 200
+                        first: 100
                         type: ["PURCHASE_ORDER"]
-                        receiveDate: { begin: "${beginStr}", end: "${endStr}" }
-                        sort: [{ field: "receiveDate", mode: "desc" }]
+                        product: ["${productUrl}"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
                     ) {
                         edges {
                             node {
                                 orderId
                                 status
+                                orderDate
                                 receiveDate
                                 supplier { name }
-                                itemList(first: 100) {
+                                itemList(first: 20) {
                                     edges {
                                         node {
                                             product { productId }
@@ -315,7 +353,7 @@ export class FinaleClient {
                     if (ie.node.product?.productId === sku) {
                         matchingOrders.push({
                             orderId: po.orderId,
-                            receiveDate: po.receiveDate || "",
+                            receiveDate: po.receiveDate || po.orderDate || "",
                             supplier: po.supplier?.name || "Unknown",
                             qty: parseFinaleNumber(ie.node.quantity),
                         });
@@ -353,12 +391,15 @@ export class FinaleClient {
         const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
         const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
+        // product filter narrows response to sales orders containing this SKU only.
+        const productUrlSales = `/${this.accountPath}/api/product/${sku}`;
         const query = {
             query: `
                 query {
                     orderViewConnection(
-                        first: 200
+                        first: 50
                         type: ["SALES_ORDER"]
+                        product: ["${productUrlSales}"]
                         orderDate: { begin: "${beginStr}", end: "${endStr}" }
                         sort: [{ field: "orderDate", mode: "desc" }]
                     ) {
@@ -366,7 +407,7 @@ export class FinaleClient {
                             node {
                                 orderId
                                 status
-                                itemList(first: 100) {
+                                itemList(first: 20) {
                                     edges {
                                         node {
                                             product { productId }
@@ -710,7 +751,7 @@ export class FinaleClient {
      * Also, `status` + `product` filters conflict — so we query by product only
      * and filter for Committed status client-side.
      */
-    private async findCommittedPOsForProduct(productId: string): Promise<POInfo[]> {
+    async findCommittedPOsForProduct(productId: string): Promise<POInfo[]> {
         try {
             const productUrl = `/${this.accountPath}/api/product/${productId}`;
             const query = {
@@ -771,7 +812,7 @@ export class FinaleClient {
                         status: po.status,
                         orderDate: po.orderDate,
                         supplier: po.supplier?.name || "Unknown",
-                        quantityOnOrder: matchingItem?.node.quantity || 0,
+                        quantityOnOrder: parseFinaleNumber(matchingItem?.node.quantity) || 0,
                         total: po.total || 0,
                     };
                 });
@@ -1514,6 +1555,7 @@ export class FinaleClient {
      */
     async getRecentlyCompletedBuilds(since: Date): Promise<Array<{
         buildId: string;
+        buildUrl: string;
         sku: string;
         quantity: number;
         completedAt: string;
@@ -1534,6 +1576,7 @@ export class FinaleClient {
                             edges {
                                 node {
                                     buildId
+                                    buildUrl
                                     status
                                     quantityToProduce
                                     completeTransactionTimestamp
@@ -1558,6 +1601,7 @@ export class FinaleClient {
                 .filter((e: any) => e.node.status === 'Completed' && e.node.productToProduce?.productId)
                 .map((e: any) => ({
                     buildId: e.node.buildId,
+                    buildUrl: e.node.buildUrl || '',
                     sku: e.node.productToProduce.productId,
                     quantity: parseInt(e.node.quantityToProduce || '0', 10),
                     completedAt: e.node.completeTransactionTimestamp || '',
@@ -2386,10 +2430,12 @@ export class FinaleClient {
         if (atRisk.length === 0) return [];
 
         // ── Step 2: Resolve supplier for each at-risk product (batched, 5x concurrency) ──
-        // Cache partyId → { groupName, isManufactured } to avoid repeat calls
-        const partyCache = new Map<string, { groupName: string; isManufactured: boolean }>();
+        // Cache partyId → { groupName, isManufactured, isDropship } to avoid repeat calls
+        // isDropship: fulfilled direct-to-customer — no BAS reorder needed
+        //   (Autopot, Printful, Grand Master, HLG, Evergreen, AC Infinity)
+        const partyCache = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean }>();
 
-        const resolveParty = async (partyId: string): Promise<{ groupName: string; isManufactured: boolean }> => {
+        const resolveParty = async (partyId: string): Promise<{ groupName: string; isManufactured: boolean; isDropship: boolean }> => {
             if (partyCache.has(partyId)) return partyCache.get(partyId)!;
             try {
                 const res = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
@@ -2401,11 +2447,12 @@ export class FinaleClient {
                     groupName.toLowerCase().includes('manufacturing') ||
                     groupName.toLowerCase().includes('soil dept') ||
                     groupName.toLowerCase().includes('bas soil');
-                const result = { groupName, isManufactured };
+                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
+                const result = { groupName, isManufactured, isDropship };
                 partyCache.set(partyId, result);
                 return result;
             } catch {
-                return { groupName: 'Unknown', isManufactured: false };
+                return { groupName: 'Unknown', isManufactured: false, isDropship: false };
             }
         };
 
@@ -2418,6 +2465,7 @@ export class FinaleClient {
             supplierName: string;
             unitPrice: number;
             isManufactured: boolean;
+            isDropship: boolean;
         }
 
         const richItems: RichItem[] = [];
@@ -2449,6 +2497,7 @@ export class FinaleClient {
                         supplierName: party.groupName,
                         unitPrice: mainSupplier.price ?? 0,
                         isManufactured: party.isManufactured,
+                        isDropship: party.isDropship,
                     });
                 } catch {
                     // Skip products we can't resolve
@@ -2456,8 +2505,8 @@ export class FinaleClient {
             }
         }));
 
-        // ── Step 3: Filter to external vendors only, group by supplier ──
-        const external = richItems.filter(i => !i.isManufactured && i.supplierPartyId);
+        // ── Step 3: Filter to external, non-dropship vendors only, group by supplier ──
+        const external = richItems.filter(i => !i.isManufactured && !i.isDropship && i.supplierPartyId);
         const byVendor = new Map<string, RichItem[]>();
         for (const item of external) {
             const key = item.supplierPartyId!;
@@ -2542,6 +2591,368 @@ export class FinaleClient {
 
         console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items)`);
         return { orderId, finaleUrl };
+    }
+
+    // ──────────────────────────────────────────────────
+    // PURCHASING INTELLIGENCE
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Combines purchase history, sales history, and committed open POs into a single
+     * GraphQL request using field aliases. Replaces three separate calls
+     * (getPurchasedQty + getSalesQty + findCommittedPOsForProduct) used by
+     * getPurchasingIntelligence, requesting only the fields that method needs.
+     *
+     * purchasedIn / soldIn  — date-windowed velocity signals
+     * committedPOs          — all-time open supply (no date filter; Committed = always current)
+     */
+    private async getProductActivity(sku: string, daysBack: number): Promise<{
+        purchasedQty: number;
+        soldQty: number;
+        openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }>;
+    }> {
+        const end = new Date();
+        const begin = new Date();
+        begin.setDate(begin.getDate() - daysBack);
+        const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        const productUrl = `/${this.accountPath}/api/product/${sku}`;
+
+        const query = {
+            query: `{
+                purchasedIn: orderViewConnection(
+                    first: 100
+                    type: ["PURCHASE_ORDER"]
+                    product: ["${productUrl}"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        status
+                        itemList(first: 20) {
+                            edges { node { product { productId } quantity } }
+                        }
+                    }}
+                }
+                soldIn: orderViewConnection(
+                    first: 50
+                    type: ["SALES_ORDER"]
+                    product: ["${productUrl}"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        status
+                        itemList(first: 20) {
+                            edges { node { product { productId } quantity } }
+                        }
+                    }}
+                }
+                committedPOs: orderViewConnection(
+                    first: 20
+                    type: ["PURCHASE_ORDER"]
+                    product: ["${productUrl}"]
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        orderId status orderDate
+                        itemList(first: 20) {
+                            edges { node { product { productId } quantity } }
+                        }
+                    }}
+                }
+            }`
+        };
+
+        try {
+            let res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            // 429 rate-limit backoff: wait 5s and retry once
+            if (res.status === 429) {
+                console.warn(`[finale] rate limited on ${sku} activity query — backing off 5s`);
+                await new Promise(r => setTimeout(r, 5000));
+                res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                    method: 'POST',
+                    headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                    body: JSON.stringify(query),
+                });
+            }
+            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+            const result = await res.json();
+            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+
+            let purchasedQty = 0;
+            for (const edge of result.data?.purchasedIn?.edges || []) {
+                const po = edge.node;
+                if (po.status !== 'Completed') continue;
+                for (const ie of po.itemList?.edges || []) {
+                    if (ie.node.product?.productId === sku) {
+                        purchasedQty += parseFinaleNumber(ie.node.quantity);
+                        break;
+                    }
+                }
+            }
+
+            let soldQty = 0;
+            for (const edge of result.data?.soldIn?.edges || []) {
+                const so = edge.node;
+                if (so.status !== 'Completed' && so.status !== 'Shipped') continue;
+                for (const ie of so.itemList?.edges || []) {
+                    if (ie.node.product?.productId === sku) {
+                        soldQty += parseFinaleNumber(ie.node.quantity);
+                        break;
+                    }
+                }
+            }
+
+            const openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }> = [];
+            for (const edge of result.data?.committedPOs?.edges || []) {
+                const po = edge.node;
+                if (po.status !== 'Committed') continue;
+                for (const ie of po.itemList?.edges || []) {
+                    if (ie.node.product?.productId === sku) {
+                        openPOs.push({
+                            orderId: po.orderId,
+                            quantityOnOrder: parseFinaleNumber(ie.node.quantity) || 0,
+                            orderDate: po.orderDate || '',
+                        });
+                        break;
+                    }
+                }
+            }
+
+            return { purchasedQty, soldQty, openPOs };
+        } catch {
+            return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+        }
+    }
+
+    /**
+     * Scan all active products with consumption history and compute velocity-based
+     * purchasing intelligence from raw receipt/shipment data.
+     *
+     * Unlike getExternalReorderItems(), this method:
+     *   - Uses purchase receipt history (not Finale's unreliable reorderQuantityToOrder)
+     *   - Uses shipment history as a second velocity signal
+     *   - Fetches REST stock levels (GraphQL stockOnHand = "--" for most products)
+     *   - Computes runway, adjusted runway (with open POs), and urgency independently
+     *   - Generates natural language explanations per item
+     *
+     * @param daysBack  Lookback window for velocity calculation (default: 90 days)
+     */
+    async getPurchasingIntelligence(daysBack = 365): Promise<PurchasingGroup[]> {
+        const PAGE_SIZE = 500;
+
+        // ── Step 1: Page productViewConnection — presence signal only ──
+        // Two signals qualify a product as "actively moving":
+        //   - reorderQuantityToOrder > 0  : Finale is flagging it for reorder (covers purchased-for-resale)
+        //   - consumptionQuantity > 0     : BOM consumption (covers purchased components)
+        // NOTE: consumptionQuantity alone misses purchased-for-resale items (boxes, packaging, etc.)
+        // which have consumptionQuantity=0 but reorderQuantityToOrder>0 and demandQuantity>0.
+        const candidates: string[] = [];
+        let cursor: string | null = null;
+
+        while (true) {
+            const afterClause: string = cursor ? `, after: "${cursor}"` : '';
+            const query: { query: string } = {
+                query: `{
+                    productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        edges { node { productId status consumptionQuantity reorderQuantityToOrder } }
+                    }
+                }`
+            };
+
+            const res: Response = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const conn: any = json.data?.productViewConnection;
+            if (!conn) break;
+
+            for (const edge of conn.edges || []) {
+                const p = edge.node;
+                if (p.status !== 'Active') continue;
+                const consumption = this.parseFinaleNum(p.consumptionQuantity);
+                const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
+                if ((consumption !== null && consumption > 0) || (reorderQty !== null && reorderQty > 0)) {
+                    candidates.push(p.productId);
+                }
+            }
+
+            if (!conn.pageInfo.hasNextPage) break;
+            cursor = conn.pageInfo.endCursor;
+        }
+
+        console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates with consumption > 0`);
+        if (candidates.length === 0) return [];
+
+        // ── Step 2-8: 5x concurrent workers per candidate SKU ──
+        // Vendors excluded from purchasing intelligence:
+        //   isManufactured : internal BAS production depts
+        //   isDropship     : fulfilled direct by vendor — no BAS reorder needed
+        //                    (Autopot, Printful, Grand Master, HLG, Evergreen, AC Infinity)
+        const partyCache = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean }>();
+
+        const resolveParty = async (partyUrl: string): Promise<{ groupName: string; isManufactured: boolean; isDropship: boolean }> => {
+            const partyId = partyUrl.split('/').pop() || '';
+            if (partyCache.has(partyId)) return partyCache.get(partyId)!;
+            try {
+                const r = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
+                    headers: { Authorization: this.authHeader, Accept: 'application/json' },
+                });
+                const data = await r.json();
+                const groupName: string = data.groupName || data.name || 'Unknown';
+                const isManufactured = /buildasoil|manufacturing|soil dept|bas soil/i.test(groupName);
+                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
+                const result = { groupName, isManufactured, isDropship };
+                partyCache.set(partyId, result);
+                return result;
+            } catch {
+                return { groupName: 'Unknown', isManufactured: false, isDropship: false };
+            }
+        };
+
+        const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 };
+        const items: PurchasingItem[] = [];
+        const queue = [...candidates];
+
+        // 3 workers: keeps peak concurrency at ~3 simultaneous Finale requests.
+        // 100ms inter-SKU pause spreads load to ~180 calls/min sustained — well within limits.
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (queue.length > 0) {
+                const sku = queue.shift()!;
+                try {
+                    // Step A: REST product data first — need supplier URL to check exclusions
+                    // before spending any GraphQL calls on manufactured/dropship vendors.
+                    const prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                    const suppliers: any[] = prodData.supplierList || [];
+                    const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
+                    if (!mainSupplier?.supplierPartyUrl) continue;
+
+                    // Step B: Resolve supplier and check exclusions (partyCache keeps this fast after first hit)
+                    const party = await resolveParty(mainSupplier.supplierPartyUrl);
+                    if (party.isManufactured || party.isDropship) continue;
+
+                    // Step C: Single combined GraphQL request — purchase history + sales history + open POs
+                    const activity = await this.getProductActivity(sku, daysBack);
+
+                    const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
+                    const productName: string = prodData.internalName || prodData.productId || sku;
+                    const unitPrice: number = mainSupplier.price ?? 0;
+
+                    // Lead time: REST product field → 14d default
+                    const rawLeadTime = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
+                    const leadTimeDays = !isNaN(rawLeadTime) && rawLeadTime > 0 ? rawLeadTime : 14;
+                    const leadTimeProvenance = !isNaN(rawLeadTime) && rawLeadTime > 0
+                        ? `${rawLeadTime}d (Finale)`
+                        : '14d default';
+
+                    // Stock from REST (GraphQL returns "--" for most products in bulk scans)
+                    const stockOnHand = parseFinaleNumber(prodData.quantityOnHand ?? prodData.stockLevel ?? 0);
+
+                    // Open PO supply
+                    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
+
+                    // Step 4: velocity + runway
+                    const purchaseVelocity = activity.purchasedQty / daysBack;
+                    const salesVelocity = activity.soldQty / daysBack;
+                    const dailyRate = Math.max(purchaseVelocity, salesVelocity);
+                    if (dailyRate === 0) continue; // no actual movement
+
+                    const runwayDays = stockOnHand / dailyRate;
+                    const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
+
+                    // Step 6: urgency (based on raw runway, not adjusted)
+                    const urgency: PurchasingItem['urgency'] =
+                        runwayDays < leadTimeDays ? 'critical'
+                            : runwayDays < leadTimeDays + 30 ? 'warning'
+                                : runwayDays < leadTimeDays + 60 ? 'watch'
+                                    : 'ok';
+
+                    // Step 7: natural language explanation
+                    const rateSource = purchaseVelocity >= salesVelocity ? 'receipts' : 'shipments';
+                    const parts: string[] = [
+                        `Avg ${dailyRate.toFixed(1)}/day (${daysBack}d ${rateSource})`,
+                        `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays)}d`,
+                        `Lead ${leadTimeDays}d`,
+                    ];
+                    if (stockOnOrder > 0) {
+                        parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
+                    }
+                    const urgencyNote = urgency === 'critical' ? 'order now, already short'
+                        : urgency === 'warning' ? 'order soon'
+                            : urgency === 'watch' ? 'monitor'
+                                : 'covered';
+                    const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
+
+                    // Step 8: suggested qty (lead time + 60d buffer, rounded to 50)
+                    const suggestedQty = Math.max(50, Math.ceil(dailyRate * (leadTimeDays + 60) / 50) * 50);
+
+                    items.push({
+                        productId: sku,
+                        productName,
+                        supplierName: party.groupName,
+                        supplierPartyId: partyId,
+                        unitPrice,
+                        stockOnHand,
+                        stockOnOrder,
+                        purchaseVelocity,
+                        salesVelocity,
+                        dailyRate,
+                        runwayDays,
+                        adjustedRunwayDays,
+                        leadTimeDays,
+                        leadTimeProvenance,
+                        openPOs: activity.openPOs.map(po => ({
+                            orderId: po.orderId,
+                            quantity: po.quantityOnOrder,
+                            orderDate: po.orderDate,
+                        })),
+                        urgency,
+                        explanation,
+                        suggestedQty,
+                    });
+                } catch {
+                    // Skip products that error — non-fatal
+                }
+                // 100ms breathing room between SKUs — keeps sustained load ~180 req/min
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        // Step 9: group by vendor, sort vendors by worst urgency
+        const byVendor = new Map<string, PurchasingItem[]>();
+        for (const item of items) {
+            if (!byVendor.has(item.supplierPartyId)) byVendor.set(item.supplierPartyId, []);
+            byVendor.get(item.supplierPartyId)!.push(item);
+        }
+
+        const groups: PurchasingGroup[] = [];
+        for (const groupItems of byVendor.values()) {
+            groupItems.sort((a, b) =>
+                urgencyRank[a.urgency] - urgencyRank[b.urgency] || a.runwayDays - b.runwayDays
+            );
+            const worstUrgency = groupItems.reduce<PurchasingItem['urgency']>(
+                (worst, item) => urgencyRank[item.urgency] < urgencyRank[worst] ? item.urgency : worst,
+                'ok'
+            );
+            groups.push({
+                vendorName: groupItems[0].supplierName,
+                vendorPartyId: groupItems[0].supplierPartyId,
+                urgency: worstUrgency,
+                items: groupItems,
+            });
+        }
+
+        groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
+        console.log(`[finale] getPurchasingIntelligence: ${items.length} items across ${groups.length} vendors`);
+        return groups;
     }
 
     // ── private helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──

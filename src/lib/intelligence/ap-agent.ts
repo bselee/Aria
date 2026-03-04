@@ -13,6 +13,7 @@ import {
     applyReconciliation,
     ReconciliationResult,
     storePendingApproval,
+    buildAuditMetadata,
 } from "../finale/reconciler";
 import { unifiedObjectGeneration } from "./llm";
 import { storePendingDropship } from "./dropship-store";
@@ -386,7 +387,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
             // 1c. Zero-line-item guard — possible OCR failure on scanned/corrupted PDF
             if (!invoiceData.lineItems || invoiceData.lineItems.length === 0) {
                 const warnMsg = `⚠️ *Invoice parsed with 0 line items — possible OCR failure*\nVendor: ${invoiceData.vendorName}\nInvoice: #${invoiceData.invoiceNumber}\nFile: \`${filename}\`\nForwarded to Bill.com. Finale reconciliation skipped — please review manually.`;
-                try { await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch {}
+                try { await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch { }
                 await this.logActivity(supabase, from, subject, "PROCESSING_ERROR",
                     `Invoice parsed with 0 line items — possible OCR failure (${filename})`,
                     { invoiceNumber: invoiceData.invoiceNumber, vendorName: invoiceData.vendorName, filename }
@@ -694,7 +695,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     ])
                 });
             }
-        } else {
+        } else if (!matched) {
             this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
         }
 
@@ -744,6 +745,46 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     }
                 }
                 console.log(`   ⚠️ Force-upgraded to needs_approval (fallback PO match)`);
+            }
+
+            // PHASE 3: Vendor-specific auto-approve threshold check.
+            // If this vendor has a learned threshold (from 5+ past approvals at 80%+ rate),
+            // and ALL price changes are under that threshold, downgrade needs_approval → auto_approve.
+            // This is the autonomy loop: more approvals → tighter threshold → less human review.
+            if (
+                !forceApproval &&
+                result.overallVerdict === "needs_approval" &&
+                result.priceChanges.length > 0
+            ) {
+                try {
+                    const { data: vendorProfile } = await supabase
+                        .from("vendor_profiles")
+                        .select("auto_approve_threshold")
+                        .eq("vendor_name", result.vendorName)
+                        .single();
+
+                    if (vendorProfile?.auto_approve_threshold !== null && vendorProfile?.auto_approve_threshold !== undefined) {
+                        const threshold = vendorProfile.auto_approve_threshold;
+                        const maxVariance = result.priceChanges
+                            .filter((pc: any) => pc.verdict === "needs_approval")
+                            .reduce((max: number, pc: any) => Math.max(max, Math.abs(pc.percentChange * 100)), 0);
+
+                        if (maxVariance <= threshold && maxVariance > 0) {
+                            // All variances within learned threshold — downgrade to auto_approve
+                            for (const pc of result.priceChanges) {
+                                if (pc.verdict === "needs_approval") {
+                                    pc.verdict = "auto_approve";
+                                    pc.reason += ` | Phase 3 auto-approved (${maxVariance.toFixed(1)}% ≤ ${threshold}% vendor threshold)`;
+                                }
+                            }
+                            result.overallVerdict = "auto_approve";
+                            result.autoApplicable = true;
+                            console.log(`   🤖 Phase 3: Auto-approved (max ${maxVariance.toFixed(1)}% ≤ ${threshold}% vendor threshold for ${result.vendorName})`);
+                        }
+                    }
+                } catch {
+                    // Non-blocking: if vendor profile lookup fails, fall through to normal approval flow
+                }
             }
 
             console.log(`   📊 Reconciliation: ${result.overallVerdict} | Impact: $${result.totalDollarImpact.toFixed(2)}`);
@@ -857,15 +898,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
                     : `Flagged for review: ${result.overallVerdict}`,
                 notified_slack: !!this.slack,
-                metadata: {
-                    orderId: result.orderId,
-                    invoiceNumber: result.invoiceNumber,
-                    verdict: result.overallVerdict,
-                    totalImpact: result.totalDollarImpact,
-                    applied: applyResult.applied,
-                    skipped: applyResult.skipped,
-                    errors: applyResult.errors,
-                }
+                metadata: buildAuditMetadata(result, applyResult, "auto")
             });
         } catch (err: any) {
             console.warn("⚠️ Failed to log reconciliation:", err.message);

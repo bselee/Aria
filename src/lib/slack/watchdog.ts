@@ -5,9 +5,10 @@
  *          Uses fuzzy matching (Fuse.js) against known products from PO history.
  *          Cross-references active POs for instant ETA lookups.
  *          Reports actionable findings to Will on Telegram.
+ *          Replies in Slack threads with per-SKU Finale stock context.
  * @author  Antigravity / Aria
  * @created 2026-02-24
- * @updated 2026-02-25
+ * @updated 2026-03-04
  * @deps    @slack/web-api, fuse.js, intelligence/llm, supabase, axios, finale/client
  */
 
@@ -59,6 +60,22 @@ interface DetectedRequest {
     eta: string | null;
     timestamp: string;
     finaleContext: string | null;  // Real-time stock/risk context from Finale
+    messageTs: string;             // Original Slack ts for thread replies & reactions
+    threadTs?: string;             // Thread parent ts, if applicable
+}
+
+// Per-SKU Finale stock detail for intelligent replies
+interface SkuStockDetail {
+    sku: string;
+    onHand: number | null;
+    onOrder: number | null;
+    stockoutDays: number | null;
+    incomingPOs: number;
+    found: boolean;
+    recommendation: string; // Human-readable one-liner
+    vendorName: string | null;    // Primary supplier name from Finale
+    vendorPartyUrl: string | null; // For PO matching
+    needsReorder: boolean;         // True if stockout ≤ 30d or out of stock
 }
 
 // ──────────────────────────────────────────────────
@@ -68,6 +85,9 @@ interface DetectedRequest {
 // DECISION(2026-02-26): Only monitor channels where legitimate purchasing
 // requests come in. #inventory-management was too noisy with general chatter.
 // DMs are always monitored for direct requests to Will.
+// DECISION(2026-03-04): Also monitor ALL channels for @Bill mentions.
+// Parker's 3.0BAGCF request was missed because it was posted outside
+// the purchasing channels but tagged @Bill Selee directly.
 const MONITORED_CHANNEL_NAMES = new Set([
     "purchasing",
     "purchase-orders",
@@ -75,14 +95,15 @@ const MONITORED_CHANNEL_NAMES = new Set([
 
 export class SlackWatchdog {
     private client: WebClient;
-    private botClient: WebClient | null = null; // Bot token — used for users.info (has users:read scope)
+    private botClient: WebClient | null = null; // Bot token — used for users.info AND thread replies
     private lastChecked: Map<string, string> = new Map();
     private lastCheckedThreads: Map<string, string> = new Map(); // threadKey -> last reply ts
-    private channelNames: Map<string, string> = new Map();
-    private userNames: Map<string, string> = new Map(); // userId -> display name
+    private channelNames: Map<string, string> = new Map();       // Full-monitor channels (DMs + purchasing)
+    private mentionChannels: Map<string, string> = new Map();    // All other channels — only process @Bill mentions
+    private userNames: Map<string, string> = new Map();          // userId -> display name
     private productCatalog: KnownProduct[] = [];
     private fuse: Fuse<KnownProduct> | null = null;
-    private pendingRequests: DetectedRequest[] = []; // buffer for batch reporting
+    private pendingRequests: DetectedRequest[] = [];  // buffer for batch reporting
     private pollIntervalMs: number;
     private finaleClient: FinaleClient;
     private processedRequests: Set<string> = new Set(); // In-memory dedup for request alerts
@@ -252,27 +273,34 @@ export class SlackWatchdog {
                     limit: 200,
                 });
 
-                let count = 0;
+                let fullCount = 0;
+                let mentionCount = 0;
                 for (const ch of (result.channels || [])) {
                     if (!ch.is_member && !ch.is_im) continue;
 
                     const name = ch.name || ch.id || "dm";
                     const isDM = ch.is_im === true;
 
-                    // DECISION(2026-02-26): Only register DMs and explicitly
-                    // allowlisted channels. Everything else is ignored.
                     if (isDM || MONITORED_CHANNEL_NAMES.has(name)) {
+                        // Full-monitor: process ALL messages
                         this.channelNames.set(ch.id!, name);
-                        count++;
+                        fullCount++;
+                    } else if (!isDM) {
+                        // DECISION(2026-03-04): Register all other channels for @Bill mention detection.
+                        // Parker's request was missed because it was in a non-purchasing channel
+                        // but explicitly tagged @Bill Selee. We now catch those.
+                        this.mentionChannels.set(ch.id!, name);
+                        mentionCount++;
                     }
                 }
-                console.log(`  ✅ ${label}: ${count} monitored`);
+                console.log(`  ✅ ${label}: ${fullCount} full-monitor, ${mentionCount} mention-watch`);
             } catch (err: any) {
                 console.warn(`  ⚠️ ${label}: skipped (${err.data?.error || err.message})`);
             }
         }
 
-        console.log(`📋 Monitoring ${this.channelNames.size} channels total (allowlist: DMs + ${[...MONITORED_CHANNEL_NAMES].join(', ')})`);
+        console.log(`📋 Full-monitor: ${this.channelNames.size} channels (DMs + ${[...MONITORED_CHANNEL_NAMES].join(', ')})`);
+        console.log(`📋 @Mention-watch: ${this.mentionChannels.size} additional channels`);
     }
 
     // ──────────────────────────────────────────────────
@@ -284,6 +312,7 @@ export class SlackWatchdog {
         const day = new Date().getDay();
         if (day === 0 || day === 6) return;
 
+        // 1. Full-monitor channels: process ALL messages (DMs + purchasing channels)
         for (const [channelId, channelName] of this.channelNames) {
             try {
                 await this.pollChannel(channelId, channelName);
@@ -292,6 +321,59 @@ export class SlackWatchdog {
                     // Silently skip non-critical errors
                 }
             }
+        }
+
+        // 2. @Mention channels: only process messages that tag @Bill
+        // DECISION(2026-03-04): Poll all channels Will is a member of, but only
+        // process messages containing <@OWNER_USER_ID>. This catches requests
+        // like Parker's 3.0BAGCF post in any channel when @Bill is explicitly tagged.
+        if (this.ownerUserId) {
+            for (const [channelId, channelName] of this.mentionChannels) {
+                try {
+                    await this.pollMentionChannel(channelId, channelName);
+                } catch (err: any) {
+                    if (!err.message?.includes("not_in_channel") && !err.message?.includes("channel_not_found")) {
+                        // Silently skip non-critical errors
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Polls a non-purchasing channel for messages that explicitly tag @Bill.
+     * Only processes messages containing `<@OWNER_USER_ID>`.
+     * Same bookmark/thread logic as pollChannel, but with a mention filter.
+     */
+    private async pollMentionChannel(channelId: string, channelName: string) {
+        const mentionTag = `<@${this.ownerUserId}>`;
+        const oldest = this.lastChecked.get(channelId);
+
+        const result = await this.client.conversations.history({
+            channel: channelId,
+            oldest: oldest || undefined,
+            limit: 10, // Lower limit for mention channels — less traffic expected
+        });
+
+        const messages = result.messages || [];
+        if (messages.length === 0) return;
+
+        // Update bookmark
+        const newestTs = messages[0]?.ts;
+        if (newestTs) this.lastChecked.set(channelId, newestTs);
+
+        // Skip first poll (baseline)
+        if (!oldest) return;
+
+        // Only human messages that mention @Bill (no bots, no system, not from Will himself)
+        const mentionMessages = messages.filter((m: any) =>
+            m.type === "message" && !m.subtype && !m.bot_id && m.text &&
+            m.text.length > 10 && m.user !== this.ownerUserId &&
+            m.text.includes(mentionTag)
+        );
+
+        for (const msg of mentionMessages) {
+            await this.processMessage(msg.text!, msg.user || "unknown", channelId, channelName, msg.ts!, msg.thread_ts);
         }
     }
 
@@ -373,8 +455,10 @@ export class SlackWatchdog {
 
     // ──────────────────────────────────────────────────
     // MESSAGE ANALYSIS
-    // IMPORTANT: Aria NEVER posts in Slack. Eyes-only mode.
-    // The only Slack action is adding a 👀 reaction from Will's account.
+    // DECISION(2026-03-04): Aria now replies in Slack threads with stock context
+    // for purchasing requests. This replaces the old "eyes-only" mode for product
+    // requests. Aria replies as a bot (SLACK_BOT_TOKEN) — clearly Aria, not Will.
+    // Still sends Telegram digest for Will's visibility.
     // ──────────────────────────────────────────────────
 
     private async processMessage(text: string, userId: string, channelId: string, channelName: string, messageTs: string, threadTs?: string) {
@@ -388,8 +472,6 @@ export class SlackWatchdog {
         console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
 
         // Step 2: React with 👀 from Will's account (user token) to signal "looking into it"
-        // DECISION(2026-02-24): Reaction comes from Will's user token, NOT a bot.
-        // This looks natural — like Will saw it himself. Aria stays invisible.
         await this.addEyesReaction(channelId, messageTs);
 
         // Step 3: Fuzzy match against product catalog
@@ -408,35 +490,60 @@ export class SlackWatchdog {
         // Step 5: Resolve user name
         const userName = await this.resolveUserName(userId);
 
-        // Step 6: Query Finale for real-time stock context on ALL items in the request.
-        // If message contained explicit SKU codes (e.g. BLM207, S-445), look each up directly.
-        // Fall back to fuzzy-matched product if no explicit SKUs found.
-        // Regex covers: BLM207, ALK101, NC104, DOM101 (letters+digits) AND S-445 (letter-digits)
+        // Step 6: Collect ALL SKU candidates for Finale lookup.
+        // DECISION(2026-03-04): Use LLM's allItems extraction as PRIMARY source.
+        // The old regex-only approach missed SKUs like "3.0BAGCF" (digit-first, period).
+        // Now: merge LLM items + regex matches + fuzzy match, dedup, lookup each.
+        const skuCandidates = new Set<string>();
+
+        // Source 1: LLM-extracted items (most reliable for natural language)
+        for (const item of (analysis.allItems || [analysis.itemDescription])) {
+            if (item && item.length >= 2) skuCandidates.add(item.trim());
+        }
+
+        // Source 2: Regex fallback — expanded to catch digit-first SKUs
+        // Handles: 3.0BAGCF, 3.0CF, S-4122, BLM207, ALK101, NC104, DOM101
+        const skuPattern = /\b(\d+\.?\d*[A-Z]{2,}[A-Z0-9]*|[A-Z]{1,6}[._-]?[0-9]{2,5}(?:[._-][A-Z0-9]+)*)\b/g;
+        for (const m of text.matchAll(skuPattern)) {
+            skuCandidates.add(m[1]);
+        }
+
+        // Source 3: Fuzzy-matched product SKU
+        if (match && match.product.sku !== 'N/A') {
+            skuCandidates.add(match.product.sku);
+        }
+
+        const skusToLookup = [...skuCandidates].slice(0, 8); // Cap at 8 to avoid hammering Finale
+
+        // Step 6a: Look up each SKU in Finale for detailed stock context
         let finaleContext: string | null = null;
-        const skuPattern = /\b([A-Z]{1,6}-?[0-9]{2,5}(?:-[A-Z0-9]+)?)\b/g;
-        const explicitSkus = [...new Set(
-            [...text.matchAll(skuPattern)].map(m => m[1])
-        )];
+        const stockDetails: SkuStockDetail[] = [];
 
-        const skusToLookup = explicitSkus.length > 0
-            ? explicitSkus.slice(0, 6) // cap at 6 to avoid hammering Finale
-            : (match && match.product.sku !== 'N/A' ? [match.product.sku] : []);
+        for (const sku of skusToLookup) {
+            const detail = await this.getDetailedStockContext(sku);
+            stockDetails.push(detail);
+        }
 
-        if (skusToLookup.length > 0) {
-            const contexts: string[] = [];
-            for (const sku of skusToLookup) {
-                const ctx = await this.getFinaleStockContext(sku);
-                if (ctx) contexts.push(`  *${sku}*: ${ctx}`);
-                else contexts.push(`  *${sku}*: not found in Finale`);
-            }
-            if (contexts.length > 0) finaleContext = contexts.join('\n');
+        // Build the finaleContext string for Telegram
+        if (stockDetails.length > 0) {
+            finaleContext = stockDetails.map(d => {
+                if (!d.found) return `  *${d.sku}*: not found in Finale`;
+                const parts: string[] = [];
+                if (d.onHand !== null) parts.push(`${d.onHand.toLocaleString()} on hand`);
+                if (d.onOrder !== null && d.onOrder > 0) parts.push(`${d.onOrder} on order`);
+                if (d.stockoutDays !== null) {
+                    if (d.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${d.stockoutDays}d!`);
+                    else parts.push(`${d.stockoutDays}d runway`);
+                }
+                if (d.incomingPOs > 0) parts.push(`${d.incomingPOs} PO incoming`);
+                return `  *${d.sku}*: ${parts.join(' · ') || 'in Finale, no stock data'}`;
+            }).join('\n');
         }
 
         // Apply Box Agent overrides if it's explicitly talking about boxes
-        // The BoxAgent will parse physical count claims and generate a deep reality-check report
         const boxReport = await this.boxAgent.analyzeSlackMessage(text);
         if (boxReport) {
-            finaleContext = boxReport; // Replace the standard one-liners with the deep Box Report
+            finaleContext = boxReport;
         }
 
         // Step 6b: In-memory dedup to prevent repeat alerts for the same request
@@ -450,7 +557,29 @@ export class SlackWatchdog {
             return;
         }
 
-        // Step 7: Queue the detected request (Telegram digest only — NO Slack posting)
+        // Step 7: Reply in Slack thread with per-SKU stock context
+        // DECISION(2026-03-04): Aria replies as bot with intelligent stock info.
+        // This gives the requester immediate feedback and surfaces hidden inventory.
+        if (stockDetails.length > 0 && !boxReport) {
+            const replyText = this.composeStockReply(stockDetails, userName, analysis);
+            const replyTs = threadTs || messageTs; // Reply in existing thread, or start new one
+            await this.replyInThread(channelId, replyTs, replyText);
+        }
+
+        // Step 7b: For urgent reorder SKUs, check for existing draft POs from the vendor
+        // DECISION(2026-03-04): Instead of just alerting Will, proactively check if there's
+        // a draft PO from the same vendor (e.g., ULINE) that the item could be added to.
+        // Notify via Telegram (NOT Slack) with actionable context.
+        const urgentSkus = stockDetails.filter(d => d.found && d.needsReorder);
+        if (urgentSkus.length > 0 && !boxReport) {
+            setImmediate(async () => {
+                for (const urgent of urgentSkus) {
+                    await this.sendPOActionToTelegram(urgent, userName, channelName);
+                }
+            });
+        }
+
+        // Step 8: Queue the detected request (Telegram digest for Will)
         const request: DetectedRequest = {
             channel: channelName,
             channelId,
@@ -464,6 +593,8 @@ export class SlackWatchdog {
             eta,
             timestamp: new Date().toISOString(),
             finaleContext,
+            messageTs,
+            threadTs,
         };
 
         this.pendingRequests.push(request);
@@ -482,17 +613,18 @@ export class SlackWatchdog {
                     confidence: analysis.confidence,
                     matchedProduct: match?.product?.name || null,
                     activePO,
+                    skusChecked: skusToLookup,
                 },
             });
         });
 
-        // Step 8: Mark as processed in dedup set
+        // Step 9: Mark as processed in dedup set
         this.processedRequests.add(dedupKey);
     }
 
     /**
      * Reacts with 👀 on a Slack message using Will's user token.
-     * This is the ONLY action Aria takes in Slack — she never posts.
+     * Signals to the requester that the message was seen.
      */
     private async addEyesReaction(channelId: string, messageTs: string) {
         try {
@@ -608,39 +740,247 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
     // ──────────────────────────────────────────────────
 
     /**
-     * Query Finale for a concise stock summary of any SKU.
-     * Uses getComponentStockProfile (GraphQL productViewConnection) — works for ALL Finale
-     * products regardless of whether they have a BOM or are pure purchased items.
-     * Returns a one-liner like: "450 on hand · Stockout in 23d · PO incoming"
-     * Returns null if Finale has no data for the SKU.
+     * Query Finale for detailed stock info for a single SKU.
+     * Returns structured SkuStockDetail for use in both Slack replies and Telegram.
+     * Also resolves the vendor/supplier for PO matching on urgent items.
      */
-    private async getFinaleStockContext(sku: string): Promise<string | null> {
+    private async getDetailedStockContext(sku: string): Promise<SkuStockDetail> {
+        const emptyResult: SkuStockDetail = {
+            sku, onHand: null, onOrder: null, stockoutDays: null, incomingPOs: 0,
+            found: false, recommendation: 'Not found in Finale',
+            vendorName: null, vendorPartyUrl: null, needsReorder: false,
+        };
+
         try {
             const profile = await this.finaleClient.getComponentStockProfile(sku);
-            if (!profile.hasFinaleData) return null;
+            if (!profile.hasFinaleData) return emptyResult;
 
-            const parts: string[] = [];
+            const onHand = profile.onHand;
+            const onOrder = profile.onOrder;
+            const stockoutDays = profile.stockoutDays;
+            const incomingPOs = profile.incomingPOs.length;
 
-            if (profile.onHand !== null) parts.push(`${profile.onHand.toLocaleString()} on hand`);
-            if (profile.onOrder !== null && profile.onOrder > 0) parts.push(`${profile.onOrder} on order`);
-
-            if (profile.stockoutDays !== null) {
-                if (profile.stockoutDays <= 14) {
-                    parts.push(`⚠️ Stockout in ${profile.stockoutDays}d!`);
-                } else if (profile.stockoutDays <= 30) {
-                    parts.push(`Stockout in ${profile.stockoutDays}d`);
-                } else {
-                    parts.push(`${profile.stockoutDays}d runway`);
+            // Resolve vendor from product detail (for PO matching)
+            // DECISION(2026-03-04): We do the extra REST call because
+            // knowing the vendor lets us find existing draft POs to add to.
+            let vendorName: string | null = null;
+            let vendorPartyUrl: string | null = null;
+            try {
+                const product = await this.finaleClient.lookupProduct(sku);
+                if (product && product.suppliers.length > 0) {
+                    const mainSupplier = product.suppliers.find(s => s.role === 'MAIN') || product.suppliers[0];
+                    vendorName = mainSupplier.name;
+                    vendorPartyUrl = mainSupplier.partyUrl;
                 }
+            } catch { /* vendor resolution is best-effort */ }
+
+            // Determine if this SKU needs reorder
+            const needsReorder = (
+                (stockoutDays !== null && stockoutDays <= 30) ||
+                (onHand !== null && onHand === 0)
+            );
+
+            // Generate intelligent recommendation
+            let recommendation: string;
+            if (onHand !== null && onHand > 0 && stockoutDays !== null && stockoutDays > 60) {
+                recommendation = `We've got ${onHand.toLocaleString()} on hand — that's ${stockoutDays}d of runway. Should be good for a while.`;
+            } else if (onHand !== null && onHand > 0 && stockoutDays !== null && stockoutDays > 30) {
+                recommendation = `${onHand.toLocaleString()} on hand, ${stockoutDays}d runway. Not urgent but worth keeping an eye on.`;
+            } else if (stockoutDays !== null && stockoutDays <= 14) {
+                recommendation = `Thanks for the heads up! Only ${stockoutDays}d until stockout — getting on this.`;
+            } else if (stockoutDays !== null && stockoutDays <= 30) {
+                recommendation = `Good call — ${stockoutDays}d until stockout. Adding to the order list.`;
+            } else if (incomingPOs > 0) {
+                recommendation = `Already on order — ${incomingPOs} PO${incomingPOs > 1 ? 's' : ''} incoming.`;
+            } else if (onHand !== null && onHand === 0) {
+                recommendation = `We're out! Getting this ordered ASAP.`;
+            } else {
+                recommendation = `In Finale — checking on it.`;
             }
 
-            if (profile.incomingPOs.length > 0) {
-                parts.push(`${profile.incomingPOs.length} PO incoming`);
-            }
-
-            return parts.length > 0 ? parts.join(' · ') : `in Finale, no stock data`;
+            return {
+                sku, onHand, onOrder, stockoutDays, incomingPOs,
+                found: true, recommendation,
+                vendorName, vendorPartyUrl, needsReorder,
+            };
         } catch {
-            return null;
+            return { ...emptyResult, recommendation: 'Finale lookup error' };
+        }
+    }
+
+    /**
+     * Compose the Slack thread reply with per-SKU stock context.
+     * DECISION(2026-03-04): Tone should sound like Will — casual, warm, first-person.
+     * Not a robotic bot response. Think "helpful coworker who checked the system for you."
+     */
+    private composeStockReply(details: SkuStockDetail[], requesterName: string, analysis: RequestExtraction): string {
+        // Personalized opener based on context
+        const urgentItems = details.filter(d => d.found && d.needsReorder);
+        const plentyItems = details.filter(d => d.found && !d.needsReorder && d.onHand !== null && d.onHand > 0);
+
+        let opener: string;
+        if (urgentItems.length > 0 && plentyItems.length > 0) {
+            opener = `Hey ${requesterName.split(' ')[0]} — checked Finale on these. Some we're good on, others definitely need attention:`;
+        } else if (urgentItems.length > 0) {
+            opener = `Thanks for the heads up ${requesterName.split(' ')[0]}! Checked Finale — you're right, we need to move on ${urgentItems.length > 1 ? 'these' : 'this'}:`;
+        } else if (plentyItems.length > 0) {
+            opener = `Hey ${requesterName.split(' ')[0]}, just checked Finale on ${details.length > 1 ? 'these' : 'this'}:`;
+        } else {
+            opener = `Checked Finale for you ${requesterName.split(' ')[0]}:`;
+        }
+
+        const lines: string[] = [opener, ''];
+
+        for (const d of details) {
+            if (!d.found) {
+                lines.push(`• *${d.sku}* — Can't find this one in Finale. Double check the SKU?`);
+                continue;
+            }
+
+            const stockParts: string[] = [];
+            if (d.onHand !== null) stockParts.push(`${d.onHand.toLocaleString()} on hand`);
+            if (d.onOrder !== null && d.onOrder > 0) stockParts.push(`${d.onOrder.toLocaleString()} on order`);
+            if (d.stockoutDays !== null) {
+                if (d.stockoutDays <= 14) stockParts.push(`⚠️ stockout in ${d.stockoutDays}d`);
+                else stockParts.push(`${d.stockoutDays}d runway`);
+            }
+            if (d.incomingPOs > 0) stockParts.push(`${d.incomingPOs} PO incoming`);
+            if (d.vendorName) stockParts.push(d.vendorName);
+
+            lines.push(`• *${d.sku}* — ${stockParts.join(' · ')}`);
+            lines.push(`  _${d.recommendation}_`);
+        }
+
+        return lines.join('\n');
+    }
+
+    // ──────────────────────────────────────────────────
+    // SLACK THREAD REPLY
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Posts a reply in a Slack thread using the bot token.
+     * DECISION(2026-03-04): Aria replies as a bot (not Will's account) so it's
+     * clearly an automated response. Uses SLACK_BOT_TOKEN.
+     * Falls back to user token if bot token is unavailable.
+     */
+    private async replyInThread(channelId: string, threadTs: string, text: string) {
+        const client = this.botClient || this.client;
+        try {
+            await client.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: text,
+                unfurl_links: false, // Don't unfurl links in stock replies
+            });
+            console.log(`  💬 Replied in Slack thread (channel: ${channelId})`);
+        } catch (err: any) {
+            console.warn(`  ⚠️ Could not reply in thread: ${err.data?.error || err.message}`);
+        }
+    }
+
+    /**
+     * Query Finale for a concise stock summary of any SKU (legacy one-liner format).
+     * Kept for backward compatibility with Telegram digest.
+     */
+    private async getFinaleStockContext(sku: string): Promise<string | null> {
+        const detail = await this.getDetailedStockContext(sku);
+        if (!detail.found) return null;
+
+        const parts: string[] = [];
+        if (detail.onHand !== null) parts.push(`${detail.onHand.toLocaleString()} on hand`);
+        if (detail.onOrder !== null && detail.onOrder > 0) parts.push(`${detail.onOrder} on order`);
+        if (detail.stockoutDays !== null) {
+            if (detail.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${detail.stockoutDays}d!`);
+            else if (detail.stockoutDays <= 30) parts.push(`Stockout in ${detail.stockoutDays}d`);
+            else parts.push(`${detail.stockoutDays}d runway`);
+        }
+        if (detail.incomingPOs > 0) parts.push(`${detail.incomingPOs} PO incoming`);
+        return parts.length > 0 ? parts.join(' · ') : `in Finale, no stock data`;
+    }
+
+    /**
+     * Find open/draft POs from a specific vendor in Finale.
+     * DECISION(2026-03-04): Looking for status "Open" (ORDER_CREATED) POs
+     * that haven't been committed yet — these are draft POs that we can add to.
+     * Uses GraphQL to query by supplier name and filter for Open status.
+     *
+     * @param vendorName - The vendor/supplier name (e.g., "ULINE")
+     * @returns Array of draft POs with orderId, orderDate, and item count
+     */
+    private async findDraftPOsForVendor(vendorName: string): Promise<Array<{
+        orderId: string;
+        orderDate: string;
+        itemCount: number;
+        total: number;
+        finaleUrl: string;
+    }>> {
+        try {
+            // Query recent POs and filter for Open status + matching vendor
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 20
+                        type: ["PURCHASE_ORDER"]
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges {
+                            node {
+                                orderId
+                                status
+                                orderDate
+                                supplier { name }
+                                total
+                                itemList(first: 100) {
+                                    edges {
+                                        node {
+                                            product { productId }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }`
+            };
+
+            // Access Finale client internals for API call
+            // any: accessing private fields for GraphQL query
+            const fc = this.finaleClient as any;
+            const res = await fetch(`${fc.apiBase}/${fc.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: {
+                    Authorization: fc.authHeader,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            if (result.errors) return [];
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            const vendorLower = vendorName.toLowerCase();
+
+            return edges
+                .filter((edge: any) =>
+                    edge.node.status === 'Open' &&
+                    edge.node.supplier?.name?.toLowerCase().includes(vendorLower)
+                )
+                .map((edge: any) => {
+                    const po = edge.node;
+                    return {
+                        orderId: po.orderId,
+                        orderDate: po.orderDate,
+                        itemCount: po.itemList?.edges?.length || 0,
+                        total: po.total || 0,
+                        finaleUrl: `https://app.finaleinventory.com/${fc.accountPath}/purchaseorder?purchaseorderid=${po.orderId}`,
+                    };
+                });
+        } catch (err: any) {
+            console.warn(`  ⚠️ Draft PO lookup failed for ${vendorName}:`, err.message);
+            return [];
         }
     }
 
@@ -732,6 +1072,64 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             this.pendingRequests = [];
         } catch (err: any) {
             console.error("❌ Telegram digest failed:", err.message);
+        }
+    }
+
+    /**
+     * Sends a Telegram notification for a SKU that needs reorder.
+     * DECISION(2026-03-04): Checks for existing draft POs from the vendor
+     * and gives Will actionable options: add to existing draft or create new.
+     * This is sent to Telegram (not Slack) because it's a decision for Will only.
+     */
+    private async sendPOActionToTelegram(detail: SkuStockDetail, requesterName: string, channelName: string) {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return;
+
+        let message = `📦 *Reorder Needed: ${detail.sku}*\n\n`;
+        message += `Requested by ${requesterName} in #${channelName}\n`;
+        message += `Stock: ${detail.onHand?.toLocaleString() ?? '?'} on hand`;
+        if (detail.stockoutDays !== null) message += ` \u00b7 ${detail.stockoutDays}d until stockout`;
+        message += `\n`;
+
+        if (detail.vendorName) {
+            message += `Vendor: *${detail.vendorName}*\n\n`;
+
+            // Check for existing draft POs from this vendor
+            const draftPOs = await this.findDraftPOsForVendor(detail.vendorName);
+
+            if (draftPOs.length > 0) {
+                // Sort by most recent date
+                draftPOs.sort((a, b) => new Date(b.orderDate).getTime() - new Date(a.orderDate).getTime());
+                const newest = draftPOs[0];
+
+                message += `\u2705 *Found draft PO from ${detail.vendorName}:*\n`;
+                message += `  PO #${newest.orderId} (${newest.orderDate}) — ${newest.itemCount} items\n`;
+                message += `  [Open in Finale](${newest.finaleUrl})\n\n`;
+                message += `\u27a1\ufe0f Add *${detail.sku}* to this draft PO?\n`;
+                message += `  /addtopo ${newest.orderId} ${detail.sku}\n\n`;
+
+                if (draftPOs.length > 1) {
+                    message += `_(${draftPOs.length - 1} more draft PO${draftPOs.length > 2 ? 's' : ''} from ${detail.vendorName})_\n`;
+                }
+            } else {
+                message += `No draft POs from ${detail.vendorName} found.\n`;
+                message += `Create new? /createpo ${detail.vendorName} ${detail.sku}\n`;
+            }
+        } else {
+            message += `\n\u26a0\ufe0f Vendor unknown — check Finale for supplier info.\n`;
+        }
+
+        try {
+            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+            });
+            console.log(`  \ud83d\udce8 Sent PO action for ${detail.sku} to Telegram`);
+        } catch (err: any) {
+            console.error(`  \u274c PO action Telegram failed for ${detail.sku}:`, err.message);
         }
     }
 }
