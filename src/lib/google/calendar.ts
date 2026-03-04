@@ -97,6 +97,27 @@ export class CalendarClient {
     }
 
     /**
+     * Fetch raw event data for a single event.
+     * Returns the event's summary, description, and other fields.
+     */
+    async getEventRaw(
+        calendarId: string,
+        eventId: string
+    ): Promise<{ summary: string; description: string } | null> {
+        await this.init();
+        try {
+            const res = await this.calendar!.events.get({ calendarId, eventId });
+            return {
+                summary: res.data.summary || '',
+                description: res.data.description || '',
+            };
+        } catch (err: any) {
+            console.warn(`⚠️ [Calendar] Could not get event ${eventId}: ${err.message}`);
+            return null;
+        }
+    }
+
+    /**
      * Append a note to an existing calendar event's description.
      * Best-effort — silently swallows errors so a write failure never blocks
      * the Telegram notification that always fires first.
