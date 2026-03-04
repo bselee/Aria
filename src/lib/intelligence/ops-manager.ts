@@ -412,11 +412,19 @@ export class OpsManager {
                     }
                 }
 
-                // Index to Pinecone for RAG
+                // Index to Pinecone for RAG — sanitize nulls (Pinecone rejects null metadata values)
+                const pineconeMetadata: Record<string, string | number | boolean | string[]> = {
+                    po_number: poNumber,
+                    subject,
+                    tracking_numbers: trackingNumbers,
+                };
+                if (responseTimeMins !== null && responseTimeMins !== undefined) {
+                    pineconeMetadata.vendor_response_time = responseTimeMins;
+                }
                 await indexOperationalContext(
                     `po-${poNumber}`,
                     `PO ${poNumber} for ${subject}. Sent: ${new Date(sentAt).toLocaleString()}. Response: ${responseAt ? new Date(responseAt).toLocaleString() : 'Pending'}. Tracking: ${trackingNumbers.join(", ") || 'None'}`,
-                    { po_number: poNumber, subject, vendor_response_time: responseTimeMins, tracking_numbers: trackingNumbers }
+                    pineconeMetadata
                 );
 
                 // Update DB (full record sync — tracking already upserted above if new)
@@ -834,22 +842,45 @@ export class OpsManager {
                 const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/view/build/${Buffer.from(buildApiPath).toString('base64')}`;
 
                 if (matched?.eventId && matched.calendarId) {
-                    const scheduledQty = matched.quantity;
-                    let completionNote: string;
-                    if (scheduledQty && scheduledQty !== build.quantity) {
-                        const pct = Math.round((build.quantity / scheduledQty) * 100);
-                        // 🟡 partial if under scheduled, ✅ if met or exceeded
-                        const icon = build.quantity < scheduledQty ? '🟡' : '✅';
-                        completionNote = `${icon} Completed: ${timeStr} — ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
-                    } else {
-                        completionNote = `✅ Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
+                    // Dedup: skip if this event already has a completion annotation
+                    try {
+                        const existingEvent = await calendar.getEventRaw(matched.calendarId, matched.eventId);
+                        const existingDesc = existingEvent?.description || '';
+                        const existingTitle = existingEvent?.summary || '';
+                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('✅') || existingTitle.startsWith('🟡')) {
+                            console.log(`⏭️ [build-watcher] ${build.sku} already annotated, skipping`);
+                        } else {
+                            const scheduledQty = matched.quantity;
+                            // Determine icon: 🟡 partial if under scheduled, ✅ if met or exceeded
+                            const icon = (scheduledQty && build.quantity < scheduledQty) ? '🟡' : '✅';
+
+                            // 1. Prepend icon to title so it's visible on calendar grid
+                            const newTitle = `${icon} ${existingTitle}`;
+
+                            // 2. Build description annotation with Finale link
+                            let completionNote: string;
+                            if (scheduledQty && scheduledQty !== build.quantity) {
+                                const pct = Math.round((build.quantity / scheduledQty) * 100);
+                                completionNote = `${icon} Completed: ${timeStr} — ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
+                            } else {
+                                completionNote = `${icon} Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
+                            }
+                            completionNote += `\n→ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
+
+                            const newDesc = existingDesc
+                                ? `${existingDesc}\n${completionNote}`
+                                : completionNote;
+
+                            await calendar.updateEventTitleAndDescription(
+                                matched.calendarId,
+                                matched.eventId,
+                                newTitle,
+                                newDesc
+                            );
+                        }
+                    } catch (e: any) {
+                        console.warn(`[build-watcher] Calendar annotation failed for ${build.sku}: ${e.message}`);
                     }
-                    completionNote += `\n→ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
-                    await calendar.appendToEventDescription(
-                        matched.calendarId,
-                        matched.eventId,
-                        completionNote
-                    );
                 }
 
                 // Persist to Supabase so the dashboard shows the completion indicator

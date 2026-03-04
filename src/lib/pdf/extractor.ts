@@ -83,7 +83,8 @@ const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. 
 
 /**
  * For scanned/image PDFs — passes the raw PDF bytes to an LLM with native PDF support.
- * Tries Gemini (via Vercel AI SDK) first, then Anthropic direct SDK as fallback.
+ * Strategy order: Anthropic (A) → OpenAI Files API (B) → OpenRouter (C) → Gemini direct (D, last resort).
+ * Gemini direct is last because the free-tier quota is 0 — it will always fail unless on a paid plan.
  */
 async function extractScannedPDF(
     buffer: Buffer,
@@ -91,37 +92,8 @@ async function extractScannedPDF(
 ): Promise<PDFExtractionResult> {
     let extractedText = "";
 
-    // Strategy A: Gemini REST API with inlineData (avoids Vercel AI SDK type constraints)
-    console.log(`[extractor] Strategy A — Gemini key: ${process.env.GOOGLE_GENERATIVE_AI_API_KEY ? "SET" : "MISSING"}`);
-    if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-        try {
-            const geminiRes = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        systemInstruction: { parts: [{ text: SCANNED_PDF_SYSTEM }] },
-                        contents: [{
-                            parts: [
-                                { inlineData: { mimeType: "application/pdf", data: buffer.toString("base64") } },
-                                { text: SCANNED_PDF_PROMPT },
-                            ],
-                        }],
-                    }),
-                }
-            );
-            const geminiData = await geminiRes.json() as any;
-            if (geminiData.error) throw new Error(geminiData.error.message);
-            extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-            if (extractedText) console.log(`[extractor] Strategy A succeeded — ${extractedText.length} chars`);
-        } catch (err: any) {
-            console.warn("⚠️ Gemini PDF extraction failed, trying Anthropic:", err.message);
-        }
-    }
-
-    // Strategy B: Anthropic direct SDK (native PDF document blocks)
-    console.log(`[extractor] Strategy B — extractedText empty: ${!extractedText}, Anthropic key: ${process.env.ANTHROPIC_API_KEY ? "SET" : "MISSING"}`);
+    // Strategy A: Anthropic direct SDK (native PDF document blocks — cheap Haiku, paid key always available)
+    console.log(`[extractor] Strategy A — Anthropic key: ${process.env.ANTHROPIC_API_KEY ? "SET" : "MISSING"}`);
     if (!extractedText && process.env.ANTHROPIC_API_KEY) {
         try {
             const anthropic = getAnthropicClient();
@@ -156,9 +128,9 @@ async function extractScannedPDF(
         }
     }
 
-    // Strategy C: OpenAI — upload PDF via Files API then reference by file_id in Responses API.
+    // Strategy B: OpenAI — upload PDF via Files API then reference by file_id in Responses API.
     // Split upload + inference avoids large base64 JSON bodies that can hang on slow connections.
-    console.log(`[extractor] Strategy C — extractedText empty: ${!extractedText}, OpenAI key: ${process.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
+    console.log(`[extractor] Strategy B — extractedText empty: ${!extractedText}, OpenAI key: ${process.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
     if (!extractedText && process.env.OPENAI_API_KEY) {
         let uploadedFileId: string | null = null;
         try {
@@ -229,9 +201,9 @@ async function extractScannedPDF(
         }
     }
 
-    // Strategy D: OpenRouter — Gemini 2.0 Flash via OpenAI-compatible endpoint
+    // Strategy C: OpenRouter — Gemini 2.5 Flash Lite via OpenAI-compatible endpoint
     // Uses chat completions + image_url with PDF data URI (Gemini supports application/pdf)
-    console.log(`[extractor] Strategy D — extractedText empty: ${!extractedText}, OpenRouter key: ${process.env.OPENROUTER_API_KEY ? "SET" : "MISSING"}`);
+    console.log(`[extractor] Strategy C — extractedText empty: ${!extractedText}, OpenRouter key: ${process.env.OPENROUTER_API_KEY ? "SET" : "MISSING"}`);
     if (!extractedText && process.env.OPENROUTER_API_KEY) {
         try {
             console.log("[extractor] Calling OpenRouter (Gemini 2.0 Flash)...");
@@ -277,8 +249,38 @@ async function extractScannedPDF(
         }
     }
 
+    // Strategy D: Gemini direct REST API — last resort only.
+    // Free-tier quota is 0 (always fails unless on a paid Gemini plan). Kept as final fallback.
+    console.log(`[extractor] Strategy D — extractedText empty: ${!extractedText}, Gemini key: ${process.env.GOOGLE_GENERATIVE_AI_API_KEY ? "SET" : "MISSING"}`);
+    if (!extractedText && process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+        try {
+            const geminiRes = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        systemInstruction: { parts: [{ text: SCANNED_PDF_SYSTEM }] },
+                        contents: [{
+                            parts: [
+                                { inlineData: { mimeType: "application/pdf", data: buffer.toString("base64") } },
+                                { text: SCANNED_PDF_PROMPT },
+                            ],
+                        }],
+                    }),
+                }
+            );
+            const geminiData = await geminiRes.json() as any;
+            if (geminiData.error) throw new Error(geminiData.error.message);
+            extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            if (extractedText) console.log(`[extractor] Strategy D succeeded — ${extractedText.length} chars`);
+        } catch (err: any) {
+            console.warn("⚠️ Gemini PDF extraction failed:", err.message);
+        }
+    }
+
     if (!extractedText) {
-        throw new Error("Scanned PDF extraction failed — Gemini, Anthropic, OpenAI, and OpenRouter all unavailable. Check API keys/credits.");
+        throw new Error("Scanned PDF extraction failed — Anthropic, OpenAI, OpenRouter, and Gemini all unavailable. Check API keys/credits.");
     }
 
     return {
