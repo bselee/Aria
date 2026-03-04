@@ -50,3 +50,6 @@ tmp_*.txt
 test-explore.ts
 test-search.ts
 test-stock.ts
+
+# Build artifacts
+tsconfig.tsbuildinfo
