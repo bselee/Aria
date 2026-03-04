@@ -68,6 +68,36 @@ export interface ReceivedPO {
     finaleUrl: string;
 }
 
+export interface ExternalReorderItem {
+    productId: string;
+    stockoutDays: number | null;  // null = Finale can't calculate (no demand history)
+    reorderQty: number | null;    // Finale's suggested order quantity; null = not configured
+    consumptionQty: number;       // 90-day consumption
+    supplierPartyId: string | null;
+    supplierName: string;
+    unitPrice: number;
+    isManufactured: boolean;      // always false for items in ExternalReorderGroup
+}
+
+export interface ExternalReorderGroup {
+    vendorName: string;
+    vendorPartyId: string;
+    urgency: 'critical' | 'warning' | 'reorder_flagged';
+    items: ExternalReorderItem[];
+}
+
+export interface FullPO {
+    orderId: string;
+    vendorName: string;
+    orderDate: string;           // YYYY-MM-DD
+    expectedDate: string | null; // Finale's dueDate field (quoted delivery date)
+    receiveDate: string | null;  // null if not yet received
+    status: string;              // 'Committed' | 'Completed' | 'Cancelled' | etc.
+    total: number;
+    items: Array<{ productId: string; quantity: number }>;
+    finaleUrl: string;
+}
+
 export interface ConsumptionReport {
     productId: string;
     name: string;
@@ -88,6 +118,13 @@ export interface ConsumptionReport {
 // ──────────────────────────────────────────────────
 // CLIENT
 // ──────────────────────────────────────────────────
+
+function parseFinaleNumber(val: string | number | null | undefined): number {
+    if (val == null) return 0;
+    const cleaned = String(val).replace(/,/g, '');
+    const num = parseFloat(cleaned);
+    return isNaN(num) ? 0 : num;
+}
 
 export class FinaleClient {
     private authHeader: string;
@@ -185,7 +222,7 @@ export class FinaleClient {
 
             const edges = result.data?.orderViewConnection?.edges || [];
             return edges
-                // receiveDate filter already ensures receipt in range; don't restrict by status
+                .filter((edge: any) => edge.node.status === "Completed")
                 .map((edge: any) => {
                     const po = edge.node;
                     const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
@@ -194,10 +231,10 @@ export class FinaleClient {
                         orderDate: po.orderDate || "",
                         receiveDate: po.receiveDate || "",
                         supplier: po.supplier?.name || "Unknown",
-                        total: parseFloat(po.total) || 0,
+                        total: parseFinaleNumber(po.total),
                         items: (po.itemList?.edges || []).map((ie: any) => ({
                             productId: ie.node.product?.productId || "?",
-                            quantity: parseFloat(ie.node.quantity) || 0,
+                            quantity: parseFinaleNumber(ie.node.quantity),
                         })),
                         finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                     };
@@ -280,7 +317,7 @@ export class FinaleClient {
                             orderId: po.orderId,
                             receiveDate: po.receiveDate || "",
                             supplier: po.supplier?.name || "Unknown",
-                            qty: parseFloat(ie.node.quantity) || 0,
+                            qty: parseFinaleNumber(ie.node.quantity),
                         });
                         break; // one entry per PO
                     }
@@ -292,6 +329,127 @@ export class FinaleClient {
         } catch (err: any) {
             console.error(`getPurchasedQty failed for ${sku}:`, err.message);
             return { sku, totalQty: 0, orderCount: 0, orders: [] };
+        }
+    }
+
+    /**
+     * Returns total quantity sold (shipped) for a SKU over a rolling date range,
+     * as well as open demand and current stock levels.
+     * Uses orderViewConnection with type SALES_ORDER and productViewConnection.
+     */
+    async getSalesQty(sku: string, daysBack: number = 365): Promise<{
+        sku: string;
+        totalSoldQty: number;      // Completed / Shipped
+        soldOrderCount: number;
+        openDemandQty: number;     // Committed sales orders
+        openDemandCount: number;
+        stockOnHand: number | null;
+        stockAvailable: number | null;
+    }> {
+        const end = new Date();
+        const begin = new Date();
+        begin.setDate(begin.getDate() - daysBack);
+
+        const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+        const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+        const query = {
+            query: `
+                query {
+                    orderViewConnection(
+                        first: 200
+                        type: ["SALES_ORDER"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges {
+                            node {
+                                orderId
+                                status
+                                itemList(first: 100) {
+                                    edges {
+                                        node {
+                                            product { productId }
+                                            quantity
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    productViewConnection(first: 1, productId: "${sku}") {
+                        edges {
+                            node {
+                                stockOnHand
+                                stockAvailable
+                            }
+                        }
+                    }
+                }
+            `
+        };
+
+        try {
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) {
+                return { sku, totalSoldQty: 0, soldOrderCount: 0, openDemandQty: 0, openDemandCount: 0, stockOnHand: null, stockAvailable: null };
+            }
+
+            const result = await res.json();
+            const edges = result.data?.orderViewConnection?.edges || [];
+            const productNode = result.data?.productViewConnection?.edges?.[0]?.node;
+
+            let totalSoldQty = 0;
+            let soldOrderCount = 0;
+            let openDemandQty = 0;
+            let openDemandCount = 0;
+
+            for (const edge of edges) {
+                const order = edge.node;
+                const isSold = order.status === "Completed" || order.status === "Shipped";
+                const isOpen = order.status === "Committed";
+
+                if (!isSold && !isOpen) continue;
+
+                for (const ie of (order.itemList?.edges || [])) {
+                    if (ie.node.product?.productId === sku) {
+                        const qty = parseFinaleNumber(ie.node.quantity);
+                        if (isSold) {
+                            totalSoldQty += qty;
+                            soldOrderCount++;
+                        } else if (isOpen) {
+                            openDemandQty += qty;
+                            openDemandCount++;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            const parseVal = (val: string | null | undefined): number | null => {
+                if (!val || val === '--' || val === 'null') return null;
+                const cleaned = val.replace(/[^0-9.,\-]/g, '').replace(/,/g, '');
+                const n = parseFloat(cleaned);
+                return isNaN(n) ? null : n;
+            };
+
+            return {
+                sku,
+                totalSoldQty,
+                soldOrderCount,
+                openDemandQty,
+                openDemandCount,
+                stockOnHand: productNode ? parseVal(productNode.stockOnHand) : null,
+                stockAvailable: productNode ? parseVal(productNode.stockAvailable) : null
+            };
+        } catch (err: any) {
+            console.error(`getSalesQty failed for ${sku}:`, err.message);
+            return { sku, totalSoldQty: 0, soldOrderCount: 0, openDemandQty: 0, openDemandCount: 0, stockOnHand: null, stockAvailable: null };
         }
     }
 
@@ -395,10 +553,10 @@ export class FinaleClient {
                         orderDate: po.orderDate || "",
                         receiveDate: "",  // Not received yet
                         supplier: po.supplier?.name || "Unknown",
-                        total: parseFloat(po.total) || 0,
+                        total: parseFinaleNumber(po.total),
                         items: (po.itemList?.edges || []).map((ie: any) => ({
                             productId: ie.node.product?.productId || "?",
-                            quantity: parseFloat(ie.node.quantity) || 0,
+                            quantity: parseFinaleNumber(ie.node.quantity),
                         })),
                         finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                     };
@@ -514,7 +672,7 @@ export class FinaleClient {
                 finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
                 lineItems: (match.node.itemList?.edges || []).map((ie: any) => ({
                     sku: ie.node.product?.productId || "?",
-                    qty: parseFloat(ie.node.quantity) || 0,
+                    qty: parseFinaleNumber(ie.node.quantity),
                 })),
             };
         } catch (err: any) {
@@ -730,6 +888,7 @@ export class FinaleClient {
         demandQuantity: number | null;
         consumptionQuantity: number | null;
         leadTimeDays: number | null;
+        reorderQuantityToOrder: number | null;
         hasFinaleData: boolean;      // Whether Finale returned ANY meaningful data
         incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>;
     }> {
@@ -741,6 +900,7 @@ export class FinaleClient {
             demandQuantity: null as number | null,
             consumptionQuantity: null as number | null,
             leadTimeDays: null as number | null,
+            reorderQuantityToOrder: null as number | null,
             hasFinaleData: false,
             incomingPOs: [] as Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>,
         };
@@ -766,6 +926,7 @@ export class FinaleClient {
                                 stockoutDays
                                 demandQuantity
                                 consumptionQuantity
+                                reorderQuantityToOrder
                             }
                         }
                     }
@@ -791,6 +952,7 @@ export class FinaleClient {
                     profile.stockoutDays = parseVal(node.stockoutDays);
                     profile.demandQuantity = parseVal(node.demandQuantity);
                     profile.consumptionQuantity = parseVal(node.consumptionQuantity);
+                    profile.reorderQuantityToOrder = parseVal(node.reorderQuantityToOrder);
                     // If we got ANY real values, Finale tracks this product
                     profile.hasFinaleData = (
                         profile.onHand !== null ||
@@ -816,6 +978,11 @@ export class FinaleClient {
                 profile.hasFinaleData = true;
             }
         } catch { /* continue */ }
+
+        // 3. Lead time from Finale product REST (single call, safe to fail)
+        try {
+            profile.leadTimeDays = await this.getLeadTime(productId);
+        } catch { /* leave null */ }
 
         return profile;
     }
@@ -1334,6 +1501,73 @@ export class FinaleClient {
         }
     }
 
+    /**
+     * Fetch manufacturing/build orders completed after `since`.
+     *
+     * VERIFIED (2026-03-03): Finale exposes builds via GraphQL `buildViewConnection`.
+     * - Filter: status=["Completed"], completeDateActual={ begin, afterInclusive: true }
+     * - Date format: YYYY-MM-DD (en-CA locale, same as all other Finale date queries)
+     * - Fields: buildId, quantityToProduce (String), completeTransactionTimestamp,
+     *           productToProduce.productId
+     *
+     * Returns [] (never throws) — build watcher cron is always safe.
+     */
+    async getRecentlyCompletedBuilds(since: Date): Promise<Array<{
+        buildId: string;
+        sku: string;
+        quantity: number;
+        completedAt: string;
+    }>> {
+        const sinceDate = since.toLocaleDateString('en-CA', { timeZone: 'America/Denver' }); // YYYY-MM-DD
+
+        try {
+            // NOTE: The Finale `status` filter arg is non-functional (returns 0 regardless of value).
+            // We filter client-side on status === "Completed" after fetching by date.
+            const query = {
+                query: `
+                    query {
+                        buildViewConnection(
+                            first: 100
+                            completeDateActual: { begin: "${sinceDate}", afterInclusive: true }
+                            sort: [{ field: "completeDateActual", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    buildId
+                                    status
+                                    quantityToProduce
+                                    completeTransactionTimestamp
+                                    productToProduce { productId }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            if (!res.ok) return [];
+            const data = await res.json();
+            if (data?.errors?.length) return [];
+
+            const edges: any[] = data?.data?.buildViewConnection?.edges || [];
+            return edges
+                .filter((e: any) => e.node.status === 'Completed' && e.node.productToProduce?.productId)
+                .map((e: any) => ({
+                    buildId: e.node.buildId,
+                    sku: e.node.productToProduce.productId,
+                    quantity: parseInt(e.node.quantityToProduce || '0', 10),
+                    completedAt: e.node.completeTransactionTimestamp || '',
+                }));
+        } catch (err: any) {
+            console.warn('[FinaleClient] getRecentlyCompletedBuilds failed:', err.message);
+            return [];
+        }
+    }
+
     private async get(endpoint: string): Promise<any> {
         const url = `${this.apiBase}${endpoint}`;
 
@@ -1451,12 +1685,18 @@ export class FinaleClient {
             Object.assign(currentPO, unlocked);
         }
 
-        // 3. Add the new adjustment to the existing list
-        const adjustments = [...(currentPO.orderAdjustmentList || [])];
+        // 3. Upsert: remove any existing entries for this fee type, then add the new one.
+        //    Prevents duplicate adjustment lines if called more than once.
+        const promoUrl = `/${this.accountPath}/api/productpromo/${fee.id}`;
+        const hint = (description || fee.name).toLowerCase().slice(0, 8);
+        const adjustments = (currentPO.orderAdjustmentList || []).filter((adj: any) =>
+            adj.productPromoUrl !== promoUrl &&
+            !(adj.description || "").toLowerCase().includes(hint)
+        );
         adjustments.push({
             amount,
             description: description || fee.name,
-            productPromoUrl: `/${this.accountPath}/api/productpromo/${fee.id}`,
+            productPromoUrl: promoUrl,
         });
 
         // 4. POST the updated PO with the new adjustment
@@ -1472,6 +1712,51 @@ export class FinaleClient {
         }
 
         return updated;
+    }
+
+    /**
+     * Update the amount on an existing PO adjustment (e.g. Freight $0 → $4053.59).
+     * Uses GET → find by productPromoUrl → update amount → POST pattern.
+     * If the adjustment is not found by promo ID, falls back to description match.
+     */
+    async updateOrderAdjustmentAmount(
+        orderId: string,
+        feeType: keyof typeof FinaleClient.FINALE_FEE_TYPES,
+        newAmount: number,
+        descriptionHint?: string
+    ): Promise<any> {
+        const fee = FinaleClient.FINALE_FEE_TYPES[feeType];
+        const encodedId = encodeURIComponent(orderId);
+        const promoUrl = `/${this.accountPath}/api/productpromo/${fee.id}`;
+
+        // 1. Fetch current PO state
+        const currentPO = await this.getOrderDetails(orderId);
+
+        // 2. Unlock if committed
+        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
+            await this.post(currentPO.actionUrlEdit, {});
+            const unlocked = await this.getOrderDetails(orderId);
+            Object.assign(currentPO, unlocked);
+        }
+
+        // 3. Consolidate: remove ALL entries for this fee type, add one at newAmount.
+        //    This handles the case where a duplicate $0 + real amount entry exists.
+        const hint = (descriptionHint || fee.name).toLowerCase().slice(0, 8);
+        const adjustments = (currentPO.orderAdjustmentList || []).filter((adj: any) =>
+            adj.productPromoUrl !== promoUrl &&
+            !(adj.description || "").toLowerCase().includes(hint)
+        ) as any[];
+        adjustments.push({
+            amount: newAmount,
+            description: descriptionHint || fee.name,
+            productPromoUrl: promoUrl,
+        });
+
+        // 4. POST back
+        return this.post(
+            `/${this.accountPath}/api/order/${encodedId}`,
+            { ...currentPO, orderAdjustmentList: adjustments }
+        );
     }
 
     /**
@@ -1763,5 +2048,506 @@ export class FinaleClient {
             finaleUrl: data.productUrl || "",
             openPOs: [],  // Populated later by lookupProduct()
         };
+    }
+
+    /**
+     * Fetch just the lead time (days) for a component SKU.
+     * Single REST call — no supplier resolution or PO lookup.
+     * Returns null if the product has no lead time set or on any error.
+     */
+    async getLeadTime(sku: string): Promise<number | null> {
+        try {
+            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku.trim())}`);
+            const raw = data?.leadTime;
+            if (raw == null) return null;
+            const n = parseInt(String(raw), 10);
+            return isNaN(n) ? null : n;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Batch sales velocity for a list of finished-good SKUs.
+     * Returns a Map of sku → { dailyRate, stockOnHand, daysOfFinishedStock, openDemandQty }
+     * used to augment build risk reports with actual sell-through data.
+     *
+     * Uses getSalesQty() per SKU with a 90-day lookback, run in parallel (5x concurrency).
+     * Never throws — returns an empty Map on any failure.
+     */
+    async getFinishedGoodVelocity(skus: string[], daysBack: number = 90): Promise<Map<string, {
+        dailyRate: number;
+        stockOnHand: number | null;
+        daysOfFinishedStock: number | null;
+        openDemandQty: number;
+    }>> {
+        const result = new Map<string, {
+            dailyRate: number;
+            stockOnHand: number | null;
+            daysOfFinishedStock: number | null;
+            openDemandQty: number;
+        }>();
+
+        if (skus.length === 0) return result;
+
+        // Run 5 at a time to stay well inside Finale rate limits
+        const concurrency = 5;
+        const queue = [...skus];
+        const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+            while (queue.length > 0) {
+                const sku = queue.shift()!;
+                try {
+                    const data = await this.getSalesQty(sku, daysBack);
+                    const dailyRate = daysBack > 0 ? data.totalSoldQty / daysBack : 0;
+                    const daysOfFinishedStock =
+                        data.stockOnHand !== null && dailyRate > 0
+                            ? Math.round(data.stockOnHand / dailyRate)
+                            : null;
+                    result.set(sku, {
+                        dailyRate,
+                        stockOnHand: data.stockOnHand,
+                        daysOfFinishedStock,
+                        openDemandQty: data.openDemandQty,
+                    });
+                } catch {
+                    // Non-fatal: skip this SKU
+                }
+            }
+        });
+        await Promise.all(workers);
+        return result;
+    }
+
+    /**
+     * Fetch all purchase orders placed within the last N days (all statuses).
+     * Used by the purchasing calendar sync to create/update calendar events.
+     *
+     * Includes Finale's deliverDate (quoted expected delivery) as expectedDate.
+     * Never throws — returns empty array on any error.
+     */
+    async getRecentPurchaseOrders(daysBack: number = 7): Promise<FullPO[]> {
+        try {
+            const now = new Date();
+            const end = new Date(now);
+            end.setDate(end.getDate() + 1);
+            const beginDate = new Date(now);
+            beginDate.setDate(beginDate.getDate() - daysBack);
+
+            const beginStr = beginDate.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 500
+                            type: ["PURCHASE_ORDER"]
+                            orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                            sort: [{ field: "orderDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    orderId
+                                    orderUrl
+                                    status
+                                    orderDate
+                                    dueDate
+                                    receiveDate
+                                    total
+                                    supplier { name }
+                                    itemList(first: 50) {
+                                        edges {
+                                            node {
+                                                product { productId }
+                                                quantity
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return [];
+            const result = await res.json();
+            if (result.errors) {
+                console.error('[finale] getRecentPurchaseOrders error:', result.errors[0]?.message);
+                return [];
+            }
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            return edges.map((edge: any) => {
+                const po = edge.node;
+                const items = (po.itemList?.edges || [])
+                    .map((e: any) => ({ productId: e.node?.product?.productId ?? '', quantity: e.node?.quantity ?? 0 }))
+                    .filter((i: any) => i.productId);
+                // Normalize any date to YYYY-MM-DD (Finale returns inconsistent formats like "4/2/2026")
+                const toISODate = (d: string | null | undefined): string | null => {
+                    if (!d) return null;
+                    const parsed = new Date(d);
+                    return isNaN(parsed.getTime()) ? null : parsed.toISOString().split('T')[0];
+                };
+                return {
+                    orderId: po.orderId,
+                    vendorName: po.supplier?.name ?? '',
+                    orderDate: toISODate(po.orderDate) ?? '',
+                    expectedDate: toISODate(po.dueDate),
+                    receiveDate: toISODate(po.receiveDate),
+                    status: po.status ?? '',
+                    total: parseFinaleNumber(po.total),
+                    items,
+                    finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
+                } as FullPO;
+            });
+        } catch (err: any) {
+            console.error('[finale] getRecentPurchaseOrders error:', err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Compute median actual lead time per vendor from the last N days of completed POs.
+     * Only includes vendors with ≥ 3 completed POs (insufficient data otherwise).
+     *
+     * Used by the purchasing calendar sync to estimate expected arrival dates when
+     * Finale's deliverDate is absent or unreliable.
+     *
+     * Returns Map<vendorName, medianDays>.
+     * Never throws — returns empty Map on any error.
+     */
+    async getVendorLeadTimeHistory(daysBack: number = 90): Promise<Map<string, number>> {
+        try {
+            const now = new Date();
+            const end = new Date(now);
+            end.setDate(end.getDate() + 1);
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - daysBack);
+
+            const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+
+            const query = {
+                query: `
+                    query {
+                        orderViewConnection(
+                            first: 500
+                            type: ["PURCHASE_ORDER"]
+                            receiveDate: { begin: "${beginStr}", end: "${endStr}" }
+                            sort: [{ field: "receiveDate", mode: "desc" }]
+                        ) {
+                            edges {
+                                node {
+                                    status
+                                    orderDate
+                                    receiveDate
+                                    supplier { name }
+                                }
+                            }
+                        }
+                    }
+                `
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return new Map();
+            const result = await res.json();
+            if (result.errors) return new Map();
+
+            const edges = result.data?.orderViewConnection?.edges || [];
+            // Group lead times by vendor
+            const byVendor = new Map<string, number[]>();
+            for (const edge of edges) {
+                const po = edge.node;
+                if (po.status !== 'Completed') continue;
+                if (!po.orderDate || !po.receiveDate) continue;
+                const vendor = po.supplier?.name;
+                if (!vendor) continue;
+                const orderMs = new Date(po.orderDate).getTime();
+                const receiveMs = new Date(po.receiveDate).getTime();
+                if (isNaN(orderMs) || isNaN(receiveMs)) continue;
+                const days = Math.round((receiveMs - orderMs) / 86_400_000);
+                if (days < 0 || days > 365) continue; // sanity check
+                if (!byVendor.has(vendor)) byVendor.set(vendor, []);
+                byVendor.get(vendor)!.push(days);
+            }
+
+            // Compute median for vendors with ≥ 3 data points
+            const result2 = new Map<string, number>();
+            for (const [vendor, days] of byVendor) {
+                if (days.length < 3) continue;
+                const sorted = [...days].sort((a, b) => a - b);
+                const mid = Math.floor(sorted.length / 2);
+                const median = sorted.length % 2 === 0
+                    ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+                    : sorted[mid];
+                result2.set(vendor, median);
+            }
+            return result2;
+        } catch (err: any) {
+            console.error('[finale] getVendorLeadTimeHistory error:', err.message);
+            return new Map();
+        }
+    }
+
+    // ──────────────────────────────────────────────────
+    // EXTERNAL REORDER ASSESSMENT
+    // ──────────────────────────────────────────────────
+
+    /**
+     * Scan ALL active products for external-vendor reorder needs.
+     *
+     * Triggers (either qualifies):
+     *   - Finale's reorderQuantityToOrder > 0  (Finale explicitly recommends ordering)
+     *   - stockoutDays < 45 AND consumptionQuantity > 0  (velocity-based detection)
+     *
+     * Excludes:
+     *   - Products with no velocity and no Finale reorder flag
+     *   - Products whose primary supplier is BuildASoil-internal (BOM-driven, handled elsewhere)
+     *   - Products with no supplier configured
+     *
+     * Returns items grouped by vendor for easy consolidated PO creation.
+     *
+     * One full scan ≈ 16 Finale GraphQL pages + ~N REST calls for at-risk products.
+     * Should be called once before creating draft POs, not on a hot path.
+     */
+    async getExternalReorderItems(): Promise<ExternalReorderGroup[]> {
+        const PAGE_SIZE = 500;
+
+        // ── Step 1: Paginate productViewConnection for all active products ──
+        const atRisk: Array<{
+            productId: string;
+            stockoutDays: number | null;
+            reorderQty: number | null;
+            consumptionQty: number;
+        }> = [];
+
+        let cursor: string | null = null;
+        let pageCount = 0;
+
+        while (true) {
+            const afterClause: string = cursor ? `, after: "${cursor}"` : '';
+            const query: { query: string } = {
+                query: `{
+                    productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        edges { node {
+                            productId status
+                            stockoutDays consumptionQuantity reorderQuantityToOrder
+                        }}
+                    }
+                }`
+            };
+
+            const res: Response = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const conn: any = json.data?.productViewConnection;
+            if (!conn) break;
+
+            for (const edge of conn.edges || []) {
+                const p = edge.node;
+                if (p.status !== 'Active') continue;
+
+                const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
+                const stockoutDays = this.parseFinaleNum(p.stockoutDays);
+                const consumptionQty = this.parseFinaleNum(p.consumptionQuantity) ?? 0;
+
+                const finaleRecommends = reorderQty !== null && reorderQty > 0;
+                const velocityAlert = consumptionQty > 0 && stockoutDays !== null && stockoutDays < 45;
+
+                if (finaleRecommends || velocityAlert) {
+                    atRisk.push({ productId: p.productId, stockoutDays, reorderQty, consumptionQty });
+                }
+            }
+
+            pageCount++;
+            if (!conn.pageInfo.hasNextPage) break;
+            cursor = conn.pageInfo.endCursor;
+        }
+
+        console.log(`[finale] getExternalReorderItems: scanned ${pageCount} pages, ${atRisk.length} at-risk products`);
+
+        if (atRisk.length === 0) return [];
+
+        // ── Step 2: Resolve supplier for each at-risk product (batched, 5x concurrency) ──
+        // Cache partyId → { groupName, isManufactured } to avoid repeat calls
+        const partyCache = new Map<string, { groupName: string; isManufactured: boolean }>();
+
+        const resolveParty = async (partyId: string): Promise<{ groupName: string; isManufactured: boolean }> => {
+            if (partyCache.has(partyId)) return partyCache.get(partyId)!;
+            try {
+                const res = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
+                    headers: { Authorization: this.authHeader, Accept: 'application/json' },
+                });
+                const data = await res.json();
+                const groupName: string = data.groupName || data.name || 'Unknown';
+                const isManufactured = groupName.toLowerCase().includes('buildasoil') ||
+                    groupName.toLowerCase().includes('manufacturing') ||
+                    groupName.toLowerCase().includes('soil dept') ||
+                    groupName.toLowerCase().includes('bas soil');
+                const result = { groupName, isManufactured };
+                partyCache.set(partyId, result);
+                return result;
+            } catch {
+                return { groupName: 'Unknown', isManufactured: false };
+            }
+        };
+
+        interface RichItem {
+            productId: string;
+            stockoutDays: number | null;
+            reorderQty: number | null;
+            consumptionQty: number;
+            supplierPartyId: string | null;
+            supplierName: string;
+            unitPrice: number;
+            isManufactured: boolean;
+        }
+
+        const richItems: RichItem[] = [];
+        const queue = [...atRisk];
+
+        await Promise.all(Array.from({ length: 5 }, async () => {
+            while (queue.length > 0) {
+                const item = queue.shift()!;
+                try {
+                    const prodRes = await fetch(
+                        `${this.apiBase}/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+                        { headers: { Authorization: this.authHeader, Accept: 'application/json' } }
+                    );
+                    const prod = await prodRes.json();
+                    const suppliers: any[] = prod.supplierList || [];
+                    const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
+
+                    if (!mainSupplier?.supplierPartyUrl) {
+                        // No supplier configured — skip (can't create a PO without a vendor)
+                        continue;
+                    }
+
+                    const partyId = mainSupplier.supplierPartyUrl.split('/').pop();
+                    const party = await resolveParty(partyId);
+
+                    richItems.push({
+                        ...item,
+                        supplierPartyId: partyId,
+                        supplierName: party.groupName,
+                        unitPrice: mainSupplier.price ?? 0,
+                        isManufactured: party.isManufactured,
+                    });
+                } catch {
+                    // Skip products we can't resolve
+                }
+            }
+        }));
+
+        // ── Step 3: Filter to external vendors only, group by supplier ──
+        const external = richItems.filter(i => !i.isManufactured && i.supplierPartyId);
+        const byVendor = new Map<string, RichItem[]>();
+        for (const item of external) {
+            const key = item.supplierPartyId!;
+            if (!byVendor.has(key)) byVendor.set(key, []);
+            byVendor.get(key)!.push(item);
+        }
+
+        const groups: ExternalReorderGroup[] = [];
+        for (const [partyId, items] of byVendor) {
+            const urgency = items.some(i => i.stockoutDays !== null && i.stockoutDays < 14) ? 'critical'
+                : items.some(i => i.stockoutDays !== null && i.stockoutDays < 45) ? 'warning'
+                    : 'reorder_flagged';
+
+            groups.push({
+                vendorName: items[0].supplierName,
+                vendorPartyId: partyId,
+                urgency,
+                items: items.sort((a, b) => (a.stockoutDays ?? 999) - (b.stockoutDays ?? 999)),
+            });
+        }
+
+        return groups.sort((a, b) => {
+            const rank = { critical: 0, warning: 1, reorder_flagged: 2 };
+            return rank[a.urgency] - rank[b.urgency];
+        });
+    }
+
+    /**
+     * Create a draft purchase order in Finale for human review and commit.
+     *
+     * Created with statusId=ORDER_CREATED (visible in Finale as "Draft/Open").
+     * The human commits it in Finale UI by clicking the commit/lock button.
+     *
+     * @param vendorPartyId  Finale partyId of the supplier (from getExternalReorderItems)
+     * @param items          Line items to include
+     * @param memo           Optional memo/notes for the PO
+     * @returns              { orderId, finaleUrl } of the created draft
+     */
+    async createDraftPurchaseOrder(
+        vendorPartyId: string,
+        items: Array<{ productId: string; quantity: number; unitPrice: number }>,
+        memo?: string
+    ): Promise<{ orderId: string; finaleUrl: string }> {
+        const today = new Date().toISOString().split('T')[0] + 'T00:00:00';
+
+        const payload: Record<string, any> = {
+            orderTypeId: 'PURCHASE_ORDER',
+            statusId: 'ORDER_CREATED',
+            orderDate: today,
+            orderRoleList: [{ roleTypeId: 'SUPPLIER', partyId: vendorPartyId }],
+            orderItemList: items.map(item => ({
+                productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+            })),
+        };
+        if (memo) payload.privateNotes = memo;
+
+        const res = await fetch(`${this.apiBase}/${this.accountPath}/api/order`, {
+            method: 'POST',
+            headers: {
+                Authorization: this.authHeader,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+            const body = await res.text();
+            throw new Error(`Finale PO creation failed (${res.status}): ${body.slice(0, 200)}`);
+        }
+
+        const data = await res.json();
+        const orderId = data.orderId;
+        if (!orderId) throw new Error('Finale returned no orderId');
+
+        // Build the human-readable Finale URL (same base64 pattern used throughout client.ts)
+        const rawOrderUrl = data.orderUrl || `/${this.accountPath}/api/order/${orderId}`;
+        const encodedUrl = Buffer.from(rawOrderUrl).toString('base64');
+        const finaleUrl = `${this.apiBase}/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
+
+        console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items)`);
+        return { orderId, finaleUrl };
+    }
+
+    // ── private helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──
+    private parseFinaleNum(val: any): number | null {
+        if (val === null || val === undefined || val === 'null' || val === '--') return null;
+        const n = parseFloat(String(val).replace(/[^0-9.\-]/g, ''));
+        return isNaN(n) ? null : n;
     }
 }

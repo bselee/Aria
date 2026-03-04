@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const SCOPES = [
-    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/calendar.events',
 ];
 
 const TOKEN_PATH = path.join(process.cwd(), 'calendar-token.json');

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw } from "lucide-react";
+import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createBrowserClient } from "@/lib/supabase";
 
 type ReceivedPO = {
@@ -48,11 +48,11 @@ function fmtDollars(n: number): string {
 }
 
 export default function ReceivedItemsPanel() {
-    const [pos, setPos]         = useState<ReceivedPO[]>([]);
-    const [apMap, setApMap]     = useState<ApStatusMap>({});
+    const [pos, setPos] = useState<ReceivedPO[]>([]);
+    const [apMap, setApMap] = useState<ApStatusMap>({});
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
-    const [error, setError]     = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
 
     // Resizable height — persisted
     const containerRef = useRef<HTMLDivElement>(null);
@@ -63,6 +63,14 @@ export default function ReceivedItemsPanel() {
         if (s) setBodyHeight(Math.max(80, Math.min(600, parseInt(s))));
     }, []);
     useEffect(() => { localStorage.setItem("aria-dash-recv-h", String(bodyHeight)); }, [bodyHeight]);
+
+    // Collapse state — persisted to localStorage
+    const [isCollapsed, setIsCollapsed] = useState(false);
+    useEffect(() => {
+        const s = localStorage.getItem("aria-dash-recv-collapsed");
+        if (s === "true") setIsCollapsed(true);
+    }, []);
+    useEffect(() => { localStorage.setItem("aria-dash-recv-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
     const startResize = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
@@ -146,58 +154,68 @@ export default function ReceivedItemsPanel() {
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
                     <RefreshCw className={`w-3 h-3 ${refreshing ? 'animate-spin' : ''}`} />
                 </button>
+                <button
+                    onClick={() => setIsCollapsed(!isCollapsed)}
+                    className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
+                >
+                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
+                </button>
             </div>
 
-            {loading ? (
-                <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
-                    <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-                    <span className="text-xs font-mono">Loading…</span>
-                </div>
-            ) : error ? (
-                <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
-            ) : pos.length === 0 ? (
-                <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in the last 14 days</span></div>
-            ) : (
-                <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
-                    {pos.map(po => {
-                        const apStatus = apMap[po.orderId];
-                        const dollars = fmtDollars(po.total);
-                        return (
-                            <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
-                                {/* Line 1: date · vendor · AP status · total */}
-                                <div className="flex items-center gap-2 min-w-0">
-                                    <span className="text-xs font-mono text-zinc-600 shrink-0">{fmtDateTime(po.receiveDate)}</span>
-                                    <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
-                                    {apStatus && (
-                                        <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
-                                            {apStatus.label}
-                                        </span>
-                                    )}
-                                    {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
-                                </div>
-                                {/* Line 2: PO# + SKUs */}
-                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                                    <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
-                                        className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
-                                        {po.orderId}
-                                    </a>
-                                    <span className="text-zinc-700 text-xs">·</span>
-                                    {po.items.map(item => (
-                                        <span key={item.productId} className="text-sm font-mono text-zinc-200">
-                                            {item.productId}
-                                            <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
-                                        </span>
-                                    ))}
-                                </div>
-                            </div>
-                        );
-                    })}
-                </div>
-            )}
+            {!isCollapsed && (
+                <>
+                    {loading ? (
+                        <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
+                            <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
+                            <span className="text-xs font-mono">Loading…</span>
+                        </div>
+                    ) : error ? (
+                        <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
+                    ) : pos.length === 0 ? (
+                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in the last 14 days</span></div>
+                    ) : (
+                        <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
+                            {pos.map(po => {
+                                const apStatus = apMap[po.orderId];
+                                const dollars = fmtDollars(po.total);
+                                return (
+                                    <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
+                                        {/* Line 1: date · vendor · AP status · total */}
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <span className="text-xs font-mono text-zinc-600 shrink-0">{fmtDateTime(po.receiveDate)}</span>
+                                            <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
+                                            {apStatus && (
+                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
+                                                    {apStatus.label}
+                                                </span>
+                                            )}
+                                            {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
+                                        </div>
+                                        {/* Line 2: PO# + SKUs */}
+                                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                            <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
+                                                className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
+                                                {po.orderId}
+                                            </a>
+                                            <span className="text-zinc-700 text-xs">·</span>
+                                            {po.items.map(item => (
+                                                <span key={item.productId} className="text-sm font-mono text-zinc-200">
+                                                    {item.productId}
+                                                    <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
 
-            {!loading && !error && pos.length > 0 && (
-                <div onMouseDown={startResize}
-                    className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
+                    {!loading && !error && pos.length > 0 && (
+                        <div onMouseDown={startResize}
+                            className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
+                    )}
+                </>
             )}
         </div>
     );

@@ -6,7 +6,7 @@
 
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
-import { unifiedTextGeneration } from "../intelligence/llm";
+import { getAnthropicClient } from "../anthropic";
 
 export interface PDFExtractionResult {
     rawText: string;
@@ -78,31 +78,208 @@ export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
     };
 }
 
+const SCANNED_PDF_PROMPT = "Extract all text from this invoice PDF. Include every line item, price, quantity, vendor name, invoice number, PO number, dates, addresses, and totals. Return the complete raw text content — do not summarize.";
+const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. Extract ALL text from this PDF exactly as it appears. Preserve every number, date, vendor name, invoice number, PO number, line item, quantity, unit price, and total.";
+
 /**
- * For scanned/image PDFs — utilizes LLM document capabilities.
- * Currently defaults to Anthropic's native PDF support via unified service logic
- * but falls back to OpenAI if needed.
+ * For scanned/image PDFs — passes the raw PDF bytes to an LLM with native PDF support.
+ * Tries Gemini (via Vercel AI SDK) first, then Anthropic direct SDK as fallback.
  */
 async function extractScannedPDF(
     buffer: Buffer,
     partial: { rawText: string; tables: TableData[]; pageCount: number }
 ): Promise<PDFExtractionResult> {
-    // Note: unifiedTextGeneration currently handles text, but for scanned PDFs
-    // we would ideally need multi-modal support. 
-    // For now, we'll use a specific prompt and the raw text we DID get (if any).
-    // If it's truly zero text, the LLM will struggle without the actual buffer.
+    let extractedText = "";
 
-    // DECISION(2026-02-20): Using unifiedTextGeneration to handle the "sparse text" case.
-    // In a future update, we can pass the actual base64 to the unified service if it supports multi-modal.
+    // Strategy A: Gemini REST API with inlineData (avoids Vercel AI SDK type constraints)
+    console.log(`[extractor] Strategy A — Gemini key: ${process.env.GOOGLE_GENERATIVE_AI_API_KEY ? "SET" : "MISSING"}`);
+    if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+        try {
+            const geminiRes = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        systemInstruction: { parts: [{ text: SCANNED_PDF_SYSTEM }] },
+                        contents: [{
+                            parts: [
+                                { inlineData: { mimeType: "application/pdf", data: buffer.toString("base64") } },
+                                { text: SCANNED_PDF_PROMPT },
+                            ],
+                        }],
+                    }),
+                }
+            );
+            const geminiData = await geminiRes.json() as any;
+            if (geminiData.error) throw new Error(geminiData.error.message);
+            extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            if (extractedText) console.log(`[extractor] Strategy A succeeded — ${extractedText.length} chars`);
+        } catch (err: any) {
+            console.warn("⚠️ Gemini PDF extraction failed, trying Anthropic:", err.message);
+        }
+    }
 
-    const extractedText = await unifiedTextGeneration({
-        system: "You are an expert OCR and document analysis engine.",
-        prompt: `The following document text was extracted with low confidence (likely scanned). 
-        Please clean it up, fix any typos, and ensure all data points (dates, amounts, vendor names) are preserved.
-        
-        PARTIAL TEXT:
-        ${partial.rawText.slice(0, 4000)}`
-    });
+    // Strategy B: Anthropic direct SDK (native PDF document blocks)
+    console.log(`[extractor] Strategy B — extractedText empty: ${!extractedText}, Anthropic key: ${process.env.ANTHROPIC_API_KEY ? "SET" : "MISSING"}`);
+    if (!extractedText && process.env.ANTHROPIC_API_KEY) {
+        try {
+            const anthropic = getAnthropicClient();
+            const response = await anthropic.messages.create({
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: 4000,
+                system: SCANNED_PDF_SYSTEM,
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "document",
+                                source: {
+                                    type: "base64",
+                                    media_type: "application/pdf",
+                                    data: buffer.toString("base64"),
+                                },
+                            } as any,
+                            { type: "text", text: SCANNED_PDF_PROMPT },
+                        ],
+                    },
+                ],
+            });
+            extractedText = response.content
+                .filter(b => b.type === "text")
+                .map(b => (b as any).text)
+                .join("\n");
+            if (extractedText) console.log(`[extractor] Strategy B succeeded — ${extractedText.length} chars`);
+        } catch (err: any) {
+            console.warn("⚠️ Anthropic PDF extraction failed:", err.message);
+        }
+    }
+
+    // Strategy C: OpenAI — upload PDF via Files API then reference by file_id in Responses API.
+    // Split upload + inference avoids large base64 JSON bodies that can hang on slow connections.
+    console.log(`[extractor] Strategy C — extractedText empty: ${!extractedText}, OpenAI key: ${process.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
+    if (!extractedText && process.env.OPENAI_API_KEY) {
+        let uploadedFileId: string | null = null;
+        try {
+            console.log("[extractor] Uploading PDF to OpenAI Files API...");
+            const uploadController = new AbortController();
+            const uploadTimeout = setTimeout(() => uploadController.abort(), 30_000);
+            try {
+                const formData = new FormData();
+                formData.append("file", new Blob([buffer as unknown as BlobPart], { type: "application/pdf" }), "invoice.pdf");
+                formData.append("purpose", "user_data");
+                const uploadRes = await fetch("https://api.openai.com/v1/files", {
+                    method: "POST",
+                    signal: uploadController.signal,
+                    headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
+                    body: formData,
+                });
+                console.log(`[extractor] OpenAI upload status: ${uploadRes.status}`);
+                const uploadData = await uploadRes.json() as any;
+                if (uploadData.error) throw new Error(JSON.stringify(uploadData.error));
+                uploadedFileId = uploadData.id;
+                console.log(`[extractor] OpenAI file uploaded: ${uploadedFileId}`);
+            } finally {
+                clearTimeout(uploadTimeout);
+            }
+
+            if (uploadedFileId) {
+                const inferController = new AbortController();
+                const inferTimeout = setTimeout(() => {
+                    console.warn("[extractor] OpenAI inference timed out after 60s — aborting");
+                    inferController.abort();
+                }, 60_000);
+                try {
+                    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
+                        method: "POST",
+                        signal: inferController.signal,
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+                        },
+                        body: JSON.stringify({
+                            model: "gpt-4o",
+                            instructions: SCANNED_PDF_SYSTEM,
+                            input: [{
+                                role: "user",
+                                content: [
+                                    { type: "input_file", file_id: uploadedFileId },
+                                    { type: "input_text", text: SCANNED_PDF_PROMPT },
+                                ],
+                            }],
+                        }),
+                    });
+                    console.log(`[extractor] OpenAI Responses API status: ${openaiRes.status}`);
+                    const openaiData = await openaiRes.json() as any;
+                    if (openaiData.error) throw new Error(JSON.stringify(openaiData.error));
+                    extractedText = openaiData.output?.[0]?.content?.[0]?.text || "";
+                    console.log(`[extractor] Strategy C result — ${extractedText.length} chars`);
+                } finally {
+                    clearTimeout(inferTimeout);
+                    // Best-effort cleanup: delete the uploaded file
+                    fetch(`https://api.openai.com/v1/files/${uploadedFileId}`, {
+                        method: "DELETE",
+                        headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
+                    }).catch(() => {});
+                }
+            }
+        } catch (err: any) {
+            console.warn("⚠️ OpenAI PDF extraction failed:", err.message);
+        }
+    }
+
+    // Strategy D: OpenRouter — Gemini 2.0 Flash via OpenAI-compatible endpoint
+    // Uses chat completions + image_url with PDF data URI (Gemini supports application/pdf)
+    console.log(`[extractor] Strategy D — extractedText empty: ${!extractedText}, OpenRouter key: ${process.env.OPENROUTER_API_KEY ? "SET" : "MISSING"}`);
+    if (!extractedText && process.env.OPENROUTER_API_KEY) {
+        try {
+            console.log("[extractor] Calling OpenRouter (Gemini 2.0 Flash)...");
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => {
+                console.warn("[extractor] OpenRouter fetch timed out after 60s — aborting");
+                controller.abort();
+            }, 60_000);
+            try {
+                const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                    method: "POST",
+                    signal: controller.signal,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        "HTTP-Referer": "https://aria.buildasoil.com",
+                        "X-Title": "Aria AP Agent",
+                    },
+                    body: JSON.stringify({
+                        model: "google/gemini-2.5-flash-lite",
+                        messages: [{
+                            role: "user",
+                            content: [
+                                {
+                                    type: "image_url",
+                                    image_url: { url: `data:application/pdf;base64,${buffer.toString("base64")}` },
+                                },
+                                { type: "text", text: `${SCANNED_PDF_SYSTEM}\n\n${SCANNED_PDF_PROMPT}` },
+                            ],
+                        }],
+                    }),
+                });
+                console.log(`[extractor] OpenRouter HTTP status: ${orRes.status}`);
+                const orData = await orRes.json() as any;
+                if (orData.error) throw new Error(JSON.stringify(orData.error));
+                extractedText = orData.choices?.[0]?.message?.content || "";
+                console.log(`[extractor] Strategy D result — ${extractedText.length} chars`);
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        } catch (err: any) {
+            console.warn("⚠️ OpenRouter PDF extraction failed:", err.message);
+        }
+    }
+
+    if (!extractedText) {
+        throw new Error("Scanned PDF extraction failed — Gemini, Anthropic, OpenAI, and OpenRouter all unavailable. Check API keys/credits.");
+    }
 
     return {
         rawText: extractedText,

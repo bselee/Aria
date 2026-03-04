@@ -27,6 +27,7 @@ import BuildSchedulePanel from "@/components/dashboard/BuildSchedulePanel";
 import ChatMirror from "@/components/dashboard/ChatMirror";
 import InvoiceQueuePanel from "@/components/dashboard/InvoiceQueuePanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
+import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 
 const DEFAULT_LEFT_W = 480;
@@ -51,6 +52,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
         </div>
     ),
     "invoice-queue": <InvoiceQueuePanel key="invoice-queue" />,
+    "reorder": <ReorderPanel key="reorder" />,
     "build-schedule": <BuildSchedulePanel key="build-schedule" />,
     "chat-mirror": (
         <div key="chat-mirror" className="flex flex-col flex-1 overflow-hidden min-h-[400px]">
@@ -64,7 +66,7 @@ type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings", "activity"],
-    mid: ["invoice-queue", "build-schedule"],
+    mid: ["invoice-queue", "reorder", "build-schedule"],
     right: ["chat-mirror"]
 };
 
@@ -236,11 +238,10 @@ export default function DashboardPage() {
                 <section className="flex-1 flex flex-row overflow-hidden bg-[#09090b] min-w-0">
 
                     {/* Left column */}
-                    <Column id="left" items={layout.left} style={{ width: leftW }} className="shrink-0 flex flex-col overflow-y-auto overflow-x-hidden min-h-screen pb-20">
-                        <header className="px-4 py-3 border-b border-zinc-800 bg-[#09090b] flex items-center justify-between shrink-0 sticky top-0 z-10 backdrop-blur-md">
+                    <Column id="left" items={layout.left} style={{ width: leftW }} className="shrink-0 flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
+                        <header className="px-4 py-3 -m-4 mb-0 border-b border-zinc-800 bg-[#09090b] flex items-center justify-between shrink-0 sticky top-0 z-10 backdrop-blur-md">
                             <div>
-                                <h1 className="text-sm font-semibold tracking-tight text-zinc-200">Aria Ops</h1>
-                                <p className="text-xs text-zinc-600 mt-0.5">BuildASoil</p>
+                                <h1 className="text-sm font-semibold tracking-tight text-zinc-200">Ops</h1>
                             </div>
                             <div className="flex gap-2">
                                 <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-800/60 border border-zinc-700/50">
@@ -264,7 +265,7 @@ export default function DashboardPage() {
                     <ColHandle onMouseDown={startLeftResize} />
 
                     {/* Middle column */}
-                    <Column id="mid" items={layout.mid} style={{ width: midW }} className="shrink-0 flex flex-col overflow-y-auto overflow-x-hidden min-h-screen pb-20">
+                    <Column id="mid" items={layout.mid} style={{ width: midW }} className="shrink-0 flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
                         {layout.mid.map(id => (
                             <SortablePanel key={id} id={id} className={id === "activity" || id === "chat-mirror" ? "flex-1" : undefined}>
                                 {PANEL_MAP[id]}
@@ -275,7 +276,7 @@ export default function DashboardPage() {
                     <ColHandle onMouseDown={startMidResize} />
 
                     {/* Right column */}
-                    <Column id="right" items={layout.right} className="flex-1 min-w-[240px] flex flex-col overflow-y-auto overflow-x-hidden min-h-screen pb-20">
+                    <Column id="right" items={layout.right} className="flex-1 min-w-[240px] flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
                         {layout.right.map(id => (
                             <SortablePanel key={id} id={id} className={id === "activity" || id === "chat-mirror" ? "flex-1" : undefined}>
                                 {PANEL_MAP[id]}

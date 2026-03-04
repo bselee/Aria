@@ -1,5 +1,36 @@
 import { createClient } from '../supabase';
-import type { BuildRiskReport } from './build-risk';
+import type { BuildRiskReport, ComponentDemand } from './build-risk';
+
+/**
+ * Fetch the most recent saved snapshot's component risk levels from Supabase.
+ * Used by the morning risk run to detect components that have flipped
+ * from CRITICAL/WARNING → OK (restock event).
+ *
+ * Returns a map of SKU → { riskLevel } or null if no prior snapshot exists.
+ */
+export async function getLastSnapshot(): Promise<Record<string, { riskLevel: ComponentDemand['riskLevel'] }> | null> {
+    try {
+        const db = createClient();
+        if (!db) return null;
+
+        const { data, error } = await db
+            .from('build_risk_snapshots')
+            .select('components')
+            .order('generated_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (error || !data?.components) return null;
+
+        // components is stored as Record<string, ComponentDemand> (Sets serialized as arrays)
+        const raw = data.components as Record<string, any>;
+        return Object.fromEntries(
+            Object.entries(raw).map(([sku, c]) => [sku, { riskLevel: c.riskLevel as ComponentDemand['riskLevel'] }])
+        );
+    } catch {
+        return null;
+    }
+}
 
 export async function saveBuildRiskSnapshot(report: BuildRiskReport): Promise<void> {
   try {

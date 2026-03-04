@@ -358,10 +358,43 @@ bot.command('buildrisk', async (ctx) => {
 
         await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
 
-        // Persist snapshot to Supabase for dashboard (fire-and-forget)
+        // Persist snapshot + generate smart reorder prescriptions (fire-and-forget)
         setImmediate(async () => {
             const { saveBuildRiskSnapshot } = await import('../lib/builds/build-risk-logger');
             await saveBuildRiskSnapshot(report);
+
+            // Smart prescriptions: only send if not alerted in last 20h
+            try {
+                const { generateReorderPrescriptions, formatPrescriptionsTelegram } = await import('../lib/builds/reorder-engine');
+                const { createClient } = await import('../lib/supabase');
+                const prescriptions = await generateReorderPrescriptions(report.components, report.fgVelocity);
+                if (prescriptions.length > 0) {
+                    const db = createClient();
+                    const cutoff = new Date(Date.now() - 20 * 60 * 60 * 1000).toISOString();
+                    const { data: recent } = db
+                        ? await db.from('proactive_alerts').select('sku,risk_level').gte('alerted_at', cutoff)
+                        : { data: [] };
+                    const recentSet = new Set((recent ?? []).map((r: any) => `${r.sku}:${r.risk_level}`));
+                    const fresh = prescriptions.filter(p => !recentSet.has(`${p.componentSku}:${p.riskLevel}`));
+                    if (fresh.length > 0) {
+                        await ctx.reply(formatPrescriptionsTelegram(fresh), { parse_mode: 'Markdown' });
+                        if (db) {
+                            await db.from('proactive_alerts').upsert(
+                                fresh.map(p => ({
+                                    sku: p.componentSku, alert_type: 'reorder', risk_level: p.riskLevel,
+                                    stockout_days: p.stockoutDays, suggested_order_qty: p.suggestedOrderQty,
+                                    days_after_order: p.daysAfterOrder, alerted_at: new Date().toISOString(),
+                                })),
+                                { onConflict: 'sku,alert_type' }
+                            );
+                        }
+                    } else {
+                        await ctx.reply('🧠 _Smart reorder alerts already sent recently — no duplicates._', { parse_mode: 'Markdown' });
+                    }
+                }
+            } catch (err: any) {
+                console.warn('[buildrisk/prescriptions] non-fatal:', err.message);
+            }
         });
 
         // Follow-up: Ask about unrecognized SKUs
@@ -442,6 +475,93 @@ bot.command('requests', async (ctx) => {
         await ctx.reply(reply, { parse_mode: 'Markdown' });
     } catch (err: any) {
         await ctx.reply(`❌ Error: ${err.message}`);
+    }
+});
+
+// /builds — Show completed builds from the last 24 hours (or N days with /builds 7)
+bot.command('builds', async (ctx) => {
+    ctx.sendChatAction('typing');
+
+    const args = ctx.message.text.replace(/^\/builds\s*/, '').trim();
+    const days = Math.min(Math.max(parseInt(args) || 1, 1), 30);
+
+    try {
+        const { createClient } = await import('../lib/supabase');
+        const db = createClient();
+        if (!db) {
+            return ctx.reply('❌ Supabase not configured.', { parse_mode: 'Markdown' });
+        }
+
+        const since = new Date(Date.now() - days * 86400000).toISOString();
+        const { data, error } = await db
+            .from('build_completions')
+            .select('build_id,sku,quantity,completed_at,created_at')
+            .gte('created_at', since)
+            .order('created_at', { ascending: false })
+            .limit(50);
+
+        if (error) throw new Error(error.message);
+
+        if (!data || data.length === 0) {
+            const label = days === 1 ? 'today' : `the last ${days} days`;
+            return ctx.reply(`🏭 *Build Completions*\n\nNo completed builds recorded for ${label}.\n_The watcher checks every 30 min._`, { parse_mode: 'Markdown' });
+        }
+
+        // Group by date
+        const byDate = new Map<string, typeof data>();
+        for (const row of data) {
+            const dateKey = new Date(row.completed_at).toLocaleDateString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Denver',
+            });
+            if (!byDate.has(dateKey)) byDate.set(dateKey, []);
+            byDate.get(dateKey)!.push(row);
+        }
+
+        const totalUnits = data.reduce((s: number, r: any) => s + (r.quantity || 0), 0);
+        const label = days === 1 ? 'Today' : `Last ${days} Days`;
+        let reply = `🏭 *Build Completions — ${label}*\n`;
+        reply += `${data.length} build${data.length > 1 ? 's' : ''}  |  ${totalUnits.toLocaleString()} total units\n`;
+        reply += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const [dateStr, rows] of byDate) {
+            reply += `\n📅 *${dateStr}*\n`;
+            for (const row of rows) {
+                const time = new Date(row.completed_at).toLocaleTimeString('en-US', {
+                    hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver',
+                });
+                reply += `✅ \`${row.sku}\` × ${row.quantity.toLocaleString()} — ${time}\n`;
+            }
+        }
+
+        reply += `\n_Use /builds 7 for last 7 days_`;
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        console.error('Builds command error:', err.message);
+        await ctx.reply(`❌ Error fetching builds: ${err.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
+// /alerts — Show recent smart reorder/build prescriptions from the last 24 hours
+bot.command('alerts', async (ctx) => {
+    ctx.sendChatAction('typing');
+    try {
+        const { createClient } = await import('../lib/supabase');
+        const db = createClient();
+        if (!db) return ctx.reply('❌ Supabase not configured.');
+
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const { data, error } = await db
+            .from('proactive_alerts')
+            .select('sku,risk_level,stockout_days,suggested_order_qty,days_after_order,alerted_at')
+            .gte('alerted_at', since)
+            .order('alerted_at', { ascending: false });
+
+        if (error) throw new Error(error.message);
+
+        const { formatAlertsDigest } = await import('../lib/builds/reorder-engine');
+        await ctx.reply(formatAlertsDigest(data ?? []), { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        await ctx.reply(`❌ Error fetching alerts: ${err.message}`, { parse_mode: 'Markdown' });
     }
 });
 
@@ -1300,6 +1420,27 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                         }
                     }
                 }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "reorder_assessment",
+                    description: "Scan all active Finale products and return external-vendor reorder recommendations grouped by vendor with urgency. Use when Will asks about reorders, low stock, what to order, purchasing needs, or 'what do we need to buy'.",
+                    parameters: { type: "object", properties: {} }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "create_draft_pos",
+                    description: "Create draft purchase orders in Finale for human review and commit. Creates one PO per vendor for all flagged reorder items, or filtered to a specific vendor. Draft POs appear in Finale as ORDER_CREATED for Will to review and commit.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            vendor_filter: { type: "string", description: "Optional vendor name to create PO for only that vendor. Omit to create all flagged POs." }
+                        }
+                    }
+                }
             }
         ];
 
@@ -1357,6 +1498,66 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                     const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
                     const report = await runBuildRiskAnalysis(30, () => { });
                     result = report.slackMessage;
+                } else if (toolCall.function.name === "reorder_assessment") {
+                    const { FinaleClient } = await import('../lib/finale/client');
+                    const finaleClient = new FinaleClient();
+                    const groups = await finaleClient.getExternalReorderItems();
+                    if (groups.length === 0) {
+                        result = "✅ All stocking items are within safe levels — nothing to reorder.";
+                    } else {
+                        const crit = groups.filter(g => g.urgency === 'critical');
+                        const warn = groups.filter(g => g.urgency === 'warning');
+                        const flag = groups.filter(g => g.urgency === 'reorder_flagged');
+                        const lines: string[] = [`📦 *Reorder Assessment* — ${groups.length} vendor${groups.length !== 1 ? 's' : ''} flagged\n`];
+                        if (crit.length) lines.push(`🔴 *Critical (<14d):* ${crit.map(g => `${g.vendorName} (${g.items.length})`).join(', ')}`);
+                        if (warn.length) lines.push(`🟡 *Warning (14–44d):* ${warn.map(g => `${g.vendorName} (${g.items.length})`).join(', ')}`);
+                        if (flag.length) lines.push(`📦 *Flagged:* ${flag.map(g => g.vendorName).join(', ')}`);
+                        // Top 5 most urgent individual SKUs
+                        const allItems = groups.flatMap(g => g.items.map(i => ({ ...i, vendor: g.vendorName })));
+                        const topItems = allItems
+                            .filter(i => i.stockoutDays !== null)
+                            .sort((a, b) => (a.stockoutDays ?? 999) - (b.stockoutDays ?? 999))
+                            .slice(0, 5);
+                        if (topItems.length) {
+                            lines.push(`\n*Most urgent SKUs:*`);
+                            for (const i of topItems) {
+                                lines.push(`  • ${i.productId} — ${i.stockoutDays}d out · ${i.vendor}${i.reorderQty ? ` · qty:${i.reorderQty}` : ''}`);
+                            }
+                        }
+                        lines.push(`\nSay "create draft POs" to generate Finale drafts for all vendors.`);
+                        result = lines.join('\n');
+                    }
+                } else if (toolCall.function.name === "create_draft_pos") {
+                    const { FinaleClient } = await import('../lib/finale/client');
+                    const finaleClient = new FinaleClient();
+                    const groups = await finaleClient.getExternalReorderItems();
+                    const filtered = args.vendor_filter
+                        ? groups.filter(g => g.vendorName.toLowerCase().includes((args.vendor_filter as string).toLowerCase()))
+                        : groups;
+                    if (filtered.length === 0) {
+                        result = args.vendor_filter
+                            ? `No reorder items found for vendor matching "${args.vendor_filter}".`
+                            : "No external vendor reorder items found.";
+                    } else {
+                        const created: string[] = [];
+                        for (const group of filtered) {
+                            try {
+                                const items = group.items.map((i: any) => ({
+                                    productId: i.productId,
+                                    quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
+                                    unitPrice: i.unitPrice,
+                                }));
+                                const po = await finaleClient.createDraftPurchaseOrder(
+                                    group.vendorPartyId, items,
+                                    `Auto-generated draft — review and commit in Finale`
+                                );
+                                created.push(`✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''})`);
+                            } catch (e: any) {
+                                created.push(`❌ ${group.vendorName}: ${e.message}`);
+                            }
+                        }
+                        result = `*Draft POs Created:*\n${created.join('\n')}`;
+                    }
                 } else if (toolCall.function.name === "query_vendors") {
                     const { createClient } = await import('../lib/supabase');
                     const db = createClient();
@@ -1835,6 +2036,27 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                             }
                         }
                     }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "reorder_assessment",
+                        description: "Scan all active Finale products and return external-vendor reorder recommendations grouped by vendor with urgency. Use when Will asks about reorders, low stock, what to order, purchasing needs, or 'what do we need to buy'.",
+                        parameters: { type: "object", properties: {} }
+                    }
+                },
+                {
+                    type: "function",
+                    function: {
+                        name: "create_draft_pos",
+                        description: "Create draft purchase orders in Finale for human review and commit. Creates one PO per vendor for all flagged reorder items, or filtered to a specific vendor. Draft POs appear in Finale as ORDER_CREATED for Will to review and commit.",
+                        parameters: {
+                            type: "object",
+                            properties: {
+                                vendor_filter: { type: "string", description: "Optional vendor name to create PO for only that vendor. Omit to create all flagged POs." }
+                            }
+                        }
+                    }
                 }
             ];
 
@@ -1894,6 +2116,65 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                         const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
                         const report = await runBuildRiskAnalysis(30, () => { });
                         result = report.slackMessage;
+                    } else if (toolCall.function.name === "reorder_assessment") {
+                        const { FinaleClient } = await import('../lib/finale/client');
+                        const finaleClient = new FinaleClient();
+                        const groups = await finaleClient.getExternalReorderItems();
+                        if (groups.length === 0) {
+                            result = "✅ All stocking items are within safe levels — nothing to reorder.";
+                        } else {
+                            const crit = groups.filter((g: any) => g.urgency === 'critical');
+                            const warn = groups.filter((g: any) => g.urgency === 'warning');
+                            const flag = groups.filter((g: any) => g.urgency === 'reorder_flagged');
+                            const lines: string[] = [`📦 *Reorder Assessment* — ${groups.length} vendor${groups.length !== 1 ? 's' : ''} flagged\n`];
+                            if (crit.length) lines.push(`🔴 *Critical (<14d):* ${crit.map((g: any) => `${g.vendorName} (${g.items.length})`).join(', ')}`);
+                            if (warn.length) lines.push(`🟡 *Warning (14–44d):* ${warn.map((g: any) => `${g.vendorName} (${g.items.length})`).join(', ')}`);
+                            if (flag.length) lines.push(`📦 *Flagged:* ${flag.map((g: any) => g.vendorName).join(', ')}`);
+                            const allItems = groups.flatMap((g: any) => g.items.map((i: any) => ({ ...i, vendor: g.vendorName })));
+                            const topItems = allItems
+                                .filter((i: any) => i.stockoutDays !== null)
+                                .sort((a: any, b: any) => (a.stockoutDays ?? 999) - (b.stockoutDays ?? 999))
+                                .slice(0, 5);
+                            if (topItems.length) {
+                                lines.push(`\n*Most urgent SKUs:*`);
+                                for (const i of topItems) {
+                                    lines.push(`  • ${i.productId} — ${i.stockoutDays}d out · ${i.vendor}${i.reorderQty ? ` · qty:${i.reorderQty}` : ''}`);
+                                }
+                            }
+                            lines.push(`\nSay "create draft POs" to generate Finale drafts for all vendors.`);
+                            result = lines.join('\n');
+                        }
+                    } else if (toolCall.function.name === "create_draft_pos") {
+                        const { FinaleClient } = await import('../lib/finale/client');
+                        const finaleClient = new FinaleClient();
+                        const groups = await finaleClient.getExternalReorderItems();
+                        const filtered = args.vendor_filter
+                            ? groups.filter((g: any) => g.vendorName.toLowerCase().includes((args.vendor_filter as string).toLowerCase()))
+                            : groups;
+                        if (filtered.length === 0) {
+                            result = args.vendor_filter
+                                ? `No reorder items found for vendor matching "${args.vendor_filter}".`
+                                : "No external vendor reorder items found.";
+                        } else {
+                            const created: string[] = [];
+                            for (const group of filtered) {
+                                try {
+                                    const items = group.items.map((i: any) => ({
+                                        productId: i.productId,
+                                        quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
+                                        unitPrice: i.unitPrice,
+                                    }));
+                                    const po = await finaleClient.createDraftPurchaseOrder(
+                                        group.vendorPartyId, items,
+                                        `Auto-generated draft — review and commit in Finale`
+                                    );
+                                    created.push(`✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''})`);
+                                } catch (e: any) {
+                                    created.push(`❌ ${group.vendorName}: ${e.message}`);
+                                }
+                            }
+                            result = `*Draft POs Created:*\n${created.join('\n')}`;
+                        }
                     } else if (toolCall.function.name === "query_vendors") {
                         const { createClient } = await import('../lib/supabase');
                         const db = createClient();
@@ -2094,6 +2375,30 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             : message);
     });
 
+    // TEXT COMMAND FALLBACK for approvals — handles /approve_<id> and /reject_<id>
+    // typed as plain text. Useful when the inline buttons are no longer tappable
+    // (e.g., old message scrolled past, or approval came from the test pipeline script).
+    bot.hears(/^\/approve_(.+)$/, async (ctx) => {
+        const approvalId = ctx.match[1];
+        console.log(`🔑 Approval text command: ${approvalId}`);
+        try {
+            const result = await approvePendingReconciliation(approvalId);
+            const responseMsg = result.success
+                ? `${result.message}\n\nApplied:\n${result.applied.map((a: string) => `  ✅ ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map((e: string) => `  ❌ ${e}`).join('\n')}` : ''}`
+                : `⚠️ ${result.message}`;
+            await ctx.reply(responseMsg, { parse_mode: 'Markdown' });
+        } catch (err: any) {
+            await ctx.reply(`❌ Approval failed: ${err.message}`);
+        }
+    });
+
+    bot.hears(/^\/reject_(.+)$/, async (ctx) => {
+        const approvalId = ctx.match[1];
+        console.log(`🔒 Rejection text command: ${approvalId}`);
+        const message = await rejectPendingReconciliation(approvalId);
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+    });
+
     // DROPSHIP INVOICE INLINE BUTTONS
     // ──────────────────────────────────────────────────
     // When an unmatched invoice arrives, AP agent sends three buttons.
@@ -2101,13 +2406,16 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     bot.action(/^dropship_fwd_(.+)$/, async (ctx) => {
         const dropId = ctx.match[1];
-        await ctx.answerCbQuery('Forwarding to bill.com...');
-
         const pending = getPendingDropship(dropId);
+
+        // Must answer the callback query within 10s regardless of outcome.
+        // Use neutral text here; the editMessageText below gives the real status.
+        await ctx.answerCbQuery(pending ? 'Forwarding to bill.com...' : 'Data expired — see recovery options');
+
         if (!pending) {
             await ctx.editMessageText(
                 (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
-                '\n\n❌ Invoice data expired. Re-run the AP agent to reprocess.'
+                '\n\n⚠️ Invoice data no longer in memory (bot restarted and cleared in-memory store).\n\nRecovery options:\n• Forward the original email to buildasoilap@bill.com manually\n• Run /ap scan to re-poll the inbox\n• Check Supabase `invoices` table for this invoice'
             );
             return;
         }
@@ -2168,10 +2476,20 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         await ctx.answerCbQuery('Enter the PO number in chat');
         const name = pending ? pending.invoiceNumber : dropId;
 
-        // Register state so the text handler knows to intercept the next message
         const chatId = ctx.chat?.id;
-        if (chatId) pendingPoEntry.set(chatId, dropId);
 
+        if (!pending) {
+            // Bot restarted — in-memory store is gone. Give the same three recovery
+            // options as the dropship_fwd_ stale path for consistency.
+            if (chatId) pendingPoEntry.set(chatId, dropId);
+            await ctx.reply(
+                `⚠️ Invoice data expired (bot restarted — in-memory store cleared).\n\nRecovery options:\n• Forward the original email to buildasoilap@bill.com manually\n• Reply with the PO# and I'll check Supabase for the invoice\n• Run /ap scan to re-poll the inbox`
+            );
+            return;
+        }
+
+        // Register state so the text handler knows to intercept the next message
+        if (chatId) pendingPoEntry.set(chatId, dropId);
         await ctx.reply(
             `What's the Finale PO number for invoice ${name}?\nReply with just the PO# and I'll run the match.`
         );

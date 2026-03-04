@@ -52,3 +52,10 @@
 - [x] `/buildrisk` command in Telegram bot.
 - [x] Daily 7:30 AM cron in OpsManager (Telegram + Slack #purchasing).
 - [x] Refined product search with fuzzy matching + enriched results.
+
+## 🛒 Reorder Assessment Module
+- [x] Create `/api/dashboard/reorder` route with module-level cache
+- [x] Create `ReorderPanel.tsx` dashboard component
+- [x] Add `ReorderPanel` to dashboard page
+- [x] Streamline bot `reorder_assessment` output
+- [x] Fix `finaleUrl` in `createDraftPurchaseOrder`

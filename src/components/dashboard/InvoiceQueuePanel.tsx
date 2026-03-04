@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase";
-import { Receipt } from "lucide-react";
+import { Receipt, ChevronDown } from "lucide-react";
 
 type LogEntry = {
   id: string;
@@ -43,16 +43,24 @@ function classify(log: LogEntry): Status {
 }
 
 const STATUS_CFG: Record<Status, { dot: string; label: string; text: string }> = {
-  matched:   { dot: "bg-emerald-500", label: "MATCHED",   text: "text-emerald-400" },
-  pending:   { dot: "bg-amber-400",   label: "PENDING",   text: "text-amber-300" },
-  unmatched: { dot: "bg-rose-500",    label: "NO MATCH",  text: "text-rose-300" },
-  forwarded: { dot: "bg-blue-400",    label: "FWDED",     text: "text-blue-300" },
-  junk:      { dot: "bg-zinc-700",    label: "JUNK",      text: "text-zinc-600" },
+  matched: { dot: "bg-emerald-500", label: "MATCHED", text: "text-emerald-400" },
+  pending: { dot: "bg-amber-400", label: "PENDING", text: "text-amber-300" },
+  unmatched: { dot: "bg-rose-500", label: "NO MATCH", text: "text-rose-300" },
+  forwarded: { dot: "bg-blue-400", label: "FWDED", text: "text-blue-300" },
+  junk: { dot: "bg-zinc-700", label: "JUNK", text: "text-zinc-600" },
 };
 
 export default function InvoiceQueuePanel() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Collapse state — persisted to localStorage
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  useEffect(() => {
+    const s = localStorage.getItem("aria-dash-invoice-collapsed");
+    if (s === "true") setIsCollapsed(true);
+  }, []);
+  useEffect(() => { localStorage.setItem("aria-dash-invoice-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
   useEffect(() => {
     const supabase = createBrowserClient();
@@ -83,7 +91,7 @@ export default function InvoiceQueuePanel() {
   }, []);
 
   const pending = logs.filter(l => classify(l) === "pending");
-  const rest    = logs.filter(l => classify(l) !== "pending" && classify(l) !== "junk");
+  const rest = logs.filter(l => classify(l) !== "pending" && classify(l) !== "junk");
 
   return (
     <div className="border-b border-zinc-800 shrink-0">
@@ -100,53 +108,63 @@ export default function InvoiceQueuePanel() {
         {!loading && pending.length === 0 && (
           <span className="text-xs font-mono text-zinc-600">all clear</span>
         )}
+        <button
+          onClick={() => setIsCollapsed(!isCollapsed)}
+          className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
+        >
+          <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
+        </button>
       </div>
 
-      {loading && (
-        <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
-          <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-          <span className="text-xs font-mono">Loading…</span>
-        </div>
-      )}
-
-      {/* Pending first — always visible */}
-      {pending.map(log => {
-        const cfg = STATUS_CFG.pending;
-        const poId = log.metadata?.orderId;
-        return (
-          <div key={log.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-amber-500/10 bg-amber-500/5">
-            <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{vendorName(log.email_from)}</span>
-                {poId && <span className="text-xs font-mono text-blue-400 shrink-0">→ PO {poId}</span>}
-                <span className="text-[10px] font-mono text-zinc-600 shrink-0 ml-auto">{timeAgo(log.created_at)}</span>
-              </div>
-              <div className="text-xs text-amber-300/70 truncate mt-0.5">{log.action_taken}</div>
+      {!isCollapsed && (
+        <>
+          {loading && (
+            <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
+              <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
+              <span className="text-xs font-mono">Loading…</span>
             </div>
-          </div>
-        );
-      })}
+          )}
 
-      {/* Recent matched / forwarded — capped scroll */}
-      {rest.length > 0 && (
-        <div className="max-h-[160px] overflow-y-auto">
-          {rest.slice(0, 15).map(log => {
-            const status = classify(log);
-            const cfg = STATUS_CFG[status];
+          {/* Pending first — always visible */}
+          {pending.map(log => {
+            const cfg = STATUS_CFG.pending;
             const poId = log.metadata?.orderId;
-            if (status === "junk") return null;
             return (
-              <div key={log.id} className="flex items-center gap-2.5 px-4 py-1.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
-                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
-                <span className="text-xs font-mono text-zinc-300 truncate flex-1">{vendorName(log.email_from)}</span>
-                {poId && <span className="text-[10px] font-mono text-blue-400/60 shrink-0">PO {poId}</span>}
-                <span className={`text-[10px] font-mono font-semibold shrink-0 ${cfg.text}`}>{cfg.label}</span>
-                <span className="text-[10px] font-mono text-zinc-700 shrink-0 w-6 text-right">{timeAgo(log.created_at)}</span>
+              <div key={log.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-amber-500/10 bg-amber-500/5">
+                <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{vendorName(log.email_from)}</span>
+                    {poId && <span className="text-xs font-mono text-blue-400 shrink-0">→ PO {poId}</span>}
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0 ml-auto">{timeAgo(log.created_at)}</span>
+                  </div>
+                  <div className="text-xs text-amber-300/70 truncate mt-0.5">{log.action_taken}</div>
+                </div>
               </div>
             );
           })}
-        </div>
+
+          {/* Recent matched / forwarded — capped scroll */}
+          {rest.length > 0 && (
+            <div className="max-h-[160px] overflow-y-auto">
+              {rest.slice(0, 15).map(log => {
+                const status = classify(log);
+                const cfg = STATUS_CFG[status];
+                const poId = log.metadata?.orderId;
+                if (status === "junk") return null;
+                return (
+                  <div key={log.id} className="flex items-center gap-2.5 px-4 py-1.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
+                    <span className="text-xs font-mono text-zinc-300 truncate flex-1">{vendorName(log.email_from)}</span>
+                    {poId && <span className="text-[10px] font-mono text-blue-400/60 shrink-0">PO {poId}</span>}
+                    <span className={`text-[10px] font-mono font-semibold shrink-0 ${cfg.text}`}>{cfg.label}</span>
+                    <span className="text-[10px] font-mono text-zinc-700 shrink-0 w-6 text-right">{timeAgo(log.created_at)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

@@ -18,6 +18,10 @@ export const CALENDAR_IDS = {
     MFG: 'manufacturing@buildasoil.com'
 };
 
+// Will's purchasing pipeline calendar — owned by Will's account so writes always succeed
+export const PURCHASING_CALENDAR_ID =
+    'c_0bb49beb30aa38cadf6d2272a41e1628ff3cefe9c369b16e987e368b93acdd55@group.calendar.google.com';
+
 export interface CalendarEvent {
     id: string;
     title: string;
@@ -89,6 +93,94 @@ export class CalendarClient {
         } catch (err: any) {
             console.error(`❌ Failed to fetch events for calendar ${calendarId}:`, err.message);
             throw err;
+        }
+    }
+
+    /**
+     * Append a note to an existing calendar event's description.
+     * Best-effort — silently swallows errors so a write failure never blocks
+     * the Telegram notification that always fires first.
+     */
+    async appendToEventDescription(
+        calendarId: string,
+        eventId: string,
+        note: string
+    ): Promise<void> {
+        await this.init();
+        try {
+            const existing = await this.calendar!.events.get({ calendarId, eventId });
+            const currentDesc = existing.data.description || '';
+            const separator = currentDesc ? '\n' : '';
+            await this.calendar!.events.patch({
+                calendarId,
+                eventId,
+                requestBody: { description: `${currentDesc}${separator}${note}` },
+            });
+            console.log(`📅 Appended calendar note to event ${eventId}`);
+        } catch (err: any) {
+            console.warn(`⚠️ [Calendar] Could not update event ${eventId}: ${err.message}`);
+        }
+    }
+
+    /**
+     * Create a new all-day event on a calendar.
+     * Returns the new event's ID.
+     * Throws on error — caller should handle.
+     */
+    async createEvent(
+        calendarId: string,
+        event: { title: string; description: string; date: string }
+    ): Promise<string> {
+        await this.init();
+        // Google Calendar all-day events: end.date must be the NEXT day (exclusive)
+        const startDate = new Date(event.date);
+        const endDate = new Date(startDate);
+        endDate.setUTCDate(endDate.getUTCDate() + 1);
+        const endDateStr = endDate.toISOString().split('T')[0];
+
+        const res = await this.calendar!.events.insert({
+            calendarId,
+            requestBody: {
+                summary: event.title,
+                description: event.description,
+                start: { date: event.date },
+                end: { date: endDateStr },
+            },
+        });
+        return res.data.id!;
+    }
+
+    /**
+     * Delete a calendar event. Best-effort — silently swallows errors.
+     */
+    async deleteEvent(calendarId: string, eventId: string): Promise<void> {
+        await this.init();
+        try {
+            await this.calendar!.events.delete({ calendarId, eventId });
+        } catch (err: any) {
+            console.warn(`⚠️ [Calendar] Could not delete event ${eventId}: ${err.message}`);
+        }
+    }
+
+    /**
+     * Update an existing event's title and description in place.
+     * Best-effort — silently swallows errors.
+     */
+    async updateEventTitleAndDescription(
+        calendarId: string,
+        eventId: string,
+        title: string,
+        description: string
+    ): Promise<void> {
+        await this.init();
+        try {
+            await this.calendar!.events.patch({
+                calendarId,
+                eventId,
+                requestBody: { summary: title, description },
+            });
+        } catch (err: any) {
+            console.warn(`⚠️ [Calendar] Could not update event ${eventId}: ${err.message}`);
         }
     }
 

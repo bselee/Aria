@@ -15,7 +15,7 @@ export function SortablePanel({ id, children, className }: { id: string; childre
     };
 
     return (
-        <div ref={setNodeRef} style={style} className={`group relative flex flex-col min-h-[100px] resize-y overflow-hidden bg-[#0c0c0e] border border-zinc-800/80 rounded-lg shadow-sm ${className || "shrink-0"}`}>
+        <div ref={setNodeRef} style={style} className={`group relative flex flex-col min-h-0 overflow-hidden bg-[#0c0c0e] border border-zinc-800/80 rounded-lg shadow-sm ${className || "shrink-0"}`}>
             {/* Drag handle */}
             <div
                 {...attributes}

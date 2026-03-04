@@ -17,6 +17,8 @@ export interface ParsedBuild {
     originalEvent: string;
     confidence: number;
     designation: 'SOIL' | 'MFG';
+    eventId: string | null;      // Google Calendar event ID for description write-back
+    calendarId: string | null;   // e.g. 'manufacturing@buildasoil.com'
 }
 
 const BuildPlanSchema = z.object({
@@ -95,6 +97,13 @@ Extract the structured build plan from the following Calendar events:
 ${eventTextList}
 `;
 
+        // Build a lookup so we can re-attach Google Calendar event IDs post-LLM.
+        // The LLM outputs `originalEvent` (verbatim event title), so we key by
+        // "startDate::title" to find the source CalendarEvent after parsing.
+        const eventLookup = new Map(
+            events.map(e => [`${e.startDate}::${e.title}`, e])
+        );
+
         try {
             const result = await unifiedObjectGeneration({
                 system: RECOGNIZED_SKUS_CONTEXT,
@@ -105,7 +114,16 @@ ${eventTextList}
             });
 
             console.log(`🤖 Parsed ${result.builds.length} production builds, ignored ${result.ignoredEvents.length} generic events.`);
-            return result.builds;
+
+            // Attach event IDs for calendar write-back (not done by LLM — we match ourselves)
+            return result.builds.map(build => {
+                const source = eventLookup.get(`${build.buildDate}::${build.originalEvent}`);
+                return {
+                    ...build,
+                    eventId: source?.id ?? null,
+                    calendarId: source?.calendarId ?? null,
+                };
+            });
 
         } catch (error: any) {
             console.error('❌ Failed to parse calendar events:', error.message);

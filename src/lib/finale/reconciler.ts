@@ -60,11 +60,22 @@ export function storePendingApproval(result: ReconciliationResult, client: Final
     });
 
     // Auto-expire after 24h
-    setTimeout(() => {
+    setTimeout(async () => {
         const entry = pendingApprovals.get(id);
         if (entry && entry.status === "pending") {
             entry.status = "expired";
             pendingApprovals.delete(id);
+            // Fix 5: Notify Will so he knows the window closed and nothing was applied.
+            // Prevents him from tapping a stale Telegram approval button expecting action.
+            try {
+                const { Telegraf } = await import("telegraf");
+                const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+                const r = entry.result;
+                await alertBot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID!,
+                    `⏰ Reconciliation approval expired (24h)\nPO: \`${r.orderId}\` | Vendor: ${r.vendorName}\nInvoice: #${r.invoiceNumber} — $${r.totalDollarImpact?.toFixed(2) ?? "?"} impact\nChanges NOT applied. Re-process invoice or update PO manually.`
+                );
+            } catch { /* non-blocking */ }
         }
     }, 24 * 60 * 60 * 1000);
 
@@ -116,13 +127,10 @@ export async function approvePendingReconciliation(id: string): Promise<{
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
-                action_taken: `Approved via Telegram: ${applyResult.applied.length} applied, ${applyResult.errors.length} errors`,
+                action_taken: `Approved via Telegram: ${applyResult.applied.length} applied, ${applyResult.skipped.length} skipped, ${applyResult.errors.length} errors`,
                 metadata: {
-                    invoiceNumber: entry.result.invoiceNumber,
-                    orderId: entry.result.orderId,
+                    ...buildAuditMetadata(entry.result, applyResult, "telegram"),
                     approvalId: id,
-                    applied: applyResult.applied,
-                    errors: applyResult.errors,
                 },
             });
 
@@ -139,7 +147,34 @@ export async function approvePendingReconciliation(id: string): Promise<{
         }
     } catch (logErr: any) {
         console.warn(`⚠️ Failed to log approval to activity log: ${logErr.message}`);
+        // Fix 2: Alert Will — Finale was already updated but the audit log write failed.
+        // Without this log entry, checkDuplicateReconciliation() will find nothing on the
+        // next invoice poll and may attempt to reconcile the same invoice again.
+        try {
+            const { Telegraf } = await import("telegraf");
+            const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+            await alertBot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID!,
+                `🚨 AUDIT LOG FAILURE — approval for PO \`${entry.result.orderId}\` was applied to Finale but NOT logged to Supabase.\n⚠️ Risk of double-reconciliation on next invoice poll.\nManually verify PO in Finale and mark invoice as processed.`
+            );
+        } catch { /* non-blocking */ }
     }
+
+    // Pinecone: remember this approval outcome (non-blocking)
+    setImmediate(async () => {
+        try {
+            const { remember } = await import("../intelligence/memory");
+            const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+            await remember({
+                category: "decision",
+                content: `PO ${entry.result.orderId} reconciliation approved by Will. ${applyResult.applied.length} changes applied, ${applyResult.errors.length} errors. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact: $${entry.result.totalDollarImpact.toFixed(2)}.`,
+                tags: ["reconciliation", "approved", entry.result.orderId, vendorSlug],
+                source: "email",
+                relatedTo: entry.result.vendorName,
+                priority: "normal",
+            });
+        } catch { /* non-blocking — never fail the approval flow */ }
+    });
 
     return {
         success: true,
@@ -178,7 +213,34 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         }
     } catch (logErr: any) {
         console.warn(`⚠️ Failed to log rejection to activity log: ${logErr.message}`);
+        // Fix 8: Alert Will — rejection was actioned but the audit log write failed.
+        // Without this log entry, checkDuplicateReconciliation() will find nothing on the
+        // next invoice poll and may attempt to reconcile the same invoice again.
+        try {
+            const { Telegraf } = await import("telegraf");
+            const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+            await alertBot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID!,
+                `🚨 AUDIT LOG FAILURE — rejection for PO \`${entry.result.orderId}\` was actioned but NOT logged to Supabase.\n⚠️ Risk of duplicate reconciliation attempt on next invoice poll.\nNo Finale changes were made, but manually verify the invoice is not re-processed.`
+            );
+        } catch { /* non-blocking */ }
     }
+
+    // Pinecone: remember this rejection for future context (non-blocking)
+    setImmediate(async () => {
+        try {
+            const { remember } = await import("../intelligence/memory");
+            const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+            await remember({
+                category: "decision",
+                content: `PO ${entry.result.orderId} reconciliation REJECTED by Will. No changes applied. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact would have been: $${entry.result.totalDollarImpact.toFixed(2)}.`,
+                tags: ["reconciliation", "rejected", entry.result.orderId, vendorSlug],
+                source: "email",
+                relatedTo: entry.result.vendorName,
+                priority: "high",
+            });
+        } catch { /* non-blocking */ }
+    });
 
     return `❌ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
 }
@@ -408,6 +470,26 @@ export async function reconcileInvoiceToPO(
         };
     }
 
+    // ── Guard 0.5: Empty PO line items ─────────────────────────────────────────
+    // Fix 6: A PO with 0 line items is a template, data issue, or wrong PO.
+    // Silently returning no_change would mark the invoice as processed with nothing done.
+    // Surface it as needs_approval so Will sees it and can investigate.
+    if (!poSummary.items || poSummary.items.length === 0) {
+        return {
+            orderId,
+            invoiceNumber: invoice.invoiceNumber,
+            vendorName: invoice.vendorName,
+            priceChanges: [],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "needs_approval",
+            summary: `⚠️ PO ${orderId} has no line items in Finale — possible data issue or template PO. Invoice not reconciled.`,
+            totalDollarImpact: 0,
+            autoApplicable: false,
+            warnings: ["PO has 0 line items in Finale — possible data issue or template PO. Manual review required."],
+        };
+    }
+
     // ── Guard 1: Vendor correlation ────────────────────────────────────────────
     // Verify the invoice vendor plausibly matches this PO's supplier.
     // Falls back to PO# reference and SKU overlap when names diverge.
@@ -434,7 +516,9 @@ export async function reconcileInvoiceToPO(
             vendorNote: vendorCorrelation.note,
         };
     } else if (vendorCorrelation.confidence !== "high") {
-        // Medium confidence — proceed but surface the mismatch in the summary
+        // Medium confidence — proceed but surface the mismatch in the summary.
+        // Dollar-impact escalation for medium confidence is applied after totalDollarImpact
+        // is calculated (see step 5.5 below).
         warnings.push(vendorCorrelation.note);
         vendorNote = vendorCorrelation.note;
     }
@@ -460,6 +544,33 @@ export async function reconcileInvoiceToPO(
             if (pc.verdict === "auto_approve") {
                 pc.verdict = "needs_approval";
                 pc.reason += ` | Total PO impact $${totalDollarImpact.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} cap`;
+            }
+        }
+        // Fix 1: Also escalate fee changes — freight/tariff/tax must not auto-apply
+        // when the total PO impact is high, even if each fee delta is individually small.
+        for (const fc of feeChanges) {
+            if (fc.verdict === "auto_approve") {
+                fc.verdict = "needs_approval";
+                fc.reason += " | Total PO impact exceeds $500 threshold — manual approval required";
+            }
+        }
+    }
+
+    // 5.5 Fix 3: Medium vendor confidence + non-trivial dollar impact → require approval.
+    // Vendor was matched via brand-word or PO# signal (not Jaccard ≥ 0.5), meaning there
+    // is real risk of a name-variant mismatch. If the dollar impact is material (≥$100),
+    // don't silently auto-apply — surface it for Will to confirm.
+    if (vendorCorrelation.confidence !== "high" && totalDollarImpact >= 100) {
+        for (const pc of priceChanges) {
+            if (pc.verdict === "auto_approve") {
+                pc.verdict = "needs_approval";
+                pc.reason += " | Medium vendor confidence — manual confirmation required";
+            }
+        }
+        for (const fc of feeChanges) {
+            if (fc.verdict === "auto_approve") {
+                fc.verdict = "needs_approval";
+                fc.reason += " | Medium vendor confidence — manual confirmation required";
             }
         }
     }
@@ -511,8 +622,13 @@ export async function reconcileInvoiceToPO(
  * "BuildASoil Organics" vs "BuildASoil Organics LLC" → ~0.67
  */
 function wordOverlapSimilarity(a: string, b: string): number {
-    const normalize = (s: string) =>
-        s.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
+    // Fix 7: Collapse dotted initials before stripping punctuation so that
+    // "A.B.C. Corp" tokenizes as ["abc", "corp"] not ["a", "b", "c", "corp"],
+    // giving correct Jaccard overlap against "ABC Corp".
+    const normalize = (s: string) => {
+        const collapsed = s.replace(/\b([A-Za-z])\.([A-Za-z]\.)+/g, (m) => m.replace(/\./g, ""));
+        return collapsed.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
+    };
 
     const wordsA = new Set(normalize(a));
     const wordsB = new Set(normalize(b));
@@ -548,6 +664,33 @@ function validateVendorCorrelation(
             pass: true,
             confidence: "high",
             note: `Vendor matched: "${invoice.vendorName}" ↔ "${poSummary.supplier}" (${(similarity * 100).toFixed(0)}% word overlap)`,
+        };
+    }
+
+    // Signal 1b: Brand word match — any significant shared word (>4 chars) is a brand indicator.
+    // Catches "Riceland Foods, Inc." ↔ "Riceland USA" where Jaccard is only 0.25
+    // but the distinctive brand name "Riceland" is shared.
+    // Fix 4: Blocklist common generic words that appear across unrelated vendors and
+    // would otherwise produce false-positive medium-confidence matches.
+    const GENERIC_WORDS = new Set([
+        "united", "national", "international", "supply", "supplies",
+        "organics", "organic", "company", "corporation", "industries",
+        "holdings", "products", "services", "group", "trading",
+        "enterprise", "enterprises", "solutions", "global", "systems",
+    ]);
+    // Fix 7: Also collapse dotted initials here for consistent tokenization.
+    const normalize = (s: string) => {
+        const collapsed = s.replace(/\b([A-Za-z])\.([A-Za-z]\.)+/g, (m) => m.replace(/\./g, ""));
+        return collapsed.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
+    };
+    const wordsA = normalize(invoice.vendorName);
+    const wordsB = new Set(normalize(poSummary.supplier));
+    const sharedBrandWord = wordsA.find(w => w.length > 4 && wordsB.has(w) && !GENERIC_WORDS.has(w));
+    if (sharedBrandWord) {
+        return {
+            pass: true,
+            confidence: "medium",
+            note: `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed via shared brand word "${sharedBrandWord}".`,
         };
     }
 
@@ -601,10 +744,26 @@ function reconcileLineItems(
     po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>
 ): PriceChange[] {
     const changes: PriceChange[] = [];
+    const matchedPoProductIds = new Set<string>(); // prevent double-matching the same PO product
 
     for (const invLine of invoice.lineItems) {
+        // Skip adjustment/credit lines — these have $0 unit price or 0 qty and are
+        // invoice metadata (e.g., "Pts Pr Adj", freight credits), not product lines.
+        if (invLine.unitPrice === 0 || invLine.qty === 0) {
+            console.log(`     [reconciler] Skipping adjustment line: "${invLine.description}" (qty=${invLine.qty}, unitPrice=${invLine.unitPrice})`);
+            continue;
+        }
+
         // Try to match by SKU first, then by fuzzy description
         const poLine = findMatchingPOLine({ ...invLine, sku: invLine.sku ?? undefined }, po.items);
+
+        // Skip if this PO product was already matched by a previous invoice line.
+        // This prevents split description lines (OCR artifact) from double-matching the same product.
+        if (poLine && matchedPoProductIds.has(poLine.productId)) {
+            console.log(`     [reconciler] Skipping duplicate match: invoice line "${invLine.description}" already matched to ${poLine.productId}`);
+            continue;
+        }
+        if (poLine) matchedPoProductIds.add(poLine.productId);
 
         if (!poLine) {
             // Invoice has a line item not found in PO — info only, don't block
@@ -822,10 +981,58 @@ function reconcileFees(
                 amount: invoiceAmount,
                 description: mapping.label,
                 existingAmount,
-                isNew: existingAmount === 0,
+                isNew: !existingFee,
                 verdict,
                 reason,
             });
+        }
+    }
+
+    // Derived freight fallback: if no explicit freight was extracted but
+    // invoice.total > product subtotal, the gap is likely freight/shipping.
+    // Catches invoices where the freight label ("Alan to BAS", "Frt Chg", etc.)
+    // isn't recognized as a standard freight keyword by the LLM extractor.
+    //
+    // Use computed line-item subtotal when invoice.subtotal is 0 (OCR missed it).
+    // Filter to non-adjustment lines (unitPrice > 0 AND qty > 0).
+    const hasExplicitFreight = (invoice.freight ?? 0) > 0;
+    if (!hasExplicitFreight && invoice.total > 0) {
+        const computedSubtotal = invoice.lineItems
+            .filter(li => (li.unitPrice ?? 0) > 0 && (li.qty ?? 0) > 0)
+            .reduce((sum, li) => sum + (li.qty ?? 0) * (li.unitPrice ?? 0), 0);
+        const productSubtotal = computedSubtotal > 0 ? computedSubtotal
+            : (invoice.subtotal > 0 ? invoice.subtotal : 0);
+
+        if (productSubtotal > 0) {
+            const knownCharges = (invoice.tax ?? 0) + (invoice.tariff ?? 0) +
+                (invoice.labor ?? 0) + (invoice.fuelSurcharge ?? 0);
+            const discountOffset = Math.abs(invoice.discount ?? 0);
+            const derivedFreight = invoice.total - productSubtotal - knownCharges + discountOffset;
+
+            if (derivedFreight > 1) {
+                const existingFee = po.adjustments.find(adj => {
+                    const d = adj.description.toLowerCase();
+                    return d.includes("freight") || d.includes("shipping") || d.includes("frt");
+                });
+                const existingAmount = existingFee?.amount || 0;
+
+                if (Math.abs(derivedFreight - existingAmount) > 0.01) {
+                    const feeDelta = Math.abs(derivedFreight - existingAmount);
+                    const verdict: "auto_approve" | "needs_approval" =
+                        feeDelta > RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS
+                            ? "needs_approval"
+                            : "auto_approve";
+                    changes.push({
+                        feeType: "FREIGHT",
+                        amount: derivedFreight,
+                        description: existingFee?.description || "Freight",
+                        existingAmount,
+                        isNew: !existingFee,
+                        verdict,
+                        reason: `Derived freight: $${invoice.total.toFixed(2)} total − $${productSubtotal.toFixed(2)} product subtotal = $${derivedFreight.toFixed(2)}`,
+                    });
+                }
+            }
         }
     }
 
@@ -912,11 +1119,16 @@ export async function applyReconciliation(
                     fc.amount,
                     fc.description
                 );
-                applied.push(`Fee: ${fc.description} $${fc.amount.toFixed(2)}`);
+                applied.push(`Fee added: ${fc.description} $${fc.amount.toFixed(2)}`);
             } else {
-                // TODO(will)[2026-03-15]: Handle fee updates (not just additions).
-                // For now we skip updating existing fees — only add new ones.
-                skipped.push(`Fee: ${fc.description} already exists ($${fc.existingAmount.toFixed(2)}), invoice has $${fc.amount.toFixed(2)}`);
+                // Update existing fee (e.g. Freight sitting at $0 → actual amount)
+                await client.updateOrderAdjustmentAmount(
+                    result.orderId,
+                    fc.feeType,
+                    fc.amount,
+                    fc.description
+                );
+                applied.push(`Fee updated: ${fc.description} $${fc.existingAmount.toFixed(2)} → $${fc.amount.toFixed(2)}`);
             }
         } catch (err: any) {
             errors.push(`Fee ${fc.description}: Failed — ${err.message}`);
@@ -1049,6 +1261,54 @@ async function saveTrackingNumbers(
     } catch (err: any) {
         console.warn(`⚠️ Failed to save tracking numbers: ${err.message}`);
     }
+}
+
+// ──────────────────────────────────────────────────
+// AUDIT METADATA
+// ──────────────────────────────────────────────────
+
+/**
+ * Build a structured audit record for ap_activity_log.metadata.
+ * Captures every price change, fee change, and invoice amount for full recall.
+ */
+export function buildAuditMetadata(
+    result: ReconciliationResult,
+    applyResult: { applied: string[]; skipped: string[]; errors: string[] },
+    trigger: "auto" | "telegram" | "manual"
+) {
+    return {
+        trigger,
+        invoiceNumber: result.invoiceNumber,
+        orderId: result.orderId,
+        vendorName: result.vendorName,
+        verdict: result.overallVerdict,
+        totalDollarImpact: result.totalDollarImpact,
+        priceChanges: result.priceChanges.map(pc => ({
+            productId: pc.productId,
+            description: pc.description,
+            from: pc.poPrice,
+            to: pc.invoicePrice,
+            pct: parseFloat((pc.percentChange * 100).toFixed(2)),
+            impact: parseFloat(pc.dollarImpact.toFixed(2)),
+            verdict: pc.verdict,
+        })),
+        feeChanges: result.feeChanges.map(fc => ({
+            type: fc.feeType,
+            description: fc.description,
+            from: fc.existingAmount,
+            to: fc.amount,
+            delta: parseFloat((fc.amount - fc.existingAmount).toFixed(2)),
+            verdict: fc.verdict,
+        })),
+        tracking: result.trackingUpdate ? {
+            trackingNumbers: result.trackingUpdate.trackingNumbers,
+            shipDate: result.trackingUpdate.shipDate,
+            carrier: result.trackingUpdate.carrierName,
+        } : null,
+        applied: applyResult.applied,
+        skipped: applyResult.skipped,
+        errors: applyResult.errors,
+    };
 }
 
 // ──────────────────────────────────────────────────

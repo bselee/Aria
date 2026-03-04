@@ -2,9 +2,7 @@ import { NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { SYSTEM_PROMPT } from '@/config/persona';
 
-// Server-side in-memory chat history for the dashboard (resets on server restart)
-const dashHistory: any[] = [];
-const MAX_HISTORY = 20;
+// Remove in-memory dashHistory. We fetch from DB for true portability.
 
 const RUNTIME_RULES = `
 
@@ -15,6 +13,7 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
 - "search the web" / "find" / "look up online" → use perplexity_search immediately
 - "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products
 - Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
+- Sales history / units sold / volume for a product → use get_sales_history
 - Vendor info → use query_vendors
 - PO status → use query_purchase_orders
 - Invoice status → use query_invoices
@@ -76,6 +75,21 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         function: {
             name: "get_purchase_history",
             description: "Get total quantity purchased for a SKU over a time period.",
+            parameters: {
+                type: "object",
+                properties: {
+                    sku: { type: "string" },
+                    days: { type: "number" }
+                },
+                required: ["sku"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_sales_history",
+            description: "Get total quantity sold (shipped) for a SKU over a time period.",
             parameters: {
                 type: "object",
                 properties: {
@@ -165,12 +179,23 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: 'OpenAI not configured' }, { status: 500 });
         }
 
-        // Log user message
+        let dbHistory: any[] = [];
+        let dbClient: any = null;
         try {
             const { createClient } = await import('@/lib/supabase');
-            const db = createClient();
-            if (db) {
-                await db.from('sys_chat_logs').insert({
+            dbClient = createClient();
+            if (dbClient) {
+                // Fetch last 20 messages for context
+                const { data } = await dbClient.from('sys_chat_logs')
+                    .select('role, content')
+                    .order('created_at', { ascending: false })
+                    .limit(20);
+                if (data) {
+                    dbHistory = data.reverse().map((r: any) => ({ role: r.role as 'user' | 'assistant', content: r.content }));
+                }
+
+                // Log user message
+                await dbClient.from('sys_chat_logs').insert({
                     source: 'telegram',
                     role: 'user',
                     content: message,
@@ -179,15 +204,14 @@ export async function POST(req: Request) {
             }
         } catch { /* non-blocking */ }
 
-        // Update history
-        dashHistory.push({ role: 'user', content: message });
-        if (dashHistory.length > MAX_HISTORY) dashHistory.splice(0, dashHistory.length - MAX_HISTORY);
+        // Actually insert the incoming message into this context run
+        dbHistory.push({ role: 'user', content: message });
 
         const response = await openai.chat.completions.create({
             model: 'gpt-4o',
             messages: [
                 { role: 'system', content: SYSTEM_PROMPT + RUNTIME_RULES },
-                ...dashHistory
+                ...dbHistory
             ],
             tools,
             tool_choice: 'auto',
@@ -226,6 +250,20 @@ export async function POST(req: Request) {
                         result = purchased.totalQty > 0
                             ? `${args.sku}: Purchased ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s) in the last ${args.days || 365} days.`
                             : `${args.sku}: No purchase/receiving records found in the last ${args.days || 365} days.`;
+                    } else if (toolCall.function.name === 'get_sales_history') {
+                        const { FinaleClient } = await import('@/lib/finale/client');
+                        const finale = new FinaleClient();
+                        const sales = await finale.getSalesQty(args.sku, args.days || 365);
+
+                        let msg = `${args.sku} Sales & Demand (Last ${args.days || 365} days):\n`;
+                        msg += `- Sold (Shipped/Completed): ${sales.totalSoldQty.toFixed(1)} units across ${sales.soldOrderCount} order(s)\n`;
+                        msg += `- Open Demand (Committed): ${sales.openDemandQty.toFixed(1)} units across ${sales.openDemandCount} order(s)\n`;
+
+                        if (sales.stockOnHand !== null || sales.stockAvailable !== null) {
+                            msg += `- Current Stock: ${sales.stockOnHand ?? '--'} on hand, ${sales.stockAvailable ?? '--'} available`;
+                        }
+
+                        result = msg;
                     } else if (toolCall.function.name === 'query_vendors') {
                         const { createClient } = await import('@/lib/supabase');
                         const db = createClient();
@@ -237,7 +275,7 @@ export async function POST(req: Request) {
                                 .limit(5);
                             result = error ? `DB error: ${error.message}` :
                                 !data?.length ? `No vendors found matching "${args.name}".` :
-                                JSON.stringify(data, null, 2);
+                                    JSON.stringify(data, null, 2);
                         }
                     } else if (toolCall.function.name === 'query_invoices') {
                         const { createClient } = await import('@/lib/supabase');
@@ -256,7 +294,7 @@ export async function POST(req: Request) {
                             const { data, error } = await q;
                             result = error ? `DB error: ${error.message}` :
                                 !data?.length ? `No invoices found.` :
-                                JSON.stringify(data, null, 2);
+                                    JSON.stringify(data, null, 2);
                         }
                     } else if (toolCall.function.name === 'query_purchase_orders') {
                         const { createClient } = await import('@/lib/supabase');
@@ -275,7 +313,7 @@ export async function POST(req: Request) {
                             const { data, error } = await q;
                             result = error ? `DB error: ${error.message}` :
                                 !data?.length ? `No purchase orders found.` :
-                                JSON.stringify(data, null, 2);
+                                    JSON.stringify(data, null, 2);
                         }
                     } else if (toolCall.function.name === 'perplexity_search') {
                         const perplexityKey = process.env.PERPLEXITY_API_KEY;
@@ -301,33 +339,26 @@ export async function POST(req: Request) {
                 toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: result });
             }
 
+            const msgForFinal = { role: msg.role, content: msg.content || '', tool_calls: msg.tool_calls };
+
             const finalRes = await openai.chat.completions.create({
                 model: 'gpt-4o',
                 messages: [
                     { role: 'system', content: SYSTEM_PROMPT },
-                    ...dashHistory,
-                    msg,
+                    ...dbHistory,
+                    msgForFinal as any,
                     ...toolResults
                 ]
             });
             reply = finalRes.choices[0].message.content || '';
-
-            dashHistory.push(msg);
-            dashHistory.push(...toolResults);
-            dashHistory.push({ role: 'assistant', content: reply });
         } else {
             reply = msg.content || '';
-            dashHistory.push({ role: 'assistant', content: reply });
         }
-
-        if (dashHistory.length > MAX_HISTORY) dashHistory.splice(0, dashHistory.length - MAX_HISTORY);
 
         // Log assistant reply
         try {
-            const { createClient } = await import('@/lib/supabase');
-            const db = createClient();
-            if (db) {
-                await db.from('sys_chat_logs').insert({
+            if (dbClient) {
+                await dbClient.from('sys_chat_logs').insert({
                     source: 'telegram',
                     role: 'assistant',
                     content: reply,

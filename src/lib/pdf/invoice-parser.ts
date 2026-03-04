@@ -2,44 +2,45 @@ import { z } from "zod";
 import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const LineItemSchema = z.object({
-    lineNumber: z.number().nullable().optional(),
+    lineNumber: z.coerce.number().nullable().optional(),
     sku: z.string().nullable().optional(),
-    description: z.string(),
-    qty: z.number(),
+    description: z.string().catch(""),
+    qty: z.coerce.number().catch(0),
     unit: z.string().nullable().optional(),   // "EA", "LB", "BAG", "PALLET"
-    unitPrice: z.number(),
-    discount: z.number().nullable().optional(),
-    total: z.number(),
+    unitPrice: z.coerce.number().catch(0),
+    discount: z.coerce.number().nullable().optional(),
+    total: z.coerce.number().catch(0),
     poLineRef: z.string().nullable().optional(),  // Reference back to PO line
 });
 
 export const InvoiceSchema = z.object({
-    documentType: z.literal("invoice"),
-    invoiceNumber: z.string(),
+    documentType: z.literal("invoice").default("invoice"),
+    // .catch() on required fields: if model returns wrong type/value, use fallback instead of throw
+    invoiceNumber: z.string().catch("UNKNOWN"),
     poNumber: z.string().nullable().optional(),
     orderNumber: z.string().nullable().optional(),
-    vendorName: z.string(),
+    vendorName: z.string().catch("UNKNOWN"),
     vendorAddress: z.string().nullable().optional(),
     vendorPhone: z.string().nullable().optional(),
     vendorEmail: z.string().nullable().optional(),
     vendorWebsite: z.string().nullable().optional(),
     billTo: z.string().nullable().optional(),
     shipTo: z.string().nullable().optional(),
-    invoiceDate: z.string(),               // YYYY-MM-DD
+    invoiceDate: z.string().catch(new Date().toISOString().split("T")[0]),  // YYYY-MM-DD
     dueDate: z.string().nullable().optional(),
     shipDate: z.string().nullable().optional(),
     paymentTerms: z.string().nullable().optional(),  // "Net 30", "2/10 Net 30", etc.
-    lineItems: z.array(LineItemSchema),
-    subtotal: z.number(),
-    freight: z.number().nullable().optional(),
-    fuelSurcharge: z.number().nullable().optional(),
-    tax: z.number().nullable().optional(),
-    tariff: z.number().nullable().optional(),         // Duties, tariffs, import fees
-    labor: z.number().nullable().optional(),          // Labor, handling, processing fees
-    discount: z.number().nullable().optional(),
-    total: z.number(),
-    amountPaid: z.number().nullable().optional(),
-    amountDue: z.number(),
+    lineItems: z.array(LineItemSchema).catch([]),
+    subtotal: z.coerce.number().catch(0),
+    freight: z.coerce.number().nullable().optional(),
+    fuelSurcharge: z.coerce.number().nullable().optional(),
+    tax: z.coerce.number().nullable().optional(),
+    tariff: z.coerce.number().nullable().optional(),         // Duties, tariffs, import fees
+    labor: z.coerce.number().nullable().optional(),          // Labor, handling, processing fees
+    discount: z.coerce.number().nullable().optional(),
+    total: z.coerce.number().catch(0),
+    amountPaid: z.coerce.number().nullable().optional(),
+    amountDue: z.coerce.number().catch(0),
     currency: z.string().nullable().optional(),
     trackingNumbers: z.array(z.string()).nullable().optional(),
     proNumber: z.string().nullable().optional(),  // LTL PRO number
@@ -47,7 +48,8 @@ export const InvoiceSchema = z.object({
     carrierName: z.string().nullable().optional(),
     remitTo: z.string().nullable().optional(),
     notes: z.string().nullable().optional(),
-    confidence: z.enum(["high", "medium", "low"]),
+    // Models sometimes return "HIGH"/"CERTAIN"/etc — catch maps any invalid value to "medium"
+    confidence: z.enum(["high", "medium", "low"]).catch("medium"),
 });
 
 export type InvoiceData = z.infer<typeof InvoiceSchema>;

@@ -15,7 +15,7 @@ import {
     storePendingApproval,
 } from "../finale/reconciler";
 import { unifiedObjectGeneration } from "./llm";
-import { storePendingDropship, getAllPendingDropships } from "./dropship-store";
+import { storePendingDropship } from "./dropship-store";
 import { z } from "zod";
 
 // ──────────────────────────────────────────────────
@@ -59,32 +59,29 @@ export class APAgent {
     }
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
+        // reasoning omitted — we only need the label, dropping it saves output tokens on every call
         const schema = z.object({
             intent: z.enum(["INVOICE", "DROPSHIP_INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
-            reasoning: z.string()
         });
 
-        const prompt = `Classify this incoming email from our Accounts Payable inbox.
+        const prompt = `Classify this AP inbox email. Reply with the single intent label only.
 From: ${from}
 Subject: ${subject}
 Snippet: ${snippet}
 
-CATEGORIES:
-INVOICE - Vendor submitting a bill for goods we ordered via a standard purchase order (warehouse stock, bulk orders).
-DROPSHIP_INVOICE - Vendor billing us for a DROPSHIP order shipped directly to a customer. Signals: "dropship", "ship to customer", a customer address on the invoice, or order type is clearly a customer fulfillment. No Finale PO reconciliation needed — just forward to bill.com.
-STATEMENT - Vendor sending an account statement, aging summary, or reconciliation.
-ADVERTISEMENT - Marketing, promotional spam, newsletters, or sales pitches.
-HUMAN_INTERACTION - Payment questions, order issues, or generic emails that a human must read and reply to.
-
-Classify carefully based on the sender, subject and text snippet.`;
+INVOICE - Standard vendor bill for PO-based stock.
+DROPSHIP_INVOICE - Bill for goods shipped directly to our customer (no Finale PO).
+STATEMENT - Account statement or aging summary.
+ADVERTISEMENT - Marketing, spam, or newsletter.
+HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
 
         try {
             const res = await unifiedObjectGeneration({
-                system: "You are an AP Routing Engine sorting a corporate inbox.",
+                system: "AP routing engine. Return the intent label only.",
                 prompt,
                 schema,
                 schemaName: "EmailIntent"
-            }) as { intent: string, reasoning: string };
+            }) as { intent: string };
 
             return res.intent;
         } catch (err) {
@@ -141,7 +138,26 @@ Classify carefully based on the sender, subject and text snippet.`;
             const statementsLabelId = await this.getOrCreateLabel(gmail, "Statements");
 
             for (const m of messages) {
-                const msg = await gmail.users.messages.get({ userId: "me", id: m.id! });
+                let msg: any;
+                try {
+                    msg = await gmail.users.messages.get({ userId: "me", id: m.id! });
+                } catch (fetchErr: any) {
+                    const isQuota = fetchErr.code === 429 ||
+                        String(fetchErr.message).toLowerCase().includes("quota") ||
+                        String(fetchErr.message).toLowerCase().includes("ratelimit");
+                    if (isQuota) {
+                        console.warn("   ⚠️ Gmail API rate limit hit — stopping batch early.");
+                        try {
+                            await this.bot.telegram.sendMessage(
+                                process.env.TELEGRAM_CHAT_ID || "",
+                                `⚠️ Gmail API rate limit hit — AP inbox poll interrupted. Some emails may not have been processed. Will retry on next cycle.`
+                            );
+                        } catch { /* swallow */ }
+                        break;
+                    }
+                    console.error(`   ❌ Failed to fetch message ${m.id}:`, fetchErr.message);
+                    continue;
+                }
                 const payload = msg.data.payload;
                 const headers = payload?.headers || [];
 
@@ -211,6 +227,22 @@ Classify carefully based on the sender, subject and text snippet.`;
 
                 for (const part of pdfParts) {
                     if (part.body?.attachmentId) {
+                        // Idempotency check — skip if this Gmail message was already processed
+                        // Prevents double-forwarding to Bill.com on crash + re-poll scenarios
+                        if (supabase) {
+                            const { data: existing } = await supabase
+                                .from("documents")
+                                .select("id")
+                                .eq("gmail_message_id", m.id!)
+                                .limit(1)
+                                .single();
+                            if (existing) {
+                                console.log(`   ⏭️ Skipping already-processed message ${m.id} (${part.filename})`);
+                                processedAnyPDF = true; // treat as processed so we mark read + label
+                                continue;
+                            }
+                        }
+
                         console.log(`     Downloading ${part.filename}`);
 
                         const attachment = await gmail.users.messages.attachments.get({
@@ -225,13 +257,42 @@ Classify carefully based on the sender, subject and text snippet.`;
 
                             // 1. Forward strictly to buildasoilap@bill.com IMMEDIATELY
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
-                            await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+                            const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+                            if (!forwarded) {
+                                // Critical: Bill.com never received the invoice — alert Will immediately
+                                try {
+                                    await this.bot.telegram.sendMessage(
+                                        process.env.TELEGRAM_CHAT_ID || "",
+                                        `🚨 *BILL\.COM FORWARD FAILED*\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\.com\. Please forward manually\.`,
+                                        { parse_mode: "MarkdownV2" }
+                                    );
+                                } catch { /* swallow — can't alert about the alert failure */ }
+                            }
 
                             // 2. Process Database & Extraction matching in the background
                             // We do this non-blocking so it doesn't hold up the pipeline if it fails
                             const buffer = Buffer.from(base64Data, "base64");
-                            this.processInvoiceBuffer(buffer, part.filename!, subject, from, supabase, isDropship).catch(err => {
-                                console.error(`     ❌ Background matching failed for ${part.filename!}:`, err);
+                            const capturedFilename = part.filename!;
+                            const capturedMessageId = m.id!;
+                            this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, isDropship, capturedMessageId).catch(async (err) => {
+                                console.error(`     ❌ Background processing failed for ${capturedFilename}:`, err);
+                                try {
+                                    await this.bot.telegram.sendMessage(
+                                        process.env.TELEGRAM_CHAT_ID || "",
+                                        `⚠️ *Invoice processing failed — manual review needed*\nFile: \`${capturedFilename}\`\nFrom: ${from}\nSubject: _${subject.substring(0, 80)}_\n\nError: ${err.message}\n\nForwarded to Bill\.com ${forwarded ? "✓" : "✗"} \| Finale reconciliation ✗`,
+                                        { parse_mode: "MarkdownV2" }
+                                    );
+                                } catch { /* swallow */ }
+                                // Best-effort Supabase log for the background failure
+                                try {
+                                    await supabase?.from("ap_activity_log").insert({
+                                        email_from: from,
+                                        email_subject: subject,
+                                        intent: "PROCESSING_ERROR",
+                                        action_taken: `Background processing failed: ${err.message}`,
+                                        metadata: { filename: capturedFilename, error: err.message, billComForwarded: forwarded },
+                                    });
+                                } catch { /* swallow */ }
                             });
                         }
                     }
@@ -266,7 +327,7 @@ Classify carefully based on the sender, subject and text snippet.`;
         }
     }
 
-    private async forwardToBillCom(gmail: any, originalSubject: string, filename: string, base64Data: string) {
+    public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, base64Data: string): Promise<boolean> {
         console.log(`     -> Forwarding ${filename} to buildasoilap@bill.com`);
         const boundary = "b_aria_forwarded_bill_" + Math.random().toString(36).substring(2);
         const mimeMessage = [
@@ -296,16 +357,19 @@ Classify carefully based on the sender, subject and text snippet.`;
                     raw: Buffer.from(mimeMessage).toString("base64url")
                 }
             });
+            return true;
         } catch (err: any) {
             console.error("     ❌ Failed to forward to bill.com:", err.message);
+            return false;
         }
     }
 
-    private async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, isDropship = false) {
+    public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, isDropship = false, messageId?: string) {
         try {
             // 1. Extract + parse
             const extracted = await extractPDF(buffer);
             const invoiceData: InvoiceData = await parseInvoice(extracted.rawText);
+
 
             // 1b. Low-confidence guard — garbled PDF, skip reconciliation entirely
             if (invoiceData.confidence === "low") {
@@ -319,16 +383,109 @@ Classify carefully based on the sender, subject and text snippet.`;
                 return;
             }
 
+            // 1c. Zero-line-item guard — possible OCR failure on scanned/corrupted PDF
+            if (!invoiceData.lineItems || invoiceData.lineItems.length === 0) {
+                const warnMsg = `⚠️ *Invoice parsed with 0 line items — possible OCR failure*\nVendor: ${invoiceData.vendorName}\nInvoice: #${invoiceData.invoiceNumber}\nFile: \`${filename}\`\nForwarded to Bill.com. Finale reconciliation skipped — please review manually.`;
+                try { await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch {}
+                await this.logActivity(supabase, from, subject, "PROCESSING_ERROR",
+                    `Invoice parsed with 0 line items — possible OCR failure (${filename})`,
+                    { invoiceNumber: invoiceData.invoiceNumber, vendorName: invoiceData.vendorName, filename }
+                );
+                return;
+            }
+
             // 2. Find matching PO — Finale direct, no Supabase middle layer
             // If invoice has a PO# printed on it, use it. Otherwise query Finale by
             // vendor name + invoice date to find the most plausible open PO.
             let finalePONumber: string | null = invoiceData.poNumber || null;
             let matchSource = "PO# on invoice";
+            let forceApproval = false;
+
+            // Subject-line PO is stored as a last-resort fallback only.
+            // Vendor invoice references (e.g., "B123402") are often THEIR internal PO,
+            // not BuildASoil's Finale PO. Only use it if no other candidates resolve.
+            const subjectPoMatch = subject.match(/\bPO\s*#?\s*([A-Za-z]?\d{5,})/i);
+            const subjectPoFallback = subjectPoMatch ? subjectPoMatch[1] : null;
+            if (subjectPoFallback && !finalePONumber) {
+                finalePONumber = subjectPoFallback;
+                matchSource = "PO# from email subject (no OCR PO found) — REQUIRES APPROVAL";
+                forceApproval = true; // Subject-line PO is unverified — require human confirmation
+            }
+
+            // If invoice printed multiple PO numbers (e.g., "B7732 B123402"), resolve
+            // to the first token that exists in Finale.
+            // Also try Finale's B(NNNN) parenthesized format — vendors often omit parens
+            // on their invoices (e.g., "B123402" → Finale ID "B(123402)").
+            // Single FinaleClient reused across both PO-resolution phases below
+            const probeClient = new FinaleClient();
+
+            if (finalePONumber) {
+                const tokens = finalePONumber.includes(" ")
+                    ? finalePONumber.split(/\s+/).filter(Boolean)
+                    : [finalePONumber];
+                const candidates: string[] = [];
+                for (const t of tokens) {
+                    candidates.push(t);
+                    // Try Finale's parenthesized format: "B123402" → "B(123402)"
+                    const withParens = t.replace(/^([A-Za-z]+)(\d+)$/, "$1($2)");
+                    if (withParens !== t) candidates.push(withParens);
+                    // Try just the numeric part and parens-only variant
+                    const digitsOnly = t.replace(/^[A-Za-z]+/, "");
+                    if (digitsOnly && digitsOnly !== t) {
+                        candidates.push(digitsOnly);
+                        candidates.push(`(${digitsOnly})`);
+                        // OCR commonly transposes adjacent digit pairs. Add all single-swap variants.
+                        for (let i = 0; i < digitsOnly.length - 1; i++) {
+                            const arr = digitsOnly.split("");
+                            [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+                            const swapped = arr.join("");
+                            if (swapped !== digitsOnly) candidates.push(swapped);
+                        }
+                    }
+                }
+                if (candidates.length > 1) {
+                    // Pass 1: collect all valid candidates
+                    const validCandidates: string[] = [];
+                    for (const candidate of candidates) {
+                        try {
+                            await probeClient.getOrderDetails(candidate);
+                            validCandidates.push(candidate);
+                        } catch {
+                            // not found — try next
+                        }
+                    }
+
+                    if (validCandidates.length === 1) {
+                        console.log(`     → Resolved PO "${finalePONumber}" to: ${validCandidates[0]}`);
+                        finalePONumber = validCandidates[0];
+                    } else if (validCandidates.length > 1) {
+                        // Multiple valid POs — disambiguate by vendor name similarity
+                        console.log(`     → Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
+                        let bestCandidate = validCandidates[0];
+                        let bestScore = -1;
+                        const invoiceVendorWords = (invoiceData.vendorName || "")
+                            .toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                        for (const candidate of validCandidates) {
+                            try {
+                                const summary = await probeClient.getOrderSummary(candidate);
+                                if (!summary) continue;
+                                const supplierLower = summary.supplier.toLowerCase();
+                                const score = invoiceVendorWords.filter(w => supplierLower.includes(w)).length;
+                                console.log(`     ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
+                                if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+                            } catch {
+                                /* leave current best */
+                            }
+                        }
+                        console.log(`     → Best vendor match: PO ${bestCandidate}`);
+                        finalePONumber = bestCandidate;
+                    }
+                }
+            }
 
             if (!finalePONumber && !isDropship) {
                 try {
-                    const finaleClient = new FinaleClient();
-                    const candidates = await finaleClient.findPOByVendorAndDate(
+                    const candidates = await probeClient.findPOByVendorAndDate(
                         invoiceData.vendorName,
                         invoiceData.invoiceDate,
                         30 // ±30-day window
@@ -365,7 +522,8 @@ Classify carefully based on the sender, subject and text snippet.`;
                 email_subject: subject,
                 raw_text: extracted.rawText,
                 action_required: !matched,
-                action_summary: `Invoice from ${from} for $${invoiceData.total}`
+                action_summary: `Invoice from ${from} for $${invoiceData.total}`,
+                gmail_message_id: messageId || null,
             }).select("id").single();
 
             await supabase.from("invoices").upsert({
@@ -388,6 +546,51 @@ Classify carefully based on the sender, subject and text snippet.`;
                 raw_data: invoiceData
             }, { onConflict: "invoice_number" });
 
+            // 3b. Log Bill.com forward event with full invoice detail
+            // The actual forward happened upstream in processUnreadInvoices before this buffer was queued.
+            // We log here because vendor/invoice data isn't available until after parse.
+            await this.logActivity(supabase, from, subject, "BILL_FORWARD",
+                `Invoice #${invoiceData.invoiceNumber} forwarded to Bill.com — $${invoiceData.total.toLocaleString()} from ${invoiceData.vendorName}`,
+                {
+                    invoiceNumber: invoiceData.invoiceNumber,
+                    vendorName: invoiceData.vendorName,
+                    total: invoiceData.total,
+                    poNumber: finalePONumber || null,
+                    matched,
+                    isDropship,
+                    filename,
+                }
+            );
+
+            // 3c. Pinecone vendor pattern memory — non-blocking, best-effort
+            setImmediate(async () => {
+                try {
+                    const { remember } = await import("./memory");
+                    const { storeVendorPattern } = await import("./vendor-memory");
+                    const vendorSlug = invoiceData.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+                    await remember({
+                        category: "vendor_pattern",
+                        content: `${invoiceData.vendorName} invoice: #${invoiceData.invoiceNumber}, $${invoiceData.total}. PO: ${finalePONumber || "no match"} via ${matchSource}. Confidence: ${invoiceData.confidence}. ${invoiceData.lineItems?.length || 0} line items. Terms: ${invoiceData.paymentTerms || "unknown"}.`,
+                        tags: ["ap_invoice", vendorSlug, matched ? "matched" : "unmatched"],
+                        source: "email",
+                        relatedTo: invoiceData.vendorName,
+                        priority: matched ? "normal" : "high",
+                    });
+                    await storeVendorPattern({
+                        vendorName: invoiceData.vendorName,
+                        documentType: "INVOICE",
+                        pattern: `Sends invoices via email. PO# format on invoice: ${invoiceData.poNumber || "not printed"}. ${invoiceData.lineItems?.length || 0} line items. Payment terms: ${invoiceData.paymentTerms || "unknown"}.`,
+                        handlingRule: isDropship
+                            ? "Dropship vendor: forward to bill.com, skip Finale reconciliation"
+                            : `Forward to bill.com and reconcile against Finale PO. Match via: ${matchSource}`,
+                        learnedFrom: "email_attachment",
+                        confidence: invoiceData.confidence === "high" ? 0.9 : invoiceData.confidence === "medium" ? 0.7 : 0.5,
+                    });
+                } catch (memErr: any) {
+                    console.warn("⚠️ AP vendor memory write failed:", memErr.message);
+                }
+            });
+
             // 4. Notify Will — unmatched gets action buttons
             let pendingDropshipId: string | null = null;
             if (!matched) {
@@ -401,17 +604,38 @@ Classify carefully based on the sender, subject and text snippet.`;
                     base64Pdf: buffer.toString("base64"),
                 });
             }
-            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, subject, from, isDropship, pendingDropshipId);
+            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, from, isDropship, pendingDropshipId);
 
             // 5. Reconcile against Finale
             // Reconciler fetches the live PO, runs all guardrails, and either
             // auto-applies safe changes or sends a Telegram approval request.
+            // forceApproval=true when PO was matched via vendor+date fallback (not exact PO#),
+            // or via subject-line extraction — both require Will's confirmation before any Finale writes.
+            forceApproval = forceApproval || matchSource.includes("REQUIRES APPROVAL");
             if (!isDropship && matched && finalePONumber) {
-                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase);
+                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval);
             }
 
         } catch (err: any) {
             console.error(`   Error processing buffer for ${filename}:`, err.message);
+            // Alert Will — something in the pipeline failed after bill.com forward
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            try {
+                await this.bot.telegram.sendMessage(
+                    chatId,
+                    `⚠️ *Invoice processing error — manual review needed*\nFile: \`${filename}\`\nFrom: ${from}\n\nError: ${err.message}\n\nBill\.com forward already sent\. Finale reconciliation did NOT run\.`,
+                    { parse_mode: "MarkdownV2" }
+                );
+            } catch { /* swallow */ }
+            try {
+                await supabase?.from("ap_activity_log").insert({
+                    email_from: from,
+                    email_subject: subject,
+                    intent: "PROCESSING_ERROR",
+                    action_taken: `processInvoiceBuffer failed: ${err.message}`,
+                    metadata: { filename, error: err.message, stage: "processInvoiceBuffer" },
+                });
+            } catch { /* swallow */ }
         }
     }
 
@@ -420,7 +644,6 @@ Classify carefully based on the sender, subject and text snippet.`;
         matched: boolean,
         poNumber: string | null,
         matchSource: string,
-        subject: string,
         from: string,
         isDropship = false,
         pendingDropshipId: string | null = null
@@ -445,16 +668,32 @@ Classify carefully based on the sender, subject and text snippet.`;
 
         const chatId = process.env.TELEGRAM_CHAT_ID || "";
         if (!matched && pendingDropshipId) {
-            this.bot.telegram.sendMessage(chatId, msg, {
-                parse_mode: "Markdown",
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback("📦 Dropship — Forward to bill.com", `dropship_fwd_${pendingDropshipId}`)],
-                    [
-                        Markup.button.callback("📋 This Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
-                        Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
-                    ],
-                ])
-            });
+            if (isDropship) {
+                // Forward already happened automatically — don't show the forward button again.
+                // Only offer "has a PO" (in case it should have been reconciled) and Skip.
+                msg += `\n✅ _Auto-forwarded to Bill\.com_`;
+                this.bot.telegram.sendMessage(chatId, msg, {
+                    parse_mode: "Markdown",
+                    ...Markup.inlineKeyboard([
+                        [
+                            Markup.button.callback("📋 Actually Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
+                            Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
+                        ],
+                    ])
+                });
+            } else {
+                // Unmatched regular invoice — show all three options
+                this.bot.telegram.sendMessage(chatId, msg, {
+                    parse_mode: "Markdown",
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback("📦 Dropship — Forward to bill.com", `dropship_fwd_${pendingDropshipId}`)],
+                        [
+                            Markup.button.callback("📋 This Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
+                            Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
+                        ],
+                    ])
+                });
+            }
         } else {
             this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
         }
@@ -486,13 +725,55 @@ Classify carefully based on the sender, subject and text snippet.`;
     private async reconcileAndUpdate(
         invoice: InvoiceData,
         orderId: string,
-        supabase: any
+        supabase: any,
+        forceApproval = false   // true when PO matched via vendor+date fallback — require human sign-off
     ): Promise<void> {
         try {
             const finaleClient = new FinaleClient();
             const result: ReconciliationResult = await reconcileInvoiceToPO(invoice, orderId, finaleClient);
 
+            // If PO was matched via vendor+date fallback (not exact PO# on invoice), upgrade
+            // any auto_approve verdict to needs_approval so Will confirms before we write Finale.
+            if (forceApproval && result.overallVerdict === "auto_approve") {
+                result.overallVerdict = "needs_approval";
+                result.autoApplicable = false;
+                for (const pc of result.priceChanges) {
+                    if (pc.verdict === "auto_approve") {
+                        pc.verdict = "needs_approval";
+                        pc.reason += " | PO matched via vendor+date fallback — manual confirmation required";
+                    }
+                }
+                console.log(`   ⚠️ Force-upgraded to needs_approval (fallback PO match)`);
+            }
+
             console.log(`   📊 Reconciliation: ${result.overallVerdict} | Impact: $${result.totalDollarImpact.toFixed(2)}`);
+
+            // Helper to fire Pinecone memory after any reconciliation outcome (non-blocking)
+            const writeReconciliationMemory = (verdict: string) => {
+                setImmediate(async () => {
+                    try {
+                        const { remember } = await import("./memory");
+                        const vendorSlug = result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+                        const priceChangeSummary = result.priceChanges
+                            .filter(pc => pc.verdict !== "no_change" && pc.verdict !== "no_match")
+                            .map(pc => `${pc.productId}: $${pc.poPrice}→$${pc.invoicePrice} (${(pc.percentChange * 100).toFixed(1)}%)`)
+                            .join(", ") || "none";
+                        const feeSummary = result.feeChanges
+                            .map(fc => `${fc.feeType}: $${fc.amount}`)
+                            .join(", ") || "none";
+                        await remember({
+                            category: "decision",
+                            content: `PO ${orderId} reconciled (${verdict}): ${result.vendorName} invoice #${result.invoiceNumber}. $${result.totalDollarImpact.toFixed(2)} impact. Price changes: ${priceChangeSummary}. Fees: ${feeSummary}. Forced approval: ${forceApproval}.`,
+                            tags: ["reconciliation", verdict, orderId, vendorSlug],
+                            source: "email",
+                            relatedTo: result.vendorName,
+                            priority: verdict === "rejected" || verdict === "needs_approval" ? "high" : "normal",
+                        });
+                    } catch (memErr: any) {
+                        console.warn("⚠️ Reconciliation memory write failed:", memErr.message);
+                    }
+                });
+            };
 
             if (result.overallVerdict === "auto_approve") {
                 // Safe to auto-apply
@@ -508,20 +789,24 @@ Classify carefully based on the sender, subject and text snippet.`;
 
                     await this.logReconciliation(supabase, result, applyResult);
                 }
+                writeReconciliationMemory("auto_approve");
                 await this.sendReconciliationNotification(result);
 
             } else if (result.overallVerdict === "needs_approval") {
                 // Store for Telegram bot approval and send inline keyboard
                 const approvalId = storePendingApproval(result, finaleClient);
+                writeReconciliationMemory("needs_approval");
                 await this.sendApprovalRequest(result, approvalId);
 
             } else if (result.overallVerdict === "rejected") {
                 // Magnitude error — alert but do NOT apply
+                writeReconciliationMemory("rejected");
                 await this.sendReconciliationNotification(result);
 
             } else if (result.overallVerdict === "duplicate") {
                 // Already reconciled — alert Will but do NOT re-apply
                 console.log(`   🔁 Duplicate: Invoice #${result.invoiceNumber} already reconciled against PO ${orderId}`);
+                writeReconciliationMemory("duplicate");
                 await this.sendReconciliationNotification(result);
 
             } else {
@@ -535,6 +820,23 @@ Classify carefully based on the sender, subject and text snippet.`;
 
         } catch (err: any) {
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
+            // Alert Will — Finale API failure means PO was not updated. Human must check manually.
+            try {
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || "",
+                    `🚨 *Reconciliation failed — manual action needed*\nPO: \`${orderId}\`\nVendor: ${invoice.vendorName}\nInvoice: ${invoice.invoiceNumber}\n\nError: ${err.message}\n\nBill\.com forward ✓ \| Finale PO update ✗\nPlease review PO ${orderId} manually\.`,
+                    { parse_mode: "MarkdownV2" }
+                );
+            } catch { /* swallow */ }
+            try {
+                await this.logActivity(
+                    supabase, invoice.vendorName,
+                    `Invoice ${invoice.invoiceNumber} → PO ${orderId}`,
+                    "RECONCILIATION_ERROR",
+                    `Reconciliation failed: ${err.message}`,
+                    { invoiceNumber: invoice.invoiceNumber, orderId, error: err.message }
+                );
+            } catch { /* swallow */ }
         }
     }
 
@@ -682,9 +984,15 @@ Classify carefully based on the sender, subject and text snippet.`;
         const supabase = createClient();
         if (!supabase) return;
 
-        // Get today's activity (UTC day)
-        const todayStart = new Date();
-        todayStart.setUTCHours(0, 0, 0, 0);
+        // Get today's activity from midnight Denver time (America/Denver, UTC-6/7).
+        // Using UTC midnight would miss emails processed in the early Denver morning hours.
+        // Detect MDT vs MST dynamically so DST transitions don't break the query window.
+        const _now = new Date();
+        const _denverDate = _now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+        const _tzName = new Intl.DateTimeFormat("en-US", { timeZone: "America/Denver", timeZoneName: "short" })
+            .formatToParts(_now).find(p => p.type === "timeZoneName")?.value ?? "MST";
+        const _offset = _tzName === "MDT" ? "-06:00" : "-07:00";
+        const todayStart = new Date(`${_denverDate}T00:00:00${_offset}`);
 
         const { data: logs, error } = await supabase
             .from("ap_activity_log")

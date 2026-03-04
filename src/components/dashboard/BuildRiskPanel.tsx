@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase";
-import { TrendingDown } from "lucide-react";
+import { TrendingDown, ChevronDown } from "lucide-react";
 
 type ComponentRisk = {
   componentSku: string;
@@ -42,6 +42,14 @@ function timeAgo(iso: string): string {
 export default function BuildRiskPanel() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Collapse state — persisted to localStorage
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  useEffect(() => {
+    const s = localStorage.getItem("aria-dash-risk-collapsed");
+    if (s === "true") setIsCollapsed(true);
+  }, []);
+  useEffect(() => { localStorage.setItem("aria-dash-risk-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
   // Resizable height — persisted to localStorage
   const [bodyHeight, setBodyHeight] = useState(160);
@@ -129,10 +137,16 @@ export default function BuildRiskPanel() {
         {!loading && !snapshot && (
           <span className="text-xs text-zinc-700">run /buildrisk</span>
         )}
+        <button
+          onClick={() => setIsCollapsed(!isCollapsed)}
+          className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
+        >
+          <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
+        </button>
       </div>
 
       {/* Component rows */}
-      {atRisk.length > 0 && (
+      {!isCollapsed && atRisk.length > 0 && (
         <>
           <div
             className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full border-t border-zinc-800/60"

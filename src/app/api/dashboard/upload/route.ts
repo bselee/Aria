@@ -54,12 +54,36 @@ export async function POST(req: Request) {
                 max_tokens: 500
             });
             reply = res.choices[0].message.content || 'Could not analyze image.';
+
+            // Log both sides to sys_chat_logs so they appear in the chat feed
+            try {
+                const { createClient } = await import('@/lib/supabase');
+                const db = createClient();
+                if (db) {
+                    await db.from('sys_chat_logs').insert([
+                        {
+                            source: 'telegram',
+                            role: 'user',
+                            content: `[Uploaded file: ${filename}]`,
+                            metadata: { from: 'dashboard', fileType: mimeType }
+                        },
+                        {
+                            source: 'telegram',
+                            role: 'assistant',
+                            content: reply,
+                            metadata: { from: 'dashboard' }
+                        }
+                    ]);
+                }
+            } catch { /* non-blocking */ }
         }
 
         // ── PDF files → extract + classify + parse ─────────────────────
         else if (mimeType === 'application/pdf' || mimeType === 'application/x-pdf') {
             const { extractPDF } = await import('@/lib/pdf/extractor');
             const extracted = await extractPDF(buffer);
+
+            let actionMetadata: any = null;
 
             if (!extracted?.rawText?.trim()) {
                 reply = `Uploaded ${filename} — but couldn't extract text. The PDF may be scanned or protected.`;
@@ -73,7 +97,7 @@ export async function POST(req: Request) {
                     const lines = invoice.lineItems?.length
                         ? invoice.lineItems.slice(0, 8).map(li =>
                             `  • ${li.sku || li.description} — qty ${li.qty} @ $${li.unitPrice} = $${li.total}`
-                          ).join('\n')
+                        ).join('\n')
                         : '  (no line items parsed)';
                     reply = [
                         `📄 **Invoice detected** — ${filename}`,
@@ -84,6 +108,14 @@ export async function POST(req: Request) {
                         `Due: ${invoice.dueDate || 'unknown'}`,
                         invoice.lineItems?.length ? `\nLine items (${invoice.lineItems.length}):\n${lines}` : '',
                     ].filter(Boolean).join('\n');
+
+                    actionMetadata = {
+                        action_type: 'invoice_ready',
+                        filename,
+                        bufferBase64: buffer.toString('base64'),
+                        vendorName: invoice.vendorName,
+                        total: invoice.total
+                    };
 
                 } else if (classification.type === 'PURCHASE_ORDER') {
                     const { parsePurchaseOrder } = await import('@/lib/pdf/po-parser');
@@ -137,6 +169,30 @@ export async function POST(req: Request) {
                     }
                 }
             }
+
+            // Log both sides to sys_chat_logs so they appear in the chat feed
+            try {
+                const { createClient } = await import('@/lib/supabase');
+                const db = createClient();
+                if (db) {
+                    await db.from('sys_chat_logs').insert([
+                        {
+                            source: 'telegram',
+                            role: 'user',
+                            content: `[Uploaded file: ${filename}]`,
+                            metadata: { from: 'dashboard', fileType: mimeType }
+                        },
+                        {
+                            source: 'telegram',
+                            role: 'assistant',
+                            content: reply,
+                            metadata: { from: 'dashboard', ...actionMetadata }
+                        }
+                    ]);
+                }
+            } catch { /* non-blocking */ }
+
+            return NextResponse.json({ reply, actionMetadata });
         }
 
         // ── Spreadsheets ─────────────────────────────────────────────
@@ -169,29 +225,29 @@ export async function POST(req: Request) {
                 max_tokens: 600
             });
             reply = `📊 **${filename}**\n\n${res.choices[0].message.content || ''}`;
-        }
 
-        // Log both sides to sys_chat_logs so they appear in the chat feed
-        try {
-            const { createClient } = await import('@/lib/supabase');
-            const db = createClient();
-            if (db) {
-                await db.from('sys_chat_logs').insert([
-                    {
-                        source: 'telegram',
-                        role: 'user',
-                        content: `[Uploaded file: ${filename}]`,
-                        metadata: { from: 'dashboard', fileType: mimeType }
-                    },
-                    {
-                        source: 'telegram',
-                        role: 'assistant',
-                        content: reply,
-                        metadata: { from: 'dashboard' }
-                    }
-                ]);
-            }
-        } catch { /* non-blocking */ }
+            // Log both sides to sys_chat_logs so they appear in the chat feed
+            try {
+                const { createClient } = await import('@/lib/supabase');
+                const db = createClient();
+                if (db) {
+                    await db.from('sys_chat_logs').insert([
+                        {
+                            source: 'telegram',
+                            role: 'user',
+                            content: `[Uploaded file: ${filename}]`,
+                            metadata: { from: 'dashboard', fileType: mimeType }
+                        },
+                        {
+                            source: 'telegram',
+                            role: 'assistant',
+                            content: reply,
+                            metadata: { from: 'dashboard' }
+                        }
+                    ]);
+                }
+            } catch { /* non-blocking */ }
+        }
 
         return NextResponse.json({ reply });
     } catch (err: any) {

@@ -27,10 +27,12 @@ import { FinaleClient } from '../finale/client';
 export interface ComponentDemand {
     componentSku: string;
     totalRequiredQty: number;
+    onHand: number | null;           // Current stock on hand from Finale
     onOrder: number | null;
     stockoutDays: number | null;
     demandQuantity: number | null;
     consumptionQuantity: number | null;
+    leadTimeDays: number | null;     // Supplier lead time in days (from Finale product)
     incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>;
     usedIn: Set<string>;
     designations: Set<string>;
@@ -46,10 +48,18 @@ export interface UnrecognizedSku {
     suggestions: string[];  // Fuzzy match suggestions from Finale
 }
 
+export interface FGVelocity {
+    dailyRate: number;               // Units sold per day (90-day rolling avg)
+    stockOnHand: number | null;      // Current finished-good stock on shelf
+    daysOfFinishedStock: number | null;  // stockOnHand / dailyRate
+    openDemandQty: number;           // Committed sales orders not yet shipped
+}
+
 export interface BuildRiskReport {
     builds: ParsedBuild[];
     components: Map<string, ComponentDemand>;
     unrecognizedSkus: UnrecognizedSku[];
+    fgVelocity: Map<string, FGVelocity>;  // Sales velocity per finished-good SKU
     criticalCount: number;
     warningCount: number;
     watchCount: number;
@@ -217,10 +227,12 @@ export async function runBuildRiskAnalysis(
                     componentDemandTracker.set(sku, {
                         componentSku: sku,
                         totalRequiredQty: 0,
+                        onHand: null,
                         onOrder: null,
                         stockoutDays: null,
                         demandQuantity: null,
                         consumptionQuantity: null,
+                        leadTimeDays: null,
                         incomingPOs: [],
                         usedIn: new Set(),
                         designations: new Set(),
@@ -264,10 +276,12 @@ export async function runBuildRiskAnalysis(
 
     const tasks = demandEntries.map(demand => async () => {
         const profile = await finale.getComponentStockProfile(demand.componentSku);
+        demand.onHand = profile.onHand;
         demand.onOrder = profile.onOrder;
         demand.stockoutDays = profile.stockoutDays;
         demand.demandQuantity = profile.demandQuantity;
         demand.consumptionQuantity = profile.consumptionQuantity;
+        demand.leadTimeDays = profile.leadTimeDays;
         demand.incomingPOs = profile.incomingPOs;
         demand.hasFinaleData = profile.hasFinaleData;
         demand.riskLevel = classifyRisk(demand);
@@ -287,13 +301,27 @@ export async function runBuildRiskAnalysis(
     const okCount = demandEntries.length - criticalCount - warningCount - watchCount;
     log(`✅ 🔴 ${criticalCount} critical · 🟡 ${warningCount} warning · 👀 ${watchCount} watch · ✅ ${okCount} OK`);
 
-    const slackMessage = formatSlackReport(builds, componentDemandTracker, unrecognizedSkus, daysOut);
-    const telegramMessage = formatTelegramReport(builds, componentDemandTracker, unrecognizedSkus, daysOut);
+    // Step 5: Sales velocity for finished goods — how fast are we selling each SKU?
+    // Enriches the report with dailyRate + finished stock runway, no impact on component risk.
+    log(`📈 Fetching sales velocity for ${aggregatedBuilds.size} finished goods...`);
+    const fgSkus = Array.from(aggregatedBuilds.keys());
+    let fgVelocity: Map<string, FGVelocity> = new Map();
+    try {
+        fgVelocity = await finale.getFinishedGoodVelocity(fgSkus, 90);
+        const withData = Array.from(fgVelocity.values()).filter(v => v.dailyRate > 0).length;
+        log(`✅ Sales velocity fetched for ${withData}/${fgSkus.length} SKUs.`);
+    } catch (err: any) {
+        log(`⚠️ Sales velocity fetch failed (non-fatal): ${err.message}`);
+    }
+
+    const slackMessage = formatSlackReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
+    const telegramMessage = formatTelegramReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
 
     return {
         builds,
         components: componentDemandTracker,
         unrecognizedSkus,
+        fgVelocity,
         criticalCount,
         warningCount,
         watchCount,
@@ -314,6 +342,7 @@ function formatSlackReport(
     components: Map<string, ComponentDemand>,
     unrecognizedSkus: UnrecognizedSku[],
     daysOut: number,
+    fgVelocity: Map<string, FGVelocity> = new Map(),
 ): string {
     const criticals = Array.from(components.values()).filter(c => c.riskLevel === 'CRITICAL');
     const warnings = Array.from(components.values()).filter(c => c.riskLevel === 'WARNING');
@@ -327,6 +356,23 @@ function formatSlackReport(
     msg += `_${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Denver' })}_\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `*${totalBuilds}* builds · *${uniqueFGs}* finished goods · *${components.size}* raw components\n\n`;
+
+    // Sales velocity section — show FG SKUs that have meaningful sell-through data
+    const velocityRows = Array.from(fgVelocity.entries())
+        .filter(([, v]) => v.dailyRate > 0)
+        .sort((a, b) => (b[1].dailyRate) - (a[1].dailyRate));
+    if (velocityRows.length > 0) {
+        msg += `*📈 Finished Good Sell-Through (90-Day Avg)*\n`;
+        for (const [sku, v] of velocityRows) {
+            const rate = v.dailyRate < 1 ? v.dailyRate.toFixed(1) : Math.round(v.dailyRate).toString();
+            const stockNote = v.daysOfFinishedStock !== null
+                ? ` · ~${v.daysOfFinishedStock}d on shelf`
+                : '';
+            const demandNote = v.openDemandQty > 0 ? ` · ${v.openDemandQty.toLocaleString()} open demand` : '';
+            msg += `• \`${sku}\`: ${rate}/day${stockNote}${demandNote}\n`;
+        }
+        msg += `\n`;
+    }
 
     if (criticals.length > 0) {
         msg += `*[CRITICAL] STOCKOUT ≤ 14 DAYS, NO PO (${criticals.length})*\n\n`;
@@ -392,6 +438,7 @@ function formatTelegramReport(
     components: Map<string, ComponentDemand>,
     unrecognizedSkus: UnrecognizedSku[],
     daysOut: number,
+    fgVelocity: Map<string, FGVelocity> = new Map(),
 ): string {
     const criticals = Array.from(components.values()).filter(c => c.riskLevel === 'CRITICAL');
     const warnings = Array.from(components.values()).filter(c => c.riskLevel === 'WARNING');
@@ -404,6 +451,21 @@ function formatTelegramReport(
     let msg = `*${daysOut}-Day SOIL/MFG Build Calendar*\n`;
     msg += `_${new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Denver' })}_\n`;
     msg += `Builds: ${totalBuilds}  |  FGs: ${uniqueFGs}  |  Components: ${components.size}\n\n`;
+
+    // Sales velocity — compact one-liner per selling SKU
+    const velocityRows = Array.from(fgVelocity.entries())
+        .filter(([, v]) => v.dailyRate > 0)
+        .sort((a, b) => b[1].dailyRate - a[1].dailyRate);
+    if (velocityRows.length > 0) {
+        msg += `*📈 Sell-Through (90d avg)*\n`;
+        for (const [sku, v] of velocityRows.slice(0, 8)) {
+            const rate = v.dailyRate < 1 ? v.dailyRate.toFixed(1) : Math.round(v.dailyRate).toString();
+            const shelf = v.daysOfFinishedStock !== null ? ` · ${v.daysOfFinishedStock}d stock` : '';
+            msg += `• \`${sku}\`: ${rate}/day${shelf}\n`;
+        }
+        if (velocityRows.length > 8) msg += `_...+${velocityRows.length - 8} more_\n`;
+        msg += `\n`;
+    }
 
     if (criticals.length > 0) {
         msg += `*[CRITICAL] (${criticals.length}):*\n`;
@@ -464,6 +526,7 @@ function emptyReport(daysOut: number): BuildRiskReport {
         builds: [],
         components: new Map(),
         unrecognizedSkus: [],
+        fgVelocity: new Map(),
         criticalCount: 0,
         warningCount: 0,
         watchCount: 0,

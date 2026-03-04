@@ -18,6 +18,7 @@ import { createClient } from "../supabase";
 import axios from "axios";
 import Fuse from "fuse.js";
 import { FinaleClient } from "../finale/client";
+import { BoxAgent } from "../agents/box-agent";
 
 // ──────────────────────────────────────────────────
 // SCHEMAS
@@ -86,6 +87,7 @@ export class SlackWatchdog {
     private finaleClient: FinaleClient;
     private processedRequests: Set<string> = new Set(); // In-memory dedup for request alerts
     private ownerUserId: string | null = null; // Will's Slack ID — we skip his messages
+    private boxAgent: BoxAgent;
 
     constructor(pollIntervalSeconds: number = 60) {
         const token = process.env.SLACK_ACCESS_TOKEN;
@@ -102,6 +104,7 @@ export class SlackWatchdog {
         // detected Slack requests with real-time stock data. If Finale keys
         // are missing, we still work — just without stock context.
         this.finaleClient = new FinaleClient();
+        this.boxAgent = new BoxAgent();
 
         // DECISION(2026-02-26): Dedup is now in-memory (Set) instead of Pinecone.
         // The old approach wrote 1024-dim dummy vectors to PINECONE_INDEX (email-embeddings),
@@ -427,6 +430,13 @@ export class SlackWatchdog {
                 else contexts.push(`  *${sku}*: not found in Finale`);
             }
             if (contexts.length > 0) finaleContext = contexts.join('\n');
+        }
+
+        // Apply Box Agent overrides if it's explicitly talking about boxes
+        // The BoxAgent will parse physical count claims and generate a deep reality-check report
+        const boxReport = await this.boxAgent.analyzeSlackMessage(text);
+        if (boxReport) {
+            finaleContext = boxReport; // Replace the standard one-liners with the deep Box Report
         }
 
         // Step 6b: In-memory dedup to prevent repeat alerts for the same request

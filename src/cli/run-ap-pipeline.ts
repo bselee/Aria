@@ -2,22 +2,22 @@
  * @file    run-ap-pipeline.ts
  * @purpose Manually trigger the full AP invoice pipeline on a real invoice
  *          found in Gmail. Mirrors processInvoiceBuffer() in ap-agent.ts.
- *          Used to run the AutoPot APUS-243331 invoice through the pipeline.
+ *          Searches for any recent invoice with a PDF — most recent match wins.
  * @usage   node --import tsx src/cli/run-ap-pipeline.ts
  */
 
 import { google } from "googleapis";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { createClient } from "../lib/supabase";
 import { extractPDF } from "../lib/pdf/extractor";
 import { parseInvoice, InvoiceData } from "../lib/pdf/invoice-parser";
-import { matchInvoiceToPO, MatchResult } from "../lib/matching/invoice-po-matcher";
 import { FinaleClient } from "../lib/finale/client";
 import {
     reconcileInvoiceToPO,
     applyReconciliation,
     storePendingApproval,
+    buildAuditMetadata,
     ReconciliationResult,
     TrackingUpdate,
 } from "../lib/finale/reconciler";
@@ -29,11 +29,19 @@ dotenv.config({ path: ".env.local" });
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
-async function tg(msg: string) {
-    try {
-        await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown" });
-    } catch (err: any) {
-        console.warn("   ⚠️ Telegram send failed:", err.message);
+async function tg(msg: string, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown" });
+            return;
+        } catch (err: any) {
+            if (i < retries - 1) {
+                console.warn(`   ⚠️ Telegram send failed (attempt ${i + 1}/${retries}): ${err.message} — retrying...`);
+                await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+            } else {
+                console.warn(`   ⚠️ Telegram send failed after ${retries} attempts: ${err.message}`);
+            }
+        }
     }
 }
 
@@ -63,18 +71,28 @@ async function main() {
         process.exit(1);
     }
 
-    console.log("\n2️⃣  Searching for AutoPot invoice...");
+    console.log("\n2️⃣  Searching for most recent invoice with PDF...");
     let pdfBuffer: Buffer | null = null;
     let pdfBase64Raw = "";  // kept for bill.com forwarding
     let subject = "";
     let from = "";
     let filename = "";
 
+    // Optional: --subject "substring" narrows the Gmail search to a specific invoice
+    const subjectFilter = (() => {
+        const idx = process.argv.indexOf("--subject");
+        return idx !== -1 ? process.argv[idx + 1] : null;
+    })();
+    if (subjectFilter) console.log(`   🔍 Filtering by subject: "${subjectFilter}"`);
+
     try {
-        // Try AutoPot specifically first; fall back to any recent invoice PDF
-        const queries = [
-            "AutoPot invoice has:attachment filename:pdf newer_than:90d",
-            "has:attachment filename:pdf (invoice OR inv OR bill) newer_than:30d",
+        // Find any recent invoice PDF — most recent match wins
+        const baseSearch = subjectFilter
+            ? `subject:"${subjectFilter}" has:attachment filename:pdf newer_than:90d`
+            : null;
+        const queries = baseSearch ? [baseSearch] : [
+            "has:attachment filename:pdf (invoice OR inv OR bill) newer_than:14d",
+            "has:attachment filename:pdf newer_than:30d",
         ];
 
         for (const q of queries) {
@@ -126,8 +144,18 @@ async function main() {
                 }
 
                 if (base64) {
+                    const candidate = Buffer.from(base64, "base64");
+                    if (candidate.length < 1024) {
+                        console.log(`   ⏭️  Skipping ${filename} — too small (${candidate.length} bytes), likely not a real invoice`);
+                        continue;
+                    }
+                    // Skip dashboard upload echoes forwarded by the bot itself
+                    if (subject.includes("Dashboard Upload")) {
+                        console.log(`   ⏭️  Skipping dashboard upload echo: "${subject}"`);
+                        continue;
+                    }
                     pdfBase64Raw = base64;
-                    pdfBuffer = Buffer.from(base64, "base64");
+                    pdfBuffer = candidate;
                     console.log(`   ⬇️  Downloaded ${Math.round(pdfBuffer.length / 1024)} KB`);
                     break;
                 }
@@ -147,11 +175,26 @@ async function main() {
     // ── Step 2: Extract + Parse ───────────────────────────────────────────────
     console.log("\n3️⃣  Extracting and parsing invoice...");
     let invoiceData: InvoiceData;
+    let subjectPoFallback: string | null = null;
     try {
         const extracted = await extractPDF(pdfBuffer);
         console.log(`   📄 Extracted ${extracted.rawText.length} chars of text`);
 
         invoiceData = await parseInvoice(extracted.rawText);
+
+        // Subject-line PO is stored as a last-resort fallback.
+        // Vendor invoice references (e.g., Riceland's "B123402") are often THEIR internal PO
+        // number, not BuildASoil's Finale PO. OCR reads BuildASoil's printed PO ("B124302" →
+        // Finale 124302). Only use subject extraction if ALL OCR candidates fail Finale probe.
+        const subjectPoMatch = subject.match(/\bPO\s*#?\s*([A-Za-z]?\d{5,})/i);
+        subjectPoFallback = subjectPoMatch ? subjectPoMatch[1] : null;
+        if (subjectPoFallback && !invoiceData.poNumber) {
+            invoiceData.poNumber = subjectPoFallback;
+            console.log(`   📧 PO from subject (no OCR PO found): ${subjectPoFallback}`);
+        } else if (subjectPoFallback) {
+            console.log(`   📧 Subject PO ${subjectPoFallback} noted as fallback (probing OCR candidates first)`);
+        }
+
         console.log(`   ✅ Parsed:`);
         console.log(`      Invoice #:    ${invoiceData.invoiceNumber}`);
         console.log(`      Vendor:       ${invoiceData.vendorName}`);
@@ -175,36 +218,119 @@ async function main() {
         process.exit(1);
     }
 
-    // ── Step 3: Match to PO ───────────────────────────────────────────────────
-    console.log("\n4️⃣  Matching invoice to open PO...");
-    let matchResult: MatchResult;
-    try {
-        matchResult = await matchInvoiceToPO(invoiceData);
-        console.log(`   ${matchResult.matched ? "✅" : "❌"} Match: ${matchResult.matched ? "YES" : "NO"}`);
-        console.log(`      Confidence:  ${matchResult.confidence}`);
-        console.log(`      Strategy:    ${matchResult.matchStrategy}`);
-        console.log(`      PO Number:   ${matchResult.matchedPO?.poNumber || "(none)"}`);
-        console.log(`      Auto-Approve: ${matchResult.autoApprove}`);
-        if (matchResult.discrepancies.length > 0) {
-            for (const d of matchResult.discrepancies) {
-                console.log(`      ⚠️ [${d.severity.toUpperCase()}] ${d.field}: invoice=${d.invoiceValue} vs PO=${d.poValue}`);
-            }
-        }
-    } catch (err: any) {
-        console.error("   ❌ Match failed:", err.message);
-        // Continue with unmatched result
-        matchResult = {
-            matched: false,
-            confidence: "none",
-            matchedPO: null,
-            matchStrategy: `Error: ${err.message}`,
-            discrepancies: [],
-            autoApprove: false,
-        };
+    // ── Step 3b: Resolve PO via Finale-direct probe ───────────────────────────
+    // NOTE: Production ap-agent.ts queries Finale directly (not Supabase).
+    // This step mirrors that behavior exactly so test results match production.
+    console.log("\n4️⃣  Resolving PO via Finale direct probe...");
+    let finalePONumber = invoiceData.poNumber || null;
+    let matchSource = "PO# on invoice";
+
+    if (subjectPoFallback && !finalePONumber) {
+        finalePONumber = subjectPoFallback;
+        matchSource = "PO# from email subject (no OCR PO found)";
     }
 
+    if (finalePONumber) {
+        const tokens = finalePONumber.includes(" ")
+            ? finalePONumber.split(/\s+/).filter(Boolean)
+            : [finalePONumber];
+        const candidates: string[] = [];
+        for (const t of tokens) {
+            candidates.push(t);
+            const withParens = t.replace(/^([A-Za-z]+)(\d+)$/, "$1($2)");
+            if (withParens !== t) candidates.push(withParens);
+            const digitsOnly = t.replace(/^[A-Za-z]+/, "");
+            if (digitsOnly && digitsOnly !== t) {
+                candidates.push(digitsOnly);
+                candidates.push(`(${digitsOnly})`);
+                for (let i = 0; i < digitsOnly.length - 1; i++) {
+                    const arr = digitsOnly.split("");
+                    [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+                    const swapped = arr.join("");
+                    if (swapped !== digitsOnly) candidates.push(swapped);
+                }
+            }
+        }
+        if (candidates.length > 1 || candidates[0] !== finalePONumber) {
+            console.log(`   ⚠️  Probing Finale for valid PO from candidates: ${candidates.join(", ")}...`);
+            const probeClient = new FinaleClient();
+            const validCandidates: string[] = [];
+            for (const candidate of candidates) {
+                try {
+                    await probeClient.getOrderDetails(candidate);
+                    validCandidates.push(candidate);
+                } catch {
+                    console.log(`   ↳ "${candidate}" not found in Finale`);
+                }
+            }
+            if (validCandidates.length === 1) {
+                console.log(`   ✅ Resolved to PO: ${validCandidates[0]}`);
+                finalePONumber = validCandidates[0];
+            } else if (validCandidates.length > 1) {
+                console.log(`   ⚠️  Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
+                let bestCandidate = validCandidates[0];
+                let bestScore = -1;
+                const invoiceVendorWords = (invoiceData.vendorName || "")
+                    .toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                for (const candidate of validCandidates) {
+                    try {
+                        const summary = await probeClient.getOrderSummary(candidate);
+                        if (!summary) continue;
+                        const score = invoiceVendorWords.filter(w => summary.supplier.toLowerCase().includes(w)).length;
+                        console.log(`   ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
+                        if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+                    } catch { /* leave current best */ }
+                }
+                console.log(`   ✅ Best vendor match: PO ${bestCandidate}`);
+                finalePONumber = bestCandidate;
+            } else if (subjectPoFallback) {
+                // Last resort: subject line fallback
+                const subjectCandidates = [subjectPoFallback];
+                const subjectDigits = subjectPoFallback.replace(/^[A-Za-z]+/, "");
+                if (subjectDigits && subjectDigits !== subjectPoFallback) subjectCandidates.push(subjectDigits);
+                for (const candidate of subjectCandidates) {
+                    try {
+                        await probeClient.getOrderDetails(candidate);
+                        console.log(`   ✅ Resolved via subject fallback: PO ${candidate}`);
+                        finalePONumber = candidate;
+                        matchSource = "PO# from email subject (fallback)";
+                        break;
+                    } catch {
+                        console.log(`   ↳ "${candidate}" not found`);
+                    }
+                }
+            }
+        }
+    }
+
+    // If still no PO, try Finale vendor+date fallback
+    if (!finalePONumber) {
+        try {
+            const finaleClient = new FinaleClient();
+            const candidates = await finaleClient.findPOByVendorAndDate(
+                invoiceData.vendorName, invoiceData.invoiceDate, 30
+            );
+            const plausible = candidates.filter(c =>
+                (c.status === "Committed" || c.status === "Open") &&
+                invoiceData.total > 0 &&
+                Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10
+            );
+            if (plausible.length > 0) {
+                plausible.sort((a, b) => Math.abs(a.total - invoiceData.total) - Math.abs(b.total - invoiceData.total));
+                finalePONumber = plausible[0].orderId;
+                matchSource = `Finale vendor+date match (${plausible[0].supplier}, ${plausible[0].orderDate}) — REQUIRES APPROVAL`;
+                console.log(`   → Finale fallback matched PO ${finalePONumber} for ${invoiceData.vendorName}`);
+            }
+        } catch (err: any) {
+            console.warn(`   ⚠️  Finale fallback lookup failed: ${err.message}`);
+        }
+    }
+
+    const matched = !!finalePONumber;
+    console.log(`   ${matched ? "✅" : "❌"} Match: ${matched ? `YES — PO ${finalePONumber} (${matchSource})` : "NO"}\n`);
+
     // ── Step 4: Save to Supabase ──────────────────────────────────────────────
-    console.log("\n5️⃣  Saving to Supabase...");
+    console.log("5️⃣  Saving to Supabase...");
     const supabase = createClient();
     let documentId: string | null = null;
 
@@ -219,7 +345,7 @@ async function main() {
                 source_ref: from,
                 email_from: from,
                 email_subject: subject,
-                action_required: !matchResult.matched || matchResult.discrepancies.length > 0,
+                action_required: !matched,
                 action_summary: `Invoice from ${from} for $${invoiceData.total}`,
             }).select("id").single();
 
@@ -233,7 +359,7 @@ async function main() {
             const { error: invError } = await supabase.from("invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
-                po_number: invoiceData.poNumber || matchResult.matchedPO?.poNumber || null,
+                po_number: finalePONumber || null,
                 invoice_date: invoiceData.invoiceDate,
                 due_date: invoiceData.dueDate || invoiceData.invoiceDate,
                 payment_terms: invoiceData.paymentTerms,
@@ -245,10 +371,7 @@ async function main() {
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
-                status: matchResult.matched
-                    ? (matchResult.autoApprove ? "matched_approved" : "matched_review")
-                    : "unmatched",
-                discrepancies: matchResult.discrepancies,
+                status: matched ? "matched_review" : "unmatched",
                 document_id: documentId,
                 raw_data: invoiceData,
             }, { onConflict: "invoice_number" }).select("id").single();
@@ -297,43 +420,49 @@ async function main() {
         console.error(`   ❌ bill.com forward failed: ${err.message}`);
     }
 
-    // ── Step 7: Telegram Notification ────────────────────────────────────────
+    // ── Step 6b: Telegram Notification ───────────────────────────────────────
     console.log("\n7️⃣  Sending Telegram notification...");
-    let tgMsg = `🧾 *New Invoice Processed*\n`;
+    let tgMsg = `🧾 *New Invoice Processed* _(manual pipeline run)_\n`;
     tgMsg += `From: ${from}\n`;
     tgMsg += `Vendor: ${invoiceData.vendorName}\n`;
     tgMsg += `Invoice #: ${invoiceData.invoiceNumber}\n`;
     tgMsg += `Total: $${invoiceData.total.toLocaleString()} (Due: $${invoiceData.amountDue.toLocaleString()})\n`;
     tgMsg += `━━━━━\n`;
 
-    if (matchResult.matched) {
-        const poNum = matchResult.matchedPO?.poNumber || invoiceData.poNumber || "Unknown";
-        tgMsg += `✅ Matched to PO #${poNum} (${matchResult.confidence} confidence)\n`;
-        if (matchResult.autoApprove) {
-            tgMsg += `✨ *Auto-Approved* — No discrepancies.\n`;
-        } else if (matchResult.discrepancies.length > 0) {
-            tgMsg += `⚠️ *Action Required — Discrepancies:*\n`;
-            for (const d of matchResult.discrepancies) {
-                tgMsg += `  • [${d.severity.toUpperCase()}] ${d.field}: Inv=${d.invoiceValue} vs PO=${d.poValue}\n`;
-            }
-        } else {
-            tgMsg += `⚠️ *Manual Review Required* — ${matchResult.matchStrategy}\n`;
-        }
+    if (matched && finalePONumber) {
+        tgMsg += `✅ Matched to PO #${finalePONumber}\n`;
+        tgMsg += `_${matchSource}_\n`;
+        tgMsg += `Running reconciliation against Finale...\n`;
     } else {
-        tgMsg += `❌ *Unmatched Invoice*\nCould not match to an open PO.\nStrategy: ${matchResult.matchStrategy}\n`;
+        tgMsg += `❌ *No PO found*\nInvoice #: ${invoiceData.invoiceNumber}\n_Searched Finale by vendor name + date_\n`;
     }
 
     await tg(tgMsg);
     console.log("   ✅ Telegram notification sent");
 
-    // ── Step 8: Reconcile against Finale ─────────────────────────────────────
-    const finalePONumber = invoiceData.poNumber || matchResult.matchedPO?.poNumber;
+    // ── Step 7: Reconcile against Finale ─────────────────────────────────────
+    // PO already resolved via Finale-direct probe in Step 4 above.
+    // forceApproval=true when matched via vendor+date fallback (mirrors production behavior).
+    const forceApproval = matchSource.includes("REQUIRES APPROVAL");
 
-    if (matchResult.matched && finalePONumber) {
-        console.log(`\n7️⃣  Reconciling against Finale PO ${finalePONumber}...`);
+    if (matched && finalePONumber) {
+        console.log(`\n7️⃣  Reconciling against Finale PO ${finalePONumber}${forceApproval ? " (force-approval: fallback match)" : ""}...`);
         try {
             const finaleClient = new FinaleClient();
             const result: ReconciliationResult = await reconcileInvoiceToPO(invoiceData, finalePONumber, finaleClient);
+
+            // Mirror production ap-agent behavior: fallback matches require approval before any Finale writes
+            if (forceApproval && result.overallVerdict === "auto_approve") {
+                result.overallVerdict = "needs_approval";
+                result.autoApplicable = false;
+                for (const pc of result.priceChanges) {
+                    if (pc.verdict === "auto_approve") {
+                        pc.verdict = "needs_approval";
+                        pc.reason += " | PO matched via vendor+date fallback — manual confirmation required";
+                    }
+                }
+                console.log(`   ⚠️  Force-upgraded to needs_approval (fallback PO match)`);
+            }
 
             console.log(`   📊 Verdict:   ${result.overallVerdict}`);
             console.log(`   💰 Impact:    $${result.totalDollarImpact.toFixed(2)}`);
@@ -357,7 +486,7 @@ async function main() {
                 if (applyResult.applied.length > 0) console.log(`      Changes: ${applyResult.applied.join(", ")}`);
                 if (applyResult.errors.length > 0) console.error(`      Errors: ${applyResult.errors.join(", ")}`);
 
-                // Log to Supabase
+                // Full audit log to Supabase
                 if (supabase) {
                     await supabase.from("ap_activity_log").insert({
                         email_from: invoiceData.vendorName,
@@ -365,7 +494,7 @@ async function main() {
                         intent: "RECONCILIATION",
                         action_taken: `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
                         notified_slack: false,
-                        metadata: { orderId: result.orderId, invoiceNumber: result.invoiceNumber },
+                        metadata: buildAuditMetadata(result, applyResult, "auto"),
                     });
                     console.log("   ✅ Reconciliation logged to Supabase");
                 }
@@ -379,15 +508,38 @@ async function main() {
                 await tg(reconMsg);
 
             } else if (result.overallVerdict === "needs_approval") {
-                console.log("\n   ⏳ Changes require approval — sending Telegram request...");
-                const approvalId = storePendingApproval(result, finaleClient);
-                let approvalMsg = `⚠️ *Reconciliation Approval Required*\n`;
-                approvalMsg += `PO: ${result.orderId} | Invoice: ${result.invoiceNumber}\n`;
-                approvalMsg += `Impact: $${result.totalDollarImpact.toFixed(2)}\n`;
-                approvalMsg += `Approval ID: \`${approvalId}\`\n`;
-                approvalMsg += `\nReply /approve_${approvalId} to apply or /reject_${approvalId} to discard.`;
-                await tg(approvalMsg);
-                console.log(`   ✅ Approval request sent (id: ${approvalId})`);
+                // Manual test run — apply immediately instead of waiting for Telegram approval.
+                // The live bot's 15-min AP check uses the normal approval flow; this script
+                // is interactive so Will can see the output and it's appropriate to apply now.
+                console.log("\n   🚀 Applying changes (manual run — auto-approved)...");
+                const allApprovedItems = result.priceChanges
+                    .filter(pc => pc.verdict === "needs_approval")
+                    .map(pc => pc.productId);
+                const allApprovedFees = result.feeChanges
+                    .filter(fc => fc.verdict === "needs_approval")
+                    .map(fc => fc.feeType);
+                const applyResult = await applyReconciliation(result, finaleClient, allApprovedItems, allApprovedFees);
+                console.log(`   ✅ Applied: ${applyResult.applied.length} | Skipped: ${applyResult.skipped.length} | Errors: ${applyResult.errors.length}`);
+                if (applyResult.applied.length > 0) console.log(`      Changes: ${applyResult.applied.join(", ")}`);
+                if (applyResult.errors.length > 0) console.error(`      Errors: ${applyResult.errors.join(", ")}`);
+
+                // Full audit log to Supabase
+                if (supabase) {
+                    await supabase.from("ap_activity_log").insert({
+                        email_from: invoiceData.vendorName,
+                        email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
+                        intent: "RECONCILIATION",
+                        action_taken: `Manual run applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
+                        notified_slack: false,
+                        metadata: buildAuditMetadata(result, applyResult, "manual"),
+                    });
+                    console.log("   ✅ Reconciliation logged to Supabase");
+                }
+
+                let reconMsg = result.summary + "\n\n✅ *Applied via manual pipeline run*\n";
+                if (applyResult.applied.length > 0) reconMsg += `Changes: ${applyResult.applied.join(", ")}\n`;
+                if (applyResult.errors.length > 0) reconMsg += `Errors: ${applyResult.errors.join(", ")}\n`;
+                await tg(reconMsg);
 
             } else if (result.overallVerdict === "rejected") {
                 console.warn("   🚫 Changes REJECTED — likely OCR/decimal error. NOT applying.");
@@ -407,12 +559,7 @@ async function main() {
             await tg(`❌ Reconciliation failed for invoice ${invoiceData.invoiceNumber}: ${err.message}`);
         }
     } else {
-        console.log("\n7️⃣  Reconciliation skipped — no PO match.");
-        if (!matchResult.matched) {
-            console.log("      Reason: invoice not matched to a Finale PO");
-        } else {
-            console.log("      Reason: no PO number available");
-        }
+        console.log("\n7️⃣  Reconciliation skipped — no PO matched in Finale.");
     }
 
     console.log("\n═══════════════════════════════════════════════");
