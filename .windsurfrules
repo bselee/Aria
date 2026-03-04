@@ -1,0 +1,64 @@
+# Aria — Windsurf Rules
+
+Will's personal ops assistant for BuildASoil. Full architecture in `CLAUDE.md`.
+
+## Critical Rules
+
+1. **`src/lib/finale/client.ts` — pre-existing TS errors, DO NOT fix.**
+   Typecheck: `npx tsc --noEmit 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator"`
+
+2. **After any bot code change**: typecheck → `pm2 restart aria-bot`
+   Restart drops `pendingApprovals` (24h TTL) and `pendingDropships` (48h TTL) — ephemeral by design.
+
+3. **Two LLM paths — never mix:**
+   - `src/cli/start-bot.ts`: **OpenAI GPT-4o** tool_calls directly
+   - All other modules: `unifiedTextGeneration()` in `src/lib/intelligence/llm.ts`
+   - Dashboard chat: **Gemini 2.5 Flash** (`@ai-sdk/google`) — completely separate stack
+
+4. **Finale writes: GET → Modify → POST always**
+   Unlock `ORDER_LOCKED` POs via `actionUrlEdit` first.
+   Fee IDs: FREIGHT=10007, TAX=10008, TARIFF=10014, LABOR=10016, SHIPPING=10017
+
+5. **Slack watchdog: eyes-only.** Only 👀 reactions. Never post.
+
+6. **Direct Anthropic SDK**: use `getAnthropicClient()` from `src/lib/anthropic.ts`
+
+## AP Pipeline Summary
+Email → classify → forward to bill.com → PDF OCR (4-strategy) → Finale PO match → reconcile
+Thresholds: ≤3% auto | >3% <10× Telegram approval | ≥10× REJECT | >$500 manual
+
+## Build Risk
+Calendar → LLM parse BOMs → Finale stock check → CRITICAL/WARNING/WATCH/OK → 7:30 AM Mon-Fri
+
+## Process Management
+- `pm2 start ecosystem.config.cjs` — start both services (aria-bot, aria-slack)
+- `pm2 restart aria-bot` — restart after code changes
+- `pm2 logs` — tail logs
+- `.env.local` loaded inside each script — PM2 does NOT use env_file
+
+## Key Paths
+```
+src/cli/start-bot.ts                    # Telegram bot (primary entry)
+src/lib/intelligence/ap-agent.ts        # AP invoice processing
+src/lib/intelligence/ops-manager.ts     # Cron jobs (America/Denver)
+src/lib/intelligence/llm.ts             # Unified LLM wrapper
+src/lib/finale/client.ts                # Finale API (leave TS errors alone)
+src/lib/finale/reconciler.ts            # Reconciliation engine
+src/lib/builds/build-risk.ts            # Build risk analysis
+src/lib/pdf/                            # PDF extraction + parsing
+src/config/persona.ts                   # Aria personality/system prompt
+src/app/api/dashboard/chat/route.ts     # Gemini 2.5 Flash dashboard chat
+src/app/api/dashboard/purchasing/route.ts  # Purchasing intelligence (30-min cache)
+src/components/dashboard/PurchasingPanel.tsx  # Velocity/runway/urgency/snooze panel
+```
+
+## Finale API Efficiency Rules
+- **3 concurrent workers max** for scanning loops; **100ms pause** between SKUs
+- **Product filter** on `orderViewConnection` when querying for a specific SKU
+- **Combined GraphQL aliases** for receipts + shipments + open POs = 1 request
+- **REST-first exclusion**: check `isManufactured`/`isDropship` before GraphQL calls
+- **429 backoff**: 5s wait + single retry
+
+## Dropship Exclusions (server-side both panels)
+Autopot, Printful, Grand Master, HLG, Evergreen, AC Infinity — NEVER show in reorder/purchasing panels.
+Regex in `resolveParty()`: `/autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i`

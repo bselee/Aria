@@ -1,0 +1,84 @@
+# Aria — Cursor Rules
+
+This is Will's personal ops assistant for BuildASoil. Full architecture in `CLAUDE.md`.
+
+## Critical Rules (read these first)
+
+1. **`src/lib/finale/client.ts` has pre-existing TS errors — DO NOT fix them.**
+   - Typecheck filter: `npx tsc --noEmit 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator"`
+
+2. **After ANY code change to the bot**: typecheck → `pm2 restart aria-bot`
+   - `pm2 restart` drops `pendingApprovals` (24h) and `pendingDropships` (48h) — warn Will if approvals pending
+
+3. **Two LLM paths** — never mix them:
+   - Bot (`start-bot.ts`): **OpenAI GPT-4o** with tool_calls directly
+   - Everything else: `unifiedTextGeneration()` / `unifiedObjectGeneration()` in `src/lib/intelligence/llm.ts`
+   - Dashboard chat (`/api/dashboard/chat/route.ts`): **Gemini 2.5 Flash** — completely separate
+
+4. **Finale write pattern: GET → Modify → POST always**
+   - If `ORDER_LOCKED`: call `actionUrlEdit` first, re-fetch, then modify + POST
+   - Fee IDs: FREIGHT=10007, TAX=10008, TARIFF=10014, LABOR=10016, SHIPPING=10017
+
+5. **In-memory state is ephemeral by design** — no persistence for `pendingApprovals` or `pendingDropships`
+
+6. **Slack watchdog is eyes-only** — NEVER add posting logic. Only 👀 reactions via user token.
+
+7. **Direct Anthropic SDK**: use `getAnthropicClient()` from `src/lib/anthropic.ts` — not `new Anthropic()`
+   - Exception: `github/client.ts` and `vendors/enricher.ts` bypass this — fix them when you touch those files
+
+## Environment
+- All scripts load `.env.local` via `dotenv.config({ path: '.env.local' })` — PM2 does NOT use env_file
+- Path alias: `@/*` maps to `src/*`
+- Gmail tokens: `token.json` (default/bill.selee), `ap-token.json` (ap@buildasoil.com), `calendar-token.json`
+- Pinecone index: `gravity-memory` (1024d) — namespace `aria-memory` (ops), `vendor-memory` (vendor patterns)
+
+## AP Invoice Pipeline (brief)
+Email arrives at ap@ → classify → forward to bill.com → parse PDF (4-strategy OCR) → match to Finale PO → reconcile
+- ≤3%: auto-apply | >3% <10×: Telegram approval | ≥10×: REJECT (OCR decimal error) | >$500 impact: manual
+
+## Key Module Paths
+```
+src/cli/start-bot.ts          # Telegram bot entry + all tool definitions
+src/lib/intelligence/
+  ap-agent.ts                 # AP invoice pipeline
+  ops-manager.ts              # Cron scheduler (America/Denver)
+  llm.ts                      # unifiedTextGeneration / unifiedObjectGeneration
+  memory.ts                   # Pinecone memory (remember/recall)
+  build-parser.ts             # LLM calendar → BOM extraction
+src/lib/finale/
+  client.ts                   # Finale REST API (pre-existing TS errors — leave alone)
+  reconciler.ts               # Invoice→PO reconciliation engine
+src/lib/builds/
+  build-risk.ts               # CRITICAL/WARNING/WATCH/OK risk engine
+  reorder-engine.ts           # Reorder threshold + draft PO
+src/lib/pdf/                  # extractor, classifier, invoice-parser, po-parser, etc.
+src/lib/slack/watchdog.ts     # Eyes-only Slack monitor
+src/config/persona.ts         # Aria's personality/system prompt
+src/app/api/dashboard/purchasing/route.ts   # Purchasing intelligence (30-min cache)
+src/components/dashboard/PurchasingPanel.tsx  # Velocity/runway/urgency/snooze panel
+```
+
+## Finale API Efficiency Rules
+- Max **3 concurrent workers** for any scanning loop
+- **100ms pause** between SKU dispatches (`await new Promise(r => setTimeout(r, 100))`)
+- **Product filter** on every `orderViewConnection` for a specific SKU: `product: ["/${accountPath}/api/product/${sku}"]`
+- **Combined GraphQL** with aliases — merge receipts + shipments + open POs into 1 HTTP request (see `getProductActivity`)
+- **REST-first exclusion**: do the cheap REST/partygroup call and check `isManufactured`/`isDropship` before any GraphQL scans
+- **429 backoff**: 5s wait + single retry
+
+## Dropship Exclusion List (server-side, both panels)
+Autopot, Printful, Grand Master, HLG (Horticulture Lighting), Evergreen, AC Infinity
+Applied in `resolveParty()` via regex: `/autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i`
+These MUST NOT appear in ReorderPanel or PurchasingPanel.
+
+## Cron Schedule (America/Denver)
+- 7:30 AM Mon-Fri: build risk → Telegram + Slack #purchasing
+- 8:00 AM daily: daily summary
+- 8:01 AM Fridays: weekly summary
+- Every 15 min: AP inbox check
+- Hourly: advertisement cleanup
+- Every 30 min: PO conversation sync
+
+## Supabase Tables
+`documents`, `vendors`, `vendor_profiles`, `invoices`, `purchase_orders`, `shipments`, `ap_activity_log`,
+`build_risk_snapshots`, `build_completions`, `proactive_alerts`, `purchasing_calendar_events`, `sys_chat_logs`

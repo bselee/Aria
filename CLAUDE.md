@@ -99,6 +99,9 @@ Run `src/cli/gmail-auth.ts` with the appropriate slot to generate/refresh tokens
 | `src/lib/vendors/enricher.ts` | Web-enriches vendor records via Firecrawl (payment portals, AR emails, remit addresses) and computes vendor spend stats. Env: `FIRECRAWL_API_KEY` |
 | `src/app/api/webhooks/github/route.ts` | GitHub webhook handler: processes PDFs in new PRs, marks documents ARCHIVED when issues close |
 | `src/app/dashboard/` | Next.js command terminal UI for Will. Chat backed by Gemini 2.5 Flash — separate from the Telegram bot stack. |
+| `src/lib/finale/client.ts` → `getPurchasingIntelligence()` | Purchasing velocity engine: pages active SKUs, computes receipt/shipment velocity, runway, urgency, and natural language explanation per item. Groups by vendor. |
+| `src/app/api/dashboard/purchasing/route.ts` | GET: purchasing intelligence (30-min module cache, `?bust=1`, `?daysBack=730`) / POST: create draft PO, invalidates cache |
+| `src/components/dashboard/PurchasingPanel.tsx` | Dashboard panel: vendor tabs by urgency, per-item runway/velocity/explanation, snooze system, checkboxes, bulk Draft PO |
 
 ### AP Invoice Pipeline
 When an invoice arrives at `ap@buildasoil.com`, the AP agent does two independent things:
@@ -112,6 +115,39 @@ Reconciliation safety thresholds (defined in `reconciler.ts`, do not change with
 - **>3% but <10× magnitude** → flag for Telegram bot approval before applying
 - **≥10× magnitude shift** → REJECT outright (OCR/decimal error)
 - **Total PO impact >$500** → require manual approval regardless of per-line %
+
+### Purchasing Intelligence (`getPurchasingIntelligence()`)
+
+Aria computes purchasing velocity and urgency from raw Finale data — never trusts server-calculated `reorderQuantityToOrder` or `consumptionQuantity` values (unreliable).
+
+**Pipeline:**
+1. GraphQL-page `productViewConnection` (500/page) for Active SKUs with `consumptionQuantity > 0` OR `reorderQuantityToOrder > 0` — presence signal only, not for values
+2. REST `lookupProduct(sku)` → stock, supplier; call `resolveParty` → check `isManufactured` + `isDropship`; skip excluded vendors
+3. `getProductActivity(sku, daysBack)` — **single combined GraphQL request** with three aliased root fields: `purchasedIn` (receipt history), `soldIn` (shipment history), `committedPOs` (open POs)
+4. Compute: `purchaseVelocity = purchasedQty/daysBack`, `salesVelocity = soldQty/daysBack`, `dailyRate = max(...)`, `runwayDays = stock/dailyRate`
+5. Urgency: CRITICAL < leadTime, WARNING < leadTime+30, WATCH < leadTime+60, OK otherwise
+6. Group by vendor; sort vendors worst-first; sort items by urgency then runwayDays ASC
+
+**Dropship exclusions (server-side, both panels):**
+Regex applied in `resolveParty()`: `/autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i`
+Returns `{ groupName, isManufactured, isDropship }`. Items flagged either way are silently skipped — no downstream API calls wasted.
+
+**API efficiency rules:**
+- **3 concurrent workers** (not 5) — Finale rate limit protection
+- **100ms pause** between SKU dispatches (`await new Promise(r => setTimeout(r, 100))`)
+- **429 backoff**: 5s wait + single retry inside `getProductActivity`
+- **Product filter** on all `orderViewConnection` calls: `product: ["/${accountPath}/api/product/${sku}"]` — fetches only that SKU's orders, not all orders
+- Default window: **365 days** (`daysBack = 365`); deep-dive: 730 days via `?daysBack=730`
+
+**Snooze system (PurchasingPanel):**
+- localStorage key: `aria-dash-purchasing-snooze`
+- Vendor key: `v:${vendorPartyId}` | Item key: `productId`
+- Durations: 30d, 90d, "forever" (`{ until: number | "forever" }`)
+- `vendorEffectivelySnoozed()`: true if vendor-level snoozed OR all items individually snoozed
+- Expired entries auto-purged on mount; "X snoozed" badge with Eye toggle in header
+
+**Interfaces:** `PurchasingItem`, `PurchasingGroup` defined in `client.ts` near `ExternalReorderGroup`.
+`findCommittedPOsForProduct` is **public** (used by `getProductActivity` combined query).
 
 ### Finale Write Pattern
 All Finale PO mutations use **GET → Modify → POST**. If the PO status is `ORDER_LOCKED`, call `actionUrlEdit` first to unlock it, then re-fetch, modify, and POST. See `FinaleClient.addOrderAdjustment()` and `updateOrderItemPrice()`.
@@ -134,6 +170,50 @@ Key tables: `documents`, `vendors`, `vendor_profiles`, `invoices`, `purchase_ord
 - `Every 15 min` — AP inbox invoice check
 - `Hourly` — Advertisement cleanup
 - `Every 30 min` — PO conversation sync
+
+## Agents & Skills
+
+### Cross-Tool Availability
+Agents are propagated to all AI coding tools:
+- **Claude Code**: `.claude/agents/` (native)
+- **Cursor**: `.cursor/agents/` + `.cursorrules` (root)
+- **Windsurf**: `.windsurfrules` (root)
+- **Cline/Roo**: `.clinerules` (root) + `.roo/rules/aria-context.md`
+- **All other tools**: `.agents/agents/` + root rule files
+
+### Agents (`.claude/agents/`)
+Specialized sub-agents with deep context on specific subsystems. Claude Code invokes these automatically when working in their domain.
+
+| Agent | File | Use When |
+|-------|------|----------|
+| `ap-pipeline` | `.claude/agents/ap-pipeline.md` | Working on AP invoice processing: `ap-agent.ts`, `reconciler.ts`, `extractor.ts`, `invoice-parser.ts`, `invoice-po-matcher.ts` |
+| `build-risk` | `.claude/agents/build-risk.md` | Working on build risk analysis: `build-risk.ts`, `build-parser.ts`, `calendar.ts` |
+| `reorder` | `.claude/agents/reorder.md` | Working on reorder engine: `reorder-engine.ts`, `lead-time-service.ts`, `ReorderPanel.tsx`, `client.ts` reorder methods |
+| `finale-ops` | `.claude/agents/finale-ops.md` | All Finale API operations: queries, mutations, GET→Modify→POST pattern, fee types |
+| `slack-watchdog` | `.claude/agents/slack-watchdog.md` | Working on `watchdog.ts` or `start-slack.ts` |
+| `pdf-pipeline` | `.claude/agents/pdf-pipeline.md` | Working on PDF extraction/parsing: `extractor.ts`, `classifier.ts`, `invoice-parser.ts`, all parsers |
+| `ops-manager` | `.claude/agents/ops-manager.md` | Working on cron jobs, scheduled summaries, `ops-manager.ts` |
+| `bot-tools` | `.claude/agents/bot-tools.md` | Adding/modifying Telegram bot tools in `start-bot.ts`, persona changes, dashboard chat |
+| `vendor-intelligence` | `.claude/agents/vendor-intelligence.md` | Working on vendor enrichment, PO correlator, GitHub integration |
+| `dashboard` | `.claude/agents/dashboard.md` | Working on Next.js dashboard UI, API routes, React components |
+| `memory-pinecone` | `.claude/agents/memory-pinecone.md` | Pinecone vector memory, recall system, vendor patterns, Slack dedup |
+| `supabase` | `.claude/agents/supabase.md` | DB schema, query patterns, migrations, Supabase client usage |
+
+### Skills (`.claude/skills/`)
+Slash-command workflows for common Aria operations.
+
+| Skill | Invoke | Purpose |
+|-------|--------|---------|
+| `typecheck` | `/typecheck` | Run TS typecheck with correct ignore filters (finale/client.ts, folder-watcher, validator) |
+| `restart-bot` | `/restart-bot` | Typecheck + `pm2 restart aria-bot` — full safe restart workflow |
+| `ap-test` | `/ap-test` | Run AP pipeline test scripts against real Gmail/Finale |
+| `pm2` | `/pm2` | PM2 status, logs, start/stop/restart reference |
+| `add-bot-tool` | `/add-bot-tool` | Scaffold a new Telegram bot tool (definition + handler + auto-learn hook) |
+| `finale-lookup` | `/finale-lookup` | Run Finale probe/test scripts for data lookup |
+| `gmail-reauth` | `/gmail-reauth` | Re-authenticate Gmail OAuth (ap slot or default slot) and Calendar |
+| `build-risk-check` | `/build-risk-check` | Run build risk analysis scripts |
+| `reorder-check` | `/reorder-check` | Inspect reorder items and draft PO creation |
+| `firecrawl` | `/firecrawl` | Web scraping/search via Firecrawl CLI |
 
 ## Required Environment Variables (`.env.local`)
 
