@@ -20,7 +20,7 @@ interface PendingPOSend {
     id: string;
     orderId: string;
     review: DraftPOReview;
-    vendorEmail: string;
+    vendorEmail: string | null;
     vendorEmailSource: string;  // 'vendor_profiles' | 'vendors_table' | 'unknown'
     createdAt: number;
 }
@@ -30,7 +30,7 @@ const pendingPOSends = new Map<string, PendingPOSend>();
 export function storePendingPOSend(
     orderId: string,
     review: DraftPOReview,
-    vendorEmail: string,
+    vendorEmail: string | null,
     source: string
 ): string {
     const id = `posend_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -149,8 +149,9 @@ export function generatePOEmailBody(review: DraftPOReview): { subject: string; b
  */
 export async function commitAndSendPO(
     id: string,
-    triggeredBy: 'telegram' | 'dashboard'
-): Promise<{ orderId: string; sentTo: string; gmailMessageId: string }> {
+    triggeredBy: 'telegram' | 'dashboard',
+    skipEmail: boolean = false
+): Promise<{ orderId: string; sentTo: string | null; gmailMessageId: string | null; emailSkipped: boolean }> {
     const pending = getPendingPOSend(id);
     if (!pending) throw new Error('Pending PO send not found or expired — initiate a new Review & Send');
 
@@ -161,27 +162,34 @@ export async function commitAndSendPO(
     await finale.commitDraftPO(orderId);
     const committedAt = new Date().toISOString();
 
-    // 2. Send email via bill.selee@buildasoil.com
-    const auth = await getAuthenticatedClient('default');
-    const gmail = google.gmail({ version: 'v1', auth });
+    // 2. Send email via bill.selee@buildasoil.com (if not skipped and email exists)
+    let gmailMessageId = null;
+    let sentAt = null;
 
-    const { subject, body } = generatePOEmailBody(review);
-    const mimeMessage = [
-        `To: ${vendorEmail}`,
-        `From: bill.selee@buildasoil.com`,
-        `Subject: ${subject}`,
-        `Content-Type: text/plain; charset=utf-8`,
-        ``,
-        body,
-    ].join('\r\n');
+    if (!skipEmail && vendorEmail) {
+        const auth = await getAuthenticatedClient('default');
+        const gmail = google.gmail({ version: 'v1', auth });
 
-    const sendResult = await gmail.users.messages.send({
-        userId: 'me',
-        requestBody: { raw: Buffer.from(mimeMessage).toString('base64url') },
-    });
+        const { subject, body } = generatePOEmailBody(review);
+        const mimeMessage = [
+            `To: ${vendorEmail}`,
+            `From: bill.selee@buildasoil.com`,
+            `Subject: ${subject}`,
+            `Content-Type: text/plain; charset=utf-8`,
+            ``,
+            body,
+        ].join('\r\n');
 
-    const gmailMessageId = sendResult.data.id || '';
-    const sentAt = new Date().toISOString();
+        const sendResult = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: { raw: Buffer.from(mimeMessage).toString('base64url') },
+        });
+
+        gmailMessageId = sendResult.data.id || '';
+        sentAt = new Date().toISOString();
+    }
+
+    const { subject } = generatePOEmailBody(review);
 
     // 3. Log to Supabase
     const db = createClient();
@@ -191,7 +199,7 @@ export async function commitAndSendPO(
                 po_number: orderId,
                 vendor_name: review.vendorName,
                 vendor_party_id: review.vendorPartyId,
-                sent_to_email: vendorEmail,
+                sent_to_email: skipEmail ? null : vendorEmail,
                 total_amount: review.total,
                 item_count: review.items.length,
                 committed_at: committedAt,
@@ -203,13 +211,15 @@ export async function commitAndSendPO(
                 email_from: 'bill.selee@buildasoil.com',
                 email_subject: subject,
                 intent: 'PO_SEND',
-                action_taken: `PO #${orderId} committed in Finale and emailed to ${vendorEmail}`,
+                action_taken: skipEmail || !vendorEmail
+                    ? `PO #${orderId} committed in Finale (Email skipped/unavailable)`
+                    : `PO #${orderId} committed in Finale and emailed to ${vendorEmail}`,
                 notified_slack: false,
-                metadata: { orderId, vendorEmail, triggeredBy, gmailMessageId, itemCount: review.items.length },
+                metadata: { orderId, vendorEmail: skipEmail ? null : vendorEmail, triggeredBy, gmailMessageId, itemCount: review.items.length, emailSkipped: skipEmail || !vendorEmail },
             }),
         ]);
     }
 
     expirePendingPOSend(id);
-    return { orderId, sentTo: vendorEmail, gmailMessageId };
+    return { orderId, sentTo: skipEmail ? null : vendorEmail, gmailMessageId, emailSkipped: skipEmail || !vendorEmail };
 }

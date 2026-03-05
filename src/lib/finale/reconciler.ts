@@ -144,6 +144,13 @@ export async function approvePendingReconciliation(id: string): Promise<{
                     status: "open",
                 }, { onConflict: "po_number", ignoreDuplicates: false });
             }
+
+            // Update structured invoice state
+            await supabase.from("invoices").update({
+                status: "reconciled"
+            })
+                .eq("invoice_number", entry.result.invoiceNumber)
+                .ilike("vendor_name", `%${entry.result.vendorName}%`);
         }
     } catch (logErr: any) {
         console.warn(`⚠️ Failed to log approval to activity log: ${logErr.message}`);
@@ -210,6 +217,13 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
                     verdict: "rejected",
                 },
             });
+
+            // Update structured invoice state
+            await supabase.from("invoices").update({
+                status: "matched_review"
+            })
+                .eq("invoice_number", entry.result.invoiceNumber)
+                .ilike("vendor_name", `%${entry.result.vendorName}%`);
         }
     } catch (logErr: any) {
         console.warn(`⚠️ Failed to log rejection to activity log: ${logErr.message}`);

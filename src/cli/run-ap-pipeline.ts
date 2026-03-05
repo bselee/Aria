@@ -117,7 +117,7 @@ async function main() {
                 const pdfParts: any[] = [];
                 function walkParts(parts: any[]): void {
                     for (const part of parts) {
-                        if (part.mimeType === "application/pdf" && part.filename) pdfParts.push(part);
+                        if (part.filename && part.filename.toLowerCase().endsWith(".pdf")) pdfParts.push(part);
                         if (part.parts?.length) walkParts(part.parts);
                     }
                 }
@@ -390,6 +390,10 @@ async function main() {
     console.log("\n6️⃣  Forwarding invoice to buildasoilap@bill.com...");
     try {
         const boundary = "b_aria_fwd_" + Math.random().toString(36).substring(2);
+
+        // Chunk the base64 string to adhere to RFC 2045 76-character line limit
+        const chunkedBase64 = pdfBase64Raw.match(/.{1,76}/g)?.join("\r\n") || pdfBase64Raw;
+
         const mimeMessage = [
             `To: buildasoilap@bill.com`,
             `Subject: Fwd: ${subject}`,
@@ -407,7 +411,7 @@ async function main() {
             `Content-Transfer-Encoding: base64`,
             `Content-Disposition: attachment; filename="${filename}"`,
             ``,
-            pdfBase64Raw,
+            chunkedBase64,
             `--${boundary}--`,
         ].join("\r\n");
 

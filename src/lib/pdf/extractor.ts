@@ -43,10 +43,15 @@ export interface PDFMetadata {
  * and finally LLM-based OCR if the document appears to be scanned.
  */
 export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
-    // Strategy 1: pdf-parse for raw text (fast, handles most text PDFs)
-    const parsed = await pdfParse(buffer, {
-        max: 0,               // All pages
-    });
+    let parsed: any;
+    try {
+        parsed = await pdfParse(buffer, {
+            max: 0,               // All pages
+        });
+    } catch (err: any) {
+        console.warn(`⚠️ Fast PDF parse failed (${err.message}). Falling back to visual LLM OCR...`);
+        return await extractScannedPDF(buffer, { rawText: "", tables: [], pageCount: 1 });
+    }
 
     const rawText = parsed.text;
     const pageCount = parsed.numpages;
@@ -193,7 +198,7 @@ async function extractScannedPDF(
                     fetch(`https://api.openai.com/v1/files/${uploadedFileId}`, {
                         method: "DELETE",
                         headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-                    }).catch(() => {});
+                    }).catch(() => { });
                 }
             }
         } catch (err: any) {

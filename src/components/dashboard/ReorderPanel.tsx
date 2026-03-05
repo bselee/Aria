@@ -173,7 +173,7 @@ export default function ReorderPanel() {
             {/* Header */}
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
                 <ShoppingCart className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Reorder</span>
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Finale Reorder</span>
                 {data && !scanning && (
                     <span className="text-xs text-zinc-700">{timeAgo(data.cachedAt)}</span>
                 )}

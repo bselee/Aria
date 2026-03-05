@@ -30,6 +30,7 @@ import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
+import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 
 const DEFAULT_LEFT_W = 480;
 const DEFAULT_MID_W = 340;
@@ -56,6 +57,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
     "reorder": <ReorderPanel key="reorder" />,
     "purchasing": <PurchasingPanel key="purchasing" />,
     "build-schedule": <BuildSchedulePanel key="build-schedule" />,
+    "active-purchases": <ActivePurchasesPanel key="active-purchases" />,
     "chat-mirror": (
         <div key="chat-mirror" className="flex flex-col flex-1 overflow-hidden min-h-[400px]">
             <ChatMirror />
@@ -68,7 +70,7 @@ type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings", "activity"],
-    mid: ["invoice-queue", "reorder", "purchasing", "build-schedule"],
+    mid: ["invoice-queue", "reorder", "purchasing", "active-purchases", "build-schedule"],
     right: ["chat-mirror"]
 };
 

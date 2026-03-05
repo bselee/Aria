@@ -3,7 +3,10 @@ import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import { Telegraf, Markup } from "telegraf";
 import { WebClient } from "@slack/web-api";
+import { z } from "zod";
+import { unifiedObjectGeneration } from "./llm";
 import { extractPDF } from "../pdf/extractor";
+import { recall } from "./memory";
 import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 // matchInvoiceToPO kept for manual re-match flow in start-bot.ts invoice_has_po_ handler
 // but is no longer in the hot path — ap-agent queries Finale directly
@@ -15,25 +18,9 @@ import {
     storePendingApproval,
     buildAuditMetadata,
 } from "../finale/reconciler";
-import { unifiedObjectGeneration } from "./llm";
 import { storePendingDropship } from "./dropship-store";
-import { z } from "zod";
 
-// ──────────────────────────────────────────────────
-// KNOWN DROPSHIP VENDORS
-// ──────────────────────────────────────────────────
-// DECISION(2026-02-27): These vendors always ship directly to customers —
-// there is NEVER a matching Finale PO for them. Skip LLM classification and
-// auto-route as DROPSHIP_INVOICE (forward to bill.com, no reconciliation).
-// Add vendor name or email fragments (case-insensitive) as needed.
-const KNOWN_DROPSHIP_KEYWORDS = [
-    "autopot",
-    "logan labs",
-    "loganlab",
-    "evergreen growers",
-    "evergreengrow",
-    // add more: "vendor name fragment" or "emaildomain.com"
-];
+import { KNOWN_DROPSHIP_KEYWORDS } from "../../config/dropship-vendors";
 
 /**
  * @file    ap-agent.ts
@@ -55,7 +42,7 @@ export class APAgent {
     }
 
     private isKnownDropshipVendor(from: string, subject: string): boolean {
-        const haystack = `${from} ${subject}`.toLowerCase();
+        const haystack = `${from} ${subject} `.toLowerCase();
         return KNOWN_DROPSHIP_KEYWORDS.some(kw => haystack.includes(kw.toLowerCase()));
     }
 
@@ -65,16 +52,24 @@ export class APAgent {
             intent: z.enum(["INVOICE", "DROPSHIP_INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
         });
 
-        const prompt = `Classify this AP inbox email. Reply with the single intent label only.
-From: ${from}
+        // Recall rules to see if this vendor has specific handling instructions (like always being DROPSHIP)
+        const memories = await recall(`Accounts Payable routing rules for vendor ${from} subject ${subject} `, { topK: 3, minScore: 0.5 });
+        let memoryContext = "";
+        if (memories.length > 0) {
+            memoryContext = "\n\nPast Experiences & Specific Vendor Rules:\n" + memories.map(m => `- [${m.category}] ${m.content} `).join("\n");
+        }
+
+        const prompt = `Classify this AP inbox email.Reply with the single intent label only.
+    From: ${from}
 Subject: ${subject}
 Snippet: ${snippet}
+${memoryContext}
 
-INVOICE - Standard vendor bill for PO-based stock.
-DROPSHIP_INVOICE - Bill for goods shipped directly to our customer (no Finale PO).
-STATEMENT - Account statement or aging summary.
-ADVERTISEMENT - Marketing, spam, or newsletter.
-HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
+INVOICE - Standard vendor bill for PO - based stock.
+    DROPSHIP_INVOICE - Bill for goods shipped directly to our customer(no Finale PO).
+        STATEMENT - Account statement or aging summary.
+            ADVERTISEMENT - Marketing, spam, or newsletter.
+                HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
 
         try {
             const res = await unifiedObjectGeneration({
@@ -125,10 +120,11 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
             const gmail = google.gmail({ version: "v1", auth });
             const supabase = createClient();
 
-            // Find *ALL* unread emails in the inbox
+            // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent
+            // and have a PDF attachment.
             const { data } = await gmail.users.messages.list({
                 userId: "me",
-                q: "is:unread in:inbox",
+                q: "is:unread in:inbox -label:AP-Seen filename:pdf newer_than:3d",
                 maxResults: 15
             });
 
@@ -143,6 +139,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
             // Pre-fetch labels to optimize
             const invoiceFwdLabelId = await this.getOrCreateLabel(gmail, "Invoice Forward");
             const statementsLabelId = await this.getOrCreateLabel(gmail, "Statements");
+            const apSeenLabelId = await this.getOrCreateLabel(gmail, "AP-Seen");
 
             for (const m of messages) {
                 let msg: any;
@@ -157,12 +154,12 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                         try {
                             await this.bot.telegram.sendMessage(
                                 process.env.TELEGRAM_CHAT_ID || "",
-                                `⚠️ Gmail API rate limit hit — AP inbox poll interrupted. Some emails may not have been processed. Will retry on next cycle.`
+                                `⚠️ Gmail API rate limit hit — AP inbox poll interrupted.Some emails may not have been processed.Will retry on next cycle.`
                             );
                         } catch { /* swallow */ }
                         break;
                     }
-                    console.error(`   ❌ Failed to fetch message ${m.id}:`, fetchErr.message);
+                    console.error(`   ❌ Failed to fetch message ${m.id}: `, fetchErr.message);
                     continue;
                 }
                 const payload = msg.data.payload;
@@ -172,13 +169,13 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                 const from = headers.find((h: any) => h.name === "From")?.value || "Unknown Sender";
                 const snippet = msg.data.snippet || "";
 
-                console.log(`   Evaluating Email: "${subject}" from ${from}`);
+                console.log(`   Evaluating Email: "${subject}" from ${from} `);
 
                 // Fast-path: skip LLM for known dropship vendors
                 const intent = this.isKnownDropshipVendor(from, subject)
                     ? "DROPSHIP_INVOICE"
                     : await this.classifyEmailIntent(subject, from, snippet);
-                console.log(`     -> Classified as: ${intent}`);
+                console.log(`     -> Classified as: ${intent} `);
 
                 if (intent === "ADVERTISEMENT") {
                     // Mark as read and REMOVE from inbox (archive)
@@ -208,8 +205,16 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                 }
 
                 if (intent === "HUMAN_INTERACTION") {
-                    // We just leave it unread in the inbox so the user is forced to engage.
-                    await this.logActivity(supabase, from, subject, "HUMAN_INTERACTION", "Left unread for human review");
+                    // We just leave it unread in the inbox so the user is forced to engage,
+                    // but we tag it with AP-Seen so the agent doesn't scan it again.
+                    await gmail.users.messages.modify({
+                        userId: "me",
+                        id: m.id!,
+                        requestBody: {
+                            addLabelIds: [apSeenLabelId]
+                        }
+                    });
+                    // Do not logActivity to avoid dashboard clutter
                     continue;
                 }
 
@@ -244,13 +249,13 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                                 .limit(1)
                                 .single();
                             if (existing) {
-                                console.log(`   ⏭️ Skipping already-processed message ${m.id} (${part.filename})`);
+                                console.log(`   ⏭️ Skipping already - processed message ${m.id} (${part.filename})`);
                                 processedAnyPDF = true; // treat as processed so we mark read + label
                                 continue;
                             }
                         }
 
-                        console.log(`     Downloading ${part.filename}`);
+                        console.log(`     Downloading ${part.filename} `);
 
                         const attachment = await gmail.users.messages.attachments.get({
                             userId: "me",
@@ -270,7 +275,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                                 try {
                                     await this.bot.telegram.sendMessage(
                                         process.env.TELEGRAM_CHAT_ID || "",
-                                        `🚨 *BILL\.COM FORWARD FAILED*\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\.com\. Please forward manually\.`,
+                                        `🚨 * BILL\.COM FORWARD FAILED *\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\.com\. Please forward manually\.`,
                                         { parse_mode: "MarkdownV2" }
                                     );
                                 } catch { /* swallow — can't alert about the alert failure */ }
@@ -325,7 +330,15 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     // It was classified as an Invoice but had no PDF, so leave unread for human interaction.
                     const logIntent = isDropship ? "DROPSHIP_INVOICE" : "INVOICE";
                     console.log(`     ⚠️ No PDF found on ${logIntent}. Leaving unread for human check.`);
-                    await this.logActivity(supabase, from, subject, logIntent, "No PDF found — left unread for human review");
+
+                    await gmail.users.messages.modify({
+                        userId: "me",
+                        id: m.id!,
+                        requestBody: {
+                            addLabelIds: [apSeenLabelId]
+                        }
+                    });
+                    // Do not logActivity to avoid dashboard clutter
                 }
             }
 
@@ -337,6 +350,11 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
     public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, base64Data: string): Promise<boolean> {
         console.log(`     -> Forwarding ${filename} to buildasoilap@bill.com`);
         const boundary = "b_aria_forwarded_bill_" + Math.random().toString(36).substring(2);
+
+        // Convert Gmail's base64url to standard base64 and wrap at 76 chars per RFC 2045
+        const standardBase64 = base64Data.replace(/-/g, "+").replace(/_/g, "/");
+        const chunkedBase64 = standardBase64.match(/.{1,76}/g)?.join("\r\n") || standardBase64;
+
         const mimeMessage = [
             `To: buildasoilap@bill.com`,
             `Subject: Fwd: ${originalSubject}`,
@@ -353,7 +371,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
             `Content-Transfer-Encoding: base64`,
             `Content-Disposition: attachment; filename="${filename}"`,
             ``,
-            base64Data,
+            chunkedBase64,
             `--${boundary}--`
         ].join("\r\n");
 
@@ -887,9 +905,6 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
         }
     }
 
-    /**
-     * Log reconciliation results to Supabase for audit trail.
-     */
     private async logReconciliation(
         supabase: any,
         result: ReconciliationResult,
@@ -906,6 +921,38 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                 notified_slack: !!this.slack,
                 metadata: buildAuditMetadata(result, applyResult, "auto")
             });
+
+            // Update structured invoice state
+            let newStatus = "matched_review";
+            if (result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change") newStatus = "reconciled";
+            if (result.overallVerdict === "no_match") newStatus = "unmatched";
+
+            const discrepancies = [
+                ...result.priceChanges.filter(pc => pc.verdict !== "no_change").map(pc => ({
+                    type: "price",
+                    productId: pc.productId,
+                    expected: pc.poPrice,
+                    actual: pc.invoicePrice,
+                    verdict: pc.verdict,
+                    reason: pc.reason
+                })),
+                ...result.feeChanges.map(fc => ({
+                    type: "fee",
+                    feeType: fc.feeType,
+                    expected: fc.existingAmount,
+                    actual: fc.amount,
+                    verdict: fc.verdict,
+                    reason: fc.reason
+                }))
+            ];
+
+            await supabase.from("invoices").update({
+                status: newStatus,
+                discrepancies: discrepancies
+            })
+                .eq("invoice_number", result.invoiceNumber)
+                .ilike("vendor_name", `%${result.vendorName}%`);
+
         } catch (err: any) {
             console.warn("⚠️ Failed to log reconciliation:", err.message);
         }

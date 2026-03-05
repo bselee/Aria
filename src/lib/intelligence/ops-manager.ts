@@ -22,6 +22,12 @@ import { unifiedTextGeneration } from "./llm";
 import { runBuildRiskAnalysis } from "../builds/build-risk";
 import { leadTimeService } from "../builds/lead-time-service";
 import { APAgent } from "./ap-agent";
+import { APIdentifierAgent } from "./workers/ap-identifier";
+import { EmailIngestionWorker } from "./workers/email-ingestion";
+import { APForwarderAgent } from "./workers/ap-forwarder";
+import { TrackingAgent } from "./tracking-agent";
+import { AcknowledgementAgent } from "./acknowledgement-agent";
+import { SupervisorAgent } from "./supervisor-agent";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -38,14 +44,51 @@ const TRACKING_PATTERNS = {
 };
 
 type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
-interface TrackingStatus { category: TrackingCategory; display: string; }
+interface TrackingStatus { category: TrackingCategory; display: string; public_url?: string; }
 
+
+const LTL_DIRECT_LINKS: Record<string, string> = {
+    "Old Dominion Freight Line": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
+    "Old Dominion": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
+    "Saia": "https://www.saia.com/tracking?pro={PRO}",
+    "Estes": "https://www.estes-express.com/tracking?pro={PRO}",
+    "R&L Carriers": "https://www.rlcarriers.com/freight/shipping/shipment-tracing?pro={PRO}",
+    "XPO Logistics": "https://app.xpo.com/track/pro/{PRO}",
+    "Dayton Freight": "https://www.daytonfreight.com/tracking/?pro={PRO}",
+    "FedEx Freight": "https://www.fedex.com/fedextrack/?tracknumbers={PRO}",
+    "UPS Freight": "https://www.tforcefreight.com/ltl/apps/Tracking?type=P&HAWB={PRO}",
+    "TForce Freight": "https://www.tforcefreight.com/ltl/apps/Tracking?type=P&HAWB={PRO}",
+    "YRC Freight": "https://my.yrc.com/tools/track/shipments?referenceNumber={PRO}",
+    "Yellow Freight": "https://my.yrc.com/tools/track/shipments?referenceNumber={PRO}",
+    "Central Transport": "https://www.centraltransport.com/forms/tracking.aspx?pro={PRO}",
+    "ABF Freight": "https://arcb.com/tools/tracking.html?pro={PRO}",
+    "ArcBest": "https://arcb.com/tools/tracking.html?pro={PRO}"
+};
 
 function carrierUrl(trackingNumber: string): string {
+    // Check if it's an LLM-encoded string (Carrier:::Number)
+    if (trackingNumber.includes(":::")) {
+        const [carrierName, actualNumber] = trackingNumber.split(":::", 2);
+
+        // Find a matching LTL direct link if available
+        const knownCarrier = Object.keys(LTL_DIRECT_LINKS).find(k =>
+            carrierName.toLowerCase().includes(k.toLowerCase())
+        );
+
+        if (knownCarrier) {
+            return LTL_DIRECT_LINKS[knownCarrier].replace("{PRO}", encodeURIComponent(actualNumber));
+        }
+
+        // Fallback for an unknown LTL carrier that we still scraped
+        return `https://parcelsapp.com/en/tracking/${actualNumber}`;
+    }
+
     if (/^1Z/i.test(trackingNumber)) return `https://www.ups.com/track?tracknum=${trackingNumber}`;
     if (/^(94|92|93|95)/.test(trackingNumber)) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${trackingNumber}`;
     if (/^JD/i.test(trackingNumber)) return `https://www.dhl.com/us-en/home/tracking.html?tracking-id=${trackingNumber}`;
-    return `https://www.fedex.com/fedextrack/?tracknumbers=${trackingNumber}`;
+    if (/\b(96\d{18}|\d{15}|\d{12})\b/.test(trackingNumber)) return `https://www.fedex.com/fedextrack/?tracknumbers=${trackingNumber}`;
+    // Fallback for PRO, BOL, or generic 
+    return `https://parcelsapp.com/en/tracking/${trackingNumber}`;
 }
 
 /**
@@ -84,29 +127,66 @@ function parseTrackingContent(content: string): TrackingStatus | null {
     return null;
 }
 
+import EasyPostClient from "@easypost/api";
+
 /**
- * Scrape a carrier tracking page via Firecrawl and return structured delivery status.
- * Pure regex parsing — no LLM. Times out after 20s; returns null on any failure.
+ * Fetch tracking status directly from EasyPost API.
+ * Returns null if tracking fails.
  */
-async function scrapeTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
-    const apiKey = process.env.FIRECRAWL_API_KEY;
+async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    const apiKey = process.env.EASYPOST_API_KEY;
     if (!apiKey) return null;
 
     try {
-        const firecrawl = new FirecrawlApp({ apiKey });
-        const result = await Promise.race([
-            firecrawl.scrapeUrl(carrierUrl(trackingNumber), { formats: ["markdown"] }),
-            new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error("Firecrawl timeout")), 20000)
-            ),
-        ]) as any;
+        const client = new EasyPostClient(apiKey);
 
-        const content: string = result?.markdown || result?.content || "";
-        if (content.length < 50) return null;
+        let reqParam: any = { tracking_code: trackingNumber };
 
-        return parseTrackingContent(content);
+        // Handle LTL LLM Decoded Strings
+        if (trackingNumber.includes(":::")) {
+            const [carrierName, actualNumber] = trackingNumber.split(":::", 2);
+            // We pass the carrier to EasyPost if we have it - it dramatically helps their tracker engine
+            reqParam = { tracking_code: actualNumber, carrier: carrierName };
+        }
+
+        const tracker = await client.Tracker.create(reqParam);
+
+        // EasyPost statuses: unknown, pre_transit, in_transit, out_for_delivery, delivered, available_for_pickup, return_to_sender, failure, cancelled, error
+        switch (tracker.status) {
+            case "delivered": {
+                // Return actual delivered date
+                let dDisplay = "Delivered";
+                if (tracker.updated_at) {
+                    const d = new Date(tracker.updated_at);
+                    dDisplay = `Delivered ${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+                }
+                return { category: 'delivered', display: dDisplay, public_url: tracker.public_url };
+            }
+            case "out_for_delivery":
+                return { category: 'out_for_delivery', display: 'Out for delivery', public_url: tracker.public_url };
+            case "failure":
+            case "error":
+            case "return_to_sender":
+            case "cancelled":
+                return { category: 'exception', display: 'Delivery exception', public_url: tracker.public_url };
+            case "in_transit":
+            case "pre_transit":
+            default: {
+                let dDisplay = "In transit";
+                if (tracker.est_delivery_date) {
+                    const e = new Date(tracker.est_delivery_date);
+                    dDisplay = `Expected ${e.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+                }
+                return { category: 'in_transit', display: dDisplay, public_url: tracker.public_url };
+            }
+        }
     } catch (err: any) {
-        console.warn(`[tracking-scrape] ${trackingNumber}: ${err.message}`);
+        // Suppress billing/insufficient funds errors so it doesn't pollute the logs
+        if (err.message && err.message.includes("Insufficient funds")) {
+            console.warn(`[tracking-api] EasyPost billing error for ${trackingNumber} — add card to clear.`);
+        } else {
+            console.warn(`[tracking-api] Failed to track ${trackingNumber}: ${err.message}`);
+        }
         return null;
     }
 }
@@ -143,6 +223,13 @@ export class OpsManager {
     private slack: WebClient | null;
     private slackChannel: string;
     private apAgent: APAgent;
+    private apIdentifier: APIdentifierAgent;
+    private emailIngestionDefault: EmailIngestionWorker;
+    private emailIngestionAP: EmailIngestionWorker;
+    private apForwarder: APForwarderAgent;
+    private trackingAgent: TrackingAgent;
+    private ackAgent: AcknowledgementAgent;
+    private supervisor: SupervisorAgent;
     // In-memory dedup for build completion alerts.
     // Hydrated from Supabase on startup to prevent duplicate alerts after restart.
     private seenCompletedBuildIds = new Set<string>();
@@ -168,8 +255,48 @@ export class OpsManager {
             console.warn("⚠️ OpsManager: SLACK_BOT_TOKEN not set — Slack cross-posting disabled.");
         }
 
-        // Initialize dedicated AP inbox agent
+        // Initialize dedicated AP agents
         this.apAgent = new APAgent(bot);
+        this.apIdentifier = new APIdentifierAgent();
+        this.emailIngestionDefault = new EmailIngestionWorker("default");
+        this.emailIngestionAP = new EmailIngestionWorker("ap");
+        this.apForwarder = new APForwarderAgent();
+        this.trackingAgent = new TrackingAgent();
+        this.ackAgent = new AcknowledgementAgent("default");
+        this.supervisor = new SupervisorAgent(bot);
+    }
+
+    /**
+     * Safely executes a scheduled task, catching unhandled errors and handing them off 
+     * to the Supervisor exception queue instead of crashing silently or blindly alerting.
+     */
+    private async safeRun(taskName: string, task: () => Promise<any> | any) {
+        try {
+            await task();
+        } catch (error: any) {
+            console.error(`🚨 [${taskName}] Crashed during execution. Handing to Supervisor...`, error.message);
+            try {
+                // Hand over to the exceptions queue
+                const supabase = createClient();
+                await supabase.from('ops_agent_exceptions').insert({
+                    agent_name: taskName,
+                    error_message: error.message || "Unknown error",
+                    error_stack: error.stack || ""
+                });
+            } catch (queueErr) {
+                console.error(`     ❌ Failed to write crash exception for ${taskName} to DB:`, queueErr);
+
+                // Absolute fallback in case the DB is down
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId && this.bot) {
+                    await this.bot.telegram.sendMessage(
+                        chatId,
+                        `🚨 <b>DB Unavailable - Crash Escalation</b> 🚨\n\n<b>Agent:</b> ${taskName}\n<b>Error:</b> ${error.message}`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => { });
+                }
+            }
+        }
     }
 
     /**
@@ -184,49 +311,73 @@ export class OpsManager {
             console.warn('[ops-manager] hydrateSeenSets failed (non-fatal):', err.message)
         );
 
-        // DECISION(2026-03-04): Build Risk Analysis @ 5:00 AM — team starts early.
-        // Fires before the crew arrives so calendar annotations and stockout
-        // warnings are visible when they check the build schedule.
-        cron.schedule("0 5 * * 1-5", () => {
-            this.sendBuildRiskReport();
-        }, { timezone: "America/Denver" });
+        // Supervisor checking errors
+        cron.schedule("*/5 * * * *", () => {
+            this.supervisor.supervise();
+        });
 
-        // AP Agent checks for new invoices every 15 minutes
+        // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
+        cron.schedule("*/5 * * * *", () => {
+            this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
+            this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
+        });
+
+        // AP Identifier scans for unread PDFs every 15 minutes and queues them
         cron.schedule("*/15 * * * *", () => {
-            this.apAgent.processUnreadInvoices();
+            this.safeRun("APIdentifierAgent", () => this.apIdentifier.identifyAndQueue());
+        });
+
+        // AP Forwarder ships queued invoices to Bill.com every 15 minutes
+        cron.schedule("2-59/15 * * * *", () => {
+            this.safeRun("APForwarderAgent", () => this.apForwarder.processPendingForwards());
+        });
+
+        // Acknowledgement Agent runs every 12 minutes to routinely thank vendors
+        cron.schedule("*/12 * * * *", () => {
+            this.safeRun("AcknowledgementAgent", () => this.ackAgent.processUnreadEmails(20));
         });
 
         // Daily Summary @ 8:00 AM weekdays only
         cron.schedule("0 8 * * 1-5", () => {
-            this.sendDailySummary();
+            this.safeRun("DailySummary", () => this.sendDailySummary());
+        }, { timezone: "America/Denver" });
+
+        // Active Purchases Ledger to Slack @ 8:15 AM weekdays
+        cron.schedule("15 8 * * 1-5", () => {
+            this.safeRun("SlackPurchasesReport", () => this.postActivePurchasesToSlack());
         }, { timezone: "America/Denver" });
 
         // Friday Summary @ 8:01 AM
         cron.schedule("1 8 * * 5", () => {
-            this.sendWeeklySummary();
+            this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
         }, { timezone: "America/Denver" });
 
         // Email Maintenance (Advertisements) every hour
         cron.schedule("0 * * * *", () => {
-            this.processAdvertisements();
+            this.safeRun("AdMaintenance", () => this.processAdvertisements());
+        });
+
+        // Tracking Agent polls processing queue every 60 minutes
+        cron.schedule("0 * * * *", () => {
+            this.safeRun("TrackingAgent", () => this.trackingAgent.processUnreadEmails());
         });
 
         // PO Sync every 30 minutes
         cron.schedule("*/30 * * * *", () => {
-            this.syncPOConversations();
+            this.safeRun("POSync", () => this.syncPOConversations());
         });
 
         // Build Completion Watcher every 30 minutes
         // Polls Finale for newly-completed build orders, sends Telegram alert,
         // and appends a completion timestamp to the matching calendar event description.
         cron.schedule("*/30 * * * *", () => {
-            this.pollBuildCompletions();
+            this.safeRun("BuildCompletionWatcher", () => this.pollBuildCompletions());
         });
 
         // PO Receiving Watcher every 30 minutes
         // Polls Finale for today's newly-received purchase orders and sends Telegram alerts.
         cron.schedule("*/30 * * * *", () => {
-            this.pollPOReceivings();
+            this.safeRun("POReceivingWatcher", () => this.pollPOReceivings());
         });
 
         // Purchasing Calendar Sync every 4 hours
@@ -248,6 +399,8 @@ export class OpsManager {
         cron.schedule("0 17 * * 1-5", () => {
             this.apAgent.sendDailyRecap();
         }, { timezone: "America/Denver" });
+
+
     }
 
     /**
@@ -399,11 +552,14 @@ export class OpsManager {
                             ? `Items: ${poDetails.lineItems.map(i => `<code>${i.sku}</code> ×${i.qty}`).join(', ')}`
                             : "";
 
-                        // Scrape delivery status + build message lines per tracking number
+                        // Fetch delivery status + build message lines per tracking number
                         const trackingLines = await Promise.all(newTracking.map(async t => {
-                            const ts = await scrapeTrackingStatus(t);
+                            const ts = await getTrackingStatus(t);
                             const statusStr = ts ? `  ${ts.display}` : "";
-                            return `<a href="${carrierUrl(t)}">${t}</a><i>${statusStr}</i>`;
+                            const link = ts?.public_url || carrierUrl(t);
+                            // Cleanup display for LTL
+                            const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
+                            return `<a href="${link}">${displayT}</a><i>${statusStr}</i>`;
                         }));
 
                         let msg = `<b>Tracking Alert</b>\n\n${poLine}\nVendor: ${vendorName}\nSent: ${sentDate}`;
@@ -650,6 +806,160 @@ export class OpsManager {
         const slackMsg = `:calendar: *Friday Weekly Operations Review*\n\n${summary}`;
         await this.postToSlack(slackMsg, "Weekly Summary");
     }
+
+    /**
+     * Gets the active purchases list (used by Dashboard API and Slack).
+     */
+    async getActivePurchasesList(daysBack: number = 60) {
+        const finaleClient = new FinaleClient();
+        // Fetch last N days of POs to ensure we get active ones
+        const pos = await finaleClient.getRecentPurchaseOrders(daysBack);
+        await leadTimeService.warmCache();
+
+        const now = new Date();
+        now.setHours(0, 0, 0, 0);
+
+        // Fetch tracking from Supabase
+        const supabase = createClient();
+        const poNumbers = pos.map(p => p.orderId).filter(Boolean);
+        const trackingMap = new Map<string, string[]>();
+
+        if (supabase && poNumbers.length > 0) {
+            try {
+                for (let i = 0; i < poNumbers.length; i += 100) {
+                    const chunk = poNumbers.slice(i, i + 100);
+                    const { data: dbPOs } = await supabase
+                        .from("purchase_orders")
+                        .select("po_number, tracking_numbers")
+                        .in("po_number", chunk);
+
+                    for (const dp of dbPOs || []) {
+                        trackingMap.set(dp.po_number, dp.tracking_numbers || []);
+                    }
+                }
+            } catch (e: any) {
+                console.warn("[ops-manager] active purchases tracking fetch failed:", e.message);
+            }
+        }
+
+        const activePos = [];
+
+        function addDaysLoc(dateStr: string, days: number): string {
+            const d = new Date(dateStr);
+            d.setUTCDate(d.getUTCDate() + days);
+            return d.toISOString().split("T")[0];
+        }
+
+        for (const po of pos) {
+            if (!po.orderId) continue;
+            // Skip dropship POs
+            if (po.orderId.toLowerCase().includes("dropship")) continue;
+
+            const status = (po.status || "").toLowerCase();
+            // Only show committed or completed — skip drafts and cancelled
+            if (!["committed", "completed"].includes(status)) continue;
+
+            const isReceived = status === "completed";
+
+            // If received, auto-remove after 5 days
+            if (isReceived && po.receiveDate) {
+                const recDate = new Date(po.receiveDate);
+                recDate.setHours(0, 0, 0, 0);
+                const diffTime = Math.abs(now.getTime() - recDate.getTime());
+                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                if (diffDays > 5) {
+                    continue; // skip received > 5 days ago
+                }
+            }
+
+            // Calculate expected date like the calendar
+            let expectedDate: string;
+            let leadProvenance: string;
+
+            if (po.orderDate) {
+                const lt = await leadTimeService.getForVendor(po.vendorName);
+                expectedDate = addDaysLoc(po.orderDate, lt.days);
+                leadProvenance = lt.label;
+            } else {
+                expectedDate = new Date().toISOString().split("T")[0];
+                leadProvenance = "14d default";
+            }
+
+            activePos.push({
+                ...po,
+                expectedDate,
+                leadProvenance,
+                isReceived,
+                trackingNumbers: trackingMap.get(po.orderId) || []
+            });
+        }
+
+        activePos.sort((a, b) => {
+            const da = new Date(a.orderDate || 0).getTime();
+            const db = new Date(b.orderDate || 0).getTime();
+            return db - da; // newest first
+        });
+
+        return activePos;
+    }
+
+    /**
+     * Build and post the Active Purchases Ledger to Slack.
+     */
+    async postActivePurchasesToSlack() {
+        console.log("🛒 Preparing Active Purchases Slack Ledger...");
+        if (!this.slack) {
+            console.log("Skipping Slack ledger: Slack not configured");
+            return;
+        }
+
+        try {
+            // Slack ledger only shows the trailing 14 days (two weeks) of POs to reduce noise
+            const purchases = await this.getActivePurchasesList(14);
+            if (purchases.length === 0) return; // Silent if no active purchases
+
+            let msg = `:ledger: *Active Purchases Ledger*\n_Running list of incoming shipments from the last 14 days (auto-clears 5 days after receipt)_\n\n`;
+
+            for (const p of purchases) {
+                const rcvd = p.isReceived;
+                const icon = this.poStatusEmoji(p.status);
+
+                let block = `${icon} *<${p.finaleUrl}|PO# ${p.orderId}>* — ${p.vendorName}\n`;
+
+                // Keep the layout identical to the Purchasing Calendar
+                if (rcvd && p.receiveDate) {
+                    const expectedMs = new Date(p.expectedDate).getTime();
+                    const actualMs = new Date(p.receiveDate).getTime();
+                    const diff = Math.round((actualMs - expectedMs) / 86_400_000);
+                    const timing = diff === 0 ? 'on time' : diff > 0 ? `${diff}d late` : `${Math.abs(diff)}d early`;
+                    block += `> Ordered: ${this.fmtDate(p.orderDate)} | Received: ${this.fmtDate(p.receiveDate)} (${timing})\n`;
+                } else {
+                    block += `> Ordered: ${this.fmtDate(p.orderDate)} | Expected: ${this.fmtDate(p.expectedDate)} (${p.leadProvenance})\n`;
+                    // Any future tracking links/data injected here until units arrive and are received
+                    if (p.trackingNumbers && p.trackingNumbers.length > 0) {
+                        const tracLinks = p.trackingNumbers.map((t: string) => `<${carrierUrl(t)}|${t}>`);
+                        block += `> Tracking: ${tracLinks.join(" | ")}\n`;
+                    } else {
+                        block += `> Tracking: _Awaiting Tracking_\n`;
+                    }
+                }
+
+                // Truncate item list identically
+                const itemLines = p.items.slice(0, 5).map((i: any) => `${i.productId} × ${i.quantity.toLocaleString()}`);
+                if (p.items.length > 5) itemLines.push(`+ ${p.items.length - 5} more`);
+                block += `> Items: ${itemLines.join(', ')}\n`;
+
+                block += `> Total: $${p.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n`;
+
+                msg += block + "\n";
+            }
+
+            await this.postToSlack(msg, "Active Purchases Ledger");
+        } catch (e: any) {
+            console.error(`❌ Active Purchases Ledger failed:`, e.message);
+        }
+    }
+
 
     /**
      * Run the Calendar BOM build risk analysis and post results.
@@ -1236,30 +1546,38 @@ export class OpsManager {
         else date.setDate(date.getDate() - 7);
         const isoDate = date.toISOString().split("T")[0];
 
-        // For weekly reports, calculate Monday of current week → today (Mountain Time)
-        let finaleStartDate: string | undefined;
+        // For weekly reports AND daily week-to-date data, calculate Monday of current week → tomorrow
+        const now = new Date();
+        const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 5=Fri
+        const monday = new Date(now);
+        monday.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+        const finaleStartDate = monday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
         let finaleEndDate: string | undefined;
+        let queryStartDate = isoDate;
+
         if (timeframe === "week") {
-            const now = new Date();
-            const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 5=Fri
-            const monday = new Date(now);
-            monday.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
-            finaleStartDate = monday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const tomorrow = new Date(now);
             tomorrow.setDate(now.getDate() + 1);
             finaleEndDate = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            queryStartDate = monday.toISOString().split("T")[0];
+        } else {
+            // For yesterday, we still want week-to-date totals, so we fetch everything from Monday to Today
+            const today = new Date(now);
+            finaleEndDate = today.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            queryStartDate = monday.toISOString().split("T")[0];
         }
 
         try {
             const [pos, invoices, documents] = await Promise.all([
-                supabase.from("purchase_orders").select("po_number, vendor_name, total, status").gte("created_at", isoDate).limit(50),
-                supabase.from("invoices").select("invoice_number, vendor_name, amount_due, status").gte("created_at", isoDate).limit(20),
-                supabase.from("documents").select("type, status, email_from, email_subject, action_required").gte("created_at", isoDate).limit(10)
+                supabase.from("purchase_orders").select("po_number, vendor_name, total, status, created_at").gte("created_at", queryStartDate).limit(100),
+                supabase.from("invoices").select("invoice_number, vendor_name, amount_due, status, created_at").gte("created_at", queryStartDate).limit(50),
+                supabase.from("documents").select("type, status, email_from, email_subject, action_required, created_at").gte("created_at", queryStartDate).limit(20)
             ]);
 
-            // Grab Finale received and committed PO data — use full week range for weekly reports
-            let finaleReceivedDataText = "No receivings data from Finale.";
-            let finaleCommittedDataText = "No committed PO data from Finale.";
+            // Grab Finale received and committed PO data — use full week range for both reports
+            let finaleReceivedPOs: any[] = [];
+            let finaleCommittedPOs: any[] = [];
             try {
                 const { FinaleClient } = await import("../finale/client");
                 const finale = new FinaleClient();
@@ -1267,8 +1585,8 @@ export class OpsManager {
                     finale.getTodaysReceivedPOs(finaleStartDate, finaleEndDate),
                     finale.getTodaysCommittedPOs(finaleStartDate, finaleEndDate)
                 ]);
-                finaleReceivedDataText = finale.formatReceivingsDigest(receivedPOs);
-                finaleCommittedDataText = await finale.formatCommittedDigest(committedPOs);
+                finaleReceivedPOs = receivedPOs;
+                finaleCommittedPOs = committedPOs;
             } catch (err) {
                 console.warn("Could not fetch Finale PO activity for summary", err);
             }
@@ -1302,21 +1620,21 @@ export class OpsManager {
             return {
                 timeframe,
                 purchase_orders_db: pos.data || [],
-                finale_receivings_digest: finaleReceivedDataText,
-                finale_committed_digest: finaleCommittedDataText,
+                finale_receivings: finaleReceivedPOs,
+                finale_committed: finaleCommittedPOs,
                 invoices: invoices.data || [],
                 documents: documents.data || [],
                 unread_emails: { count: unreadCount, subjects: unreadSubjects }
             };
         } catch (err) {
-            return { timeframe, purchase_orders_db: [], finale_receivings_digest: "Error", finale_committed_digest: "Error", invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
+            return { timeframe, purchase_orders_db: [], finale_receivings: [], finale_committed: [], invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
         }
     }
 
     private async generateLLMSummary(title: string, data: any) {
         const isWeekly = data.timeframe === "week";
-        const isEmpty = !data.purchase_orders_db.length && !data.invoices.length && !data.documents.length
-            && data.unread_emails.count === 0 && data.finale_receivings_digest.includes("No ");
+        const isEmpty = !data.purchase_orders_db?.length && !data.invoices?.length && !data.documents?.length
+            && data.unread_emails?.count === 0 && (!data.finale_receivings || data.finale_receivings.length === 0);
         if (isEmpty) return "No operations tracked in the system for this timeframe.";
 
         const prompt = isWeekly
@@ -1331,7 +1649,15 @@ DO NOT include: vendors-contacted/invoiced section, unread emails, document proc
 Format with clean markdown bullets. Be specific with numbers — no vague summaries.
 Data: ${JSON.stringify(data)}`
             : `Summarize the following operations activity for the Daily Morning report.
-Focus on: total spend/amount due, Finale receivings (POs received, units, vendors), committed POs, and unread actionable email count.
+The data provided contains WEEK-TO-DATE records (from Monday through Yesterday).
+Your summary MUST include WEEKLY TOTALS for the week so far (Monday to yesterday), AND add in the previous day's (yesterday's) specific receptions and POs placed.
+
+Focus on: 
+- Total spend/amount due (Week-to-date and Yesterday specific).
+- Finale receivings (Show week-to-date total POs/units/spend, AND clearly list yesterday's specific POs received).
+- Committed POs (Show week-to-date total, AND specifically list yesterday's POs placed).
+- Unread actionable email count (current snapshot).
+
 DO NOT include a vendors-contacted/invoiced section.
 Format cleanly with markdown bullets. Be concise but actionable. If a section has no data, skip it.
 Data: ${JSON.stringify(data)}`;
@@ -1389,11 +1715,12 @@ Data: ${JSON.stringify(data)}`;
     /**
      * Build the calendar event description for a PO.
      */
-    private buildPOEventDescription(
+    private async buildPOEventDescription(
         po: FullPO,
         expectedDate: string,
-        leadProvenance: string
-    ): string {
+        leadProvenance: string,
+        trackingNumbers: string[]
+    ): Promise<string> {
         const isReceived = (po.status || '').toLowerCase() === 'completed';
         const isCancelled = (po.status || '').toLowerCase() === 'cancelled';
 
@@ -1411,6 +1738,19 @@ Data: ${JSON.stringify(data)}`;
             if (!isCancelled) {
                 lines.push(`Expected: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
             }
+        }
+
+        if (trackingNumbers.length > 0) {
+            const trackingLines = await Promise.all(trackingNumbers.map(async t => {
+                const ts = await getTrackingStatus(t);
+                const statusStr = ts ? ` ${ts.display}` : "";
+                const link = ts?.public_url || carrierUrl(t);
+                const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
+                return `<a href="${link}">${displayT}</a><i>${statusStr}</i>`;
+            }));
+            lines.push(`Tracking: ${trackingLines.join(' | ')}`);
+        } else if (!isReceived && !isCancelled) {
+            lines.push(`Tracking: Awaiting Tracking`);
         }
 
         // Line items — max 5 + overflow count
@@ -1460,10 +1800,20 @@ Data: ${JSON.stringify(data)}`;
             // Load existing Supabase rows into a Map for O(1) lookup
             const { data: existingRows } = await supabase
                 .from('purchasing_calendar_events')
-                .select('po_number, event_id, calendar_id, status');
-            const existing = new Map<string, { event_id: string; calendar_id: string; status: string }>();
+                .select('po_number, event_id, calendar_id, status, last_tracking');
+            const existing = new Map<string, { event_id: string; calendar_id: string; status: string; last_tracking: string }>();
             for (const row of existingRows ?? []) {
                 existing.set(row.po_number, row);
+            }
+
+            // Also fetch all tracking numbers from purchase_orders for the recent POs
+            const { data: poRows } = await supabase
+                .from('purchase_orders')
+                .select('po_number, tracking_numbers')
+                .in('po_number', pos.map(p => p.orderId).filter(Boolean));
+            const trackingMap = new Map<string, string[]>();
+            for (const row of poRows ?? []) {
+                trackingMap.set(row.po_number, row.tracking_numbers || []);
             }
 
             const calendar = new CalendarClient();
@@ -1491,7 +1841,13 @@ Data: ${JSON.stringify(data)}`;
                 }
 
                 const title = this.buildPOEventTitle(po);
-                const description = this.buildPOEventDescription(po, expectedDate, leadProvenance);
+
+                // Get tracking array for this PO
+                const trackingNumbers = trackingMap.get(po.orderId) || [];
+                // Sort tracking numbers for stable stringification
+                const trackingHash = trackingNumbers.slice().sort().join(',');
+
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers);
                 const newStatus = (po.status || '').toLowerCase() === 'completed' ? 'received'
                     : (po.status || '').toLowerCase() === 'cancelled' ? 'cancelled'
                         : 'open';
@@ -1511,14 +1867,15 @@ Data: ${JSON.stringify(data)}`;
                             event_id: eventId,
                             calendar_id: PURCHASING_CALENDAR_ID,
                             status: newStatus,
+                            last_tracking: trackingHash
                         });
                         counts.created++;
                         console.log(`📅 [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${expectedDate}`);
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (existingRow.status !== newStatus) {
-                    // Status changed — update in place
+                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
+                    // Status changed or tracking changed — update in place
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
                         existingRow.event_id,
@@ -1526,10 +1883,10 @@ Data: ${JSON.stringify(data)}`;
                         description
                     );
                     await supabase.from('purchasing_calendar_events')
-                        .update({ status: newStatus, updated_at: new Date().toISOString() })
+                        .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
                         .eq('po_number', po.orderId);
                     counts.updated++;
-                    console.log(`📅 [cal-sync] Updated event for PO #${po.orderId}: ${existingRow.status} → ${newStatus}`);
+                    console.log(`📅 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus}, tracking changed=${existingRow.last_tracking !== trackingHash}`);
                 } else {
                     counts.skipped++;
                 }

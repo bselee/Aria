@@ -88,30 +88,42 @@ export default function ReceivedItemsPanel() {
         window.addEventListener('mouseup', onUp);
     }, [bodyHeight]);
 
-    // Fetch real AP status from ap_activity_log
+    // Fetch real AP status directly from the invoices table (single source of truth)
     useEffect(() => {
         const supabase = createBrowserClient();
         supabase
-            .from("ap_activity_log")
-            .select("metadata,action_taken")
-            .eq("intent", "INVOICE")
+            .from("invoices")
+            .select("po_number, status, discrepancies")
+            .not("po_number", "is", null)
             .order("created_at", { ascending: false })
             .limit(200)
-            .then((res: { data: Array<{ metadata: any; action_taken: string }> | null }) => {
+            .then((res: { data: Array<{ po_number: string; status: string; discrepancies: any[] }> | null }) => {
                 const data = res.data;
                 if (!data) return;
                 const map: ApStatusMap = {};
                 for (const row of data) {
-                    const id = String(row.metadata?.orderId || "");
+                    const id = row.po_number;
                     if (!id || map[id]) continue;  // first (most recent) wins
-                    const a = (row.action_taken || "").toLowerCase();
-                    if (a.includes("pending") || a.includes("flagged") || a.includes("approval")) {
-                        map[id] = { label: "PENDING", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" };
-                    } else if (a.includes("applied") || a.includes("matched") || a.includes("reconcil")) {
-                        map[id] = { label: "MATCHED", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" };
-                    } else if (a.includes("forwarded") || a.includes("bill.com")) {
-                        map[id] = { label: "FWDED", cls: "text-blue-400 border-blue-500/20 bg-blue-500/5" };
+
+                    const st = row.status || "unmatched";
+                    let label = "UNMATCHED";
+                    let cls = "text-zinc-500 border-zinc-700 bg-zinc-800/20";
+
+                    if (st === "matched_review") {
+                        label = "PENDING";
+                        cls = "text-amber-300 border-amber-500/30 bg-amber-500/10";
+                    } else if (st === "reconciled" || st === "matched_approved") {
+                        const hasChanges = row.discrepancies && row.discrepancies.length > 0;
+                        label = hasChanges ? "RECONCILED ±" : "RECONCILED";
+                        cls = hasChanges
+                            ? "text-blue-400 border-blue-500/30 bg-blue-500/10"
+                            : "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
+                    } else if (st === "unmatched") {
+                        label = "UNMATCHED";
+                        cls = "text-zinc-400 border-zinc-500/30 bg-zinc-500/10";
                     }
+
+                    map[id] = { label, cls };
                 }
                 setApMap(map);
             });

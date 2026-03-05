@@ -34,7 +34,7 @@ type Status = "matched" | "pending" | "unmatched" | "forwarded" | "junk";
 
 function classify(log: LogEntry): Status {
   const a = log.action_taken.toLowerCase();
-  if (log.intent === "ADVERTISEMENT" || a.includes("archived") || a.includes("ignored")) return "junk";
+  if (log.intent === "ADVERTISEMENT" || a.includes("archived") || a.includes("ignored") || a.includes("unread")) return "junk";
   if (a.includes("pending") || a.includes("flagged") || a.includes("review") || a.includes("approval")) return "pending";
   if (a.includes("applied") || a.includes("reconcil") || a.includes("matched")) return "matched";
   if (a.includes("forwarded") || a.includes("bill.com")) return "forwarded";
@@ -90,8 +90,19 @@ export default function InvoiceQueuePanel() {
     return () => { supabase.removeChannel(sub); };
   }, []);
 
-  const pending = logs.filter(l => classify(l) === "pending");
-  const rest = logs.filter(l => classify(l) !== "pending" && classify(l) !== "junk");
+  // Deduplicate logs by email_from and email_subject to bundle repeated statuses
+  const uniqueLogs = Object.values(
+    logs.reduce((acc, log) => {
+      const key = `${log.email_from}-${log.email_subject}`;
+      if (!acc[key] || new Date(log.created_at) > new Date(acc[key].created_at)) {
+        acc[key] = log;
+      }
+      return acc;
+    }, {} as Record<string, LogEntry>)
+  ).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+  const pending = uniqueLogs.filter(l => classify(l) === "pending");
+  const rest = uniqueLogs.filter(l => classify(l) !== "pending" && classify(l) !== "junk");
 
   return (
     <div className="border-b border-zinc-800 shrink-0">

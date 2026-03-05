@@ -109,6 +109,9 @@ export interface PurchasingItem {
     suggestedQty: number;
     orderIncrementQty: number | null;  // "Std reorder in qty of" — snap order quantities to this multiple
     isBulkDelivery: boolean;           // true → route to Soil facility
+    finaleReorderQty: number | null;
+    finaleStockoutDays: number | null;
+    finaleConsumptionQty: number | null;
 }
 
 export interface PurchasingGroup {
@@ -3182,7 +3185,7 @@ export class FinaleClient {
 
         // Set the Purchase Destination if we resolved a valid facility URL
         if (facilityUrl) {
-            payload.originFacilityUrl = facilityUrl;
+            payload.destinationFacilityUrl = facilityUrl;
         }
 
         if (memo) payload.privateNotes = memo;
@@ -3376,7 +3379,7 @@ export class FinaleClient {
         //   - consumptionQuantity > 0     : BOM consumption (covers purchased components)
         // NOTE: consumptionQuantity alone misses purchased-for-resale items (boxes, packaging, etc.)
         // which have consumptionQuantity=0 but reorderQuantityToOrder>0 and demandQuantity>0.
-        const candidates: string[] = [];
+        const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null }> = [];
         let cursor: string | null = null;
 
         while (true) {
@@ -3385,7 +3388,7 @@ export class FinaleClient {
                 query: `{
                     productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
                         pageInfo { hasNextPage endCursor }
-                        edges { node { productId status consumptionQuantity reorderQuantityToOrder } }
+                        edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays } }
                     }
                 }`
             };
@@ -3404,16 +3407,20 @@ export class FinaleClient {
                 if (p.status !== 'Active') continue;
                 const consumption = this.parseFinaleNum(p.consumptionQuantity);
                 const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
-                if ((consumption !== null && consumption > 0) || (reorderQty !== null && reorderQty > 0)) {
-                    candidates.push(p.productId);
-                }
+                const stockoutDays = this.parseFinaleNum(p.stockoutDays);
+                candidates.push({
+                    productId: p.productId,
+                    finaleReorderQty: reorderQty,
+                    finaleStockoutDays: stockoutDays,
+                    finaleConsumptionQty: consumption
+                });
             }
 
             if (!conn.pageInfo.hasNextPage) break;
             cursor = conn.pageInfo.endCursor;
         }
 
-        console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates with consumption > 0`);
+        console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates found`);
         if (candidates.length === 0) return [];
 
         // ── Step 2-8: 5x concurrent workers per candidate SKU ──
@@ -3450,7 +3457,8 @@ export class FinaleClient {
         // 100ms inter-SKU pause spreads load to ~180 calls/min sustained — well within limits.
         await Promise.all(Array.from({ length: 3 }, async () => {
             while (queue.length > 0) {
-                const sku = queue.shift()!;
+                const candidate = queue.shift()!;
+                const sku = candidate.productId;
                 try {
                     // Step A: REST product data first — need supplier URL to check exclusions
                     // before spending any GraphQL calls on manufactured/dropship vendors.
@@ -3554,6 +3562,9 @@ export class FinaleClient {
                         suggestedQty,
                         orderIncrementQty,
                         isBulkDelivery,
+                        finaleReorderQty: candidate.finaleReorderQty,
+                        finaleStockoutDays: candidate.finaleStockoutDays,
+                        finaleConsumptionQty: candidate.finaleConsumptionQty,
                     });
                 } catch {
                     // Skip products that error — non-fatal

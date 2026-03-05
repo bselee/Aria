@@ -35,7 +35,7 @@ export async function POST(req: NextRequest) {
             }
 
             const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
-            const sendId = email ? storePendingPOSend(orderId, review, email, source) : null;
+            const sendId = storePendingPOSend(orderId, review, email, source);
 
             return NextResponse.json({ review, email, emailSource: source, sendId });
 
@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
                 );
             }
 
-            const result = await commitAndSendPO(sendId, 'dashboard');
+            const result = await commitAndSendPO(sendId, 'dashboard', body.skipEmail || false);
             return NextResponse.json(result);
 
         } else if (action === 'cancel') {

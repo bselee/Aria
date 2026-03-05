@@ -44,13 +44,13 @@ function getOpenRouterProvider() {
     });
     return [
         {
-            name: 'OpenRouter Gemini 2.5 Flash Lite',
-            model: () => openrouter('google/gemini-2.5-flash-lite'),
+            name: 'OpenRouter Claude 3.5 Haiku',
+            model: () => openrouter('anthropic/claude-3.5-haiku'),
             available: true,
         },
         {
-            name: 'OpenRouter Mistral Small 3.2',
-            model: () => openrouter('mistralai/mistral-small-3.2-24b-instruct'),
+            name: 'OpenRouter Llama 3.3 70B',
+            model: () => openrouter('meta-llama/llama-3.3-70b-instruct'),
             available: true,
         },
     ];
@@ -77,6 +77,25 @@ function getProviderChain(): ProviderEntry[] {
     ].filter(p => p.available);
 }
 
+// Circuit Breaker: Track dead providers globally to prevent endless fail loops on big batches
+const deadProviders = new Map<string, number>();
+const DEAD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+function isProviderDead(name: string): boolean {
+    const deadUntil = deadProviders.get(name);
+    if (!deadUntil) return false;
+    if (Date.now() > deadUntil) {
+        deadProviders.delete(name);
+        return false;
+    }
+    return true;
+}
+
+function markProviderDead(name: string, reason: string) {
+    console.warn(`🛑 Circuit breaking ${name} for 5 minutes. Reason: ${reason}`);
+    deadProviders.set(name, Date.now() + DEAD_TIMEOUT_MS);
+}
+
 /**
  * Generates raw text using the provider fallback chain.
  * Tries each available provider in order until one succeeds.
@@ -92,16 +111,28 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
 
     for (let i = 0; i < providers.length; i++) {
         const provider = providers[i];
+
+        if (isProviderDead(provider.name)) {
+            continue;
+        }
+
         try {
             const { text } = await generateText({
                 model: provider.model(),
                 system: options.system,
                 temperature: options.temperature,
+                maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
             } as any);
             return text;
         } catch (err: any) {
             lastError = err;
+
+            // If quota out, mark dead
+            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("429"))) {
+                markProviderDead(provider.name, err.message);
+            }
+
             const next = providers[i + 1];
             if (next) {
                 console.warn(`⚠️ ${provider.name} failed: ${err.message}. Falling back to ${next.name}...`);
@@ -130,6 +161,11 @@ export async function unifiedObjectGeneration<T>(
 
     for (let i = 0; i < providers.length; i++) {
         const provider = providers[i];
+
+        if (isProviderDead(provider.name)) {
+            continue;
+        }
+
         try {
             const { object } = await (generateObject({
                 model: provider.model(),
@@ -137,6 +173,7 @@ export async function unifiedObjectGeneration<T>(
                 schemaName: options.schemaName,
                 system: options.system,
                 temperature: options.temperature,
+                maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 // Disable strict JSON schema for OpenAI-compatible endpoints (allows optional/nullable fields)
                 providerOptions: { openai: { strictJsonSchema: false } },
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
@@ -144,6 +181,12 @@ export async function unifiedObjectGeneration<T>(
             return object;
         } catch (err: any) {
             lastError = err;
+
+            // If quota out, mark dead
+            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("balance") || err.message.includes("429"))) {
+                markProviderDead(provider.name, err.message);
+            }
+
             const next = providers[i + 1];
             if (next) {
                 console.warn(`⚠️ ${provider.name} failed: ${err.message}. Falling back to ${next.name}...`);

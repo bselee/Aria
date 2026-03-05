@@ -13,6 +13,7 @@ type PurchasingItem = {
     urgency: "critical" | "warning" | "watch" | "ok";
     explanation: string; suggestedQty: number;
     orderIncrementQty: number | null; isBulkDelivery: boolean;
+    finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
 };
 type PurchasingGroup = {
     vendorName: string; vendorPartyId: string;
@@ -38,16 +39,16 @@ type SnoozeMap = Record<string, SnoozeEntry>;
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
 const URGENCY_RANK = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
 const URGENCY = {
-    critical: { badge: "bg-rose-500/20 text-rose-300 border-rose-500/40", dot: "bg-rose-500", label: "CRIT", tab: "border-rose-500 text-rose-300" },
-    warning:  { badge: "bg-amber-500/20 text-amber-300 border-amber-500/40", dot: "bg-amber-400", label: "WARN", tab: "border-amber-400 text-amber-300" },
-    watch:    { badge: "bg-blue-500/20 text-blue-300 border-blue-500/40",   dot: "bg-blue-400",  label: "WTCH", tab: "border-blue-400 text-blue-300" },
-    ok:       { badge: "bg-zinc-700/50 text-zinc-400 border-zinc-600/40",   dot: "bg-zinc-500",  label: "OK",   tab: "border-zinc-500 text-zinc-400" },
+    critical: { badge: "bg-red-500/20 text-red-300 border-red-500/40", dot: "bg-red-500", label: "CRIT", tab: "border-red-500 text-red-300" },
+    warning: { badge: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40", dot: "bg-yellow-400", label: "WARN", tab: "border-yellow-400 text-yellow-300" },
+    watch: { badge: "bg-green-500/20 text-green-300 border-green-500/40", dot: "bg-green-500", label: "WTCH", tab: "border-green-500 text-green-300" },
+    ok: { badge: "bg-zinc-700/50 text-zinc-400 border-zinc-600/40", dot: "bg-zinc-500", label: "OK", tab: "border-zinc-500 text-zinc-400" },
 } as const;
 
 function runwayColor(days: number) {
-    if (days < 14) return "text-rose-400 font-semibold";
-    if (days < 45) return "text-amber-400 font-semibold";
-    if (days < 90) return "text-blue-400";
+    if (days < 14) return "text-red-400 font-semibold";
+    if (days < 45) return "text-yellow-400 font-semibold";
+    if (days < 90) return "text-green-400";
     return "text-zinc-500";
 }
 function timeAgo(iso: string) {
@@ -108,7 +109,7 @@ export default function PurchasingPanel() {
             }
             setSnooze(cleaned);
             localStorage.setItem(SNOOZE_LS, JSON.stringify(cleaned));
-        } catch {}
+        } catch { }
     }, []);
 
     const startResize = useCallback((e: React.MouseEvent) => {
@@ -304,14 +305,14 @@ export default function PurchasingPanel() {
         }
     }
 
-    async function handleConfirmSend() {
+    async function handleConfirmSend(skipEmail: boolean = false) {
         if (!commitModal?.sendId) return;
         setSendingPO(true);
         try {
             const res = await fetch('/api/dashboard/purchasing/commit', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'send', sendId: commitModal.sendId }),
+                body: JSON.stringify({ action: 'send', sendId: commitModal.sendId, skipEmail }),
             });
             const json = await res.json();
             if (!res.ok) { setError(json.error || 'Send failed'); return; }
@@ -330,7 +331,7 @@ export default function PurchasingPanel() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action: 'cancel', sendId: commitModal.sendId }),
-            }).catch(() => {});
+            }).catch(() => { });
         }
         setCommitModal(null);
     }
@@ -388,11 +389,11 @@ export default function PurchasingPanel() {
                             {commitModal.email ? (
                                 <span className="text-zinc-400">To: <span className="text-zinc-200">{commitModal.email}</span> <span className="text-zinc-600">({commitModal.emailSource})</span></span>
                             ) : (
-                                <span className="text-amber-400">⚠ No vendor email on file — cannot send</span>
+                                <span className="text-amber-400">⚠ No vendor email on file. You can still commit the PO to Finale.</span>
                             )}
                         </div>
                         {commitModal.email && (
-                            <div className="px-4 py-2 text-[10px] font-mono text-amber-500/80 border-t border-zinc-800/40">
+                            <div className="px-4 py-2 text-[10px] font-mono text-amber-500/80 border-t border-zinc-800/40 bg-amber-500/10">
                                 ⚠ This will commit the PO in Finale AND email the vendor.
                             </div>
                         )}
@@ -401,14 +402,21 @@ export default function PurchasingPanel() {
                                 className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
                                 Cancel
                             </button>
+                            <button
+                                onClick={() => handleConfirmSend(true)}
+                                disabled={sendingPO}
+                                className="text-[11px] font-mono px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors disabled:opacity-40"
+                            >
+                                Commit Only
+                            </button>
                             {commitModal.email && (
                                 <button
-                                    onClick={handleConfirmSend}
+                                    onClick={() => handleConfirmSend(false)}
                                     disabled={sendingPO}
                                     className="text-[11px] font-mono px-4 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
                                 >
                                     {sendingPO && <div className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />}
-                                    {sendingPO ? 'Sending…' : '✅ Confirm Send'}
+                                    {sendingPO ? 'Sending…' : '✅ Commit & Email Vendor'}
                                 </button>
                             )}
                         </div>
@@ -430,12 +438,12 @@ export default function PurchasingPanel() {
                 <div className="flex-1" />
 
                 {critCount > 0 && (
-                    <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-rose-500/20 text-rose-300 border-rose-500/40">
+                    <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-red-500/20 text-red-300 border-red-500/40">
                         {critCount} CRIT
                     </span>
                 )}
                 {warnCount > 0 && (
-                    <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-300 border-amber-500/40">
+                    <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
                         {warnCount} WARN
                     </span>
                 )}
@@ -444,11 +452,10 @@ export default function PurchasingPanel() {
                 {hiddenItemCount > 0 && (
                     <button
                         onClick={() => setShowSnoozed(s => !s)}
-                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                            showSnoozed
-                                ? "bg-zinc-700 text-zinc-300 border-zinc-600"
-                                : "bg-transparent text-zinc-600 border-zinc-800 hover:text-zinc-400 hover:border-zinc-700"
-                        }`}
+                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${showSnoozed
+                            ? "bg-zinc-700 text-zinc-300 border-zinc-600"
+                            : "bg-transparent text-zinc-600 border-zinc-800 hover:text-zinc-400 hover:border-zinc-700"
+                            }`}
                         title={showSnoozed ? "Hide snoozed" : "Show snoozed items"}
                     >
                         <Eye className="w-2.5 h-2.5" />
@@ -493,11 +500,10 @@ export default function PurchasingPanel() {
                         <div className="flex items-center border-b border-zinc-800/60 bg-zinc-950/30 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                             <button
                                 onClick={() => setVendorTab("all")}
-                                className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 ${
-                                    vendorTab === "all"
-                                        ? "border-zinc-400 text-zinc-300 bg-zinc-800/30"
-                                        : "border-transparent text-zinc-600 hover:text-zinc-400"
-                                }`}
+                                className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 ${vendorTab === "all"
+                                    ? "border-zinc-400 text-zinc-300 bg-zinc-800/30"
+                                    : "border-transparent text-zinc-600 hover:text-zinc-400"
+                                    }`}
                             >
                                 All <span className="opacity-60">{activeGroups.length}</span>
                             </button>
@@ -511,13 +517,12 @@ export default function PurchasingPanel() {
                                 return (
                                     <button key={g.vendorPartyId}
                                         onClick={() => setVendorTab(g.vendorPartyId)}
-                                        className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 flex items-center gap-1 ${
-                                            vSnoozed
-                                                ? "border-transparent text-zinc-700 hover:text-zinc-500"
-                                                : isActive
-                                                    ? `${cfg.tab} bg-zinc-800/30`
-                                                    : "border-transparent text-zinc-600 hover:text-zinc-400"
-                                        }`}
+                                        className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 flex items-center gap-1 ${vSnoozed
+                                            ? "border-transparent text-zinc-700 hover:text-zinc-500"
+                                            : isActive
+                                                ? `${cfg.tab} bg-zinc-800/30`
+                                                : "border-transparent text-zinc-600 hover:text-zinc-400"
+                                            }`}
                                     >
                                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
                                         <span className={vSnoozed ? "line-through" : ""}>
@@ -630,11 +635,10 @@ export default function PurchasingPanel() {
                                                             <button
                                                                 onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
                                                                 disabled={anyCreating}
-                                                                className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${
-                                                                    selectedCount > 0
-                                                                        ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
-                                                                        : "bg-transparent text-zinc-600 border-zinc-800"
-                                                                }`}
+                                                                className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
+                                                                    ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
+                                                                    : "bg-transparent text-zinc-600 border-zinc-800"
+                                                                    }`}
                                                             >
                                                                 {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
                                                                 {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
@@ -712,97 +716,125 @@ export default function PurchasingPanel() {
 
                                                             return (
                                                                 <div key={iKey}
-                                                                    className={`px-4 py-2 border-b border-zinc-800/20 last:border-0 ${
-                                                                        itemSnoozed ? "opacity-35" : isChecked ? "" : "opacity-50"
-                                                                    }`}>
-                                                                    {/* Row 1: checkbox · dot · name · badges · sku · runway · snooze */}
-                                                                    <div className="flex items-center gap-2">
-                                                                        {itemSnoozed
-                                                                            ? <span className="w-3 h-3 shrink-0" />
-                                                                            : (
-                                                                                <input type="checkbox" checked={isChecked}
-                                                                                    onChange={() => toggleItem(pid, iKey)}
-                                                                                    className={`w-3 h-3 rounded shrink-0 ${
-                                                                                        item.urgency === "critical" ? "accent-rose-400"
-                                                                                        : item.urgency === "warning" ? "accent-amber-400"
+                                                                    className={`px-4 py-3 border-b border-zinc-800/20 last:border-0 ${itemSnoozed ? "opacity-35" : isChecked ? "" : "opacity-50"
+                                                                        }`}>
+                                                                    <div className="flex items-start gap-3">
+                                                                        {!itemSnoozed && (
+                                                                            <input type="checkbox" checked={isChecked}
+                                                                                onChange={() => toggleItem(pid, iKey)}
+                                                                                className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
+                                                                                    : item.urgency === "warning" ? "accent-yellow-400"
                                                                                         : "accent-zinc-400"
                                                                                     }`} />
-                                                                            )
-                                                                        }
-                                                                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${itemSnoozed ? "bg-zinc-700" : URGENCY[item.urgency].dot}`} />
-                                                                        <span className={`text-xs font-mono flex-1 truncate ${itemSnoozed ? "line-through text-zinc-600" : "text-zinc-200"}`}>
-                                                                            {item.productName}
-                                                                        </span>
-                                                                        {itemSnoozed && (
-                                                                            <span className="text-[9px] font-mono text-zinc-600 shrink-0">
-                                                                                {snoozeLabel(iKey)}
-                                                                            </span>
                                                                         )}
-                                                                        {isBundle && (
-                                                                            <span className="text-[9px] font-mono text-blue-500/70 border border-blue-500/20 rounded px-1 shrink-0">
-                                                                                bundle?
-                                                                            </span>
-                                                                        )}
-                                                                        <span className="text-[10px] font-mono text-zinc-600 shrink-0">{item.productId}</span>
-                                                                        {!itemSnoozed && (
-                                                                            <span className={`text-[11px] font-mono shrink-0 ${rc}`}>
-                                                                                {Math.round(item.runwayDays)}d
-                                                                                {item.stockOnOrder > 0 && (
-                                                                                    <span className="text-zinc-600 font-normal text-[10px]">
-                                                                                        {" "}→{Math.round(item.adjustedRunwayDays)}d
+                                                                        {itemSnoozed && <div className="mt-1 w-3.5 h-3.5" />}
+
+                                                                        <div className="flex-1 min-w-0">
+                                                                            {/* Row 1: Dot · SKU · Badges · Runway · Snooze */}
+                                                                            <div className="flex items-center gap-2">
+                                                                                <span className={`w-2 h-2 rounded-full shrink-0 ${itemSnoozed ? "bg-zinc-700" : URGENCY[item.urgency].dot}`} />
+                                                                                <span className={`text-sm font-mono font-bold truncate ${itemSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
+                                                                                    {item.productId}
+                                                                                </span>
+
+                                                                                {itemSnoozed && (
+                                                                                    <span className="text-[9px] font-mono text-zinc-600 shrink-0">
+                                                                                        {snoozeLabel(iKey)}
                                                                                     </span>
                                                                                 )}
-                                                                            </span>
-                                                                        )}
-                                                                        {/* Item snooze button */}
-                                                                        <div className="relative shrink-0">
-                                                                            <button
-                                                                                onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === iKey ? null : iKey); }}
-                                                                                className={`text-[11px] font-mono transition-colors ${
-                                                                                    itemSnoozed
-                                                                                        ? "text-zinc-600 hover:text-emerald-400"
-                                                                                        : "text-zinc-700 hover:text-zinc-400"
-                                                                                }`}
-                                                                                title={itemSnoozed ? "Unsnooze" : "Snooze this item"}
-                                                                            >{itemSnoozed ? "↩" : "···"}</button>
-                                                                            {snoozeMenu === iKey && renderSnoozeMenu(iKey)}
+                                                                                {isBundle && (
+                                                                                    <span className="text-[9px] font-mono text-blue-500/70 border border-blue-500/20 rounded px-1 shrink-0">
+                                                                                        bundle?
+                                                                                    </span>
+                                                                                )}
+
+                                                                                <div className="flex-1" />
+
+                                                                                {!itemSnoozed && (
+                                                                                    <span className={`text-[11px] font-mono shrink-0 ${rc}`}>
+                                                                                        Out in {Math.round(item.runwayDays)}d
+                                                                                        {item.stockOnOrder > 0 && (
+                                                                                            <span className="text-zinc-600 font-normal text-[10px]">
+                                                                                                {" "}→{Math.round(item.adjustedRunwayDays)}d
+                                                                                            </span>
+                                                                                        )}
+                                                                                    </span>
+                                                                                )}
+
+                                                                                <div className="relative shrink-0 ml-1">
+                                                                                    <button
+                                                                                        onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === iKey ? null : iKey); }}
+                                                                                        className={`text-[11px] font-mono transition-colors ${itemSnoozed
+                                                                                            ? "text-zinc-600 hover:text-emerald-400"
+                                                                                            : "text-zinc-700 hover:text-zinc-400"
+                                                                                            }`}
+                                                                                        title={itemSnoozed ? "Unsnooze" : "Snooze this item"}
+                                                                                    >{itemSnoozed ? "↩" : "···"}</button>
+                                                                                    {snoozeMenu === iKey && renderSnoozeMenu(iKey)}
+                                                                                </div>
+                                                                            </div>
+
+                                                                            {/* Row 2: Description & Amount */}
+                                                                            {!itemSnoozed && (
+                                                                                <div className="flex items-center gap-2 mt-1">
+                                                                                    <span className="text-[11px] font-mono text-zinc-400 flex-1 truncate">{item.productName}</span>
+                                                                                    {item.unitPrice > 0 ? (
+                                                                                        <span className="text-[11px] font-mono text-emerald-400 font-semibold shrink-0">
+                                                                                            ${item.unitPrice.toFixed(2)}/ea
+                                                                                        </span>
+                                                                                    ) : (
+                                                                                        <span className="text-[11px] font-mono text-zinc-600 shrink-0">
+                                                                                            $0.00
+                                                                                        </span>
+                                                                                    )}
+                                                                                </div>
+                                                                            )}
+
+                                                                            {/* Row 3: Details & Qty */}
+                                                                            {!itemSnoozed && (
+                                                                                <div className="flex items-center justify-between gap-2 mt-2">
+                                                                                    <div className="flex flex-col gap-1">
+                                                                                        <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-500">
+                                                                                            <span>{item.dailyRate.toFixed(1)}/day</span>
+                                                                                            <span>·</span>
+                                                                                            <span>{Math.round(item.stockOnHand)} on hand</span>
+                                                                                        </div>
+                                                                                        {(item.finaleReorderQty ?? 0) > 0 && (
+                                                                                            <div className="flex items-center gap-1.5 mt-0.5">
+                                                                                                <Zap className="w-3 h-3 text-cyan-500" />
+                                                                                                <span className="text-[10px] font-mono text-cyan-500/80 italic">
+                                                                                                    Finale Reorder: {item.finaleReorderQty}
+                                                                                                </span>
+                                                                                            </div>
+                                                                                        )}
+                                                                                    </div>
+                                                                                    <div className="flex items-center gap-2">
+                                                                                        <label className="flex items-center gap-1.5 shrink-0">
+                                                                                            <span className="text-[10px] font-mono text-zinc-500">qty</span>
+                                                                                            <input
+                                                                                                type="number" min={1} value={qty}
+                                                                                                onChange={e => setQty(pid, iKey, parseInt(e.target.value) || 1)}
+                                                                                                onClick={e => e.stopPropagation()}
+                                                                                                className="w-16 px-1.5 py-0.5 text-[11px] font-mono bg-zinc-900 border border-zinc-700 hover:border-zinc-500 rounded text-zinc-200 focus:outline-none focus:border-emerald-500 text-right transition-colors"
+                                                                                            />
+                                                                                        </label>
+                                                                                        {item.unitPrice > 0 && (
+                                                                                            <span className="text-[11px] font-mono text-zinc-300 font-semibold shrink-0 w-16 text-right">
+                                                                                                = ${(qty * item.unitPrice).toFixed(0)}
+                                                                                            </span>
+                                                                                        )}
+                                                                                    </div>
+                                                                                </div>
+                                                                            )}
+
+                                                                            {/* Row 4: Explanation */}
+                                                                            {!itemSnoozed && (
+                                                                                <div className="mt-1.5 text-[10px] font-mono text-zinc-600 italic">
+                                                                                    {item.explanation}
+                                                                                </div>
+                                                                            )}
                                                                         </div>
                                                                     </div>
-
-                                                                    {/* Row 2 + 3 — hidden when item is snoozed */}
-                                                                    {!itemSnoozed && (
-                                                                        <>
-                                                                            <div className="flex items-center gap-2 mt-1 pl-8 text-[10px] font-mono">
-                                                                                <span className="text-zinc-600">{item.dailyRate.toFixed(1)}/day</span>
-                                                                                <span className="text-zinc-700">·</span>
-                                                                                <span className="text-zinc-600">{Math.round(item.stockOnHand)} on hand</span>
-                                                                                {item.unitPrice > 0 && (
-                                                                                    <>
-                                                                                        <span className="text-zinc-700">·</span>
-                                                                                        <span className="text-zinc-700">${item.unitPrice.toFixed(2)}/ea</span>
-                                                                                    </>
-                                                                                )}
-                                                                                <div className="flex-1" />
-                                                                                <label className="flex items-center gap-1 shrink-0">
-                                                                                    <span className="text-zinc-600">qty</span>
-                                                                                    <input
-                                                                                        type="number" min={1} value={qty}
-                                                                                        onChange={e => setQty(pid, iKey, parseInt(e.target.value) || 1)}
-                                                                                        onClick={e => e.stopPropagation()}
-                                                                                        className="w-16 px-1.5 py-0.5 text-[10px] font-mono bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:border-zinc-500 text-right"
-                                                                                    />
-                                                                                </label>
-                                                                                {item.unitPrice > 0 && (
-                                                                                    <span className="text-zinc-700 shrink-0 w-14 text-right">
-                                                                                        =${(qty * item.unitPrice).toFixed(0)}
-                                                                                    </span>
-                                                                                )}
-                                                                            </div>
-                                                                            <div className="mt-0.5 pl-8 text-[10px] font-mono text-zinc-600 italic">
-                                                                                {item.explanation}
-                                                                            </div>
-                                                                        </>
-                                                                    )}
                                                                 </div>
                                                             );
                                                         })}

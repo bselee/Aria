@@ -55,6 +55,7 @@ import {
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
 const openaiKey = process.env.OPENAI_API_KEY;
+const openrouterKey = process.env.OPENROUTER_API_KEY;
 const perplexityKey = process.env.PERPLEXITY_API_KEY;
 
 if (!token) {
@@ -63,7 +64,21 @@ if (!token) {
 }
 
 const bot = new Telegraf(token);
-const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
+
+// Route main chat through OpenRouter first, fallback to OpenAI if no key
+const openai = openrouterKey
+    ? new OpenAI({
+        apiKey: openrouterKey,
+        baseURL: 'https://openrouter.ai/api/v1',
+        defaultHeaders: {
+            "HTTP-Referer": "https://buildasoil.com",
+            "X-Title": "Aria Bot",
+        }
+    })
+    : (openaiKey ? new OpenAI({ apiKey: openaiKey }) : null);
+
+// Use Haiku via OR, or GPT-4o if stuck on raw OpenAI API
+const CHAT_MODEL = openrouterKey ? 'anthropic/claude-3.5-haiku' : 'gpt-4o';
 const perplexity = perplexityKey ? new OpenAI({
     apiKey: perplexityKey,
     baseURL: 'https://api.perplexity.ai'
@@ -1573,7 +1588,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                                             { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
                                         ]],
                                     },
-                                }).catch(() => {});
+                                }).catch(() => { });
                             } catch (e: any) {
                                 created.push(`❌ ${group.vendorName}: ${e.message}`);
                             }
@@ -2083,7 +2098,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             ];
 
             const response = await openai.chat.completions.create({
-                model: "gpt-4o",
+                model: CHAT_MODEL,
                 messages: [
                     {
                         role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules
@@ -2206,7 +2221,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                                                     { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
                                                 ]],
                                             },
-                                        }).catch(() => {});
+                                        }).catch(() => { });
                                     }
                                 } catch (e: any) {
                                     created.push(`❌ ${group.vendorName}: ${e.message}`);
@@ -2290,7 +2305,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 }
 
                 const finalRes = await openai.chat.completions.create({
-                    model: "gpt-4o",
+                    model: CHAT_MODEL,
                     messages: [
                         { role: "system", content: SYSTEM_PROMPT },
                         ...chatHistory[chatId],
@@ -2640,7 +2655,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                         source: 'telegram',
                         priority: 'normal',
                     });
-                } catch {}
+                } catch { }
             });
         } catch (err: any) {
             await ctx.reply(`❌ Failed to commit/send PO: ${err.message}`);
@@ -2698,7 +2713,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     }
 
     console.log('📅 Cron schedules registered:');
-    console.log('   🏭 Build Risk Report: 7:30 AM MT (Mon-Fri)');
+
     console.log('   📊 Daily PO Summary:  8:00 AM MT (Daily)');
     console.log('   🗓️  Weekly Review:     8:01 AM MT (Fridays)');
     console.log('   📦 PO Sync:           Every 30 min');
