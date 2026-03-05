@@ -115,7 +115,13 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
         console.log("🕵️‍♀️ [AP-Agent] Scanning ap@buildasoil.com for new invoices...");
         try {
             // "ap" designates the target token path (token-ap.json)
-            const auth = await getAuthenticatedClient("ap");
+            let auth;
+            try {
+                auth = await getAuthenticatedClient("ap");
+            } catch (err: any) {
+                console.warn("   ⚠️ Missing 'ap' token, falling back to 'default' token...");
+                auth = await getAuthenticatedClient("default");
+            }
             const gmail = google.gmail({ version: "v1", auth });
             const supabase = createClient();
 
