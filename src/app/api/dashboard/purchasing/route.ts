@@ -32,7 +32,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
         }
 
         const client = new FinaleClient();
-        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo);
+        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
 
         // Invalidate cache so next GET reflects the new PO
         cache = null;

@@ -100,7 +100,7 @@ async function main() {
             hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver'
         });
 
-        const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/view/build/${Buffer.from(build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`).toString('base64')}`;
+        const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/detail/${Buffer.from(build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`).toString('base64')}`;
 
         const scheduledQty = matched?.quantity ?? null;
         let title: string;

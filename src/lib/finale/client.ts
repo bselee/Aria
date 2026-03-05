@@ -64,7 +64,7 @@ export interface ReceivedPO {
     receiveDate: string;
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number }>;
+    items: Array<{ productId: string; quantity: number; orderedQuantity?: number }>;
     finaleUrl: string;
 }
 
@@ -77,6 +77,8 @@ export interface ExternalReorderItem {
     supplierName: string;
     unitPrice: number;
     isManufactured: boolean;      // always false for items in ExternalReorderGroup
+    orderIncrementQty: number | null;  // "Std reorder in qty of" from Finale — snap quantities to this multiple
+    isBulkDelivery: boolean;           // true → route to Soil facility instead of Shipping
 }
 
 export interface ExternalReorderGroup {
@@ -105,6 +107,8 @@ export interface PurchasingItem {
     urgency: 'critical' | 'warning' | 'watch' | 'ok';
     explanation: string;           // natural language, computed server-side
     suggestedQty: number;
+    orderIncrementQty: number | null;  // "Std reorder in qty of" — snap order quantities to this multiple
+    isBulkDelivery: boolean;           // true → route to Soil facility
 }
 
 export interface PurchasingGroup {
@@ -124,6 +128,17 @@ export interface FullPO {
     total: number;
     items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
+}
+
+export interface DraftPOReview {
+    orderId: string;
+    vendorName: string;
+    vendorPartyId: string;
+    orderDate: string;
+    total: number;
+    items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number }>;
+    finaleUrl: string;
+    canCommit: boolean;   // true only if statusId === 'ORDER_CREATED'
 }
 
 export interface ConsumptionReport {
@@ -154,6 +169,24 @@ function parseFinaleNumber(val: string | number | null | undefined): number {
     return isNaN(num) ? 0 : num;
 }
 
+/**
+ * DECISION(2026-03-04): Purchase Destination routing.
+ * Finale POs use `originFacilityUrl` to set where received goods go.
+ * Two destinations at BAS: "Shipping" (default) and "Soil" (bulk/raw).
+ * Bulk detection infers Soil routing from product characteristics:
+ *   - Product name contains: tote, bulk, raw, pallet, super sack, truckload
+ *   - Packing string implies >2000 lbs or yard/ton/CY units
+ *   - Multiple large-format items ordered together
+ * Override via optional `purchaseDestination` param on createDraftPurchaseOrder.
+ */
+
+/** Facility URL cache — module-level so it persists across FinaleClient instances. */
+interface FacilityInfo {
+    url: string;   // e.g. "/buildasoilorganics/api/facility/12345"
+    name: string;  // e.g. "Shipping", "Soil"
+}
+let _facilityCache: FacilityInfo[] | null = null;
+
 export class FinaleClient {
     private authHeader: string;
     private apiBase: string;
@@ -181,6 +214,490 @@ export class FinaleClient {
         } catch (err: any) {
             console.error("❌ Finale connection failed:", err.message);
             return false;
+        }
+    }
+
+    /**
+     * Fetch and cache all Finale facility URLs.
+     * Used to set `originFacilityUrl` (Purchase Destination) on POs.
+     * Typically returns: Shipping, Soil, and any other configured locations.
+     */
+    async getFacilities(): Promise<FacilityInfo[]> {
+        if (_facilityCache) return _facilityCache;
+
+        try {
+            const data = await this.get(`/${this.accountPath}/api/facility`);
+            // Finale often returns parallel collections ({ facilityId: [...], facilityUrl: [...] })
+            let facilities: FacilityInfo[] = [];
+
+            if (Array.isArray(data)) {
+                facilities = data.map((f: any) => ({
+                    url: f.facilityUrl || f.url || `/${this.accountPath}/api/facility/${f.facilityId}`,
+                    name: f.facilityName || f.name || f.facilityId || 'Unknown',
+                }));
+            } else if (data && Array.isArray(data.facilityId)) {
+                for (let i = 0; i < data.facilityId.length; i++) {
+                    facilities.push({
+                        url: data.facilityUrl?.[i] || `/${this.accountPath}/api/facility/${data.facilityId[i]}`,
+                        name: data.facilityName?.[i] || data.facilityId[i] || 'Unknown',
+                    });
+                }
+            } else {
+                const list: any[] = data?.facilityList || [];
+                facilities = list.map((f: any) => ({
+                    url: f.facilityUrl || f.url || `/${this.accountPath}/api/facility/${f.facilityId}`,
+                    name: f.facilityName || f.name || f.facilityId || 'Unknown',
+                }));
+            }
+
+            _facilityCache = facilities;
+
+            console.log(`[finale] getFacilities: found ${_facilityCache.length} facilities: ${_facilityCache.map(f => f.name).join(', ')}`);
+            return _facilityCache;
+        } catch (err: any) {
+            console.warn(`[finale] getFacilities failed: ${err.message}`);
+            return [];
+        }
+    }
+
+    /**
+     * Resolve a facility URL by name (case-insensitive partial match).
+     * Returns null if the facility isn't found — callers should omit the field in that case.
+     *
+     * @param name - Facility name to match, e.g. "Shipping" or "Soil"
+     */
+    async getFacilityUrl(name: string): Promise<string | null> {
+        const facilities = await this.getFacilities();
+        const nameLower = name.toLowerCase();
+        const match = facilities.find(f => f.name.toLowerCase().includes(nameLower));
+        return match?.url ?? null;
+    }
+
+    /**
+     * Infer whether a product is a "bulk delivery" item that should route to the Soil facility.
+     *
+     * DECISION(2026-03-04): Bulk detection heuristics — ordered by strongest signal:
+     * 1. Product name contains: tote, bulk, raw, pallet, super sack, truckload, yard, CY
+     * 2. Packing string implies large format (>2000 lbs, ton, yard, CY units)
+     * 3. Category includes "raw" or "bulk"
+     *
+     * Default is Shipping — Soil only when we have strong signal.
+     * Override is always available via the `purchaseDestination` param.
+     *
+     * @param productData - Raw product data from Finale REST API
+     * @returns true if item should route to Soil facility
+     */
+    static isBulkDelivery(productData: {
+        productId?: string;
+        internalName?: string;
+        normalizedPackingString?: string;
+        userCategory?: string;
+    }): boolean {
+        const name = (productData.internalName || productData.productId || '').toLowerCase();
+        const packing = (productData.normalizedPackingString || '').toLowerCase();
+        const category = (productData.userCategory || '').toLowerCase();
+
+        // Strong signal: product name directly indicates bulk
+        const bulkNamePatterns = /\b(tote|bulk|raw|pallet|super\s*sack|truckload|truck\s*load|yard|cubic\s*yard|\bcy\b|tanker)\b/;
+        if (bulkNamePatterns.test(name)) return true;
+
+        // Packing string weight check — anything ≥2000 lbs is bulk
+        const weightMatch = packing.match(/(\d[\d,.]*)\s*(lb|lbs|pound|pounds)/i);
+        if (weightMatch) {
+            const weight = parseFloat(weightMatch[1].replace(/,/g, ''));
+            if (weight >= 2000) return true;
+        }
+
+        // Packing string with ton/yard/CY units
+        if (/\b(ton|tons|yard|yards|\bcy\b|cubic\s*yard)\b/.test(packing)) return true;
+
+        // Category-based signal
+        if (/\b(raw|bulk)\b/.test(category)) return true;
+
+        return false;
+    }
+
+    /**
+     * Round a quantity UP to the nearest multiple of the order increment.
+     * If increment is null/0/1, returns the original quantity unchanged.
+     *
+     * Examples with increment=80:
+     *   40 → 80, 80 → 80, 120 → 160, 200 → 200
+     *
+     * @param quantity        - Raw calculated reorder quantity
+     * @param incrementQty   - "Std reorder in qty of" from Finale product
+     * @returns Snapped quantity (always >= increment if increment is set)
+     */
+    static snapToIncrement(quantity: number, incrementQty: number | null): number {
+        if (!incrementQty || incrementQty <= 1) return quantity;
+        return Math.max(incrementQty, Math.ceil(quantity / incrementQty) * incrementQty);
+    }
+
+    /**
+     * Check whether a Finale product is flagged "Do not reorder".
+     *
+     * DECISION(2026-03-04): Products marked "Do not reorder" in Finale should be
+     * excluded from ALL reorder assessments and draft PO creation. We check
+     * multiple possible locations since Finale's storage varies:
+     *   - `reorderPointPolicy` field (e.g. "DO_NOT_REORDER", "doNotReorder")
+     *   - `doNotReorder` boolean field
+     *   - Product name or description containing "do not reorder" (case-insensitive)
+     *   - `userFieldDataList` entries with "do not reorder" values
+     *
+     * @param productData - Raw product data from Finale REST API
+     * @returns true if the product should NOT be included in reorder calculations
+     */
+    static isDoNotReorder(productData: any): boolean {
+        if (!productData) return false;
+
+        // Check reorderPointPolicy field (Finale's primary mechanism)
+        const policy = String(productData.reorderPointPolicy || '').toLowerCase();
+        if (policy.includes('do_not_reorder') || policy.includes('donotreorder') || policy.includes('do not reorder')) {
+            return true;
+        }
+
+        // Check explicit boolean field
+        if (productData.doNotReorder === true) return true;
+
+        // Check product name and description for "do not reorder" text
+        const name = String(productData.internalName || productData.productId || '').toLowerCase();
+        const desc = String(productData.description || productData.longDescription || '').toLowerCase();
+        if (name.includes('do not reorder') || desc.includes('do not reorder')) return true;
+
+        // Check user-defined fields for "do not reorder" flag
+        const userFields: any[] = productData.userFieldDataList || [];
+        for (const field of userFields) {
+            const val = String(field.value || field.userFieldValue || '').toLowerCase();
+            if (val.includes('do not reorder')) return true;
+        }
+
+        return false;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PURCHASING INTELLIGENCE METHODS
+    // DECISION(2026-03-04): Five new methods for proactive purchasing alerts.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Check for existing open/committed POs from the same vendor that overlap
+     * with the items about to be ordered. Prevents accidental double-ordering.
+     *
+     * @param vendorPartyId - Finale party URL or ID for the vendor
+     * @param productIds    - Array of SKUs being ordered
+     * @returns Array of overlapping POs with their shared SKUs (empty = no dups)
+     */
+    async checkDuplicatePOs(
+        vendorPartyId: string,
+        productIds: string[]
+    ): Promise<Array<{ orderId: string; status: string; orderDate: string; overlappingSKUs: string[]; finaleUrl: string }>> {
+        try {
+            const partyId = vendorPartyId.split('/').pop() || vendorPartyId;
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 200
+                        type: ["PURCHASE_ORDER"]
+                        statusId: ["ORDER_CREATED", "ORDER_COMMITTED"]
+                    ) {
+                        edges { node {
+                            orderId orderUrl status orderDate
+                            supplier { partyUrl name }
+                            itemList(first: 100) {
+                                edges { node { product { productId } } }
+                            }
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            const productSet = new Set(productIds.map(p => p.toLowerCase()));
+            const duplicates: Array<{ orderId: string; status: string; orderDate: string; overlappingSKUs: string[]; finaleUrl: string }> = [];
+
+            for (const edge of edges) {
+                const po = edge.node;
+                // Match vendor by partyUrl suffix
+                const poVendorId = po.supplier?.partyUrl?.split('/').pop() || '';
+                if (poVendorId !== partyId) continue;
+
+                const poSkus = (po.itemList?.edges || []).map((ie: any) =>
+                    (ie.node.product?.productId || '').toLowerCase()
+                );
+                const overlap = poSkus.filter((s: string) => productSet.has(s));
+
+                if (overlap.length > 0) {
+                    const encodedUrl = Buffer.from(po.orderUrl || '').toString('base64');
+                    duplicates.push({
+                        orderId: po.orderId,
+                        status: po.status,
+                        orderDate: po.orderDate || '',
+                        overlappingSKUs: overlap,
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
+                    });
+                }
+            }
+
+            if (duplicates.length > 0) {
+                console.log(`[finale] checkDuplicatePOs: ${duplicates.length} existing PO(s) with overlapping SKUs for vendor ${partyId}`);
+            }
+            return duplicates;
+        } catch (err: any) {
+            console.warn('[finale] checkDuplicatePOs failed:', err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Calculate the actual average lead time for a vendor by examining
+     * the last N completed POs: avg(receiveDate - orderDate).
+     *
+     * @param supplierName - Vendor name (case-insensitive match)
+     * @param limit        - Number of recent POs to analyze (default 10)
+     * @returns Actual lead time in days, or null if insufficient data
+     */
+    async getVendorLeadTimeActual(supplierName: string, limit: number = 50): Promise<number | null> {
+        try {
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: ${limit}
+                        type: ["PURCHASE_ORDER"]
+                        statusId: ["ORDER_COMPLETED"]
+                        sort: [{ field: "receiveDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            orderId orderDate receiveDate
+                            supplier { name }
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            const vendorPOs = edges
+                .map((e: any) => e.node)
+                .filter((po: any) =>
+                    po.supplier?.name?.toLowerCase().includes(supplierName.toLowerCase()) &&
+                    po.orderDate && po.receiveDate
+                );
+
+            if (vendorPOs.length < 2) return null; // Need at least 2 data points
+
+            const leadTimes = vendorPOs.map((po: any) => {
+                const ordered = new Date(po.orderDate).getTime();
+                const received = new Date(po.receiveDate).getTime();
+                return Math.max(0, Math.round((received - ordered) / 86_400_000));
+            });
+
+            const avg = Math.round(leadTimes.reduce((s: number, d: number) => s + d, 0) / leadTimes.length);
+            console.log(`[finale] Vendor lead time for "${supplierName}": ${avg}d avg (from ${leadTimes.length} POs: ${leadTimes.join(', ')}d)`);
+            return avg;
+        } catch (err: any) {
+            console.warn('[finale] getVendorLeadTimeActual failed:', err.message);
+            return null;
+        }
+    }
+
+    /**
+     * Compare a product's current supplier price against the last committed PO price.
+     * Returns the price change details if a significant deviation is detected.
+     *
+     * @param productId    - SKU to check
+     * @param currentPrice - Current supplier list price
+     * @param threshold    - Percentage change to flag (default 10%)
+     * @returns Price change info or null if no significant change
+     */
+    async checkPriceChange(
+        productId: string,
+        currentPrice: number,
+        threshold: number = 10
+    ): Promise<{ productId: string; previousPrice: number; currentPrice: number; changePct: number; lastPOId: string; lastPODate: string } | null> {
+        if (!currentPrice || currentPrice <= 0) return null;
+        try {
+            const productUrl = `/${this.accountPath}/api/product/${productId}`;
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 20
+                        type: ["PURCHASE_ORDER"]
+                        product: ["${productUrl}"]
+                        statusId: ["ORDER_COMMITTED", "ORDER_COMPLETED"]
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            orderId orderDate
+                            itemList(first: 20) {
+                                edges { node {
+                                    product { productId }
+                                    unitPrice
+                                }}
+                            }
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            for (const edge of edges) {
+                const po = edge.node;
+                for (const itemEdge of (po.itemList?.edges || [])) {
+                    const item = itemEdge.node;
+                    if (item.product?.productId?.toLowerCase() === productId.toLowerCase()) {
+                        const prevPrice = parseFinaleNumber(item.unitPrice);
+                        if (prevPrice <= 0) continue;
+                        const changePct = Math.round(((currentPrice - prevPrice) / prevPrice) * 100);
+                        if (Math.abs(changePct) >= threshold) {
+                            return {
+                                productId,
+                                previousPrice: prevPrice,
+                                currentPrice,
+                                changePct,
+                                lastPOId: po.orderId,
+                                lastPODate: po.orderDate || '',
+                            };
+                        }
+                        return null; // Found the SKU but price change is within threshold
+                    }
+                }
+            }
+            return null; // SKU not found in recent POs — first order
+        } catch (err: any) {
+            console.warn(`[finale] checkPriceChange failed for ${productId}:`, err.message);
+            return null;
+        }
+    }
+
+    /**
+     * Fetch draft Purchase Orders older than N days (for stale draft cleanup alerts).
+     *
+     * @param daysOld - Minimum age in days (default 3)
+     * @returns Array of stale draft POs with vendor, age, and item count
+     */
+    async getStaleDraftPOs(daysOld: number = 3): Promise<Array<{
+        orderId: string; supplier: string; orderDate: string;
+        ageDays: number; itemCount: number; total: number; finaleUrl: string;
+    }>> {
+        try {
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 100
+                        type: ["PURCHASE_ORDER"]
+                        statusId: ["ORDER_CREATED"]
+                        sort: [{ field: "orderDate", mode: "asc" }]
+                    ) {
+                        edges { node {
+                            orderId orderUrl orderDate total status
+                            supplier { name }
+                            itemList(first: 50) {
+                                edges { node { product { productId } } }
+                            }
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+            const now = Date.now();
+
+            return edges
+                .map((e: any) => {
+                    const po = e.node;
+                    const orderMs = new Date(po.orderDate || now).getTime();
+                    const ageDays = Math.floor((now - orderMs) / 86_400_000);
+                    const encodedUrl = Buffer.from(po.orderUrl || '').toString('base64');
+                    return {
+                        orderId: po.orderId,
+                        supplier: po.supplier?.name || 'Unknown',
+                        orderDate: po.orderDate || '',
+                        ageDays,
+                        itemCount: po.itemList?.edges?.length ?? 0,
+                        total: parseFinaleNumber(po.total),
+                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
+                    };
+                })
+                .filter(po => po.ageDays >= daysOld);
+        } catch (err: any) {
+            console.warn('[finale] getStaleDraftPOs failed:', err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Project purchasing spend over a time horizon, grouped by vendor.
+     * Uses daily consumption velocity × unit price × days.
+     *
+     * @param days - Forecast horizon (30, 60, or 90)
+     * @returns Array of vendor spend projections sorted by highest spend first
+     */
+    async getSpendForecast(days: number = 30): Promise<Array<{
+        vendor: string; projectedSpend: number;
+        topSkus: Array<{ sku: string; spend: number; dailyRate: number }>;
+    }>> {
+        try {
+            // Reuse external reorder items since they already have velocity + price
+            const groups = await this.getExternalReorderItems();
+            const forecast: Array<{
+                vendor: string; projectedSpend: number;
+                topSkus: Array<{ sku: string; spend: number; dailyRate: number }>;
+            }> = [];
+
+            for (const group of groups) {
+                let vendorTotal = 0;
+                const skuSpends: Array<{ sku: string; spend: number; dailyRate: number }> = [];
+
+                for (const item of group.items) {
+                    const dailyRate = item.consumptionQty / 90; // 90-day lookback → daily
+                    const projected = dailyRate * days * item.unitPrice;
+                    vendorTotal += projected;
+                    skuSpends.push({
+                        sku: item.productId,
+                        spend: Math.round(projected),
+                        dailyRate: Math.round(dailyRate * 10) / 10,
+                    });
+                }
+
+                if (vendorTotal > 0) {
+                    forecast.push({
+                        vendor: group.vendorName,
+                        projectedSpend: Math.round(vendorTotal),
+                        topSkus: skuSpends.sort((a, b) => b.spend - a.spend).slice(0, 5),
+                    });
+                }
+            }
+
+            return forecast.sort((a, b) => b.projectedSpend - a.projectedSpend);
+        } catch (err: any) {
+            console.warn('[finale] getSpendForecast failed:', err.message);
+            return [];
         }
     }
 
@@ -2466,6 +2983,8 @@ export class FinaleClient {
             unitPrice: number;
             isManufactured: boolean;
             isDropship: boolean;
+            orderIncrementQty: number | null;
+            isBulkDelivery: boolean;
         }
 
         const richItems: RichItem[] = [];
@@ -2488,6 +3007,15 @@ export class FinaleClient {
                         continue;
                     }
 
+                    // DECISION(2026-03-04): Skip products flagged "Do not reorder" in Finale.
+                    // Checks multiple possible locations for this flag:
+                    //   - reorderPointPolicy field (e.g. "DO_NOT_REORDER")
+                    //   - doNotReorder boolean field
+                    //   - Product name/description containing "do not reorder"
+                    if (FinaleClient.isDoNotReorder(prod)) {
+                        continue;
+                    }
+
                     const partyId = mainSupplier.supplierPartyUrl.split('/').pop();
                     const party = await resolveParty(partyId);
 
@@ -2498,6 +3026,11 @@ export class FinaleClient {
                         unitPrice: mainSupplier.price ?? 0,
                         isManufactured: party.isManufactured,
                         isDropship: party.isDropship,
+                        // DECISION(2026-03-04): Extract order increment qty from REST product data.
+                        // Finale stores this as "orderIncrementQuantity" — the "Std reorder in qty of" field.
+                        // Falls back to null if not set, meaning no rounding is applied.
+                        orderIncrementQty: this.parseFinaleNum(prod.orderIncrementQuantity),
+                        isBulkDelivery: FinaleClient.isBulkDelivery(prod),
                     });
                 } catch {
                     // Skip products we can't resolve
@@ -2540,29 +3073,118 @@ export class FinaleClient {
      * Created with statusId=ORDER_CREATED (visible in Finale as "Draft/Open").
      * The human commits it in Finale UI by clicking the commit/lock button.
      *
-     * @param vendorPartyId  Finale partyId of the supplier (from getExternalReorderItems)
-     * @param items          Line items to include
-     * @param memo           Optional memo/notes for the PO
-     * @returns              { orderId, finaleUrl } of the created draft
+     * DECISION(2026-03-04): Enhanced with Purchase Destination and order increment support.
+     *   - `originFacilityUrl` routes receiving to either Shipping (default) or Soil (bulk).
+     *   - Bulk detection auto-infers Soil when any item is flagged as bulk delivery.
+     *   - Order quantities snap UP to the product's "Std reorder in qty of" increment.
+     *   - Override via `purchaseDestination` param takes priority over auto-detection.
+     *
+     * @param vendorPartyId       Finale partyId of the supplier
+     * @param items               Line items — now supports optional orderIncrementQty and isBulkDelivery per item
+     * @param memo                Optional memo/notes for the PO
+     * @param purchaseDestination Override: "Shipping" | "Soil" (case-insensitive). If omitted, auto-detects.
+     * @returns                   { orderId, finaleUrl, facilityName } of the created draft
      */
     async createDraftPurchaseOrder(
         vendorPartyId: string,
-        items: Array<{ productId: string; quantity: number; unitPrice: number }>,
-        memo?: string
-    ): Promise<{ orderId: string; finaleUrl: string }> {
+        items: Array<{
+            productId: string;
+            quantity: number;
+            unitPrice: number;
+            orderIncrementQty?: number | null;
+            isBulkDelivery?: boolean;
+        }>,
+        memo?: string,
+        purchaseDestination?: string
+    ): Promise<{ orderId: string; finaleUrl: string; facilityName: string; duplicateWarnings: string[]; priceAlerts: string[] }> {
         const today = new Date().toISOString().split('T')[0] + 'T00:00:00';
 
+        // ── Step 0: Duplicate PO detection ──────────────────────────────────
+        // DECISION(2026-03-04): Check for existing open/committed POs from the same
+        // vendor with overlapping SKUs. We warn but still create — the caller decides.
+        const duplicateWarnings: string[] = [];
+        try {
+            const productIds = items.map(i => i.productId);
+            const dups = await this.checkDuplicatePOs(vendorPartyId, productIds);
+            for (const dup of dups) {
+                const skuList = dup.overlappingSKUs.slice(0, 3).join(', ');
+                const more = dup.overlappingSKUs.length > 3 ? ` +${dup.overlappingSKUs.length - 3} more` : '';
+                duplicateWarnings.push(
+                    `⚠️ PO #${dup.orderId} (${dup.status}) already has: ${skuList}${more}`
+                );
+            }
+        } catch (e: any) {
+            console.warn('[finale] Duplicate check failed (non-blocking):', e.message);
+        }
+
+        // ── Step 0b: Price change detection ─────────────────────────────────
+        // DECISION(2026-03-04): Flag SKUs with >=10% price change vs last PO.
+        const priceAlerts: string[] = [];
+        try {
+            for (const item of items) {
+                if (!item.unitPrice || item.unitPrice <= 0) continue;
+                const change = await this.checkPriceChange(item.productId, item.unitPrice);
+                if (change) {
+                    const direction = change.changePct > 0 ? '📈' : '📉';
+                    priceAlerts.push(
+                        `${direction} ${change.productId}: $${change.previousPrice.toFixed(2)} → $${change.currentPrice.toFixed(2)} (${change.changePct > 0 ? '+' : ''}${change.changePct}% since PO #${change.lastPOId})`
+                    );
+                }
+            }
+        } catch (e: any) {
+            console.warn('[finale] Price check failed (non-blocking):', e.message);
+        }
+
+        // ── Step 1: Snap quantities to order increments ──────────────────────
+        const adjustedItems = items.map(item => {
+            const rawQty = item.quantity;
+            const snapped = FinaleClient.snapToIncrement(rawQty, item.orderIncrementQty ?? null);
+
+            if (snapped !== rawQty) {
+                console.log(`[finale] PO qty snap: ${item.productId}: ${rawQty} → ${snapped} (increment: ${item.orderIncrementQty})`);
+            }
+
+            return {
+                productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+                quantity: snapped,
+                unitPrice: item.unitPrice,
+            };
+        });
+
+        // ── Step 2: Resolve Purchase Destination (facility) ──────────────────
+        // Priority: explicit override > auto-detect bulk > default Shipping
+        let facilityName = 'Shipping';
+        let facilityUrl: string | null = null;
+
+        if (purchaseDestination) {
+            // Explicit override from caller
+            facilityName = purchaseDestination;
+            facilityUrl = await this.getFacilityUrl(purchaseDestination);
+        } else {
+            // Auto-detect: if ANY item in this PO is bulk, route to Soil
+            const hasBulk = items.some(item => item.isBulkDelivery === true);
+            if (hasBulk) {
+                facilityName = 'Soil';
+                facilityUrl = await this.getFacilityUrl('Soil');
+            } else {
+                facilityUrl = await this.getFacilityUrl('Shipping');
+            }
+        }
+
+        // ── Step 3: Build PO payload ─────────────────────────────────────────
         const payload: Record<string, any> = {
             orderTypeId: 'PURCHASE_ORDER',
             statusId: 'ORDER_CREATED',
             orderDate: today,
             orderRoleList: [{ roleTypeId: 'SUPPLIER', partyId: vendorPartyId }],
-            orderItemList: items.map(item => ({
-                productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
-                quantity: item.quantity,
-                unitPrice: item.unitPrice,
-            })),
+            orderItemList: adjustedItems,
         };
+
+        // Set the Purchase Destination if we resolved a valid facility URL
+        if (facilityUrl) {
+            payload.originFacilityUrl = facilityUrl;
+        }
+
         if (memo) payload.privateNotes = memo;
 
         const res = await fetch(`${this.apiBase}/${this.accountPath}/api/order`, {
@@ -2589,8 +3211,10 @@ export class FinaleClient {
         const encodedUrl = Buffer.from(rawOrderUrl).toString('base64');
         const finaleUrl = `${this.apiBase}/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
 
-        console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items)`);
-        return { orderId, finaleUrl };
+        console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items) → ${facilityName}${facilityUrl ? '' : ' (facility URL not found)'}`);
+        if (duplicateWarnings.length > 0) console.log(`[finale] Duplicate warnings: ${duplicateWarnings.join(' | ')}`);
+        if (priceAlerts.length > 0) console.log(`[finale] Price alerts: ${priceAlerts.join(' | ')}`);
+        return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts };
     }
 
     // ──────────────────────────────────────────────────
@@ -2839,6 +3463,9 @@ export class FinaleClient {
                     const party = await resolveParty(mainSupplier.supplierPartyUrl);
                     if (party.isManufactured || party.isDropship) continue;
 
+                    // Skip products flagged "Do not reorder" in Finale
+                    if (FinaleClient.isDoNotReorder(prodData)) continue;
+
                     // Step C: Single combined GraphQL request — purchase history + sales history + open POs
                     const activity = await this.getProductActivity(sku, daysBack);
 
@@ -2891,8 +3518,16 @@ export class FinaleClient {
                                 : 'covered';
                     const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
 
-                    // Step 8: suggested qty (lead time + 60d buffer, rounded to 50)
-                    const suggestedQty = Math.max(50, Math.ceil(dailyRate * (leadTimeDays + 60) / 50) * 50);
+                    // Step 8: suggested qty — uses product's order increment if set, otherwise no rounding
+                    // DECISION(2026-03-04): Formerly hard-coded round-to-50. Now respects
+                    // the product's "Std reorder in qty of" field from Finale.
+                    // If no increment configured, raw quantity passes through unchanged.
+                    const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
+                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
+                    const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+
+                    // Bulk delivery detection for facility routing
+                    const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
 
                     items.push({
                         productId: sku,
@@ -2917,6 +3552,8 @@ export class FinaleClient {
                         urgency,
                         explanation,
                         suggestedQty,
+                        orderIncrementQty,
+                        isBulkDelivery,
                     });
                 } catch {
                     // Skip products that error — non-fatal
@@ -2953,6 +3590,85 @@ export class FinaleClient {
         groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
         console.log(`[finale] getPurchasingIntelligence: ${items.length} items across ${groups.length} vendors`);
         return groups;
+    }
+
+    /**
+     * Fetch a draft PO and return a structured review object for the commit/send flow.
+     * Only returns canCommit=true when statusId === 'ORDER_CREATED'.
+     */
+    async getDraftPOForReview(orderId: string): Promise<DraftPOReview> {
+        const po = await this.getOrderDetails(orderId);
+
+        // Resolve vendor name from supplier role
+        let vendorName = "Unknown Vendor";
+        let vendorPartyId = "";
+        const supplierRole = (po.orderRoleList || []).find((r: any) => r.roleTypeId === "SUPPLIER");
+        if (supplierRole?.partyId) {
+            vendorPartyId = supplierRole.partyId;
+            try {
+                vendorName = await this.resolvePartyName(
+                    `/${this.accountPath}/api/partygroup/${supplierRole.partyId}`
+                );
+            } catch {
+                vendorName = `Party#${supplierRole.partyId}`;
+            }
+        }
+
+        const items = (po.orderItemList || [])
+            .filter((item: any) => item.productId && (item.quantity ?? 0) > 0)
+            .map((item: any) => ({
+                productId: item.productId,
+                productName: item.itemDescription || item.productId,
+                quantity: item.quantity || 0,
+                unitPrice: item.unitPrice || 0,
+                lineTotal: (item.quantity || 0) * (item.unitPrice || 0),
+            }));
+
+        const rawOrderUrl = po.orderUrl || `/${this.accountPath}/api/order/${orderId}`;
+        const encodedUrl = Buffer.from(rawOrderUrl).toString("base64");
+        const finaleUrl = `${this.apiBase}/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
+
+        return {
+            orderId: po.orderId || orderId,
+            vendorName,
+            vendorPartyId,
+            orderDate: po.orderDate || new Date().toISOString().split("T")[0],
+            total: po.orderItemListTotal || items.reduce((s: number, i: any) => s + i.lineTotal, 0),
+            items,
+            finaleUrl,
+            canCommit: po.statusId === "ORDER_CREATED",
+        };
+    }
+
+    /**
+     * Commit a draft PO in Finale (ORDER_CREATED → ORDER_LOCKED).
+     * Throws if the PO is not in ORDER_CREATED status (guards against re-commit).
+     * Strategy: POST to actionUrlComplete if present; fall back to posting statusId: ORDER_LOCKED.
+     */
+    async commitDraftPO(orderId: string): Promise<{ orderId: string; committed: boolean; finalStatus: string }> {
+        const po = await this.getOrderDetails(orderId);
+
+        if (po.statusId !== "ORDER_CREATED") {
+            throw new Error(`PO ${orderId} is in status "${po.statusId}" — can only commit ORDER_CREATED drafts`);
+        }
+
+        console.log(`[finale] commitDraftPO: PO #${orderId} actionUrlComplete=${po.actionUrlComplete ?? "none"}`);
+
+        let updated: any;
+        if (po.actionUrlComplete) {
+            // Preferred: use Finale's built-in commit action URL
+            updated = await this.post(po.actionUrlComplete, {});
+        } else {
+            // Fallback: POST full order document with committed status
+            updated = await this.post(
+                `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
+                { ...po, statusId: "ORDER_LOCKED" }
+            );
+        }
+
+        const finalStatus = updated?.statusId || "ORDER_LOCKED";
+        console.log(`[finale] commitDraftPO: PO #${orderId} committed → ${finalStatus}`);
+        return { orderId, committed: true, finalStatus };
     }
 
     // ── private helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──

@@ -12,6 +12,7 @@ type PurchasingItem = {
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: "critical" | "warning" | "watch" | "ok";
     explanation: string; suggestedQty: number;
+    orderIncrementQty: number | null; isBulkDelivery: boolean;
 };
 type PurchasingGroup = {
     vendorName: string; vendorPartyId: string;
@@ -20,6 +21,16 @@ type PurchasingGroup = {
 };
 type AssessmentData = { groups: PurchasingGroup[]; cachedAt: string };
 type POResult = { orderId: string; finaleUrl: string };
+type CommitReview = {
+    sendId: string;
+    review: {
+        orderId: string; vendorName: string; total: number; orderDate: string;
+        items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number }>;
+        finaleUrl: string;
+    };
+    email: string;
+    emailSource: string;
+};
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 
@@ -57,6 +68,12 @@ export default function PurchasingPanel() {
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
+
+    // commit & send modal
+    const [commitModal, setCommitModal] = useState<CommitReview | null>(null);
+    const [commitLoading, setCommitLoading] = useState<string | null>(null); // orderId being reviewed
+    const [sendingPO, setSendingPO] = useState(false);
+    const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
 
     // snooze
     const [snooze, setSnooze] = useState<SnoozeMap>({});
@@ -224,7 +241,7 @@ export default function PurchasingPanel() {
         const pid = group.vendorPartyId;
         const items = group.items
             .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId])
-            .map(i => ({ productId: i.productId, quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty, unitPrice: i.unitPrice }));
+            .map(i => ({ productId: i.productId, quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
@@ -269,6 +286,55 @@ export default function PurchasingPanel() {
         setCreatingPO(new Set());
     }
 
+    async function handleReviewAndSend(orderId: string) {
+        setCommitLoading(orderId);
+        try {
+            const res = await fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'review', orderId }),
+            });
+            const json = await res.json();
+            if (!res.ok) { setError(json.error || 'Failed to fetch PO review'); return; }
+            setCommitModal({ sendId: json.sendId, review: json.review, email: json.email, emailSource: json.emailSource });
+        } catch (e: any) {
+            setError(`Review failed: ${e.message}`);
+        } finally {
+            setCommitLoading(null);
+        }
+    }
+
+    async function handleConfirmSend() {
+        if (!commitModal?.sendId) return;
+        setSendingPO(true);
+        try {
+            const res = await fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'send', sendId: commitModal.sendId }),
+            });
+            const json = await res.json();
+            if (!res.ok) { setError(json.error || 'Send failed'); return; }
+            setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+            setCommitModal(null);
+        } catch (e: any) {
+            setError(`Send failed: ${e.message}`);
+        } finally {
+            setSendingPO(false);
+        }
+    }
+
+    async function handleCancelCommit() {
+        if (commitModal?.sendId) {
+            fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'cancel', sendId: commitModal.sendId }),
+            }).catch(() => {});
+        }
+        setCommitModal(null);
+    }
+
     // ── derived state ──────────────────────────────────────────────────────
     const allGroups = data?.groups ?? [];
     const sortedGroups = [...allGroups].sort((a, b) => URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]);
@@ -294,6 +360,62 @@ export default function PurchasingPanel() {
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className="border-b border-zinc-800 shrink-0">
+            {/* Commit & Send modal */}
+            {commitModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                    <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl w-full max-w-lg mx-4 overflow-hidden">
+                        <div className="px-4 py-3 border-b border-zinc-800 flex items-center gap-2">
+                            <span className="text-sm font-mono font-semibold text-zinc-200">Commit & Send PO #{commitModal.review.orderId}</span>
+                            <div className="flex-1" />
+                            <span className="text-[10px] font-mono text-zinc-600">{commitModal.review.vendorName}</span>
+                        </div>
+                        <div className="px-4 py-3 space-y-1 max-h-60 overflow-y-auto">
+                            {commitModal.review.items.map(item => (
+                                <div key={item.productId} className="flex items-center gap-2 text-[11px] font-mono">
+                                    <span className="text-zinc-500 w-36 truncate shrink-0">{item.productId}</span>
+                                    <span className="text-zinc-400 flex-1 truncate">{item.productName}</span>
+                                    <span className="text-zinc-500 shrink-0">×{item.quantity}</span>
+                                    <span className="text-zinc-400 shrink-0">${item.unitPrice.toFixed(2)}</span>
+                                    <span className="text-zinc-300 shrink-0 w-20 text-right">${item.lineTotal.toFixed(2)}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="px-4 py-2 border-t border-zinc-800 flex items-center justify-between text-[11px] font-mono">
+                            <span className="text-zinc-500">Total</span>
+                            <span className="text-zinc-200 font-semibold">${commitModal.review.total.toFixed(2)}</span>
+                        </div>
+                        <div className="px-4 py-2 border-t border-zinc-800/60 text-[11px] font-mono">
+                            {commitModal.email ? (
+                                <span className="text-zinc-400">To: <span className="text-zinc-200">{commitModal.email}</span> <span className="text-zinc-600">({commitModal.emailSource})</span></span>
+                            ) : (
+                                <span className="text-amber-400">⚠ No vendor email on file — cannot send</span>
+                            )}
+                        </div>
+                        {commitModal.email && (
+                            <div className="px-4 py-2 text-[10px] font-mono text-amber-500/80 border-t border-zinc-800/40">
+                                ⚠ This will commit the PO in Finale AND email the vendor.
+                            </div>
+                        )}
+                        <div className="px-4 py-3 border-t border-zinc-800 flex items-center justify-end gap-2">
+                            <button onClick={handleCancelCommit}
+                                className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
+                                Cancel
+                            </button>
+                            {commitModal.email && (
+                                <button
+                                    onClick={handleConfirmSend}
+                                    disabled={sendingPO}
+                                    className="text-[11px] font-mono px-4 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+                                >
+                                    {sendingPO && <div className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />}
+                                    {sendingPO ? 'Sending…' : '✅ Confirm Send'}
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Backdrop — closes any open snooze dropdown */}
             {snoozeMenu && (
                 <div className="fixed inset-0 z-40" onClick={() => setSnoozeMenu(null)} />
@@ -486,10 +608,24 @@ export default function PurchasingPanel() {
                                                 ) : (
                                                     <>
                                                         {po ? (
-                                                            <a href={po.finaleUrl} target="_blank" rel="noreferrer"
-                                                                className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300 shrink-0">
-                                                                PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
-                                                            </a>
+                                                            <div className="flex items-center gap-1 shrink-0">
+                                                                <a href={po.finaleUrl} target="_blank" rel="noreferrer"
+                                                                    className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300">
+                                                                    PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
+                                                                </a>
+                                                                {sentPOs.has(po.orderId) ? (
+                                                                    <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
+                                                                ) : (
+                                                                    <button
+                                                                        onClick={() => handleReviewAndSend(po.orderId)}
+                                                                        disabled={commitLoading === po.orderId}
+                                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
+                                                                        title="Commit in Finale and email vendor"
+                                                                    >
+                                                                        {commitLoading === po.orderId ? '…' : 'Commit & Send'}
+                                                                    </button>
+                                                                )}
+                                                            </div>
                                                         ) : (
                                                             <button
                                                                 onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
@@ -534,10 +670,23 @@ export default function PurchasingPanel() {
                                                         </span>
                                                         <div className="flex-1" />
                                                         {po ? (
-                                                            <a href={po.finaleUrl} target="_blank" rel="noreferrer"
-                                                                className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
-                                                                ✓ PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
-                                                            </a>
+                                                            <div className="flex items-center gap-2">
+                                                                <a href={po.finaleUrl} target="_blank" rel="noreferrer"
+                                                                    className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
+                                                                    ✓ PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
+                                                                </a>
+                                                                {sentPOs.has(po.orderId) ? (
+                                                                    <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
+                                                                ) : (
+                                                                    <button
+                                                                        onClick={() => handleReviewAndSend(po.orderId)}
+                                                                        disabled={commitLoading === po.orderId}
+                                                                        className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40"
+                                                                    >
+                                                                        {commitLoading === po.orderId ? 'Loading…' : 'Commit & Send'}
+                                                                    </button>
+                                                                )}
+                                                            </div>
                                                         ) : selectedCount > 0 ? (
                                                             <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
                                                                 className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">

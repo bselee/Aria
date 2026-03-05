@@ -108,21 +108,26 @@ async function runWithConcurrency<T>(
 // RISK CLASSIFICATION
 // ──────────────────────────────────────────────────
 
-function classifyRisk(demand: ComponentDemand): ComponentDemand['riskLevel'] {
+function classifyRisk(demand: ComponentDemand, isCraftComponent: boolean = false): ComponentDemand['riskLevel'] {
     const days = demand.stockoutDays;
     const hasPOs = demand.incomingPOs.length > 0;
 
-    // Stockout ≤14 days with no POs → CRITICAL
-    if (days !== null && days <= 14 && !hasPOs) return 'CRITICAL';
+    // DECISION(2026-03-04): CRAFT builds pull from many vendors and have deep BOMs.
+    // Give CRAFT components an extra 7-day buffer on all thresholds so they trigger
+    // earlier and get more ordering lead time.
+    const buffer = isCraftComponent ? 7 : 0;
 
-    // Stockout ≤14 days with POs (PO might save us) → WARNING
-    if (days !== null && days <= 14 && hasPOs) return 'WARNING';
+    // Stockout ≤14d (21d for CRAFT) with no POs → CRITICAL
+    if (days !== null && days <= 14 + buffer && !hasPOs) return 'CRITICAL';
 
-    // Stockout ≤30 days → WARNING
-    if (days !== null && days <= 30) return 'WARNING';
+    // Stockout ≤14d (21d for CRAFT) with POs (PO might save us) → WARNING
+    if (days !== null && days <= 14 + buffer && hasPOs) return 'WARNING';
 
-    // Stockout ≤60 days → WATCH
-    if (days !== null && days <= 60) return 'WATCH';
+    // Stockout ≤30d (37d for CRAFT) → WARNING
+    if (days !== null && days <= 30 + buffer) return 'WARNING';
+
+    // Stockout ≤60d (67d for CRAFT) → WATCH
+    if (days !== null && days <= 60 + buffer) return 'WATCH';
 
     return 'OK';
 }
@@ -284,7 +289,8 @@ export async function runBuildRiskAnalysis(
         demand.leadTimeDays = profile.leadTimeDays;
         demand.incomingPOs = profile.incomingPOs;
         demand.hasFinaleData = profile.hasFinaleData;
-        demand.riskLevel = classifyRisk(demand);
+        const isCraft = Array.from(demand.usedIn).some(fg => fg.toUpperCase().startsWith('CRAFT'));
+        demand.riskLevel = classifyRisk(demand, isCraft);
     });
 
     await runWithConcurrency(tasks, 5, (completed, total) => {
@@ -372,6 +378,17 @@ function formatSlackReport(
             msg += `• \`${sku}\`: ${rate}/day${stockNote}${demandNote}\n`;
         }
         msg += `\n`;
+    }
+
+    // ── CRAFT build awareness ────────────────────────────────────────────
+    // DECISION(2026-03-04): Keep it brief. The real work is in classifyRisk()
+    // which gives CRAFT components a +7d buffer on all thresholds.
+    const craftBuilds = builds.filter(b => b.sku.toUpperCase().startsWith('CRAFT'));
+    if (craftBuilds.length > 0) {
+        const craftSkus = [...new Set(craftBuilds.map(b => b.sku))];
+        const craftCompCount = Array.from(components.values())
+            .filter(c => Array.from(c.usedIn).some(fg => fg.toUpperCase().startsWith('CRAFT'))).length;
+        msg += `🔬 _CRAFT builds detected (${craftSkus.join(', ')}) — ${craftCompCount} components given +7d lead time buffer_\n\n`;
     }
 
     if (criticals.length > 0) {
@@ -465,6 +482,15 @@ function formatTelegramReport(
         }
         if (velocityRows.length > 8) msg += `_...+${velocityRows.length - 8} more_\n`;
         msg += `\n`;
+    }
+
+    // ── CRAFT build awareness (Telegram) ─────────────────────────────────
+    const craftBuildsTg = builds.filter(b => b.sku.toUpperCase().startsWith('CRAFT'));
+    if (craftBuildsTg.length > 0) {
+        const craftSkusTg = [...new Set(craftBuildsTg.map(b => b.sku))];
+        const craftCompCountTg = Array.from(components.values())
+            .filter(c => Array.from(c.usedIn).some(fg => fg.toUpperCase().startsWith('CRAFT'))).length;
+        msg += `🔬 _CRAFT builds (${craftSkusTg.join(', ')}) — ${craftCompCountTg} comps get +7d buffer_\n\n`;
     }
 
     if (criticals.length > 0) {

@@ -11,6 +11,8 @@ type ReorderItem = {
     supplierPartyId: string | null;
     supplierName: string;
     unitPrice: number;
+    orderIncrementQty: number | null;
+    isBulkDelivery: boolean;
 };
 
 type ReorderGroup = {
@@ -139,6 +141,8 @@ export default function ReorderPanel() {
                 productId: i.productId,
                 quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
                 unitPrice: i.unitPrice,
+                orderIncrementQty: i.orderIncrementQty ?? null,
+                isBulkDelivery: i.isBulkDelivery ?? false,
             }));
             const res = await fetch("/api/dashboard/reorder", {
                 method: "POST",

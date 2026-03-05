@@ -41,6 +41,13 @@ import {
     removePendingDropship,
     getAllPendingDropships,
 } from '../lib/intelligence/dropship-store';
+import {
+    storePendingPOSend,
+    getPendingPOSend,
+    expirePendingPOSend,
+    lookupVendorOrderEmail,
+    commitAndSendPO,
+} from '../lib/purchasing/po-sender';
 
 // ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
@@ -1540,23 +1547,38 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                             : "No external vendor reorder items found.";
                     } else {
                         const created: string[] = [];
+                        const tgChatId = String(chatId);
                         for (const group of filtered) {
                             try {
                                 const items = group.items.map((i: any) => ({
                                     productId: i.productId,
                                     quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
                                     unitPrice: i.unitPrice,
+                                    orderIncrementQty: i.orderIncrementQty ?? null,
+                                    isBulkDelivery: i.isBulkDelivery ?? false,
                                 }));
                                 const po = await finaleClient.createDraftPurchaseOrder(
                                     group.vendorPartyId, items,
                                     `Auto-generated draft — review and commit in Finale`
                                 );
-                                created.push(`✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''})`);
+                                let poLine = `✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
+                                if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
+                                if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
+                                created.push(poLine);
+                                // Send inline Review & Send keyboard for this PO
+                                bot.telegram.sendMessage(tgChatId, poLine, {
+                                    reply_markup: {
+                                        inline_keyboard: [[
+                                            { text: '📋 Review & Send', callback_data: `po_review_${po.orderId}` },
+                                            { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
+                                        ]],
+                                    },
+                                }).catch(() => {});
                             } catch (e: any) {
                                 created.push(`❌ ${group.vendorName}: ${e.message}`);
                             }
                         }
-                        result = `*Draft POs Created:*\n${created.join('\n')}`;
+                        result = `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
                     }
                 } else if (toolCall.function.name === "query_vendors") {
                     const { createClient } = await import('../lib/supabase');
@@ -2157,23 +2179,40 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                                 : "No external vendor reorder items found.";
                         } else {
                             const created: string[] = [];
+                            const chatId = ctx.chat?.id?.toString() ?? process.env.TELEGRAM_CHAT_ID ?? '';
                             for (const group of filtered) {
                                 try {
                                     const items = group.items.map((i: any) => ({
                                         productId: i.productId,
                                         quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
                                         unitPrice: i.unitPrice,
+                                        orderIncrementQty: i.orderIncrementQty ?? null,
+                                        isBulkDelivery: i.isBulkDelivery ?? false,
                                     }));
                                     const po = await finaleClient.createDraftPurchaseOrder(
                                         group.vendorPartyId, items,
                                         `Auto-generated draft — review and commit in Finale`
                                     );
-                                    created.push(`✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''})`);
+                                    let poLine = `✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
+                                    if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
+                                    if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
+                                    created.push(poLine);
+                                    // Send inline Review & Send keyboard for this PO
+                                    if (chatId) {
+                                        ctx.telegram.sendMessage(chatId, poLine, {
+                                            reply_markup: {
+                                                inline_keyboard: [[
+                                                    { text: '📋 Review & Send', callback_data: `po_review_${po.orderId}` },
+                                                    { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
+                                                ]],
+                                            },
+                                        }).catch(() => {});
+                                    }
                                 } catch (e: any) {
                                     created.push(`❌ ${group.vendorName}: ${e.message}`);
                                 }
                             }
-                            result = `*Draft POs Created:*\n${created.join('\n')}`;
+                            result = `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
                         }
                     } else if (toolCall.function.name === "query_vendors") {
                         const { createClient } = await import('../lib/supabase');
@@ -2502,6 +2541,126 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
         await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched in Supabase.');
+    });
+
+    // PO COMMIT & SEND INLINE BUTTONS
+    // ──────────────────────────────────────────────────
+    // Three-step flow:
+    //   po_review_<orderId>      → fetch PO details, look up vendor email, show confirm screen
+    //   po_confirm_send_<sendId> → commit in Finale + send email
+    //   po_cancel_send_<sendId>  → dismiss, PO stays as draft
+    //   po_skip_<orderId>        → silent dismiss (no review needed)
+
+    bot.action(/^po_review_(.+)$/, async (ctx) => {
+        const orderId = ctx.match[1];
+        await ctx.answerCbQuery('Fetching PO details…');
+        try {
+            const { FinaleClient } = await import('../lib/finale/client');
+            const finale = new FinaleClient();
+            const review = await finale.getDraftPOForReview(orderId);
+
+            if (!review.canCommit) {
+                await ctx.editMessageText(
+                    (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
+                    `\n\n⚠️ PO #${orderId} is no longer in draft status — cannot commit.`
+                );
+                return;
+            }
+
+            const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
+
+            const itemLines = review.items.map(i =>
+                `  • ${i.productId}  ${i.productName.slice(0, 28).padEnd(28)}  ×${i.quantity}  $${i.unitPrice.toFixed(2)} = $${i.lineTotal.toFixed(2)}`
+            ).join('\n');
+
+            const reviewText = [
+                `📋 *PO #${review.orderId} — ${review.vendorName}*`,
+                ``,
+                itemLines,
+                ``,
+                `*Total: $${review.total.toFixed(2)}*`,
+                `To: ${email ? `${email} _(${source})_` : '⚠️ No vendor email on file'}`,
+                ``,
+                email
+                    ? `⚠️ _This will commit in Finale AND email the vendor._`
+                    : `_Cannot send — no email address found for ${review.vendorName}._\n_Add it to vendor\\_profiles or the vendors table._`,
+            ].join('\n');
+
+            if (!email) {
+                await ctx.editMessageText(reviewText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: '❌ Cancel', callback_data: `po_cancel_send_noop_${orderId}` },
+                        ]],
+                    },
+                });
+                return;
+            }
+
+            const sendId = storePendingPOSend(orderId, review, email, source);
+            await ctx.editMessageText(reviewText, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Confirm Send', callback_data: `po_confirm_send_${sendId}` },
+                        { text: '❌ Cancel', callback_data: `po_cancel_send_${sendId}` },
+                    ]],
+                },
+            });
+        } catch (err: any) {
+            await ctx.reply(`❌ Failed to fetch PO #${orderId}: ${err.message}`);
+        }
+    });
+
+    bot.action(/^po_confirm_send_(.+)$/, async (ctx) => {
+        const sendId = ctx.match[1];
+        await ctx.answerCbQuery('Committing and sending…');
+        const pending = getPendingPOSend(sendId);
+        if (!pending) {
+            await ctx.editMessageText(
+                (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
+                '\n\n⚠️ Send data expired (bot restarted). Please tap "Review & Send" again to re-initiate.'
+            );
+            return;
+        }
+        try {
+            const result = await commitAndSendPO(sendId, 'telegram');
+            await ctx.editMessageText(
+                (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
+                `\n\n✅ PO #${result.orderId} committed in Finale and emailed to ${result.sentTo}`
+            );
+            // Pinecone auto-learn
+            setImmediate(async () => {
+                try {
+                    const { remember } = await import('../lib/intelligence/memory');
+                    await remember({
+                        category: 'process',
+                        content: `PO #${result.orderId} committed in Finale and emailed to ${result.sentTo}`,
+                        source: 'telegram',
+                        priority: 'normal',
+                    });
+                } catch {}
+            });
+        } catch (err: any) {
+            await ctx.reply(`❌ Failed to commit/send PO: ${err.message}`);
+        }
+    });
+
+    bot.action(/^po_cancel_send_(.+)$/, async (ctx) => {
+        const sendId = ctx.match[1];
+        await ctx.answerCbQuery('Cancelled');
+        expirePendingPOSend(sendId);
+        const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text : '';
+        await ctx.editMessageText(original + '\n\n_Cancelled — PO remains as draft in Finale._', { parse_mode: 'Markdown' });
+    });
+
+    bot.action(/^po_skip_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery('Skipped');
+        const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text : '';
+        await ctx.editMessageText(original + '\n\n_Skipped — PO stays as draft in Finale._', { parse_mode: 'Markdown' });
     });
 
     // Fire-and-forget the launch, then start OpsManager right away.

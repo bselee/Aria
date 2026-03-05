@@ -235,6 +235,12 @@ export class OpsManager {
             this.syncPurchasingCalendar();
         });
 
+        // Stale Draft PO Cleanup Alert @ 9:00 AM weekdays
+        // DECISION(2026-03-04): Nudges Will when draft POs sit uncommitted for >3 days.
+        cron.schedule("0 9 * * 1-5", () => {
+            this.alertStaleDraftPOs();
+        }, { timezone: "America/Denver" });
+
         // AP Agent Daily Recap @ 5:00 PM MST weekdays
         // DECISION(2026-02-26): End-of-day recap provides a monitoring layer
         // so Will can review all AP Agent decisions daily. Critical during
@@ -786,9 +792,76 @@ export class OpsManager {
                 });
 
                 console.log(`📦 [po-watcher] PO received: ${po.orderId} from ${po.supplier} (${itemCount} units)`);
+
+                // ── Receiving Discrepancy Detection ──────────────────────────
+                // DECISION(2026-03-04): Compare received qty vs ordered qty per item.
+                // Flag shorts and overs via Telegram so they don't go unnoticed.
+                const discrepancies: string[] = [];
+                for (const item of po.items) {
+                    const ordered = item.orderedQuantity ?? 0;
+                    const received = item.quantity;
+                    if (ordered > 0 && received !== ordered) {
+                        const diff = received - ordered;
+                        const pct = Math.round((diff / ordered) * 100);
+                        const icon = diff < 0 ? '🔴' : '🟡';
+                        discrepancies.push(`${icon} \`${item.productId}\`: ordered ${ordered.toLocaleString()} → received ${received.toLocaleString()} (${diff > 0 ? '+' : ''}${diff.toLocaleString()}, ${pct > 0 ? '+' : ''}${pct}%)`);
+                    }
+                }
+                if (discrepancies.length > 0) {
+                    const discMsg =
+                        `⚠️ *Receiving Discrepancy — PO #${po.orderId}*\n` +
+                        `Supplier: ${po.supplier}\n\n` +
+                        discrepancies.join('\n');
+                    this.bot.telegram.sendMessage(
+                        process.env.TELEGRAM_CHAT_ID || '',
+                        discMsg,
+                        { parse_mode: 'Markdown' }
+                    ).catch((e: any) => console.warn('[po-watcher] Discrepancy alert failed:', e.message));
+                }
             }
         } catch (err: any) {
             console.error('[po-watcher] pollPOReceivings error:', err.message);
+        }
+    }
+
+    /**
+     * Alert on stale draft POs (uncommitted for >3 days).
+     * Runs daily at 9 AM weekdays via cron.
+     *
+     * DECISION(2026-03-04): Simple daily nudge so forgotten drafts don't
+     * sit forever. Lists each stale draft with vendor, age, and a Finale link.
+     */
+    async alertStaleDraftPOs(): Promise<void> {
+        try {
+            const finale = new FinaleClient();
+            const stale = await finale.getStaleDraftPOs(3);
+
+            if (stale.length === 0) {
+                console.log('[ops-manager] No stale draft POs found.');
+                return;
+            }
+
+            const lines = stale.map(po => {
+                const dateStr = po.orderDate
+                    ? new Date(po.orderDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                    : '?';
+                return `• PO #${po.orderId} — ${po.supplier} (${po.ageDays}d old, ${po.itemCount} items, $${po.total.toLocaleString()}) [${dateStr}]`;
+            });
+
+            const msg =
+                `📋 *${stale.length} Stale Draft PO${stale.length > 1 ? 's' : ''}*\n` +
+                `_Uncommitted for 3+ days — commit or delete:_\n\n` +
+                lines.join('\n');
+
+            this.bot.telegram.sendMessage(
+                process.env.TELEGRAM_CHAT_ID || '',
+                msg,
+                { parse_mode: 'Markdown' }
+            ).catch((e: any) => console.warn('[ops-manager] Stale draft alert failed:', e.message));
+
+            console.log(`📋 [ops-manager] Sent stale draft alert for ${stale.length} PO(s).`);
+        } catch (err: any) {
+            console.error('[ops-manager] alertStaleDraftPOs error:', err.message);
         }
     }
 
@@ -837,9 +910,9 @@ export class OpsManager {
 
                 // Build the Finale deep-link URL for this build
                 const accountPath = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-                // VERIFIED(2026-03-04): buildUrl comes from GraphQL; Finale route uses build/view/build/{base64}
+                // VERIFIED(2026-03-04): buildUrl comes from GraphQL; Finale route is build/detail/{base64}
                 const buildApiPath = build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`;
-                const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/view/build/${Buffer.from(buildApiPath).toString('base64')}`;
+                const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/detail/${Buffer.from(buildApiPath).toString('base64')}`;
 
                 if (matched?.eventId && matched.calendarId) {
                     // Dedup: skip if this event already has a completion annotation
