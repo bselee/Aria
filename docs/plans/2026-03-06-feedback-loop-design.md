@@ -11,7 +11,11 @@
 
 A unified feedback loop system that captures every signal of "was Aria right?" and
 uses those signals to continuously improve predictions, recommendations, and
-communication. One central module, one central table, 7 pillars of learning.
+communication. One central module, one central table, 8 pillars of learning.
+
+The 8th pillar — **Housekeeping** — is the Kaizen discipline that prevents
+data bloat. Aria cleans up after herself: pruning stale memories, purging
+old feedback events, and keeping every data store lean and useful.
 
 The system answers three questions constantly:
 1. **Was I right?** (accuracy tracking)
@@ -50,6 +54,17 @@ The system answers three questions constantly:
 │  • Vendor reliability rankings           │
 │  • Drift detection alerts                │
 │  • "How am I doing?" Telegram message    │
+└──────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────┐
+│         Nightly Housekeeping Cron        │
+│  • Prune synced feedback_events > 90d    │
+│  • Purge stale Pinecone memories         │
+│  • Clean old chat logs > 90d             │
+│  • Purge resolved exceptions > 30d       │
+│  • Purge expired proactive_alerts > 90d  │
+│  • Report cleanup stats in log           │
 └──────────────────────────────────────────┘
 ```
 
@@ -117,6 +132,7 @@ Indexes on `(category, created_at)`, `(agent_source, created_at)`, `(subject_typ
 | `syncLearningsToMemory()` | Push validated learnings to Pinecone |
 | `proposeThresholdAdjustments()` | Suggest changes to auto-approve thresholds |
 | `detectDrift(category, windowDays?)` | Alert if accuracy is declining |
+| `runHousekeeping()` | Prune stale data from all stores — the Kaizen janitor |
 
 ### Type Interface
 
@@ -137,7 +153,7 @@ interface FeedbackEvent {
 
 ---
 
-## The 7 Pillars
+## The 8 Pillars
 
 ### Pillar 1: Correction Capture
 
@@ -278,6 +294,43 @@ interface FeedbackEvent {
 - Proposes threshold adjustments (requires Will's /approve to apply)
 - Detects accuracy drift and raises alerts if any domain drops below 60%
 
+### Pillar 8: Housekeeping — 掃除 (Souji)
+
+**Philosophy:** A bloated database is a broken brain. Aria keeps her own house clean.
+
+**When:** Nightly at 11:00 PM Denver time. Also triggered manually via `/housekeeping`.
+
+**Retention Policies:**
+
+| Data Store | Rule | Retention |
+|-----------|------|-----------|
+| `feedback_events` | Synced to memory + older than 90 days | DELETE |
+| `feedback_events` | Unscored events older than 30 days | DELETE (no learning value) |
+| `feedback_events` | Engagement "ignored" events older than 14 days | DELETE (pattern captured) |
+| `sys_chat_logs` | Older than 90 days | DELETE |
+| `ops_agent_exceptions` | Resolved/escalated/ignored older than 30 days | DELETE |
+| `proactive_alerts` | Older than 90 days | DELETE |
+| Pinecone `aria-memory` | Never recalled in 60+ days | DELETE |
+| Pinecone `vendor-memory` | Confidence < 0.3 or contradicted by newer pattern | DELETE |
+| `ap_activity_log` | **NEVER** — audit trail, keep indefinitely | RETAIN |
+
+**Pinecone Memory Hygiene:**
+- Every `recall()` call should update a `last_recalled_at` metadata field on matched vectors
+- Memories with `last_recalled_at` older than 60 days (or never recalled) are candidates for pruning
+- Before deleting, check if the memory has been referenced in a learning statement — if so, keep it
+- Conflicting memories (e.g. "vendor X is reliable" score 0.9 vs. "vendor X is unreliable" score 0.3): keep the higher-scored, more recent one
+
+**Cleanup Report** (logged, not sent to Telegram unless numbers are surprising):
+```
+🧹 [Housekeeping] Nightly cleanup complete:
+  feedback_events: 47 pruned (12 synced+old, 28 unscored+stale, 7 ignored)
+  sys_chat_logs: 203 pruned (>90 days)
+  ops_agent_exceptions: 5 pruned (resolved >30d)
+  proactive_alerts: 3 pruned (>90 days)
+  Pinecone aria-memory: 8 stale memories pruned
+  Total rows reclaimed: 266
+```
+
 ---
 
 ## Integration Strategy
@@ -295,6 +348,8 @@ interface FeedbackEvent {
 ### Cron Schedule Additions (OpsManager):
 - `10:00 AM daily` — Outcome verification check
 - `8:15 AM Fridays` — Kaizen self-review report
+- `11:00 PM daily` — Housekeeping (prune stale data from all stores)
+- `9:00 PM daily` — Memory sync (push learnings to Pinecone)
 
 ---
 
@@ -304,7 +359,7 @@ Explicitly **not** building (yet):
 - Auto-applying threshold changes. Proposals only — Will approves.
 - Dashboard confidence panel. Will get to this in Phase 3.
 - Real-time drift alerting. Weekly review is sufficient for now.
-- Memory pruning. Wait until we see memory accumulation issues.
+- Cold storage archival for ap_activity_log (>1 year). Wait until volume justifies it.
 
 ---
 
@@ -315,3 +370,6 @@ Explicitly **not** building (yet):
 3. Vendor reliability scores are queryable via Telegram `/vendor` command
 4. Aria's Pinecone memories include validated learnings from feedback
 5. Accuracy trends are visible week-over-week in the Kaizen report
+6. Nightly housekeeping keeps all tables under control — no unbounded growth
+7. Stale Pinecone memories are pruned automatically — no vector bloat
+8. `/housekeeping` command shows cleanup stats on demand

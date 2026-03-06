@@ -1267,7 +1267,376 @@ git commit -m "feat(feedback): wire AP agent classification and forwarding to Ka
 
 ---
 
-### Task 12: Final Integration — TypeScript Check and PM2 Restart
+## Phase 3: Housekeeping — 掃除 (Souji)
+
+### Task 12: Add `runHousekeeping()` to feedback-loop.ts
+
+**Files:**
+- Modify: `src/lib/intelligence/feedback-loop.ts`
+
+**Step 1: Add the housekeeping function**
+
+Append after `proposeThresholdAdjustments()`:
+
+```typescript
+// ──────────────────────────────────────────────────
+// HOUSEKEEPING — Aria cleans up after herself
+// ──────────────────────────────────────────────────
+
+export interface HousekeepingReport {
+    feedbackEventsPruned: number;
+    chatLogsPruned: number;
+    exceptionsPruned: number;
+    alertsPruned: number;
+    pineconeMemoriesPruned: number;
+    totalReclaimed: number;
+}
+
+/**
+ * RETENTION POLICIES (hardcoded — Kaizen discipline):
+ *
+ * | Store               | Rule                                          | Retention |
+ * |---------------------|-----------------------------------------------|-----------|
+ * | feedback_events     | synced_to_memory=true AND > 90 days           | DELETE    |
+ * | feedback_events     | unscored (accuracy_score IS NULL) AND > 30d   | DELETE    |
+ * | feedback_events     | engagement "ignored" AND > 14 days            | DELETE    |
+ * | sys_chat_logs       | > 90 days                                     | DELETE    |
+ * | ops_agent_exceptions| status != 'pending' AND > 30 days             | DELETE    |
+ * | proactive_alerts    | > 90 days                                     | DELETE    |
+ * | Pinecone aria-memory| last_recalled_at > 60 days OR never recalled  | DELETE    |
+ * | ap_activity_log     | NEVER — audit trail                           | RETAIN    |
+ */
+
+const RETENTION = {
+    FEEDBACK_SYNCED_DAYS: 90,
+    FEEDBACK_UNSCORED_DAYS: 30,
+    FEEDBACK_IGNORED_DAYS: 14,
+    CHAT_LOGS_DAYS: 90,
+    EXCEPTIONS_DAYS: 30,
+    ALERTS_DAYS: 90,
+    PINECONE_STALE_DAYS: 60,
+} as const;
+
+/**
+ * Run nightly housekeeping — prune stale data from ALL stores.
+ * A bloated database is a broken brain. Aria keeps her own house clean.
+ *
+ * Returns a report of what was pruned. Logged to console; only sent to
+ * Telegram if numbers are surprisingly high (> 500 total).
+ */
+export async function runHousekeeping(): Promise<HousekeepingReport> {
+    const report: HousekeepingReport = {
+        feedbackEventsPruned: 0,
+        chatLogsPruned: 0,
+        exceptionsPruned: 0,
+        alertsPruned: 0,
+        pineconeMemoriesPruned: 0,
+        totalReclaimed: 0,
+    };
+
+    const db = createClient();
+    if (!db) {
+        console.warn("⚠️ [Housekeeping] Supabase unavailable — skipping cleanup");
+        return report;
+    }
+
+    console.log("🧹 [Housekeeping] Starting nightly cleanup...");
+
+    // ── 1. feedback_events: synced + old ─────────────────────
+    try {
+        const cutoff90 = new Date(Date.now() - RETENTION.FEEDBACK_SYNCED_DAYS * 86400000).toISOString();
+        const { data: syncedOld, error: e1 } = await db
+            .from("feedback_events")
+            .delete()
+            .eq("synced_to_memory", true)
+            .lt("created_at", cutoff90)
+            .select("id");
+        if (!e1 && syncedOld) report.feedbackEventsPruned += syncedOld.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] feedback_events synced cleanup error: ${err.message}`);
+    }
+
+    // ── 2. feedback_events: unscored + stale ─────────────────
+    try {
+        const cutoff30 = new Date(Date.now() - RETENTION.FEEDBACK_UNSCORED_DAYS * 86400000).toISOString();
+        const { data: unscoredOld, error: e2 } = await db
+            .from("feedback_events")
+            .delete()
+            .is("accuracy_score", null)
+            .lt("created_at", cutoff30)
+            .select("id");
+        if (!e2 && unscoredOld) report.feedbackEventsPruned += unscoredOld.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] feedback_events unscored cleanup error: ${err.message}`);
+    }
+
+    // ── 3. feedback_events: ignored engagement + stale ───────
+    try {
+        const cutoff14 = new Date(Date.now() - RETENTION.FEEDBACK_IGNORED_DAYS * 86400000).toISOString();
+        const { data: ignoredOld, error: e3 } = await db
+            .from("feedback_events")
+            .delete()
+            .eq("category", "engagement")
+            .eq("user_action", "ignored")
+            .lt("created_at", cutoff14)
+            .select("id");
+        if (!e3 && ignoredOld) report.feedbackEventsPruned += ignoredOld.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] feedback_events ignored cleanup error: ${err.message}`);
+    }
+
+    // ── 4. sys_chat_logs: > 90 days ──────────────────────────
+    try {
+        const cutoff90 = new Date(Date.now() - RETENTION.CHAT_LOGS_DAYS * 86400000).toISOString();
+        const { data: oldLogs, error: e4 } = await db
+            .from("sys_chat_logs")
+            .delete()
+            .lt("created_at", cutoff90)
+            .select("id");
+        if (!e4 && oldLogs) report.chatLogsPruned = oldLogs.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] sys_chat_logs cleanup error: ${err.message}`);
+    }
+
+    // ── 5. ops_agent_exceptions: resolved/escalated/ignored > 30 days ──
+    try {
+        const cutoff30 = new Date(Date.now() - RETENTION.EXCEPTIONS_DAYS * 86400000).toISOString();
+        const { data: oldExceptions, error: e5 } = await db
+            .from("ops_agent_exceptions")
+            .delete()
+            .neq("status", "pending")
+            .lt("created_at", cutoff30)
+            .select("id");
+        if (!e5 && oldExceptions) report.exceptionsPruned = oldExceptions.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] ops_agent_exceptions cleanup error: ${err.message}`);
+    }
+
+    // ── 6. proactive_alerts: > 90 days ───────────────────────
+    try {
+        const cutoff90 = new Date(Date.now() - RETENTION.ALERTS_DAYS * 86400000).toISOString();
+        const { data: oldAlerts, error: e6 } = await db
+            .from("proactive_alerts")
+            .delete()
+            .lt("alerted_at", cutoff90)
+            .select("id");
+        if (!e6 && oldAlerts) report.alertsPruned = oldAlerts.length;
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] proactive_alerts cleanup error: ${err.message}`);
+    }
+
+    // ── 7. Pinecone: stale memories never recalled in 60+ days ──
+    try {
+        report.pineconeMemoriesPruned = await pruneStaleMemories();
+    } catch (err: any) {
+        console.warn(`⚠️ [Housekeeping] Pinecone cleanup error: ${err.message}`);
+    }
+
+    // ── Summary ──────────────────────────────────────────────
+    report.totalReclaimed =
+        report.feedbackEventsPruned +
+        report.chatLogsPruned +
+        report.exceptionsPruned +
+        report.alertsPruned +
+        report.pineconeMemoriesPruned;
+
+    console.log(
+        `🧹 [Housekeeping] Nightly cleanup complete:\n` +
+        `  feedback_events: ${report.feedbackEventsPruned} pruned\n` +
+        `  sys_chat_logs: ${report.chatLogsPruned} pruned (>${RETENTION.CHAT_LOGS_DAYS}d)\n` +
+        `  ops_agent_exceptions: ${report.exceptionsPruned} pruned (resolved >${RETENTION.EXCEPTIONS_DAYS}d)\n` +
+        `  proactive_alerts: ${report.alertsPruned} pruned (>${RETENTION.ALERTS_DAYS}d)\n` +
+        `  Pinecone aria-memory: ${report.pineconeMemoriesPruned} stale memories pruned\n` +
+        `  Total reclaimed: ${report.totalReclaimed}`
+    );
+
+    return report;
+}
+
+/**
+ * Prune stale Pinecone memories that haven't been recalled in 60+ days.
+ * Uses the `last_recalled_at` metadata field set by recall().
+ *
+ * Strategy:
+ * 1. List vectors in the aria-memory namespace (batch of 100)
+ * 2. Check `last_recalled_at` metadata
+ * 3. Delete any vector where last_recalled_at is older than 60 days
+ *    OR where last_recalled_at is missing (never recalled, and stored_at > 60 days)
+ *
+ * Returns count of pruned vectors.
+ */
+async function pruneStaleMemories(): Promise<number> {
+    try {
+        const { Pinecone } = await import("@pinecone-database/pinecone");
+        const apiKey = process.env.PINECONE_API_KEY;
+        if (!apiKey) return 0;
+
+        const pc = new Pinecone({ apiKey });
+        const indexName = process.env.PINECONE_INDEX || "gravity-memory";
+        const indexHost = process.env.PINECONE_MEMORY_HOST;
+        const index = indexHost ? pc.index(indexName, indexHost) : pc.index(indexName);
+
+        const namespace = index.namespace("aria-memory");
+        const staleCutoff = new Date(Date.now() - RETENTION.PINECONE_STALE_DAYS * 86400000).toISOString();
+
+        // List vectors — Pinecone list() returns IDs in pages
+        const listResult = await namespace.listPaginated({ limit: 100 });
+
+        if (!listResult.vectors || listResult.vectors.length === 0) return 0;
+
+        const ids = listResult.vectors.map(v => v.id);
+        const fetchResult = await namespace.fetch(ids);
+
+        const idsToDelete: string[] = [];
+
+        for (const [id, record] of Object.entries(fetchResult.records || {})) {
+            if (!record?.metadata) continue;
+
+            const meta = record.metadata as Record<string, any>;
+            const lastRecalled = meta.last_recalled_at as string | undefined;
+            const storedAt = meta.stored_at as string | undefined;
+
+            // Never recalled — check if it's old enough to prune
+            if (!lastRecalled) {
+                if (storedAt && storedAt < staleCutoff) {
+                    idsToDelete.push(id);
+                }
+                continue;
+            }
+
+            // Recalled, but not recently
+            if (lastRecalled < staleCutoff) {
+                idsToDelete.push(id);
+            }
+        }
+
+        if (idsToDelete.length > 0) {
+            await namespace.deleteMany(idsToDelete);
+            console.log(`🧹 [Housekeeping] Pruned ${idsToDelete.length} stale Pinecone memories: ${idsToDelete.join(", ")}`);
+        }
+
+        return idsToDelete.length;
+    } catch (err: any) {
+        console.error(`❌ [Housekeeping] Pinecone prune error: ${err.message}`);
+        return 0;
+    }
+}
+
+/**
+ * Format a housekeeping report for Telegram display.
+ */
+export function formatHousekeepingReport(report: HousekeepingReport): string {
+    return (
+        `🧹 <b>Housekeeping Report</b>\n\n` +
+        `<b>Rows Pruned:</b>\n` +
+        `  feedback_events: ${report.feedbackEventsPruned}\n` +
+        `  sys_chat_logs: ${report.chatLogsPruned}\n` +
+        `  ops_agent_exceptions: ${report.exceptionsPruned}\n` +
+        `  proactive_alerts: ${report.alertsPruned}\n` +
+        `  Pinecone memories: ${report.pineconeMemoriesPruned}\n\n` +
+        `<b>Total reclaimed:</b> ${report.totalReclaimed} rows/vectors\n\n` +
+        `<i>🧹 A tidy house is a tidy mind.</i>`
+    );
+}
+```
+
+**Step 2: Commit**
+
+```bash
+git add src/lib/intelligence/feedback-loop.ts
+git commit -m "feat(feedback): add runHousekeeping() with retention policies for all data stores"
+```
+
+---
+
+### Task 13: Add `/housekeeping` Bot Command and Nightly Cron
+
+**Files:**
+- Modify: `src/cli/start-bot.ts`
+- Modify: `src/lib/intelligence/ops-manager.ts`
+
+**Step 1: Add `/housekeeping` command to start-bot.ts**
+
+Add import at top:
+```typescript
+import { runHousekeeping, formatHousekeepingReport } from "../lib/intelligence/feedback-loop";
+```
+
+Add the command:
+```typescript
+// /housekeeping — Run Aria's data cleanup on demand
+bot.command('housekeeping', async (ctx) => {
+    ctx.sendChatAction('typing');
+    try {
+        await ctx.reply('🧹 Running housekeeping...');
+        const report = await runHousekeeping();
+        await ctx.reply(formatHousekeepingReport(report), { parse_mode: 'HTML' });
+    } catch (err: any) {
+        ctx.reply(`❌ Housekeeping failed: ${err.message}`);
+    }
+});
+```
+
+**Step 2: Add nightly housekeeping cron to OpsManager**
+
+In the `start()` method, add (import `runHousekeeping` at top of ops-manager.ts):
+```typescript
+// Housekeeping — nightly at 11:00 PM Denver (prune stale data everywhere)
+cron.schedule("0 23 * * *", () => this.safeRun("Nightly Housekeeping", async () => {
+    const report = await runHousekeeping();
+
+    // Only alert Will via Telegram if cleanup was surprisingly large
+    if (report.totalReclaimed > 500) {
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (chatId) {
+            await this.bot.telegram.sendMessage(
+                chatId,
+                `🧹 <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
+                { parse_mode: "HTML" }
+            );
+        }
+    }
+}), { timezone: "America/Denver" });
+```
+
+**Step 3: Update `recall()` in memory.ts to track last_recalled_at**
+
+In `src/lib/intelligence/memory.ts`, inside the `recall()` function, after getting results from Pinecone, add an update to track when each memory was last recalled:
+
+```typescript
+// Kaizen housekeeping: update last_recalled_at on recalled memories
+// so the housekeeping cron can prune stale ones.
+if (results.matches && results.matches.length > 0) {
+    const now = new Date().toISOString();
+    const updates = results.matches
+        .filter(m => (m.score ?? 0) >= minScore)
+        .map(m => ({
+            id: m.id,
+            values: m.values || [],
+            metadata: { ...((m.metadata as Record<string, any>) || {}), last_recalled_at: now },
+        }));
+
+    if (updates.length > 0) {
+        try {
+            await index.namespace(NAMESPACE).upsert(updates);
+        } catch (updateErr: any) {
+            // Non-fatal — don't block recall if metadata update fails
+            console.warn(`⚠️ [Memory] Failed to update last_recalled_at: ${updateErr.message}`);
+        }
+    }
+}
+```
+
+**Step 4: Commit**
+
+```bash
+git add src/cli/start-bot.ts src/lib/intelligence/ops-manager.ts src/lib/intelligence/memory.ts
+git commit -m "feat(feedback): add /housekeeping command, nightly cron, and recall() tracking"
+```
+
+---
+
+### Task 14: Final Integration — TypeScript Check and PM2 Restart
 
 **Step 1: Run TypeScript check**
 
@@ -1288,7 +1657,12 @@ Expected: Bot restarts successfully.
 Send `/kaizen` in Telegram.
 Expected: Receives a Kaizen report (will show "no data yet" initially, which is correct).
 
-**Step 5: Final commit and push**
+**Step 5: Test /housekeeping command**
+
+Send `/housekeeping` in Telegram.
+Expected: Receives a housekeeping report showing 0 pruned rows (no stale data yet, which is correct).
+
+**Step 6: Final commit and push**
 
 ```bash
 git add -A
@@ -1297,12 +1671,14 @@ git commit -m "feat(feedback): complete Aria Kaizen feedback loop system
 - feedback_events Supabase table for all feedback signals
 - feedback-loop.ts central module with recordFeedback, analyzeAccuracy,
   getVendorReliability, generateSelfReview, syncLearningsToMemory,
-  detectDrift, proposeThresholdAdjustments
+  detectDrift, proposeThresholdAdjustments, runHousekeeping
 - Reconciler wired for correction capture (approve/reject)
 - Supervisor wired for error pattern tracking
 - OpsManager wired for engagement tracking + weekly Kaizen cron
 - AP Agent wired for classification and vendor reliability
-- /kaizen and /vendor Telegram commands
+- /kaizen, /vendor, and /housekeeping Telegram commands
+- Nightly housekeeping cron prunes all stale data
+- Pinecone memory tracking via last_recalled_at metadata
 - Daily memory sync + weekly self-review on Fridays 8:15 AM"
 git push
 ```
@@ -1319,13 +1695,16 @@ After the system runs for a few days, verify:
 4. **Pinecone memories** include "LEARNED:" and "CONFIRMED:" entries from the Kaizen loop
 5. **Reconciler approve/reject** shows up in the feedback events
 6. **Supervisor errors** are tracked with pattern data
+7. **`/housekeeping` command** returns a cleanup report
+8. **Nightly cron** runs and logs cleanup stats (check `pm2 logs` for "Housekeeping" entries)
+9. **No unbounded table growth** — verify row counts are stable week-over-week
 
 ---
 
-## Future Work (Phase 3 — after data accumulates)
+## Future Work (Phase 4 — after data accumulates)
 
 - **Confidence Dashboard Panel** — Next.js dashboard showing accuracy by domain
 - **Build risk post-mortem** — After build date, check if risk materialized
 - **PO outcome tracking** — Did recommended POs actually get created?
 - **Auto-threshold proposals** — Make proposeThresholdAdjustments() more sophisticated with statistical analysis
-- **Memory pruning** — Identify and remove Pinecone memories that never get recalled
+- **Cold storage archival** — Move ap_activity_log rows > 1 year to cold storage when volume justifies
