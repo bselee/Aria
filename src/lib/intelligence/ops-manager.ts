@@ -42,8 +42,41 @@ const TRACKING_PATTERNS = {
     dhl: /\bJD\d{18}\b/i,
     // generic: require '#' or ':' separator — prevents "tracking information" false matches
     // keyword is non-capturing (?:...) so match[1] is always the tracking number
-    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i
+    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i,
+    // LTL freight identifiers — whitespace required after keyword
+    pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
+    bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
 };
+
+// LTL carrier keyword detection — ordered by specificity (most specific first)
+const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
+    [/\bold\s+dominion\s+freight\b/i, "Old Dominion"],
+    [/\bold\s+dominion\b/i,           "Old Dominion"],
+    [/\bodfl\b/i,                     "Old Dominion"],
+    [/\bdayton\s+freight\b/i,         "Dayton Freight"],
+    [/\bfedex\s+freight\b/i,          "FedEx Freight"],
+    [/\br\s*&\s*l\s+carriers?\b/i,    "R&L Carriers"],
+    [/\brl\s+carriers?\b/i,           "R&L Carriers"],
+    [/\bxpo\s+logistics\b/i,          "XPO Logistics"],
+    [/\bxpo\b/i,                      "XPO Logistics"],
+    [/\btforce\s+freight\b/i,         "TForce Freight"],
+    [/\bups\s+freight\b/i,            "TForce Freight"],
+    [/\byrc\s+freight\b/i,            "YRC Freight"],
+    [/\byellow\s+freight\b/i,         "Yellow Freight"],
+    [/\bcentral\s+transport\b/i,      "Central Transport"],
+    [/\babf\s+freight\b/i,            "ABF Freight"],
+    [/\barcbest\b/i,                  "ArcBest"],
+    [/\bestes\s+express\b/i,          "Estes"],
+    [/\bestes\b/i,                    "Estes"],
+    [/\bsaia\b/i,                     "Saia"],
+];
+
+function detectLTLCarrier(text: string): string | null {
+    for (const [pattern, name] of LTL_CARRIER_KEYWORDS) {
+        if (pattern.test(text)) return name;
+    }
+    return null;
+}
 
 type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
 interface TrackingStatus { category: TrackingCategory; display: string; public_url?: string; }
@@ -226,9 +259,43 @@ async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingS
  * Fetch tracking status directly from EasyPost API.
  * Returns null if tracking fails.
  */
+async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    // trackingNumber must be "CarrierName:::PRO#" format
+    if (!trackingNumber.includes(":::")) return null;
+    const url = carrierUrl(trackingNumber);
+    // parcelsapp fallback means unknown carrier — skip fetch
+    if (url.includes("parcelsapp.com")) return null;
+
+    try {
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return null;
+        const html = await res.text();
+        // Strip HTML tags, collapse whitespace
+        const text = html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ');
+        const parsed = parseTrackingContent(text);
+        if (parsed) return { ...parsed, public_url: url };
+    } catch (e: any) {
+        // Timeout, network error, JS-only page — silently ignore, link is still clickable
+    }
+    return null;
+}
+
 async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
-    // For FedEx numbers: use direct FedEx API (free with account) — skip EasyPost entirely
     const rawNumber = trackingNumber.includes(":::") ? trackingNumber.split(":::", 2)[1] : trackingNumber;
+
+    // LTL (:::) — try carrier page fetch first (free, no credentials)
+    if (trackingNumber.includes(":::")) {
+        return getLTLTrackingStatus(trackingNumber);
+    }
+
+    // Parcel FedEx — direct FedEx API (free with account credentials)
     if (isFedExNumber(rawNumber)) {
         return getFedExTrackingStatus(rawNumber);
     }
@@ -240,13 +307,6 @@ async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus
         const client = new EasyPostClient(apiKey);
 
         let reqParam: any = { tracking_code: trackingNumber };
-
-        // Handle LTL LLM Decoded Strings
-        if (trackingNumber.includes(":::")) {
-            const [carrierName, actualNumber] = trackingNumber.split(":::", 2);
-            // We pass the carrier to EasyPost if we have it - it dramatically helps their tracker engine
-            reqParam = { tracking_code: actualNumber, carrier: carrierName };
-        }
 
         const tracker = await client.Tracker.create(reqParam);
 
@@ -612,18 +672,26 @@ export class OpsManager {
                     if (payload?.parts) _walkMsgParts(payload.parts, bodyParts);
                     const bodyText = bodyParts.join('\n');
 
+                    // Detect LTL carrier name once per message for PRO/BOL encoding
+                    const ltlCarrier = detectLTLCarrier(bodyText);
+
                     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
                         // Run global exec loop so we catch ALL tracking numbers, not just the first
                         const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
                         let match;
                         while ((match = gRegex.exec(bodyText)) !== null) {
-                            // generic: group[1] is the number (keyword is non-capturing now)
-                            // all others: full match[0] is the tracking number
-                            const trackingNum = carrier === 'generic' ? (match[1] || match[0]) : match[0];
+                            // pro/bol/generic: group[1] is the number; others: full match[0]
+                            const trackingNum = ['generic', 'pro', 'bol'].includes(carrier) ? (match[1] || match[0]) : match[0];
                             // Must contain ≥2 digits — filters pure-word false positives
                             const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
-                            if (trackingNum && hasDigits && !trackingNumbers.includes(trackingNum)) {
-                                trackingNumbers.push(trackingNum);
+                            if (!trackingNum || !hasDigits) continue;
+                            // For PRO/BOL: encode with carrier name if detected in same message
+                            const encoded = (carrier === 'pro' || carrier === 'bol') && ltlCarrier
+                                ? `${ltlCarrier}:::${trackingNum}`
+                                : trackingNum;
+                            const rawNum = encoded.split(':::')[1] || encoded;
+                            if (!trackingNumbers.some(t => (t.split(':::')[1] || t) === rawNum)) {
+                                trackingNumbers.push(encoded);
                             }
                         }
                     }
