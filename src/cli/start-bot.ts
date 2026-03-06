@@ -744,13 +744,35 @@ bot.command('vendor', async (ctx) => {
         const { getVendorReliability } = await import('../lib/intelligence/feedback-loop');
         const score = await getVendorReliability(vendorName);
 
-        const emoji = score.reliabilityScore >= 0.85 ? '🟢' : score.reliabilityScore >= 0.6 ? '🟡' : '🔴';
+        if (!score) {
+            return ctx.reply(`❌ Could not retrieve vendor data — Supabase unavailable.`);
+        }
+
+        if (score.eventCount === 0) {
+            return ctx.reply(
+                `📊 *Vendor: ${vendorName}*\n\n` +
+                `No feedback data collected yet for this vendor.\n` +
+                `_Data accumulates as invoices are processed and reconciled._`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+
+        const pct = score.overallScore >= 0 ? score.overallScore : 0;
+        const emoji = pct >= 85 ? '🟢' : pct >= 60 ? '🟡' : '🔴';
         let msg = `📊 *Vendor: ${vendorName}*\n`;
-        msg += `${emoji} Reliability: *${(score.reliabilityScore * 100).toFixed(0)}%*\n`;
-        msg += `Based on ${score.totalEvents} events (last ${score.windowDays} days)\n\n`;
-        msg += `• Corrections: ${score.correctionRate.toFixed(0)}%\n`;
-        msg += `• Accuracy: ${score.accuracyRate.toFixed(0)}%\n`;
-        msg += `• Prediction Errors: ${score.predictionErrorRate.toFixed(0)}%\n`;
+        msg += `${emoji} Overall Score: *${pct}%*\n`;
+        msg += `Based on ${score.eventCount} events (last 90 days)\n`;
+        msg += `Trend: ${score.trend === 'improving' ? '⬆️ Improving' : score.trend === 'declining' ? '⬇️ Declining' : '➡️ Stable'}\n\n`;
+        if (score.onTimePercent >= 0) msg += `• On-Time Delivery: ${score.onTimePercent}%\n`;
+        if (score.invoiceAccuracy >= 0) msg += `• Invoice Accuracy: ${score.invoiceAccuracy}%\n`;
+        if (score.documentQuality >= 0) msg += `• Document Quality: ${score.documentQuality}%\n`;
+        if (score.avgResponseDays >= 0) msg += `• Avg Response: ${score.avgResponseDays} days\n`;
+        if (score.recentIssues.length > 0) {
+            msg += `\n⚠️ Recent Issues:\n`;
+            for (const issue of score.recentIssues) {
+                msg += `  • ${issue}\n`;
+            }
+        }
         msg += `\n_Scores update as reconciliations and corrections accumulate._`;
 
         await ctx.reply(msg, { parse_mode: 'Markdown' });
@@ -768,11 +790,13 @@ bot.command('housekeeping', async (ctx) => {
         const { runHousekeeping } = await import('../lib/intelligence/feedback-loop');
         const report = await runHousekeeping();
         let msg = `🧹 *Housekeeping Complete*\n\n`;
-        msg += `Total reclaimed: *${report.totalReclaimed}* rows/vectors\n`;
-        msg += `Duration: ${(report.durationMs / 1000).toFixed(1)}s\n\n`;
-        for (const [store, count] of Object.entries(report.storeResults)) {
-            msg += `• ${store}: ${count} pruned\n`;
-        }
+        msg += `Total reclaimed: *${report.totalReclaimed}* rows/vectors\n\n`;
+        if (report.feedbackEventsPruned > 0) msg += `• Feedback events: ${report.feedbackEventsPruned} pruned\n`;
+        if (report.chatLogsPruned > 0) msg += `• Chat logs: ${report.chatLogsPruned} pruned\n`;
+        if (report.exceptionsPruned > 0) msg += `• Exceptions: ${report.exceptionsPruned} pruned\n`;
+        if (report.alertsPruned > 0) msg += `• Alerts: ${report.alertsPruned} pruned\n`;
+        if (report.pineconeMemoriesPruned > 0) msg += `• Pinecone memories: ${report.pineconeMemoriesPruned} pruned\n`;
+        if (report.totalReclaimed === 0) msg += `_Nothing to clean — database is tidy._ ✨\n`;
         msg += `\n_Runs automatically every night at 11 PM MT._`;
         await ctx.reply(msg, { parse_mode: 'Markdown' });
     } catch (err: any) {

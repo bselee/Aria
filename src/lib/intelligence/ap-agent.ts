@@ -180,7 +180,7 @@ INVOICE - Standard vendor bill for PO - based stock.
 
                 // Kaizen: record classification prediction (Pillar 3 — Prediction Accuracy)
                 recordFeedback({
-                    category: "prediction_accuracy",
+                    category: "prediction",
                     eventType: "email_classification",
                     agentSource: "ap_agent",
                     subjectType: "message",
@@ -898,7 +898,7 @@ INVOICE - Standard vendor bill for PO - based stock.
 
             // Kaizen: record reconciliation verdict (Pillar 3 — Prediction Accuracy)
             recordFeedback({
-                category: "prediction_accuracy",
+                category: "prediction",
                 eventType: `reconciliation_${result.overallVerdict}`,
                 agentSource: "ap_agent",
                 subjectType: "po",
