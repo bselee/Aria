@@ -11,6 +11,7 @@ import { Telegraf } from "telegraf";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 import { remember, recall, Memory } from "./memory";
+import { recordFeedback } from "./feedback-loop";
 
 export class SupervisorAgent {
     private bot: Telegraf;
@@ -145,6 +146,23 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                         tags: ["ignore", "crash", rootCause.agent_name]
                     });
                 }
+
+                // Kaizen: record error pattern feedback (Pillar 5 — Self-Improving Error Handling)
+                recordFeedback({
+                    category: "error_pattern",
+                    eventType: `agent_error_${remedy.toLowerCase()}`,
+                    agentSource: "supervisor",
+                    subjectType: "message",
+                    subjectId: rootCause.agent_name,
+                    prediction: { errorMessage: rootCause.error_message.slice(0, 200) },
+                    actualOutcome: { remedy, resolved: remedy !== "ESCALATE" },
+                    accuracyScore: remedy === "ESCALATE" ? 0.3 : remedy === "RETRY" ? 0.7 : 0.5,
+                    userAction: remedy === "ESCALATE" ? "corrected" : undefined,
+                    contextData: {
+                        agent: rootCause.agent_name,
+                        stackSnippet: (rootCause.error_stack || "").slice(0, 300),
+                    },
+                }).catch(() => { /* non-blocking */ });
             }
         } catch (err: any) {
             console.error("❌ [Supervisor-Agent] Critical failure while supervising:", err.message);

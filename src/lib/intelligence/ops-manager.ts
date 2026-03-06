@@ -33,6 +33,7 @@ import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
 import { FinaleClient } from "../finale/client";
 import FirecrawlApp from "@mendable/firecrawl-js";
+import { recordFeedback, generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
@@ -51,24 +52,24 @@ const TRACKING_PATTERNS = {
 // LTL carrier keyword detection — ordered by specificity (most specific first)
 const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
     [/\bold\s+dominion\s+freight\b/i, "Old Dominion"],
-    [/\bold\s+dominion\b/i,           "Old Dominion"],
-    [/\bodfl\b/i,                     "Old Dominion"],
-    [/\bdayton\s+freight\b/i,         "Dayton Freight"],
-    [/\bfedex\s+freight\b/i,          "FedEx Freight"],
-    [/\br\s*&\s*l\s+carriers?\b/i,    "R&L Carriers"],
-    [/\brl\s+carriers?\b/i,           "R&L Carriers"],
-    [/\bxpo\s+logistics\b/i,          "XPO Logistics"],
-    [/\bxpo\b/i,                      "XPO Logistics"],
-    [/\btforce\s+freight\b/i,         "TForce Freight"],
-    [/\bups\s+freight\b/i,            "TForce Freight"],
-    [/\byrc\s+freight\b/i,            "YRC Freight"],
-    [/\byellow\s+freight\b/i,         "Yellow Freight"],
-    [/\bcentral\s+transport\b/i,      "Central Transport"],
-    [/\babf\s+freight\b/i,            "ABF Freight"],
-    [/\barcbest\b/i,                  "ArcBest"],
-    [/\bestes\s+express\b/i,          "Estes"],
-    [/\bestes\b/i,                    "Estes"],
-    [/\bsaia\b/i,                     "Saia"],
+    [/\bold\s+dominion\b/i, "Old Dominion"],
+    [/\bodfl\b/i, "Old Dominion"],
+    [/\bdayton\s+freight\b/i, "Dayton Freight"],
+    [/\bfedex\s+freight\b/i, "FedEx Freight"],
+    [/\br\s*&\s*l\s+carriers?\b/i, "R&L Carriers"],
+    [/\brl\s+carriers?\b/i, "R&L Carriers"],
+    [/\bxpo\s+logistics\b/i, "XPO Logistics"],
+    [/\bxpo\b/i, "XPO Logistics"],
+    [/\btforce\s+freight\b/i, "TForce Freight"],
+    [/\bups\s+freight\b/i, "TForce Freight"],
+    [/\byrc\s+freight\b/i, "YRC Freight"],
+    [/\byellow\s+freight\b/i, "Yellow Freight"],
+    [/\bcentral\s+transport\b/i, "Central Transport"],
+    [/\babf\s+freight\b/i, "ABF Freight"],
+    [/\barcbest\b/i, "ArcBest"],
+    [/\bestes\s+express\b/i, "Estes"],
+    [/\bestes\b/i, "Estes"],
+    [/\bsaia\b/i, "Saia"],
 ];
 
 function detectLTLCarrier(text: string): string | null {
@@ -559,6 +560,40 @@ export class OpsManager {
             this.apAgent.sendDailyRecap();
         }, { timezone: "America/Denver" });
 
+        // ── KAIZEN FEEDBACK LOOP CRONS ─────────────────────
+
+        // Weekly Kaizen Self-Review — Fridays 8:15 AM Denver
+        cron.schedule("15 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
+            const report = await generateSelfReview(7);
+            const chatId = process.env.TELEGRAM_CHAT_ID;
+            if (chatId) {
+                await this.bot.telegram.sendMessage(chatId, report, { parse_mode: "HTML" });
+            }
+        }), { timezone: "America/Denver" });
+
+        // Daily Memory Sync — every night at 10:00 PM Denver
+        cron.schedule("0 22 * * *", () => this.safeRun("KaizenMemorySync", async () => {
+            const synced = await syncLearningsToMemory();
+            if (synced > 0) {
+                console.log(`🧠 [Kaizen] Nightly sync: ${synced} learnings pushed to Pinecone`);
+            }
+        }), { timezone: "America/Denver" });
+
+        // Nightly Housekeeping — 11:00 PM Denver (prune stale data everywhere)
+        cron.schedule("0 23 * * *", () => this.safeRun("NightlyHousekeeping", async () => {
+            const report = await runHousekeeping();
+            // Only alert Will via Telegram if cleanup was surprisingly large
+            if (report.totalReclaimed > 500) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId) {
+                    await this.bot.telegram.sendMessage(
+                        chatId,
+                        `🧹 <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
+                        { parse_mode: "HTML" }
+                    );
+                }
+            }
+        }), { timezone: "America/Denver" });
 
     }
 

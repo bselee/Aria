@@ -22,6 +22,7 @@
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../supabase";
+import { recordFeedback } from "../intelligence/feedback-loop";
 
 // ──────────────────────────────────────────────────
 // PENDING APPROVAL STORE
@@ -183,6 +184,24 @@ export async function approvePendingReconciliation(id: string): Promise<{
         } catch { /* non-blocking — never fail the approval flow */ }
     });
 
+    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    recordFeedback({
+        category: "correction",
+        eventType: "reconciliation_approved",
+        agentSource: "reconciler",
+        subjectType: "po",
+        subjectId: entry.result.orderId,
+        prediction: {
+            overallVerdict: entry.result.overallVerdict,
+            totalDollarImpact: entry.result.totalDollarImpact,
+            priceChangeCount: entry.result.priceChanges.length,
+        },
+        actualOutcome: { applied: applyResult.applied.length, errors: applyResult.errors.length },
+        accuracyScore: 1.0,
+        userAction: "approved",
+        contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
+    }).catch(() => { /* non-blocking */ });
+
     return {
         success: true,
         applied: applyResult.applied,
@@ -255,6 +274,24 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             });
         } catch { /* non-blocking */ }
     });
+
+    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    recordFeedback({
+        category: "correction",
+        eventType: "reconciliation_rejected",
+        agentSource: "reconciler",
+        subjectType: "po",
+        subjectId: entry.result.orderId,
+        prediction: {
+            overallVerdict: entry.result.overallVerdict,
+            totalDollarImpact: entry.result.totalDollarImpact,
+            priceChangeCount: entry.result.priceChanges.length,
+        },
+        actualOutcome: { rejected: true, reason: "manual_rejection" },
+        accuracyScore: 0.0,
+        userAction: "rejected",
+        contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
+    }).catch(() => { /* non-blocking */ });
 
     return `❌ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
 }

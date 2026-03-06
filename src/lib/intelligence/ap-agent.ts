@@ -19,6 +19,7 @@ import {
     buildAuditMetadata,
 } from "../finale/reconciler";
 import { storePendingDropship } from "./dropship-store";
+import { recordFeedback } from "./feedback-loop";
 
 import { KNOWN_DROPSHIP_KEYWORDS } from "../../config/dropship-vendors";
 
@@ -176,6 +177,18 @@ INVOICE - Standard vendor bill for PO - based stock.
                     ? "DROPSHIP_INVOICE"
                     : await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent} `);
+
+                // Kaizen: record classification prediction (Pillar 3 — Prediction Accuracy)
+                recordFeedback({
+                    category: "prediction_accuracy",
+                    eventType: "email_classification",
+                    agentSource: "ap_agent",
+                    subjectType: "message",
+                    subjectId: m.id!,
+                    prediction: { intent, from: from.slice(0, 100), subject: subject.slice(0, 100) },
+                    accuracyScore: 1.0, // assume correct until corrected
+                    contextData: { fastPath: this.isKnownDropshipVendor(from, subject) },
+                }).catch(() => { /* non-blocking */ });
 
                 if (intent === "ADVERTISEMENT") {
                     // Mark as read and REMOVE from inbox (archive)
@@ -882,6 +895,27 @@ INVOICE - Standard vendor bill for PO - based stock.
                 }
                 await this.sendReconciliationNotification(result);
             }
+
+            // Kaizen: record reconciliation verdict (Pillar 3 — Prediction Accuracy)
+            recordFeedback({
+                category: "prediction_accuracy",
+                eventType: `reconciliation_${result.overallVerdict}`,
+                agentSource: "ap_agent",
+                subjectType: "po",
+                subjectId: orderId,
+                prediction: {
+                    verdict: result.overallVerdict,
+                    totalImpact: result.totalDollarImpact,
+                    priceChanges: result.priceChanges.length,
+                    feeChanges: result.feeChanges.length,
+                },
+                accuracyScore: result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change" ? 1.0 : 0.5,
+                contextData: {
+                    vendor: result.vendorName,
+                    invoice: result.invoiceNumber,
+                    forceApproval,
+                },
+            }).catch(() => { /* non-blocking */ });
 
         } catch (err: any) {
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
