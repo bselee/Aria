@@ -40,7 +40,9 @@ const TRACKING_PATTERNS = {
     fedex: /\b(96\d{18}|\d{15}|\d{12})\b/,
     usps: /\b(94|92|93|95)\d{20}\b/,
     dhl: /\bJD\d{18}\b/i,
-    generic: /\b(tracking|track|waybill)\s*[#:]?\s*([0-9A-Z]{10,25})\b/i
+    // generic: require '#' or ':' separator — prevents "tracking information" false matches
+    // keyword is non-capturing (?:...) so match[1] is always the tracking number
+    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i
 };
 
 type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
@@ -129,11 +131,108 @@ function parseTrackingContent(content: string): TrackingStatus | null {
 
 import EasyPostClient from "@easypost/api";
 
+// FedEx OAuth token cache — avoid re-authing on every call (tokens last 1h)
+let _fedexToken: string | null = null;
+let _fedexTokenExpiry = 0;
+
+/**
+ * Detect if a tracking number looks like FedEx format.
+ * 12-digit, 15-digit, 20-digit, or 96-prefix numbers.
+ */
+function isFedExNumber(num: string): boolean {
+    return /^\d{12}$/.test(num) || /^\d{15}$/.test(num) || /^96\d{18,20}$/.test(num) || /^\d{20}$/.test(num);
+}
+
+/**
+ * Track a FedEx shipment directly via FedEx Track API (free with account credentials).
+ * No per-call cost — uses BuildASoil's own FedEx developer account.
+ */
+async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    const clientId = process.env.FEDEX_CLIENT_ID;
+    const clientSecret = process.env.FEDEX_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return null;
+
+    try {
+        // Refresh OAuth token if expired
+        if (!_fedexToken || Date.now() >= _fedexTokenExpiry) {
+            const authRes = await fetch('https://apis.fedex.com/oauth/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret,
+                }).toString(),
+            });
+            if (!authRes.ok) throw new Error(`FedEx auth ${authRes.status}: ${await authRes.text()}`);
+            const auth = await authRes.json() as { access_token: string; expires_in: number };
+            _fedexToken = auth.access_token;
+            _fedexTokenExpiry = Date.now() + (auth.expires_in - 60) * 1000; // 60s buffer
+        }
+
+        const trackRes = await fetch('https://apis.fedex.com/track/v1/trackingnumbers', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${_fedexToken}`,
+                'X-locale': 'en_US',
+            },
+            body: JSON.stringify({
+                trackingInfo: [{ trackingNumberInfo: { trackingNumber } }],
+                includeDetailedScans: false,
+            }),
+        });
+
+        if (!trackRes.ok) throw new Error(`FedEx track ${trackRes.status}: ${await trackRes.text()}`);
+        const data = await trackRes.json() as any;
+
+        const result = data?.output?.completeTrackResults?.[0]?.trackResults?.[0];
+        if (!result) return null;
+
+        const statusCode: string = result.latestStatusDetail?.code ?? '';
+        const dates: any[] = result.dateAndTimes ?? [];
+        const deliveredEntry = dates.find((d: any) => d.type === 'ACTUAL_DELIVERY');
+        const estEntry = result.estimatedDeliveryTimeWindow?.window?.ends;
+
+        switch (statusCode) {
+            case 'DL': {
+                let display = 'Delivered';
+                if (deliveredEntry?.dateTime) {
+                    const d = new Date(deliveredEntry.dateTime);
+                    display = `Delivered ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+                }
+                return { category: 'delivered', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            }
+            case 'OD':
+                return { category: 'out_for_delivery', display: 'Out for delivery', public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            case 'DE':
+                return { category: 'exception', display: 'Delivery exception', public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            default: {
+                let display = 'In transit';
+                if (estEntry) {
+                    const e = new Date(estEntry);
+                    display = `Expected ${e.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+                }
+                return { category: 'in_transit', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            }
+        }
+    } catch (err: any) {
+        console.warn(`[tracking-api] FedEx direct track failed for ${trackingNumber}: ${err.message}`);
+        return null;
+    }
+}
+
 /**
  * Fetch tracking status directly from EasyPost API.
  * Returns null if tracking fails.
  */
 async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    // For FedEx numbers: use direct FedEx API (free with account) — skip EasyPost entirely
+    const rawNumber = trackingNumber.includes(":::") ? trackingNumber.split(":::", 2)[1] : trackingNumber;
+    if (isFedExNumber(rawNumber)) {
+        return getFedExTrackingStatus(rawNumber);
+    }
+
     const apiKey = process.env.EASYPOST_API_KEY;
     if (!apiKey) return null;
 
@@ -463,7 +562,8 @@ export class OpsManager {
             for (const m of search.messages) {
                 const { data: thread } = await gmail.users.threads.get({
                     userId: "me",
-                    id: m.threadId!
+                    id: m.threadId!,
+                    format: 'full'
                 });
 
                 if (!thread.messages) continue;
@@ -495,18 +595,36 @@ export class OpsManager {
 
                 const responseTimeMins = responseAt ? Math.round((responseAt - sentAt) / 60000) : null;
 
-                // 🔍 Extract Tracking Numbers from Snippets
+                // 🔍 Extract Tracking Numbers from full message body (snippet is too short — truncates numbers)
+                const _decodeGmailBody = (data: string): string =>
+                    Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
+                const _walkMsgParts = (parts: any[], out: string[]) => {
+                    for (const part of parts ?? []) {
+                        if (part.mimeType === 'text/plain' && part.body?.data) out.push(_decodeGmailBody(part.body.data));
+                        if (part.parts?.length) _walkMsgParts(part.parts, out);
+                    }
+                };
                 let trackingNumbers: string[] = [];
                 for (const msg of thread.messages) {
-                    const body = msg.snippet || "";
+                    const bodyParts: string[] = [msg.snippet || ''];
+                    const payload = msg.payload;
+                    if (payload?.body?.data) bodyParts.push(_decodeGmailBody(payload.body.data));
+                    if (payload?.parts) _walkMsgParts(payload.parts, bodyParts);
+                    const bodyText = bodyParts.join('\n');
+
                     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-                        const match = body.match(regex);
-                        if (!match) continue;
-                        // For the generic pattern, capture group [2] is the number itself.
-                        // All other patterns are direct matches with no prefix in [0].
-                        const trackingNum = carrier === "generic" ? match[2] : match[0];
-                        if (trackingNum && !trackingNumbers.includes(trackingNum)) {
-                            trackingNumbers.push(trackingNum);
+                        // Run global exec loop so we catch ALL tracking numbers, not just the first
+                        const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+                        let match;
+                        while ((match = gRegex.exec(bodyText)) !== null) {
+                            // generic: group[1] is the number (keyword is non-capturing now)
+                            // all others: full match[0] is the tracking number
+                            const trackingNum = carrier === 'generic' ? (match[1] || match[0]) : match[0];
+                            // Must contain ≥2 digits — filters pure-word false positives
+                            const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
+                            if (trackingNum && hasDigits && !trackingNumbers.includes(trackingNum)) {
+                                trackingNumbers.push(trackingNum);
+                            }
                         }
                     }
                 }
@@ -516,10 +634,14 @@ export class OpsManager {
                 const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
                 const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
 
+                // Always read existing tracking so we can merge — never overwrite inbox-sourced tracking
+                const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers").eq("po_number", poNumber).maybeSingle();
+                const oldTracking = existingPO?.tracking_numbers || [];
+                // Merge: inbox-backfilled numbers stay even if PO thread doesn't mention them
+                const mergedTracking = [...new Set([...oldTracking, ...trackingNumbers])];
+
                 // Alert for NEW tracking numbers
                 if (trackingNumbers.length > 0) {
-                    const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers").eq("po_number", poNumber).single();
-                    const oldTracking = existingPO?.tracking_numbers || [];
                     const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
 
                     if (newTracking.length > 0) {
@@ -529,7 +651,7 @@ export class OpsManager {
                             po_number: poNumber,
                             vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                             vendor_response_time_minutes: responseTimeMins,
-                            tracking_numbers: trackingNumbers,
+                            tracking_numbers: mergedTracking,
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
 
@@ -589,12 +711,12 @@ export class OpsManager {
                     pineconeMetadata
                 );
 
-                // Update DB (full record sync — tracking already upserted above if new)
+                // Update DB (full record sync — use merged tracking to preserve inbox-sourced numbers)
                 await supabase.from("purchase_orders").upsert({
                     po_number: poNumber,
                     vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                     vendor_response_time_minutes: responseTimeMins,
-                    tracking_numbers: trackingNumbers,
+                    tracking_numbers: mergedTracking,
                     updated_at: new Date().toISOString()
                 }, { onConflict: "po_number" });
 
@@ -1719,7 +1841,8 @@ Data: ${JSON.stringify(data)}`;
         po: FullPO,
         expectedDate: string,
         leadProvenance: string,
-        trackingNumbers: string[]
+        trackingNumbers: string[],
+        prefetchedStatuses?: Map<string, TrackingStatus | null>
     ): Promise<string> {
         const isReceived = (po.status || '').toLowerCase() === 'completed';
         const isCancelled = (po.status || '').toLowerCase() === 'cancelled';
@@ -1742,7 +1865,7 @@ Data: ${JSON.stringify(data)}`;
 
         if (trackingNumbers.length > 0) {
             const trackingLines = await Promise.all(trackingNumbers.map(async t => {
-                const ts = await getTrackingStatus(t);
+                const ts = prefetchedStatuses?.has(t) ? prefetchedStatuses.get(t)! : await getTrackingStatus(t);
                 const statusStr = ts ? ` ${ts.display}` : "";
                 const link = ts?.public_url || carrierUrl(t);
                 const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
@@ -1844,10 +1967,21 @@ Data: ${JSON.stringify(data)}`;
 
                 // Get tracking array for this PO
                 const trackingNumbers = trackingMap.get(po.orderId) || [];
-                // Sort tracking numbers for stable stringification
-                const trackingHash = trackingNumbers.slice().sort().join(',');
 
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers);
+                // Pre-fetch EasyPost statuses so we can include them in change-detection hash
+                // (hash must reflect status so re-sync triggers when billing was fixed or status changes)
+                const trackingStatuses = new Map<string, TrackingStatus | null>();
+                await Promise.all(trackingNumbers.map(async t => {
+                    trackingStatuses.set(t, await getTrackingStatus(t));
+                }));
+
+                // Hash = sorted "num:status" pairs — changes when EasyPost status changes
+                const trackingHash = trackingNumbers.slice().sort().map(t => {
+                    const ts = trackingStatuses.get(t);
+                    return ts ? `${t}:${ts.category}` : t;
+                }).join(',');
+
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses);
                 const newStatus = (po.status || '').toLowerCase() === 'completed' ? 'received'
                     : (po.status || '').toLowerCase() === 'cancelled' ? 'cancelled'
                         : 'open';

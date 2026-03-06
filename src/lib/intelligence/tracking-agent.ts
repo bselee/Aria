@@ -16,11 +16,18 @@ const TRACKING_PATTERNS = {
     ups: /\b1Z[A-Z0-9]{16}\b/gi,
     fedex: /\b(96\d{18}|\d{15}|\d{12})\b/g,
     usps: /\b(94|92|93|95)\d{20}\b/g,
-    dhl: /\bJD\d{18}\b/ig,
-    generic: /\b(?:tracking|track|waybill)\s*[#:]?\s*([0-9A-Z]{10,25})\b/ig,
-    pro: /\b(?:PRO|PRO[\s\-]*#?)\s*([0-9A-Z]{7,15})\b/ig,
-    bol: /\b(?:BOL|BOL[\s\-]*#?|Bill[\s\-]*of[\s\-]*Lading)\s*([0-9A-Z]{7,25})\b/ig
+    dhl: /\bJD\d{18}\b/gi,
+    // generic: require '#' or ':' separator so "tracking information" doesn't match
+    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi,
+    // PRO/BOL: require whitespace after keyword — prevents "production"/"bolus" false matches
+    pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi,
+    bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/gi,
 };
+
+// Tracking numbers must contain at least 2 digits — filters pure-word false positives
+function isValidTrackingNum(num: string): boolean {
+    return (num.match(/\d/g)?.length ?? 0) >= 2;
+}
 
 export class TrackingAgent {
     private decodeBase64(data: string): string {
@@ -85,7 +92,7 @@ export class TrackingAgent {
                     trackingNum = match[0];
                 }
 
-                if (trackingNum && !extracted.some(t => t.includes(trackingNum))) {
+                if (trackingNum && isValidTrackingNum(trackingNum) && !extracted.some(t => t.includes(trackingNum))) {
                     extracted.push(trackingNum);
                 }
             }
@@ -196,9 +203,26 @@ export class TrackingAgent {
 
                 const subject = m.subject || "";
                 const bodyMsg = m.body_snippet || "";
-                const poMatch = subject.match(/PO\s*#?\s*(\d+)/i) || bodyMsg.match(/PO\s*#?\s*(\d+)/i);
+                let poMatch = subject.match(/PO\s*#?\s*(\d+)/i) || bodyMsg.match(/PO\s*#?\s*(\d+)/i);
 
-                // If there's no PO match, we can skip it, as we can't associate the tracking.
+                // If no PO # in snippet, try LLM extraction as fallback before skipping
+                if (!poMatch) {
+                    try {
+                        const schema = z.object({ poNumber: z.string().nullable() });
+                        const res = await unifiedObjectGeneration({
+                            system: "Extract a BuildASoil PO number from this email subject/snippet. Return null if not found.",
+                            prompt: `Subject: ${subject}\nBody snippet: ${bodyMsg}`,
+                            schema,
+                            schemaName: "POExtraction"
+                        }) as { poNumber: string | null };
+                        if (res?.poNumber) {
+                            const llmMatch = res.poNumber.match(/(\d+)/);
+                            if (llmMatch) poMatch = llmMatch;
+                        }
+                    } catch (_) { /* ignore, will skip below */ }
+                }
+
+                // Still no PO # — can't associate tracking, skip
                 if (!poMatch) {
                     continue;
                 }

@@ -1181,8 +1181,30 @@ export async function applyReconciliation(
                     await client.updateShipmentTracking(firstShipment, updates);
                     applied.push(`Tracking: ${newTrackingNumbers.join(", ") || "ship date updated"}`);
 
-                    // Save tracking numbers to Supabase for future dedup
+                    // Save tracking numbers to invoices table for future dedup
                     await saveTrackingNumbers(newTrackingNumbers, result.invoiceNumber);
+
+                    // Also persist to purchase_orders.tracking_numbers so calendar sync + dashboard show it
+                    if (newTrackingNumbers.length > 0) {
+                        try {
+                            const supabase = createClient();
+                            if (supabase) {
+                                const { data: existingPO } = await supabase
+                                    .from("purchase_orders")
+                                    .select("tracking_numbers")
+                                    .eq("po_number", result.orderId)
+                                    .maybeSingle();
+                                const merged = [...new Set([...(existingPO?.tracking_numbers ?? []), ...newTrackingNumbers])];
+                                await supabase.from("purchase_orders").upsert({
+                                    po_number: result.orderId,
+                                    tracking_numbers: merged,
+                                    updated_at: new Date().toISOString(),
+                                }, { onConflict: "po_number" });
+                            }
+                        } catch (e: any) {
+                            console.warn(`⚠️ [reconciler] Failed to persist tracking to purchase_orders: ${e.message}`);
+                        }
+                    }
                 } else {
                     skipped.push("Tracking: No shipment found on PO to attach tracking to");
                 }
