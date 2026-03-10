@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { Receipt, ChevronDown } from "lucide-react";
+import { Receipt, ChevronDown, Check, X } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -18,11 +18,11 @@ function timeAgo(iso: string): string {
 type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched";
 
 const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
-  auto_approved: { dot: "bg-emerald-500",  label: "AUTO",    pulse: false },
-  needs_approval: { dot: "bg-amber-400",   label: "PENDING", pulse: true  },
-  rejected:       { dot: "bg-red-500",     label: "REJECT",  pulse: false },
-  duplicate:      { dot: "bg-zinc-600",    label: "DUP",     pulse: false },
-  unmatched:      { dot: "bg-rose-500",    label: "NO PO",   pulse: false },
+  auto_approved: { dot: "bg-emerald-500", label: "AUTO", pulse: false },
+  needs_approval: { dot: "bg-amber-400", label: "PENDING", pulse: true },
+  rejected: { dot: "bg-red-500", label: "REJECT", pulse: false },
+  duplicate: { dot: "bg-zinc-600", label: "DUP", pulse: false },
+  unmatched: { dot: "bg-rose-500", label: "NO PO", pulse: false },
 };
 
 function statusCfg(status: string) {
@@ -35,6 +35,28 @@ export default function InvoiceQueuePanel() {
   const [invoices, setInvoices] = useState<InvoiceQueueItem[]>([]);
   const [stats, setStats] = useState<InvoiceQueueStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [actingOn, setActingOn] = useState<string | null>(null);
+
+  // Handle approve/dismiss actions
+  const handleAction = useCallback(async (id: string, action: "approve" | "dismiss") => {
+    setActingOn(id);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ activityLogId: id, action }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error("Action failed:", data.error);
+      }
+    } catch (err) {
+      console.error("Action error:", err);
+    } finally {
+      setActingOn(null);
+      fetchData(true); // bust cache and refresh
+    }
+  }, []);
 
   // Collapse state — persisted to localStorage
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -71,7 +93,7 @@ export default function InvoiceQueuePanel() {
 
   // Partition into pending vs rest
   const pending = invoices.filter(i => i.status === "needs_approval");
-  const rest    = invoices.filter(i => i.status !== "needs_approval");
+  const rest = invoices.filter(i => i.status !== "needs_approval");
 
   return (
     <div className="border-b border-zinc-800 shrink-0">
@@ -194,8 +216,25 @@ export default function InvoiceQueuePanel() {
                       {timeAgo(inv.processedAt)}
                     </span>
                   </div>
-                  <div className="text-xs text-amber-300/70 truncate mt-0.5">
-                    Pending approval
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-xs text-amber-300/70">Pending approval</span>
+                    <div className="flex-1" />
+                    <button
+                      onClick={() => handleAction(inv.id, "approve")}
+                      disabled={actingOn === inv.id}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                    >
+                      <Check className="w-3 h-3" />
+                      {actingOn === inv.id ? "..." : "Approve"}
+                    </button>
+                    <button
+                      onClick={() => handleAction(inv.id, "dismiss")}
+                      disabled={actingOn === inv.id}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                    >
+                      <X className="w-3 h-3" />
+                      Dismiss
+                    </button>
                   </div>
                 </div>
               </div>
