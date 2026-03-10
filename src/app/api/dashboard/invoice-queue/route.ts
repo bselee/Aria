@@ -13,6 +13,7 @@ import { createClient } from '@/lib/supabase';
 
 export type InvoiceQueueItem = {
     id: string;
+    activityLogId: string | null;
     invoiceNumber: string;
     vendorName: string;
     total: number;
@@ -192,6 +193,7 @@ export async function GET(req: NextRequest) {
 
             return {
                 id: String(row.id),
+                activityLogId: matchedLog?.id ? String(matchedLog.id) : null,
                 invoiceNumber: invNum,
                 vendorName: row.vendor_name ?? 'Unknown',
                 total: Number(row.total ?? 0),

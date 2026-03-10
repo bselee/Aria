@@ -29,6 +29,41 @@ function statusCfg(status: string) {
   return STATUS_CFG[status as StatusKey] ?? { dot: "bg-zinc-600", label: status.toUpperCase(), pulse: false };
 }
 
+// ── Guidance ──────────────────────────────────────────────────────────────────
+
+function pendingGuidance(inv: InvoiceQueueItem): { text: string; suggestion: "approve" | "dismiss" | "review" } {
+  const v = inv.vendorName.toLowerCase();
+  const num = (inv.invoiceNumber ?? "").toLowerCase();
+  const impact = Math.abs(inv.dollarImpact ?? 0);
+
+  // OCR failure — nothing to reconcile
+  if (v === "error" || v === "unknown" || num === "error" || num === "") {
+    return { text: "OCR failed — couldn't read this document. Dismiss it.", suggestion: "dismiss" };
+  }
+  // No PO match
+  if (!inv.poNumber) {
+    return { text: "No PO matched. Could be a statement or duplicate.", suggestion: "review" };
+  }
+  // Tiny variance — rounding or minor price diff
+  if (impact > 0 && impact < 1) {
+    return { text: `$${impact.toFixed(2)} rounding difference — safe to approve.`, suggestion: "approve" };
+  }
+  // Freight-heavy invoice
+  if (inv.freight && inv.freight > 0 && impact > 0) {
+    return { text: `Includes $${inv.freight.toFixed(0)} freight. Approve if freight is expected.`, suggestion: "approve" };
+  }
+  // Larger gap
+  if (impact > 5) {
+    return { text: `$${impact.toFixed(2)} variance — review line items before approving.`, suggestion: "review" };
+  }
+  // Balance warning from reconciler
+  if (inv.balanceWarning) {
+    return { text: inv.balanceWarning, suggestion: "review" };
+  }
+  // Default
+  return { text: "Price or fee changes detected — review and approve.", suggestion: "review" };
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function InvoiceQueuePanel() {
@@ -217,24 +252,39 @@ export default function InvoiceQueuePanel() {
                     </span>
                   </div>
                   <div className="flex items-center gap-2 mt-1">
-                    <span className="text-xs text-amber-300/70">Pending approval</span>
+                    {(() => {
+                      const g = pendingGuidance(inv);
+                      return (
+                        <span className={`text-[10px] font-mono truncate ${g.suggestion === "dismiss" ? "text-zinc-500" :
+                            g.suggestion === "approve" ? "text-emerald-400/70" :
+                              "text-amber-300/70"
+                          }`}>
+                          {g.suggestion === "approve" ? "✓ " : g.suggestion === "dismiss" ? "⊘ " : "⚠ "}
+                          {g.text}
+                        </span>
+                      );
+                    })()}
                     <div className="flex-1" />
-                    <button
-                      onClick={() => handleAction(inv.id, "approve")}
-                      disabled={actingOn === inv.id}
-                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
-                    >
-                      <Check className="w-3 h-3" />
-                      {actingOn === inv.id ? "..." : "Approve"}
-                    </button>
-                    <button
-                      onClick={() => handleAction(inv.id, "dismiss")}
-                      disabled={actingOn === inv.id}
-                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
-                    >
-                      <X className="w-3 h-3" />
-                      Dismiss
-                    </button>
+                    {inv.activityLogId && (
+                      <>
+                        <button
+                          onClick={() => handleAction(inv.activityLogId!, "approve")}
+                          disabled={actingOn === inv.activityLogId}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                        >
+                          <Check className="w-3 h-3" />
+                          {actingOn === inv.activityLogId ? "..." : "Approve"}
+                        </button>
+                        <button
+                          onClick={() => handleAction(inv.activityLogId!, "dismiss")}
+                          disabled={actingOn === inv.activityLogId}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                        >
+                          <X className="w-3 h-3" />
+                          Dismiss
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
