@@ -633,16 +633,48 @@ export default function ActivityFeed() {
 
     if (loading) {
         return (
-            <div className="flex flex-col items-center justify-center py-20 text-zinc-500">
-                <div className="w-6 h-6 border-2 border-neon-blue border-t-transparent rounded-full animate-spin mb-4" />
-                <p className="font-mono text-sm tracking-widest uppercase">Initializing Secure Feed...</p>
+            <div className="space-y-4 px-4 py-6">
+                {[1, 2, 3].map(i => (
+                    <div key={i} className="p-4 rounded-xl border border-zinc-800/60 space-y-2">
+                        <div className="flex items-center gap-2">
+                            <div className="w-4 h-4 rounded-full skeleton-shimmer shrink-0" />
+                            <div className="skeleton-shimmer h-3" style={{ width: `${50 + i * 10}%` }} />
+                            <div className="skeleton-shimmer h-2.5 w-12 ml-auto" />
+                        </div>
+                        <div className="skeleton-shimmer h-4" style={{ width: `${60 + i * 8}%` }} />
+                        <div className="skeleton-shimmer h-3" style={{ width: `${40 + i * 12}%` }} />
+                    </div>
+                ))}
             </div>
         );
     }
 
+    // DECISION(2026-03-10): Filter out junk/advertisement entries from the feed.
+    // Only actionable items (invoices, reconciliations, errors, items needing review)
+    // are shown. User requested: "Only want to see actionable, clickable information
+    // that needs human attention."
+    const actionableLogs = logs.filter(log => {
+        const isJunk = log.intent === "ADVERTISEMENT" || (
+            log.action_taken.toLowerCase().includes("archived") &&
+            !log.action_taken.toLowerCase().includes("review") &&
+            !log.action_taken.toLowerCase().includes("flagged") &&
+            !log.action_taken.toLowerCase().includes("error") &&
+            !log.action_taken.toLowerCase().includes("failed")
+        );
+        return !isJunk;
+    });
+    const hiddenCount = logs.length - actionableLogs.length;
+
     return (
         <div className="space-y-6 relative before:absolute before:inset-0 before:ml-4 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-zinc-800 before:to-transparent">
-            {logs.map((log) => {
+            {hiddenCount > 0 && (
+                <div className="text-center">
+                    <span className="text-[10px] font-mono text-zinc-600 bg-zinc-900/50 px-2 py-0.5 rounded-full">
+                        {hiddenCount} auto-archived hidden
+                    </span>
+                </div>
+            )}
+            {actionableLogs.map((log) => {
                 // Determine styling based on intent and action
                 let dotColor = "bg-zinc-700 ring-zinc-900";
                 let Icon = BotMessageSquare;
@@ -691,7 +723,7 @@ export default function ActivityFeed() {
                                 : isReviewed
                                     ? "border-zinc-800/40 hover:border-zinc-700"
                                     : needsReview && isRecon
-                                        ? "border-amber-500/20 hover:border-amber-500/40"
+                                        ? "border-amber-500/20 hover:border-amber-500/40 border-l-2"
                                         : "border-zinc-800/60 hover:border-zinc-700 hover:bg-zinc-900/60"
                                 }`}>
                                 <div className="flex justify-between items-start mb-2">
@@ -715,7 +747,7 @@ export default function ActivityFeed() {
                                             </span>
                                         )}
                                     </div>
-                                    <span className="text-xs font-mono text-zinc-500">{fmtTime(log.created_at)}</span>
+                                    <span className="text-xs font-mono text-[var(--dash-ts)]">{fmtTime(log.created_at)}</span>
                                 </div>
 
                                 <h3 className="text-sm font-semibold text-zinc-200 mb-1 leading-snug">{log.action_taken}</h3>

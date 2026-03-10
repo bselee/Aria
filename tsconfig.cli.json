@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+        "target": "ES2017",
+        "lib": [
+            "esnext"
+        ],
+        "allowJs": true,
+        "skipLibCheck": true,
+        "strict": true,
+        "noEmit": true,
+        "esModuleInterop": true,
+        "module": "esnext",
+        "moduleResolution": "node",
+        "resolveJsonModule": true,
+        "isolatedModules": true,
+        "incremental": true,
+        "tsBuildInfoFile": "./.tsbuildinfo.cli",
+        "paths": {
+            "@/*": [
+                "./src/*"
+            ]
+        }
+    },
+    "include": [
+        "src/cli/**/*.ts",
+        "src/lib/**/*.ts",
+        "src/config/**/*.ts",
+        "src/types/**/*.ts"
+    ],
+    "exclude": [
+        "node_modules"
+    ]
+}

@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
 
@@ -20,7 +20,7 @@ export class EmailIngestionWorker {
         console.log(`📡 [EmailIngestionWorker] Fetching unread emails to queue...`);
         try {
             const auth = await getAuthenticatedClient(this.tokenIdentifier);
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
             // Ensure our Aria-Ingested label exists so we don't process emails multiple times

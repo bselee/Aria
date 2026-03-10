@@ -6,7 +6,7 @@
  * @usage   node --import tsx src/cli/run-ap-pipeline.ts
  */
 
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { Telegraf, Markup } from "telegraf";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { createClient } from "../lib/supabase";
@@ -57,12 +57,12 @@ async function main() {
     try {
         try {
             const auth = await getAuthenticatedClient("ap");
-            gmail = google.gmail({ version: "v1", auth });
+            gmail = GmailApi({ version: "v1", auth });
             const p = await gmail.users.getProfile({ userId: "me" });
             console.log(`   ✅ Connected as: ${p.data.emailAddress} (ap token)`);
         } catch {
             const auth = await getAuthenticatedClient("default");
-            gmail = google.gmail({ version: "v1", auth });
+            gmail = GmailApi({ version: "v1", auth });
             const p = await gmail.users.getProfile({ userId: "me" });
             console.log(`   ✅ Connected as: ${p.data.emailAddress} (default token)`);
         }

@@ -1,18 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { createBrowserClient } from "@/lib/supabase";
+import { useEffect, useState, useCallback } from "react";
 import { Receipt, ChevronDown } from "lucide-react";
+import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
 
-type LogEntry = {
-  id: string;
-  created_at: string;
-  email_from: string;
-  email_subject: string;
-  intent: string;
-  action_taken: string;
-  metadata: any;
-};
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function timeAgo(iso: string): string {
   const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
@@ -23,35 +15,25 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
-function vendorName(from: string): string {
-  // Extract display name from "Vendor Name <email@domain.com>" or just use email
-  const m = from.match(/^([^<]+?)\s*</);
-  if (m) return m[1].trim();
-  return from.replace(/@.*/, "");
-}
+type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched";
 
-type Status = "matched" | "pending" | "unmatched" | "forwarded" | "junk";
-
-function classify(log: LogEntry): Status {
-  const a = log.action_taken.toLowerCase();
-  if (log.intent === "ADVERTISEMENT" || a.includes("archived") || a.includes("ignored") || a.includes("unread")) return "junk";
-  if (a.includes("pending") || a.includes("flagged") || a.includes("review") || a.includes("approval")) return "pending";
-  if (a.includes("applied") || a.includes("reconcil") || a.includes("matched")) return "matched";
-  if (a.includes("forwarded") || a.includes("bill.com")) return "forwarded";
-  if (a.includes("no match") || a.includes("unmatched") || a.includes("dropship")) return "unmatched";
-  return "forwarded";
-}
-
-const STATUS_CFG: Record<Status, { dot: string; label: string; text: string }> = {
-  matched: { dot: "bg-emerald-500", label: "MATCHED", text: "text-emerald-400" },
-  pending: { dot: "bg-amber-400", label: "PENDING", text: "text-amber-300" },
-  unmatched: { dot: "bg-rose-500", label: "NO MATCH", text: "text-rose-300" },
-  forwarded: { dot: "bg-blue-400", label: "FWDED", text: "text-blue-300" },
-  junk: { dot: "bg-zinc-700", label: "JUNK", text: "text-zinc-600" },
+const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
+  auto_approved: { dot: "bg-emerald-500",  label: "AUTO",    pulse: false },
+  needs_approval: { dot: "bg-amber-400",   label: "PENDING", pulse: true  },
+  rejected:       { dot: "bg-red-500",     label: "REJECT",  pulse: false },
+  duplicate:      { dot: "bg-zinc-600",    label: "DUP",     pulse: false },
+  unmatched:      { dot: "bg-rose-500",    label: "NO PO",   pulse: false },
 };
 
+function statusCfg(status: string) {
+  return STATUS_CFG[status as StatusKey] ?? { dot: "bg-zinc-600", label: status.toUpperCase(), pulse: false };
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export default function InvoiceQueuePanel() {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceQueueItem[]>([]);
+  const [stats, setStats] = useState<InvoiceQueueStats | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Collapse state — persisted to localStorage
@@ -60,57 +42,58 @@ export default function InvoiceQueuePanel() {
     const s = localStorage.getItem("aria-dash-invoice-collapsed");
     if (s === "true") setIsCollapsed(true);
   }, []);
-  useEffect(() => { localStorage.setItem("aria-dash-invoice-collapsed", String(isCollapsed)); }, [isCollapsed]);
-
   useEffect(() => {
-    const supabase = createBrowserClient();
+    localStorage.setItem("aria-dash-invoice-collapsed", String(isCollapsed));
+  }, [isCollapsed]);
 
-    supabase
-      .from("ap_activity_log")
-      .select("*")
-      .in("intent", ["INVOICE", "STATEMENT", "HUMAN_INTERACTION"])
-      .order("created_at", { ascending: false })
-      .limit(30)
-      .then((res: { data: LogEntry[] | null }) => {
-        if (res.data) setLogs(res.data);
+  // Fetch from API route
+  const fetchData = useCallback((bust = false) => {
+    const url = bust
+      ? "/api/dashboard/invoice-queue?bust=1"
+      : "/api/dashboard/invoice-queue";
+    fetch(url)
+      .then(r => r.ok ? r.json() : null)
+      .then((data: InvoiceQueueResponse | null) => {
+        if (data) {
+          setInvoices(data.invoices);
+          setStats(data.stats);
+        }
         setLoading(false);
-      });
-
-    const sub = supabase
-      .channel("invoice_queue_changes")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "ap_activity_log" },
-        (p: any) => {
-          const entry = p.new as LogEntry;
-          if (["INVOICE", "STATEMENT", "HUMAN_INTERACTION"].includes(entry.intent)) {
-            setLogs(cur => [entry, ...cur].slice(0, 30));
-          }
-        })
-      .subscribe();
-
-    return () => { supabase.removeChannel(sub); };
+      })
+      .catch(() => setLoading(false));
   }, []);
 
-  // Deduplicate logs by email_from and email_subject to bundle repeated statuses
-  const uniqueLogs = Object.values(
-    logs.reduce((acc, log) => {
-      const key = `${log.email_from}-${log.email_subject}`;
-      if (!acc[key] || new Date(log.created_at) > new Date(acc[key].created_at)) {
-        acc[key] = log;
-      }
-      return acc;
-    }, {} as Record<string, LogEntry>)
-  ).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(() => fetchData(), 60_000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
-  const pending = uniqueLogs.filter(l => classify(l) === "pending");
-  const rest = uniqueLogs.filter(l => classify(l) !== "pending" && classify(l) !== "junk");
+  // Partition into pending vs rest
+  const pending = invoices.filter(i => i.status === "needs_approval");
+  const rest    = invoices.filter(i => i.status !== "needs_approval");
 
   return (
     <div className="border-b border-zinc-800 shrink-0">
       {/* Header */}
-      <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+      <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
         <Receipt className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-        <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">AP / Invoices</span>
+        <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">
+          AP / Invoices
+        </span>
         <div className="flex-1" />
+
+        {/* CSV export — only when expanded */}
+        {!isCollapsed && (
+          <button
+            onClick={() => window.open("/api/dashboard/invoice-queue?export=1", "_blank")}
+            className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300 transition-colors mr-1"
+          >
+            export
+          </button>
+        )}
+
+        {/* Pending badge */}
         {pending.length > 0 && (
           <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-300 border-amber-500/40">
             {pending.length} PENDING
@@ -119,6 +102,7 @@ export default function InvoiceQueuePanel() {
         {!loading && pending.length === 0 && (
           <span className="text-xs font-mono text-zinc-600">all clear</span>
         )}
+
         <button
           onClick={() => setIsCollapsed(!isCollapsed)}
           className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
@@ -129,47 +113,134 @@ export default function InvoiceQueuePanel() {
 
       {!isCollapsed && (
         <>
-          {loading && (
-            <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
-              <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-              <span className="text-xs font-mono">Loading…</span>
+          {/* Stats bar */}
+          {stats && (
+            <div className="px-4 py-1.5 border-b border-zinc-800/40 flex items-center gap-3 flex-wrap">
+              <span className="text-[10px] font-mono text-zinc-500">
+                today: <span className="text-zinc-400">{stats.totalToday}</span>
+              </span>
+              <span className="text-[10px] font-mono text-zinc-600">|</span>
+              <span className="text-[10px] font-mono text-zinc-500">
+                auto: <span className="text-emerald-400">{stats.autoApproved}</span>
+              </span>
+              <span className="text-[10px] font-mono text-zinc-500">
+                pending: <span className="text-amber-300">{stats.needsApproval}</span>
+              </span>
+              <span className="text-[10px] font-mono text-zinc-500">
+                unmatched: <span className="text-rose-400">{stats.unmatched}</span>
+              </span>
+              {stats.totalDollarImpact !== 0 && (
+                <>
+                  <span className="text-[10px] font-mono text-zinc-600">|</span>
+                  <span className="text-[10px] font-mono text-zinc-500">
+                    impact:{" "}
+                    <span className={stats.totalDollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}>
+                      {stats.totalDollarImpact >= 0 ? "+" : ""}${Math.abs(stats.totalDollarImpact).toFixed(2)}
+                    </span>
+                  </span>
+                </>
+              )}
             </div>
           )}
 
-          {/* Pending first — always visible */}
-          {pending.map(log => {
-            const cfg = STATUS_CFG.pending;
-            const poId = log.metadata?.orderId;
+          {/* Skeleton loading */}
+          {loading && (
+            <div className="px-4 py-2 space-y-2.5">
+              {[1, 2, 3].map(i => (
+                <div key={i} className="flex items-center gap-2.5">
+                  <div className="w-1.5 h-1.5 rounded-full skeleton-shimmer shrink-0" />
+                  <div className="skeleton-shimmer h-3.5" style={{ width: `${40 + i * 15}%` }} />
+                  <div className="skeleton-shimmer h-3 w-8 ml-auto" />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Pending invoices — highlighted row */}
+          {pending.map(inv => {
+            const cfg = statusCfg(inv.status);
             return (
-              <div key={log.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-amber-500/10 bg-amber-500/5">
+              <div
+                key={inv.id}
+                className="flex items-start gap-2.5 px-4 py-2 border-b border-amber-500/10 bg-amber-500/5 border-l-2"
+                style={{ borderLeftColor: "var(--dash-accent-pending)" }}
+              >
                 <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{vendorName(log.email_from)}</span>
-                    {poId && <span className="text-xs font-mono text-blue-400 shrink-0">→ PO {poId}</span>}
-                    <span className="text-[10px] font-mono text-zinc-600 shrink-0 ml-auto">{timeAgo(log.created_at)}</span>
+                    <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
+                      {inv.vendorName}
+                    </span>
+                    {inv.invoiceNumber && (
+                      <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                        #{inv.invoiceNumber}
+                      </span>
+                    )}
+                    {inv.poNumber && (
+                      <span className="text-xs font-mono text-blue-400 shrink-0">
+                        → PO {inv.poNumber}
+                      </span>
+                    )}
+                    {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
+                      <span
+                        className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
+                        title={inv.balanceWarning ?? undefined}
+                      >
+                        {inv.dollarImpact >= 0 ? "+" : ""}${Math.abs(inv.dollarImpact).toFixed(2)}
+                        {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
+                      </span>
+                    )}
+                    <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
+                      {timeAgo(inv.processedAt)}
+                    </span>
                   </div>
-                  <div className="text-xs text-amber-300/70 truncate mt-0.5">{log.action_taken}</div>
+                  <div className="text-xs text-amber-300/70 truncate mt-0.5">
+                    Pending approval
+                  </div>
                 </div>
               </div>
             );
           })}
 
-          {/* Recent matched / forwarded — capped scroll */}
+          {/* Remaining invoices — compact scrollable list */}
           {rest.length > 0 && (
             <div className="max-h-[160px] overflow-y-auto">
-              {rest.slice(0, 15).map(log => {
-                const status = classify(log);
-                const cfg = STATUS_CFG[status];
-                const poId = log.metadata?.orderId;
-                if (status === "junk") return null;
+              {rest.slice(0, 20).map(inv => {
+                const cfg = statusCfg(inv.status);
                 return (
-                  <div key={log.id} className="flex items-center gap-2.5 px-4 py-1.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
+                  <div
+                    key={inv.id}
+                    className="flex items-center gap-2.5 px-4 py-1.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors"
+                  >
                     <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
-                    <span className="text-xs font-mono text-zinc-300 truncate flex-1">{vendorName(log.email_from)}</span>
-                    {poId && <span className="text-[10px] font-mono text-blue-400/60 shrink-0">PO {poId}</span>}
-                    <span className={`text-[10px] font-mono font-semibold shrink-0 ${cfg.text}`}>{cfg.label}</span>
-                    <span className="text-[10px] font-mono text-zinc-700 shrink-0 w-6 text-right">{timeAgo(log.created_at)}</span>
+                    <span className="text-xs font-mono text-zinc-300 truncate flex-1">
+                      {inv.vendorName}
+                    </span>
+                    {inv.invoiceNumber && (
+                      <span className="text-[10px] font-mono text-zinc-600 shrink-0">
+                        #{inv.invoiceNumber}
+                      </span>
+                    )}
+                    {inv.poNumber && (
+                      <span className="text-[10px] font-mono text-blue-400/60 shrink-0">
+                        PO {inv.poNumber}
+                      </span>
+                    )}
+                    {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
+                      <span
+                        className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
+                        title={inv.balanceWarning ?? undefined}
+                      >
+                        {inv.dollarImpact >= 0 ? "+" : ""}${Math.abs(inv.dollarImpact).toFixed(2)}
+                        {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
+                      </span>
+                    )}
+                    <span className="text-[10px] font-mono font-semibold shrink-0 text-zinc-500">
+                      {cfg.label}
+                    </span>
+                    <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 w-6 text-right">
+                      {timeAgo(inv.processedAt)}
+                    </span>
                   </div>
                 );
               })}

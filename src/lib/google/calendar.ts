@@ -7,7 +7,7 @@
  * @env     GOOGLE_APPLICATION_CREDENTIALS - path to service account JSON
  */
 
-import { google, calendar_v3 } from 'googleapis';
+import { calendar as CalendarApi, calendar_v3 } from '@googleapis/calendar';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getAuthenticatedCalendarClient } from './calendar-auth';
@@ -45,7 +45,7 @@ export class CalendarClient {
     private async init() {
         if (this.calendar) return;
         const authClient = await getAuthenticatedCalendarClient();
-        this.calendar = google.calendar({ version: 'v3', auth: authClient as any });
+        this.calendar = CalendarApi({ version: 'v3', auth: authClient });
     }
 
     /**

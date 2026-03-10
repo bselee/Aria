@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import { Telegraf, Markup } from "telegraf";
@@ -16,9 +16,12 @@ import {
     applyReconciliation,
     ReconciliationResult,
     storePendingApproval,
+    updatePendingApprovalMessageId,
     buildAuditMetadata,
+    buildReconciliationReport,
 } from "../finale/reconciler";
 import { storePendingDropship } from "./dropship-store";
+import { recordFeedback } from "./feedback-loop";
 
 import { KNOWN_DROPSHIP_KEYWORDS } from "../../config/dropship-vendors";
 
@@ -117,7 +120,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                 console.warn("   ⚠️ Missing 'ap' token, falling back to 'default' token...");
                 auth = await getAuthenticatedClient("default");
             }
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
             // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent
@@ -176,6 +179,18 @@ INVOICE - Standard vendor bill for PO - based stock.
                     ? "DROPSHIP_INVOICE"
                     : await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent} `);
+
+                // Kaizen: record classification prediction (Pillar 3 — Prediction Accuracy)
+                recordFeedback({
+                    category: "prediction",
+                    eventType: "email_classification",
+                    agentSource: "ap_agent",
+                    subjectType: "message",
+                    subjectId: m.id!,
+                    prediction: { intent, from: from.slice(0, 100), subject: subject.slice(0, 100) },
+                    accuracyScore: 1.0, // assume correct until corrected
+                    contextData: { fastPath: this.isKnownDropshipVendor(from, subject) },
+                }).catch(() => { /* non-blocking */ });
 
                 if (intent === "ADVERTISEMENT") {
                     // Mark as read and REMOVE from inbox (archive)
@@ -396,9 +411,49 @@ INVOICE - Standard vendor bill for PO - based stock.
             const invoiceData: InvoiceData = await parseInvoice(extracted.rawText);
 
 
-            // 1b. Low-confidence guard — garbled PDF, skip reconciliation entirely
+            // 1b. Vendor pattern check — consult stored handling rules before proceeding.
+            // Non-blocking: if Pinecone is down, processing continues normally.
+            setImmediate(async () => {
+                try {
+                    const { getVendorPattern } = await import("./vendor-memory");
+                    const pattern = await getVendorPattern(invoiceData.vendorName);
+                    if (pattern?.invoiceBehavior === "multi_page_split") {
+                        console.warn(`⚠️ [vendor-memory] ${invoiceData.vendorName} requires multi_page_split — forwarded as single file`);
+                        const chatId = process.env.TELEGRAM_CHAT_ID || "";
+                        await this.bot.telegram.sendMessage(chatId,
+                            `⚠️ *Vendor pattern: multi-page split required*\n` +
+                            `Vendor: ${invoiceData.vendorName}\nFile: \`${filename}\`\n` +
+                            `_${pattern.handlingRule}_\n\n` +
+                            `PDF was forwarded as-is to Bill.com — please split manually if this is a multi-invoice bundle.`,
+                            { parse_mode: "Markdown" }
+                        ).catch(() => { });
+                    }
+                } catch {
+                    // Non-fatal — vendor memory is advisory only
+                }
+            });
+
+            // 1c. Low-confidence guard — garbled PDF, skip reconciliation entirely
             if (invoiceData.confidence === "low") {
                 console.warn(`     ⚠️ Low-confidence parse for ${filename} — alerting Will.`);
+                // C2 FIX: Persist the document even on OCR failure so it's never silently lost.
+                // Without this, the email sits unread with zero audit trail in `documents`.
+                try {
+                    await supabase.from("documents").insert({
+                        type: "invoice",
+                        status: "ocr_failed",
+                        source: "email",
+                        source_ref: from,
+                        email_from: from,
+                        email_subject: subject,
+                        raw_text: extracted.rawText,
+                        action_required: true,
+                        action_summary: `OCR low-confidence for ${filename} from ${from}`,
+                        gmail_message_id: messageId || null,
+                        ocr_strategy: extracted.ocrStrategy || null,
+                        ocr_duration_ms: extracted.ocrDurationMs || null,
+                    });
+                } catch { /* best-effort — Telegram alert is the primary signal */ }
                 const chatId = process.env.TELEGRAM_CHAT_ID || "";
                 await this.bot.telegram.sendMessage(chatId,
                     `⚠️ *Low-confidence invoice parse*\nFile: \`${filename}\`\nVendor: ${invoiceData.vendorName}\nForwarded to Bill.com but no Finale reconciliation attempted. Please review manually.`,
@@ -410,6 +465,23 @@ INVOICE - Standard vendor bill for PO - based stock.
 
             // 1c. Zero-line-item guard — possible OCR failure on scanned/corrupted PDF
             if (!invoiceData.lineItems || invoiceData.lineItems.length === 0) {
+                // C2 FIX: Persist the document so zero-line-item failures have an audit trail.
+                try {
+                    await supabase.from("documents").insert({
+                        type: "invoice",
+                        status: "ocr_failed",
+                        source: "email",
+                        source_ref: from,
+                        email_from: from,
+                        email_subject: subject,
+                        raw_text: extracted.rawText,
+                        action_required: true,
+                        action_summary: `0 line items extracted for ${filename} — OCR failure`,
+                        gmail_message_id: messageId || null,
+                        ocr_strategy: extracted.ocrStrategy || null,
+                        ocr_duration_ms: extracted.ocrDurationMs || null,
+                    });
+                } catch { /* best-effort */ }
                 const warnMsg = `⚠️ *Invoice parsed with 0 line items — possible OCR failure*\nVendor: ${invoiceData.vendorName}\nInvoice: #${invoiceData.invoiceNumber}\nFile: \`${filename}\`\nForwarded to Bill.com. Finale reconciliation skipped — please review manually.`;
                 try { await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch { }
                 await this.logActivity(supabase, from, subject, "PROCESSING_ERROR",
@@ -619,7 +691,7 @@ INVOICE - Standard vendor bill for PO - based stock.
             // 4. Notify Will — unmatched gets action buttons
             let pendingDropshipId: string | null = null;
             if (!matched) {
-                pendingDropshipId = storePendingDropship({
+                pendingDropshipId = await storePendingDropship({
                     invoiceNumber: invoiceData.invoiceNumber,
                     vendorName: invoiceData.vendorName,
                     total: invoiceData.total,
@@ -638,7 +710,7 @@ INVOICE - Standard vendor bill for PO - based stock.
             // or via subject-line extraction — both require Will's confirmation before any Finale writes.
             forceApproval = forceApproval || matchSource.includes("REQUIRES APPROVAL");
             if (!isDropship && matched && finalePONumber) {
-                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval);
+                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval, matchSource);
             }
 
         } catch (err: any) {
@@ -751,11 +823,28 @@ INVOICE - Standard vendor bill for PO - based stock.
         invoice: InvoiceData,
         orderId: string,
         supabase: any,
-        forceApproval = false   // true when PO matched via vendor+date fallback — require human sign-off
+        forceApproval = false,   // true when PO matched via vendor+date fallback — require human sign-off
+        matchStrategy?: string   // M4: Which strategy matched this invoice to PO
     ): Promise<void> {
         try {
             const finaleClient = new FinaleClient();
-            const result: ReconciliationResult = await reconcileInvoiceToPO(invoice, orderId, finaleClient);
+
+            // Retry wrapper: Finale is occasionally unavailable. Exponential backoff
+            // (2s, 4s, 8s) before giving up and alerting Will to retry manually.
+            let result: ReconciliationResult;
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    result = await reconcileInvoiceToPO(invoice, orderId, finaleClient, matchStrategy);
+                    break;
+                } catch (retryErr: any) {
+                    if (attempt === maxAttempts) throw retryErr;
+                    const delayMs = 2000 * Math.pow(2, attempt - 1);
+                    console.warn(`   ⚠️ Finale reconciliation attempt ${attempt}/${maxAttempts} failed: ${retryErr.message}. Retrying in ${delayMs}ms...`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                }
+            }
+            result = result!;
 
             // If PO was matched via vendor+date fallback (not exact PO# on invoice), upgrade
             // any auto_approve verdict to needs_approval so Will confirms before we write Finale.
@@ -843,6 +932,21 @@ INVOICE - Standard vendor bill for PO - based stock.
             if (result.overallVerdict === "auto_approve") {
                 // Safe to auto-apply
                 if (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate) {
+                    // C1 FIX: Write "pending" audit entry BEFORE Finale writes.
+                    // If applyReconciliation() succeeds but logReconciliation() fails,
+                    // checkDuplicateReconciliation() still finds this entry and stops re-processing.
+                    let pendingLogId: string | null = null;
+                    try {
+                        const { data: pendingLog } = await supabase.from("ap_activity_log").insert({
+                            email_from: result.vendorName,
+                            email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
+                            intent: "RECONCILIATION",
+                            action_taken: "Pending — applying to Finale...",
+                            metadata: { invoiceNumber: result.invoiceNumber, orderId: result.orderId, status: "pending" },
+                        }).select("id").single();
+                        pendingLogId = pendingLog?.id ?? null;
+                    } catch { /* proceed — Finale write is still safe, just loses idempotency guard */ }
+
                     const applyResult = await applyReconciliation(result, finaleClient);
 
                     if (applyResult.applied.length > 0) {
@@ -852,14 +956,50 @@ INVOICE - Standard vendor bill for PO - based stock.
                         console.error(`   ❌ ${applyResult.errors.length} error(s) applying to Finale:`, applyResult.errors);
                     }
 
-                    await this.logReconciliation(supabase, result, applyResult);
+                    // Update the pending entry to "applied" with full audit data,
+                    // or fall back to a new row if the update fails.
+                    if (pendingLogId) {
+                        try {
+                            await supabase.from("ap_activity_log").update({
+                                action_taken: result.autoApplicable
+                                    ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
+                                    : `Flagged for review: ${result.overallVerdict}`,
+                                notified_slack: !!this.slack,
+                                metadata: buildAuditMetadata(result, applyResult, "auto"),
+                                reconciliation_report: result.report ?? null,
+                            }).eq("id", pendingLogId);
+
+                            // Update structured invoice state (same logic as logReconciliation)
+                            let newStatus = "matched_review";
+                            if (result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change") newStatus = "reconciled";
+                            if (result.overallVerdict === "no_match") newStatus = "unmatched";
+                            const discrepancies = [
+                                ...result.priceChanges.filter(pc => pc.verdict !== "no_change").map(pc => ({
+                                    type: "price", productId: pc.productId, expected: pc.poPrice,
+                                    actual: pc.invoicePrice, verdict: pc.verdict, reason: pc.reason
+                                })),
+                                ...result.feeChanges.map(fc => ({
+                                    type: "fee", feeType: fc.feeType, expected: fc.existingAmount,
+                                    actual: fc.amount, verdict: fc.verdict, reason: fc.reason
+                                }))
+                            ];
+                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
+                                .eq("invoice_number", result.invoiceNumber)
+                                .ilike("vendor_name", `%${result.vendorName}%`);
+                        } catch {
+                            // Fallback: write a new row (old pattern) if update failed
+                            await this.logReconciliation(supabase, result, applyResult);
+                        }
+                    } else {
+                        await this.logReconciliation(supabase, result, applyResult);
+                    }
                 }
                 writeReconciliationMemory("auto_approve");
                 await this.sendReconciliationNotification(result);
 
             } else if (result.overallVerdict === "needs_approval") {
                 // Store for Telegram bot approval and send inline keyboard
-                const approvalId = storePendingApproval(result, finaleClient);
+                const approvalId = await storePendingApproval(result, finaleClient);
                 writeReconciliationMemory("needs_approval");
                 await this.sendApprovalRequest(result, approvalId);
 
@@ -882,6 +1022,27 @@ INVOICE - Standard vendor bill for PO - based stock.
                 }
                 await this.sendReconciliationNotification(result);
             }
+
+            // Kaizen: record reconciliation verdict (Pillar 3 — Prediction Accuracy)
+            recordFeedback({
+                category: "prediction",
+                eventType: `reconciliation_${result.overallVerdict}`,
+                agentSource: "ap_agent",
+                subjectType: "po",
+                subjectId: orderId,
+                prediction: {
+                    verdict: result.overallVerdict,
+                    totalImpact: result.totalDollarImpact,
+                    priceChanges: result.priceChanges.length,
+                    feeChanges: result.feeChanges.length,
+                },
+                accuracyScore: result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change" ? 1.0 : 0.5,
+                contextData: {
+                    vendor: result.vendorName,
+                    invoice: result.invoiceNumber,
+                    forceApproval,
+                },
+            }).catch(() => { /* non-blocking */ });
 
         } catch (err: any) {
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
@@ -911,6 +1072,10 @@ INVOICE - Standard vendor bill for PO - based stock.
         applyResult: { applied: string[]; skipped: string[]; errors: string[] }
     ): Promise<void> {
         try {
+            // Build the structured audit report — use cached result.report if present,
+            // otherwise generate it on the spot (no extra API calls needed).
+            const reconciliationReport = result.report ?? null;
+
             await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
@@ -919,7 +1084,8 @@ INVOICE - Standard vendor bill for PO - based stock.
                     ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
                     : `Flagged for review: ${result.overallVerdict}`,
                 notified_slack: !!this.slack,
-                metadata: buildAuditMetadata(result, applyResult, "auto")
+                metadata: buildAuditMetadata(result, applyResult, "auto"),
+                reconciliation_report: reconciliationReport,
             });
 
             // Update structured invoice state
@@ -997,12 +1163,14 @@ INVOICE - Standard vendor bill for PO - based stock.
      *
      * DECISION(2026-02-26): Using Telegram (not Slack) for approvals per Will.
      * This keeps the approval flow in the same chat where Will already operates.
+     * DECISION(2026-03-10): Capture the Telegram message_id after send so we can
+     * back-fill it into pending_reconciliations for post-restart button recovery.
      */
     private async sendApprovalRequest(result: ReconciliationResult, approvalId: string): Promise<void> {
         const msg = result.summary + "\n\n☝️ *Tap to approve or reject these changes:*";
 
         try {
-            await this.bot.telegram.sendMessage(
+            const sentMsg = await this.bot.telegram.sendMessage(
                 process.env.TELEGRAM_CHAT_ID || "",
                 msg,
                 {
@@ -1013,6 +1181,10 @@ INVOICE - Standard vendor bill for PO - based stock.
                     ])
                 }
             );
+            // Back-fill the Telegram message ID so it's available after a restart
+            if (sentMsg?.message_id) {
+                updatePendingApprovalMessageId(approvalId, sentMsg.message_id).catch(() => { /* non-blocking */ });
+            }
         } catch (err: any) {
             console.error("Telegram approval request failed:", err.message);
             // Fallback: send without buttons
@@ -1096,21 +1268,25 @@ INVOICE - Standard vendor bill for PO - based stock.
             return;
         }
 
-        // Group by intent
+        // Group by intent — exclude ads from the recap (they're still logged to DB)
         const grouped: Record<string, typeof logs> = {};
         for (const log of logs) {
+            if (log.intent === "ADVERTISEMENT") continue; // ads are archived, no need to report
             if (!grouped[log.intent]) grouped[log.intent] = [];
             grouped[log.intent].push(log);
         }
 
+        const adCount = logs.filter(l => l.intent === "ADVERTISEMENT").length;
+        const actionableCount = logs.length - adCount;
+
         const intentEmoji: Record<string, string> = {
             INVOICE: "🧾",
             STATEMENT: "📑",
-            ADVERTISEMENT: "🗑️",
             HUMAN_INTERACTION: "👤"
         };
 
-        let msg = `📊 *AP Agent Daily Recap* — ${logs.length} email${logs.length > 1 ? 's' : ''} processed\n`;
+        let msg = `📊 *AP Agent Daily Recap* — ${actionableCount} email${actionableCount !== 1 ? 's' : ''} processed\n`;
+        if (adCount > 0) msg += `_${adCount} ad${adCount !== 1 ? 's' : ''} auto-archived_\n`;
         msg += `━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
         for (const [intent, items] of Object.entries(grouped)) {

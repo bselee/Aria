@@ -302,7 +302,7 @@ export default function BuildSchedulePanel() {
             </span>
           )}
           {snapshot && (
-            <span className="text-xs text-zinc-700">{timeAgo(snapshot.generated_at)}</span>
+            <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(snapshot.generated_at)}</span>
           )}
           <button
             onClick={() => setIsCollapsed(!isCollapsed)}
@@ -317,9 +317,14 @@ export default function BuildSchedulePanel() {
         <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full">
 
           {loading && (
-            <div className="px-4 py-3 flex items-center gap-2 text-zinc-700">
-              <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-              <span className="text-xs font-mono">Loading…</span>
+            <div className="px-4 py-2 space-y-2.5">
+              {[1, 2, 3].map(i => (
+                <div key={i} className="flex items-center gap-2.5">
+                  <div className="w-2 h-2 rounded-full skeleton-shimmer shrink-0" />
+                  <div className="skeleton-shimmer h-3.5" style={{ width: `${40 + i * 15}%` }} />
+                  <div className="skeleton-shimmer h-3 w-12 ml-auto" />
+                </div>
+              ))}
             </div>
           )}
 

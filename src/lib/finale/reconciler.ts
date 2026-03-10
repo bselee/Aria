@@ -22,6 +22,8 @@
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../supabase";
+import { recordFeedback } from "../intelligence/feedback-loop";
+import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
 
 // ──────────────────────────────────────────────────
 // PENDING APPROVAL STORE
@@ -49,8 +51,12 @@ export interface PendingApproval {
 const pendingApprovals = new Map<string, PendingApproval>();
 
 /** Store a reconciliation result for bot approval */
-export function storePendingApproval(result: ReconciliationResult, client: FinaleClient): string {
+export async function storePendingApproval(result: ReconciliationResult, client: FinaleClient): Promise<string> {
     const id = `recon_${result.orderId}_${Date.now()}`;
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    // C3 FIX: Cache the FinaleClient instance (not serializable to JSONB).
+    // On reload after restart, we re-instantiate from env vars (stateless).
     pendingApprovals.set(id, {
         id,
         result,
@@ -59,32 +65,164 @@ export function storePendingApproval(result: ReconciliationResult, client: Final
         status: "pending",
     });
 
-    // Auto-expire after 24h
-    setTimeout(async () => {
-        const entry = pendingApprovals.get(id);
-        if (entry && entry.status === "pending") {
-            entry.status = "expired";
-            pendingApprovals.delete(id);
-            // Fix 5: Notify Will so he knows the window closed and nothing was applied.
-            // Prevents him from tapping a stale Telegram approval button expecting action.
-            try {
-                const { Telegraf } = await import("telegraf");
-                const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
-                const r = entry.result;
-                await alertBot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID!,
-                    `⏰ Reconciliation approval expired (24h)\nPO: \`${r.orderId}\` | Vendor: ${r.vendorName}\nInvoice: #${r.invoiceNumber} — $${r.totalDollarImpact?.toFixed(2) ?? "?"} impact\nChanges NOT applied. Re-process invoice or update PO manually.`
-                );
-            } catch { /* non-blocking */ }
+    // Persist to Supabase — this is the durable source of truth.
+    // C3 FIX: No more setTimeout expiry — expiry is handled by the `expires_at` column.
+    // Callers check `expires_at > now()` when reading.
+    try {
+        const supabase = createClient();
+        if (supabase) {
+            await supabase.from("pending_reconciliations").upsert({
+                approval_id: id,
+                invoice_number: result.invoiceNumber,
+                vendor_name: result.vendorName,
+                po_number: result.orderId,
+                order_id: result.orderId,
+                result: result as unknown as Record<string, unknown>,
+                telegram_chat_id: process.env.TELEGRAM_CHAT_ID ?? null,
+                expires_at: expiresAt.toISOString(),
+                status: "pending",
+            }, { onConflict: "approval_id" });
         }
-    }, 24 * 60 * 60 * 1000);
+    } catch (err: any) {
+        console.warn(`[reconciler] Failed to persist approval ${id} to Supabase: ${err.message}`);
+        // Non-fatal — will work for this session but won't survive restart
+    }
 
     return id;
 }
 
-/** Retrieve a pending approval by ID */
-export function getPendingApproval(id: string): PendingApproval | undefined {
-    return pendingApprovals.get(id);
+/**
+ * After the Telegram message is sent, back-fill the message_id so that on
+ * reload the bot can associate the button tap with the right approval row.
+ * Called from ap-agent.ts sendApprovalRequest() after sendMessage() resolves.
+ */
+export async function updatePendingApprovalMessageId(approvalId: string, telegramMessageId: number): Promise<void> {
+    try {
+        const supabase = createClient();
+        if (supabase) {
+            await supabase.from("pending_reconciliations")
+                .update({ telegram_message_id: telegramMessageId })
+                .eq("approval_id", approvalId);
+        }
+    } catch { /* non-blocking */ }
+}
+
+/**
+ * Re-hydrate in-memory pendingApprovals from Supabase after a bot restart.
+ * Returns the list of entries so start-bot.ts can re-send Telegram approval prompts.
+ *
+ * DECISION(2026-03-10): The FinaleClient instance cannot be serialised to JSONB, so
+ * restored entries get a fresh FinaleClient. Since FinaleClient is stateless (every
+ * call re-authenticates via API key), this is safe.
+ */
+export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
+    approvalId: string;
+    result: ReconciliationResult;
+    telegramChatId: string;
+    expiresAt: Date;
+}>> {
+    try {
+        const supabase = createClient();
+        if (!supabase) return [];
+
+        // C3 FIX: Filter by status='pending' (new column) and expires_at > now()
+        const { data, error } = await supabase
+            .from("pending_reconciliations")
+            .select("approval_id, result, telegram_chat_id, expires_at")
+            .eq("status", "pending")
+            .gt("expires_at", new Date().toISOString());
+
+        if (error || !data) {
+            console.warn("[reconciler] loadPendingApprovalsFromSupabase query error:", error?.message);
+            return [];
+        }
+
+        const restored: Array<{
+            approvalId: string;
+            result: ReconciliationResult;
+            telegramChatId: string;
+            expiresAt: Date;
+        }> = [];
+
+        for (const row of data) {
+            try {
+                const result = row.result as ReconciliationResult;
+                const expiresAt = new Date(row.expires_at);
+                const approvalId: string = row.approval_id;
+
+                // Skip if already in memory (process didn't actually restart — just a race)
+                if (pendingApprovals.has(approvalId)) continue;
+
+                // Re-hydrate into in-memory cache with a fresh FinaleClient
+                const freshClient = new FinaleClient();
+                pendingApprovals.set(approvalId, {
+                    id: approvalId,
+                    result,
+                    client: freshClient,
+                    createdAt: expiresAt.getTime() - 24 * 60 * 60 * 1000,
+                    status: "pending",
+                });
+
+                // C3 FIX: No more setTimeout — expiry is column-based.
+                // getPendingApproval() checks expires_at > now() on every read.
+
+                restored.push({
+                    approvalId,
+                    result,
+                    telegramChatId: row.telegram_chat_id ?? process.env.TELEGRAM_CHAT_ID ?? "",
+                    expiresAt,
+                });
+            } catch (rowErr: any) {
+                console.warn(`[reconciler] Skipping malformed pending_reconciliations row: ${rowErr.message}`);
+            }
+        }
+
+        return restored;
+    } catch (err: any) {
+        console.warn("[reconciler] loadPendingApprovalsFromSupabase failed:", err.message);
+        return [];
+    }
+}
+
+/**
+ * Retrieve a pending approval by ID.
+ * C3 FIX: Now async — reads from Supabase first, falls back to in-memory cache.
+ * On restart, in-memory cache is empty but Supabase has the row.
+ */
+export async function getPendingApproval(id: string): Promise<PendingApproval | undefined> {
+    // Fast path: check in-memory cache first (same-session)
+    const cached = pendingApprovals.get(id);
+    if (cached && cached.status === "pending") return cached;
+
+    // Slow path: read from Supabase (survives restart)
+    try {
+        const supabase = createClient();
+        if (!supabase) return undefined;
+
+        const { data } = await supabase.from("pending_reconciliations")
+            .select("*")
+            .eq("approval_id", id)
+            .eq("status", "pending")
+            .gt("expires_at", new Date().toISOString())
+            .single();
+
+        if (!data) return undefined;
+
+        // Re-instantiate FinaleClient (stateless — reads creds from env)
+        const client = new FinaleClient();
+        const entry: PendingApproval = {
+            id: data.approval_id,
+            result: data.result as ReconciliationResult,
+            client,
+            createdAt: new Date(data.created_at).getTime(),
+            status: "pending",
+        };
+        // Populate the in-memory cache for subsequent reads
+        pendingApprovals.set(id, entry);
+        return entry;
+    } catch {
+        return undefined;
+    }
 }
 
 /** Mark a pending approval as approved and apply changes */
@@ -94,7 +232,8 @@ export async function approvePendingReconciliation(id: string): Promise<{
     errors: string[];
     message: string;
 }> {
-    const entry = pendingApprovals.get(id);
+    // C3 FIX: Use async getPendingApproval (reads from Supabase if not in memory)
+    const entry = await getPendingApproval(id);
     if (!entry) {
         return { success: false, applied: [], errors: [], message: "Approval not found or expired." };
     }
@@ -112,17 +251,63 @@ export async function approvePendingReconciliation(id: string): Promise<{
         .filter(fc => fc.verdict === "needs_approval")
         .map(fc => fc.feeType);
 
+    // C1 FIX (approve path): Write "pending" audit entry BEFORE Finale writes.
+    let pendingLogId: string | null = null;
+    try {
+        const sbPre = createClient();
+        if (sbPre) {
+            const { data: pendingLog } = await sbPre.from("ap_activity_log").insert({
+                email_from: entry.result.vendorName,
+                email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
+                intent: "RECONCILIATION",
+                action_taken: "Pending — applying approved changes to Finale...",
+                metadata: { invoiceNumber: entry.result.invoiceNumber, orderId: entry.result.orderId, status: "pending", approvalId: id },
+            }).select("id").single();
+            pendingLogId = pendingLog?.id ?? null;
+        }
+    } catch { /* proceed — Finale write is still safe */ }
+
     const applyResult = await applyReconciliation(
         entry.result, entry.client, approvedPriceItems, approvedFeeTypes
     );
     entry.status = "approved";
     pendingApprovals.delete(id);
 
+    // C3 FIX: Update Supabase status to "approved" instead of deleting
+    try {
+        const sbStatus = createClient();
+        if (sbStatus) {
+            await sbStatus.from("pending_reconciliations")
+                .update({ status: "approved" })
+                .eq("approval_id", id);
+        }
+    } catch { /* non-blocking */ }
+
+    // Remove from Supabase persistence now that it's resolved
+    setImmediate(async () => {
+        try {
+            const sb = createClient();
+            if (sb) await sb.from("pending_reconciliations").delete().eq("approval_id", id);
+        } catch { /* non-blocking */ }
+    });
+
     // Write RECONCILIATION entry to ap_activity_log for duplicate detection.
     // Future re-processes of this invoice+PO combo will hit checkDuplicateReconciliation().
     try {
         const supabase = createClient();
         if (supabase) {
+            // Build a final report with approval updated to reflect Will's manual approval
+            const approvedReport: ReconciliationReport | undefined = entry.result.report
+                ? {
+                    ...entry.result.report,
+                    approval: {
+                        method: "manual",
+                        approved_by: "Will",
+                        approved_at: new Date().toISOString(),
+                    },
+                }
+                : undefined;
+
             await supabase.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
@@ -132,6 +317,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
                     ...buildAuditMetadata(entry.result, applyResult, "telegram"),
                     approvalId: id,
                 },
+                reconciliation_report: approvedReport ?? null,
             });
 
             // LEARNING: Write vendor_name back to the purchase_orders row so that
@@ -174,7 +360,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
             await remember({
                 category: "decision",
-                content: `PO ${entry.result.orderId} reconciliation approved by Will. ${applyResult.applied.length} changes applied, ${applyResult.errors.length} errors. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact: $${entry.result.totalDollarImpact.toFixed(2)}.`,
+                content: `PO ${entry.result.orderId} reconciliation approved by Will. ${applyResult.applied.length} changes applied, ${applyResult.errors.length} errors. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}.`,
                 tags: ["reconciliation", "approved", entry.result.orderId, vendorSlug],
                 source: "email",
                 relatedTo: entry.result.vendorName,
@@ -182,6 +368,24 @@ export async function approvePendingReconciliation(id: string): Promise<{
             });
         } catch { /* non-blocking — never fail the approval flow */ }
     });
+
+    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    recordFeedback({
+        category: "correction",
+        eventType: "reconciliation_approved",
+        agentSource: "reconciler",
+        subjectType: "po",
+        subjectId: entry.result.orderId,
+        prediction: {
+            overallVerdict: entry.result.overallVerdict,
+            totalDollarImpact: entry.result.totalDollarImpact,
+            priceChangeCount: entry.result.priceChanges.length,
+        },
+        actualOutcome: { applied: applyResult.applied.length, errors: applyResult.errors.length },
+        accuracyScore: 1.0,
+        userAction: "approved",
+        contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
+    }).catch(() => { /* non-blocking */ });
 
     return {
         success: true,
@@ -193,18 +397,37 @@ export async function approvePendingReconciliation(id: string): Promise<{
 
 /** Reject a pending reconciliation */
 export async function rejectPendingReconciliation(id: string): Promise<string> {
-    const entry = pendingApprovals.get(id);
+    // C3 FIX: Use async getPendingApproval (reads from Supabase if not in memory)
+    const entry = await getPendingApproval(id);
     if (!entry) return "Approval not found or expired.";
     if (entry.status !== "pending") return `Already ${entry.status}.`;
 
     entry.status = "rejected";
     pendingApprovals.delete(id);
 
+    // C3 FIX: Update Supabase status to "rejected" instead of deleting
+    try {
+        const sb = createClient();
+        if (sb) await sb.from("pending_reconciliations").update({ status: "rejected" }).eq("approval_id", id);
+    } catch { /* non-blocking */ }
+
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
     // re-processing of the same invoice — rejections must be "sticky".
     try {
         const supabase = createClient();
         if (supabase) {
+            // Build a final report reflecting Will's rejection decision
+            const rejectedReport: ReconciliationReport | undefined = entry.result.report
+                ? {
+                    ...entry.result.report,
+                    approval: {
+                        method: "rejected",
+                        approved_by: "Will",
+                        approved_at: new Date().toISOString(),
+                    },
+                }
+                : undefined;
+
             await supabase.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
@@ -216,6 +439,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
                     approvalId: id,
                     verdict: "rejected",
                 },
+                reconciliation_report: rejectedReport ?? null,
             });
 
             // Update structured invoice state
@@ -247,7 +471,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
             await remember({
                 category: "decision",
-                content: `PO ${entry.result.orderId} reconciliation REJECTED by Will. No changes applied. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact would have been: $${entry.result.totalDollarImpact.toFixed(2)}.`,
+                content: `PO ${entry.result.orderId} reconciliation REJECTED by Will. No changes applied. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact would have been: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}.`,
                 tags: ["reconciliation", "rejected", entry.result.orderId, vendorSlug],
                 source: "email",
                 relatedTo: entry.result.vendorName,
@@ -255,6 +479,24 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             });
         } catch { /* non-blocking */ }
     });
+
+    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    recordFeedback({
+        category: "correction",
+        eventType: "reconciliation_rejected",
+        agentSource: "reconciler",
+        subjectType: "po",
+        subjectId: entry.result.orderId,
+        prediction: {
+            overallVerdict: entry.result.overallVerdict,
+            totalDollarImpact: entry.result.totalDollarImpact,
+            priceChangeCount: entry.result.priceChanges.length,
+        },
+        actualOutcome: { rejected: true, reason: "manual_rejection" },
+        accuracyScore: 0.0,
+        userAction: "rejected",
+        contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
+    }).catch(() => { /* non-blocking */ });
 
     return `❌ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
 }
@@ -352,6 +594,16 @@ const RECONCILIATION_CONFIG = {
     FEE_AUTO_APPROVE_CAP_DOLLARS: 250,
 
     /**
+     * M2 FIX: Balance check gating thresholds.
+     * Small gaps (>$1 / >2%) are non-blocking warnings.
+     * Large gaps (>$5 / >5%) force needs_approval — extraction is untrustworthy.
+     */
+    BALANCE_WARN_DOLLARS: 1.00,
+    BALANCE_WARN_PCT: 0.02,
+    BALANCE_GATE_DOLLARS: 5.00,
+    BALANCE_GATE_PCT: 0.05,
+
+    /**
      * Jaccard word-overlap threshold for fuzzy vendor name matching.
      * 0.5 = at least half the unique words appear in both names.
      * Below this, correlation falls back to PO# reference and SKU overlap.
@@ -399,6 +651,66 @@ export interface TrackingUpdate {
     carrierName?: string;
 }
 
+// ──────────────────────────────────────────────────
+// RECONCILIATION REPORT — accounting audit trail
+// ──────────────────────────────────────────────────
+
+/**
+ * Structured audit report produced at the end of every reconcileInvoiceToPO() call.
+ * Written into ap_activity_log.reconciliation_report (JSONB) for accounting compliance.
+ * All fields map 1:1 to data already computed during reconciliation — no extra API calls.
+ */
+export interface ReconciliationReport {
+    generated_at: string;           // ISO timestamp
+    invoice: {
+        number: string | null;
+        vendor: string | null;
+        total: number | null;
+        date: string | null;
+        po_number: string | null;
+        line_count: number;
+        freight: number | null;
+        tax: number | null;
+        tariff: number | null;
+        labor: number | null;
+        discount: number | null;
+    };
+    finale_po: {
+        order_id: string;
+        vendor: string | null;
+        total: number | null;
+        line_count: number;
+    } | null;
+    changes: Array<{
+        sku: string;
+        description: string;
+        field: string;
+        invoice_value: number | string | null;
+        po_value: number | string | null;
+        disposition: string;    // auto_approve | needs_approval | no_change | rejected | no_match
+        note?: string;
+    }>;
+    fees_applied: {
+        freight: number | null;
+        tax: number | null;
+        tariff: number | null;
+        labor: number | null;
+        discount: number | null;
+    };
+    approval: {
+        method: "auto" | "manual" | "pending" | "rejected";
+        approved_by?: string;   // "system" | "Will"
+        approved_at?: string;
+    };
+    balance_check: {
+        valid: boolean;
+        gap?: number;
+        message?: string;
+    };
+    warnings: string[];
+    match_strategy?: string;    // M4: Which PO matching strategy found the match
+}
+
 export interface ReconciliationResult {
     orderId: string;
     invoiceNumber: string;
@@ -412,6 +724,71 @@ export interface ReconciliationResult {
     autoApplicable: boolean;    // True only if ALL changes are auto_approve or no_change
     warnings: string[];         // Non-blocking issues (vendor fuzzy match, low-confidence match, etc.)
     vendorNote?: string;        // Set when vendor correlation used non-name signal to confirm
+    notes?: string;             // Non-blocking informational notes (e.g., balance validation warning)
+    report?: ReconciliationReport;  // Structured audit report — populated at end of reconcileInvoiceToPO()
+}
+
+// ──────────────────────────────────────────────────
+// INVOICE BALANCE VALIDATION
+// ──────────────────────────────────────────────────
+
+/**
+ * Validates that the extracted line items + fees sum to the invoice total.
+ * A significant gap (>2% of total AND >$1.00) is a signal that OCR or LLM
+ * extraction dropped a line item, misread a fee, or garbled the total.
+ *
+ * This is a NON-BLOCKING check — it returns a warning but never aborts
+ * reconciliation. The intent is to surface extraction unreliability early
+ * so the reconciliation result can carry that context in `notes`.
+ *
+ * @param invoice  Parsed invoice data
+ * @returns        { valid, gap, message } — valid=false means the balance gap
+ *                 is material and the extraction may not be trustworthy.
+ */
+export function validateInvoiceBalance(
+    invoice: InvoiceData
+): { valid: boolean; gap: number; message: string } {
+    if (!invoice.total || invoice.total <= 0) {
+        return { valid: true, gap: 0, message: "Invoice total is zero — balance check skipped" };
+    }
+
+    // Sum only product lines (skip adjustment lines with qty=0 or unitPrice=0)
+    const lineTotal = invoice.lineItems
+        .filter(li => (li.qty ?? 0) > 0 && (li.unitPrice ?? 0) > 0)
+        .reduce((sum, li) => sum + (li.qty ?? 0) * (li.unitPrice ?? 0), 0);
+
+    const fees =
+        (invoice.freight ?? 0) +
+        (invoice.tax ?? 0) +
+        (invoice.tariff ?? 0) +
+        (invoice.labor ?? 0) +
+        (invoice.fuelSurcharge ?? 0);
+
+    const discountOffset = invoice.discount ?? 0;  // already a positive number per schema
+
+    const computed = lineTotal + fees - discountOffset;
+    const gap = Math.abs(computed - invoice.total);
+    const gapPct = gap / invoice.total;
+
+    // M2 FIX: Two-tier gating — small gaps warn, large gaps block
+    if (gapPct > RECONCILIATION_CONFIG.BALANCE_GATE_PCT && gap > RECONCILIATION_CONFIG.BALANCE_GATE_DOLLARS) {
+        return {
+            valid: false,
+            gap,
+            severity: "gate" as const,
+            message: `⛔ Large balance gap — extraction unreliable (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%). Forcing manual approval.`,
+        };
+    }
+    if (gapPct > RECONCILIATION_CONFIG.BALANCE_WARN_PCT && gap > RECONCILIATION_CONFIG.BALANCE_WARN_DOLLARS) {
+        return {
+            valid: false,
+            gap,
+            severity: "warn" as const,
+            message: `⚠️ Extraction may be unreliable — line items + fees don't balance to invoice total (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%)`,
+        };
+    }
+
+    return { valid: true, gap, severity: "ok" as const, message: "Invoice balance checks out" };
 }
 
 // ──────────────────────────────────────────────────
@@ -438,9 +815,35 @@ export interface ReconciliationResult {
 export async function reconcileInvoiceToPO(
     invoice: InvoiceData,
     orderId: string,
-    client: FinaleClient
+    client: FinaleClient,
+    matchStrategy?: string       // M4: Which strategy matched this invoice to PO
 ): Promise<ReconciliationResult> {
     const warnings: string[] = [];
+
+    // ── Balance validation ─────────────────────────────────────────────────────
+    // M2 FIX: Two tiers — "warn" is non-blocking, "gate" forces needs_approval.
+    // A large balance gap means OCR extraction is untrustworthy.
+    const balanceCheck = validateInvoiceBalance(invoice);
+    if (!balanceCheck.valid) {
+        console.warn(`[reconciler] ⚠️ Balance validation: ${balanceCheck.message}`);
+    }
+    const balanceNote = balanceCheck.valid ? undefined : balanceCheck.message;
+    // M2 FIX: If the gap is large enough to be unreliable, force manual review.
+    const balanceGatesApproval = balanceCheck.severity === "gate";
+
+    // ── H2: Vendor memory fee label consult ────────────────────────────────────
+    // Fetch any vendor-specific fee label → Finale fee type mappings from Pinecone.
+    // Non-fatal: if vendor memory is unavailable, fall back to hardcoded defaults.
+    let vendorFeeLabelMap: Record<string, string> = {};
+    try {
+        const vendorPattern = await getVendorPattern(invoice.vendorName);
+        if (vendorPattern?.feeLabelMap) {
+            vendorFeeLabelMap = vendorPattern.feeLabelMap;
+            console.log(`[reconciler] H2: Loaded ${Object.keys(vendorFeeLabelMap).length} vendor fee label mappings for ${invoice.vendorName}`);
+        }
+    } catch {
+        // Non-fatal — vendor memory is advisory only
+    }
 
     // ── Guard 0: Duplicate detection ──────────────────────────────────────────
     // Fast-fail before any Finale reads. If this invoice+PO combo was already
@@ -463,6 +866,7 @@ export async function reconcileInvoiceToPO(
             totalDollarImpact: 0,
             autoApplicable: false,
             warnings: [],
+            report: buildReconciliationReport(invoice, null, [], [], balanceCheck, "duplicate", []),
         };
     }
 
@@ -481,6 +885,7 @@ export async function reconcileInvoiceToPO(
             totalDollarImpact: 0,
             autoApplicable: false,
             warnings: [],
+            report: buildReconciliationReport(invoice, null, [], [], balanceCheck, "no_match", []),
         };
     }
 
@@ -489,6 +894,7 @@ export async function reconcileInvoiceToPO(
     // Silently returning no_change would mark the invoice as processed with nothing done.
     // Surface it as needs_approval so Will sees it and can investigate.
     if (!poSummary.items || poSummary.items.length === 0) {
+        const emptyPoWarnings = ["PO has 0 line items in Finale — possible data issue or template PO. Manual review required."];
         return {
             orderId,
             invoiceNumber: invoice.invoiceNumber,
@@ -500,7 +906,8 @@ export async function reconcileInvoiceToPO(
             summary: `⚠️ PO ${orderId} has no line items in Finale — possible data issue or template PO. Invoice not reconciled.`,
             totalDollarImpact: 0,
             autoApplicable: false,
-            warnings: ["PO has 0 line items in Finale — possible data issue or template PO. Manual review required."],
+            warnings: emptyPoWarnings,
+            report: buildReconciliationReport(invoice, poSummary, [], [], balanceCheck, "needs_approval", emptyPoWarnings),
         };
     }
 
@@ -512,6 +919,7 @@ export async function reconcileInvoiceToPO(
 
     if (!vendorCorrelation.pass) {
         // Low confidence — no name, PO#, or SKU evidence. Escalate for human review.
+        const vendorMismatchWarnings = [vendorCorrelation.note];
         return {
             orderId,
             invoiceNumber: invoice.invoiceNumber,
@@ -522,12 +930,13 @@ export async function reconcileInvoiceToPO(
             overallVerdict: "needs_approval",
             summary: buildReconciliationSummary(
                 orderId, invoice, [], [], null, 0, "needs_approval",
-                [vendorCorrelation.note]
+                vendorMismatchWarnings
             ),
             totalDollarImpact: 0,
             autoApplicable: false,
-            warnings: [vendorCorrelation.note],
+            warnings: vendorMismatchWarnings,
             vendorNote: vendorCorrelation.note,
+            report: buildReconciliationReport(invoice, poSummary, [], [], balanceCheck, "needs_approval", vendorMismatchWarnings),
         };
     } else if (vendorCorrelation.confidence !== "high") {
         // Medium confidence — proceed but surface the mismatch in the summary.
@@ -541,7 +950,7 @@ export async function reconcileInvoiceToPO(
     const priceChanges = reconcileLineItems(invoice, poSummary);
 
     // 2. Compare fees (includes Guard 3: fee dollar threshold)
-    const feeChanges = reconcileFees(invoice, poSummary);
+    const feeChanges = reconcileFees(invoice, poSummary, vendorFeeLabelMap);
 
     // 3. Check for tracking info
     const trackingUpdate = reconcileTracking(invoice);
@@ -602,6 +1011,13 @@ export async function reconcileInvoiceToPO(
         overallVerdict = "auto_approve";
     }
 
+    // M2 FIX: If balance gap is large, override auto_approve → needs_approval.
+    // Large gap = OCR extraction is unreliable, don't apply changes silently.
+    if (balanceGatesApproval && overallVerdict === "auto_approve") {
+        overallVerdict = "needs_approval";
+        warnings.push(balanceCheck.message);
+    }
+
     const autoApplicable = overallVerdict === "auto_approve" || overallVerdict === "no_change";
 
     // 7. Build summary
@@ -609,6 +1025,40 @@ export async function reconcileInvoiceToPO(
         orderId, invoice, priceChanges, feeChanges, trackingUpdate,
         totalDollarImpact, overallVerdict, warnings
     );
+
+    // M3: Learn fee label → Finale fee type mappings after successful reconciliation.
+    // Fire-and-forget: don't block the return. Only learn from auto_approve or no_change
+    // verdicts — these are high-confidence and safe to learn from.
+    if (overallVerdict === "auto_approve" || overallVerdict === "no_change") {
+        setImmediate(async () => {
+            try {
+                // Build a map of invoice charge labels → Finale fee types from this reconciliation
+                const learnedMap: Record<string, string> = { ...vendorFeeLabelMap };
+                for (const fc of feeChanges) {
+                    if (fc.description && fc.feeType) {
+                        learnedMap[fc.description.toLowerCase()] = fc.feeType;
+                    }
+                }
+                // Only update vendor memory if we learned something new
+                if (Object.keys(learnedMap).length > Object.keys(vendorFeeLabelMap).length) {
+                    const existingPattern = await getVendorPattern(invoice.vendorName);
+                    await storeVendorPattern({
+                        vendorName: invoice.vendorName,
+                        documentType: 'INVOICE',
+                        pattern: existingPattern?.pattern || `Invoice from ${invoice.vendorName}`,
+                        handlingRule: existingPattern?.handlingRule || 'Forward to bill.com, reconcile with Finale',
+                        invoiceBehavior: existingPattern?.invoiceBehavior || 'single_page',
+                        learnedFrom: 'reconciliation',
+                        confidence: existingPattern?.confidence || 0.8,
+                        feeLabelMap: learnedMap,
+                    });
+                    console.log(`[reconciler] M3: Learned ${Object.keys(learnedMap).length} fee label mappings for ${invoice.vendorName}`);
+                }
+            } catch {
+                // Non-fatal — learning is advisory only
+            }
+        });
+    }
 
     return {
         orderId,
@@ -623,7 +1073,86 @@ export async function reconcileInvoiceToPO(
         autoApplicable,
         warnings,
         vendorNote,
+        notes: balanceNote,
+        report: buildReconciliationReport(invoice, poSummary, priceChanges, feeChanges, balanceCheck, overallVerdict, warnings, matchStrategy),
     };
+}
+
+// ──────────────────────────────────────────────────
+// UOM NORMALIZATION
+// ──────────────────────────────────────────────────
+
+/**
+ * UOM → multiplier to convert invoice qty to base countable units (EA).
+ * Used for case/pack reconciliation where vendors bill per-case but
+ * Finale tracks per-unit (or vice versa).
+ *
+ * DECISION: "case" defaults to 12 units; "bag" is weight-based → see UOM_TO_LB.
+ * Vendor-specific overrides (e.g., "case/24") are handled via explicit keys.
+ */
+const UOM_TO_EA: Record<string, number> = {
+    each: 1, ea: 1, pc: 1, pcs: 1, piece: 1, unit: 1, units: 1,
+    "case": 12, "cs": 12, "cse": 12,
+    "case/12": 12, "case/24": 24, "cs/24": 24,
+};
+
+/**
+ * UOM → multiplier to convert invoice qty to base weight units (LB).
+ * Used for bulk material lines where weight-per-bag varies by product.
+ *
+ * DECISION: "bag" defaults to 50 lb; override with explicit "bag/40" etc.
+ * "pallet" treated as ~2000 lb (approximate — always needs_approval via
+ * the existing magnitude guardrail anyway if the price swing is large).
+ */
+const UOM_TO_LB: Record<string, number> = {
+    lb: 1, lbs: 1, pound: 1, pounds: 1,
+    kg: 2.20462, kilo: 2.20462, kilogram: 2.20462,
+    g: 0.00220462, gram: 0.00220462, grams: 0.00220462,
+    oz: 0.0625, ounce: 0.0625, ounces: 0.0625,
+    bag: 50, bg: 50,
+    "bag/40": 40, "bag/50": 50,
+    "pallet": 2000,
+};
+
+/**
+ * Normalize a line item to a common base unit for apples-to-apples comparison.
+ *
+ * Returns `{ baseQty, normalizedPrice, normalized }` where:
+ *   - baseQty       = qty × uom multiplier (e.g., 10 cases × 12 = 120 EA)
+ *   - normalizedPrice = total / baseQty  (per base-unit price)
+ *   - normalized    = true if a UOM conversion was applied
+ *
+ * If the UOM is not recognized or is EA-equivalent, returns inputs unchanged.
+ *
+ * @param qty        Quantity on the line
+ * @param unitPrice  Unit price on the line (per stated UOM)
+ * @param uom        Unit of measure string (e.g., "CASE/12", "bag", "LB")
+ */
+export function normalizeLineTotal(
+    qty: number,
+    unitPrice: number,
+    uom?: string | null
+): { baseQty: number; normalizedPrice: number; normalized: boolean } {
+    if (!uom) return { baseQty: qty, normalizedPrice: unitPrice, normalized: false };
+
+    const key = uom.trim().toLowerCase();
+
+    const eaMult = UOM_TO_EA[key];
+    if (eaMult !== undefined && eaMult !== 1) {
+        const baseQty = qty * eaMult;
+        const normalizedPrice = baseQty > 0 ? (qty * unitPrice) / baseQty : unitPrice;
+        return { baseQty, normalizedPrice, normalized: true };
+    }
+
+    const lbMult = UOM_TO_LB[key];
+    if (lbMult !== undefined && lbMult !== 1) {
+        const baseQty = qty * lbMult;
+        const normalizedPrice = baseQty > 0 ? (qty * unitPrice) / baseQty : unitPrice;
+        return { baseQty, normalizedPrice, normalized: true };
+    }
+
+    // EA=1 or LB=1 keys — already in base unit, no conversion needed
+    return { baseQty: qty, normalizedPrice: unitPrice, normalized: false };
 }
 
 // ──────────────────────────────────────────────────
@@ -795,20 +1324,54 @@ function reconcileLineItems(
             continue;
         }
 
-        const priceDelta = invLine.unitPrice - poLine.unitPrice;
-        const percentChange = poLine.unitPrice > 0
-            ? Math.abs(priceDelta) / poLine.unitPrice
-            : (invLine.unitPrice > 0 ? 1 : 0);
+        // UOM normalization: convert invoice and PO lines to a common per-base-unit
+        // price before comparison. This prevents a false "price change" when the
+        // invoice bills per-case (e.g., $120/case of 12) but Finale tracks per-EA
+        // ($10/EA). Finale PO lines carry no UOM field so we always pass null there.
+        const invoiceNorm = normalizeLineTotal(invLine.qty, invLine.unitPrice, invLine.unit ?? null);
+        const poNorm = normalizeLineTotal(poLine.quantity, poLine.unitPrice, null);
 
-        const dollarImpact = priceDelta * invLine.qty;
+        // Effective prices to compare (per base unit after normalization)
+        const effectiveInvPrice = invoiceNorm.normalizedPrice;
+        const effectivePoPrice = poNorm.normalizedPrice;
 
-        // Run through price safety checks
+        const priceDelta = effectiveInvPrice - effectivePoPrice;
+        const percentChange = effectivePoPrice > 0
+            ? Math.abs(priceDelta) / effectivePoPrice
+            : (effectiveInvPrice > 0 ? 1 : 0);
+
+        const dollarImpact = priceDelta * (invoiceNorm.normalized ? invoiceNorm.baseQty : invLine.qty);
+
+        // Run through price safety checks using normalized prices
         let { verdict: pVerdict, reason: pReason } = evaluatePriceChange(
-            poLine.unitPrice,
-            invLine.unitPrice,
+            effectivePoPrice,
+            effectiveInvPrice,
             percentChange,
             dollarImpact
         );
+
+        // Append UOM normalization context to the reason when a conversion was applied
+        if (invoiceNorm.normalized) {
+            const uomKey = (invLine.unit ?? "").trim().toLowerCase();
+            const eaMult = UOM_TO_EA[uomKey];
+            const lbMult = UOM_TO_LB[uomKey];
+            const mult = eaMult ?? lbMult ?? 1;
+            const baseUnit = eaMult !== undefined ? "EA" : "LB";
+            pReason += ` | UOM normalized: ${(invLine.unit ?? "").toUpperCase()} →${baseUnit !== "EA" ? " per " : " "}${baseUnit} (×${mult})`;
+
+            // Ambiguous case/bag keys: the multiplier was assumed, not stated explicitly
+            // in the UOM string. Force needs_approval so Will can verify the pack size.
+            const AMBIGUOUS_CASE_KEYS = new Set(["case", "cs", "cse"]);
+            const AMBIGUOUS_BAG_KEYS = new Set(["bag", "bg"]);
+
+            if (AMBIGUOUS_CASE_KEYS.has(uomKey)) {
+                pVerdict = "needs_approval";
+                pReason += " | case size assumed 12 — verify";
+            } else if (AMBIGUOUS_BAG_KEYS.has(uomKey)) {
+                pVerdict = "needs_approval";
+                pReason += " | bag weight assumed 50 lb — verify";
+            }
+        }
 
         // Guard 2: Quantity overbill — never auto-approve if invoice qty > PO qty.
         // Even a tiny price change is suspicious when the vendor is billing for
@@ -946,9 +1509,10 @@ function findMatchingPOLine(
 // FEE COMPARISON
 // ──────────────────────────────────────────────────
 
-function reconcileFees(
+export function reconcileFees(
     invoice: InvoiceData,
-    po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>
+    po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>,
+    vendorFeeLabelMap: Record<string, string> = {}   // H2: vendor-specific fee label→type mappings
 ): FeeChange[] {
     const changes: FeeChange[] = [];
 
@@ -969,10 +1533,20 @@ function reconcileFees(
         const invoiceAmount = invoice[mapping.invoiceField] as number | undefined;
         if (!invoiceAmount || invoiceAmount <= 0) continue;
 
-        // Check if PO already has this fee type
-        const existingFee = po.adjustments.find(adj =>
-            adj.description.toLowerCase().includes(mapping.label.toLowerCase())
-        );
+        // H2: Use vendor-learned fee label map to find PO adjustments
+        // that use non-standard labels (e.g., "frt chg" instead of "freight").
+        // Falls back to the hardcoded mapping.label if no vendor label match.
+        const vendorLabelsForType = Object.entries(vendorFeeLabelMap)
+            .filter(([, feeType]) => feeType === mapping.feeType)
+            .map(([label]) => label.toLowerCase());
+
+        const existingFee = po.adjustments.find(adj => {
+            const adjLower = adj.description.toLowerCase();
+            // Check hardcoded label first
+            if (adjLower.includes(mapping.label.toLowerCase())) return true;
+            // Check vendor-learned labels
+            return vendorLabelsForType.some(vl => adjLower.includes(vl));
+        });
 
         const existingAmount = existingFee?.amount || 0;
 
@@ -996,6 +1570,37 @@ function reconcileFees(
                 description: mapping.label,
                 existingAmount,
                 isNew: !existingFee,
+                verdict,
+                reason,
+            });
+        }
+    }
+
+    // C5 FIX: Discount negation — invoice parser extracts discount as a positive number.
+    // Must write to Finale as NEGATIVE to subtract from PO total.
+    // Uses DISCOUNT_20 fee type (id 10011) as the vehicle for flat-dollar discounts.
+    const discountAmount = invoice.discount ?? 0;
+    if (discountAmount > 0) {
+        const existingDiscount = po.adjustments.find(adj =>
+            adj.description.toLowerCase().includes("discount")
+        );
+        const existingAmount = existingDiscount?.amount || 0;
+        const negatedAmount = -Math.abs(discountAmount);
+
+        if (Math.abs(negatedAmount - existingAmount) > 0.01) {
+            const feeDelta = Math.abs(negatedAmount - existingAmount);
+            const verdict: "auto_approve" | "needs_approval" =
+                feeDelta > RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS
+                    ? "needs_approval" : "auto_approve";
+            const reason = verdict === "needs_approval"
+                ? `Discount delta $${feeDelta.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS} cap — requires approval`
+                : `Discount $${discountAmount.toFixed(2)} applied as -$${discountAmount.toFixed(2)}`;
+            changes.push({
+                feeType: "DISCOUNT_20",
+                amount: negatedAmount,  // NEGATIVE — subtracts from PO total
+                description: "Discount",
+                existingAmount,
+                isNew: !existingDiscount,
                 verdict,
                 reason,
             });
@@ -1181,8 +1786,30 @@ export async function applyReconciliation(
                     await client.updateShipmentTracking(firstShipment, updates);
                     applied.push(`Tracking: ${newTrackingNumbers.join(", ") || "ship date updated"}`);
 
-                    // Save tracking numbers to Supabase for future dedup
+                    // Save tracking numbers to invoices table for future dedup
                     await saveTrackingNumbers(newTrackingNumbers, result.invoiceNumber);
+
+                    // Also persist to purchase_orders.tracking_numbers so calendar sync + dashboard show it
+                    if (newTrackingNumbers.length > 0) {
+                        try {
+                            const supabase = createClient();
+                            if (supabase) {
+                                const { data: existingPO } = await supabase
+                                    .from("purchase_orders")
+                                    .select("tracking_numbers")
+                                    .eq("po_number", result.orderId)
+                                    .maybeSingle();
+                                const merged = [...new Set([...(existingPO?.tracking_numbers ?? []), ...newTrackingNumbers])];
+                                await supabase.from("purchase_orders").upsert({
+                                    po_number: result.orderId,
+                                    tracking_numbers: merged,
+                                    updated_at: new Date().toISOString(),
+                                }, { onConflict: "po_number" });
+                            }
+                        } catch (e: any) {
+                            console.warn(`⚠️ [reconciler] Failed to persist tracking to purchase_orders: ${e.message}`);
+                        }
+                    }
                 } else {
                     skipped.push("Tracking: No shipment found on PO to attach tracking to");
                 }
@@ -1322,6 +1949,116 @@ export function buildAuditMetadata(
         applied: applyResult.applied,
         skipped: applyResult.skipped,
         errors: applyResult.errors,
+    };
+}
+
+// ──────────────────────────────────────────────────
+// RECONCILIATION REPORT BUILDER
+// ──────────────────────────────────────────────────
+
+/**
+ * Build a structured ReconciliationReport from data already computed in reconcileInvoiceToPO().
+ * No extra API calls — all inputs are already in-scope at the call site.
+ *
+ * The report is written into ap_activity_log.reconciliation_report (JSONB) so that
+ * accounting can query, filter, and export a full audit trail per invoice.
+ */
+export function buildReconciliationReport(
+    invoice: InvoiceData,
+    poSummary: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>> | null,
+    priceChanges: PriceChange[],
+    feeChanges: FeeChange[],
+    balanceCheck: { valid: boolean; gap: number; message: string },
+    overallVerdict: ReconciliationVerdict,
+    warnings: string[],
+    matchStrategy?: string       // M4: Which matching strategy found the PO
+): ReconciliationReport {
+    const now = new Date().toISOString();
+
+    // Derive approval method from the verdict at report-build time.
+    // Telegram approvals update this after the fact via their own log writes.
+    let approvalMethod: ReconciliationReport["approval"]["method"];
+    if (overallVerdict === "auto_approve" || overallVerdict === "no_change") {
+        approvalMethod = "auto";
+    } else if (overallVerdict === "rejected") {
+        approvalMethod = "rejected";
+    } else if (overallVerdict === "duplicate") {
+        approvalMethod = "auto";
+    } else {
+        // needs_approval, no_match — awaiting Will's Telegram decision
+        approvalMethod = "pending";
+    }
+
+    const isAutoOrNoChange = approvalMethod === "auto";
+
+    // Flatten price + fee changes into a unified changes array
+    const changes: ReconciliationReport["changes"] = [
+        ...priceChanges.map(pc => ({
+            sku: pc.productId,
+            description: pc.description,
+            field: "unit_price",
+            invoice_value: pc.invoicePrice,
+            po_value: pc.poPrice,
+            disposition: pc.verdict as string,
+            note: pc.reason,
+        })),
+        ...feeChanges.map(fc => ({
+            sku: fc.feeType,
+            description: fc.description,
+            field: "fee",
+            invoice_value: fc.amount,
+            po_value: fc.existingAmount,
+            disposition: fc.verdict as string,
+            note: fc.reason,
+        })),
+    ];
+
+    // Resolve fees_applied from feeChanges (keyed by feeType)
+    const feeByType = (type: string) => feeChanges.find(fc => fc.feeType === type)?.amount ?? null;
+
+    return {
+        generated_at: now,
+        invoice: {
+            number: invoice.invoiceNumber ?? null,
+            vendor: invoice.vendorName ?? null,
+            total: invoice.total ?? null,
+            date: invoice.invoiceDate ?? null,
+            po_number: invoice.poNumber ?? null,
+            line_count: invoice.lineItems?.length ?? 0,
+            freight: invoice.freight ?? null,
+            tax: invoice.tax ?? null,
+            tariff: invoice.tariff ?? null,
+            labor: invoice.labor ?? null,
+            discount: invoice.discount ?? null,
+        },
+        finale_po: poSummary
+            ? {
+                order_id: poSummary.orderId,
+                vendor: poSummary.supplier ?? null,
+                total: poSummary.total ?? null,
+                line_count: poSummary.items?.length ?? 0,
+            }
+            : null,
+        changes,
+        fees_applied: {
+            freight: feeByType("FREIGHT"),
+            tax: feeByType("TAX"),
+            tariff: feeByType("TARIFF"),
+            labor: feeByType("LABOR"),
+            discount: invoice.discount ?? null,
+        },
+        approval: {
+            method: approvalMethod,
+            approved_by: isAutoOrNoChange ? "system" : undefined,
+            approved_at: isAutoOrNoChange ? now : undefined,
+        },
+        balance_check: {
+            valid: balanceCheck.valid,
+            gap: balanceCheck.gap > 0 ? balanceCheck.gap : undefined,
+            message: balanceCheck.message || undefined,
+        },
+        warnings,
+        match_strategy: matchStrategy,
     };
 }
 

@@ -45,10 +45,12 @@ async function run() {
             const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
             const rateSource = purchaseVelocity >= salesVelocity ? 'receipts' : 'shipments';
             const suggestedQty = Math.max(50, Math.ceil(dailyRate * (leadTimeDays + 60) / 50) * 50);
-            const urgency = runwayDays < leadTimeDays ? 'CRITICAL'
-                : runwayDays < leadTimeDays + 30 ? 'WARNING'
-                : runwayDays < leadTimeDays + 60 ? 'WATCH'
-                : 'OK';
+            // DECISION(2026-03-09): Use adjusted runway (on-hand + on-order) for urgency.
+            // Raw runwayDays caused items with active POs to falsely flag as CRITICAL.
+            const urgency = adjustedRunwayDays < leadTimeDays ? 'CRITICAL'
+                : adjustedRunwayDays < leadTimeDays + 30 ? 'WARNING'
+                    : adjustedRunwayDays < leadTimeDays + 60 ? 'WATCH'
+                        : 'OK';
 
             // Resolve vendor name
             const suppliers = prodData.supplierList || [];
@@ -73,8 +75,8 @@ async function run() {
             }
             const urgencyNote = urgency === 'CRITICAL' ? 'order now, already short'
                 : urgency === 'WARNING' ? 'order soon'
-                : urgency === 'WATCH' ? 'monitor'
-                : 'covered';
+                    : urgency === 'WATCH' ? 'monitor'
+                        : 'covered';
             const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
 
             console.log(`   Name        : ${prodData.internalName}`);

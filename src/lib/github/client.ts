@@ -1,9 +1,8 @@
 import { Octokit } from "@octokit/rest";
 import { createClient } from "@/lib/supabase";
-import Anthropic from "@anthropic-ai/sdk";
+import { getAnthropicClient } from "@/lib/anthropic";
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-const anthropic = new Anthropic();
 
 const GITHUB_OWNER = process.env.GITHUB_OWNER!;
 const GITHUB_REPO = process.env.GITHUB_REPO!;
@@ -131,7 +130,7 @@ export class GitHubClient {
             octokit.repos.listCommits({ owner: GITHUB_OWNER, repo: GITHUB_REPO, since, per_page: 20 }),
         ]);
 
-        const response = await anthropic.messages.create({
+        const response = await getAnthropicClient().messages.create({
             model: "claude-sonnet-4-6",
             max_tokens: 1024,
             messages: [{

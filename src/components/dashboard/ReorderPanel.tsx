@@ -29,6 +29,7 @@ type AssessmentData = {
 
 type POResult = { orderId: string; finaleUrl: string };
 
+// DECISION(2026-03-10): Badge hierarchy reform — only CRIT gets a filled pill.
 const URGENCY = {
     critical: {
         badge: "bg-rose-500/20 text-rose-300 border-rose-500/40",
@@ -37,14 +38,14 @@ const URGENCY = {
         row: "border-rose-500/10",
     },
     warning: {
-        badge: "bg-amber-500/20 text-amber-300 border-amber-500/40",
+        badge: "text-amber-400",
         dot: "bg-amber-400",
         label: "WARN",
         row: "border-zinc-800/40",
     },
     reorder_flagged: {
-        badge: "bg-zinc-700/50 text-zinc-400 border-zinc-600/40",
-        dot: "bg-zinc-500",
+        badge: "text-zinc-500",
+        dot: "bg-zinc-600",
         label: "FLAG",
         row: "border-zinc-800/40",
     },
@@ -171,11 +172,11 @@ export default function ReorderPanel() {
     return (
         <div className="border-b border-zinc-800 shrink-0">
             {/* Header */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <ShoppingCart className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Finale Reorder</span>
                 {data && !scanning && (
-                    <span className="text-xs text-zinc-700">{timeAgo(data.cachedAt)}</span>
+                    <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(data.cachedAt)}</span>
                 )}
                 {scanning && (
                     <span className="text-xs text-zinc-600 font-mono">scanning…</span>
@@ -194,7 +195,7 @@ export default function ReorderPanel() {
                     </span>
                 )}
                 {flagged > 0 && !critical && !warning && (
-                    <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-zinc-700/50 text-zinc-400 border-zinc-600/40">
+                    <span className="text-xs font-mono text-zinc-500">
                         {flagged} FLAG
                     </span>
                 )}
@@ -222,9 +223,14 @@ export default function ReorderPanel() {
                 <>
                     {/* Loading skeleton */}
                     {isLoading && !data && (
-                        <div className="px-4 py-3 flex items-center gap-2 border-t border-zinc-800/60 text-zinc-700">
-                            <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-                            <span className="text-xs font-mono">Scanning Finale inventory…</span>
+                        <div className="px-4 py-2 space-y-2.5">
+                            {[1, 2, 3].map(i => (
+                                <div key={i} className="flex items-center gap-2.5">
+                                    <div className="w-2 h-2 rounded-full skeleton-shimmer shrink-0" />
+                                    <div className="skeleton-shimmer h-3.5" style={{ width: `${45 + i * 15}%` }} />
+                                    <div className="skeleton-shimmer h-3 w-10 ml-auto" />
+                                </div>
+                            ))}
                         </div>
                     )}
 
@@ -267,8 +273,11 @@ export default function ReorderPanel() {
                                                     </span>
                                                 </button>
 
-                                                {/* Urgency badge */}
-                                                <span className={`text-[10px] font-mono px-1 py-0.5 rounded border shrink-0 ${cfg.badge}`}>
+                                                {/* Urgency badge — only CRIT gets a pill */}
+                                                <span className={`text-[10px] font-mono shrink-0 ${group.urgency === "critical"
+                                                        ? `px-1 py-0.5 rounded border ${cfg.badge}`
+                                                        : cfg.badge
+                                                    }`}>
                                                     {cfg.label}
                                                 </span>
 
@@ -322,10 +331,10 @@ export default function ReorderPanel() {
                                                             >
                                                                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${urgDot}`} />
                                                                 <span className="text-zinc-200 flex-1 truncate">{item.productId}</span>
-                                                                <span className="text-zinc-600 shrink-0">
+                                                                <span className="text-[var(--dash-l3)] shrink-0">
                                                                     out: {item.stockoutDays !== null ? `${item.stockoutDays}d` : "—"}
                                                                 </span>
-                                                                <span className="text-zinc-500 shrink-0">
+                                                                <span className="text-[var(--dash-l2)] shrink-0">
                                                                     qty: {orderedQty}
                                                                 </span>
                                                                 {item.unitPrice > 0 && (

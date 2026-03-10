@@ -38,11 +38,14 @@ type SnoozeMap = Record<string, SnoozeEntry>;
 // ── constants ──────────────────────────────────────────────────────────────
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
 const URGENCY_RANK = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
+// DECISION(2026-03-10): Badge hierarchy reform — only CRIT gets a filled pill.
+// WARN = amber text only (no pill).  WATCH/OK = invisible badge.
+// This prevents badge blindness when most rows are critical.
 const URGENCY = {
-    critical: { badge: "bg-red-500/20 text-red-300 border-red-500/40", dot: "bg-red-500", label: "CRIT", tab: "border-red-500 text-red-300" },
-    warning: { badge: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40", dot: "bg-yellow-400", label: "WARN", tab: "border-yellow-400 text-yellow-300" },
-    watch: { badge: "bg-green-500/20 text-green-300 border-green-500/40", dot: "bg-green-500", label: "WTCH", tab: "border-green-500 text-green-300" },
-    ok: { badge: "bg-zinc-700/50 text-zinc-400 border-zinc-600/40", dot: "bg-zinc-500", label: "OK", tab: "border-zinc-500 text-zinc-400" },
+    critical: { badge: "bg-red-500/20 text-red-300 border-red-500/40", badgeOutline: "bg-transparent text-red-400 border-red-500/30", dot: "bg-red-500", label: "CRIT", tab: "border-red-500 text-red-300" },
+    warning: { badge: "text-amber-400", badgeOutline: "text-amber-400", dot: "bg-amber-400", label: "WARN", tab: "border-amber-400 text-amber-300" },
+    watch: { badge: "text-zinc-500", badgeOutline: "text-zinc-500", dot: "bg-emerald-500", label: "WTCH", tab: "border-emerald-500 text-emerald-300" },
+    ok: { badge: "", badgeOutline: "", dot: "bg-zinc-600", label: "", tab: "border-zinc-600 text-zinc-500" },
 } as const;
 
 function runwayColor(days: number) {
@@ -430,10 +433,10 @@ export default function PurchasingPanel() {
             )}
 
             {/* ── Header ── */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Purchasing</span>
-                {data && !scanning && <span className="text-xs text-zinc-700">{timeAgo(data.cachedAt)}</span>}
+                {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
                 <div className="flex-1" />
 
@@ -541,9 +544,14 @@ export default function PurchasingPanel() {
                     )}
 
                     {isLoading && !data && (
-                        <div className="px-4 py-3 flex items-center gap-2 border-t border-zinc-800/60 text-zinc-700">
-                            <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-                            <span className="text-xs font-mono">Scanning Finale receipts + shipments…</span>
+                        <div className="px-4 py-2 space-y-2.5">
+                            {[1, 2, 3, 4].map(i => (
+                                <div key={i} className="flex items-center gap-2.5">
+                                    <div className="w-2 h-2 rounded-full skeleton-shimmer shrink-0" />
+                                    <div className="skeleton-shimmer h-3.5" style={{ width: `${50 + i * 12}%` }} />
+                                    <div className="skeleton-shimmer h-3 w-10 ml-auto" />
+                                </div>
+                            ))}
                         </div>
                     )}
                     {error && (
@@ -583,15 +591,18 @@ export default function PurchasingPanel() {
                                                     <span className={`text-sm font-mono font-semibold truncate ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
                                                         {group.vendorName}
                                                     </span>
-                                                    <span className="text-[11px] font-mono text-zinc-600 shrink-0">
+                                                    <span className="text-[11px] font-mono text-[var(--dash-l2)] shrink-0">
                                                         {vSnoozed
                                                             ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
                                                             : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
                                                     </span>
                                                 </button>
 
-                                                {!vSnoozed && (
-                                                    <span className={`text-[10px] font-mono px-1 py-0.5 rounded border shrink-0 ${cfg.badge}`}>
+                                                {!vSnoozed && cfg.label && (
+                                                    <span className={`text-[10px] font-mono shrink-0 ${group.urgency === "critical"
+                                                            ? (po ? `px-1 py-0.5 rounded border ${cfg.badgeOutline}` : `px-1 py-0.5 rounded border ${cfg.badge}`)
+                                                            : cfg.badge
+                                                        }`}>
                                                         {cfg.label}
                                                     </span>
                                                 )}
@@ -777,7 +788,7 @@ export default function PurchasingPanel() {
                                                                             {/* Row 2: Description & Amount */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center gap-2 mt-1">
-                                                                                    <span className="text-[11px] font-mono text-zinc-400 flex-1 truncate">{item.productName}</span>
+                                                                                    <span className="text-[11px] font-mono text-[var(--dash-l2)] flex-1 truncate">{item.productName}</span>
                                                                                     {item.unitPrice > 0 ? (
                                                                                         <span className="text-[11px] font-mono text-emerald-400 font-semibold shrink-0">
                                                                                             ${item.unitPrice.toFixed(2)}/ea
@@ -794,7 +805,7 @@ export default function PurchasingPanel() {
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center justify-between gap-2 mt-2">
                                                                                     <div className="flex flex-col gap-1">
-                                                                                        <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-500">
+                                                                                        <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--dash-l3)]">
                                                                                             <span>{item.dailyRate.toFixed(1)}/day</span>
                                                                                             <span>·</span>
                                                                                             <span>{Math.round(item.stockOnHand)} on hand</span>

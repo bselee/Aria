@@ -126,9 +126,27 @@ export default function ChatMirror() {
                         metadata: { from: "dashboard", isTemp: true }
                     } as ChatLog)].slice(-50);
                 });
+            } else if (data.error) {
+                // Surface API errors as a visible chat message
+                setLogs(curr => [...curr, ({
+                    id: `err-${Date.now()}`,
+                    created_at: new Date().toISOString(),
+                    source: "telegram",
+                    role: "assistant",
+                    content: `⚠ Aria couldn't process that: ${data.error}. Try again in a moment.`,
+                    metadata: { from: "dashboard", isError: true }
+                } as ChatLog)].slice(-50));
             }
         } catch (e: any) {
-            console.error("Send error:", e.message);
+            // Network error — show inline feedback
+            setLogs(curr => [...curr, ({
+                id: `err-${Date.now()}`,
+                created_at: new Date().toISOString(),
+                source: "telegram",
+                role: "assistant",
+                content: `⚠ Connection error: ${e.message}. Check your network and try again.`,
+                metadata: { from: "dashboard", isError: true }
+            } as ChatLog)].slice(-50));
         } finally {
             setSending(false);
             textareaRef.current?.focus();

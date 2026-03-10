@@ -171,6 +171,24 @@ export class SlackWatchdog {
         // 5. Refresh product catalog every 30 minutes
         setInterval(() => this.buildProductCatalog(), 30 * 60 * 1000);
 
+        // 6. Prune unbounded in-memory collections (OOM prevention)
+        // DECISION(2026-03-09): processedRequests Set and lastCheckedThreads Map
+        // grow indefinitely without pruning. Cap them to prevent memory leaks.
+        setInterval(() => {
+            if (this.processedRequests.size > 1000) {
+                console.log(`[watchdog] processedRequests: ${this.processedRequests.size} → clearing`);
+                this.processedRequests.clear();
+            }
+            if (this.lastCheckedThreads.size > 500) {
+                console.log(`[watchdog] lastCheckedThreads: ${this.lastCheckedThreads.size} → clearing`);
+                this.lastCheckedThreads.clear();
+            }
+            // Flush stale pending requests (should be empty after digest, but safety net)
+            if (this.pendingRequests.length > 50) {
+                this.pendingRequests = this.pendingRequests.slice(-20);
+            }
+        }, 30 * 60 * 1000);
+
         console.log("🦊 Aria Slack Watchdog: LIVE and hunting for requests.");
     }
 

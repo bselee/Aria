@@ -19,7 +19,7 @@
  *   4. Build a vendor intelligence database for operational awareness
  */
 
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import { unifiedObjectGeneration } from "./llm";
@@ -108,7 +108,7 @@ export async function scanPOEmails(
     try {
         // "default" token maps to bill.selee@buildasoil.com
         const auth = await getAuthenticatedClient("default");
-        const gmail = google.gmail({ version: "v1", auth });
+        const gmail = GmailApi({ version: "v1", auth });
 
         const afterDate = new Date(Date.now() - daysBack * 86_400_000);
         const afterStr = afterDate.toISOString().split("T")[0].replace(/-/g, "/");

@@ -1,4 +1,4 @@
-import { google, gmail_v1 } from "googleapis";
+import { gmail as GmailApi, gmail_v1 } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "./auth";
 import { extractPDF } from "../../lib/pdf/extractor";
 import { classifyDocument } from "../../lib/pdf/classifier";
@@ -28,7 +28,7 @@ export async function processEmailAttachments(
     emailMetadata: { from: string; subject: string; date: string }
 ) {
     const auth = await getAuthenticatedClient(accountId);
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = GmailApi({ version: "v1", auth });
 
     // Get full message
     const { data: message } = await gmail.users.messages.get({

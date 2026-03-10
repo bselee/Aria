@@ -4,7 +4,7 @@ description: |
   Typecheck the project and restart aria-bot via PM2. Use after any code change to start-bot.ts
   or any file it imports. Automatically filters known pre-existing TS errors.
 allowed-tools:
-  - Bash(npx tsc *)
+  - Bash(npm run typecheck*)
   - Bash(pm2 *)
 ---
 

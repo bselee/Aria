@@ -115,9 +115,11 @@ async function run() {
             const runwayDays = stockOnHand / dailyRate;
             const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
 
-            const urgency = runwayDays < leadTimeDays ? 'CRITICAL'
-                : runwayDays < leadTimeDays + 30 ? 'WARNING'
-                    : runwayDays < leadTimeDays + 60 ? 'WATCH'
+            // DECISION(2026-03-09): Use adjusted runway (on-hand + on-order) for urgency.
+            // Raw runwayDays caused items with active POs to falsely flag as CRITICAL.
+            const urgency = adjustedRunwayDays < leadTimeDays ? 'CRITICAL'
+                : adjustedRunwayDays < leadTimeDays + 30 ? 'WARNING'
+                    : adjustedRunwayDays < leadTimeDays + 60 ? 'WATCH'
                         : 'OK';
 
             const rateSource = purchaseVelocity >= salesVelocity ? 'receipts' : 'shipments';

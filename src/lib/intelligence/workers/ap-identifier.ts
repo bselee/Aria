@@ -6,7 +6,7 @@
  * @author  Antigravity / Aria
  */
 
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
 import { z } from "zod";
@@ -110,11 +110,11 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                 if (!gmailClients[inbox]) {
                     try {
                         const auth = await getAuthenticatedClient(inbox);
-                        gmailClients[inbox] = google.gmail({ version: "v1", auth });
+                        gmailClients[inbox] = GmailApi({ version: "v1", auth });
                     } catch (e: any) {
                         console.warn(`   ⚠️ Missing '${inbox}' token, falling back to 'default' token...`);
                         const fallbackAuth = await getAuthenticatedClient("default");
-                        gmailClients[inbox] = google.gmail({ version: "v1", auth: fallbackAuth });
+                        gmailClients[inbox] = GmailApi({ version: "v1", auth: fallbackAuth });
                     }
                 }
                 return gmailClients[inbox];

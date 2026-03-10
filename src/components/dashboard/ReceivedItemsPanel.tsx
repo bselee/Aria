@@ -154,10 +154,10 @@ export default function ReceivedItemsPanel() {
 
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
-                <span className="text-xs text-zinc-700">14d</span>
+                <span className="text-[10px] text-[var(--dash-ts)] font-mono">14d</span>
                 <div className="flex-1" />
                 {!loading && pos.length > 0 && (
                     <span className="text-xs font-mono text-zinc-500">{pos.length} POs</span>
@@ -177,9 +177,13 @@ export default function ReceivedItemsPanel() {
             {!isCollapsed && (
                 <>
                     {loading ? (
-                        <div className="px-4 py-2 flex items-center gap-2 text-zinc-700">
-                            <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-                            <span className="text-xs font-mono">Loading…</span>
+                        <div className="px-4 py-2 space-y-2.5">
+                            {[1, 2, 3].map(i => (
+                                <div key={i} className="flex items-center gap-2.5">
+                                    <div className="skeleton-shimmer h-3.5" style={{ width: `${30 + i * 12}%` }} />
+                                    <div className="skeleton-shimmer h-3 w-16 ml-auto" />
+                                </div>
+                            ))}
                         </div>
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
@@ -194,7 +198,7 @@ export default function ReceivedItemsPanel() {
                                     <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
-                                            <span className="text-xs font-mono text-zinc-600 shrink-0">{fmtDateTime(po.receiveDate)}</span>
+                                            <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDate)}</span>
                                             <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
                                             {apStatus && (
                                                 <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>

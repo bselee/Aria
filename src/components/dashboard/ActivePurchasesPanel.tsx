@@ -23,6 +23,30 @@ type ApiResponse = {
     error?: string;
 };
 
+// Build clickable carrier tracking URL (mirrors ops-manager.ts logic)
+function carrierUrl(trackingNumber: string): string {
+    const raw = trackingNumber.includes(":::") ? trackingNumber.split(":::")[1] : trackingNumber;
+    const carrier = trackingNumber.includes(":::") ? trackingNumber.split(":::")[0].toLowerCase() : "";
+
+    // LTL carriers
+    if (carrier.includes("old dominion") || carrier.includes("odfl")) return `https://www.odfl.com/trace/Trace.jsp?pro=${raw}`;
+    if (carrier.includes("saia")) return `https://www.saia.com/tracking?pro=${raw}`;
+    if (carrier.includes("estes")) return `https://www.estes-express.com/tracking?pro=${raw}`;
+    if (carrier.includes("xpo")) return `https://app.xpo.com/track/pro/${raw}`;
+    if (carrier.includes("dayton")) return `https://www.daytonfreight.com/tracking/?pro=${raw}`;
+    if (carrier.includes("fedex freight")) return `https://www.fedex.com/fedextrack/?tracknumbers=${raw}`;
+    if (carrier.includes("r&l") || carrier.includes("r+l")) return `https://www.rlcarriers.com/freight/shipping/shipment-tracing?pro=${raw}`;
+
+    // Parcel carriers — detect from number format
+    if (/^1Z[A-Z0-9]{16}$/i.test(raw)) return `https://www.ups.com/track?tracknum=${raw}`;
+    if (/^(94|92|93|95)\d{20}$/.test(raw)) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${raw}`;
+    if (/^(96\d{18}|\d{15}|\d{12})$/.test(raw)) return `https://www.fedex.com/fedextrack/?tracknumbers=${raw}`;
+    if (/^JD\d{18}$/i.test(raw)) return `https://www.dhl.com/us-en/home/tracking.html?tracking-id=${raw}`;
+
+    // Fallback: ParcelApp
+    return `https://parcelsapp.com/en/tracking/${raw}`;
+}
+
 // Returns e.g. "Mar 3, 2026"
 function fmtDate(dateStr: string | null | undefined): string {
     if (!dateStr) return "Unknown";
@@ -133,10 +157,10 @@ export default function ActivePurchasesPanel() {
 
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <ListChecks className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Active Purchases</span>
-                {cachedAt && !refreshing && <span className="text-xs text-zinc-700">{timeAgo(cachedAt)}</span>}
+                {cachedAt && !refreshing && <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(cachedAt)}</span>}
                 {refreshing && <span className="text-xs text-zinc-600 font-mono">refreshing…</span>}
                 <div className="flex-1" />
 
@@ -174,9 +198,13 @@ export default function ActivePurchasesPanel() {
             {!isCollapsed && (
                 <>
                     {loading ? (
-                        <div className="px-4 py-3 flex items-center gap-2 text-zinc-700">
-                            <div className="w-3 h-3 border border-zinc-700 border-t-transparent rounded-full animate-spin shrink-0" />
-                            <span className="text-xs font-mono">Loading active POs...</span>
+                        <div className="px-4 py-2 space-y-2.5">
+                            {[1, 2, 3].map(i => (
+                                <div key={i} className="flex items-center gap-2.5">
+                                    <div className="skeleton-shimmer h-4" style={{ width: `${35 + i * 12}%` }} />
+                                    <div className="skeleton-shimmer h-3 w-14 ml-auto" />
+                                </div>
+                            ))}
                         </div>
                     ) : error ? (
                         <div className="px-4 py-3 border-t border-zinc-800/60"><span className="text-xs font-mono text-rose-400">{error}</span></div>
@@ -224,7 +252,7 @@ export default function ActivePurchasesPanel() {
                                         </div>
 
                                         {/* Line 2: Links and Schedule text */}
-                                        <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-zinc-500">
+                                        <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-[var(--dash-l2)]">
                                             <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
                                                 className="text-blue-500 hover:text-blue-400 transition-colors inline-flex items-center gap-1 shrink-0">
                                                 {po.orderId} <ExternalLink className="w-2.5 h-2.5" />
@@ -240,10 +268,17 @@ export default function ActivePurchasesPanel() {
                                             {po.trackingNumbers && po.trackingNumbers.length > 0 && (
                                                 <>
                                                     <span className="text-zinc-700">·</span>
-                                                    <span className="text-zinc-400">Trk: {po.trackingNumbers.map(t => {
-                                                        const dt = t.includes(":::") ? t.split(":::")[1] : t;
-                                                        return dt;
-                                                    }).join(", ")}</span>
+                                                    <span className="text-zinc-400 shrink-0">Trk:</span>
+                                                    {po.trackingNumbers.map((t, i) => {
+                                                        const display = t.includes(":::") ? t.replace(":::", " ") : t;
+                                                        const url = carrierUrl(t);
+                                                        return (
+                                                            <a key={i} href={url} target="_blank" rel="noopener noreferrer"
+                                                                className="text-cyan-400 hover:text-cyan-300 hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5">
+                                                                {display}<ExternalLink className="w-2 h-2 opacity-60" />
+                                                            </a>
+                                                        );
+                                                    })}
                                                 </>
                                             )}
                                         </div>

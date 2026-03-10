@@ -1,10 +1,9 @@
 import FirecrawlApp from "@mendable/firecrawl-js";
-import Anthropic from "@anthropic-ai/sdk";
+import { getAnthropicClient } from "@/lib/anthropic";
 import { createClient } from "@/lib/supabase";
 import { z } from "zod";
 
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! });
-const anthropic = new Anthropic();
 
 export interface VendorProfile {
     id: string;
@@ -60,7 +59,7 @@ export async function enrichVendorFromWeb(vendorId: string, vendorName: string) 
         });
 
         // Use LLM to synthesize enriched profile
-        const response = await anthropic.messages.create({
+        const response = await getAnthropicClient().messages.create({
             model: "claude-haiku-4-5-20251001",
             max_tokens: 1024,
             messages: [{

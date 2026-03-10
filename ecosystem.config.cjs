@@ -36,7 +36,11 @@ module.exports = {
             // DECISION(2026-02-26): --dns-result-order=ipv4first forces IPv4 for all
             // DNS lookups. Node 18+ prefers IPv6 by default, but Supabase (and most
             // cloud services) don't respond on IPv6 → fetch() hangs indefinitely.
-            interpreter_args: "--dns-result-order=ipv4first --import tsx",
+            // DECISION(2026-03-09): --max-old-space-size=1024 caps V8 heap at 1GB.
+            // PM2's max_memory_restart uses RSS which can diverge from V8 heap on Windows —
+            // the previous session reached 4GB before crashing. This flag enforces a hard
+            // limit at the Node.js level so PM2 restarts within seconds of the OOM threshold.
+            interpreter_args: "--dns-result-order=ipv4first --import tsx --max-old-space-size=1024",
             cwd: __dirname,
             env: {
                 // DECISION(2026-02-25): Load .env.local via dotenv inside the scripts.
@@ -48,7 +52,7 @@ module.exports = {
             max_restarts: 10,
             min_uptime: "10s",
             restart_delay: 5000,           // 5s between restart attempts
-            max_memory_restart: "512M",    // Restart if memory exceeds 512MB
+            max_memory_restart: "768M",    // Restart if memory exceeds 768MB (raised from 512M after OOM fixes)
             // DECISION(2026-02-25): exp_backoff_restart_delay prevents rapid-fire
             // restarts if there's a persistent error (e.g. expired API key).
             // Delay doubles each restart: 5s → 10s → 20s → 40s → ... up to 5min.

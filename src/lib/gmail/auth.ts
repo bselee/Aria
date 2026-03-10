@@ -2,16 +2,32 @@
  * @file    auth.ts
  * @purpose Multi-account Gmail OAuth2 client with per-account token storage.
  *          Supports multiple Gmail accounts (e.g., "default", "purchasing").
+ *          Delegates to shared google-oauth.ts for OAuth2 logic.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-02-24
- * @deps    google-auth-library
+ * @updated 2026-03-10
+ * @deps    @googleapis/gmail, ../google/google-oauth
  * @env     GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI
  */
 
-import { OAuth2Client } from "google-auth-library";
+// DECISION(2026-03-09): Use auth.OAuth2 from @googleapis/gmail instead of the root
+// google-auth-library. @googleapis/gmail bundles google-auth-library@10.x internally,
+// and googleapis-common performs an instanceof check against its own bundled class.
+// The root package is v9.x — a different class instance — so instanceof fails and
+// the Authorization header is never sent. Using the same class the package bundled
+// ensures the check passes and OAuth tokens are properly attached to every request.
+import { auth as gmailAuth } from '@googleapis/gmail';
 import * as fs from 'fs';
 import * as path from 'path';
+
+import {
+    getAuthenticatedGoogleClient,
+    getGoogleAuthUrl,
+    exchangeGoogleCodeAndSave,
+    type GoogleOAuthConfig,
+} from '../google/google-oauth';
+
+type GmailOAuth2Client = InstanceType<typeof gmailAuth.OAuth2>;
 
 // DECISION(2026-02-24): Each account gets its own token file (token-{accountId}.json)
 // so we can auth multiple Gmail accounts. "default" maps to "token-default.json".
@@ -39,92 +55,38 @@ function getTokenPath(accountId: string): string {
     return accountTokenPath;
 }
 
+/** Shared config wired to the Gmail auth module and scopes */
+const GMAIL_OAUTH_CONFIG: GoogleOAuthConfig = {
+    authModule: gmailAuth,
+    scopes: SCOPES,
+    getTokenPath,
+    label: 'Gmail',
+    authCommand: (accountId) => `npx tsx src/cli/gmail-auth.ts ${accountId}`,
+    requiredScopeSubstring: 'gmail.send',
+};
+
 /**
  * Get an authenticated Gmail client for the specified account.
- * 
+ *
  * @param accountId - Account identifier (e.g., "default", "purchasing")
  * @returns Authenticated OAuth2Client
  */
-export async function getAuthenticatedClient(accountId: string = 'default'): Promise<OAuth2Client> {
-    if (!process.env.GMAIL_CLIENT_ID || !process.env.GMAIL_CLIENT_SECRET) {
-        throw new Error("GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in .env.local");
-    }
-
-    const client = new OAuth2Client({
-        clientId: process.env.GMAIL_CLIENT_ID,
-        clientSecret: process.env.GMAIL_CLIENT_SECRET,
-        redirectUri: process.env.GMAIL_REDIRECT_URI || 'http://localhost',
-    });
-
-    const tokenPath = getTokenPath(accountId);
-
-    if (fs.existsSync(tokenPath)) {
-        try {
-            const token = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
-
-            // Check if token has send scope — warn if not
-            const tokenScopes = token.scope || '';
-            if (!tokenScopes.includes('gmail.send')) {
-                console.warn(`⚠️ [Gmail Auth] Token for "${accountId}" missing gmail.send scope. Run: npx tsx src/cli/gmail-auth.ts ${accountId}`);
-            }
-
-            client.setCredentials(token);
-
-            // Auto-refresh if token is expired
-            if (token.expiry_date && Date.now() >= token.expiry_date) {
-                console.log(`🔄 [Gmail Auth] Refreshing expired token for "${accountId}"...`);
-                const { credentials } = await client.refreshAccessToken();
-                client.setCredentials(credentials);
-                // Save refreshed token
-                fs.writeFileSync(tokenPath, JSON.stringify(credentials, null, 2));
-                console.log(`✅ [Gmail Auth] Token refreshed and saved for "${accountId}"`);
-            } else {
-                console.log(`✅ [Gmail Auth] Loaded token for account: ${accountId}`);
-            }
-        } catch (err: any) {
-            console.error(`❌ [Gmail Auth] Failed to load token for "${accountId}": ${err.message}`);
-            throw new Error(`Gmail auth failed for "${accountId}". Run: npx tsx src/cli/gmail-auth.ts ${accountId}`);
-        }
-    } else {
-        throw new Error(`No Gmail token for "${accountId}". Run: npx tsx src/cli/gmail-auth.ts ${accountId}`);
-    }
-
-    return client;
+export async function getAuthenticatedClient(accountId: string = 'default'): Promise<GmailOAuth2Client> {
+    return getAuthenticatedGoogleClient(GMAIL_OAUTH_CONFIG, accountId) as Promise<GmailOAuth2Client>;
 }
 
 /**
  * Generate an authorization URL for the specified account.
  */
 export function getAuthUrl(accountId: string = 'default'): string {
-    const client = new OAuth2Client({
-        clientId: process.env.GMAIL_CLIENT_ID,
-        clientSecret: process.env.GMAIL_CLIENT_SECRET,
-        redirectUri: process.env.GMAIL_REDIRECT_URI || 'http://localhost',
-    });
-
-    return client.generateAuthUrl({
-        access_type: 'offline',
-        scope: SCOPES,
-        prompt: 'consent', // Force consent screen to get refresh token
-        state: accountId,
-    });
+    return getGoogleAuthUrl(GMAIL_OAUTH_CONFIG, accountId);
 }
 
 /**
  * Exchange an authorization code for tokens and save them.
  */
 export async function exchangeCodeAndSave(code: string, accountId: string = 'default'): Promise<void> {
-    const client = new OAuth2Client({
-        clientId: process.env.GMAIL_CLIENT_ID,
-        clientSecret: process.env.GMAIL_CLIENT_SECRET,
-        redirectUri: process.env.GMAIL_REDIRECT_URI || 'http://localhost',
-    });
-
-    const { tokens } = await client.getToken(code);
-    const tokenPath = path.join(process.cwd(), `token-${accountId}.json`);
-    fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
-    console.log(`✅ Token saved to ${tokenPath}`);
-    console.log(`   Scopes: ${tokens.scope}`);
+    return exchangeGoogleCodeAndSave(GMAIL_OAUTH_CONFIG, code, accountId);
 }
 
 /** All configured scopes */

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { google } from 'googleapis';
+import { gmail as GmailApi } from '@googleapis/gmail';
 import { createClient } from '@/lib/supabase';
 import { APAgent } from '@/lib/intelligence/ap-agent';
 import { Telegraf } from 'telegraf';
@@ -21,13 +21,13 @@ export async function POST(req: Request) {
         const buffer = Buffer.from(bufferBase64, 'base64');
         const supabase = createClient();
 
-        // Initialize dummy bot for APAgent if not defined since this is a manual trigger
-        // The APAgent might send a message, so we provide the actual token if available
-        const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || 'dummy_token');
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        if (!token) return NextResponse.json({ error: 'TELEGRAM_BOT_TOKEN not configured' }, { status: 500 });
+        const bot = new Telegraf(token);
         const apAgent = new APAgent(bot);
 
         const auth = await getAuthenticatedClient('ap').catch(() => getAuthenticatedClient('default'));
-        const gmail = google.gmail({ version: 'v1', auth });
+        const gmail = GmailApi({ version: 'v1', auth });
 
         const fromString = "Uploaded via Operations Dashboard";
         const subjectString = `Dashboard Upload: ${filename}`;

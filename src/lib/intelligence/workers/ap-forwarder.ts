@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
 
@@ -55,7 +55,7 @@ export class APForwarderAgent {
                 console.warn("   ⚠️ Missing 'ap' token, falling back to 'default'...");
                 auth = await getAuthenticatedClient("default");
             }
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
 
             for (const item of queueItems) {
                 try {

@@ -10,7 +10,7 @@
  * @deps    googleapis, node-cron, telegraf, @slack/web-api, builds/build-risk
  */
 
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import cron from "node-cron";
@@ -31,8 +31,9 @@ import { SupervisorAgent } from "./supervisor-agent";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
-import { FinaleClient } from "../finale/client";
+import { FinaleClient, finaleClient } from "../finale/client";
 import FirecrawlApp from "@mendable/firecrawl-js";
+import { generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
@@ -40,8 +41,43 @@ const TRACKING_PATTERNS = {
     fedex: /\b(96\d{18}|\d{15}|\d{12})\b/,
     usps: /\b(94|92|93|95)\d{20}\b/,
     dhl: /\bJD\d{18}\b/i,
-    generic: /\b(tracking|track|waybill)\s*[#:]?\s*([0-9A-Z]{10,25})\b/i
+    // generic: require '#' or ':' separator — prevents "tracking information" false matches
+    // keyword is non-capturing (?:...) so match[1] is always the tracking number
+    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i,
+    // LTL freight identifiers — whitespace required after keyword
+    pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
+    bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
 };
+
+// LTL carrier keyword detection — ordered by specificity (most specific first)
+const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
+    [/\bold\s+dominion\s+freight\b/i, "Old Dominion"],
+    [/\bold\s+dominion\b/i, "Old Dominion"],
+    [/\bodfl\b/i, "Old Dominion"],
+    [/\bdayton\s+freight\b/i, "Dayton Freight"],
+    [/\bfedex\s+freight\b/i, "FedEx Freight"],
+    [/\br\s*&\s*l\s+carriers?\b/i, "R&L Carriers"],
+    [/\brl\s+carriers?\b/i, "R&L Carriers"],
+    [/\bxpo\s+logistics\b/i, "XPO Logistics"],
+    [/\bxpo\b/i, "XPO Logistics"],
+    [/\btforce\s+freight\b/i, "TForce Freight"],
+    [/\bups\s+freight\b/i, "TForce Freight"],
+    [/\byrc\s+freight\b/i, "YRC Freight"],
+    [/\byellow\s+freight\b/i, "Yellow Freight"],
+    [/\bcentral\s+transport\b/i, "Central Transport"],
+    [/\babf\s+freight\b/i, "ABF Freight"],
+    [/\barcbest\b/i, "ArcBest"],
+    [/\bestes\s+express\b/i, "Estes"],
+    [/\bestes\b/i, "Estes"],
+    [/\bsaia\b/i, "Saia"],
+];
+
+function detectLTLCarrier(text: string): string | null {
+    for (const [pattern, name] of LTL_CARRIER_KEYWORDS) {
+        if (pattern.test(text)) return name;
+    }
+    return null;
+}
 
 type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
 interface TrackingStatus { category: TrackingCategory; display: string; public_url?: string; }
@@ -129,11 +165,142 @@ function parseTrackingContent(content: string): TrackingStatus | null {
 
 import EasyPostClient from "@easypost/api";
 
+// FedEx OAuth token cache — avoid re-authing on every call (tokens last 1h)
+let _fedexToken: string | null = null;
+let _fedexTokenExpiry = 0;
+
+/**
+ * Detect if a tracking number looks like FedEx format.
+ * 12-digit, 15-digit, 20-digit, or 96-prefix numbers.
+ */
+function isFedExNumber(num: string): boolean {
+    return /^\d{12}$/.test(num) || /^\d{15}$/.test(num) || /^96\d{18,20}$/.test(num) || /^\d{20}$/.test(num);
+}
+
+/**
+ * Track a FedEx shipment directly via FedEx Track API (free with account credentials).
+ * No per-call cost — uses BuildASoil's own FedEx developer account.
+ */
+async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    const clientId = process.env.FEDEX_CLIENT_ID;
+    const clientSecret = process.env.FEDEX_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return null;
+
+    try {
+        // Refresh OAuth token if expired
+        if (!_fedexToken || Date.now() >= _fedexTokenExpiry) {
+            const authRes = await fetch('https://apis.fedex.com/oauth/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret,
+                }).toString(),
+            });
+            if (!authRes.ok) throw new Error(`FedEx auth ${authRes.status}: ${await authRes.text()}`);
+            const auth = await authRes.json() as { access_token: string; expires_in: number };
+            _fedexToken = auth.access_token;
+            _fedexTokenExpiry = Date.now() + (auth.expires_in - 60) * 1000; // 60s buffer
+        }
+
+        const trackRes = await fetch('https://apis.fedex.com/track/v1/trackingnumbers', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${_fedexToken}`,
+                'X-locale': 'en_US',
+            },
+            body: JSON.stringify({
+                trackingInfo: [{ trackingNumberInfo: { trackingNumber } }],
+                includeDetailedScans: false,
+            }),
+        });
+
+        if (!trackRes.ok) throw new Error(`FedEx track ${trackRes.status}: ${await trackRes.text()}`);
+        const data = await trackRes.json() as any;
+
+        const result = data?.output?.completeTrackResults?.[0]?.trackResults?.[0];
+        if (!result) return null;
+
+        const statusCode: string = result.latestStatusDetail?.code ?? '';
+        const dates: any[] = result.dateAndTimes ?? [];
+        const deliveredEntry = dates.find((d: any) => d.type === 'ACTUAL_DELIVERY');
+        const estEntry = result.estimatedDeliveryTimeWindow?.window?.ends;
+
+        switch (statusCode) {
+            case 'DL': {
+                let display = 'Delivered';
+                if (deliveredEntry?.dateTime) {
+                    const d = new Date(deliveredEntry.dateTime);
+                    display = `Delivered ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+                }
+                return { category: 'delivered', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            }
+            case 'OD':
+                return { category: 'out_for_delivery', display: 'Out for delivery', public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            case 'DE':
+                return { category: 'exception', display: 'Delivery exception', public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            default: {
+                let display = 'In transit';
+                if (estEntry) {
+                    const e = new Date(estEntry);
+                    display = `Expected ${e.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+                }
+                return { category: 'in_transit', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+            }
+        }
+    } catch (err: any) {
+        console.warn(`[tracking-api] FedEx direct track failed for ${trackingNumber}: ${err.message}`);
+        return null;
+    }
+}
+
 /**
  * Fetch tracking status directly from EasyPost API.
  * Returns null if tracking fails.
  */
+async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    // trackingNumber must be "CarrierName:::PRO#" format
+    if (!trackingNumber.includes(":::")) return null;
+    const url = carrierUrl(trackingNumber);
+    // parcelsapp fallback means unknown carrier — skip fetch
+    if (url.includes("parcelsapp.com")) return null;
+
+    try {
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return null;
+        const html = await res.text();
+        // Strip HTML tags, collapse whitespace
+        const text = html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ');
+        const parsed = parseTrackingContent(text);
+        if (parsed) return { ...parsed, public_url: url };
+    } catch (e: any) {
+        // Timeout, network error, JS-only page — silently ignore, link is still clickable
+    }
+    return null;
+}
+
 async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+    const rawNumber = trackingNumber.includes(":::") ? trackingNumber.split(":::", 2)[1] : trackingNumber;
+
+    // LTL (:::) — try carrier page fetch first (free, no credentials)
+    if (trackingNumber.includes(":::")) {
+        return getLTLTrackingStatus(trackingNumber);
+    }
+
+    // Parcel FedEx — direct FedEx API (free with account credentials)
+    if (isFedExNumber(rawNumber)) {
+        return getFedExTrackingStatus(rawNumber);
+    }
+
     const apiKey = process.env.EASYPOST_API_KEY;
     if (!apiKey) return null;
 
@@ -141,13 +308,6 @@ async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus
         const client = new EasyPostClient(apiKey);
 
         let reqParam: any = { tracking_code: trackingNumber };
-
-        // Handle LTL LLM Decoded Strings
-        if (trackingNumber.includes(":::")) {
-            const [carrierName, actualNumber] = trackingNumber.split(":::", 2);
-            // We pass the carrier to EasyPost if we have it - it dramatically helps their tracker engine
-            reqParam = { tracking_code: actualNumber, carrier: carrierName };
-        }
 
         const tracker = await client.Tracker.create(reqParam);
 
@@ -400,6 +560,56 @@ export class OpsManager {
             this.apAgent.sendDailyRecap();
         }, { timezone: "America/Denver" });
 
+        // ── KAIZEN FEEDBACK LOOP CRONS ─────────────────────
+
+        // Weekly Kaizen Self-Review — Fridays 8:15 AM Denver
+        cron.schedule("15 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
+            const report = await generateSelfReview(7);
+            const chatId = process.env.TELEGRAM_CHAT_ID;
+            if (chatId) {
+                await this.bot.telegram.sendMessage(chatId, report, { parse_mode: "HTML" });
+            }
+        }), { timezone: "America/Denver" });
+
+        // Daily Memory Sync — every night at 10:00 PM Denver
+        cron.schedule("0 22 * * *", () => this.safeRun("KaizenMemorySync", async () => {
+            const synced = await syncLearningsToMemory();
+            if (synced > 0) {
+                console.log(`🧠 [Kaizen] Nightly sync: ${synced} learnings pushed to Pinecone`);
+            }
+        }), { timezone: "America/Denver" });
+
+        // Nightly Housekeeping — 11:00 PM Denver (prune stale data everywhere)
+        cron.schedule("0 23 * * *", () => this.safeRun("NightlyHousekeeping", async () => {
+            const report = await runHousekeeping();
+            // Only alert Will via Telegram if cleanup was surprisingly large
+            if (report.totalReclaimed > 500) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId) {
+                    await this.bot.telegram.sendMessage(
+                        chatId,
+                        `🧹 <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
+                        { parse_mode: "HTML" }
+                    );
+                }
+            }
+        }), { timezone: "America/Denver" });
+
+        // Daily Dedup Set Reset — midnight Denver (OOM prevention)
+        // DECISION(2026-03-09): These Sets grow by ~50-100 entries/day and are
+        // never pruned during runtime. Over weeks, thousands of entries accumulate.
+        // Safe to clear nightly because Sets are re-hydrated from Supabase/Finale
+        // on the next relevant poll cycle, and stale dedup keys from yesterday
+        // are irrelevant (build completions and PO receivings are date-scoped).
+        cron.schedule("0 0 * * *", () => {
+            const sizeBefore = this.seenCompletedBuildIds.size +
+                this.seenReceivedPOIds.size +
+                this.seenOutsideThreadMsgIds.size;
+            this.seenCompletedBuildIds.clear();
+            this.seenReceivedPOIds.clear();
+            this.seenOutsideThreadMsgIds.clear();
+            console.log(`[ops-manager] Daily dedup reset: cleared ${sizeBefore} entries across 3 Sets`);
+        }, { timezone: "America/Denver" });
 
     }
 
@@ -410,7 +620,7 @@ export class OpsManager {
         console.log("🧹 Running Advertisement Cleanup...");
         try {
             const auth = await getAuthenticatedClient("default");
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
 
             const { data: search } = await gmail.users.messages.list({
                 userId: "me",
@@ -444,7 +654,7 @@ export class OpsManager {
         console.log("📦 Syncing PO Conversations...");
         try {
             const auth = await getAuthenticatedClient("default");
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
             // Only scan POs from the last 14 days — tracking arrives well within that window
@@ -463,7 +673,8 @@ export class OpsManager {
             for (const m of search.messages) {
                 const { data: thread } = await gmail.users.threads.get({
                     userId: "me",
-                    id: m.threadId!
+                    id: m.threadId!,
+                    format: 'full'
                 });
 
                 if (!thread.messages) continue;
@@ -495,18 +706,44 @@ export class OpsManager {
 
                 const responseTimeMins = responseAt ? Math.round((responseAt - sentAt) / 60000) : null;
 
-                // 🔍 Extract Tracking Numbers from Snippets
+                // 🔍 Extract Tracking Numbers from full message body (snippet is too short — truncates numbers)
+                const _decodeGmailBody = (data: string): string =>
+                    Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
+                const _walkMsgParts = (parts: any[], out: string[]) => {
+                    for (const part of parts ?? []) {
+                        if (part.mimeType === 'text/plain' && part.body?.data) out.push(_decodeGmailBody(part.body.data));
+                        if (part.parts?.length) _walkMsgParts(part.parts, out);
+                    }
+                };
                 let trackingNumbers: string[] = [];
                 for (const msg of thread.messages) {
-                    const body = msg.snippet || "";
+                    const bodyParts: string[] = [msg.snippet || ''];
+                    const payload = msg.payload;
+                    if (payload?.body?.data) bodyParts.push(_decodeGmailBody(payload.body.data));
+                    if (payload?.parts) _walkMsgParts(payload.parts, bodyParts);
+                    const bodyText = bodyParts.join('\n');
+
+                    // Detect LTL carrier name once per message for PRO/BOL encoding
+                    const ltlCarrier = detectLTLCarrier(bodyText);
+
                     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-                        const match = body.match(regex);
-                        if (!match) continue;
-                        // For the generic pattern, capture group [2] is the number itself.
-                        // All other patterns are direct matches with no prefix in [0].
-                        const trackingNum = carrier === "generic" ? match[2] : match[0];
-                        if (trackingNum && !trackingNumbers.includes(trackingNum)) {
-                            trackingNumbers.push(trackingNum);
+                        // Run global exec loop so we catch ALL tracking numbers, not just the first
+                        const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+                        let match;
+                        while ((match = gRegex.exec(bodyText)) !== null) {
+                            // pro/bol/generic: group[1] is the number; others: full match[0]
+                            const trackingNum = ['generic', 'pro', 'bol'].includes(carrier) ? (match[1] || match[0]) : match[0];
+                            // Must contain ≥2 digits — filters pure-word false positives
+                            const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
+                            if (!trackingNum || !hasDigits) continue;
+                            // For PRO/BOL: encode with carrier name if detected in same message
+                            const encoded = (carrier === 'pro' || carrier === 'bol') && ltlCarrier
+                                ? `${ltlCarrier}:::${trackingNum}`
+                                : trackingNum;
+                            const rawNum = encoded.split(':::')[1] || encoded;
+                            if (!trackingNumbers.some(t => (t.split(':::')[1] || t) === rawNum)) {
+                                trackingNumbers.push(encoded);
+                            }
                         }
                     }
                 }
@@ -516,10 +753,14 @@ export class OpsManager {
                 const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
                 const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
 
+                // Always read existing tracking so we can merge — never overwrite inbox-sourced tracking
+                const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers, line_items").eq("po_number", poNumber).maybeSingle();
+                const oldTracking = existingPO?.tracking_numbers || [];
+                // Merge: inbox-backfilled numbers stay even if PO thread doesn't mention them
+                const mergedTracking = [...new Set([...oldTracking, ...trackingNumbers])];
+
                 // Alert for NEW tracking numbers
                 if (trackingNumbers.length > 0) {
-                    const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers").eq("po_number", poNumber).single();
-                    const oldTracking = existingPO?.tracking_numbers || [];
                     const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
 
                     if (newTracking.length > 0) {
@@ -529,7 +770,7 @@ export class OpsManager {
                             po_number: poNumber,
                             vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                             vendor_response_time_minutes: responseTimeMins,
-                            tracking_numbers: trackingNumbers,
+                            tracking_numbers: mergedTracking,
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
 
@@ -540,8 +781,7 @@ export class OpsManager {
                         });
 
                         // Fetch PO line items + Finale deep-link
-                        const { FinaleClient } = await import("../finale/client");
-                        const finale = new FinaleClient();
+                        const finale = finaleClient;
                         const poDetails = await finale.getPOLineItems(poNumber);
 
                         const poLine = poDetails
@@ -589,14 +829,34 @@ export class OpsManager {
                     pineconeMetadata
                 );
 
-                // Update DB (full record sync — tracking already upserted above if new)
+                // Update DB (full record sync — use merged tracking to preserve inbox-sourced numbers)
                 await supabase.from("purchase_orders").upsert({
                     po_number: poNumber,
+                    vendor_name: vendorName,
                     vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                     vendor_response_time_minutes: responseTimeMins,
-                    tracking_numbers: trackingNumbers,
+                    tracking_numbers: mergedTracking,
                     updated_at: new Date().toISOString()
                 }, { onConflict: "po_number" });
+
+                // Lazily populate line_items for the Slack watchdog product catalog.
+                // Only fetch from Finale once per PO (existingPO.line_items is [] on first sync).
+                if (!existingPO?.line_items?.length) {
+                    try {
+                        const { FinaleClient: FC } = await import("../finale/client");
+                        const fclient = new FC();
+                        const poDetails = await fclient.getPOLineItems(poNumber);
+                        if (poDetails?.lineItems?.length) {
+                            await supabase.from("purchase_orders").upsert({
+                                po_number: poNumber,
+                                line_items: poDetails.lineItems.map(i => ({ sku: i.sku, qty: i.qty })),
+                                updated_at: new Date().toISOString(),
+                            }, { onConflict: "po_number" });
+                        }
+                    } catch {
+                        // Non-fatal — catalog will populate on next sync cycle
+                    }
+                }
 
                 // Update vendor intelligence profile — accumulate known email addresses
                 // and track whether this vendor replies to PO threads.
@@ -811,7 +1071,6 @@ export class OpsManager {
      * Gets the active purchases list (used by Dashboard API and Slack).
      */
     async getActivePurchasesList(daysBack: number = 60) {
-        const finaleClient = new FinaleClient();
         // Fetch last N days of POs to ensure we get active ones
         const pos = await finaleClient.getRecentPurchaseOrders(daysBack);
         await leadTimeService.warmCache();
@@ -1001,7 +1260,7 @@ export class OpsManager {
 
         // Hydrate PO receivings: load today's received PO IDs from Finale
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             const todayPOs = await finale.getTodaysReceivedPOs();
             for (const po of todayPOs) this.seenReceivedPOIds.add(po.orderId);
             console.log(`[ops-manager] Hydrated ${todayPOs.length} today's received POs into dedup set.`);
@@ -1034,7 +1293,7 @@ export class OpsManager {
      */
     async pollPOReceivings(): Promise<void> {
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             const received = await finale.getTodaysReceivedPOs();
 
             for (const po of received) {
@@ -1143,7 +1402,7 @@ export class OpsManager {
      */
     async alertStaleDraftPOs(): Promise<void> {
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             const stale = await finale.getStaleDraftPOs(3);
 
             if (stale.length === 0) {
@@ -1187,7 +1446,7 @@ export class OpsManager {
      */
     async pollBuildCompletions() {
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             const since = new Date(Date.now() - 31 * 60 * 1000); // 31 min ago (overlaps slightly to avoid gaps)
             const completed = await finale.getRecentlyCompletedBuilds(since);
 
@@ -1579,8 +1838,7 @@ export class OpsManager {
             let finaleReceivedPOs: any[] = [];
             let finaleCommittedPOs: any[] = [];
             try {
-                const { FinaleClient } = await import("../finale/client");
-                const finale = new FinaleClient();
+                const finale = finaleClient;
                 const [receivedPOs, committedPOs] = await Promise.all([
                     finale.getTodaysReceivedPOs(finaleStartDate, finaleEndDate),
                     finale.getTodaysCommittedPOs(finaleStartDate, finaleEndDate)
@@ -1597,7 +1855,7 @@ export class OpsManager {
             if (timeframe === "yesterday") {
                 try {
                     const auth = await getAuthenticatedClient("default");
-                    const gmail = google.gmail({ version: "v1", auth });
+                    const gmail = GmailApi({ version: "v1", auth });
                     const { data } = await gmail.users.messages.list({
                         userId: "me",
                         q: "is:unread -label:Advertisements -label:SPAM INBOX",
@@ -1719,7 +1977,8 @@ Data: ${JSON.stringify(data)}`;
         po: FullPO,
         expectedDate: string,
         leadProvenance: string,
-        trackingNumbers: string[]
+        trackingNumbers: string[],
+        prefetchedStatuses?: Map<string, TrackingStatus | null>
     ): Promise<string> {
         const isReceived = (po.status || '').toLowerCase() === 'completed';
         const isCancelled = (po.status || '').toLowerCase() === 'cancelled';
@@ -1742,7 +2001,7 @@ Data: ${JSON.stringify(data)}`;
 
         if (trackingNumbers.length > 0) {
             const trackingLines = await Promise.all(trackingNumbers.map(async t => {
-                const ts = await getTrackingStatus(t);
+                const ts = prefetchedStatuses?.has(t) ? prefetchedStatuses.get(t)! : await getTrackingStatus(t);
                 const statusStr = ts ? ` ${ts.display}` : "";
                 const link = ts?.public_url || carrierUrl(t);
                 const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
@@ -1779,7 +2038,7 @@ Data: ${JSON.stringify(data)}`;
     async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number }> {
         const counts = { created: 0, updated: 0, skipped: 0 };
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             const supabase = createClient();
             if (!supabase) {
                 console.warn('[cal-sync] Supabase unavailable — skipping purchasing calendar sync');
@@ -1844,10 +2103,21 @@ Data: ${JSON.stringify(data)}`;
 
                 // Get tracking array for this PO
                 const trackingNumbers = trackingMap.get(po.orderId) || [];
-                // Sort tracking numbers for stable stringification
-                const trackingHash = trackingNumbers.slice().sort().join(',');
 
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers);
+                // Pre-fetch EasyPost statuses so we can include them in change-detection hash
+                // (hash must reflect status so re-sync triggers when billing was fixed or status changes)
+                const trackingStatuses = new Map<string, TrackingStatus | null>();
+                await Promise.all(trackingNumbers.map(async t => {
+                    trackingStatuses.set(t, await getTrackingStatus(t));
+                }));
+
+                // Hash = sorted "num:status" pairs — changes when EasyPost status changes
+                const trackingHash = trackingNumbers.slice().sort().map(t => {
+                    const ts = trackingStatuses.get(t);
+                    return ts ? `${t}:${ts.category}` : t;
+                }).join(',');
+
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses);
                 const newStatus = (po.status || '').toLowerCase() === 'completed' ? 'received'
                     : (po.status || '').toLowerCase() === 'cancelled' ? 'cancelled'
                         : 'open';

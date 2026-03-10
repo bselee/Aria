@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { unifiedObjectGeneration } from "./llm";
 import { createClient } from "../supabase";
@@ -115,7 +115,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
         console.log(`🤖 [Acknowledgement-Agent] Checking email queue for routine emails...`);
         try {
             const auth = await getAuthenticatedClient(this.tokenIdentifier);
-            const gmail = google.gmail({ version: "v1", auth });
+            const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
             if (!supabase) {

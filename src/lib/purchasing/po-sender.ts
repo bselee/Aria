@@ -7,7 +7,7 @@
 
 import { createClient } from '../supabase';
 import { getAuthenticatedClient } from '../gmail/auth';
-import { google } from 'googleapis';
+import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 
 // ──────────────────────────────────────────────────
@@ -168,7 +168,7 @@ export async function commitAndSendPO(
 
     if (!skipEmail && vendorEmail) {
         const auth = await getAuthenticatedClient('default');
-        const gmail = google.gmail({ version: 'v1', auth });
+        const gmail = GmailApi({ version: 'v1', auth });
 
         const { subject, body } = generatePOEmailBody(review);
         const mimeMessage = [

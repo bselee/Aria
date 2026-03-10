@@ -4,16 +4,18 @@
  *          Aria learns how each vendor sends documents and how to process them.
  * @author  Will / Antigravity
  * @created 2026-02-24
- * @updated 2026-02-24
- * @deps    @pinecone-database/pinecone, openai
+ * @updated 2026-03-06
+ * @deps    @pinecone-database/pinecone, ./embedding
  * @env     PINECONE_API_KEY, PINECONE_INDEX, OPENAI_API_KEY
+ *
+ * DECISION(2026-03-06): Embedding logic extracted to shared embedding.ts.
+ * All functions degrade gracefully on embedding/Pinecone failures.
  */
 
 import { Pinecone } from '@pinecone-database/pinecone';
-import OpenAI from 'openai';
+import { embed } from './embedding';
 
 let pc: Pinecone | null = null;
-let openai: OpenAI | null = null;
 
 const NAMESPACE = 'vendor-memory';
 
@@ -27,23 +29,7 @@ export interface VendorPattern {
     exampleFilenames?: string[];
     learnedFrom?: string;       // Source: "telegram_upload", "email_attachment", "manual"
     confidence: number;         // 0-1, how confident we are in this pattern
-}
-
-/**
- * Generate an embedding vector from text using OpenAI.
- */
-async function embed(text: string): Promise<number[]> {
-    if (!openai) {
-        openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    }
-
-    const res = await openai.embeddings.create({
-        model: 'text-embedding-3-small',
-        input: text,
-        dimensions: 1024, // Compact but effective
-    });
-
-    return res.data[0].embedding;
+    feeLabelMap?: Record<string, string>;  // H2/M3: vendor-specific fee label → Finale fee type (e.g., {"frt chg": "FREIGHT", "handling": "LABOR"})
 }
 
 /**
@@ -65,6 +51,7 @@ function getIndex() {
 /**
  * Store a vendor document pattern in Pinecone.
  * Called when Aria learns something new about how a vendor sends documents.
+ * Non-fatal: logs and continues if embedding or Pinecone fails.
  */
 export async function storeVendorPattern(pattern: VendorPattern): Promise<void> {
     try {
@@ -81,6 +68,12 @@ export async function storeVendorPattern(pattern: VendorPattern): Promise<void> 
         ].filter(Boolean).join('\n');
 
         const vector = await embed(embeddingText);
+
+        // DECISION(2026-03-06): Skip upsert if embedding fails — non-fatal.
+        if (!vector) {
+            console.warn(`⚠️ Skipping vendor pattern store — embedding unavailable for: ${pattern.vendorName}`);
+            return;
+        }
 
         const id = `vendor-${pattern.vendorName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
 
@@ -99,6 +92,7 @@ export async function storeVendorPattern(pattern: VendorPattern): Promise<void> 
                 confidence: pattern.confidence,
                 text: embeddingText,
                 updated_at: new Date().toISOString(),
+                feeLabelMap: pattern.feeLabelMap ? JSON.stringify(pattern.feeLabelMap) : '',
             }
         }]);
 
@@ -133,6 +127,7 @@ export async function getVendorPattern(vendorName: string): Promise<VendorPatter
             exampleFilenames: meta.exampleFilenames ? String(meta.exampleFilenames).split(',') : [],
             learnedFrom: meta.learnedFrom,
             confidence: meta.confidence,
+            feeLabelMap: meta.feeLabelMap ? JSON.parse(String(meta.feeLabelMap)) : undefined,
         };
     } catch (err: any) {
         console.error(`❌ Failed to retrieve vendor pattern: ${err.message}`);
@@ -148,6 +143,12 @@ export async function findRelevantPatterns(documentText: string, topK: number = 
     try {
         const index = getIndex();
         const vector = await embed(documentText.slice(0, 2000));
+
+        // Embedding failed — return empty rather than crash
+        if (!vector) {
+            console.warn(`⚠️ findRelevantPatterns() skipped — embedding unavailable.`);
+            return [];
+        }
 
         const results = await index.namespace(NAMESPACE).query({
             vector,

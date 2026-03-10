@@ -8,7 +8,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
-import { google } from 'googleapis';
+import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { processEmailAttachments } from '../lib/gmail/attachment-handler';
 import { createClient } from '../lib/supabase';
@@ -19,7 +19,7 @@ async function main() {
 
     try {
         const auth = await getAuthenticatedClient("default");
-        const gmail = google.gmail({ version: "v1", auth });
+        const gmail = GmailApi({ version: "v1", auth });
         const supabase = createClient();
 
         // 1. Calculate date 14 days ago

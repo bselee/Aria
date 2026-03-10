@@ -1,3 +1,11 @@
+/**
+ * @file    page.tsx
+ * @purpose ARIA Operations Dashboard — 5-column draggable layout with floating chat
+ * @author  Will
+ * @created 2026-02-20
+ * @updated 2026-03-09
+ * @deps    @dnd-kit/core, @dnd-kit/sortable, dashboard panel components
+ */
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
@@ -20,6 +28,7 @@ import {
     sortableKeyboardCoordinates,
     verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
+import { useDroppable } from "@dnd-kit/core";
 
 import ActivityFeed from "@/components/dashboard/ActivityFeed";
 import BuildRiskPanel from "@/components/dashboard/BuildRiskPanel";
@@ -32,8 +41,11 @@ import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 
-const DEFAULT_LEFT_W = 480;
-const DEFAULT_MID_W = 340;
+// ── Column width defaults (px) ──────────────────────────────────────
+const DEFAULT_LEFT_W = 360;
+const DEFAULT_MIDLEFT_W = 300;
+const DEFAULT_MIDRIGHT_W = 320;
+const DEFAULT_FARRIGHT_W = 300;
 
 function ColHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
     return (
@@ -46,35 +58,36 @@ function ColHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void
 }
 
 const PANEL_MAP: Record<string, React.ReactNode> = {
-    "build-risk": <BuildRiskPanel key="build-risk" />,
-    "receivings": <ReceivedItemsPanel key="receivings" />,
+    "build-risk": <BuildRiskPanel />,
+    "receivings": <ReceivedItemsPanel />,
     "activity": (
-        <div key="activity" className="flex flex-col flex-1 overflow-hidden min-h-[300px]">
+        <div className="flex flex-col flex-1 overflow-hidden min-h-[300px]">
             <ActivityFeed />
         </div>
     ),
-    "invoice-queue": <InvoiceQueuePanel key="invoice-queue" />,
-    "reorder": <ReorderPanel key="reorder" />,
-    "purchasing": <PurchasingPanel key="purchasing" />,
-    "build-schedule": <BuildSchedulePanel key="build-schedule" />,
-    "active-purchases": <ActivePurchasesPanel key="active-purchases" />,
-    "chat-mirror": (
-        <div key="chat-mirror" className="flex flex-col flex-1 overflow-hidden min-h-[400px]">
-            <ChatMirror />
-        </div>
-    )
+    "invoice-queue": <InvoiceQueuePanel />,
+    "reorder": <ReorderPanel />,
+    "purchasing": <PurchasingPanel />,
+    "build-schedule": <BuildSchedulePanel />,
+    "active-purchases": <ActivePurchasesPanel />,
 };
 
-type ColumnId = "left" | "mid" | "right";
+// ── Layout types ────────────────────────────────────────────────────
+// DECISION(2026-03-09): Moved to 5 columns to reduce crowding.
+// ChatMirror extracted to a floating widget so it no longer consumes a column.
+type ColumnId = "left" | "midLeft" | "midRight" | "farRight" | "right";
 type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
-    left: ["build-risk", "receivings", "activity"],
-    mid: ["invoice-queue", "reorder", "purchasing", "active-purchases", "build-schedule"],
-    right: ["chat-mirror"]
+    left: ["build-risk", "receivings"],
+    midLeft: ["invoice-queue", "active-purchases"],
+    midRight: ["reorder", "purchasing"],
+    farRight: ["build-schedule"],
+    right: ["activity"]
 };
 
-import { useDroppable } from "@dnd-kit/core";
+// All ColumnIds for iteration during layout merge / restore
+const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "farRight", "right"];
 
 function Column({ id, items, children, style, className }: { id: string, items: string[], children: React.ReactNode, style?: React.CSSProperties, className?: string }) {
     const { setNodeRef } = useDroppable({ id });
@@ -89,49 +102,108 @@ function Column({ id, items, children, style, className }: { id: string, items: 
 
 export default function DashboardPage() {
     const [leftW, setLeftW] = useState(DEFAULT_LEFT_W);
-    const [midW, setMidW] = useState(DEFAULT_MID_W);
+    const [midLeftW, setMidLeftW] = useState(DEFAULT_MIDLEFT_W);
+    const [midRightW, setMidRightW] = useState(DEFAULT_MIDRIGHT_W);
+    const [farRightW, setFarRightW] = useState(DEFAULT_FARRIGHT_W);
     const [layout, setLayout] = useState<LayoutState>(DEFAULT_LAYOUT);
     const [activeId, setActiveId] = useState<string | null>(null);
+    const [chatOpen, setChatOpen] = useState(false);
 
     // Initialize layout from localStorage, avoiding hydration mismatch
     const [mounted, setMounted] = useState(false);
     useEffect(() => {
         setMounted(true);
         const lw = localStorage.getItem("aria-dash-left-w");
-        const mw = localStorage.getItem("aria-dash-mid-w");
+        const mlw = localStorage.getItem("aria-dash-midleft-w");
+        const mrw = localStorage.getItem("aria-dash-midright-w");
+        const frw = localStorage.getItem("aria-dash-farright-w");
         const ly = localStorage.getItem("aria-dash-layout");
+        const co = localStorage.getItem("aria-dash-chat-open");
 
-        if (lw) setLeftW(Math.max(240, Math.min(760, parseInt(lw))));
-        if (mw) setMidW(Math.max(200, Math.min(600, parseInt(mw))));
+        if (lw) setLeftW(Math.max(200, Math.min(600, parseInt(lw))));
+        if (mlw) setMidLeftW(Math.max(200, Math.min(600, parseInt(mlw))));
+        if (mrw) setMidRightW(Math.max(200, Math.min(600, parseInt(mrw))));
+        if (frw) setFarRightW(Math.max(200, Math.min(600, parseInt(frw))));
+        if (co === "true") setChatOpen(true);
         if (ly) {
             try {
                 const restored = JSON.parse(ly);
-                if (restored.left && restored.mid && restored.right) {
+
+                // DECISION(2026-03-09): Migrate old layouts to 5-column format.
+                // Also strip the removed "chat-mirror" panel from any column.
+                if (restored.mid && !restored.midLeft) {
+                    const oldMid: string[] = restored.mid;
+                    restored.midLeft = oldMid.filter((id: string) =>
+                        DEFAULT_LAYOUT.midLeft.includes(id)
+                    );
+                    restored.midRight = oldMid.filter((id: string) =>
+                        DEFAULT_LAYOUT.midRight.includes(id)
+                    );
+                    const placed = new Set([...restored.midLeft, ...restored.midRight]);
+                    const overflow = oldMid.filter((id: string) => !placed.has(id));
+                    restored.right = [...(restored.right || []), ...overflow];
+                    delete restored.mid;
+                }
+                // Ensure farRight column exists (migration from 4-col layout)
+                if (!restored.farRight) {
+                    restored.farRight = DEFAULT_LAYOUT.farRight;
+                }
+                // Strip chat-mirror from all columns (now a floating widget)
+                for (const col of ALL_COLUMNS) {
+                    if (restored[col]) {
+                        restored[col] = (restored[col] as string[]).filter((id: string) => id !== "chat-mirror");
+                    }
+                }
+                // Deduplicate: if a panel appears in multiple columns, keep
+                // only the first occurrence to avoid React key warnings.
+                const seen = new Set<string>();
+                for (const col of ALL_COLUMNS) {
+                    if (restored[col]) {
+                        restored[col] = (restored[col] as string[]).filter((id: string) => {
+                            if (seen.has(id)) return false;
+                            seen.add(id);
+                            return true;
+                        });
+                    }
+                }
+
+                // Validate all five columns exist before restoring
+                if (restored.left && restored.midLeft && restored.midRight && restored.farRight && restored.right) {
                     // Merge any panels that exist in DEFAULT_LAYOUT but are missing from
                     // the saved layout (prevents new panels from being silently dropped
                     // by stale localStorage saves).
-                    for (const [col, ids] of Object.entries(DEFAULT_LAYOUT) as [ColumnId, string[]][]) {
-                        for (const id of ids) {
-                            const inSaved = (Object.values(restored) as string[][]).flat().includes(id);
-                            if (!inSaved) restored[col].push(id);
+                    for (const col of ALL_COLUMNS) {
+                        const defaults = DEFAULT_LAYOUT[col];
+                        for (const id of defaults) {
+                            const inSaved = ALL_COLUMNS.some(c =>
+                                (restored[c] as string[])?.includes(id)
+                            );
+                            if (!inSaved) {
+                                if (!restored[col]) restored[col] = [];
+                                restored[col].push(id);
+                            }
                         }
                     }
                     setLayout(restored);
                 }
-            } catch (e) { }
+            } catch { /* corrupt localStorage — use defaults */ }
         }
     }, []);
 
     // Persist on change
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-left-w", String(leftW)); }, [leftW, mounted]);
-    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-mid-w", String(midW)); }, [midW, mounted]);
+    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midleft-w", String(midLeftW)); }, [midLeftW, mounted]);
+    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midright-w", String(midRightW)); }, [midRightW, mounted]);
+    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-farright-w", String(farRightW)); }, [farRightW, mounted]);
+    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-chat-open", String(chatOpen)); }, [chatOpen, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-layout", JSON.stringify(layout)); }, [layout, mounted]);
 
+    // ── Resize handlers ─────────────────────────────────────────────
     const startLeftResize = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
         const startX = e.clientX, startW = leftW;
         const onMove = (ev: MouseEvent) =>
-            setLeftW(Math.max(240, Math.min(760, startW + ev.clientX - startX)));
+            setLeftW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
         const onUp = () => {
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
@@ -140,19 +212,46 @@ export default function DashboardPage() {
         window.addEventListener("mouseup", onUp);
     }, [leftW]);
 
-    const startMidResize = useCallback((e: React.MouseEvent) => {
+    const startMidLeftResize = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
-        const startX = e.clientX, startW = midW;
+        const startX = e.clientX, startW = midLeftW;
         const onMove = (ev: MouseEvent) =>
-            setMidW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
+            setMidLeftW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
         const onUp = () => {
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
         };
         window.addEventListener("mousemove", onMove);
         window.addEventListener("mouseup", onUp);
-    }, [midW]);
+    }, [midLeftW]);
 
+    const startMidRightResize = useCallback((e: React.MouseEvent) => {
+        e.preventDefault();
+        const startX = e.clientX, startW = midRightW;
+        const onMove = (ev: MouseEvent) =>
+            setMidRightW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
+        const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+        };
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+    }, [midRightW]);
+
+    const startFarRightResize = useCallback((e: React.MouseEvent) => {
+        e.preventDefault();
+        const startX = e.clientX, startW = farRightW;
+        const onMove = (ev: MouseEvent) =>
+            setFarRightW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
+        const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+        };
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+    }, [farRightW]);
+
+    // ── DnD ─────────────────────────────────────────────────────────
     const sensors = useSensors(
         useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
         useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -160,7 +259,7 @@ export default function DashboardPage() {
 
     function findContainer(id: string): ColumnId | undefined {
         if (id in layout) return id as ColumnId;
-        return Object.keys(layout).find((key) => layout[key as ColumnId].includes(id)) as ColumnId | undefined;
+        return ALL_COLUMNS.find((key) => layout[key].includes(id));
     }
 
     function handleDragStart(event: DragStartEvent) {
@@ -183,7 +282,6 @@ export default function DashboardPage() {
             const activeItems = prev[activeContainer];
             const overItems = prev[overContainer];
 
-            const activeIndex = activeItems.indexOf(active.id as string);
             const overIndex = overItems.indexOf(overId as string);
 
             let newIndex;
@@ -230,6 +328,10 @@ export default function DashboardPage() {
         }
     }
 
+    // ── Shared column CSS ───────────────────────────────────────────
+    const colClasses = "shrink-0 flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20";
+    const flexPanelIds = new Set(["activity", "chat-mirror"]);
+
     if (!mounted) {
         // Simple skeleton to prevent hydration mismatch
         return <main className="flex h-screen bg-[#09090b]"></main>;
@@ -251,8 +353,8 @@ export default function DashboardPage() {
             >
                 <section className="flex-1 flex flex-row overflow-hidden bg-[#09090b] min-w-0">
 
-                    {/* Left column */}
-                    <Column id="left" items={layout.left} style={{ width: leftW }} className="shrink-0 flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
+                    {/* ── Column 1: Operations ──────────────────────── */}
+                    <Column id="left" items={layout.left} style={{ width: leftW }} className={colClasses}>
                         <header className="px-4 py-3 -m-4 mb-0 border-b border-zinc-800 bg-[#09090b] flex items-center justify-between shrink-0 sticky top-0 z-10 backdrop-blur-md">
                             <div>
                                 <h1 className="text-sm font-semibold tracking-tight text-zinc-200">Ops</h1>
@@ -270,7 +372,7 @@ export default function DashboardPage() {
                         </header>
 
                         {layout.left.map(id => (
-                            <SortablePanel key={id} id={id} className={id === "activity" || id === "chat-mirror" ? "flex-1" : undefined}>
+                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
                                 {PANEL_MAP[id]}
                             </SortablePanel>
                         ))}
@@ -278,21 +380,43 @@ export default function DashboardPage() {
 
                     <ColHandle onMouseDown={startLeftResize} />
 
-                    {/* Middle column */}
-                    <Column id="mid" items={layout.mid} style={{ width: midW }} className="shrink-0 flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
-                        {layout.mid.map(id => (
-                            <SortablePanel key={id} id={id} className={id === "activity" || id === "chat-mirror" ? "flex-1" : undefined}>
+                    {/* ── Column 2: AP & Tracking ───────────────────── */}
+                    <Column id="midLeft" items={layout.midLeft} style={{ width: midLeftW }} className={colClasses}>
+                        {layout.midLeft.map(id => (
+                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
                                 {PANEL_MAP[id]}
                             </SortablePanel>
                         ))}
                     </Column>
 
-                    <ColHandle onMouseDown={startMidResize} />
+                    <ColHandle onMouseDown={startMidLeftResize} />
 
-                    {/* Right column */}
+                    {/* ── Column 3: Purchasing & Builds ─────────────── */}
+                    <Column id="midRight" items={layout.midRight} style={{ width: midRightW }} className={colClasses}>
+                        {layout.midRight.map(id => (
+                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
+                                {PANEL_MAP[id]}
+                            </SortablePanel>
+                        ))}
+                    </Column>
+
+                    <ColHandle onMouseDown={startMidRightResize} />
+
+                    {/* ── Column 4: Builds ───────────────────────────── */}
+                    <Column id="farRight" items={layout.farRight} style={{ width: farRightW }} className={colClasses}>
+                        {layout.farRight.map(id => (
+                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
+                                {PANEL_MAP[id]}
+                            </SortablePanel>
+                        ))}
+                    </Column>
+
+                    <ColHandle onMouseDown={startFarRightResize} />
+
+                    {/* ── Column 5: Activity ─────────────────────────── */}
                     <Column id="right" items={layout.right} className="flex-1 min-w-[240px] flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">
                         {layout.right.map(id => (
-                            <SortablePanel key={id} id={id} className={id === "activity" || id === "chat-mirror" ? "flex-1" : undefined}>
+                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
                                 {PANEL_MAP[id]}
                             </SortablePanel>
                         ))}
@@ -308,6 +432,33 @@ export default function DashboardPage() {
                     ) : null}
                 </DragOverlay>
             </DndContext>
+
+            {/* ── Floating Chat Widget ─────────────────────────────── */}
+            {chatOpen && (
+                <div className="fixed bottom-20 right-5 w-[420px] h-[560px] z-50 rounded-xl overflow-hidden shadow-2xl shadow-black/60 border border-zinc-700/70 bg-zinc-900 flex flex-col animate-in fade-in slide-in-from-bottom-4 duration-200">
+                    <ChatMirror />
+                </div>
+            )}
+
+            {/* ── Chat Toggle FAB ─────────────────────────────────── */}
+            <button
+                onClick={() => setChatOpen(!chatOpen)}
+                className={`fixed bottom-5 right-5 z-50 w-12 h-12 rounded-full flex items-center justify-center transition-all duration-200 shadow-lg ${chatOpen
+                        ? "bg-zinc-700 hover:bg-zinc-600 text-zinc-200 rotate-0"
+                        : "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-500/30"
+                    }`}
+                title={chatOpen ? "Close Chat" : "Open Chat"}
+            >
+                {chatOpen ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                    </svg>
+                )}
+            </button>
         </main>
     );
 }

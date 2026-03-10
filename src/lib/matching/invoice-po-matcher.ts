@@ -151,16 +151,66 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
             );
 
             if (plausible.length > 0) {
-                // Pick the closest amount match
-                plausible.sort((a, b) =>
-                    Math.abs(a.total - invoice.total) - Math.abs(b.total - invoice.total)
-                );
-                const best = plausible[0];
+                let best = plausible[0];
+                let strategyDetail = `amount-closest`;
+
+                // H4 FIX: When multiple POs match, use word overlap scoring
+                // to disambiguate. Compares invoice line item descriptions to
+                // PO line items via getOrderSummary for a Jaccard score.
+                if (plausible.length > 1) {
+                    // Collect invoice words for overlap scoring
+                    const invoiceWords = new Set<string>(
+                        (invoice.lineItems ?? [])
+                            .flatMap(li => (li.description || "").toLowerCase().split(/\W+/))
+                            .filter(w => w.length > 2)
+                    );
+
+                    let bestScore = -1;
+                    for (const candidate of plausible) {
+                        try {
+                            const summary = await finaleClient.getOrderSummary(candidate.orderId);
+                            if (!summary?.lineItems?.length) continue;
+
+                            const poWords = new Set<string>(
+                                summary.lineItems
+                                    .flatMap((li: any) => ((li.description || li.productId || "") as string).toLowerCase().split(/\W+/))
+                                    .filter((w: string) => w.length > 2)
+                            );
+
+                            // Jaccard similarity: |intersection| / |union|
+                            const intersection = [...invoiceWords].filter(w => poWords.has(w)).length;
+                            const union = new Set([...invoiceWords, ...poWords]).size;
+                            const jaccard = union > 0 ? intersection / union : 0;
+
+                            // Combine with amount proximity (normalize to 0-1 scale)
+                            const amountProximity = 1 - Math.abs(candidate.total - invoice.total) / Math.max(invoice.total, 1);
+                            const combinedScore = jaccard * 0.7 + amountProximity * 0.3;
+
+                            if (combinedScore > bestScore) {
+                                bestScore = combinedScore;
+                                best = candidate;
+                                strategyDetail = `word-overlap (jaccard=${jaccard.toFixed(2)}, amount=${amountProximity.toFixed(2)}, combined=${combinedScore.toFixed(2)})`;
+                            }
+                        } catch {
+                            // getOrderSummary failed for this candidate — skip word overlap, keep amount sort
+                        }
+                    }
+
+                    // Fallback: if word overlap didn't help (score=0), use closest amount
+                    if (bestScore <= 0) {
+                        plausible.sort((a, b) =>
+                            Math.abs(a.total - invoice.total) - Math.abs(b.total - invoice.total)
+                        );
+                        best = plausible[0];
+                        strategyDetail = `amount-closest (${plausible.length} candidates)`;
+                    }
+                }
+
                 return {
                     matched: true,
                     confidence: "medium",
                     matchedPO: stubPOData(best.orderId, best.supplier),
-                    matchStrategy: `Finale vendor+date fallback (${best.supplier}, ${best.orderDate}) — REQUIRES APPROVAL`,
+                    matchStrategy: `Finale vendor+date fallback [${strategyDetail}] (${best.supplier}, ${best.orderDate}) — REQUIRES APPROVAL`,
                     discrepancies: [],
                     autoApprove: false,
                 };

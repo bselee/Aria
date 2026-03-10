@@ -3,13 +3,13 @@
  * @purpose Unified LLM entry point with automatic fallback chain.
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-02-27
+ * @updated 2026-03-09
  * @deps    @ai-sdk/google, @ai-sdk/openai, @ai-sdk/anthropic, ai, zod
  * @env     GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY
  *
- * DECISION(2026-02-27): Chain is Gemini (direct) → GPT-4o (direct) → OpenRouter (Gemini 2.5 Flash Lite → Mistral Small 3.2).
- * Direct APIs first for lowest latency. OpenRouter as cost-effective fallback ($0.10/M and $0.06/M).
- * Anthropic re-enabled — add ANTHROPIC_API_KEY when credits are restored.
+ * DECISION(2026-03-09): Chain is Gemini (free) → OpenRouter (cheap fallback) → paid cloud.
+ * Ollama removed — it holds 1-2GB RAM resident on the local machine, causing OOM
+ * for both the Aria process and general machine usability.
  * The chain auto-skips any provider without an API key configured.
  */
 
@@ -34,9 +34,9 @@ type ProviderEntry = {
     available: boolean;
 };
 
-// OpenRouter speaks the OpenAI API — reuse @ai-sdk/openai with a custom base URL.
-// Routes: Gemini 2.5 Flash Lite ($0.10/M input) → Mistral Small 3.2 ($0.06/M input)
-function getOpenRouterProvider() {
+// ROLLBACK: OpenRouter is the preferred fallback after Gemini.
+// Cheaper than OpenAI/Anthropic direct, and no local RAM cost like Ollama.
+function getOpenRouterProvider(): ProviderEntry[] {
     if (!process.env.OPENROUTER_API_KEY) return [];
     const openrouter = createOpenAI({
         baseURL: 'https://openrouter.ai/api/v1',
@@ -56,6 +56,17 @@ function getOpenRouterProvider() {
     ];
 }
 
+// DECISION(2026-03-09): Task-appropriate provider chain for background agent work.
+//
+// The chain is designed with cost + resource awareness:
+//   1. Gemini (free tier, fast, reliable) — handles the majority of background calls
+//   2. OpenRouter (cheap) — activates when Gemini is down or quota-exhausted.
+//      Provides Claude 3.5 Haiku and Llama 3.3 70B at low per-token cost.
+//   3. OpenAI / Anthropic (paid, direct) — last-resort escalation.
+//
+// Ollama removed (2026-03-09): held 1-2GB RAM resident, crushing the local machine.
+// Bot chat uses Gemini directly (hardcoded in start-bot.ts), bypassing this chain.
+// Chain: Gemini (free) → OpenRouter (cheap) → OpenAI → Anthropic
 function getProviderChain(): ProviderEntry[] {
     return [
         {
@@ -63,9 +74,10 @@ function getProviderChain(): ProviderEntry[] {
             model: () => google('gemini-2.0-flash'),
             available: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
         },
+        ...getOpenRouterProvider(),  // Cheap fallback — slots in right after Gemini
         {
             name: 'OpenAI GPT-4o',
-            model: () => openai('gpt-4o'),
+            model: () => openai.chat('gpt-4o'),
             available: !!process.env.OPENAI_API_KEY,
         },
         {
@@ -73,7 +85,6 @@ function getProviderChain(): ProviderEntry[] {
             model: () => anthropic('claude-sonnet-4-6'),
             available: !!process.env.ANTHROPIC_API_KEY,
         },
-        ...getOpenRouterProvider(),
     ].filter(p => p.available);
 }
 
@@ -97,6 +108,33 @@ function markProviderDead(name: string, reason: string) {
 }
 
 /**
+ * Get the current status of all providers in the chain.
+ * Used by /status command to show circuit breaker state.
+ *
+ * @returns Array of { name, status, detail } for each configured provider
+ */
+export function getProviderStatus(): Array<{ name: string; status: 'healthy' | 'dead'; detail: string }> {
+    const chain = getProviderChain();
+    return chain.map(p => {
+        const deadUntil = deadProviders.get(p.name);
+        if (deadUntil && Date.now() < deadUntil) {
+            const remainingSec = Math.ceil((deadUntil - Date.now()) / 1000);
+            const remainingMin = Math.ceil(remainingSec / 60);
+            return {
+                name: p.name,
+                status: 'dead' as const,
+                detail: `circuit broken (${remainingMin}m remaining)`,
+            };
+        }
+        return {
+            name: p.name,
+            status: 'healthy' as const,
+            detail: 'ready',
+        };
+    });
+}
+
+/**
  * Generates raw text using the provider fallback chain.
  * Tries each available provider in order until one succeeds.
  */
@@ -115,6 +153,8 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
         if (isProviderDead(provider.name)) {
             continue;
         }
+
+
 
         try {
             const { text } = await generateText({
@@ -165,6 +205,8 @@ export async function unifiedObjectGeneration<T>(
         if (isProviderDead(provider.name)) {
             continue;
         }
+
+
 
         try {
             const { object } = await (generateObject({

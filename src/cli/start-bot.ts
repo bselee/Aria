@@ -1,10 +1,14 @@
 /**
  * @file    start-bot.ts
  * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
- *          Anthropic (Claude), and OpenAI (Fallback) with tool access.
+ *          Gemini (primary chat), and Vercel AI SDK tool calling.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-02-20
+ * @updated 2026-03-06
+ *
+ * DECISION(2026-03-06): Replaced OpenRouter (paid) with Gemini (free) for chat.
+ * Tools now use Vercel AI SDK tool() format with co-located execute() functions.
+ * OpenRouter can be re-enabled by setting OPENROUTER_API_KEY in llm.ts chain.
  */
 
 import * as dotenv from 'dotenv';
@@ -14,23 +18,33 @@ import * as http from 'http';
 import { Telegraf } from 'telegraf';
 import axios from 'axios';
 import OpenAI from 'openai';
+import { google as googleAI } from '@ai-sdk/google';
+import { generateText, stepCountIs } from 'ai';
+import { getAriaTools } from './aria-tools';
 import {
     SYSTEM_PROMPT,
     VOICE_CONFIG,
     TELEGRAM_CONFIG
 } from '../config/persona';
 import { OpsManager } from '../lib/intelligence/ops-manager';
+import { getProviderStatus } from '../lib/intelligence/llm';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
-import { google } from 'googleapis';
+import { gmail as GmailApi } from '@googleapis/gmail';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
+// DECISION(2026-03-06): unifiedTextGeneration kept as fallback if Gemini fails on chat.
+// Primary chat now uses generateText with google('gemini-2.0-flash') directly.
 import { FinaleClient } from '../lib/finale/client';
 import { SlackWatchdog } from '../lib/slack/watchdog';
+import { APAgent } from '../lib/intelligence/ap-agent';
+import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import {
     approvePendingReconciliation,
     rejectPendingReconciliation,
     reconcileInvoiceToPO,
     applyReconciliation,
     storePendingApproval,
+    loadPendingApprovalsFromSupabase,
+    type ReconciliationResult,
 } from '../lib/finale/reconciler';
 
 // Tracks chats where we're waiting for Will to type a Finale PO# for a manual match.
@@ -50,12 +64,56 @@ import {
 } from '../lib/purchasing/po-sender';
 
 // ──────────────────────────────────────────────────
+// HELPERS
+// ──────────────────────────────────────────────────
+
+/**
+ * Build the Telegram message text for a restored (post-restart) approval prompt.
+ * Mirrors the structure of the original approval message sent by ap-agent.ts, with
+ * an added banner noting the bot restarted and how many minutes remain on the 24h window.
+ */
+function buildRestoredApprovalMessage(result: ReconciliationResult, approvalId: string, minutesLeft: number): string {
+    const vendor = result.vendorName || 'Unknown vendor';
+    const invNum = result.invoiceNumber || '?';
+    const poNum = result.orderId || '?';
+
+    const changes: string[] = [];
+    for (const pc of result.priceChanges ?? []) {
+        if (pc.verdict === 'needs_approval') {
+            const delta = (pc.poPrice != null && pc.invoicePrice != null)
+                ? ` ($${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)})`
+                : '';
+            changes.push(`• ${pc.description || pc.productId || '?'}${delta}`);
+        }
+    }
+    for (const fc of result.feeChanges ?? []) {
+        if (fc.verdict === 'needs_approval') {
+            changes.push(`• ${fc.feeType}: $${(fc.amount ?? 0).toFixed(2)}`);
+        }
+    }
+
+    const changeList = changes.length > 0
+        ? changes.slice(0, 5).join('\n') + (changes.length > 5 ? `\n…+${changes.length - 5} more` : '')
+        : '(no itemized changes)';
+
+    const impact = result.totalDollarImpact != null ? `$${result.totalDollarImpact.toFixed(2)}` : '?';
+
+    return (
+        `🔄 *RESTORED APPROVAL* _(bot restarted — ${minutesLeft}m remaining)_\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `*Vendor:* ${vendor}\n` +
+        `*Invoice:* ${invNum}  →  *PO:* ${poNum}\n` +
+        `*Impact:* ${impact}\n\n` +
+        `*Changes pending approval:*\n${changeList}\n\n` +
+        `_Tap Approve or Reject below_`
+    );
+}
+
+// ──────────────────────────────────────────────────
 // CLIENT INITIALIZATION
 // ──────────────────────────────────────────────────
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-const openaiKey = process.env.OPENAI_API_KEY;
-const openrouterKey = process.env.OPENROUTER_API_KEY;
 const perplexityKey = process.env.PERPLEXITY_API_KEY;
 
 if (!token) {
@@ -65,20 +123,7 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
-// Route main chat through OpenRouter first, fallback to OpenAI if no key
-const openai = openrouterKey
-    ? new OpenAI({
-        apiKey: openrouterKey,
-        baseURL: 'https://openrouter.ai/api/v1',
-        defaultHeaders: {
-            "HTTP-Referer": "https://buildasoil.com",
-            "X-Title": "Aria Bot",
-        }
-    })
-    : (openaiKey ? new OpenAI({ apiKey: openaiKey }) : null);
-
-// Use Haiku via OR, or GPT-4o if stuck on raw OpenAI API
-const CHAT_MODEL = openrouterKey ? 'anthropic/claude-3.5-haiku' : 'gpt-4o';
+// Perplexity for web search tool (uses OpenAI-compatible API)
 const perplexity = perplexityKey ? new OpenAI({
     apiKey: perplexityKey,
     baseURL: 'https://api.perplexity.ai'
@@ -87,9 +132,13 @@ const perplexity = perplexityKey ? new OpenAI({
 // Finale Inventory client
 const finale = new FinaleClient();
 
+// DECISION(2026-03-06): Chat uses Gemini 2.0 Flash (free) via Vercel AI SDK.
+// Previously used OpenRouter → Claude 3.5 Haiku (paid).
+// Rollback: set OPENROUTER_API_KEY in .env.local to re-enable in llm.ts chain.
 console.log('🚀 ARIA BOT BOOTING...');
 console.log(`🤖 Telegram: ✅ Connected`);
-console.log(`🧠 Unified LLM: ✅ Ready (Anthropic + OpenAI Fallback)`);
+console.log(`🧠 Chat LLM: ✅ Gemini 2.0 Flash (free)`);
+console.log(`🧠 Background LLM: ✅ Unified chain (Gemini → OpenRouter → OpenAI → Anthropic)`);
 console.log(`🔍 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configured'}`);
 console.log(`🎙️ ElevenLabs: ${elevenLabsKey ? '✅ Loaded' : '❌ Not Configured'}`);
 console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not Configured'}`);
@@ -150,19 +199,28 @@ bot.command('status', async (ctx) => {
         .map((m: any) => `  ${m.role === 'user' ? '👤' : '🤖'} ${String(m.content).slice(0, 60).replace(/\n/g, ' ')}...`)
         .join('\n') || '  (empty)';
 
+    // Build LLM provider health report
+    const providerStatuses = getProviderStatus();
+    const llmHealthLines = providerStatuses.map(p => {
+        const icon = p.status === 'healthy' ? '✅' : '⚠️';
+        return `  ${icon} ${p.name} — ${p.detail}`;
+    }).join('\n');
+
     ctx.reply(
         `🛰️ *Aria Runtime Status*\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `⏱️ Uptime: \`${uptimeStr}\`\n` +
         `🚀 Started: \`${BOT_START_TIME.toLocaleTimeString('en-US', { timeZone: 'America/Denver' })} MT\`\n\n` +
         `*Integrations:*\n` +
-        `🤖 OpenAI: ${openai ? '✅ GPT-4o' : '❌ Not configured'}\n` +
+        `🤖 Chat LLM: ✅ Gemini 2.0 Flash (free)\n` +
         `🗄️ Supabase: ${dbStatus}\n` +
         `🧠 Memory (Pinecone): ${memStatus}\n` +
         `📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not configured'}\n` +
         `🔍 Perplexity: ${perplexityKey ? '✅ Ready' : '❌ Not configured'}\n` +
         `🦊 Slack Watchdog: ${globalWatchdog ? '✅ Running' : '❌ Not started'}\n` +
         `🎙️ Voice: ${elevenLabsKey ? '✅ ElevenLabs' : '❌ Not configured'}\n\n` +
+        `*🧠 Background LLM Chain:*\n` +
+        `${llmHealthLines}\n\n` +
         `*Conversation:*\n` +
         `💬 History: \`${historyLen} messages\` in context\n` +
         `${recentHistory}\n\n` +
@@ -176,7 +234,37 @@ bot.command('clear', (ctx) => {
     const chatId = ctx.from?.id || ctx.chat.id;
     const count = chatHistory[chatId]?.length || 0;
     chatHistory[chatId] = [];
+    delete chatLastActive[chatId];
     ctx.reply(`🗑️ Cleared ${count} messages from context. Fresh start.`, { parse_mode: 'Markdown' });
+});
+
+// /memory — on-demand memory diagnostics for OOM debugging
+// DECISION(2026-03-09): Surfaces RSS, heap, and cache sizes so Will can
+// spot memory trends without SSH-ing into the server.
+bot.command('memory', async (ctx) => {
+    const mem = process.memoryUsage();
+    const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+    const chatKeys = Object.keys(chatHistory).length;
+    const totalMsgs = Object.values(chatHistory).reduce((s, arr) => s + arr.length, 0);
+
+    const lines = [
+        `🧠 *Memory Diagnostics*`,
+        `━━━━━━━━━━━━━━━━━━━━`,
+        `📊 *Process Memory:*`,
+        `  RSS: \`${mb(mem.rss)} MB\``,
+        `  Heap Used: \`${mb(mem.heapUsed)} MB\``,
+        `  Heap Total: \`${mb(mem.heapTotal)} MB\``,
+        `  External: \`${mb(mem.external)} MB\``,
+        `  ArrayBuffers: \`${mb(mem.arrayBuffers)} MB\``,
+        ``,
+        `💬 *Chat History:*`,
+        `  Active chats: \`${chatKeys}\``,
+        `  Total messages: \`${totalMsgs}\``,
+        ``,
+        `⌛ *Uptime:* \`${((Date.now() - BOT_START_TIME.getTime()) / 3_600_000).toFixed(1)}h\``,
+    ];
+
+    await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
 // /product <SKU> — Look up a product in Finale Inventory
@@ -328,8 +416,9 @@ bot.command('consumption', async (ctx) => {
 
     try {
         const { FinaleClient } = await import('../lib/finale/client');
-        const finale = new FinaleClient();
-        const report = await finale.getBOMConsumption(sku, days);
+        // Reuse module-level finale singleton instead of creating a new instance
+        const consumptionClient = finale;
+        const report = await consumptionClient.getBOMConsumption(sku, days);
         await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
     } catch (err: any) {
         console.error('Consumption error:', err.message);
@@ -671,7 +760,7 @@ bot.command('populate', async (ctx) => {
     try {
         const { processEmailAttachments } = require('../lib/gmail/attachment-handler');
         const auth = await getAuthenticatedClient("default");
-        const gmail = google.gmail({ version: "v1", auth });
+        const gmail = GmailApi({ version: "v1", auth });
 
         const twoWeeksAgo = new Date();
         twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
@@ -709,14 +798,112 @@ bot.command('populate', async (ctx) => {
 });
 
 // ──────────────────────────────────────────────────
+// KAIZEN FEEDBACK LOOP COMMANDS
+// ──────────────────────────────────────────────────
+
+// /kaizen — Generate a self-review report of Aria's accuracy and performance
+bot.command('kaizen', async (ctx) => {
+    ctx.sendChatAction('typing');
+    await ctx.reply('🧘 Running Kaizen Self-Review... analyzing recent performance.', { parse_mode: 'Markdown' });
+
+    try {
+        const { generateSelfReview } = await import('../lib/intelligence/feedback-loop');
+        const args = ctx.message.text.replace(/^\/kaizen\s*/, '').trim();
+        const days = Math.min(Math.max(parseInt(args) || 7, 1), 90);
+        const report = await generateSelfReview(days);
+        await ctx.reply(report, { parse_mode: 'HTML' });
+    } catch (err: any) {
+        console.error('Kaizen report error:', err.message);
+        await ctx.reply(`❌ Kaizen report failed: ${err.message}`);
+    }
+});
+
+// /vendor <name> — Show vendor reliability scorecard
+bot.command('vendor', async (ctx) => {
+    const vendorName = ctx.message.text.replace(/^\/vendor\s*/, '').trim();
+    if (!vendorName) {
+        return ctx.reply(
+            '📊 *Vendor Reliability Scorecard*\n\n' +
+            'Usage: `/vendor Mountain Rose Herbs`\n\n' +
+            '_Analyzes correction rates, reconciliation outcomes, and response patterns for a specific vendor._',
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    ctx.sendChatAction('typing');
+    try {
+        const { getVendorReliability } = await import('../lib/intelligence/feedback-loop');
+        const score = await getVendorReliability(vendorName);
+
+        if (!score) {
+            return ctx.reply(`❌ Could not retrieve vendor data — Supabase unavailable.`);
+        }
+
+        if (score.eventCount === 0) {
+            return ctx.reply(
+                `📊 *Vendor: ${vendorName}*\n\n` +
+                `No feedback data collected yet for this vendor.\n` +
+                `_Data accumulates as invoices are processed and reconciled._`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+
+        const pct = score.overallScore >= 0 ? score.overallScore : 0;
+        const emoji = pct >= 85 ? '🟢' : pct >= 60 ? '🟡' : '🔴';
+        let msg = `📊 *Vendor: ${vendorName}*\n`;
+        msg += `${emoji} Overall Score: *${pct}%*\n`;
+        msg += `Based on ${score.eventCount} events (last 90 days)\n`;
+        msg += `Trend: ${score.trend === 'improving' ? '⬆️ Improving' : score.trend === 'declining' ? '⬇️ Declining' : '➡️ Stable'}\n\n`;
+        if (score.onTimePercent >= 0) msg += `• On-Time Delivery: ${score.onTimePercent}%\n`;
+        if (score.invoiceAccuracy >= 0) msg += `• Invoice Accuracy: ${score.invoiceAccuracy}%\n`;
+        if (score.documentQuality >= 0) msg += `• Document Quality: ${score.documentQuality}%\n`;
+        if (score.avgResponseDays >= 0) msg += `• Avg Response: ${score.avgResponseDays} days\n`;
+        if (score.recentIssues.length > 0) {
+            msg += `\n⚠️ Recent Issues:\n`;
+            for (const issue of score.recentIssues) {
+                msg += `  • ${issue}\n`;
+            }
+        }
+        msg += `\n_Scores update as reconciliations and corrections accumulate._`;
+
+        await ctx.reply(msg, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        await ctx.reply(`❌ Vendor lookup failed: ${err.message}`);
+    }
+});
+
+// /housekeeping — Manually trigger data cleanup
+bot.command('housekeeping', async (ctx) => {
+    ctx.sendChatAction('typing');
+    await ctx.reply('🧹 Running manual housekeeping...', { parse_mode: 'Markdown' });
+
+    try {
+        const { runHousekeeping } = await import('../lib/intelligence/feedback-loop');
+        const report = await runHousekeeping();
+        let msg = `🧹 *Housekeeping Complete*\n\n`;
+        msg += `Total reclaimed: *${report.totalReclaimed}* rows/vectors\n\n`;
+        if (report.feedbackEventsPruned > 0) msg += `• Feedback events: ${report.feedbackEventsPruned} pruned\n`;
+        if (report.chatLogsPruned > 0) msg += `• Chat logs: ${report.chatLogsPruned} pruned\n`;
+        if (report.exceptionsPruned > 0) msg += `• Exceptions: ${report.exceptionsPruned} pruned\n`;
+        if (report.alertsPruned > 0) msg += `• Alerts: ${report.alertsPruned} pruned\n`;
+        if (report.pineconeMemoriesPruned > 0) msg += `• Pinecone memories: ${report.pineconeMemoriesPruned} pruned\n`;
+        if (report.totalReclaimed === 0) msg += `_Nothing to clean — database is tidy._ ✨\n`;
+        msg += `\n_Runs automatically every night at 11 PM MT._`;
+        await ctx.reply(msg, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+        await ctx.reply(`❌ Housekeeping failed: ${err.message}`);
+    }
+});
+
+// ──────────────────────────────────────────────────
 // REUSABLE: Send email with PDF attachment via Gmail API
 // ──────────────────────────────────────────────────
 
 async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer: Buffer, pdfFilename: string): Promise<void> {
     const { getAuthenticatedClient: getGmailAuth } = await import('../lib/gmail/auth');
-    const { google } = await import('googleapis');
+    const { gmail: GmailApiDyn } = await import('@googleapis/gmail');
     const auth = await getGmailAuth('default');
-    const gmail = google.gmail({ version: 'v1', auth });
+    const gmail = GmailApiDyn({ version: 'v1', auth });
 
     const boundary = '----=_Part_' + Date.now();
     const mimeMessage = [
@@ -756,6 +943,44 @@ async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer
 // ──────────────────────────────────────────────────
 
 const chatHistory: Record<string, any[]> = {};
+const chatLastActive: Record<string, number> = {};
+
+// DECISION(2026-03-09): Periodic GC for stale chat history entries.
+// Without this, every unique Telegram chatId creates an entry that lives forever.
+// Sweep every 30 minutes — evict chats inactive for 4+ hours.
+const CHAT_GC_INTERVAL = 30 * 60 * 1000;
+const CHAT_GC_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const CHAT_MAX_KEYS = 100;
+setInterval(() => {
+    const now = Date.now();
+    const keys = Object.keys(chatHistory);
+    let evicted = 0;
+
+    for (const key of keys) {
+        const lastActive = chatLastActive[key] || 0;
+        if (now - lastActive > CHAT_GC_TTL) {
+            delete chatHistory[key];
+            delete chatLastActive[key];
+            evicted++;
+        }
+    }
+
+    // If still over cap, evict oldest
+    const remaining = Object.keys(chatHistory);
+    if (remaining.length > CHAT_MAX_KEYS) {
+        const sorted = remaining.sort((a, b) => (chatLastActive[a] || 0) - (chatLastActive[b] || 0));
+        const toEvict = sorted.slice(0, remaining.length - CHAT_MAX_KEYS);
+        for (const key of toEvict) {
+            delete chatHistory[key];
+            delete chatLastActive[key];
+            evicted++;
+        }
+    }
+
+    if (evicted > 0) {
+        console.log(`[chat-gc] Evicted ${evicted} stale chat(s) — ${Object.keys(chatHistory).length} remaining`);
+    }
+}, CHAT_GC_INTERVAL);
 
 // ──────────────────────────────────────────────────
 // DOCUMENT/FILE HANDLER — PDFs, images, Word docs
@@ -949,6 +1174,7 @@ CRITICAL RULES:
             // Store in conversation history so follow-up questions have context
             const chatId = ctx.from?.id || ctx.chat.id;
             if (!chatHistory[chatId]) chatHistory[chatId] = [];
+            chatLastActive[chatId] = Date.now();
             chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
             chatHistory[chatId].push({ role: "assistant", content: reply });
             if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
@@ -1198,6 +1424,7 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
         // Store in conversation history so follow-up questions have context
         const chatId = ctx.from?.id || ctx.chat.id;
         if (!chatHistory[chatId]) chatHistory[chatId] = [];
+        chatLastActive[chatId] = Date.now();
         chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
         chatHistory[chatId].push({ role: "assistant", content: reply });
         if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
@@ -1214,6 +1441,7 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 
 async function processTextMessage(text: string, chatId: number): Promise<string> {
     if (!chatHistory[chatId]) chatHistory[chatId] = [];
+    chatLastActive[chatId] = Date.now();
     chatHistory[chatId].push({ role: "user", content: text });
     if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
 
@@ -1283,436 +1511,54 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     let reply = "";
 
-    if (openai) {
-        const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-            {
-                type: "function",
-                function: {
-                    name: "get_weather",
-                    description: "Get real-time weather information for a specific location.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            location: { type: "string", description: "City and State, e.g. Montrose, CO" }
-                        },
-                        required: ["location"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "list_recent_emails",
-                    description: "List the 5 most recent emails from the inbox.",
-                    parameters: { type: "object", properties: {} }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "perplexity_search",
-                    description: "Search the internet for real-time information.",
-                    parameters: {
-                        type: "object",
-                        properties: { query: { type: "string" } },
-                        required: ["query"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "lookup_product",
-                    description: "Look up a SPECIFIC product in Finale Inventory by EXACT SKU. Returns stock, lead time, supplier, cost, and reorder info. Only use this when you know the exact SKU.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            sku: { type: "string", description: "The exact product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
-                        },
-                        required: ["sku"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "search_products",
-                    description: "Search Finale Inventory for products by keyword in name or description. Use this when Will asks to find, list, or search for products by name, ingredient, vendor, or description — e.g. 'kashi skus', 'kelp products', 'find castings items'. Returns matching SKUs with stock levels.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            keyword: { type: "string", description: "Search keyword to match against product names and SKUs (e.g. 'kashi', 'kelp', 'castings', 'bag')" },
-                            limit: { type: "number", description: "Max results to return (default 20)" }
-                        },
-                        required: ["keyword"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "get_consumption",
-                    description: "Get BOM consumption and stock info for a specific SKU over a number of days. Use this when the user asks for consumption of a SKU, e.g., 'consumption for KM106' or '/consumption KM106'.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            sku: { type: "string", description: "The exact product SKU/ID (e.g. KM106, S-12527)" },
-                            days: { type: "number", description: "Number of days to analyze (default 90)" }
-                        },
-                        required: ["sku"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "build_risk_analysis",
-                    description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
-                    parameters: { type: "object", properties: {} }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "get_purchase_history",
-                    description: "Get the total quantity purchased/received for a specific SKU over a time period. Use this when the user asks 'how much was purchased', 'total received', 'purchase history', or 'how much did we buy' for a product. Returns exact PO quantities from Finale.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            sku: { type: "string", description: "The exact product SKU/ID (e.g. PLQ101, KM106)" },
-                            days: { type: "number", description: "Number of days back to search (default 365)" }
-                        },
-                        required: ["sku"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "query_vendors",
-                    description: "Look up vendor info from our database by name. Returns payment terms, contact, AR email, total spend, last order date. Use when Will asks about a specific vendor, payment terms, who to contact, or vendor history.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            name: { type: "string", description: "Partial or full vendor name to search (e.g. 'AAA Cooper', 'Kashi', 'BioAg')" }
-                        },
-                        required: ["name"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "query_invoices",
-                    description: "Query invoices from our database. Use when Will asks about invoice status, unmatched invoices, overdue invoices, or invoice amounts. Filter by status: 'pending', 'matched', 'unmatched', 'paid', 'overdue'.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
-                            status: { type: "string", description: "Filter by status: pending, matched, unmatched, paid, overdue" },
-                            limit: { type: "number", description: "Max results (default 10)" }
-                        }
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "query_purchase_orders",
-                    description: "Query purchase orders from our database. Use when Will asks about open POs, PO status, what's on order, or expected deliveries. Filter by status: 'open', 'received', 'closed', 'partial'.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
-                            status: { type: "string", description: "Filter by status: open, received, closed, partial" },
-                            limit: { type: "number", description: "Max results (default 10)" }
-                        }
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "query_action_items",
-                    description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for follow-up. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            limit: { type: "number", description: "Max results (default 10)" }
-                        }
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "reorder_assessment",
-                    description: "Scan all active Finale products and return external-vendor reorder recommendations grouped by vendor with urgency. Use when Will asks about reorders, low stock, what to order, purchasing needs, or 'what do we need to buy'.",
-                    parameters: { type: "object", properties: {} }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "create_draft_pos",
-                    description: "Create draft purchase orders in Finale for human review and commit. Creates one PO per vendor for all flagged reorder items, or filtered to a specific vendor. Draft POs appear in Finale as ORDER_CREATED for Will to review and commit.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            vendor_filter: { type: "string", description: "Optional vendor name to create PO for only that vendor. Omit to create all flagged POs." }
-                        }
-                    }
-                }
-            }
-        ];
+    try {
+        // DECISION(2026-03-06): Use Gemini via Vercel AI SDK with shared Aria tools.
+        // generateText handles the full tool call loop automatically via stopWhen.
+        // Previously used OpenRouter → openai.chat.completions.create with manual tool loop.
+        const tools = getAriaTools({ finale, perplexity, bot, chatId });
+        const conversationMessages = chatHistory[chatId]
+            .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+            .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                { role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules },
-                ...chatHistory[chatId]
-            ],
+        const { text: geminiReply, steps } = await generateText({
+            model: googleAI('gemini-2.0-flash'),
+            system: SYSTEM_PROMPT + memoryContext + runtimeRules,
+            messages: conversationMessages,
             tools,
-            tool_choice: "auto",
+            stopWhen: stepCountIs(5),
         });
+        reply = geminiReply;
+        chatHistory[chatId].push({ role: 'assistant', content: reply });
 
-        const message = response.choices[0].message;
-
-        if (message.tool_calls) {
-            const toolResults: any[] = [];
-            for (const toolCall of message.tool_calls) {
-                const args = JSON.parse(toolCall.function.arguments);
-                let result = "";
-
-                if (toolCall.function.name === "get_weather") {
-                    const Firecrawl = require('@mendable/firecrawl-js').default;
-                    const app = new Firecrawl({ apiKey: process.env.FIRECRAWL_API_KEY });
-                    const scrape = await app.scrapeUrl(`https://duckduckgo.com/?q=weather+in+${encodeURIComponent(args.location)}`, { formats: ['markdown'] });
-                    result = scrape.success ? scrape.markdown : "Could not retrieve weather.";
-                } else if (toolCall.function.name === "perplexity_search" && perplexity) {
-                    const res = await perplexity.chat.completions.create({
-                        model: "sonar-reasoning",
-                        messages: [{ role: "user", content: args.query }]
-                    });
-                    result = res.choices[0].message.content || "";
-                } else if (toolCall.function.name === "list_recent_emails") {
-                    const auth = await getAuthenticatedClient("default");
-                    const gmail = google.gmail({ version: "v1", auth });
-                    const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
-                    result = JSON.stringify(data.messages);
-                } else if (toolCall.function.name === "lookup_product") {
-                    const report = await finale.productReport(args.sku);
-                    result = report.telegramMessage;
-                } else if (toolCall.function.name === "get_purchase_history") {
-                    const purchased = await finale.getPurchasedQty(args.sku, args.days || 365);
-                    if (purchased.totalQty > 0) {
-                        result = `${args.sku}: Purchased ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s) in the last ${args.days || 365} days.`;
-                    } else {
-                        result = `${args.sku}: No purchase/receiving records found in the last ${args.days || 365} days.`;
-                    }
-                } else if (toolCall.function.name === "search_products") {
-                    const searchResult = await finale.searchProducts(args.keyword, args.limit || 20);
-                    result = searchResult.telegramMessage;
-                } else if (toolCall.function.name === "get_consumption") {
-                    const report = await finale.getBOMConsumption(args.sku, args.days || 90);
-                    result = report.telegramMessage;
-                } else if (toolCall.function.name === "build_risk_analysis") {
-                    const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
-                    const report = await runBuildRiskAnalysis(30, () => { });
-                    result = report.slackMessage;
-                } else if (toolCall.function.name === "reorder_assessment") {
-                    const { FinaleClient } = await import('../lib/finale/client');
-                    const finaleClient = new FinaleClient();
-                    const groups = await finaleClient.getExternalReorderItems();
-                    if (groups.length === 0) {
-                        result = "✅ All stocking items are within safe levels — nothing to reorder.";
-                    } else {
-                        const crit = groups.filter(g => g.urgency === 'critical');
-                        const warn = groups.filter(g => g.urgency === 'warning');
-                        const flag = groups.filter(g => g.urgency === 'reorder_flagged');
-                        const lines: string[] = [`📦 *Reorder Assessment* — ${groups.length} vendor${groups.length !== 1 ? 's' : ''} flagged\n`];
-                        if (crit.length) lines.push(`🔴 *Critical (<14d):* ${crit.map(g => `${g.vendorName} (${g.items.length})`).join(', ')}`);
-                        if (warn.length) lines.push(`🟡 *Warning (14–44d):* ${warn.map(g => `${g.vendorName} (${g.items.length})`).join(', ')}`);
-                        if (flag.length) lines.push(`📦 *Flagged:* ${flag.map(g => g.vendorName).join(', ')}`);
-                        // Top 5 most urgent individual SKUs
-                        const allItems = groups.flatMap(g => g.items.map(i => ({ ...i, vendor: g.vendorName })));
-                        const topItems = allItems
-                            .filter(i => i.stockoutDays !== null)
-                            .sort((a, b) => (a.stockoutDays ?? 999) - (b.stockoutDays ?? 999))
-                            .slice(0, 5);
-                        if (topItems.length) {
-                            lines.push(`\n*Most urgent SKUs:*`);
-                            for (const i of topItems) {
-                                lines.push(`  • ${i.productId} — ${i.stockoutDays}d out · ${i.vendor}${i.reorderQty ? ` · qty:${i.reorderQty}` : ''}`);
-                            }
-                        }
-                        lines.push(`\nSay "create draft POs" to generate Finale drafts for all vendors.`);
-                        result = lines.join('\n');
-                    }
-                } else if (toolCall.function.name === "create_draft_pos") {
-                    const { FinaleClient } = await import('../lib/finale/client');
-                    const finaleClient = new FinaleClient();
-                    const groups = await finaleClient.getExternalReorderItems();
-                    const filtered = args.vendor_filter
-                        ? groups.filter(g => g.vendorName.toLowerCase().includes((args.vendor_filter as string).toLowerCase()))
-                        : groups;
-                    if (filtered.length === 0) {
-                        result = args.vendor_filter
-                            ? `No reorder items found for vendor matching "${args.vendor_filter}".`
-                            : "No external vendor reorder items found.";
-                    } else {
-                        const created: string[] = [];
-                        const tgChatId = String(chatId);
-                        for (const group of filtered) {
-                            try {
-                                const items = group.items.map((i: any) => ({
-                                    productId: i.productId,
-                                    quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
-                                    unitPrice: i.unitPrice,
-                                    orderIncrementQty: i.orderIncrementQty ?? null,
-                                    isBulkDelivery: i.isBulkDelivery ?? false,
-                                }));
-                                const po = await finaleClient.createDraftPurchaseOrder(
-                                    group.vendorPartyId, items,
-                                    `Auto-generated draft — review and commit in Finale`
-                                );
-                                let poLine = `✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
-                                if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
-                                if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
-                                created.push(poLine);
-                                // Send inline Review & Send keyboard for this PO
-                                bot.telegram.sendMessage(tgChatId, poLine, {
-                                    reply_markup: {
-                                        inline_keyboard: [[
-                                            { text: '📋 Review & Send', callback_data: `po_review_${po.orderId}` },
-                                            { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
-                                        ]],
-                                    },
-                                }).catch(() => { });
-                            } catch (e: any) {
-                                created.push(`❌ ${group.vendorName}: ${e.message}`);
-                            }
-                        }
-                        result = `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
-                    }
-                } else if (toolCall.function.name === "query_vendors") {
-                    const { createClient } = await import('../lib/supabase');
-                    const db = createClient();
-                    if (!db) {
-                        result = "Supabase not configured.";
-                    } else {
-                        const { data, error } = await db.from('vendors')
-                            .select('name, aliases, payment_terms, contact_name, contact_email, ar_email, category, total_spend, last_order_date, average_payment_days')
-                            .ilike('name', `%${args.name}%`)
-                            .limit(5);
-                        if (error) result = `DB error: ${error.message}`;
-                        else if (!data?.length) result = `No vendors found matching "${args.name}".`;
-                        else result = JSON.stringify(data, null, 2);
-                    }
-                } else if (toolCall.function.name === "query_invoices") {
-                    const { createClient } = await import('../lib/supabase');
-                    const db = createClient();
-                    if (!db) {
-                        result = "Supabase not configured.";
-                    } else {
-                        let q = db.from('invoices')
-                            .select('invoice_number, po_number, total_amount, due_date, status, discrepancies, created_at, vendors(name)')
-                            .order('created_at', { ascending: false })
-                            .limit(args.limit || 10);
-                        if (args.status) q = q.eq('status', args.status);
-                        if (args.vendor_name) {
-                            const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
-                            if (vd?.length) q = q.eq('vendor_id', vd[0].id);
-                        }
-                        const { data, error } = await q;
-                        if (error) result = `DB error: ${error.message}`;
-                        else if (!data?.length) result = `No invoices found${args.status ? ` with status "${args.status}"` : ''}.`;
-                        else result = JSON.stringify(data, null, 2);
-                    }
-                } else if (toolCall.function.name === "query_purchase_orders") {
-                    const { createClient } = await import('../lib/supabase');
-                    const db = createClient();
-                    if (!db) {
-                        result = "Supabase not configured.";
-                    } else {
-                        let q = db.from('purchase_orders')
-                            .select('po_number, issue_date, required_date, status, total_amount, line_items, vendors(name)')
-                            .order('issue_date', { ascending: false })
-                            .limit(args.limit || 10);
-                        if (args.status) q = q.eq('status', args.status);
-                        if (args.vendor_name) {
-                            const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
-                            if (vd?.length) q = q.eq('vendor_id', vd[0].id);
-                        }
-                        const { data, error } = await q;
-                        if (error) result = `DB error: ${error.message}`;
-                        else if (!data?.length) result = `No purchase orders found${args.status ? ` with status "${args.status}"` : ''}.`;
-                        else result = JSON.stringify(data, null, 2);
-                    }
-                } else if (toolCall.function.name === "query_action_items") {
-                    const { createClient } = await import('../lib/supabase');
-                    const db = createClient();
-                    if (!db) {
-                        result = "Supabase not configured.";
-                    } else {
-                        const { data, error } = await db.from('documents')
-                            .select('type, vendor_ref, action_summary, confidence, source, created_at')
-                            .eq('action_required', true)
-                            .order('created_at', { ascending: false })
-                            .limit(args.limit || 10);
-                        if (error) result = `DB error: ${error.message}`;
-                        else if (!data?.length) result = "No pending action items found.";
-                        else result = JSON.stringify(data, null, 2);
-                    }
-                }
-
-                toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
-            }
-
-            const finalRes = await openai.chat.completions.create({
-                model: "gpt-4o",
-                messages: [
-                    { role: "system", content: SYSTEM_PROMPT },
-                    ...chatHistory[chatId],
-                    message,
-                    ...toolResults
-                ]
-            });
-            reply = finalRes.choices[0].message.content || "";
-
-            chatHistory[chatId].push(message);
-            chatHistory[chatId].push(...toolResults);
-            chatHistory[chatId].push({ role: "assistant", content: reply });
-
+        // Auto-learn: store tool usage patterns in memory (fire-and-forget)
+        const toolsUsed = steps
+            .flatMap(s => s.toolCalls || [])
+            .map((tc: any) => tc.toolName);
+        if (toolsUsed.length > 0) {
             setImmediate(async () => {
                 try {
                     const { remember } = await import('../lib/intelligence/memory');
-                    const toolsUsed = message.tool_calls!.map(tc => tc.function.name).join(', ');
-                    const resultSummary = toolResults
-                        .map(tr => String(tr.content).slice(0, 300))
-                        .join(' | ');
-                    const firstTool = message.tool_calls![0].function.name;
+                    const firstTool = toolsUsed[0];
                     const category =
                         firstTool.includes('vendor') ? 'vendor_pattern' :
                             firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
                                 firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
                                     'conversation';
-                    const tagMatches = (text + ' ' + resultSummary).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                    const tagMatches = (text + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
                     const tags = [...new Set(tagMatches)].slice(0, 5);
                     await remember({
                         category,
-                        content: `Q: "${text.slice(0, 150)}" → Tool: ${toolsUsed} → A: "${reply.slice(0, 300)}"`,
+                        content: `Q: "${text.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
                         tags,
                         source: 'telegram_auto',
                         priority: 'low',
                     });
                 } catch { /* non-critical, never block the response */ }
             });
-        } else {
-            reply = message.content || "";
-            chatHistory[chatId].push({ role: "assistant", content: reply });
         }
-    } else {
+    } catch (geminiErr: any) {
+        // Fallback: if Gemini fails, use the unified chain (which includes Ollama)
+        console.warn(`⚠️ Gemini chat failed: ${geminiErr.message}. Falling back to unified chain.`);
         reply = await unifiedTextGeneration({
             system: SYSTEM_PROMPT + memoryContext + runtimeRules,
             messages: chatHistory[chatId]
@@ -1737,6 +1583,7 @@ bot.on('text', async (ctx) => {
     if (!chatHistory[chatId]) {
         chatHistory[chatId] = [];
     }
+    chatLastActive[chatId] = Date.now();
 
     // Mirror to dashboard (fire-and-forget)
     setImmediate(async () => {
@@ -1747,7 +1594,7 @@ bot.on('text', async (ctx) => {
     // ── "Please forward" shortcut — check for pending unmatched invoices ──────
     // If Will says "forward" and there are pending dropship invoices, offer buttons
     if (/\bforward\b/i.test(userText)) {
-        const pending = getAllPendingDropships();
+        const pending = await getAllPendingDropships();
         if (pending.length > 0) {
             const { Markup } = await import('telegraf');
             const lines = pending.map(p =>
@@ -1772,7 +1619,7 @@ bot.on('text', async (ctx) => {
         pendingPoEntry.delete(chatId); // Clear state regardless of outcome
 
         const poNumber = userText.trim().toUpperCase();
-        const pending = getPendingDropship(dropId);
+        const pending = await getPendingDropship(dropId);
 
         if (!pending) {
             await ctx.reply(`⚠️ Invoice session expired — the 48-hour window passed. Start a fresh AP scan if needed.`);
@@ -1808,13 +1655,13 @@ bot.on('text', async (ctx) => {
 
             if (recon.overallVerdict === 'auto_approve') {
                 const applyResult = await applyReconciliation(recon, finale);
-                removePendingDropship(dropId);
+                await removePendingDropship(dropId);
                 await ctx.reply(
                     recon.summary + `\n\n✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${poNumber}.`,
                     { parse_mode: 'Markdown' }
                 );
             } else if (recon.overallVerdict === 'needs_approval') {
-                const approvalId = storePendingApproval(recon, finale);
+                const approvalId = await storePendingApproval(recon, finale);
                 await ctx.reply(
                     recon.summary + '\n\n☝️ Tap to approve or reject:',
                     {
@@ -1914,448 +1761,52 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
         let reply = "";
 
-        if (openai) {
-            const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-                {
-                    type: "function",
-                    function: {
-                        name: "get_weather",
-                        description: "Get real-time weather information for a specific location.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                location: { type: "string", description: "City and State, e.g. Montrose, CO" }
-                            },
-                            required: ["location"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "list_recent_emails",
-                        description: "List the 5 most recent emails from the inbox.",
-                        parameters: { type: "object", properties: {} }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "perplexity_search",
-                        description: "Search the internet for real-time information.",
-                        parameters: {
-                            type: "object",
-                            properties: { query: { type: "string" } },
-                            required: ["query"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "lookup_product",
-                        description: "Look up a SPECIFIC product in Finale Inventory by EXACT SKU. Returns stock, lead time, supplier, cost, and reorder info. Only use this when you know the exact SKU.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                sku: { type: "string", description: "The exact product SKU/ID in Finale (e.g. S-12527, BC101, PU102)" }
-                            },
-                            required: ["sku"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "search_products",
-                        description: "Search Finale Inventory for products by keyword in name or description. Use this when Will asks to find, list, or search for products by name, ingredient, vendor, or description — e.g. 'kashi skus', 'kelp products', 'find castings items'. Returns matching SKUs with stock levels.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                keyword: { type: "string", description: "Search keyword to match against product names and SKUs (e.g. 'kashi', 'kelp', 'castings', 'bag')" },
-                                limit: { type: "number", description: "Max results to return (default 20)" }
-                            },
-                            required: ["keyword"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "get_consumption",
-                        description: "Get BOM consumption and stock info for a specific SKU over a number of days. Use this when the user asks for consumption of a SKU, e.g., 'consumption for KM106' or '/consumption KM106'.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                sku: { type: "string", description: "The exact product SKU/ID (e.g. KM106, S-12527)" },
-                                days: { type: "number", description: "Number of days to analyze (default 90)" }
-                            },
-                            required: ["sku"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "build_risk_analysis",
-                        description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
-                        parameters: { type: "object", properties: {} }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "get_purchase_history",
-                        description: "Get the total quantity purchased/received for a specific SKU over a time period. Use this when the user asks 'how much was purchased', 'total received', 'purchase history', or 'how much did we buy' for a product. Returns exact PO quantities from Finale.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                sku: { type: "string", description: "The exact product SKU/ID (e.g. PLQ101, KM106)" },
-                                days: { type: "number", description: "Number of days back to search (default 365)" }
-                            },
-                            required: ["sku"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "query_vendors",
-                        description: "Look up vendor info from our database by name. Returns payment terms, contact, AR email, total spend, last order date. Use when Will asks about a specific vendor, payment terms, who to contact, or vendor history.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                name: { type: "string", description: "Partial or full vendor name to search (e.g. 'AAA Cooper', 'Kashi', 'BioAg')" }
-                            },
-                            required: ["name"]
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "query_invoices",
-                        description: "Query invoices from our database. Use when Will asks about invoice status, unmatched invoices, overdue invoices, or invoice amounts. Filter by status: 'pending', 'matched', 'unmatched', 'paid', 'overdue'.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
-                                status: { type: "string", description: "Filter by status: pending, matched, unmatched, paid, overdue" },
-                                limit: { type: "number", description: "Max results (default 10)" }
-                            }
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "query_purchase_orders",
-                        description: "Query purchase orders from our database. Use when Will asks about open POs, PO status, what's on order, or expected deliveries. Filter by status: 'open', 'received', 'closed', 'partial'.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                vendor_name: { type: "string", description: "Filter by vendor name (partial match)" },
-                                status: { type: "string", description: "Filter by status: open, received, closed, partial" },
-                                limit: { type: "number", description: "Max results (default 10)" }
-                            }
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "query_action_items",
-                        description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for follow-up. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                limit: { type: "number", description: "Max results (default 10)" }
-                            }
-                        }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "reorder_assessment",
-                        description: "Scan all active Finale products and return external-vendor reorder recommendations grouped by vendor with urgency. Use when Will asks about reorders, low stock, what to order, purchasing needs, or 'what do we need to buy'.",
-                        parameters: { type: "object", properties: {} }
-                    }
-                },
-                {
-                    type: "function",
-                    function: {
-                        name: "create_draft_pos",
-                        description: "Create draft purchase orders in Finale for human review and commit. Creates one PO per vendor for all flagged reorder items, or filtered to a specific vendor. Draft POs appear in Finale as ORDER_CREATED for Will to review and commit.",
-                        parameters: {
-                            type: "object",
-                            properties: {
-                                vendor_filter: { type: "string", description: "Optional vendor name to create PO for only that vendor. Omit to create all flagged POs." }
-                            }
-                        }
-                    }
-                }
-            ];
+        try {
+            // DECISION(2026-03-06): Same Gemini + tools pattern as processTextMessage.
+            const tools = getAriaTools({ finale, perplexity, bot, chatId });
+            const conversationMessages = chatHistory[chatId]
+                .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+                .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
-            const response = await openai.chat.completions.create({
-                model: CHAT_MODEL,
-                messages: [
-                    {
-                        role: "system", content: SYSTEM_PROMPT + memoryContext + runtimeRules
-                    },
-                    ...chatHistory[chatId]
-                ],
+            const { text: geminiReply, steps } = await generateText({
+                model: googleAI('gemini-2.0-flash'),
+                system: SYSTEM_PROMPT + memoryContext + runtimeRules,
+                messages: conversationMessages,
                 tools,
-                tool_choice: "auto",
+                stopWhen: stepCountIs(5),
             });
+            reply = geminiReply;
+            chatHistory[chatId].push({ role: 'assistant', content: reply });
 
-            const message = response.choices[0].message;
-
-            if (message.tool_calls) {
-                const toolResults: any[] = [];
-                for (const toolCall of message.tool_calls) {
-                    const args = JSON.parse(toolCall.function.arguments);
-                    let result = "";
-
-                    if (toolCall.function.name === "get_weather") {
-                        const Firecrawl = require('@mendable/firecrawl-js').default;
-                        const app = new Firecrawl({ apiKey: process.env.FIRECRAWL_API_KEY });
-                        const scrape = await app.scrapeUrl(`https://duckduckgo.com/?q=weather+in+${encodeURIComponent(args.location)}`, { formats: ['markdown'] });
-                        result = scrape.success ? scrape.markdown : "Could not retrieve weather.";
-                    } else if (toolCall.function.name === "perplexity_search" && perplexity) {
-                        const res = await perplexity.chat.completions.create({
-                            model: "sonar-reasoning",
-                            messages: [{ role: "user", content: args.query }]
-                        });
-                        result = res.choices[0].message.content || "";
-                    } else if (toolCall.function.name === "list_recent_emails") {
-                        const auth = await getAuthenticatedClient("default");
-                        const gmail = google.gmail({ version: "v1", auth });
-                        const { data } = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
-                        result = JSON.stringify(data.messages);
-                    } else if (toolCall.function.name === "lookup_product") {
-                        const report = await finale.productReport(args.sku);
-                        result = report.telegramMessage;
-                    } else if (toolCall.function.name === "get_purchase_history") {
-                        const purchased = await finale.getPurchasedQty(args.sku, args.days || 365);
-                        if (purchased.totalQty > 0) {
-                            result = `${args.sku}: Purchased ${purchased.totalQty.toFixed(1)} units across ${purchased.orderCount} PO(s) in the last ${args.days || 365} days.`;
-                        } else {
-                            result = `${args.sku}: No purchase/receiving records found in the last ${args.days || 365} days.`;
-                        }
-                    } else if (toolCall.function.name === "search_products") {
-                        const searchResult = await finale.searchProducts(args.keyword, args.limit || 20);
-                        result = searchResult.telegramMessage;
-                    } else if (toolCall.function.name === "get_consumption") {
-                        const report = await finale.getBOMConsumption(args.sku, args.days || 90);
-                        result = report.telegramMessage;
-                    } else if (toolCall.function.name === "build_risk_analysis") {
-                        const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
-                        const report = await runBuildRiskAnalysis(30, () => { });
-                        result = report.slackMessage;
-                    } else if (toolCall.function.name === "reorder_assessment") {
-                        const { FinaleClient } = await import('../lib/finale/client');
-                        const finaleClient = new FinaleClient();
-                        const groups = await finaleClient.getExternalReorderItems();
-                        if (groups.length === 0) {
-                            result = "✅ All stocking items are within safe levels — nothing to reorder.";
-                        } else {
-                            const crit = groups.filter((g: any) => g.urgency === 'critical');
-                            const warn = groups.filter((g: any) => g.urgency === 'warning');
-                            const flag = groups.filter((g: any) => g.urgency === 'reorder_flagged');
-                            const lines: string[] = [`📦 *Reorder Assessment* — ${groups.length} vendor${groups.length !== 1 ? 's' : ''} flagged\n`];
-                            if (crit.length) lines.push(`🔴 *Critical (<14d):* ${crit.map((g: any) => `${g.vendorName} (${g.items.length})`).join(', ')}`);
-                            if (warn.length) lines.push(`🟡 *Warning (14–44d):* ${warn.map((g: any) => `${g.vendorName} (${g.items.length})`).join(', ')}`);
-                            if (flag.length) lines.push(`📦 *Flagged:* ${flag.map((g: any) => g.vendorName).join(', ')}`);
-                            const allItems = groups.flatMap((g: any) => g.items.map((i: any) => ({ ...i, vendor: g.vendorName })));
-                            const topItems = allItems
-                                .filter((i: any) => i.stockoutDays !== null)
-                                .sort((a: any, b: any) => (a.stockoutDays ?? 999) - (b.stockoutDays ?? 999))
-                                .slice(0, 5);
-                            if (topItems.length) {
-                                lines.push(`\n*Most urgent SKUs:*`);
-                                for (const i of topItems) {
-                                    lines.push(`  • ${i.productId} — ${i.stockoutDays}d out · ${i.vendor}${i.reorderQty ? ` · qty:${i.reorderQty}` : ''}`);
-                                }
-                            }
-                            lines.push(`\nSay "create draft POs" to generate Finale drafts for all vendors.`);
-                            result = lines.join('\n');
-                        }
-                    } else if (toolCall.function.name === "create_draft_pos") {
-                        const { FinaleClient } = await import('../lib/finale/client');
-                        const finaleClient = new FinaleClient();
-                        const groups = await finaleClient.getExternalReorderItems();
-                        const filtered = args.vendor_filter
-                            ? groups.filter((g: any) => g.vendorName.toLowerCase().includes((args.vendor_filter as string).toLowerCase()))
-                            : groups;
-                        if (filtered.length === 0) {
-                            result = args.vendor_filter
-                                ? `No reorder items found for vendor matching "${args.vendor_filter}".`
-                                : "No external vendor reorder items found.";
-                        } else {
-                            const created: string[] = [];
-                            const chatId = ctx.chat?.id?.toString() ?? process.env.TELEGRAM_CHAT_ID ?? '';
-                            for (const group of filtered) {
-                                try {
-                                    const items = group.items.map((i: any) => ({
-                                        productId: i.productId,
-                                        quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
-                                        unitPrice: i.unitPrice,
-                                        orderIncrementQty: i.orderIncrementQty ?? null,
-                                        isBulkDelivery: i.isBulkDelivery ?? false,
-                                    }));
-                                    const po = await finaleClient.createDraftPurchaseOrder(
-                                        group.vendorPartyId, items,
-                                        `Auto-generated draft — review and commit in Finale`
-                                    );
-                                    let poLine = `✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
-                                    if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
-                                    if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
-                                    created.push(poLine);
-                                    // Send inline Review & Send keyboard for this PO
-                                    if (chatId) {
-                                        ctx.telegram.sendMessage(chatId, poLine, {
-                                            reply_markup: {
-                                                inline_keyboard: [[
-                                                    { text: '📋 Review & Send', callback_data: `po_review_${po.orderId}` },
-                                                    { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
-                                                ]],
-                                            },
-                                        }).catch(() => { });
-                                    }
-                                } catch (e: any) {
-                                    created.push(`❌ ${group.vendorName}: ${e.message}`);
-                                }
-                            }
-                            result = `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
-                        }
-                    } else if (toolCall.function.name === "query_vendors") {
-                        const { createClient } = await import('../lib/supabase');
-                        const db = createClient();
-                        if (!db) {
-                            result = "Supabase not configured.";
-                        } else {
-                            const { data, error } = await db.from('vendors')
-                                .select('name, aliases, payment_terms, contact_name, contact_email, ar_email, category, total_spend, last_order_date, average_payment_days')
-                                .ilike('name', `%${args.name}%`)
-                                .limit(5);
-                            if (error) result = `DB error: ${error.message}`;
-                            else if (!data?.length) result = `No vendors found matching "${args.name}".`;
-                            else result = JSON.stringify(data, null, 2);
-                        }
-                    } else if (toolCall.function.name === "query_invoices") {
-                        const { createClient } = await import('../lib/supabase');
-                        const db = createClient();
-                        if (!db) {
-                            result = "Supabase not configured.";
-                        } else {
-                            let q = db.from('invoices')
-                                .select('invoice_number, po_number, total_amount, due_date, status, discrepancies, created_at, vendors(name)')
-                                .order('created_at', { ascending: false })
-                                .limit(args.limit || 10);
-                            if (args.status) q = q.eq('status', args.status);
-                            if (args.vendor_name) {
-                                // Join-filter via vendor name requires a subquery; approximate with vendor id lookup
-                                const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
-                                if (vd?.length) q = q.eq('vendor_id', vd[0].id);
-                            }
-                            const { data, error } = await q;
-                            if (error) result = `DB error: ${error.message}`;
-                            else if (!data?.length) result = `No invoices found${args.status ? ` with status "${args.status}"` : ''}.`;
-                            else result = JSON.stringify(data, null, 2);
-                        }
-                    } else if (toolCall.function.name === "query_purchase_orders") {
-                        const { createClient } = await import('../lib/supabase');
-                        const db = createClient();
-                        if (!db) {
-                            result = "Supabase not configured.";
-                        } else {
-                            let q = db.from('purchase_orders')
-                                .select('po_number, issue_date, required_date, status, total_amount, line_items, vendors(name)')
-                                .order('issue_date', { ascending: false })
-                                .limit(args.limit || 10);
-                            if (args.status) q = q.eq('status', args.status);
-                            if (args.vendor_name) {
-                                const { data: vd } = await db.from('vendors').select('id').ilike('name', `%${args.vendor_name}%`).limit(1);
-                                if (vd?.length) q = q.eq('vendor_id', vd[0].id);
-                            }
-                            const { data, error } = await q;
-                            if (error) result = `DB error: ${error.message}`;
-                            else if (!data?.length) result = `No purchase orders found${args.status ? ` with status "${args.status}"` : ''}.`;
-                            else result = JSON.stringify(data, null, 2);
-                        }
-                    } else if (toolCall.function.name === "query_action_items") {
-                        const { createClient } = await import('../lib/supabase');
-                        const db = createClient();
-                        if (!db) {
-                            result = "Supabase not configured.";
-                        } else {
-                            const { data, error } = await db.from('documents')
-                                .select('type, vendor_ref, action_summary, confidence, source, created_at')
-                                .eq('action_required', true)
-                                .order('created_at', { ascending: false })
-                                .limit(args.limit || 10);
-                            if (error) result = `DB error: ${error.message}`;
-                            else if (!data?.length) result = "No pending action items found.";
-                            else result = JSON.stringify(data, null, 2);
-                        }
-                    }
-
-                    toolResults.push({ role: "tool", tool_call_id: toolCall.id, content: result });
-                }
-
-                const finalRes = await openai.chat.completions.create({
-                    model: CHAT_MODEL,
-                    messages: [
-                        { role: "system", content: SYSTEM_PROMPT },
-                        ...chatHistory[chatId],
-                        message,
-                        ...toolResults
-                    ]
-                });
-                reply = finalRes.choices[0].message.content || "";
-
-                // Save AI reply to history
-                chatHistory[chatId].push(message);
-                chatHistory[chatId].push(...toolResults);
-                chatHistory[chatId].push({ role: "assistant", content: reply });
-
-                // Auto-learn: store the Q→A pattern so future identical/similar questions
-                // get instant answers from memory context instead of re-calling tools.
+            // Auto-learn: store tool usage patterns in memory (fire-and-forget)
+            const toolsUsed = steps
+                .flatMap(s => s.toolCalls || [])
+                .map((tc: any) => tc.toolName);
+            if (toolsUsed.length > 0) {
                 setImmediate(async () => {
                     try {
                         const { remember } = await import('../lib/intelligence/memory');
-                        const toolsUsed = message.tool_calls!.map(tc => tc.function.name).join(', ');
-                        const resultSummary = toolResults
-                            .map(tr => String(tr.content).slice(0, 300))
-                            .join(' | ');
-                        // Determine memory category from tool type
-                        const firstTool = message.tool_calls![0].function.name;
+                        const firstTool = toolsUsed[0];
                         const category =
                             firstTool.includes('vendor') ? 'vendor_pattern' :
                                 firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
                                     firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
                                         'conversation';
-                        // Extract any SKU-like tags from the user message + results
-                        const tagMatches = (userText + ' ' + resultSummary).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                        const tagMatches = (userText + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
                         const tags = [...new Set(tagMatches)].slice(0, 5);
                         await remember({
                             category,
-                            content: `Q: "${userText.slice(0, 150)}" → Tool: ${toolsUsed} → A: "${reply.slice(0, 300)}"`,
+                            content: `Q: "${userText.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
                             tags,
                             source: 'telegram_auto',
                             priority: 'low',
                         });
                     } catch { /* non-critical, never block the response */ }
                 });
-            } else {
-                reply = message.content || "";
-
-                // Save AI reply to history
-                chatHistory[chatId].push({ role: "assistant", content: reply });
             }
-        } else {
-            // No OpenAI — use Unified with full conversation history
+        } catch (geminiErr: any) {
+            // Fallback: if Gemini fails, use the unified chain (which includes Ollama)
+            console.warn(`⚠️ Gemini chat failed: ${geminiErr.message}. Falling back to unified chain.`);
             reply = await unifiedTextGeneration({
                 system: SYSTEM_PROMPT + memoryContext + runtimeRules,
                 messages: chatHistory[chatId]
@@ -2378,6 +1829,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         ctx.reply(`⚠️ Ops: ${err.message}`);
     }
 });
+
 
 // Boot — clear any competing session first, then start long-polling
 (async () => {
@@ -2460,7 +1912,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     bot.action(/^dropship_fwd_(.+)$/, async (ctx) => {
         const dropId = ctx.match[1];
-        const pending = getPendingDropship(dropId);
+        const pending = await getPendingDropship(dropId);
 
         // Must answer the callback query within 10s regardless of outcome.
         // Use neutral text here; the editMessageText below gives the real status.
@@ -2482,7 +1934,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             } catch {
                 authClient = await getAuthenticatedClient('default');
             }
-            const gmail = google.gmail({ version: 'v1', auth: authClient });
+            const gmail = GmailApi({ version: 'v1', auth: authClient });
 
             const boundary = 'b_aria_drop_' + Math.random().toString(36).substring(2);
             const mime = [
@@ -2511,7 +1963,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 requestBody: { raw: Buffer.from(mime).toString('base64url') },
             });
 
-            removePendingDropship(dropId);
+            await removePendingDropship(dropId);
 
             const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
                 ? ctx.callbackQuery.message.text : '';
@@ -2526,7 +1978,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     bot.action(/^invoice_has_po_(.+)$/, async (ctx) => {
         const dropId = ctx.match[1];
-        const pending = getPendingDropship(dropId);
+        const pending = await getPendingDropship(dropId);
         await ctx.answerCbQuery('Enter the PO number in chat');
         const name = pending ? pending.invoiceNumber : dropId;
 
@@ -2552,7 +2004,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         const dropId = ctx.match[1];
         await ctx.answerCbQuery('Skipped');
-        removePendingDropship(dropId);
+        await removePendingDropship(dropId);
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
         await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched in Supabase.');
@@ -2570,9 +2022,9 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         const orderId = ctx.match[1];
         await ctx.answerCbQuery('Fetching PO details…');
         try {
-            const { FinaleClient } = await import('../lib/finale/client');
-            const finale = new FinaleClient();
-            const review = await finale.getDraftPOForReview(orderId);
+            // Reuse module-level finale singleton instead of creating a new instance
+            const reviewClient = finale;
+            const review = await reviewClient.getDraftPOForReview(orderId);
 
             if (!review.canCommit) {
                 await ctx.editMessageText(
@@ -2695,6 +2147,59 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         console.warn('⚠️ Memory seed failed (non-fatal):', err.message);
     }
 
+    // Start aria-review folder watcher
+    try {
+        const reviewAgent = new APAgent(bot);
+        await initAriaReviewWatcher(reviewAgent);
+    } catch (err: any) {
+        console.warn('[aria-review] Watcher failed to start (non-fatal):', err.message);
+    }
+
+    // ── Restore pending approvals from Supabase (survive pm2 restart) ────────────
+    try {
+        const pending = await loadPendingApprovalsFromSupabase();
+
+        if (pending.length > 0) {
+            console.log(`[boot] Restoring ${pending.length} pending approval(s) from Supabase...`);
+
+            for (const entry of pending) {
+                const { approvalId, result, telegramChatId, expiresAt } = entry;
+
+                const minutesLeft = Math.round((expiresAt.getTime() - Date.now()) / 60000);
+
+                if (minutesLeft <= 0) {
+                    console.log(`[boot] Skipping expired approval ${approvalId} (already past 24h window)`);
+                    continue;
+                }
+
+                const chatId = Number(telegramChatId) || Number(process.env.TELEGRAM_CHAT_ID);
+                if (!chatId) {
+                    console.warn(`[boot] No chat ID for approval ${approvalId} — skipping`);
+                    continue;
+                }
+
+                const summaryText = buildRestoredApprovalMessage(result, approvalId, minutesLeft);
+
+                try {
+                    await bot.telegram.sendMessage(chatId, summaryText, {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '✅ Approve & Apply', callback_data: `approve_${approvalId}` },
+                                { text: '❌ Reject', callback_data: `reject_${approvalId}` },
+                            ]],
+                        },
+                    });
+                    console.log(`[boot] Restored approval prompt for ${approvalId} (${minutesLeft}m remaining)`);
+                } catch (sendErr: any) {
+                    console.warn(`[boot] Could not send restored approval for ${approvalId}: ${sendErr.message}`);
+                }
+            }
+        }
+    } catch (err: any) {
+        console.warn('[boot] Could not restore pending approvals (non-fatal):', err.message);
+    }
+
     const ops = new OpsManager(bot);
     ops.start();
 
@@ -2718,6 +2223,36 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     console.log('   🗓️  Weekly Review:     8:01 AM MT (Fridays)');
     console.log('   📦 PO Sync:           Every 30 min');
     console.log('   🧹 Ad Cleanup:        Every hour');
+
+    // ── MEMORY MONITORING (OOM prevention) ──
+    // DECISION(2026-03-09): Log memory usage hourly for PM2 log analysis.
+    // Also provides /memory command for on-demand diagnostics.
+    setInterval(() => {
+        const mem = process.memoryUsage();
+        const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+        console.log(
+            `[memory] RSS: ${mb(mem.rss)}MB | Heap: ${mb(mem.heapUsed)}/${mb(mem.heapTotal)}MB` +
+            ` | External: ${mb(mem.external)}MB | Chats: ${Object.keys(chatHistory).length}`
+        );
+    }, 15 * 60 * 1000); // every 15 minutes
+
+    let lastMemAlertSent = 0;
+    setInterval(async () => {
+        const heapUsed = process.memoryUsage().heapUsed;
+        const HEAP_THRESHOLD = 768 * 1024 * 1024;
+        const COOLDOWN = 2 * 60 * 60 * 1000;
+        if (heapUsed > HEAP_THRESHOLD && Date.now() - lastMemAlertSent > COOLDOWN) {
+            const mb = Math.round(heapUsed / 1024 / 1024);
+            const chatId = process.env.TELEGRAM_CHAT_ID;
+            if (chatId) {
+                await bot.telegram.sendMessage(
+                    chatId,
+                    `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
+                ).catch(() => { });
+                lastMemAlertSent = Date.now();
+            }
+        }
+    }, 30 * 60 * 1000); // every 30 minutes
 })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

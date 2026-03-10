@@ -23,10 +23,11 @@ type Snapshot = {
   components: Record<string, ComponentRisk>;
 };
 
+// DECISION(2026-03-10): Badge hierarchy reform — only CRITICAL gets a filled pill.
 const RISK = {
   CRITICAL: { badge: "bg-rose-500/20 text-rose-300 border-rose-500/40", dot: "bg-rose-500", order: 0 },
-  WARNING: { badge: "bg-amber-500/20 text-amber-300 border-amber-500/40", dot: "bg-amber-400", order: 1 },
-  WATCH: { badge: "bg-blue-500/20 text-blue-300 border-blue-500/40", dot: "bg-blue-400", order: 2 },
+  WARNING: { badge: "text-amber-400", dot: "bg-amber-400", order: 1 },
+  WATCH: { badge: "text-blue-400", dot: "bg-blue-400", order: 2 },
   OK: { badge: "", dot: "", order: 3 },
 };
 
@@ -107,10 +108,10 @@ export default function BuildRiskPanel() {
   return (
     <div className="border-b border-zinc-800 shrink-0">
       {/* Section header */}
-      <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50">
+      <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
         <TrendingDown className="w-3.5 h-3.5 text-zinc-500" />
         <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Build Risk</span>
-        {snapshot && <span className="text-xs text-zinc-700">{timeAgo(snapshot.generated_at)}</span>}
+        {snapshot && <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(snapshot.generated_at)}</span>}
         <div className="flex-1" />
         {snapshot && (
           <div className="flex items-center gap-1.5">
@@ -120,16 +121,16 @@ export default function BuildRiskPanel() {
               </span>
             )}
             {snapshot.warning_count > 0 && (
-              <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-300 border-amber-500/40">
+              <span className="text-xs font-mono text-amber-400">
                 {snapshot.warning_count} WARN
               </span>
             )}
             {snapshot.watch_count > 0 && (
-              <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-blue-500/20 text-blue-300 border-blue-500/40">
+              <span className="text-xs font-mono text-blue-400">
                 {snapshot.watch_count} WATCH
               </span>
             )}
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-zinc-800 text-zinc-500 border-zinc-700">
+            <span className="text-xs font-mono text-[var(--dash-l3)]">
               {snapshot.ok_count} OK
             </span>
           </div>
@@ -162,10 +163,10 @@ export default function BuildRiskPanel() {
                     {/* Line 1: SKU + stockout + POs */}
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-sm font-mono font-semibold text-zinc-100">{comp.componentSku}</span>
-                      <span className={`text-[11px] font-mono px-1.5 py-0.5 rounded border ${cfg.badge}`}>
+                      <span className={`text-[11px] font-mono ${comp.riskLevel === "CRITICAL" ? `px-1.5 py-0.5 rounded border ${cfg.badge}` : cfg.badge}`}>
                         {comp.riskLevel}
                       </span>
-                      <span className="text-xs text-zinc-400">
+                      <span className="text-xs text-[var(--dash-l2)]">
                         {comp.stockoutDays !== null ? `${comp.stockoutDays}d` : "no data"}
                       </span>
                       {comp.incomingPOs.length > 0 && (
@@ -176,7 +177,7 @@ export default function BuildRiskPanel() {
                     </div>
                     {/* Line 2: used in */}
                     {comp.usedIn.length > 0 && (
-                      <div className="mt-0.5 text-xs text-zinc-600">
+                      <div className="mt-0.5 text-xs text-[var(--dash-l3)]">
                         {comp.usedIn.slice(0, 4).join("  ·  ")}
                         {comp.usedIn.length > 4 && <span> +{comp.usedIn.length - 4}</span>}
                       </div>

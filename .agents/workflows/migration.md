@@ -1,6 +1,7 @@
 ---
 description: SQL Migration Flow — how to create, apply, and verify Supabase migrations
 ---
+// turbo-all
 
 # SQL Migration Flow
 

@@ -14,6 +14,8 @@ export interface PDFExtractionResult {
     tables: TableData[];
     metadata: PDFMetadata;
     hasImages: boolean;
+    ocrStrategy?: string;       // M1: Which extraction strategy succeeded (e.g., "pdf-parse", "anthropic", "openai", "openrouter", "gemini")
+    ocrDurationMs?: number;     // M1: Time taken for extraction in milliseconds
 }
 
 export interface PageContent {
@@ -43,6 +45,7 @@ export interface PDFMetadata {
  * and finally LLM-based OCR if the document appears to be scanned.
  */
 export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
+    const startTime = Date.now();
     let parsed: any;
     try {
         parsed = await pdfParse(buffer, {
@@ -50,7 +53,7 @@ export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
         });
     } catch (err: any) {
         console.warn(`⚠️ Fast PDF parse failed (${err.message}). Falling back to visual LLM OCR...`);
-        return await extractScannedPDF(buffer, { rawText: "", tables: [], pageCount: 1 });
+        return await extractScannedPDF(buffer, { rawText: "", tables: [], pageCount: 1 }, startTime);
     }
 
     const rawText = parsed.text;
@@ -65,7 +68,7 @@ export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
 
     if (textDensity < 0.1) {
         // Scanned document — pass to LLM vision/document support
-        return await extractScannedPDF(buffer, { rawText, tables, pageCount });
+        return await extractScannedPDF(buffer, { rawText, tables, pageCount }, startTime);
     }
 
     return {
@@ -80,6 +83,8 @@ export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
             fileSize: buffer.length,
         },
         hasImages: textDensity < 0.3,
+        ocrStrategy: "pdf-parse",
+        ocrDurationMs: Date.now() - startTime,
     };
 }
 
@@ -93,9 +98,11 @@ const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. 
  */
 async function extractScannedPDF(
     buffer: Buffer,
-    partial: { rawText: string; tables: TableData[]; pageCount: number }
+    partial: { rawText: string; tables: TableData[]; pageCount: number },
+    startTime: number = Date.now()
 ): Promise<PDFExtractionResult> {
     let extractedText = "";
+    let successStrategy = "unknown";
 
     // Strategy A: Anthropic direct SDK (native PDF document blocks — cheap Haiku, paid key always available)
     console.log(`[extractor] Strategy A — Anthropic key: ${process.env.ANTHROPIC_API_KEY ? "SET" : "MISSING"}`);
@@ -127,7 +134,10 @@ async function extractScannedPDF(
                 .filter(b => b.type === "text")
                 .map(b => (b as any).text)
                 .join("\n");
-            if (extractedText) console.log(`[extractor] Strategy B succeeded — ${extractedText.length} chars`);
+            if (extractedText) {
+                console.log(`[extractor] Strategy A succeeded — ${extractedText.length} chars`);
+                successStrategy = "anthropic";
+            }
         } catch (err: any) {
             console.warn("⚠️ Anthropic PDF extraction failed:", err.message);
         }
@@ -191,7 +201,8 @@ async function extractScannedPDF(
                     const openaiData = await openaiRes.json() as any;
                     if (openaiData.error) throw new Error(JSON.stringify(openaiData.error));
                     extractedText = openaiData.output?.[0]?.content?.[0]?.text || "";
-                    console.log(`[extractor] Strategy C result — ${extractedText.length} chars`);
+                    if (extractedText) successStrategy = "openai";
+                    console.log(`[extractor] Strategy B result — ${extractedText.length} chars`);
                 } finally {
                     clearTimeout(inferTimeout);
                     // Best-effort cleanup: delete the uploaded file
@@ -245,7 +256,8 @@ async function extractScannedPDF(
                 const orData = await orRes.json() as any;
                 if (orData.error) throw new Error(JSON.stringify(orData.error));
                 extractedText = orData.choices?.[0]?.message?.content || "";
-                console.log(`[extractor] Strategy D result — ${extractedText.length} chars`);
+                if (extractedText) successStrategy = "openrouter";
+                console.log(`[extractor] Strategy C result — ${extractedText.length} chars`);
             } finally {
                 clearTimeout(timeoutId);
             }
@@ -278,7 +290,10 @@ async function extractScannedPDF(
             const geminiData = await geminiRes.json() as any;
             if (geminiData.error) throw new Error(geminiData.error.message);
             extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-            if (extractedText) console.log(`[extractor] Strategy D succeeded — ${extractedText.length} chars`);
+            if (extractedText) {
+                console.log(`[extractor] Strategy D succeeded — ${extractedText.length} chars`);
+                successStrategy = "gemini";
+            }
         } catch (err: any) {
             console.warn("⚠️ Gemini PDF extraction failed:", err.message);
         }
@@ -297,6 +312,8 @@ async function extractScannedPDF(
             fileSize: buffer.length,
         },
         hasImages: true,
+        ocrStrategy: successStrategy,
+        ocrDurationMs: Date.now() - startTime,
     };
 }
 

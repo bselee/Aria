@@ -189,12 +189,30 @@ interface FacilityInfo {
     name: string;  // e.g. "Shipping", "Soil"
 }
 let _facilityCache: FacilityInfo[] | null = null;
+let _facilityCacheAt = 0;
+const FACILITY_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
+// DECISION(2026-03-09): Moved partyNameCache from instance-level to module-level.
+// Previously, each `new FinaleClient()` created its own Map that populated
+// independently. With 48+ instantiation sites (cron jobs, command handlers),
+// this caused unbounded memory growth as async closures kept instances alive.
+// Module-level cache is shared across all instances — one Map, bounded.
+const _partyNameCache = new Map<string, string>();  // party URL → name
+let _partyNameCacheAt = 0;
+const PARTY_NAME_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
+const PARTY_NAME_CACHE_MAX = 500;
+
+// Shared party resolution cache — partyId → resolved party info + timestamp.
+// Shared across getExternalReorderItems() and getPurchasingIntelligence() so
+// concurrent scans don't duplicate partygroup API calls for the same vendor.
+const _partyCacheShared = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean; ts: number }>();
+const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
+const PARTY_CACHE_MAX = 200;
 
 export class FinaleClient {
     private authHeader: string;
     private apiBase: string;
     private accountPath: string;
-    private partyNameCache = new Map<string, string>();  // party URL → name
 
     constructor() {
         const apiKey = process.env.FINALE_API_KEY || "";
@@ -226,7 +244,7 @@ export class FinaleClient {
      * Typically returns: Shipping, Soil, and any other configured locations.
      */
     async getFacilities(): Promise<FacilityInfo[]> {
-        if (_facilityCache) return _facilityCache;
+        if (_facilityCache && Date.now() - _facilityCacheAt < FACILITY_CACHE_TTL) return _facilityCache;
 
         try {
             const data = await this.get(`/${this.accountPath}/api/facility`);
@@ -254,6 +272,7 @@ export class FinaleClient {
             }
 
             _facilityCache = facilities;
+            _facilityCacheAt = Date.now();
 
             console.log(`[finale] getFacilities: found ${_facilityCache.length} facilities: ${_facilityCache.map(f => f.name).join(', ')}`);
             return _facilityCache;
@@ -2132,24 +2151,77 @@ export class FinaleClient {
         }
     }
 
+    /**
+     * H3 FIX: Retry wrapper with exponential backoff for transient Finale API failures.
+     * Retries on: 5xx server errors, network failures, 429 rate limits.
+     * Does NOT retry: 4xx client errors (bad request, not found, auth failure).
+     *
+     * @param fn       - Async function that performs the fetch
+     * @param label    - Human-readable label for logging (e.g., "GET /api/order/123")
+     * @param maxRetries - Maximum retry attempts (default: 3)
+     */
+    private async fetchWithRetry<T>(
+        fn: () => Promise<Response>,
+        label: string,
+        maxRetries = 3
+    ): Promise<T> {
+        let lastError: Error | null = null;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const response = await fn();
+
+                // 429 rate limit: wait 5s and retry
+                if (response.status === 429 && attempt < maxRetries) {
+                    console.warn(`[FinaleClient] 429 rate-limited on ${label} — waiting 5s (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(r => setTimeout(r, 5000));
+                    continue;
+                }
+
+                // 5xx server error: exponential backoff
+                if (response.status >= 500 && attempt < maxRetries) {
+                    const delayMs = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+                    console.warn(`[FinaleClient] ${response.status} on ${label} — retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                    continue;
+                }
+
+                // Non-retryable error (4xx) or final attempt
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Finale API ${response.status}: ${response.statusText} — ${errorText.substring(0, 200)}`);
+                }
+
+                return await response.json() as T;
+            } catch (err: any) {
+                lastError = err;
+                // Network error (not HTTP error): retry with backoff
+                if (err.name === "TypeError" || err.code === "ECONNRESET" || err.code === "ETIMEDOUT" || err.code === "ENOTFOUND") {
+                    if (attempt < maxRetries) {
+                        const delayMs = Math.pow(2, attempt) * 1000;
+                        console.warn(`[FinaleClient] Network error on ${label}: ${err.message} — retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+                        await new Promise(r => setTimeout(r, delayMs));
+                        continue;
+                    }
+                }
+                throw err;
+            }
+        }
+        throw lastError ?? new Error(`Finale API retry exhausted for ${label}`);
+    }
+
     private async get(endpoint: string): Promise<any> {
         const url = `${this.apiBase}${endpoint}`;
-
-        const response = await fetch(url, {
-            method: "GET",
-            headers: {
-                Authorization: this.authHeader,
-                Accept: "application/json",
-                "Content-Type": "application/json",
-            },
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Finale API ${response.status}: ${response.statusText} — ${errorText.substring(0, 200)}`);
-        }
-
-        return response.json();
+        return this.fetchWithRetry(
+            () => fetch(url, {
+                method: "GET",
+                headers: {
+                    Authorization: this.authHeader,
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                },
+            }),
+            `GET ${endpoint}`
+        );
     }
 
     /**
@@ -2161,23 +2233,18 @@ export class FinaleClient {
      */
     private async post(endpoint: string, body: any): Promise<any> {
         const url = `${this.apiBase}${endpoint}`;
-
-        const response = await fetch(url, {
-            method: "POST",
-            headers: {
-                Authorization: this.authHeader,
-                Accept: "application/json",
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify(body),
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Finale API POST ${response.status}: ${response.statusText} — ${errorText.substring(0, 200)}`);
-        }
-
-        return response.json();
+        return this.fetchWithRetry(
+            () => fetch(url, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(body),
+            }),
+            `POST ${endpoint}`
+        );
     }
 
     // ──────────────────────────────────────────────────
@@ -2552,14 +2619,15 @@ export class FinaleClient {
      * Caches results so we don't re-fetch for the same vendor.
      */
     private async resolvePartyName(partyUrl: string): Promise<string> {
-        if (this.partyNameCache.has(partyUrl)) {
-            return this.partyNameCache.get(partyUrl)!;
+        const cache = this.getPartyNameCache();
+        if (cache.has(partyUrl)) {
+            return cache.get(partyUrl)!;
         }
 
         try {
             const data = await this.get(partyUrl);
             const name = data.groupName || data.partyId || "Unknown";
-            this.partyNameCache.set(partyUrl, name);
+            cache.set(partyUrl, name);
             return name;
         } catch {
             return "Unknown";
@@ -2950,13 +3018,15 @@ export class FinaleClient {
         if (atRisk.length === 0) return [];
 
         // ── Step 2: Resolve supplier for each at-risk product (batched, 5x concurrency) ──
-        // Cache partyId → { groupName, isManufactured, isDropship } to avoid repeat calls
+        // Uses module-level _partyCacheShared (TTL 1h, 200-entry cap) so concurrent
+        // scans with getPurchasingIntelligence() share partygroup lookups.
         // isDropship: fulfilled direct-to-customer — no BAS reorder needed
         //   (Autopot, Printful, Grand Master, HLG, Evergreen, AC Infinity)
-        const partyCache = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean }>();
-
         const resolveParty = async (partyId: string): Promise<{ groupName: string; isManufactured: boolean; isDropship: boolean }> => {
-            if (partyCache.has(partyId)) return partyCache.get(partyId)!;
+            const cached = _partyCacheShared.get(partyId);
+            if (cached && Date.now() - cached.ts < PARTY_CACHE_TTL) {
+                return { groupName: cached.groupName, isManufactured: cached.isManufactured, isDropship: cached.isDropship };
+            }
             try {
                 const res = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
                     headers: { Authorization: this.authHeader, Accept: 'application/json' },
@@ -2969,7 +3039,11 @@ export class FinaleClient {
                     groupName.toLowerCase().includes('bas soil');
                 const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
                 const result = { groupName, isManufactured, isDropship };
-                partyCache.set(partyId, result);
+                if (_partyCacheShared.size >= PARTY_CACHE_MAX) {
+                    const oldestKey = _partyCacheShared.keys().next().value;
+                    if (oldestKey !== undefined) _partyCacheShared.delete(oldestKey);
+                }
+                _partyCacheShared.set(partyId, { ...result, ts: Date.now() });
                 return result;
             } catch {
                 return { groupName: 'Unknown', isManufactured: false, isDropship: false };
@@ -3428,11 +3502,15 @@ export class FinaleClient {
         //   isManufactured : internal BAS production depts
         //   isDropship     : fulfilled direct by vendor — no BAS reorder needed
         //                    (Autopot, Printful, Grand Master, HLG, Evergreen, AC Infinity)
-        const partyCache = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean }>();
+        // Uses module-level _partyCacheShared (TTL 1h, 200-entry cap) so concurrent
+        // scans with getExternalReorderItems() share partygroup lookups.
 
         const resolveParty = async (partyUrl: string): Promise<{ groupName: string; isManufactured: boolean; isDropship: boolean }> => {
             const partyId = partyUrl.split('/').pop() || '';
-            if (partyCache.has(partyId)) return partyCache.get(partyId)!;
+            const cached = _partyCacheShared.get(partyId);
+            if (cached && Date.now() - cached.ts < PARTY_CACHE_TTL) {
+                return { groupName: cached.groupName, isManufactured: cached.isManufactured, isDropship: cached.isDropship };
+            }
             try {
                 const r = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
                     headers: { Authorization: this.authHeader, Accept: 'application/json' },
@@ -3442,7 +3520,11 @@ export class FinaleClient {
                 const isManufactured = /buildasoil|manufacturing|soil dept|bas soil/i.test(groupName);
                 const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
                 const result = { groupName, isManufactured, isDropship };
-                partyCache.set(partyId, result);
+                if (_partyCacheShared.size >= PARTY_CACHE_MAX) {
+                    const oldestKey = _partyCacheShared.keys().next().value;
+                    if (oldestKey !== undefined) _partyCacheShared.delete(oldestKey);
+                }
+                _partyCacheShared.set(partyId, { ...result, ts: Date.now() });
                 return result;
             } catch {
                 return { groupName: 'Unknown', isManufactured: false, isDropship: false };
@@ -3467,7 +3549,7 @@ export class FinaleClient {
                     const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
                     if (!mainSupplier?.supplierPartyUrl) continue;
 
-                    // Step B: Resolve supplier and check exclusions (partyCache keeps this fast after first hit)
+                    // Step B: Resolve supplier and check exclusions (_partyCacheShared keeps this fast after first hit)
                     const party = await resolveParty(mainSupplier.supplierPartyUrl);
                     if (party.isManufactured || party.isDropship) continue;
 
@@ -3503,11 +3585,14 @@ export class FinaleClient {
                     const runwayDays = stockOnHand / dailyRate;
                     const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
 
-                    // Step 6: urgency (based on raw runway, not adjusted)
+                    // Step 6: urgency based on ADJUSTED runway (on-hand + on-order)
+                    // DECISION(2026-03-09): Changed from raw runwayDays to adjustedRunwayDays.
+                    // Previously used on-hand only, which caused items with active POs
+                    // (In Transit) to falsely flag as CRIT even when incoming supply covers demand.
                     const urgency: PurchasingItem['urgency'] =
-                        runwayDays < leadTimeDays ? 'critical'
-                            : runwayDays < leadTimeDays + 30 ? 'warning'
-                                : runwayDays < leadTimeDays + 60 ? 'watch'
+                        adjustedRunwayDays < leadTimeDays ? 'critical'
+                            : adjustedRunwayDays < leadTimeDays + 30 ? 'warning'
+                                : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
                                     : 'ok';
 
                     // Step 7: natural language explanation
@@ -3688,4 +3773,37 @@ export class FinaleClient {
         const n = parseFloat(String(val).replace(/[^0-9.\-]/g, ''));
         return isNaN(n) ? null : n;
     }
+
+    // ── CACHE MANAGEMENT (OOM prevention) ──
+
+    /**
+     * Access the shared party name cache with TTL + size bounds.
+     * All FinaleClient instances share this module-level cache.
+     */
+    protected getPartyNameCache(): Map<string, string> {
+        const now = Date.now();
+        // TTL expiry — clear entire cache if stale
+        if (now - _partyNameCacheAt > PARTY_NAME_CACHE_TTL) {
+            _partyNameCache.clear();
+            _partyNameCacheAt = now;
+        }
+        // Size cap — clear if too large (simple eviction, avoids LRU complexity)
+        if (_partyNameCache.size > PARTY_NAME_CACHE_MAX) {
+            console.log(`[finale] partyNameCache exceeded ${PARTY_NAME_CACHE_MAX} entries — clearing`);
+            _partyNameCache.clear();
+            _partyNameCacheAt = now;
+        }
+        return _partyNameCache;
+    }
 }
+
+// ──────────────────────────────────────────────────
+// SINGLETON
+// DECISION(2026-03-09): Process-level singleton for use by cron jobs,
+// command handlers, and background agents. Prevents 48+ ephemeral
+// instances from accumulating via async closure retention.
+// API route handlers may still use `new FinaleClient()` — they're
+// short-lived HTTP requests that get GC'd after the response.
+// ──────────────────────────────────────────────────
+
+export const finaleClient = new FinaleClient();

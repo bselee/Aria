@@ -7,7 +7,7 @@
  * @created 2026-02-27
  */
 
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { createClient } from "../lib/supabase";
 import { parseInvoice } from "../lib/pdf/invoice-parser";
@@ -33,11 +33,11 @@ async function main() {
         // Try ap token first, fall back to default
         try {
             const auth = await getAuthenticatedClient("ap");
-            gmail = google.gmail({ version: "v1", auth });
+            gmail = GmailApi({ version: "v1", auth });
             tokenUsed = "ap (ap@buildasoil.com)";
         } catch {
             const auth = await getAuthenticatedClient("default");
-            gmail = google.gmail({ version: "v1", auth });
+            gmail = GmailApi({ version: "v1", auth });
             tokenUsed = "default (bill.selee@buildasoil.com)";
         }
 

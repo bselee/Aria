@@ -5,6 +5,29 @@
 :root {
   --background: #09090b;
   --foreground: #f4f4f5;
+
+  /* Dashboard typography hierarchy */
+  --dash-l1: #E8E8E8;       /* Entity names — vendors, SKUs */
+  --dash-l2: #888888;       /* Metadata — qty, price, dates */
+  --dash-l3: #666666;       /* System labels — CRIT, WARN, mono uppercase */
+  --dash-ts: #555555;       /* Timestamps — dimmed, right-aligned */
+  --dash-ts-stale: #883333; /* Timestamps > 24h — subtle warm tint */
+
+  /* Human-approval accent */
+  --dash-accent-human: rgba(244, 63, 94, 0.6);  /* rose-500/60 */
+  --dash-accent-pending: rgba(251, 191, 36, 0.6); /* amber-400/60 */
+}
+
+/* ── Skeleton shimmer for loading states ── */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #18181b 25%, #27272a 37%, #18181b 63%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 4px;
 }
 
 body {

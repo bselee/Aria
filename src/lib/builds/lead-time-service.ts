@@ -12,7 +12,7 @@
  * One Finale GraphQL call fills the entire vendor map; subsequent lookups are instant.
  */
 
-import { FinaleClient } from '../finale/client';
+import { FinaleClient, finaleClient } from '../finale/client';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -43,7 +43,7 @@ export class LeadTimeService {
         if (this.cache && now - this.cacheAt < LeadTimeService.TTL) return;
 
         try {
-            const finale = new FinaleClient();
+            const finale = finaleClient;
             this.cache = await finale.getVendorLeadTimeHistory(90);
             this.cacheAt = now;
             console.log(`[LeadTimeService] Cache warmed — ${this.cache.size} vendor(s) with history`);
@@ -83,7 +83,7 @@ export class LeadTimeService {
         // 2. SKU product-level lead time from Finale REST
         if (sku) {
             try {
-                const finale = new FinaleClient();
+                const finale = finaleClient;
                 const skuDays = await finale.getLeadTime(sku);
                 if (skuDays !== null) {
                     return {

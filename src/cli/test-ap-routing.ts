@@ -1,6 +1,6 @@
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
-import { google } from "googleapis";
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { unifiedObjectGeneration } from "../lib/intelligence/llm";
 import { z } from "zod";
@@ -46,7 +46,7 @@ async function run() {
 
     // Auth as bill
     const auth = await getAuthenticatedClient("default");
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = GmailApi({ version: "v1", auth });
 
     const { data } = await gmail.users.messages.list({
         userId: "me",
