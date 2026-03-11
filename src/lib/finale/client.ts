@@ -48,6 +48,7 @@ export interface FinaleProductDetail {
     suppliers: SupplierInfo[];
     isManufactured: boolean;
     hasBOM: boolean;
+    doNotReorder: boolean;         // Finale ROM = "Do not reorder" or category = "Deprecating"
     finaleUrl: string;
     openPOs: POInfo[];             // Committed POs containing this product
 }
@@ -372,7 +373,7 @@ export class FinaleClient {
     static isDoNotReorder(productData: any): boolean {
         if (!productData) return false;
 
-        // Check reorderPointPolicy field (Finale's primary mechanism)
+        // Check reorderPointPolicy field
         const policy = String(productData.reorderPointPolicy || '').toLowerCase();
         if (policy.includes('do_not_reorder') || policy.includes('donotreorder') || policy.includes('do not reorder')) {
             return true;
@@ -380,6 +381,16 @@ export class FinaleClient {
 
         // Check explicit boolean field
         if (productData.doNotReorder === true) return true;
+
+        // DECISION(2026-03-11): Finale stores "Do not reorder" in the
+        // reorderGuidelineList entries via `reorderCalculationMethodId: "##doNotReorder"`.
+        // This is the actual mechanism used in the Finale UI. A single matching
+        // guideline (any facility) is enough to flag the product.
+        const guidelines: any[] = productData.reorderGuidelineList || [];
+        for (const g of guidelines) {
+            const methodId = String(g.reorderCalculationMethodId || '').toLowerCase();
+            if (methodId.includes('donotreorder')) return true;
+        }
 
         // Check product name and description for "do not reorder" text
         const name = String(productData.internalName || productData.productId || '').toLowerCase();
@@ -389,7 +400,7 @@ export class FinaleClient {
         // Check user-defined fields for "do not reorder" flag
         const userFields: any[] = productData.userFieldDataList || [];
         for (const field of userFields) {
-            const val = String(field.value || field.userFieldValue || '').toLowerCase();
+            const val = String(field.value || field.userFieldValue || field.attrValue || '').toLowerCase();
             if (val.includes('do not reorder')) return true;
         }
 
@@ -2677,6 +2688,7 @@ export class FinaleClient {
             suppliers,
             isManufactured,
             hasBOM,
+            doNotReorder: FinaleClient.isDoNotReorder(data),
             finaleUrl: data.productUrl || "",
             openPOs: [],  // Populated later by lookupProduct()
         };
@@ -3798,12 +3810,34 @@ export class FinaleClient {
 }
 
 // ──────────────────────────────────────────────────
-// SINGLETON
+// SINGLETON (LAZY)
 // DECISION(2026-03-09): Process-level singleton for use by cron jobs,
 // command handlers, and background agents. Prevents 48+ ephemeral
 // instances from accumulating via async closure retention.
 // API route handlers may still use `new FinaleClient()` — they're
 // short-lived HTTP requests that get GC'd after the response.
+//
+// DECISION(2026-03-11): Changed from eager (`export const finaleClient = new FinaleClient()`)
+// to lazy getter. The eager singleton was constructed at module load time
+// (ES import hoisting runs before dotenv.config()), so it captured empty
+// env vars — causing all cron jobs (calendar sync, PO sync, build watcher,
+// lead time service) to silently return empty results. The lazy getter
+// defers construction until first use, when env vars are guaranteed loaded.
 // ──────────────────────────────────────────────────
 
-export const finaleClient = new FinaleClient();
+let _finaleClientInstance: FinaleClient | null = null;
+
+/**
+ * Lazy process-level singleton.
+ * Deferred construction ensures env vars from dotenv are loaded before
+ * the FinaleClient constructor reads FINALE_API_KEY / FINALE_API_SECRET.
+ */
+export const finaleClient: FinaleClient = new Proxy({} as FinaleClient, {
+    get(_target, prop, _receiver) {
+        if (!_finaleClientInstance) {
+            _finaleClientInstance = new FinaleClient();
+        }
+        const val = (_finaleClientInstance as any)[prop];
+        return typeof val === 'function' ? val.bind(_finaleClientInstance) : val;
+    },
+});
