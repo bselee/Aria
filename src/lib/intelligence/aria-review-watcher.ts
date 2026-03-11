@@ -88,7 +88,7 @@ async function handlePDF(filePath: string, apAgent: APAgent) {
             filename,          // subject
             'aria-review',     // from
             supabase,
-            false,             // isDropship
+            false,
             undefined          // no Gmail message ID
         );
 

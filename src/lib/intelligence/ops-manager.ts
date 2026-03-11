@@ -479,7 +479,10 @@ export class OpsManager {
         // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
         cron.schedule("*/5 * * * *", () => {
             this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
-            this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
+            // TODO(will)[2026-03-11]: Re-enable when token-ap.json is created via:
+            //   npx tsx src/cli/gmail-auth.ts ap
+            // Disabled because the AP Gmail account isn't authorized yet.
+            // this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
         });
 
         // AP Identifier scans for unread PDFs every 15 minutes and queues them
@@ -543,13 +546,55 @@ export class OpsManager {
         // Purchasing Calendar Sync every 4 hours
         // Creates/updates calendar events for outgoing and received POs.
         cron.schedule("0 */4 * * *", () => {
-            this.syncPurchasingCalendar();
+            this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar());
         });
+
+        // Build Risk Analysis @ 7:30 AM weekdays
+        // DECISION(2026-03-11): Was missing from start() despite sendBuildRiskReport()
+        // being fully implemented. Caught during trigger overwatch audit.
+        cron.schedule("30 7 * * 1-5", () => {
+            this.safeRun("BuildRiskReport", () => this.sendBuildRiskReport());
+        }, { timezone: "America/Denver" });
 
         // Stale Draft PO Cleanup Alert @ 9:00 AM weekdays
         // DECISION(2026-03-04): Nudges Will when draft POs sit uncommitted for >3 days.
         cron.schedule("0 9 * * 1-5", () => {
-            this.alertStaleDraftPOs();
+            this.safeRun("StaleDraftPOAlert", () => this.alertStaleDraftPOs());
+        }, { timezone: "America/Denver" });
+
+        // OOS Report Generator — polls every 5 min between 7:45–9:05 AM weekdays
+        // DECISION(2026-03-11): Changed from fixed 8:30 cron to reactive polling.
+        // Stockie email typically arrives ~8 AM. This polls every 5 min starting 7:45
+        // so the report fires within minutes of arrival. The OOS-Processed label
+        // prevents duplicate runs. Email is left unread for human reference.
+        cron.schedule("*/5 7-9 * * 1-5", () => {
+            // Runtime guard: only fire between 7:45 and 9:05 Denver time
+            const now = new Date();
+            const denverHour = parseInt(now.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: 'America/Denver' }));
+            const denverMin = parseInt(now.toLocaleString('en-US', { minute: 'numeric', timeZone: 'America/Denver' }));
+            const minuteOfDay = denverHour * 60 + denverMin;
+            if (minuteOfDay < 7 * 60 + 45 || minuteOfDay > 9 * 60 + 5) return;
+
+            this.safeRun("OOSReportGenerator", async () => {
+                const { processStockieEmail } = await import("../reports/oos-email-trigger");
+                const result = await processStockieEmail();
+                if (result) {
+                    const chatId = process.env.TELEGRAM_CHAT_ID;
+                    if (chatId) {
+                        await this.bot.telegram.sendMessage(
+                            chatId,
+                            `📋 <b>OOS Report Generated</b>\n\n` +
+                            `📊 ${result.totalItems} out-of-stock items analyzed\n` +
+                            `🚨 ${result.needsOrder.length} need ordering\n` +
+                            `✅ ${result.onOrder.length} on order\n` +
+                            `⚠️ ${result.agingPOs.length} aging POs\n` +
+                            `🔧 ${result.internalBuild.length} internal builds\n\n` +
+                            `📁 Saved to: <code>${result.outputPath}</code>`,
+                            { parse_mode: "HTML" }
+                        );
+                    }
+                }
+            });
         }, { timezone: "America/Denver" });
 
         // AP Agent Daily Recap @ 5:00 PM MST weekdays
@@ -557,7 +602,7 @@ export class OpsManager {
         // so Will can review all AP Agent decisions daily. Critical during
         // early rollout to catch any misclassifications.
         cron.schedule("0 17 * * 1-5", () => {
-            this.apAgent.sendDailyRecap();
+            this.safeRun("APDailyRecap", () => this.apAgent.sendDailyRecap());
         }, { timezone: "America/Denver" });
 
         // ── KAIZEN FEEDBACK LOOP CRONS ─────────────────────
@@ -1964,9 +2009,13 @@ Data: ${JSON.stringify(data)}`;
 
     /**
      * Build the calendar event title for a PO.
+     * DECISION(2026-03-11): Unreceived POs get 🔴 prefix for visual urgency.
      */
     private buildPOEventTitle(po: FullPO): string {
-        const emoji = this.poStatusEmoji(po.status);
+        const s = (po.status || '').toLowerCase();
+        const isReceived = s === 'completed';
+        const isCancelled = s === 'cancelled';
+        const emoji = isReceived ? '✅' : isCancelled ? '❌' : '🔴';
         return `${emoji} PO #${po.orderId} — ${po.vendorName}`;
     }
 
@@ -2017,10 +2066,16 @@ Data: ${JSON.stringify(data)}`;
         if (po.items.length > 5) itemLines.push(`+ ${po.items.length - 5} more`);
         lines.push(`Items: ${itemLines.join(', ')}`);
 
-        lines.push(`Total: $${po.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+        // DECISION(2026-03-11): Removed monetary Total from calendar events per user request.
 
         const statusLabel = isReceived ? 'Received' : isCancelled ? 'Cancelled' : 'In Transit';
         lines.push(`Status: ${statusLabel}`);
+
+        // Unreceived POs get a prominent NOT YET RECEIVED note
+        if (!isReceived && !isCancelled) {
+            lines.push(`🔴 <b>NOT YET RECEIVED</b>`);
+        }
+
         lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
 
         return lines.join('\n');
@@ -2124,6 +2179,9 @@ Data: ${JSON.stringify(data)}`;
 
                 const existingRow = existing.get(po.orderId);
 
+                // Google Calendar colorId: 11 = Tomato (red), 2 = Sage (green)
+                const colorId = newStatus === 'received' ? '2' : '11';
+
                 if (!existingRow) {
                     // New PO — create calendar event
                     try {
@@ -2131,6 +2189,7 @@ Data: ${JSON.stringify(data)}`;
                             title,
                             description,
                             date: expectedDate,
+                            colorId,
                         });
                         await supabase.from('purchasing_calendar_events').insert({
                             po_number: po.orderId,
@@ -2150,7 +2209,8 @@ Data: ${JSON.stringify(data)}`;
                         existingRow.calendar_id,
                         existingRow.event_id,
                         title,
-                        description
+                        description,
+                        colorId
                     );
                     await supabase.from('purchasing_calendar_events')
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
