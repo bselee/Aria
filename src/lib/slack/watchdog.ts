@@ -531,20 +531,40 @@ export class SlackWatchdog {
             skuCandidates.add(match.product.sku);
         }
 
-        const skusToLookup = [...skuCandidates].slice(0, 8); // Cap at 8 to avoid hammering Finale
+        // DECISION(2026-03-11): Also add hyphen-stripped variants of each SKU.
+        // Finale stores SKUs without hyphens (e.g., "BASTM607") but Slack messages
+        // often include them (e.g., "BASTM6-07"). We try both variants.
+        const expandedCandidates = new Set<string>();
+        for (const sku of skuCandidates) {
+            expandedCandidates.add(sku);
+            const stripped = sku.replace(/-/g, '');
+            if (stripped !== sku) expandedCandidates.add(stripped);
+        }
+
+        const skusToLookup = [...expandedCandidates].slice(0, 10); // Cap at 10 to avoid hammering Finale
 
         // Step 6a: Look up each SKU in Finale for detailed stock context
         let finaleContext: string | null = null;
         const stockDetails: SkuStockDetail[] = [];
+        const foundSkus = new Set<string>(); // Track found SKUs to avoid duplicates from variant expansion
 
         for (const sku of skusToLookup) {
+            // Skip if we already found this SKU via a variant (e.g., found BASTM607, skip BASTM6-07)
+            if (foundSkus.has(sku.replace(/-/g, ''))) continue;
+
             const detail = await this.getDetailedStockContext(sku);
+            if (detail.found) foundSkus.add(sku.replace(/-/g, ''));
             stockDetails.push(detail);
         }
 
+        // Remove "not found" entries if a variant of the same SKU WAS found
+        const finalDetails = stockDetails.filter(d =>
+            d.found || !foundSkus.has(d.sku.replace(/-/g, ''))
+        );
+
         // Build the finaleContext string for Telegram
-        if (stockDetails.length > 0) {
-            finaleContext = stockDetails.map(d => {
+        if (finalDetails.length > 0) {
+            finaleContext = finalDetails.map(d => {
                 if (!d.found) return `  *${d.sku}*: not found in Finale`;
                 const parts: string[] = [];
                 if (d.onHand !== null) parts.push(`${d.onHand.toLocaleString()} on hand`);
@@ -575,20 +595,19 @@ export class SlackWatchdog {
             return;
         }
 
-        // Step 7: Reply in Slack thread with per-SKU stock context
-        // DECISION(2026-03-04): Aria replies as bot with intelligent stock info.
-        // This gives the requester immediate feedback and surfaces hidden inventory.
-        if (stockDetails.length > 0 && !boxReport) {
-            const replyText = this.composeStockReply(stockDetails, userName, analysis);
-            const replyTs = threadTs || messageTs; // Reply in existing thread, or start new one
-            await this.replyInThread(channelId, replyTs, replyText);
-        }
+        // DECISION(2026-03-11): Removed Slack thread auto-replies entirely.
+        // The bot was posting confusing messages to coworkers:
+        //   - Raw user IDs instead of names (U056HD83BK5)
+        //   - False "not found in Finale" for valid SKUs (hyphen mismatch)
+        //   - Non-sensical stock context that confused rather than helped
+        // The 👀 reaction stays (signals "seen"). Telegram digest stays (for Will).
+        // Slack channels are for humans only — Aria watches silently.
 
         // Step 7b: For urgent reorder SKUs, check for existing draft POs from the vendor
         // DECISION(2026-03-04): Instead of just alerting Will, proactively check if there's
         // a draft PO from the same vendor (e.g., ULINE) that the item could be added to.
         // Notify via Telegram (NOT Slack) with actionable context.
-        const urgentSkus = stockDetails.filter(d => d.found && d.needsReorder);
+        const urgentSkus = finalDetails.filter(d => d.found && d.needsReorder);
         if (urgentSkus.length > 0 && !boxReport) {
             setImmediate(async () => {
                 for (const urgent of urgentSkus) {
@@ -826,76 +845,11 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
         }
     }
 
-    /**
-     * Compose the Slack thread reply with per-SKU stock context.
-     * DECISION(2026-03-04): Tone should sound like Will — casual, warm, first-person.
-     * Not a robotic bot response. Think "helpful coworker who checked the system for you."
-     */
-    private composeStockReply(details: SkuStockDetail[], requesterName: string, analysis: RequestExtraction): string {
-        // Personalized opener based on context
-        const urgentItems = details.filter(d => d.found && d.needsReorder);
-        const plentyItems = details.filter(d => d.found && !d.needsReorder && d.onHand !== null && d.onHand > 0);
-
-        let opener: string;
-        if (urgentItems.length > 0 && plentyItems.length > 0) {
-            opener = `Hey ${requesterName.split(' ')[0]} — checked Finale on these. Some we're good on, others definitely need attention:`;
-        } else if (urgentItems.length > 0) {
-            opener = `Thanks for the heads up ${requesterName.split(' ')[0]}! Checked Finale — you're right, we need to move on ${urgentItems.length > 1 ? 'these' : 'this'}:`;
-        } else if (plentyItems.length > 0) {
-            opener = `Hey ${requesterName.split(' ')[0]}, just checked Finale on ${details.length > 1 ? 'these' : 'this'}:`;
-        } else {
-            opener = `Checked Finale for you ${requesterName.split(' ')[0]}:`;
-        }
-
-        const lines: string[] = [opener, ''];
-
-        for (const d of details) {
-            if (!d.found) {
-                lines.push(`• *${d.sku}* — Can't find this one in Finale. Double check the SKU?`);
-                continue;
-            }
-
-            const stockParts: string[] = [];
-            if (d.onHand !== null) stockParts.push(`${d.onHand.toLocaleString()} on hand`);
-            if (d.onOrder !== null && d.onOrder > 0) stockParts.push(`${d.onOrder.toLocaleString()} on order`);
-            if (d.stockoutDays !== null) {
-                if (d.stockoutDays <= 14) stockParts.push(`⚠️ stockout in ${d.stockoutDays}d`);
-                else stockParts.push(`${d.stockoutDays}d runway`);
-            }
-            if (d.incomingPOs > 0) stockParts.push(`${d.incomingPOs} PO incoming`);
-            if (d.vendorName) stockParts.push(d.vendorName);
-
-            lines.push(`• *${d.sku}* — ${stockParts.join(' · ')}`);
-            lines.push(`  _${d.recommendation}_`);
-        }
-
-        return lines.join('\n');
-    }
-
-    // ──────────────────────────────────────────────────
-    // SLACK THREAD REPLY
-    // ──────────────────────────────────────────────────
-
-    /**
-     * Posts a reply in a Slack thread using the bot token.
-     * DECISION(2026-03-04): Aria replies as a bot (not Will's account) so it's
-     * clearly an automated response. Uses SLACK_BOT_TOKEN.
-     * Falls back to user token if bot token is unavailable.
-     */
-    private async replyInThread(channelId: string, threadTs: string, text: string) {
-        const client = this.botClient || this.client;
-        try {
-            await client.chat.postMessage({
-                channel: channelId,
-                thread_ts: threadTs,
-                text: text,
-                unfurl_links: false, // Don't unfurl links in stock replies
-            });
-            console.log(`  💬 Replied in Slack thread (channel: ${channelId})`);
-        } catch (err: any) {
-            console.warn(`  ⚠️ Could not reply in thread: ${err.data?.error || err.message}`);
-        }
-    }
+    // DECISION(2026-03-11): composeStockReply and replyInThread removed.
+    // Aria no longer posts auto-replies in Slack channels. The bot was producing
+    // confusing messages for coworkers (raw user IDs, false "not found" for valid
+    // SKUs). Slack channels are for humans — Aria watches silently with 👀 and
+    // reports to Will via Telegram digest only.
 
     /**
      * Query Finale for a concise stock summary of any SKU (legacy one-liner format).
@@ -1017,7 +971,10 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             this.userNames.set(userId, name);
             return name;
         } catch {
-            return userId;
+            // DECISION(2026-03-11): Never expose raw user IDs (e.g., "U056HD83BK5").
+            // If we can't resolve the name, use a human-readable fallback.
+            // The only consumer now is Telegram digest — Slack replies are removed.
+            return 'a team member';
         }
     }
 

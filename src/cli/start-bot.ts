@@ -37,6 +37,7 @@ import { FinaleClient } from '../lib/finale/client';
 import { SlackWatchdog } from '../lib/slack/watchdog';
 import { APAgent } from '../lib/intelligence/ap-agent';
 import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
+import { initSandboxWatcher } from '../lib/intelligence/sandbox-watcher';
 import {
     approvePendingReconciliation,
     rejectPendingReconciliation,
@@ -47,14 +48,8 @@ import {
     type ReconciliationResult,
 } from '../lib/finale/reconciler';
 
-// Tracks chats where we're waiting for Will to type a Finale PO# for a manual match.
-// chatId → dropship store ID. Cleared after use (or on next text message).
+// chatId → pending invoice ID. Cleared after use (or on next text message).
 const pendingPoEntry = new Map<number, string>();
-import {
-    getPendingDropship,
-    removePendingDropship,
-    getAllPendingDropships,
-} from '../lib/intelligence/dropship-store';
 import {
     storePendingPOSend,
     getPendingPOSend,
@@ -1591,25 +1586,9 @@ bot.on('text', async (ctx) => {
         await logChatMessage({ source: 'telegram', role: 'user', content: userText });
     });
 
-    // ── "Please forward" shortcut — check for pending unmatched invoices ──────
-    // If Will says "forward" and there are pending dropship invoices, offer buttons
-    if (/\bforward\b/i.test(userText)) {
-        const pending = await getAllPendingDropships();
-        if (pending.length > 0) {
-            const { Markup } = await import('telegraf');
-            const lines = pending.map(p =>
-                `• ${p.vendorName} — Invoice ${p.invoiceNumber} ($${p.total.toLocaleString()})`
-            ).join('\n');
-            const buttons = pending.slice(0, 3).map(p =>
-                [Markup.button.callback(`📦 Forward ${p.invoiceNumber}`, `dropship_fwd_${p.id}`)]
-            );
-            await ctx.reply(
-                `${pending.length} unmatched invoice(s) pending:\n${lines}\n\nForward one to bill.com?`,
-                Markup.inlineKeyboard(buttons)
-            );
-            return;
-        }
-    }
+    // ── "Please forward" shortcut — removed (dropship concept retired) ──────
+    // Previously this offered pending dropship invoice buttons.
+    // Now all invoices go through normal PO matching.
 
     // ── Manual PO# entry intercept ────────────────────────────────────────────
     // When Will tapped "This Has a PO — Enter PO#", we're waiting for the number.
@@ -1619,12 +1598,7 @@ bot.on('text', async (ctx) => {
         pendingPoEntry.delete(chatId); // Clear state regardless of outcome
 
         const poNumber = userText.trim().toUpperCase();
-        const pending = await getPendingDropship(dropId);
 
-        if (!pending) {
-            await ctx.reply(`⚠️ Invoice session expired — the 48-hour window passed. Start a fresh AP scan if needed.`);
-            return;
-        }
         if (!poNumber || poNumber.length < 2) {
             await ctx.reply(`That doesn't look like a PO number. Tap the button again to retry.`);
             return;
@@ -1905,109 +1879,35 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         await ctx.reply(message, { parse_mode: 'Markdown' });
     });
 
-    // DROPSHIP INVOICE INLINE BUTTONS
+    // DROPSHIP INVOICE INLINE BUTTONS (LEGACY — feature retired)
     // ──────────────────────────────────────────────────
-    // When an unmatched invoice arrives, AP agent sends three buttons.
-    // These handlers forward to bill.com, prompt for a PO#, or skip.
+    // These handlers remain as stubs to gracefully handle taps on old messages.
 
     bot.action(/^dropship_fwd_(.+)$/, async (ctx) => {
-        const dropId = ctx.match[1];
-        const pending = await getPendingDropship(dropId);
-
-        // Must answer the callback query within 10s regardless of outcome.
-        // Use neutral text here; the editMessageText below gives the real status.
-        await ctx.answerCbQuery(pending ? 'Forwarding to bill.com...' : 'Data expired — see recovery options');
-
-        if (!pending) {
-            await ctx.editMessageText(
-                (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
-                '\n\n⚠️ Invoice data no longer in memory (bot restarted and cleared in-memory store).\n\nRecovery options:\n• Forward the original email to buildasoilap@bill.com manually\n• Run /ap scan to re-poll the inbox\n• Check Supabase `invoices` table for this invoice'
-            );
-            return;
-        }
-
-        try {
-            // Build MIME email and send via Gmail (use ap token, fall back to default)
-            let authClient: any;
-            try {
-                authClient = await getAuthenticatedClient('ap');
-            } catch {
-                authClient = await getAuthenticatedClient('default');
-            }
-            const gmail = GmailApi({ version: 'v1', auth: authClient });
-
-            const boundary = 'b_aria_drop_' + Math.random().toString(36).substring(2);
-            const mime = [
-                `To: buildasoilap@bill.com`,
-                `Subject: Fwd: ${pending.subject}`,
-                `MIME-Version: 1.0`,
-                `Content-Type: multipart/mixed; boundary="${boundary}"`,
-                ``,
-                `--${boundary}`,
-                `Content-Type: text/plain; charset="UTF-8"`,
-                ``,
-                `Dropship invoice forwarded via Aria AP Agent.`,
-                `Vendor: ${pending.vendorName} | Invoice: ${pending.invoiceNumber} | Total: $${pending.total}`,
-                ``,
-                `--${boundary}`,
-                `Content-Type: application/pdf; name="${pending.filename}"`,
-                `Content-Transfer-Encoding: base64`,
-                `Content-Disposition: attachment; filename="${pending.filename}"`,
-                ``,
-                pending.base64Pdf,
-                `--${boundary}--`,
-            ].join('\r\n');
-
-            await gmail.users.messages.send({
-                userId: 'me',
-                requestBody: { raw: Buffer.from(mime).toString('base64url') },
-            });
-
-            await removePendingDropship(dropId);
-
-            const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
-                ? ctx.callbackQuery.message.text : '';
-            await ctx.editMessageText(
-                original + `\n\n✅ Forwarded to buildasoilap@bill.com as dropship.\nAdding ${pending.vendorName} to known dropship list.`
-            );
-            console.log(`📦 Dropship forwarded: ${pending.invoiceNumber} (${pending.vendorName})`);
-        } catch (err: any) {
-            await ctx.reply(`❌ Forward failed: ${err.message}`);
-        }
+        await ctx.answerCbQuery('Dropship forwarding has been retired');
+        const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text : '';
+        await ctx.editMessageText(
+            original + '\n\n⚠️ Dropship forwarding has been retired. All invoices now go through standard PO matching.\nForward manually to buildasoilap@bill.com if needed.'
+        );
     });
 
     bot.action(/^invoice_has_po_(.+)$/, async (ctx) => {
         const dropId = ctx.match[1];
-        const pending = await getPendingDropship(dropId);
         await ctx.answerCbQuery('Enter the PO number in chat');
-        const name = pending ? pending.invoiceNumber : dropId;
 
         const chatId = ctx.chat?.id;
-
-        if (!pending) {
-            // Bot restarted — in-memory store is gone. Give the same three recovery
-            // options as the dropship_fwd_ stale path for consistency.
-            if (chatId) pendingPoEntry.set(chatId, dropId);
-            await ctx.reply(
-                `⚠️ Invoice data expired (bot restarted — in-memory store cleared).\n\nRecovery options:\n• Forward the original email to buildasoilap@bill.com manually\n• Reply with the PO# and I'll check Supabase for the invoice\n• Run /ap scan to re-poll the inbox`
-            );
-            return;
-        }
-
-        // Register state so the text handler knows to intercept the next message
         if (chatId) pendingPoEntry.set(chatId, dropId);
         await ctx.reply(
-            `What's the Finale PO number for invoice ${name}?\nReply with just the PO# and I'll run the match.`
+            `What's the Finale PO number for this invoice?\nReply with just the PO# and I'll run the match.`
         );
     });
 
     bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
-        const dropId = ctx.match[1];
         await ctx.answerCbQuery('Skipped');
-        await removePendingDropship(dropId);
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
-        await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched in Supabase.');
+        await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched.');
     });
 
     // PO COMMIT & SEND INLINE BUTTONS
@@ -2155,6 +2055,14 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         console.warn('[aria-review] Watcher failed to start (non-fatal):', err.message);
     }
 
+    // Start desktop Sandbox folder watcher
+    try {
+        const sandboxAgent = new APAgent(bot);
+        await initSandboxWatcher(sandboxAgent, bot);
+    } catch (err: any) {
+        console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
+    }
+
     // ── Restore pending approvals from Supabase (survive pm2 restart) ────────────
     try {
         const pending = await loadPendingApprovalsFromSupabase();
@@ -2219,7 +2127,8 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     console.log('📅 Cron schedules registered:');
 
-    console.log('   📊 Daily PO Summary:  8:00 AM MT (Daily)');
+    console.log('   🏭 Build Risk Report:  7:30 AM MT (Weekdays)');
+    console.log('   📊 Daily PO Summary:  8:00 AM MT (Weekdays)');
     console.log('   🗓️  Weekly Review:     8:01 AM MT (Fridays)');
     console.log('   📦 PO Sync:           Every 30 min');
     console.log('   🧹 Ad Cleanup:        Every hour');
