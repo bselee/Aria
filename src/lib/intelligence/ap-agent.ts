@@ -20,10 +20,7 @@ import {
     buildAuditMetadata,
     buildReconciliationReport,
 } from "../finale/reconciler";
-import { storePendingDropship } from "./dropship-store";
 import { recordFeedback } from "./feedback-loop";
-
-import { KNOWN_DROPSHIP_KEYWORDS } from "../../config/dropship-vendors";
 
 /**
  * @file    ap-agent.ts
@@ -44,18 +41,15 @@ export class APAgent {
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
     }
 
-    private isKnownDropshipVendor(from: string, subject: string): boolean {
-        const haystack = `${from} ${subject} `.toLowerCase();
-        return KNOWN_DROPSHIP_KEYWORDS.some(kw => haystack.includes(kw.toLowerCase()));
-    }
+
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         // reasoning omitted — we only need the label, dropping it saves output tokens on every call
         const schema = z.object({
-            intent: z.enum(["INVOICE", "DROPSHIP_INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
         });
 
-        // Recall rules to see if this vendor has specific handling instructions (like always being DROPSHIP)
+        // Recall rules to see if this vendor has specific handling instructions
         const memories = await recall(`Accounts Payable routing rules for vendor ${from} subject ${subject} `, { topK: 3, minScore: 0.5 });
         let memoryContext = "";
         if (memories.length > 0) {
@@ -68,8 +62,7 @@ Subject: ${subject}
 Snippet: ${snippet}
 ${memoryContext}
 
-INVOICE - Standard vendor bill for PO - based stock.
-    DROPSHIP_INVOICE - Bill for goods shipped directly to our customer(no Finale PO).
+INVOICE - Standard vendor bill (may or may not have a PO).
         STATEMENT - Account statement or aging summary.
             ADVERTISEMENT - Marketing, spam, or newsletter.
                 HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
@@ -174,10 +167,7 @@ INVOICE - Standard vendor bill for PO - based stock.
 
                 console.log(`   Evaluating Email: "${subject}" from ${from} `);
 
-                // Fast-path: skip LLM for known dropship vendors
-                const intent = this.isKnownDropshipVendor(from, subject)
-                    ? "DROPSHIP_INVOICE"
-                    : await this.classifyEmailIntent(subject, from, snippet);
+                const intent = await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent} `);
 
                 // Kaizen: record classification prediction (Pillar 3 — Prediction Accuracy)
@@ -189,7 +179,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                     subjectId: m.id!,
                     prediction: { intent, from: from.slice(0, 100), subject: subject.slice(0, 100) },
                     accuracyScore: 1.0, // assume correct until corrected
-                    contextData: { fastPath: this.isKnownDropshipVendor(from, subject) },
+                    contextData: {},
                 }).catch(() => { /* non-blocking */ });
 
                 if (intent === "ADVERTISEMENT") {
@@ -233,8 +223,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                     continue;
                 }
 
-                // --- INVOICE / DROPSHIP PROCESSING ---
-                const isDropship = intent === "DROPSHIP_INVOICE";
+                // --- INVOICE PROCESSING ---
                 let processedAnyPDF = false;
                 // Recursive part walker: vendors using Outlook/Gmail sometimes nest
                 // PDFs under multipart/mixed → multipart/related → attachment.
@@ -301,7 +290,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                             const buffer = Buffer.from(base64Data, "base64");
                             const capturedFilename = part.filename!;
                             const capturedMessageId = m.id!;
-                            this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, isDropship, capturedMessageId).catch(async (err) => {
+                            this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, false, capturedMessageId).catch(async (err) => {
                                 console.error(`     ❌ Background processing failed for ${capturedFilename}:`, err);
                                 try {
                                     await this.bot.telegram.sendMessage(
@@ -336,15 +325,10 @@ INVOICE - Standard vendor bill for PO - based stock.
                         }
                     });
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    const logIntent = isDropship ? "DROPSHIP_INVOICE" : "INVOICE";
-                    const logNote = isDropship
-                        ? `Dropship — forwarded to Bill.com (${pdfNames}), no Finale reconciliation`
-                        : `Forwarded to Bill.com (${pdfNames})`;
-                    await this.logActivity(supabase, from, subject, logIntent, logNote, { attachments: pdfNames });
+                    await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, { attachments: pdfNames });
                 } else {
                     // It was classified as an Invoice but had no PDF, so leave unread for human interaction.
-                    const logIntent = isDropship ? "DROPSHIP_INVOICE" : "INVOICE";
-                    console.log(`     ⚠️ No PDF found on ${logIntent}. Leaving unread for human check.`);
+                    console.log(`     ⚠️ No PDF found on INVOICE. Leaving unread for human check.`);
 
                     await gmail.users.messages.modify({
                         userId: "me",
@@ -404,7 +388,7 @@ INVOICE - Standard vendor bill for PO - based stock.
         }
     }
 
-    public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, isDropship = false, messageId?: string) {
+    public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string) {
         try {
             // 1. Extract + parse
             const extracted = await extractPDF(buffer);
@@ -580,7 +564,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                 }
             }
 
-            if (!finalePONumber && !isDropship) {
+            if (!finalePONumber) {
                 try {
                     const candidates = await probeClient.findPOByVendorAndDate(
                         invoiceData.vendorName,
@@ -654,7 +638,6 @@ INVOICE - Standard vendor bill for PO - based stock.
                     total: invoiceData.total,
                     poNumber: finalePONumber || null,
                     matched,
-                    isDropship,
                     filename,
                 }
             );
@@ -677,9 +660,7 @@ INVOICE - Standard vendor bill for PO - based stock.
                         vendorName: invoiceData.vendorName,
                         documentType: "INVOICE",
                         pattern: `Sends invoices via email. PO# format on invoice: ${invoiceData.poNumber || "not printed"}. ${invoiceData.lineItems?.length || 0} line items. Payment terms: ${invoiceData.paymentTerms || "unknown"}.`,
-                        handlingRule: isDropship
-                            ? "Dropship vendor: forward to bill.com, skip Finale reconciliation"
-                            : `Forward to bill.com and reconcile against Finale PO. Match via: ${matchSource}`,
+                        handlingRule: `Forward to bill.com and reconcile against Finale PO. Match via: ${matchSource}`,
                         learnedFrom: "email_attachment",
                         confidence: invoiceData.confidence === "high" ? 0.9 : invoiceData.confidence === "medium" ? 0.7 : 0.5,
                     });
@@ -688,20 +669,8 @@ INVOICE - Standard vendor bill for PO - based stock.
                 }
             });
 
-            // 4. Notify Will — unmatched gets action buttons
-            let pendingDropshipId: string | null = null;
-            if (!matched) {
-                pendingDropshipId = await storePendingDropship({
-                    invoiceNumber: invoiceData.invoiceNumber,
-                    vendorName: invoiceData.vendorName,
-                    total: invoiceData.total,
-                    subject,
-                    from,
-                    filename,
-                    base64Pdf: buffer.toString("base64"),
-                });
-            }
-            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, from, isDropship, pendingDropshipId);
+            // 4. Notify Will — unmatched gets info message
+            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, from);
 
             // 5. Reconcile against Finale
             // Reconciler fetches the live PO, runs all guardrails, and either
@@ -709,7 +678,7 @@ INVOICE - Standard vendor bill for PO - based stock.
             // forceApproval=true when PO was matched via vendor+date fallback (not exact PO#),
             // or via subject-line extraction — both require Will's confirmation before any Finale writes.
             forceApproval = forceApproval || matchSource.includes("REQUIRES APPROVAL");
-            if (!isDropship && matched && finalePONumber) {
+            if (matched && finalePONumber) {
                 await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval, matchSource);
             }
 
@@ -742,12 +711,8 @@ INVOICE - Standard vendor bill for PO - based stock.
         poNumber: string | null,
         matchSource: string,
         from: string,
-        isDropship = false,
-        pendingDropshipId: string | null = null
     ) {
-        let msg = isDropship
-            ? `📦 *Dropship Invoice — Forwarded to Bill.com*\n`
-            : `🧾 *New Invoice Processed*\n`;
+        let msg = `🧾 *New Invoice Processed*\n`;
         msg += `From: ${from}\n`;
         msg += `Vendor: ${invoice.vendorName}\n`;
         msg += `Total: $${invoice.total.toLocaleString()} (Due: $${invoice.amountDue.toLocaleString()})\n`;
@@ -760,38 +725,11 @@ INVOICE - Standard vendor bill for PO - based stock.
         } else {
             msg += `❌ *No PO found*\n`;
             msg += `Invoice #: ${invoice.invoiceNumber}\n`;
-            if (!isDropship) msg += `_Searched Finale by vendor name + date_\n`;
+            msg += `_Searched Finale by vendor name + date_\n`;
         }
 
         const chatId = process.env.TELEGRAM_CHAT_ID || "";
-        if (!matched && pendingDropshipId) {
-            if (isDropship) {
-                // Forward already happened automatically — don't show the forward button again.
-                // Only offer "has a PO" (in case it should have been reconciled) and Skip.
-                msg += `\n✅ _Auto-forwarded to Bill\.com_`;
-                this.bot.telegram.sendMessage(chatId, msg, {
-                    parse_mode: "Markdown",
-                    ...Markup.inlineKeyboard([
-                        [
-                            Markup.button.callback("📋 Actually Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
-                            Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
-                        ],
-                    ])
-                });
-            } else {
-                // Unmatched regular invoice — show all three options
-                this.bot.telegram.sendMessage(chatId, msg, {
-                    parse_mode: "Markdown",
-                    ...Markup.inlineKeyboard([
-                        [Markup.button.callback("📦 Dropship — Forward to bill.com", `dropship_fwd_${pendingDropshipId}`)],
-                        [
-                            Markup.button.callback("📋 This Has a PO — Enter PO#", `invoice_has_po_${pendingDropshipId}`),
-                            Markup.button.callback("⏭️ Skip", `invoice_skip_${pendingDropshipId}`),
-                        ],
-                    ])
-                });
-            }
-        } else if (!matched) {
+        if (!matched) {
             this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
         }
 

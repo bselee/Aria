@@ -98,7 +98,7 @@ export class APForwarderAgent {
                         `--${boundary}`,
                         `Content-Type: text/plain; charset="UTF-8"`,
                         ``,
-                        `Forwarded Invoice via Aria AP Agent (Dropship).`,
+                        `Forwarded Invoice via Aria AP Agent.`,
                         ``,
                         `--${boundary}`,
                         `Content-Type: application/pdf; name="${item.pdf_filename}"`,
@@ -124,7 +124,7 @@ export class APForwarderAgent {
                         supabase,
                         item.email_from,
                         item.email_subject,
-                        item.intent || 'DROPSHIP_INVOICE',
+                        item.intent || 'INVOICE',
                         `Forwarded to Bill.com: ${item.pdf_filename}`
                     );
 
@@ -140,7 +140,7 @@ export class APForwarderAgent {
                         supabase,
                         item.email_from,
                         item.email_subject,
-                        item.intent || 'DROPSHIP_INVOICE',
+                        item.intent || 'INVOICE',
                         `Error forwarding to Bill.com: ${err.message}`
                     );
                 }

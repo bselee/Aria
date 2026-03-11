@@ -12,20 +12,15 @@ import { createClient } from "../../supabase";
 import { z } from "zod";
 import { unifiedObjectGeneration } from "../llm";
 import { recall } from "../memory";
-import { KNOWN_DROPSHIP_KEYWORDS } from "../../../config/dropship-vendors";
 
 export class APIdentifierAgent {
-    private isKnownDropshipVendor(from: string, subject: string): boolean {
-        const haystack = `${from} ${subject}`.toLowerCase();
-        return KNOWN_DROPSHIP_KEYWORDS.some(kw => haystack.includes(kw.toLowerCase()));
-    }
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         const schema = z.object({
-            intent: z.enum(["INVOICE", "DROPSHIP_INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
         });
 
-        // Recall rules to see if this vendor has specific handling instructions (like always being DROPSHIP)
+        // Recall rules to see if this vendor has specific handling instructions
         const memories = await recall(`Accounts Payable routing rules for vendor ${from} subject ${subject}`, { topK: 3, minScore: 0.5 });
         let memoryContext = "";
         if (memories.length > 0) {
@@ -38,8 +33,7 @@ Subject: ${subject}
 Snippet: ${snippet}
 ${memoryContext}
 
-INVOICE - Standard vendor bill for PO-based stock.
-DROPSHIP_INVOICE - Bill for goods shipped directly to our customer (no Finale PO).
+INVOICE - Standard vendor bill (may or may not have a PO).
 STATEMENT - Account statement or aging summary.
 ADVERTISEMENT - Marketing, spam, or newsletter.
 HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
@@ -182,9 +176,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
 
                 console.log(`   Evaluating Email: "${subject}" from ${from}`);
 
-                const intent = this.isKnownDropshipVendor(from, subject)
-                    ? "DROPSHIP_INVOICE"
-                    : await this.classifyEmailIntent(subject, from, snippet);
+                const intent = await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent}`);
 
                 if (intent === "ADVERTISEMENT") {
@@ -225,8 +217,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     continue;
                 }
 
-                // --- INVOICE / DROPSHIP QUEUEING ---
-                const isDropship = intent === "DROPSHIP_INVOICE";
+                // --- INVOICE QUEUEING ---
                 let processedAnyPDF = false;
 
                 const pdfParts: any[] = [];
@@ -287,7 +278,7 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                             }
 
                             // Insert into Queue
-                            const queueStatus = isDropship ? 'PENDING_FORWARD' : 'PENDING_EXTRACTION';
+                            const queueStatus = 'PENDING_EXTRACTION';
 
                             const { error: insertError } = await supabase.from("ap_inbox_queue").insert({
                                 message_id: uniqueMsgId,
