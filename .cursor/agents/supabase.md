@@ -103,3 +103,8 @@ Recent additions:
 4. **Migration not applied** → Run via Supabase CLI: `supabase db push` or apply `.sql` file directly
 5. **`ap_activity_log` full** → Check for stuck/unprocessed entries; clear if needed
 6. **RLS blocking service role** → Service role key bypasses RLS — if queries return empty, it's a logic issue not RLS
+
+## Cross-References
+- **Depends on:** (external Supabase only — no internal agent dependencies)
+- **Depended on by:** `ap-pipeline`, `bot-tools`, `dashboard`, `slack-watchdog`, `build-risk`, `vendor-intelligence`, `ops-manager` — nearly every agent reads/writes Supabase
+- **Shared state:** All tables listed above. Key dedup table: `ap_activity_log` (prevents double-processing of Gmail messages)

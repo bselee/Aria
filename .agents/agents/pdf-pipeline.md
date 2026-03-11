@@ -94,3 +94,8 @@ documentType: z.string().default("invoice")
 4. **Number fields as strings** → Ensure `z.coerce.number()` is used, not `z.number()`
 5. **Decimal errors (10× guardrail)** → OCR misread decimal point; check raw PDF vs parsed values
 6. **OpenAI timeout** → Confirm Files API path is being used, not inline base64 body
+
+## Cross-References
+- **Depends on:** (external LLM APIs only: Gemini, Anthropic, OpenAI, OpenRouter — no internal agent deps)
+- **Depended on by:** `ap-pipeline` (invoice/statement/BOL extraction)
+- **Shared state:** None — stateless extraction pipeline. Each call is independent.

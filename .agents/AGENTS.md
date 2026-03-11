@@ -1,9 +1,85 @@
 # ARIA — Agent Reference Guide
 
-Quick reference for all workflows, skills, and agents available in this project.
+> **Start here:** Read `docs/SYSTEM.md` first (coordinator + routing table).
+> **Current state:** Read `docs/STATUS.md` for live operational status.
 
 > [!TIP]
 > All workflows have `// turbo-all` enabled — terminal commands auto-execute without prompting.
+
+---
+
+## Quick Start — Which Agents Do I Need?
+
+| If the task involves… | Read these agents |
+|---|---|
+| AP invoices, email, reconciliation | `ap-pipeline` → `pdf-pipeline` → `finale-ops` |
+| Build risk, calendar, BOMs | `build-risk` → `finale-ops` |
+| Telegram bot tools, persona | `bot-tools` |
+| Dashboard UI, API routes, panels | `dashboard` |
+| Finale API queries/mutations | `finale-ops` |
+| Pinecone memory, recall | `memory-pinecone` |
+| Cron jobs, scheduled tasks | `ops-manager` |
+| PDF OCR, extraction, parsing | `pdf-pipeline` |
+| Reorder engine, purchasing, draft POs | `reorder` → `finale-ops` |
+| Slack monitoring, 👀 reactions | `slack-watchdog` |
+| Database schema, queries, migrations | `supabase` |
+| Vendor enrichment, PO correlation | `vendor-intelligence` |
+
+---
+
+## Dependency Graph
+
+```
+ops-manager (orchestrator — all crons)
+├──→ ap-pipeline ──→ pdf-pipeline (OCR cascade)
+│       ├──→ finale-ops (PO matching, reconciliation writes)
+│       ├──→ vendor-intelligence ──→ memory-pinecone
+│       └──→ supabase (ap_activity_log, documents)
+├──→ build-risk ──→ finale-ops (stock queries)
+└──→ vendor-intelligence (PO sync cron)
+
+bot-tools (Telegram — user-facing entry point)
+├──→ finale-ops, memory-pinecone, supabase
+├──→ build-risk, reorder, ap-pipeline (via tool_calls)
+└──→ slack-watchdog (inside same process)
+
+dashboard (Next.js — web UI entry point)
+├──→ finale-ops, supabase (via API routes)
+└──→ ap-pipeline (invoice approve/dismiss)
+
+reorder ──→ finale-ops (velocity engine, draft PO)
+slack-watchdog ──→ memory-pinecone (dedup), supabase (product catalog)
+```
+
+### Infrastructure Agents (no internal dependencies)
+
+| Agent | External Only |
+|---|---|
+| `finale-ops` | Finale REST/GraphQL API |
+| `supabase` | Supabase PostgreSQL |
+| `memory-pinecone` | Pinecone vector DB |
+| `pdf-pipeline` | Gemini, Anthropic, OpenAI, OpenRouter APIs |
+
+---
+
+## All Agents (`.agents/agents/`)
+
+Domain-specific agent personas with specialized knowledge, cross-references, and failure modes.
+
+| Agent | Domain | Depends On | Depended On By |
+|---|---|---|---|
+| `ap-pipeline` | Invoice processing pipeline | pdf, finale, vendor, supabase | ops-manager, bot-tools, dashboard |
+| `bot-tools` | Telegram bot + tool system | finale, memory, supabase, build-risk, reorder, ap | (user-facing entry) |
+| `build-risk` | Calendar BOM risk analysis | finale | ops-manager, bot-tools, dashboard |
+| `dashboard` | Next.js web UI + API routes | finale, supabase, ap-pipeline | (user-facing entry) |
+| `finale-ops` | Finale Inventory API | (external only) | ap, build-risk, reorder, bot, dashboard, vendor |
+| `memory-pinecone` | Pinecone vector memory | (external only) | bot-tools, slack-watchdog, vendor, ap |
+| `ops-manager` | Cron scheduler + orchestration | ap, build-risk, vendor | (top-level orchestrator) |
+| `pdf-pipeline` | PDF OCR + parsing | (external only) | ap-pipeline |
+| `reorder` | Reorder engine + draft POs | finale | bot-tools, dashboard |
+| `slack-watchdog` | Slack monitoring (eyes-only) | memory, supabase | (inside aria-bot) |
+| `supabase` | Database operations | (external only) | nearly all agents |
+| `vendor-intelligence` | Vendor enrichment + correlation | memory, supabase, finale | ap-pipeline, ops-manager |
 
 ---
 
@@ -47,34 +123,17 @@ Skills are automatically invoked by the agent when relevant. No slash command ne
 
 ---
 
-## Agents (`.agents/agents/`)
-
-Domain-specific agent personas with specialized knowledge and responsibilities.
-
-| Agent | Domain |
-|---|---|
-| `ap-pipeline` | Accounts payable pipeline operations |
-| `bot-tools` | Bot tooling and integrations |
-| `build-risk` | Build risk assessment and mitigation |
-| `dashboard` | Dashboard UI and data visualization |
-| `finale-ops` | Finale Inventory API operations |
-| `memory-pinecone` | Pinecone vector memory management |
-| `ops-manager` | Operations management and orchestration |
-| `pdf-pipeline` | PDF processing pipeline |
-| `reorder` | Inventory reorder logic and purchasing |
-| `slack-watchdog` | Slack monitoring and alerting |
-| `supabase` | Supabase database operations |
-| `vendor-intelligence` | Vendor data analysis and intelligence |
-
----
-
 ## Infrastructure
 
 | Item | Path | Purpose |
 |---|---|---|
+| System coordinator | `docs/SYSTEM.md` | Read FIRST — routing table + dependency graph |
+| Operational status | `docs/STATUS.md` | Living state — known issues, recent changes |
+| Deep reference | `CLAUDE.md` | Full 314-line implementation reference |
+| AP pipeline SOP | `docs/ap-pipeline-sop.md` | Detailed AP standard operating procedures |
 | Sync script | `.agents/scripts/sync-global-workflows.ps1` | Re-copies global workflows into project |
 | Global source | `~/.gemini/antigravity/global_workflows/` | Master copies of shared workflows |
 
 ---
 
-*Last updated: 2026-03-10*
+*Last updated: 2026-03-11*

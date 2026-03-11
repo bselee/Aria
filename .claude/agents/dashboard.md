@@ -106,3 +106,8 @@ for (const [col, ids] of Object.entries(DEFAULT_LAYOUT) as [ColumnId, string[]][
 6. **Panel not appearing after add** → Stale localStorage layout silently drops new panels — localStorage merge fix in page.tsx handles this
 7. **SSE stream drops** → `/watch` route uses SSE; check that Next.js isn't buffering the response
 8. **Build not running** → `npm run build` — check for TypeScript errors (ignore `finale/client.ts`)
+
+## Cross-References
+- **Depends on:** `finale-ops` (API route data), `supabase` (API route queries), `ap-pipeline` (invoice approve/dismiss actions)
+- **Depended on by:** (user-facing web UI — nothing calls dashboard)
+- **Shared state:** localStorage (browser-side panel layout, snooze), `sys_chat_logs` (Supabase), module-level caches (reorder 10min, purchasing 30min)

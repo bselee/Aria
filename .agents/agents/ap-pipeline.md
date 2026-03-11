@@ -77,3 +77,8 @@ node --import tsx src/cli/test-ap-routing.ts      # email classification only
 3. **Vendor mismatch** → check brand word signal (Signal 1b) in reconciler
 4. **10× guardrail blocking** → decimal error in OCR; inspect raw PDF manually
 5. **Dropship store empty after restart** → expected; state is ephemeral by design
+
+## Cross-References
+- **Depends on:** `pdf-pipeline` (OCR), `finale-ops` (PO matching, writes), `vendor-intelligence` (vendor correlation), `supabase` (dedup, logging)
+- **Depended on by:** `ops-manager` (15-min AP check cron), `bot-tools` (ap_pipeline_status tool), `dashboard` (invoice approve/dismiss)
+- **Shared state:** `pendingDropships` (in-memory 48h), `ap_activity_log` + `documents` (Supabase)

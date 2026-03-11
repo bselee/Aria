@@ -109,3 +109,8 @@ node --import tsx src/cli/check-finale-statuses.ts
 5. **partygroup returns wrong vendor** → `supplierList[0]` may be blank; check product setup in Finale UI
 6. **429 Too Many Requests** → Add 100ms inter-SKU pause + reduce concurrency to 3 workers; add 5s backoff + retry
 7. **Velocity showing 0 for active item** → Check date filter uses `orderDate` not `receiveDate` (receiveDate blank on completed POs)
+
+## Cross-References
+- **Depends on:** (external Finale API only — no internal agent dependencies)
+- **Depended on by:** `ap-pipeline` (PO matching, reconciliation writes), `build-risk` (stock queries), `reorder` (velocity engine, draft PO), `bot-tools` (SKU/stock/PO tools), `dashboard` (API routes), `vendor-intelligence` (vendor lookups)
+- **Shared state:** Finale API rate limits are global — all callers share the 3-worker cap + 100ms pacing

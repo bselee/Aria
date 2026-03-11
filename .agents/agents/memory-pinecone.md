@@ -77,3 +77,8 @@ node --import tsx src/cli/populate-memories.ts
 3. **Duplicate Slack alerts** → Dedup similarity threshold may be too low; check in `watchdog.ts`
 4. **Memory context overriding live data** → System prompt rule: "memory is BACKGROUND ONLY" — check if rule is present in text handler
 5. **setImmediate pattern** → If `remember()` not called: check that the `case` block has the `setImmediate` call BEFORE `break`
+
+## Cross-References
+- **Depends on:** (external Pinecone API only — no internal agent dependencies)
+- **Depended on by:** `bot-tools` (remember/recall in chat loop), `slack-watchdog` (thread/SKU dedup), `vendor-intelligence` (vendor doc patterns), `ap-pipeline` (vendor memory lookup)
+- **Shared state:** `gravity-memory` index — namespaces: `aria-memory` (Q&A pairs), `vendor-memory` (vendor doc patterns)

@@ -81,3 +81,8 @@ node --import tsx src/cli/test-finale-builds.ts
 2. **Wrong risk level** → Check Finale stock vs BOM requirement; verify `getOpenPurchaseOrders` is returning correct incoming POs
 3. **Missing component** → Build event text may not include all components; review LLM parsing in `build-parser.ts`
 4. **Calendar auth fails** → `calendar-token.json` uses separate credentials from Gmail OAuth
+
+## Cross-References
+- **Depends on:** `finale-ops` (stock queries, open PO lookups)
+- **Depended on by:** `ops-manager` (7:30 AM Mon-Fri cron), `bot-tools` (build_risk_assessment tool), `dashboard` (BuildRiskPanel)
+- **Shared state:** `build_risk_snapshots`, `proactive_alerts`, `purchasing_calendar_events` (Supabase)

@@ -111,3 +111,8 @@ pm2 restart aria-bot
 3. **Chat history context lost** → History capped at 20; older context is lost by design
 4. **Tool silently ignored** → Check switch case matches exact tool name; missing `break` causes fall-through
 5. **Dashboard chat not responding** → Uses Gemini 2.5 Flash; check `GOOGLE_GENERATIVE_AI_API_KEY`
+
+## Cross-References
+- **Depends on:** `finale-ops` (SKU/stock/PO tools), `memory-pinecone` (remember/recall), `supabase` (query tools), `build-risk`, `reorder`, `ap-pipeline` (via tool_calls)
+- **Depended on by:** (user-facing entry point — nothing calls bot-tools)
+- **Shared state:** `chatHistory` (in-memory 20 msgs), `pendingApprovals` (in-memory 24h via reconciler)

@@ -80,3 +80,8 @@ Env: `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`
 3. **PO correlation mismatches** → Check `vendor_profiles` table for stale patterns; may need to clear and re-correlate
 4. **GitHub issue not created** → Verify `GITHUB_TOKEN` has `issues:write` scope; check `GITHUB_OWNER`/`GITHUB_REPO`
 5. **Webhook not firing** → GitHub webhook must be registered pointing to `/api/webhooks/github`; verify Next.js is publicly accessible
+
+## Cross-References
+- **Depends on:** `memory-pinecone` (vendor doc patterns), `supabase` (vendor_profiles table), `finale-ops` (vendor/party lookups)
+- **Depended on by:** `ap-pipeline` (vendor name correlation), `ops-manager` (30-min PO sync cron)
+- **Shared state:** `vendor_profiles` (Supabase), `vendor-memory` namespace (Pinecone)

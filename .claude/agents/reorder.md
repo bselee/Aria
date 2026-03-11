@@ -82,3 +82,8 @@ Separate from `getExternalReorderItems`. Uses raw velocity from receipt/shipment
 4. **Draft PO fails** → Confirm `vendorPartyId` is partygroup ID, not product ID
 5. **Lead time wrong** → No historical POs for vendor → defaults to 14d
 6. **Stockout showing NaN** → `parseFinaleNum()` should strip " d"; check if format changed
+
+## Cross-References
+- **Depends on:** `finale-ops` (stock queries, velocity engine, draft PO creation)
+- **Depended on by:** `bot-tools` (reorder_assessment + create_draft_pos tools), `dashboard` (ReorderPanel + PurchasingPanel via API routes)
+- **Shared state:** Module-level reorder cache (10-min TTL), purchasing cache (30-min TTL) — shared between API route calls

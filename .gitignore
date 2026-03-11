@@ -53,3 +53,5 @@ test-stock.ts
 
 # Build artifacts
 tsconfig.tsbuildinfo
+
+tmp/

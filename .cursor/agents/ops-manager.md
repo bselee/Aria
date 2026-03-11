@@ -70,3 +70,8 @@ You are an expert on Aria's `ops-manager.ts`, which coordinates all scheduled ba
 3. **AP check running too slow** → Gmail API rate limiting; check `ap_activity_log` for stuck entries
 4. **Daily summary missing data** → Check if Supabase client initialized (`NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`)
 5. **Adding new job** → Use `node-cron` with `'America/Denver'` timezone option; add job to `startOpsManager()`
+
+## Cross-References
+- **Depends on:** `ap-pipeline` (15-min AP check), `build-risk` (7:30 AM cron), `vendor-intelligence` (PO correlation sync)
+- **Depended on by:** (top-level orchestrator — nothing calls ops-manager; it calls everything)
+- **Shared state:** Stateless — each cron job re-runs from scratch. No persistent cron state.

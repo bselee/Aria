@@ -66,3 +66,8 @@ pm2 logs aria-slack
 3. **Wrong channels monitored** → Check channel filter logic in `watchdog.ts`; channel IDs vs channel names
 4. **Product catalog stale** → 30-min refresh should handle it; check Supabase `purchase_orders` table has recent data
 5. **aria-slack not running** → Not always required; `aria-bot` is primary. Check `pm2 list`.
+
+## Cross-References
+- **Depends on:** `memory-pinecone` (thread/SKU dedup), `supabase` (product catalog from POs)
+- **Depended on by:** (runs inside `aria-bot` process — no external callers)
+- **Shared state:** In-memory Set (dedup, process-lifetime), product catalog cache (30-min refresh)

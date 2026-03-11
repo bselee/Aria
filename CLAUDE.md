@@ -130,6 +130,7 @@ Calendar auth is a **separate OAuth flow** from Gmail — it uses `GOOGLE_CLIENT
 | `src/lib/intelligence/pinecone.ts` | Pinecone vector store for operational context + deduplication state (index: `gravity-memory`, 1024d, namespace: `aria-memory`) |
 | `src/lib/intelligence/vendor-memory.ts` | Vendor document handling patterns in Pinecone (namespace: `vendor-memory`). Stores how each vendor sends docs. `seedKnownVendorPatterns()` called on boot. |
 | `src/lib/intelligence/dropship-store.ts` | In-memory store (48h TTL) for unmatched invoices pending dropship forwarding. Bot's `dropship_fwd_*` callbacks retrieve from here. Lost on restart. |
+| `src/lib/intelligence/sandbox-watcher.ts` | Watches `~/OneDrive/Desktop/Sandbox/` for dropped files. PDFs → AP pipeline, TXT → LLM Q&A, CSV/XLSX → summarize, images → Supabase Storage. Processed files move to `processed/`, responses to `responses/`. |
 | `src/lib/intelligence/po-correlator.ts` | Cross-inbox correlation: reads outgoing PO emails from `bill.selee@buildasoil.com` (label:PO), correlates with incoming invoices, builds vendor communication profiles (saved to `vendor_profiles` table) |
 | `src/lib/github/client.ts` | GitHub integration via Octokit: creates issues for document discrepancies, syncs issue state to Supabase, processes PR PDF uploads. Env: `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO` |
 | `src/lib/vendors/enricher.ts` | Web-enriches vendor records via Firecrawl (payment portals, AR emails, remit addresses) and computes vendor spend stats. Env: `FIRECRAWL_API_KEY` |
