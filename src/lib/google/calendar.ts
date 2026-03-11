@@ -150,7 +150,7 @@ export class CalendarClient {
      */
     async createEvent(
         calendarId: string,
-        event: { title: string; description: string; date: string }
+        event: { title: string; description: string; date: string; colorId?: string }
     ): Promise<string> {
         await this.init();
         // Google Calendar all-day events: end.date must be the NEXT day (exclusive)
@@ -159,14 +159,17 @@ export class CalendarClient {
         endDate.setUTCDate(endDate.getUTCDate() + 1);
         const endDateStr = endDate.toISOString().split('T')[0];
 
+        const requestBody: any = {
+            summary: event.title,
+            description: event.description,
+            start: { date: event.date },
+            end: { date: endDateStr },
+        };
+        if (event.colorId) requestBody.colorId = event.colorId;
+
         const res = await this.calendar!.events.insert({
             calendarId,
-            requestBody: {
-                summary: event.title,
-                description: event.description,
-                start: { date: event.date },
-                end: { date: endDateStr },
-            },
+            requestBody,
         });
         return res.data.id!;
     }
@@ -191,14 +194,17 @@ export class CalendarClient {
         calendarId: string,
         eventId: string,
         title: string,
-        description: string
+        description: string,
+        colorId?: string
     ): Promise<void> {
         await this.init();
         try {
+            const requestBody: any = { summary: title, description };
+            if (colorId) requestBody.colorId = colorId;
             await this.calendar!.events.patch({
                 calendarId,
                 eventId,
-                requestBody: { summary: title, description },
+                requestBody,
             });
         } catch (err: any) {
             console.warn(`⚠️ [Calendar] Could not update event ${eventId}: ${err.message}`);

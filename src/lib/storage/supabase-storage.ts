@@ -1,7 +1,7 @@
 /**
  * @file    supabase-storage.ts
  * @purpose Uploads PDFs and other documents to Supabase Storage.
- *          Provides a clean API for the attachment handler and dropship store
+ *          Provides a clean API for the attachment handler
  *          to archive files with structured paths.
  * @author  Aria (Antigravity)
  * @created 2026-03-10

@@ -16,7 +16,7 @@ import { createBrowserClient } from "@/lib/supabase";
 import {
     ExternalLink, FileText, CheckCircle2, AlertCircle, Trash2,
     Webhook, BotMessageSquare, ChevronDown, ChevronRight,
-    Check, X, Pause, RotateCcw, Package, CreditCard,
+    Check, X, Pause, RotateCcw, CreditCard,
     FileQuestion, Ban, Loader2, Send, TrendingUp, Sparkles,
     MessageSquare
 } from "lucide-react";
@@ -67,7 +67,6 @@ function fmtDollars(n: number): string {
 // ──────────────────────────────────────────────────
 
 const DISMISS_OPTIONS = [
-    { key: "dropship", label: "Dropship", icon: Package, description: "Forward to Bill.com, mark as dropship" },
     { key: "already_handled", label: "Already Handled", icon: Check, description: "Already reconciled manually" },
     { key: "duplicate", label: "Duplicate", icon: RotateCcw, description: "Copy of an already-processed invoice" },
     { key: "credit_memo", label: "Credit Memo", icon: CreditCard, description: "Not a payable invoice — it's a credit" },

@@ -23,7 +23,7 @@ import {
 type ActionRequest = {
     action: "approve" | "pause" | "dismiss" | "rematch";
     activityLogId: string;
-    dismissReason?: "dropship" | "already_handled" | "duplicate" | "credit_memo" | "statement" | "not_ours";
+    dismissReason?: "already_handled" | "duplicate" | "credit_memo" | "statement" | "not_ours";
     rematchPoNumber?: string;
 };
 
@@ -285,11 +285,11 @@ async function writeDismissMemory(
         const vendorSlug = (metadata.vendorName || "").replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
         await remember({
             category: "process",
-            content: `Invoice ${metadata.invoiceNumber} dismissed as "${reason}". Vendor: ${metadata.vendorName}. PO: ${metadata.orderId}. Learning: ${reason === "dropship" ? "Vendor may be dropship-only — consider adding to KNOWN_DROPSHIP_VENDORS" : reason === "statement" ? "Email classifier misidentified statement as invoice — retrain classifier" : reason === "credit_memo" ? "Credit memo from vendor — not a payable invoice" : "Manual override"}.`,
+            content: `Invoice ${metadata.invoiceNumber} dismissed as "${reason}". Vendor: ${metadata.vendorName}. PO: ${metadata.orderId}. Learning: ${reason === "statement" ? "Email classifier misidentified statement as invoice — retrain classifier" : reason === "credit_memo" ? "Credit memo from vendor — not a payable invoice" : "Manual override"}.`,
             tags: ["reconciliation", "dismissed", reason, vendorSlug],
             source: "dashboard",
             relatedTo: metadata.vendorName,
-            priority: reason === "dropship" ? "high" : "normal",
+            priority: "normal",
         });
     } catch { /* non-blocking — never fail the action flow */ }
 }
