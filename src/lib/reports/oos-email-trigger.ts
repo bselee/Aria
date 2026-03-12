@@ -34,6 +34,8 @@ export interface BuildBlockingInfo {
         onHand: number | null;
         onOrder: number | null;
         isBlocking: boolean; // on-hand <= 0
+        /** PO details for this component (if on order) */
+        incomingPOs: Array<{ orderId: string; quantity: number; finaleUrl: string }>;
     }>;
     blockingReason: string; // Human-readable summary
 }
@@ -186,11 +188,21 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
                     const isBlocking = isOOS
                         || profile.onHand === null
                         || profile.onHand <= 0;
+
+                    // DECISION(2026-03-12): Capture PO details per blocking component
+                    // so the email can link directly to the Finale PO page.
+                    const componentPOs = profile.incomingPOs.map(po => ({
+                        orderId: po.orderId,
+                        quantity: po.quantity,
+                        finaleUrl: `https://app.finaleinventory.com/buildasoilorganics/sc2/?order/purchase/order/${Buffer.from(`/buildasoilorganics/api/order/${po.orderId}`).toString('base64')}`,
+                    }));
+
                     components.push({
                         componentSku: comp.componentSku,
                         onHand: profile.onHand,
                         onOrder: profile.onOrder,
                         isBlocking,
+                        incomingPOs: componentPOs,
                     });
                     if (isBlocking) blockingSkus.push(comp.componentSku);
                 }
@@ -324,7 +336,7 @@ async function emailReport(
 // ──────────────────────────────────────────────────
 
 /** Format a date relative to today — "in 3 days", "5 days overdue", "today" */
-function relativeETA(dateStr: string | null): { text: string; color: string } {
+export function relativeETA(dateStr: string | null): { text: string; color: string } {
     if (!dateStr) return { text: 'TBD', color: '#94a3b8' };
     const target = new Date(dateStr + 'T12:00:00');
     const now = new Date();
@@ -336,7 +348,7 @@ function relativeETA(dateStr: string | null): { text: string; color: string } {
     return { text: `${Math.abs(diffDays)} days overdue`, color: '#b91c1c' };
 }
 
-function buildEmailBody(
+export function buildEmailBody(
     result: OOSReportResult,
     items: EnrichedOOSItem[],
     scheduledBuilds: ParsedBuild[],
@@ -516,9 +528,16 @@ function buildEmailBody(
                 // Has scheduled build — show ready or blocking components
                 if (blocking && blocking.components.some(c => c.isBlocking)) {
                     const blockers = blocking.components.filter(c => c.isBlocking);
-                    const names = blockers.slice(0, 2).map(b =>
-                        `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`
-                    ).join(', ');
+                    const names = blockers.slice(0, 2).map(b => {
+                        let label = `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`;
+                        if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
+                            const po = b.incomingPOs[0];
+                            label += ` (<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">${b.onOrder} on order</a>)`;
+                        } else if (b.onOrder && b.onOrder > 0) {
+                            label += ` (${b.onOrder} on order)`;
+                        }
+                        return label;
+                    }).join(', ');
                     const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
                     statusCell = `<span style="color:#b91c1c;font-weight:500;font-size:12px">⚠ Awaiting ${names}${suffix}</span>`;
                 } else {
@@ -531,8 +550,16 @@ function buildEmailBody(
                 } else if (blocking.components.some(c => c.isBlocking)) {
                     const blockers = blocking.components.filter(c => c.isBlocking);
                     const names = blockers.slice(0, 2).map(b => {
-                        const onOrderNote = b.onOrder && b.onOrder > 0 ? ` (${b.onOrder} on order)` : '';
-                        return `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>${onOrderNote}`;
+                        let label = `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`;
+                        // DECISION(2026-03-12): Link "on order" text to the PO in Finale
+                        // so the recipient can click through directly from the email.
+                        if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
+                            const po = b.incomingPOs[0];
+                            label += ` (<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">${b.onOrder} on order</a>)`;
+                        } else if (b.onOrder && b.onOrder > 0) {
+                            label += ` (${b.onOrder} on order)`;
+                        }
+                        return label;
                     }).join(', ');
                     const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
                     statusCell = `<span style="color:#b91c1c;font-size:12px">Blocked — awaiting ${names}${suffix}</span>`;

@@ -737,8 +737,10 @@ export class FinaleClient {
     /**
      * Fetch POs received today via GraphQL.
      * Uses `receiveDate: { begin, end }` filter.
-     * DECISION(2026-02-24): status + receiveDate filters conflict in Finale's
-     * GraphQL API, so we filter for Completed client-side.
+     * DECISION(2026-03-12): Receivings = POs with a receiveDate, regardless of
+     * status. A PO can have received items while still Committed (partial receive),
+     * Created (draft, operator still adjusting), or Completed. The receiveDate
+     * filter in the GraphQL query is the sole gate — no client-side status filter.
      */
     async getTodaysReceivedPOs(startDate?: string, endDate?: string): Promise<ReceivedPO[]> {
         try {
@@ -800,7 +802,6 @@ export class FinaleClient {
 
             const edges = result.data?.orderViewConnection?.edges || [];
             return edges
-                .filter((edge: any) => edge.node.status === "Completed")
                 .map((edge: any) => {
                     const po = edge.node;
                     const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
