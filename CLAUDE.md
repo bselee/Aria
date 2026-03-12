@@ -44,7 +44,7 @@ pm2 startup           # Generate OS startup script
 
 # After any code change to the bot:
 npm run typecheck 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator"
-# ↑ Uses --max-old-space-size=8192 to avoid OOM. Filters 3 pre-existing error sources; no output = clean. Then:
+# ↑ Uses --max-old-space-size=12288 to avoid OOM. Filters 3 pre-existing error sources; no output = clean. Then:
 pm2 restart aria-bot
 
 # TypeScript — split configs

@@ -17,6 +17,7 @@ import { gmail as GmailApi } from '@googleapis/gmail';
 import ExcelJS from 'exceljs';
 import path from 'path';
 import fs from 'fs';
+import { getTrackingStatus } from '../intelligence/ops-manager';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -392,6 +393,23 @@ export async function enrichOOSItems(
         if (expectedDelivery && po.orderDate && expectedDelivery === po.orderDate) {
             expectedDelivery = null;
         }
+        
+        // Refine with live tracking if available
+        if (trackingNums.length > 0) {
+            try {
+                const status = await getTrackingStatus(trackingNums[0]);
+                if (status && status.display) {
+                    if (status.display.toLowerCase().includes('expected')) {
+                        expectedDelivery = status.display.replace(/expected/i, '').trim();
+                    } else if (status.category === 'delivered') {
+                        expectedDelivery = status.display;
+                    }
+                }
+            } catch (err) {
+                // ignore
+            }
+        }
+        
         if (!expectedDelivery && po.orderDate) {
             const medianDays = po.vendorName ? vendorLeadTimes.get(po.vendorName) : undefined;
             // DECISION(2026-03-11): Use vendor median lead time if known, else
@@ -521,7 +539,7 @@ function determineAction(
 ): string {
     // Manufactured items → internal build
     if (product.isManufactured || product.hasBOM) {
-        return '🔧 Internal build needed — schedule manufacturing';
+        return 'Internal build needed — schedule manufacturing';
     }
 
     // DECISION(2026-03-11): Items marked "Do not reorder" in Finale or categorized
@@ -531,13 +549,13 @@ function determineAction(
         // Only show category label if it's human-readable (not a raw ID like ##user39)
         const cat = product.category;
         const catLabel = (cat && !cat.startsWith('##')) ? ` (${cat})` : '';
-        return `🔍 REVIEW — Marked "Do not reorder"${catLabel}. Take down listing or reorder?`;
+        return `REVIEW — Marked "Do not reorder"${catLabel}. Take down listing or reorder?`;
     }
 
     // No POs at all → needs ordering
     if (openPOs.length === 0) {
         const supplierName = product.suppliers[0]?.name || 'vendor';
-        return `🚨 NEEDS ORDER — No open PO. Contact ${supplierName}`;
+        return `NEEDS ORDER — No open PO. Contact ${supplierName}`;
     }
 
     // Separate completed vs open POs
@@ -552,18 +570,18 @@ function determineAction(
 
         if (po.trackingNumbers.length > 0) {
             const etaStr = po.expectedDelivery || 'tracking active';
-            return `📦 Shipped — ${po.trackingNumbers.length} tracking #(s). ETA: ${etaStr}`;
+            return `Shipped — ${po.trackingNumbers.length} tracking #(s). ETA: ${etaStr}`;
         }
 
         if (po.expectedDelivery) {
-            return `✅ On order — expected delivery ${po.expectedDelivery}`;
+            return `On order — expected delivery ${po.expectedDelivery}`;
         }
 
         if (ageDays > 30) {
-            return `⚠️ PO aging ${ageDays}+ days — follow up with ${po.supplier}`;
+            return `PO aging ${ageDays}+ days — follow up with ${po.supplier}`;
         }
 
-        return `✅ On order — PO #${po.orderId} (${po.supplier})`;
+        return `On order — PO #${po.orderId} (${po.supplier})`;
     }
 
     // Only completed POs remain — show received status with tracking
@@ -571,12 +589,12 @@ function determineAction(
     // the item is OOS despite being received. Show tracking for context.
     for (const po of completedPOs) {
         if (po.trackingNumbers.length > 0) {
-            return `📫 Received (PO ${po.orderId}) — tracking: ${po.trackingStatuses[0] || po.trackingNumbers[0]}. Still OOS — may need reorder`;
+            return `Received (PO ${po.orderId}) — tracking: ${po.trackingStatuses[0] || po.trackingNumbers[0]}. Still OOS — may need reorder`;
         }
-        return `📫 Received (PO ${po.orderId}) on ${po.expectedDelivery || po.orderDate}. Still OOS — may need reorder`;
+        return `Received (PO ${po.orderId}) on ${po.expectedDelivery || po.orderDate}. Still OOS — may need reorder`;
     }
 
-    return '✅ On order';
+    return 'On order';
 }
 
 // ──────────────────────────────────────────────────
@@ -791,13 +809,13 @@ export async function generateOOSExcel(
     }
 
     const summaryRows = [
-        ['🚨 NEEDS ORDER (No PO)', needsOrder.length, needsOrder.join(', '), 'No open POs — vendor reorder needed ASAP'],
-        ['🔍 NEEDS REVIEW', needsReview.length, needsReview.join(', '), 'Marked "Do not reorder" — take down listing or place final reorder?'],
-        ['⚠️ ON ORDER — Aging PO', agingPOs.length, agingPOs.join(', '), 'POs older than 30 days — contact vendor'],
-        ['✅ ON ORDER', onOrder.length, onOrder.join(', '), 'On order — delivery expected'],
-        ['📫 RECEIVED', received.length, received.join(', '), 'PO completed — verify invoice & put away'],
-        ['🔧 Internal Build (BOM)', internalBuild.length, internalBuild.join(', '), 'Manufactured in-house — schedule production'],
-        ['⚠️ NOT IN FINALE', notInFinale.length, notInFinale.join(', '), 'New/bundle SKU — needs Finale setup'],
+        ['NEEDS ORDER (No PO)', needsOrder.length, needsOrder.join(', '), 'No open POs — vendor reorder needed ASAP'],
+        ['NEEDS REVIEW', needsReview.length, needsReview.join(', '), 'Marked "Do not reorder" — take down listing or place final reorder?'],
+        ['ON ORDER — Aging PO', agingPOs.length, agingPOs.join(', '), 'POs older than 30 days — contact vendor'],
+        ['ON ORDER', onOrder.length, onOrder.join(', '), 'On order — delivery expected'],
+        ['RECEIVED', received.length, received.join(', '), 'PO completed — verify invoice & put away'],
+        ['Internal Build (BOM)', internalBuild.length, internalBuild.join(', '), 'Manufactured in-house — schedule production'],
+        ['NOT IN FINALE', notInFinale.length, notInFinale.join(', '), 'New/bundle SKU — needs Finale setup'],
     ];
     summaryRows.forEach((rowData, i) => {
         const row = summaryWs.addRow(rowData);

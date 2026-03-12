@@ -37,6 +37,7 @@
 
 | Date | What Changed | Key Files | Conv ID |
 |---|---|---|---|
+| 2026-03-12 | **Inline Invoice Workflow** — Generates PDF from email bodies | inline-invoice-handler.ts | (this session) |
 | 2026-03-11 | **Build Risk cron added** — was missing from `start()` | ops-manager.ts L552-557 | (this session) |
 | 2026-03-11 | safeRun() added to StaleDraftPOAlert + APDailyRecap | ops-manager.ts | (this session) |
 | 2026-03-11 | Agent coordination system created | docs/SYSTEM.md, docs/STATUS.md, all agent files | (this session) |

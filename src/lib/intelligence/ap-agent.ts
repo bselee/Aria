@@ -11,6 +11,7 @@ import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 // matchInvoiceToPO kept for manual re-match flow in start-bot.ts invoice_has_po_ handler
 // but is no longer in the hot path — ap-agent queries Finale directly
 import { FinaleClient } from "../finale/client";
+import PDFDocument from "pdfkit";
 import {
     reconcileInvoiceToPO,
     applyReconciliation,
@@ -41,12 +42,46 @@ export class APAgent {
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
     }
 
+    private decodeBase64(data: string): string {
+        return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+    }
 
+    private extractEmailText(payload: any, snippet: string): string {
+        let combinedText = snippet + "\n";
+        if (payload?.body?.data) {
+            combinedText += this.decodeBase64(payload.body.data) + "\n";
+        }
+        const walkParts = (parts: any[]) => {
+            for (const part of parts) {
+                if (part.mimeType === "text/plain" && part.body?.data) {
+                    combinedText += this.decodeBase64(part.body.data) + "\n";
+                }
+                if (part.parts?.length) walkParts(part.parts);
+            }
+        };
+        if (payload?.parts) walkParts(payload.parts);
+        return combinedText;
+    }
+
+    private generatePDF(text: string, title: string = "Invoice Details"): Promise<Buffer> {
+        return new Promise((resolve, reject) => {
+            const doc = new PDFDocument();
+            const buffers: Buffer[] = [];
+            doc.on("data", buffers.push.bind(buffers));
+            doc.on("end", () => resolve(Buffer.concat(buffers)));
+            doc.on("error", reject);
+
+            doc.fontSize(16).text(title, { underline: true });
+            doc.moveDown();
+            doc.fontSize(10).text(text);
+            doc.end();
+        });
+    }
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         // reasoning omitted — we only need the label, dropping it saves output tokens on every call
         const schema = z.object({
-            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "PREPAYMENT_REQUIRED", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
         });
 
         // Recall rules to see if this vendor has specific handling instructions
@@ -63,6 +98,7 @@ Snippet: ${snippet}
 ${memoryContext}
 
 INVOICE - Standard vendor bill (may or may not have a PO).
+        PREPAYMENT_REQUIRED - Proforma invoice or payment link indicating order will ship AFTER payment.
         STATEMENT - Account statement or aging summary.
             ADVERTISEMENT - Marketing, spam, or newsletter.
                 HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
@@ -117,10 +153,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             const supabase = createClient();
 
             // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent
-            // and have a PDF attachment.
             const { data } = await gmail.users.messages.list({
                 userId: "me",
-                q: "is:unread in:inbox -label:AP-Seen filename:pdf newer_than:3d",
+                q: "is:unread in:inbox -label:AP-Seen newer_than:3d",
                 maxResults: 15
             });
 
@@ -220,6 +255,35 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         }
                     });
                     // Do not logActivity to avoid dashboard clutter
+                    continue;
+                }
+
+                if (intent === "PREPAYMENT_REQUIRED") {
+                    console.log(`     ⚠️ Prepayment required. Alerting team.`);
+                    const emailText = this.extractEmailText(payload, snippet);
+                    const urls = emailText.match(/\bhttps?:\/\/[^\s"'<>()]+/gi) || [];
+                    let urlSnippets = "";
+                    if (urls.length > 0) {
+                        urlSnippets = `\n\n*Possible Links:*\n` + urls.slice(0, 3).join("\n");
+                    }
+
+                    const warnMsg = `🚨 *Prepayment Required*\n*From:* ${from}\n*Subject:* _${subject}_\n\nThis vendor requires prepayment before shipping. Please review this email, click any payment links, or pay via credit card.${urlSnippets}`;
+                    try {
+                        await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" });
+                        if (this.slack) {
+                            await this.slack.chat.postMessage({ channel: this.slackChannel, text: warnMsg.replace(/\*/g, "*"), mrkdwn: true });
+                        }
+                    } catch { /* swallow */ }
+                    
+                    // Tag it so it isn't scanned again, but leave it UNREAD so humans know they have to click it
+                    await gmail.users.messages.modify({
+                        userId: "me",
+                        id: m.id!,
+                        requestBody: {
+                            addLabelIds: [apSeenLabelId]
+                        }
+                    });
+                    await this.logActivity(supabase, from, subject, "PREPAYMENT", "Alerted team for manual prepayment.");
                     continue;
                 }
 
@@ -327,17 +391,66 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
                     await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, { attachments: pdfNames });
                 } else {
-                    // It was classified as an Invoice but had no PDF, so leave unread for human interaction.
-                    console.log(`     ⚠️ No PDF found on INVOICE. Leaving unread for human check.`);
-
-                    await gmail.users.messages.modify({
-                        userId: "me",
-                        id: m.id!,
-                        requestBody: {
-                            addLabelIds: [apSeenLabelId]
+                    console.log(`     ⚠️ No PDF found on INVOICE. Checking for inline links...`);
+                    const emailText = this.extractEmailText(payload, snippet);
+                    const urls = emailText.match(/\bhttps?:\/\/[^\s"'<>()]+/gi) || [];
+                    let scrapedContent = "";
+                    let hasScraped = false;
+                    
+                    if (urls.length > 0) {
+                        const invoiceUrl = urls.find(u => u.toLowerCase().includes('invoice') || u.toLowerCase().includes('pay') || u.toLowerCase().includes('bill'));
+                        if (invoiceUrl && process.env.FIRECRAWL_API_KEY) {
+                            console.log(`     🔗 Found likely invoice URL: ${invoiceUrl}. Attempting to scrape with Firecrawl...`);
+                            try {
+                                const dev = await import("@mendable/firecrawl-js");
+                                const app = new dev.default({ apiKey: process.env.FIRECRAWL_API_KEY });
+                                const scrapeResult = await app.scrapeUrl(invoiceUrl, { formats: ['markdown'] }) as any;
+                                if (scrapeResult.success && scrapeResult.markdown) {
+                                    scrapedContent = scrapeResult.markdown;
+                                    console.log(`     📄 Successfully scraped inline invoice link.`);
+                                    hasScraped = true;
+                                }
+                            } catch (err: any) {
+                                console.error(`     ❌ Firecrawl scraping failed: ${err.message}`);
+                            }
                         }
-                    });
-                    // Do not logActivity to avoid dashboard clutter
+                    }
+
+                    if (hasScraped || (emailText.length > 150 && emailText.toLowerCase().includes("total"))) {
+                        console.log(`     📄 Generating fallback PDF from ${hasScraped ? 'scraped URL' : 'email body'}...`);
+                        try {
+                            const pdfBuf = await this.generatePDF(hasScraped ? scrapedContent! : emailText, hasScraped ? "Scraped Invoice Link" : "Inline Email Invoice");
+                            
+                            // Let's pass it to processInvoiceBuffer so it can be parsed and forwarded
+                            // We give it a fake name
+                            const filename = `generated_invoice_${Date.now()}.pdf`;
+                            await this.processInvoiceBuffer(pdfBuf, filename, subject, from, supabase, false, m.id!);
+                            
+                            // Label it so it's not scanned again and remove UNREAD
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.id!,
+                                requestBody: {
+                                    addLabelIds: [invoiceFwdLabelId],
+                                    removeLabelIds: ["UNREAD"]
+                                }
+                            });
+                            await this.logActivity(supabase, from, subject, "INVOICE", "Generated PDF from inline data", { attachments: filename, inline: true });
+                        } catch (err: any) {
+                            console.error(`     ❌ Failed to process inline invoice: ${err.message}`);
+                        }
+                    } else {
+                        // Tag with AP-Seen but leave unread to force humans
+                        console.log(`     ⚠️ No clear inline invoice or link found. Leaving unread for human check.`);
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: {
+                                addLabelIds: [apSeenLabelId]
+                            }
+                        });
+                        // Do not logActivity to avoid dashboard clutter
+                    }
                 }
             }
 
@@ -910,7 +1023,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             // Update structured invoice state (same logic as logReconciliation)
                             let newStatus = "matched_review";
                             if (result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change") newStatus = "reconciled";
-                            if (result.overallVerdict === "no_match") newStatus = "unmatched";
+                            if (result.overallVerdict === ("no_match" as any)) newStatus = "unmatched";
                             const discrepancies = [
                                 ...result.priceChanges.filter(pc => pc.verdict !== "no_change").map(pc => ({
                                     type: "price", productId: pc.productId, expected: pc.poPrice,
@@ -1219,8 +1332,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
         const intentEmoji: Record<string, string> = {
             INVOICE: "🧾",
+            INLINE_INVOICE: "📧",
             STATEMENT: "📑",
-            HUMAN_INTERACTION: "👤"
+            HUMAN_INTERACTION: "👤",
+            PREPAYMENT: "🚨",
+            BILL_FORWARD: "📤",
+            RECONCILIATION: "📊",
+            PROCESSING_ERROR: "⚠️",
         };
 
         let msg = `📊 *AP Agent Daily Recap* — ${actionableCount} email${actionableCount !== 1 ? 's' : ''} processed\n`;

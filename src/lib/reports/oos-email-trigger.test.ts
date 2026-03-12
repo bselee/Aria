@@ -155,9 +155,9 @@ describe("buildEmailBody — Internal Builds section", () => {
 
         const html = buildEmailBody(result, [item], [], blockingMap, "Wednesday, March 12, 2026");
 
-        // Should contain a hyperlink wrapping "2520 on order"
+        // Should contain a hyperlink wrapping "PO#PO-4001 2520 on order"
         expect(html).toContain(`<a href="${poUrl}"`);
-        expect(html).toContain("2520 on order</a>");
+        expect(html).toContain("PO#PO-4001 2520 on order</a>");
         // Should contain the component SKU
         expect(html).toContain("CRP101");
         // Should say "Blocked"
@@ -204,7 +204,7 @@ describe("buildEmailBody — Internal Builds section", () => {
 
         // Should contain the PO link in the scheduled-build path (Awaiting, not Blocked)
         expect(html).toContain(`<a href="${poUrl}"`);
-        expect(html).toContain("5000 on order</a>");
+        expect(html).toContain("PO#PO-5050 5000 on order</a>");
         // Should say "Awaiting" (scheduled build path), not "Blocked"
         expect(html).toContain("Awaiting");
     });
@@ -314,7 +314,7 @@ describe("buildEmailBody — Internal Builds section", () => {
         // COMP-A should have a PO link
         expect(html).toContain("COMP-A");
         expect(html).toContain(`<a href="${poUrl1}"`);
-        expect(html).toContain("1000 on order</a>");
+        expect(html).toContain("PO#PO-6001 1000 on order</a>");
 
         // COMP-B should be shown WITHOUT a PO link (no on order)
         expect(html).toContain("COMP-B");

@@ -20,6 +20,8 @@ import { BuildParser, type ParsedBuild } from '../intelligence/build-parser';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import { createClient } from '../supabase';
+import { getTrackingStatus } from '../intelligence/ops-manager';
 
 // ──────────────────────────────────────────────────
 // BOM BLOCKING ANALYSIS TYPES
@@ -35,7 +37,7 @@ export interface BuildBlockingInfo {
         onOrder: number | null;
         isBlocking: boolean; // on-hand <= 0
         /** PO details for this component (if on order) */
-        incomingPOs: Array<{ orderId: string; quantity: number; finaleUrl: string }>;
+        incomingPOs: Array<{ orderId: string; quantity: number; finaleUrl: string; expectedDelivery?: string }>;
     }>;
     blockingReason: string; // Human-readable summary
 }
@@ -190,11 +192,36 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
                         || profile.onHand <= 0;
 
                     // DECISION(2026-03-12): Capture PO details per blocking component
-                    // so the email can link directly to the Finale PO page.
-                    const componentPOs = profile.incomingPOs.map(po => ({
-                        orderId: po.orderId,
-                        quantity: po.quantity,
-                        finaleUrl: `https://app.finaleinventory.com/buildasoilorganics/sc2/?order/purchase/order/${Buffer.from(`/buildasoilorganics/api/order/${po.orderId}`).toString('base64')}`,
+                    // so the email can link directly to the Finale PO page. Refine ETA using live tracking if available.
+                    const supabase = createClient();
+                    const componentPOs = await Promise.all(profile.incomingPOs.map(async po => {
+                        let refinedDelivery = po.expectedDelivery;
+                        if (supabase) {
+                            const { data } = await supabase.from('purchase_orders')
+                                .select('tracking_numbers')
+                                .eq('po_number', po.orderId)
+                                .maybeSingle();
+                                
+                            if (data && data.tracking_numbers && data.tracking_numbers.length > 0) {
+                                try {
+                                    const status = await getTrackingStatus(data.tracking_numbers[0]);
+                                    if (status && status.display && status.display.toLowerCase().includes('expected')) {
+                                        refinedDelivery = status.display.replace(/expected/i, '').trim();
+                                    } else if (status && status.display) {
+                                        refinedDelivery = status.display;
+                                    }
+                                } catch (err) {
+                                    // ignore tracking fetch error
+                                }
+                            }
+                        }
+
+                        return {
+                            orderId: po.orderId,
+                            quantity: po.quantity,
+                            expectedDelivery: refinedDelivery,
+                            finaleUrl: `https://app.finaleinventory.com/buildasoilorganics/sc2/?order/purchase/order/${Buffer.from(`/buildasoilorganics/api/order/${po.orderId}`).toString('base64')}`,
+                        };
                     }));
 
                     components.push({
@@ -532,16 +559,17 @@ export function buildEmailBody(
                         let label = `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`;
                         if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
                             const po = b.incomingPOs[0];
-                            label += ` (<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">${b.onOrder} on order</a>)`;
+                            const etaStr = po.expectedDelivery ? `, ETA ${po.expectedDelivery}` : '';
+                            label += ` <a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">)PO#${po.orderId} ${b.onOrder} on order${etaStr}</a>`;
                         } else if (b.onOrder && b.onOrder > 0) {
                             label += ` (${b.onOrder} on order)`;
                         }
                         return label;
                     }).join(', ');
                     const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
-                    statusCell = `<span style="color:#b91c1c;font-weight:500;font-size:12px">⚠ Awaiting ${names}${suffix}</span>`;
+                    statusCell = `<span style="color:#b91c1c;font-weight:500;font-size:12px">Awaiting ${names}${suffix}</span>`;
                 } else {
-                    statusCell = `<span style="color:#166534;font-weight:500;font-size:12px">✓ Components ready</span>`;
+                    statusCell = `<span style="color:#166534;font-weight:500;font-size:12px">Components ready</span>`;
                 }
             } else {
                 // No scheduled build — explain WHY
@@ -555,7 +583,8 @@ export function buildEmailBody(
                         // so the recipient can click through directly from the email.
                         if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
                             const po = b.incomingPOs[0];
-                            label += ` (<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">${b.onOrder} on order</a>)`;
+                            const etaStr = po.expectedDelivery ? `, ETA ${po.expectedDelivery}` : '';
+                            label += ` <a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">)PO#${po.orderId} ${b.onOrder} on order${etaStr}</a>`;
                         } else if (b.onOrder && b.onOrder > 0) {
                             label += ` (${b.onOrder} on order)`;
                         }

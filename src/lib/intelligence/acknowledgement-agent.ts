@@ -34,7 +34,10 @@ export class AcknowledgementAgent {
             lowerFrom.includes("no-reply") ||
             lowerFrom.includes("donotreply") ||
             lowerFrom.includes("postmaster") ||
-            lowerFrom.includes("system@");
+            lowerFrom.includes("system@") ||
+            lowerFrom.includes("mailer-daemon") ||
+            lowerFrom.includes("bounce") ||
+            lowerFrom.includes("@send.");
     }
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
@@ -42,7 +45,8 @@ export class AcknowledgementAgent {
             intent: z.enum([
                 "ROUTINE_INFO",
                 "REQUIRES_HUMAN",
-                "PROMOTIONAL"
+                "PROMOTIONAL",
+                "INLINE_INVOICE"
             ]),
             reasoning: z.string().describe("Brief reason for classification")
         });
@@ -64,6 +68,7 @@ Labels:
 ROUTINE_INFO - Standard vendor updates: order confirmations, tracking numbers, invoice deliveries, or PO acknowledgements. Contains NO questions or issues requiring human input.
 REQUIRES_HUMAN - The sender is asking a question, reporting a problem (backorder, price change, out of stock), requesting payment/approval, or needs dialogue.
 PROMOTIONAL - Marketing, spam, newsletters.
+INLINE_INVOICE - The email body contains cost breakdowns, dollar amounts, totals, freight charges, or other invoice-like data but NO PDF is attached. This is a structured cost breakdown (not a casual price mention).
 
 NOTE: If you are even slightly unsure if human attention is needed, choose REQUIRES_HUMAN.`;
 
@@ -225,6 +230,24 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         });
                         console.log(`     🗑️ Promoted/Spam archived.`);
                     } catch (e) { /* ignore */ }
+                } else if (intent === "INLINE_INVOICE") {
+                    // Delegate to InlineInvoiceHandler for PDF generation + Bill.com forward
+                    try {
+                        const { InlineInvoiceHandler } = await import('./inline-invoice-handler');
+                        const { Telegraf } = await import('telegraf');
+                        const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
+                        const handler = new InlineInvoiceHandler(bot);
+                        const bodyText = m.body_snippet || '';
+                        const result = await handler.process(bodyText, subject, senderEmail, rfcMessageId || gmailMessageId, threadId, hasPdf);
+                        if (result.processed) {
+                            console.log(`     📧 Inline invoice processed: ${result.logs.join(' | ')}`);
+                            processedCount++;
+                        } else {
+                            console.log(`     ⚠️ Inline invoice detection passed but handler declined: ${result.logs.join(' | ')}`);
+                        }
+                    } catch (err: any) {
+                        console.error(`     ❌ Inline invoice handler failed:`, err.message);
+                    }
                 } else {
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
                 }

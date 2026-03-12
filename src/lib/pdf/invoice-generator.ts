@@ -54,7 +54,8 @@ function drawMetadataSection(ctx: RenderContext, billTo: string[], metaRows: [st
     // Left column: "Bill To:"
     ctx.page.drawText('Bill To:', { x: ctx.margin, y: ctx.y, size: 10, font: ctx.fontBold, color: COLORS.darkGray });
     let leftY = ctx.y - 16;
-    for (const [idx, line] of billTo.entries()) {
+    for (let idx = 0; idx < billTo.length; idx++) {
+        const line = billTo[idx];
         ctx.page.drawText(line, { 
             x: ctx.margin, y: leftY, size: idx === 0 ? 10 : 9, 
             font: ctx.fontReg, color: idx === 0 ? COLORS.black : COLORS.medGray 

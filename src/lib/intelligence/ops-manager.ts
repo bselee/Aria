@@ -79,8 +79,8 @@ function detectLTLCarrier(text: string): string | null {
     return null;
 }
 
-type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
-interface TrackingStatus { category: TrackingCategory; display: string; public_url?: string; }
+export type TrackingCategory = 'delivered' | 'out_for_delivery' | 'in_transit' | 'exception';
+export interface TrackingStatus { category: TrackingCategory; display: string; public_url?: string; }
 
 
 const LTL_DIRECT_LINKS: Record<string, string> = {
@@ -288,7 +288,7 @@ async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingSta
     return null;
 }
 
-async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
+export async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
     const rawNumber = trackingNumber.includes(":::") ? trackingNumber.split(":::", 2)[1] : trackingNumber;
 
     // LTL (:::) — try carrier page fetch first (free, no credentials)

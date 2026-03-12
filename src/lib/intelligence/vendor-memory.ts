@@ -207,6 +207,19 @@ export async function seedKnownVendorPatterns(): Promise<void> {
             learnedFrom: 'manual',
             confidence: 0.8,
         },
+        // DECISION(2026-03-12): Auto-pay vendor invoices like Toyota Lease
+        // These send invoice PDFs but say "DO NOT PAY" because they are on auto-pay.
+        // Forwarding to Bill.com creates a risk of double-payment.
+        {
+            vendorName: 'Toyota',
+            documentType: 'INVOICE',
+            pattern: 'Sends invoice PDFs for leases but is set up for automatic payment (auto-pay). Often says "DO NOT PAY".',
+            handlingRule: 'Do NOT forward to bill.com to prevent double-payment. Log the invoice for reconciliation but skip payment processing.',
+            invoiceBehavior: 'single_page',
+            forwardTo: '', // intentional blank so we don't forward
+            learnedFrom: 'manual',
+            confidence: 0.95,
+        },
     ];
 
     console.log('🌱 Seeding vendor patterns...');

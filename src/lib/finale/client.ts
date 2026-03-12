@@ -32,6 +32,7 @@ export interface POInfo {
     orderId: string;
     status: string;
     orderDate: string;
+    expectedDelivery?: string;
     supplier: string;
     quantityOnOrder: number;
     total: number;
@@ -1319,6 +1320,7 @@ export class FinaleClient {
                                     orderId
                                     status
                                     orderDate
+                                    expectedDelivery
                                     supplier { name }
                                     total
                                     itemList(first: 100) {
@@ -1362,6 +1364,7 @@ export class FinaleClient {
                         orderId: po.orderId,
                         status: po.status,
                         orderDate: po.orderDate,
+                        expectedDelivery: po.expectedDelivery,
                         supplier: po.supplier?.name || "Unknown",
                         quantityOnOrder: parseFinaleNumber(matchingItem?.node.quantity) || 0,
                         total: po.total || 0,
@@ -1482,7 +1485,7 @@ export class FinaleClient {
         leadTimeDays: number | null;
         reorderQuantityToOrder: number | null;
         hasFinaleData: boolean;      // Whether Finale returned ANY meaningful data
-        incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>;
+        incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string; expectedDelivery?: string }>;
     }> {
         const profile = {
             onHand: null as number | null,
@@ -1494,7 +1497,7 @@ export class FinaleClient {
             leadTimeDays: null as number | null,
             reorderQuantityToOrder: null as number | null,
             hasFinaleData: false,
-            incomingPOs: [] as Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>,
+            incomingPOs: [] as Array<{ orderId: string; supplier: string; quantity: number; orderDate: string; expectedDelivery?: string }>,
         };
 
         const parseVal = (val: string | null | undefined): number | null => {
@@ -1564,6 +1567,7 @@ export class FinaleClient {
                 supplier: po.supplier,
                 quantity: po.quantityOnOrder,
                 orderDate: po.orderDate,
+                expectedDelivery: po.expectedDelivery,
             }));
             if (pos.length > 0) {
                 profile.onOrder = pos.reduce((sum, po) => sum + po.quantityOnOrder, 0);
