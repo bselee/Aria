@@ -7,7 +7,7 @@
  * @created 2026-02-24
  * @updated 2026-03-06
  * @deps    @pinecone-database/pinecone, ./embedding
- * @env     PINECONE_API_KEY, PINECONE_INDEX, OPENAI_API_KEY
+ * @env     PINECONE_API_KEY, PINECONE_INDEX
  *
  * DECISION(2026-03-06): Embedding logic extracted to shared embedding.ts.
  * Added TTL enforcement — expired memories are filtered out during recall().
@@ -15,7 +15,7 @@
  */
 
 import { Pinecone } from '@pinecone-database/pinecone';
-import { embed } from './embedding';
+import { embed, embedQuery } from './embedding';
 
 let pc: Pinecone | null = null;
 
@@ -134,7 +134,10 @@ export async function recall(query: string, options?: {
 }): Promise<MemorySearchResult[]> {
     try {
         const index = getIndex();
-        const vector = await embed(query);
+        // DECISION(2026-03-13): Use embedQuery() (inputType: 'query') for search,
+        // vs embed() (inputType: 'passage') for storage. llama-text-embed-v2 uses
+        // asymmetric embedding for optimal retrieval quality.
+        const vector = await embedQuery(query);
 
         // DECISION(2026-03-06): If embedding fails, return empty rather than crash.
         // Agent continues without memory context — better than a hard failure.

@@ -6,14 +6,14 @@
  * @created 2026-02-24
  * @updated 2026-03-06
  * @deps    @pinecone-database/pinecone, ./embedding
- * @env     PINECONE_API_KEY, PINECONE_INDEX, OPENAI_API_KEY
+ * @env     PINECONE_API_KEY, PINECONE_INDEX
  *
  * DECISION(2026-03-06): Embedding logic extracted to shared embedding.ts.
  * All functions degrade gracefully on embedding/Pinecone failures.
  */
 
 import { Pinecone } from '@pinecone-database/pinecone';
-import { embed } from './embedding';
+import { embed, embedQuery } from './embedding';
 
 let pc: Pinecone | null = null;
 
@@ -142,7 +142,7 @@ export async function getVendorPattern(vendorName: string): Promise<VendorPatter
 export async function findRelevantPatterns(documentText: string, topK: number = 3): Promise<VendorPattern[]> {
     try {
         const index = getIndex();
-        const vector = await embed(documentText.slice(0, 2000));
+        const vector = await embedQuery(documentText.slice(0, 2000));
 
         // Embedding failed — return empty rather than crash
         if (!vector) {
