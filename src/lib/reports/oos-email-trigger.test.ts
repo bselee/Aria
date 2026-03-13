@@ -78,6 +78,19 @@ describe("relativeETA", () => {
         expect(result.text).toBe("Today");
         expect(result.color).toBe("#166534");
     });
+
+    it("should handle short date formats like 'Mar 16' without returning NaN", () => {
+        const result = relativeETA("Mar 16");
+        expect(result.text).not.toContain("NaN");
+        // Should return some valid text (either a relative day count or the raw string)
+        expect(result.text.length).toBeGreaterThan(0);
+    });
+
+    it("should fall back to displaying raw string for truly unparseable dates", () => {
+        const result = relativeETA("sometime next week");
+        expect(result.text).toBe("sometime next week");
+        expect(result.color).toBe("#94a3b8");
+    });
 });
 
 // ──────────────────────────────────────────────────

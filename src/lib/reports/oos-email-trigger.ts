@@ -365,7 +365,37 @@ async function emailReport(
 /** Format a date relative to today — "in 3 days", "5 days overdue", "today" */
 export function relativeETA(dateStr: string | null): { text: string; color: string } {
     if (!dateStr) return { text: 'TBD', color: '#94a3b8' };
-    const target = new Date(dateStr + 'T12:00:00');
+
+    // DECISION(2026-03-13): Tracking sources return varied date formats —
+    // ISO "2026-03-16", short "Mar 16", "March 16, 2026", or
+    // prefixed strings like "Expected Mar 16" / "Delivered".
+    // Strip common prefixes first, then normalise year-less dates.
+    let cleaned = dateStr.trim()
+        .replace(/^(expected|estimated|est\.?|arrives?|delivery|delivered)\s*/i, '')
+        .trim();
+
+    // If it's just a status word (e.g. "Delivered") with nothing left, show as-is
+    if (!cleaned) return { text: dateStr, color: '#94a3b8' };
+
+    // DECISION(2026-03-13): Detect year-less month+day strings like "Mar 16"
+    // or "March 16". JavaScript's Date("Mar 16") defaults to year 2001,
+    // which produces wildly wrong "9128 days overdue" results.
+    // Fix: append the current year so parsing produces the correct date.
+    const monthDayOnly = /^([A-Za-z]+)\s+(\d{1,2})$/;
+    const mdMatch = cleaned.match(monthDayOnly);
+    if (mdMatch) {
+        cleaned = `${mdMatch[1]} ${mdMatch[2]}, ${new Date().getFullYear()}`;
+    }
+
+    let target = new Date(cleaned + 'T12:00:00');
+    if (isNaN(target.getTime())) {
+        target = new Date(cleaned);
+    }
+    if (isNaN(target.getTime())) {
+        // Unparseable — show the raw date string as-is
+        return { text: dateStr, color: '#94a3b8' };
+    }
+
     const now = new Date();
     const diffDays = Math.round((target.getTime() - now.getTime()) / 86_400_000);
     if (diffDays === 0) return { text: 'Today', color: '#166534' };
@@ -424,27 +454,26 @@ export function buildEmailBody(
             ? `${urgent.length} item${urgent.length > 1 ? 's' : ''} without a PO. Probably worth a call.`
             : `${urgent.length} items sitting with no PO. Time to pick up the phone.`;
 
-    // ── TH helper for consistent column headers ──
-    const th = (label: string, align = 'left') =>
-        `<th style="padding:6px 12px;text-align:${align};color:#94B8C8;font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.5px">${label}</th>`;
-    const mono = `font-family:'SF Mono',Consolas,monospace;font-size:13px`;
+    const monoStyle = `font-family:${MONO};font-size:11px`;
 
     // ── Urgent: no PO on file ──
     let urgentBlock = '';
     if (urgent.length > 0) {
         const rows = urgent.map((item, i) => {
             const supplier = item.finaleSupplier.split(';')[0]?.replace(/\s*\(\$[\d.]+\)/, '') || '—';
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
+            const bg = i % 2 === 0 ? '#fff5f5' : '#ffffff';
             return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 40)}</td>
-                <td style="padding:8px 12px;color:#666">${trunc(supplier, 28)}</td>
-                <td style="padding:8px 12px;text-align:center;${mono};color:#b91c1c;font-weight:600">${item.shopifyAvailable}</td>
+                <td class="sku-col" width="75" style="padding:10px 10px;border-bottom:1px solid #fce8e8;font-family:${MONO};font-size:11px;font-weight:700;color:#0e3a3b;vertical-align:top;">${item.sku}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid #fce8e8;font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 50)}</td>
+                <td width="160" style="padding:10px 10px;border-bottom:1px solid #fce8e8;font-family:${FONT};font-size:11px;color:#64748b;vertical-align:top;">${trunc(supplier, 28)}</td>
+                <td width="50" style="padding:10px 10px;border-bottom:1px solid #fce8e8;font-family:${FONT};font-size:14px;font-weight:700;color:#dc2626;text-align:center;vertical-align:top;">${item.shopifyAvailable}</td>
             </tr>`;
         }).join('');
-        urgentBlock = sect('Needs ordering — no PO on file', '#b91c1c',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('Vendor')}${th('Qty', 'center')}</tr>
+        urgentBlock = sect('Needs Ordering — No PO on File', '#dc2626', 'needs ordering',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#fef2f2;">${colHdr('SKU', 75)}${colHdr('Product')}${colHdr('Vendor', 160)}${colHdr('Qty', 50, 'center')}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
@@ -455,22 +484,24 @@ export function buildEmailBody(
         const rows = aging.map((item, i) => {
             const po = item.openPOs[0];
             const age = po ? Math.floor((Date.now() - new Date(po.orderDate).getTime()) / 86_400_000) : 0;
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
+            const bg = i % 2 === 0 ? '#fffbf0' : '#ffffff';
             const tracking = po?.trackingLinks?.length
-                ? `<a href="${po.trackingLinks[0]}" style="color:#2563EB;text-decoration:none">${po.carrier || 'Track'} &rarr;</a>`
-                : '<span style="color:#ccc">none</span>';
+                ? `<a href="${po.trackingLinks[0]}" style="color:#0d7377;text-decoration:none;font-family:${FONT};font-size:11px;font-weight:600;">${po.carrier || 'Track'} &#8594;</a>`
+                : `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;font-style:italic;">awaiting ship</span>`;
             return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 30)}</td>
-                <td style="padding:8px 12px">${po ? `<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;${mono}">${po.orderId}</a>` : '—'}</td>
-                <td style="padding:8px 12px;color:#92400e;font-weight:600;${mono}">${age}d</td>
-                <td style="padding:8px 12px">${tracking}</td>
-                <td style="padding:8px 12px;color:#666">${po?.supplier || '—'}</td>
+                <td class="sku-col" width="75" style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${MONO};font-size:11px;font-weight:700;color:#0e3a3b;vertical-align:top;">${item.sku}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 35)}</td>
+                <td width="65" style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${FONT};font-size:11px;color:#0d7377;font-weight:700;vertical-align:top;">${po ? `<a href="${po.finaleUrl}" style="color:#0d7377;text-decoration:none;font-weight:700;">${po.orderId}</a>` : '—'}</td>
+                <td width="50" style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${FONT};font-size:12px;color:#92400e;font-weight:700;vertical-align:top;">${age}d</td>
+                <td width="110" style="padding:10px 10px;border-bottom:1px solid #f5edd8;vertical-align:top;">${tracking}</td>
+                <td width="100" style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${FONT};font-size:11px;color:#64748b;vertical-align:top;">${po?.supplier || '—'}</td>
             </tr>`;
         }).join('');
-        agingBlock = sect('Aging POs — follow up with vendor', '#92400e',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('PO')}${th('Age')}${th('Tracking')}${th('Vendor')}</tr>
+        agingBlock = sect('Aging POs — Follow Up with Vendor', '#92400e', 'aging',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#fef9ec;">${colHdr('SKU', 75)}${colHdr('Product')}${colHdr('PO', 65)}${colHdr('Age', 50)}${colHdr('Tracking', 110)}${colHdr('Vendor', 100)}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
@@ -482,24 +513,29 @@ export function buildEmailBody(
             const po = item.openPOs[0];
             const eta = relativeETA(po?.expectedDelivery || null);
             const etaDate = po?.expectedDelivery || '';
+            const isOverdue = eta.color === '#b91c1c';
+            const rowBg = isOverdue ? '#fff5f5' : (i % 2 === 0 ? '#f9fefe' : '#ffffff');
+            const borderColor = isOverdue ? '#fce8e8' : '#e8f4f4';
             const etaDisplay = etaDate
-                ? `<span style="color:${eta.color};font-weight:600">${eta.text}</span><br><span style="color:#94a3b8;font-size:11px">${etaDate}</span>`
-                : `<span style="color:#94a3b8">TBD</span>`;
+                ? `<div style="font-family:${FONT};font-size:11px;font-weight:700;color:${eta.color};">${eta.text}</div>
+                   <div style="font-family:${FONT};font-size:10px;color:#94a3b8;margin-top:1px;">${etaDate}</div>`
+                : `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;">TBD</span>`;
             const tracking = po?.trackingLinks?.length
-                ? `<a href="${po.trackingLinks[0]}" style="color:#2563EB;text-decoration:none;font-weight:500">${po.carrier || 'Track'} &rarr;</a>`
-                : '<span style="color:#ccc">awaiting ship</span>';
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
-            return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 30)}</td>
-                <td style="padding:8px 12px">${po ? `<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;${mono}">${po.orderId}</a>` : '—'}</td>
-                <td style="padding:8px 12px">${etaDisplay}</td>
-                <td style="padding:8px 12px">${tracking}</td>
+                ? `<a href="${po.trackingLinks[0]}" style="color:#0d7377;text-decoration:none;font-family:${FONT};font-size:11px;font-weight:600;">${po.carrier || 'Track'} &#8594;</a>`
+                : `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;font-style:italic;">awaiting ship</span>`;
+            return `<tr style="background:${rowBg}">
+                <td class="sku-col" width="75" style="padding:10px 10px;border-bottom:1px solid ${borderColor};font-family:${MONO};font-size:11px;font-weight:700;color:#0e3a3b;vertical-align:top;">${item.sku}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid ${borderColor};font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 40)}</td>
+                <td width="65" style="padding:10px 10px;border-bottom:1px solid ${borderColor};font-family:${FONT};font-size:11px;color:#0d7377;font-weight:700;vertical-align:top;">${po ? `<a href="${po.finaleUrl}" style="color:#0d7377;text-decoration:none;font-weight:700;">${po.orderId}</a>` : '—'}</td>
+                <td width="135" style="padding:10px 10px;border-bottom:1px solid ${borderColor};vertical-align:top;">${etaDisplay}</td>
+                <td width="110" style="padding:10px 10px;border-bottom:1px solid ${borderColor};vertical-align:top;">${tracking}</td>
             </tr>`;
         }).join('');
-        onOrderBlock = sect('On order — POs in progress', '#166534',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('PO')}${th('Arrival')}${th('Tracking')}</tr>
+        onOrderBlock = sect('On Order — POs in Progress', '#0d7377', 'on order',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#f0fafa;">${colHdr('SKU', 75)}${colHdr('Product')}${colHdr('PO', 65)}${colHdr('Arrival', 135)}${colHdr('Tracking', 110)}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
@@ -510,22 +546,24 @@ export function buildEmailBody(
         const rows = receivedItems.map((item, i) => {
             const po = item.openPOs[0];
             const tracking = po?.trackingLinks?.length
-                ? `<a href="${po.trackingLinks[0]}" style="color:#2563EB;text-decoration:none;font-weight:500">${po.carrier || 'Track'} &rarr;</a>`
+                ? `<a href="${po.trackingLinks[0]}" style="color:#0d7377;text-decoration:none;font-family:${FONT};font-size:11px;font-weight:600;">${po.carrier || 'Track'} &#8594;</a>`
                 : po?.trackingNumbers?.length
-                    ? `<span style="color:#94a3b8">${po.trackingNumbers[0]}</span>`
-                    : '<span style="color:#ccc">—</span>';
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
+                    ? `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;">${po.trackingNumbers[0]}</span>`
+                    : `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;">—</span>`;
+            const bg = i % 2 === 0 ? '#f9fefe' : '#ffffff';
             return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 30)}</td>
-                <td style="padding:8px 12px">${po ? `<a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;${mono}">${po.orderId}</a>` : '—'}</td>
-                <td style="padding:8px 12px"><span style="color:#059669;font-weight:600">Received</span></td>
-                <td style="padding:8px 12px">${tracking}</td>
+                <td class="sku-col" width="75" style="padding:10px 10px;border-bottom:1px solid #e8f4f4;font-family:${MONO};font-size:11px;font-weight:700;color:#0e3a3b;vertical-align:top;">${item.sku}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid #e8f4f4;font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 40)}</td>
+                <td width="65" style="padding:10px 10px;border-bottom:1px solid #e8f4f4;font-family:${FONT};font-size:11px;color:#0d7377;font-weight:700;vertical-align:top;">${po ? `<a href="${po.finaleUrl}" style="color:#0d7377;text-decoration:none;font-weight:700;">${po.orderId}</a>` : '—'}</td>
+                <td width="100" style="padding:10px 10px;border-bottom:1px solid #e8f4f4;vertical-align:top;"><span style="font-family:${FONT};font-size:10px;font-weight:700;color:#059669;background:#dcfce7;padding:2px 8px;border-radius:10px;white-space:nowrap;">Received</span></td>
+                <td width="110" style="padding:10px 10px;border-bottom:1px solid #e8f4f4;vertical-align:top;">${tracking}</td>
             </tr>`;
         }).join('');
-        receivedBlock = sect('Received — Still OOS', '#7c3aed',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('PO')}${th('Status')}${th('Tracking')}</tr>
+        receivedBlock = sect('Received — Still OOS', '#059669', 'received',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#f0fdf4;">${colHdr('SKU', 75)}${colHdr('Product')}${colHdr('PO', 65)}${colHdr('Status', 100)}${colHdr('Tracking', 110)}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
@@ -536,77 +574,76 @@ export function buildEmailBody(
         const rows = builds.map((item, i) => {
             const sched = findScheduledBuild(item.sku);
             const blocking = buildBlockingMap.get(item.sku.toUpperCase());
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
+            const isBlocked = blocking && blocking.components.some(c => c.isBlocking);
+
+            // Urgency-based row tinting
+            let rowBg: string;
+            let borderColor: string;
+            if (sched) {
+                const rel = relativeETA(sched.buildDate);
+                if (rel.text === 'Today' || rel.text === 'Tomorrow') {
+                    rowBg = '#fffdf0'; borderColor = '#fef3c7';
+                } else if (isBlocked) {
+                    rowBg = '#fff5f5'; borderColor = '#fce8e8';
+                } else {
+                    rowBg = i % 2 === 0 ? '#f9feff' : '#ffffff'; borderColor = '#f0f4ff';
+                }
+            } else {
+                rowBg = isBlocked ? '#fff5f5' : (i % 2 === 0 ? '#f9feff' : '#ffffff');
+                borderColor = isBlocked ? '#fce8e8' : '#f0f4ff';
+            }
 
             // Schedule column
             let schedCell: string;
             if (sched) {
                 const rel = relativeETA(sched.buildDate);
                 const facility = sched.designation === 'SOIL' ? 'Soil' : 'MFG';
-                schedCell = `<span style="color:${rel.color};font-weight:600">${rel.text}</span>`
-                    + `<br><span style="color:#94a3b8;font-size:11px">${sched.buildDate} &middot; ${facility} &middot; ${sched.quantity} units</span>`;
+                const isToday = rel.text === 'Today';
+                const dot = isToday ? '&#9679; ' : '';
+                schedCell = `<div style="font-family:${FONT};font-size:11px;font-weight:700;color:${rel.color};">${dot}${rel.text}</div>`
+                    + `<div style="font-family:${FONT};font-size:10px;color:#94a3b8;margin-top:1px;">${sched.buildDate} &middot; ${facility} &middot; ${sched.quantity} units</div>`;
             } else {
-                schedCell = `<span style="color:#94a3b8;font-size:12px">No build on calendar</span>`;
+                schedCell = `<span style="font-family:${FONT};font-size:11px;color:#94a3b8;font-style:italic;">No build on calendar</span>`;
             }
 
-            // Status / blocking column — the actionable context
+            // Status / blocking column
             let statusCell: string;
-            if (sched) {
-                // Has scheduled build — show ready or blocking components
-                if (blocking && blocking.components.some(c => c.isBlocking)) {
-                    const blockers = blocking.components.filter(c => c.isBlocking);
-                    const names = blockers.slice(0, 2).map(b => {
-                        let label = `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`;
-                        if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
-                            const po = b.incomingPOs[0];
-                            const etaStr = po.expectedDelivery ? `, ETA ${po.expectedDelivery}` : '';
-                            label += ` <a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">)PO#${po.orderId} ${b.onOrder} on order${etaStr}</a>`;
-                        } else if (b.onOrder && b.onOrder > 0) {
-                            label += ` (${b.onOrder} on order)`;
-                        }
-                        return label;
-                    }).join(', ');
-                    const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
-                    statusCell = `<span style="color:#b91c1c;font-weight:500;font-size:12px">Awaiting ${names}${suffix}</span>`;
-                } else {
-                    statusCell = `<span style="color:#166534;font-weight:500;font-size:12px">Components ready</span>`;
-                }
+            if (blocking && isBlocked) {
+                const blockers = blocking.components.filter(c => c.isBlocking);
+                const names = blockers.slice(0, 2).map(b => {
+                    let label = b.componentSku;
+                    if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
+                        const po = b.incomingPOs[0];
+                        const etaStr = po.expectedDelivery ? `, ETA ${po.expectedDelivery}` : '';
+                        label += ` <a href="${po.finaleUrl}" style="color:#0d7377;text-decoration:none;font-size:10px;">PO#${po.orderId}${etaStr}</a>`;
+                    }
+                    return label;
+                }).join(', ');
+                const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
+
+                // BLOCKED badge in red pill
+                statusCell = `<div style="margin-bottom:3px;"><span style="font-family:${FONT};font-size:9px;font-weight:800;letter-spacing:0.06em;color:#ffffff;background:#dc2626;padding:2px 7px;border-radius:3px;text-transform:uppercase;">BLOCKED</span></div>`
+                    + `<div style="font-family:${FONT};font-size:11px;color:#dc2626;font-weight:600;margin-top:3px;">Awaiting ${names}${suffix}</div>`;
+            } else if (!blocking || !blocking.hasBOM) {
+                statusCell = `<span style="font-family:${FONT};font-size:11px;color:#2563eb;">No BOM in Finale — needs setup</span>`;
+            } else if (sched) {
+                statusCell = `<span style="font-family:${FONT};font-size:11px;color:#059669;font-weight:600;">Components ready</span>`;
             } else {
-                // No scheduled build — explain WHY
-                if (!blocking || !blocking.hasBOM) {
-                    statusCell = `<span style="color:#92400e;font-size:12px">No BOM in Finale — needs setup</span>`;
-                } else if (blocking.components.some(c => c.isBlocking)) {
-                    const blockers = blocking.components.filter(c => c.isBlocking);
-                    const names = blockers.slice(0, 2).map(b => {
-                        let label = `<code style="${mono};font-size:11px;color:#b91c1c">${b.componentSku}</code>`;
-                        // DECISION(2026-03-12): Link "on order" text to the PO in Finale
-                        // so the recipient can click through directly from the email.
-                        if (b.onOrder && b.onOrder > 0 && b.incomingPOs.length > 0) {
-                            const po = b.incomingPOs[0];
-                            const etaStr = po.expectedDelivery ? `, ETA ${po.expectedDelivery}` : '';
-                            label += ` <a href="${po.finaleUrl}" style="color:#2563EB;text-decoration:none;font-size:11px">)PO#${po.orderId} ${b.onOrder} on order${etaStr}</a>`;
-                        } else if (b.onOrder && b.onOrder > 0) {
-                            label += ` (${b.onOrder} on order)`;
-                        }
-                        return label;
-                    }).join(', ');
-                    const suffix = blockers.length > 2 ? ` +${blockers.length - 2}` : '';
-                    statusCell = `<span style="color:#b91c1c;font-size:12px">Blocked — awaiting ${names}${suffix}</span>`;
-                } else {
-                    statusCell = `<span style="color:#2563EB;font-weight:500;font-size:12px">Ready to schedule — components in stock</span>`;
-                }
+                statusCell = `<span style="font-family:${FONT};font-size:11px;color:#2563eb;font-weight:500;">Ready to schedule — components in stock</span>`;
             }
 
-            return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 28)}</td>
-                <td style="padding:8px 12px">${schedCell}</td>
-                <td style="padding:8px 12px">${statusCell}</td>
+            return `<tr style="background:${rowBg}">
+                <td class="sku-col" width="90" style="padding:10px 10px;border-bottom:1px solid ${borderColor};font-family:${MONO};font-size:10px;font-weight:700;color:#0e3a3b;vertical-align:top;">${item.sku}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid ${borderColor};font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 35)}</td>
+                <td width="175" style="padding:10px 10px;border-bottom:1px solid ${borderColor};vertical-align:top;">${schedCell}</td>
+                <td width="185" style="padding:10px 10px;border-bottom:1px solid ${borderColor};vertical-align:top;">${statusCell}</td>
             </tr>`;
         }).join('');
-        buildsBlock = sect('Internal builds — manufacturing', '#475569',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('Build schedule')}${th('Status')}</tr>
+        buildsBlock = sect('Internal Builds — Manufacturing', '#2563eb', 'internal builds',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#eff6ff;">${colHdr('SKU', 90)}${colHdr('Product')}${colHdr('Build Schedule', 175)}${colHdr('Status', 185)}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
@@ -615,103 +652,191 @@ export function buildEmailBody(
     let missingBlock = '';
     if (missing.length > 0) {
         const skus = missing.map(i =>
-            `<span style="${mono};font-weight:600">${i.sku}</span>`
-        ).join(', ');
-        missingBlock = sect('Not in Finale', '#92400e',
-            `<p style="margin:0;color:#78350f;font-size:14px">These SKUs may be new products or bundles that need setup: ${skus}</p>`);
+            `<span style="font-family:${MONO};font-size:12px;font-weight:700;color:#0e3a3b;background:#ede9fe;padding:2px 8px;border-radius:4px;margin-left:6px;">${i.sku}</span>`
+        ).join(' ');
+        missingBlock = sect('Not in Finale', '#9333ea', 'not in finale',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr style="background:#faf5ff;"><td style="padding:12px 10px;font-family:${FONT};font-size:12px;color:#9333ea;font-weight:600;">
+                These SKUs may be new products or bundles that need setup: ${skus}
+            </td></tr></table>`);
     }
 
     let reviewBlock = '';
     if (reviewItems.length > 0) {
         const rows = reviewItems.map((item, i) => {
-            const bg = i % 2 === 0 ? '#fff' : '#fafbfc';
+            const bg = i % 2 === 0 ? '#fffdf5' : '#ffffff';
+            const shortStatus = item.actionRequired
+                .replace(/^REVIEW — /, '')
+                .replace(/\. Take down listing or reorder\?$/, '');
             return `<tr style="background:${bg}">
-                <td style="padding:8px 12px;${mono};font-weight:600">${item.sku}</td>
-                <td style="padding:8px 12px;color:#333">${trunc(item.productName, 30)}</td>
-                <td style="padding:8px 12px;color:#92400e">${item.actionRequired}</td>
+                <td class="sku-col" width="75" style="padding:10px 10px;border-bottom:1px solid #fef3c7;font-family:${MONO};font-size:11px;font-weight:700;color:#0e3a3b;vertical-align:top;white-space:nowrap;">${item.sku}</td>
+                <td width="200" style="padding:10px 10px;border-bottom:1px solid #fef3c7;font-family:${FONT};font-size:12px;color:#0e3a3b;font-weight:500;vertical-align:top;">${trunc(item.productName, 45)}</td>
+                <td style="padding:10px 10px;border-bottom:1px solid #fef3c7;font-family:${FONT};font-size:11px;color:#d97706;font-weight:600;vertical-align:top;">${shortStatus}</td>
             </tr>`;
         }).join('');
-        reviewBlock = sect('Needs Review — Do Not Reorder', '#92400e',
-            `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
-                <tr style="background:#1B3A4B">${th('SKU')}${th('Product')}${th('Status')}</tr>
+        reviewBlock = sect('Needs Review — Do Not Reorder', '#d97706', 'needs review',
+            `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
+                <tr style="background:#fffbeb;">${colHdr('SKU', 75)}${colHdr('Product', 200)}${colHdr('Status')}</tr>
+            </table>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 ${rows}
             </table>`);
     }
 
+    const shortDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Denver' });
+    const filename = `OOS-Report-${new Date().toISOString().slice(0, 10)}.xlsx`;
+
     return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">
-<div style="max-width:700px;margin:20px auto">
+<html><head><meta charset="UTF-8">
+<style>
+  body { margin: 0; padding: 0; background: #e8f4f4; }
+  table { border-collapse: collapse; }
+  img { border: 0; }
+  @media only screen and (max-width: 600px) {
+    .email-wrap { width: 100% !important; }
+    .mobile-stack { display: block !important; width: 100% !important; }
+    .mobile-hide { display: none !important; }
+    .mobile-pad { padding: 12px !important; }
+    .sku-col { width: 60px !important; font-size: 10px !important; }
+    .stat-cell { display: block !important; width: 100% !important; margin-bottom: 6px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background:#e8f4f4;font-family:${FONT};">
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#e8f4f4;padding:24px 12px;">
+<tr><td align="center">
+<table class="email-wrap" width="680" cellpadding="0" cellspacing="0" border="0" style="width:680px;max-width:100%;">
 
-    <!-- Header -->
-    <div style="background:#1B3A4B;padding:24px 28px;border-radius:8px 8px 0 0">
-        <table width="100%"><tr>
-            <td>
-                <div style="font-size:20px;font-weight:700;color:#fff;letter-spacing:-0.3px">Out of Stock</div>
-                <div style="font-size:13px;color:#7FB3CB;margin-top:4px">${dateStr}</div>
-            </td>
-            <td style="text-align:right;vertical-align:top">
-                <div style="background:#2C5F7C;border-radius:6px;padding:10px 14px;display:inline-block">
-                    <div style="font-size:24px;font-weight:700;color:#fff;${mono};line-height:1">${result.totalItems}</div>
-                    <div style="font-size:10px;color:#7FB3CB;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">items</div>
-                </div>
-            </td>
-        </tr></table>
-    </div>
+  <!-- HEADER BANNER -->
+  <tr>
+    <td style="background:linear-gradient(135deg,#0a5c60 0%,#0d7377 40%,#14a085 100%);border-radius:12px 12px 0 0;padding:28px 32px 24px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td style="vertical-align:top;">
+            <table cellpadding="0" cellspacing="0" border="0"><tr>
+              <td style="vertical-align:middle;padding-right:12px;">
+                <div style="width:36px;height:36px;background:rgba(255,255,255,0.2);border-radius:8px;text-align:center;line-height:36px;font-size:18px;font-weight:900;color:white;font-family:${FONT};letter-spacing:-1px;">S</div>
+              </td>
+              <td style="vertical-align:middle;">
+                <div style="font-family:${FONT};font-size:9px;letter-spacing:0.15em;color:rgba(255,255,255,0.65);text-transform:uppercase;margin-bottom:3px;">BuildASoil OPS</div>
+                <div style="font-family:${FONT};font-size:22px;font-weight:700;color:#ffffff;line-height:1;letter-spacing:-0.5px;">Stock Out Digest</div>
+                <div style="font-family:${FONT};font-size:10px;color:rgba(255,255,255,0.55);margin-top:5px;letter-spacing:0.04em;">Response to Stockie</div>
+              </td>
+            </tr></table>
+            <div style="margin-top:12px;font-family:${FONT};font-size:12px;color:rgba(255,255,255,0.85);font-weight:600;">&#9888;&#xFE0F; ${tagline}</div>
+          </td>
+          <td style="vertical-align:top;text-align:right;">
+            <div style="font-family:${FONT};font-size:9px;color:rgba(255,255,255,0.55);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;">${dateStr}</div>
+            <div style="font-family:${FONT};font-size:44px;font-weight:700;color:#ffffff;line-height:1;letter-spacing:-2px;">${result.totalItems}</div>
+            <div style="font-family:${FONT};font-size:9px;color:rgba(255,255,255,0.55);letter-spacing:0.12em;text-transform:uppercase;">Items Flagged</div>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
 
-    <!-- Tagline -->
-    <div style="background:#15293B;padding:10px 28px">
-        <span style="font-size:13px;color:#94B8C8;font-style:italic">${tagline}</span>
-    </div>
+  <!-- SUMMARY COUNT BAR -->
+  <tr>
+    <td style="background:#ffffff;border-left:1px solid #cce8e8;border-right:1px solid #cce8e8;padding:16px 20px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+            ${qStat(urgent.length, 'Need PO', urgent.length > 0 ? '#dc2626' : '#6b7280')}
+            ${qStat(reviewItems.length, 'Review', reviewItems.length > 0 ? '#d97706' : '#6b7280')}
+            ${qStat(aging.length, 'Aging', aging.length > 0 ? '#92400e' : '#6b7280')}
+            ${qStat(onOrder.length, 'On Order', '#0d7377')}
+            ${qStat(receivedItems.length, 'Received', receivedItems.length > 0 ? '#059669' : '#6b7280')}
+            ${qStat(builds.length, 'Builds', '#2563eb')}
+            ${qStat(missing.length, 'Not Found', missing.length > 0 ? '#9333ea' : '#6b7280', true)}
+      </tr></table>
+    </td>
+  </tr>
 
-    <!-- Stats -->
-    <div style="background:#fff;padding:14px 28px;border-bottom:1px solid #e2e8f0">
-        <table width="100%" cellpadding="0" cellspacing="0"><tr>
-            ${qStat(urgent.length, 'Need PO', urgent.length > 0 ? '#b91c1c' : '#ccc')}
-            ${qStat(reviewItems.length, 'Review', reviewItems.length > 0 ? '#92400e' : '#ccc')}
-            ${qStat(aging.length, 'Aging', aging.length > 0 ? '#92400e' : '#ccc')}
-            ${qStat(onOrder.length, 'On Order', '#166534')}
-            ${qStat(receivedItems.length, 'Received', receivedItems.length > 0 ? '#7c3aed' : '#ccc')}
-            ${qStat(builds.length, 'Builds', '#475569')}
-            ${qStat(missing.length, 'Not Found', missing.length > 0 ? '#92400e' : '#ccc')}
-        </tr></table>
-    </div>
+  <!-- SECTIONS -->
+  ${urgentBlock}
+  ${reviewBlock}
+  ${agingBlock}
+  ${onOrderBlock}
+  ${receivedBlock}
+  ${buildsBlock}
+  ${missingBlock}
 
-    <!-- Sections -->
-    <div style="background:#fff;padding:20px 28px 28px">
-        ${urgentBlock}
-        ${reviewBlock}
-        ${agingBlock}
-        ${onOrderBlock}
-        ${receivedBlock}
-        ${buildsBlock}
-        ${missingBlock}
-    </div>
+  <!-- FOOTER -->
+  <tr>
+    <td style="background:#0d7377;border-radius:0 0 12px 12px;padding:18px 28px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td style="vertical-align:middle;">
+          <div style="font-family:${FONT};font-size:10px;color:rgba(255,255,255,0.6);letter-spacing:0.05em;">
+            &#128206; Full spreadsheet attached — opens in Google Sheets:
+            <span style="color:rgba(255,255,255,0.9);font-weight:600;"> ${filename}</span>
+          </div>
+        </td>
+        <td style="text-align:right;vertical-align:middle;">
+          <div style="font-family:${FONT};font-size:10px;color:rgba(255,255,255,0.5);">
+            Sent from <span style="color:rgba(255,255,255,0.85);font-weight:600;">BuildASoil OPS</span> &middot; via Stockie
+          </div>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
 
-    <!-- Footer -->
-    <div style="background:#f8fafc;padding:12px 28px;border-top:1px solid #e2e8f0;border-radius:0 0 8px 8px">
-        <span style="font-size:11px;color:#cbd5e1">Full spreadsheet attached &mdash; opens in Google Sheets</span>
-    </div>
-
-</div>
+</table>
+</td></tr>
+</table>
 </body></html>`;
 }
 
-// ── HTML Helpers ──
+// ── HTML Helpers (new UI) ──
 
-function qStat(value: number, label: string, color: string): string {
-    return `<td style="text-align:center;padding:0 4px">
-        <span style="font-size:18px;font-weight:700;color:${color};font-family:'SF Mono',Consolas,monospace">${value}</span>
-        <span style="font-size:11px;color:#94a3b8;margin-left:3px">${label}</span>
+const FONT = `-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,sans-serif`;
+const MONO = `'Courier New',Courier,monospace`;
+
+/** Section-to-route mapping — department only, no personal names */
+const ROUTE_MAP: Record<string, { route: string; color: string }> = {
+    'needs ordering': { route: '→ Purchasing', color: '#dc2626' },
+    'needs review': { route: '→ Purchasing', color: '#d97706' },
+    'aging': { route: '→ Purchasing / Logistics', color: '#92400e' },
+    'on order': { route: '→ Purchasing / Logistics', color: '#0d7377' },
+    'received': { route: '→ Receiving / Ops', color: '#059669' },
+    'internal builds': { route: '→ Manufacturing', color: '#2563eb' },
+    'not in finale': { route: '→ Setup / Admin', color: '#9333ea' },
+};
+
+function qStat(value: number, label: string, color: string, last = false): string {
+    const border = last ? '' : 'border-right:1px solid #e8f4f4;';
+    return `<td class="stat-cell" style="text-align:center;padding:8px 10px;${border}vertical-align:middle;">
+        <div style="font-family:${FONT};font-size:20px;font-weight:700;color:${color};line-height:1;">${value}</div>
+        <div style="font-family:${FONT};font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">${label}</div>
     </td>`;
 }
 
-function sect(title: string, accent: string, content: string): string {
+/** Column header cell for section tables */
+function colHdr(label: string, width?: number, align = 'left'): string {
+    const w = width ? `width="${width}"` : '';
+    return `<td ${w} style="padding:6px 10px;font-family:${FONT};font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;text-align:${align};">${label}</td>`;
+}
+
+/** Section header with colored pip + uppercase title + route label */
+function sect(title: string, accent: string, routeKey: string, content: string): string {
+    const info = ROUTE_MAP[routeKey] || { route: '', color: accent };
+    const routeSpan = info.route
+        ? `<td style="padding-left:10px;vertical-align:middle;"><span style="font-family:${FONT};font-size:10px;color:${info.color};font-weight:600;">${info.route}</span></td>`
+        : '';
     return `
-    <div style="margin-bottom:24px">
-        <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px;color:${accent};margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid ${accent}">${title}</div>
-        <div>${content}</div>
-    </div>`;
+    <!-- SPACER -->
+    <tr><td style="background:#ffffff;border-left:1px solid #cce8e8;border-right:1px solid #cce8e8;height:4px;"></td></tr>
+    <tr>
+      <td style="background:#ffffff;border-left:1px solid #cce8e8;border-right:1px solid #cce8e8;padding:0 20px 20px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:10px;">
+          <tr><td style="padding:16px 0 8px;border-bottom:2px solid ${accent};">
+            <table cellpadding="0" cellspacing="0" border="0"><tr>
+              <td style="padding-right:10px;vertical-align:middle;"><div style="width:4px;height:16px;background:${accent};border-radius:2px;"></div></td>
+              <td style="vertical-align:middle;"><span style="font-family:${FONT};font-size:11px;font-weight:700;color:#0e3a3b;text-transform:uppercase;letter-spacing:0.1em;">${title}</span></td>
+              ${routeSpan}
+            </tr></table>
+          </td></tr>
+        </table>
+        ${content}
+      </td>
+    </tr>`;
 }
 
 function trunc(str: string, max: number): string {
