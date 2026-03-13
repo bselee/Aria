@@ -981,6 +981,12 @@ export class OpsManager {
                     }
 
                     // 2. Outside-thread search: look for vendor replies in other Gmail threads
+                    // DECISION(2026-03-13): Tightened keyword filter and added per-thread dedup.
+                    // Old regex /ship|eta|tracking/i was too broad — "ship" appears in routine
+                    // vendor emails about pricing/invoices. Now requires shipping-context patterns
+                    // like "shipped", "will ship", "tracking number", "expected delivery", etc.
+                    // Also dedup by threadId (not just messageId) so multiple messages in the
+                    // same conversation don't each generate a separate alert.
                     const vendorDomain = vendorEmail.split('@')[1];
                     if (vendorDomain && !vendorDomain.includes('buildasoil.com')) {
                         try {
@@ -990,16 +996,27 @@ export class OpsManager {
                                 q: `from:${vendorDomain} after:${sendDateStr} -label:PO`,
                                 maxResults: 5,
                             });
+                            // Dedup by thread: only alert once per outside Gmail thread per PO
+                            const seenOutsideThreadIds = new Set<string>();
+                            let outsideAlertCount = 0;
+                            const MAX_OUTSIDE_ALERTS_PER_PO = 2;
+
                             for (const outsideMsg of outsideSearch?.messages || []) {
+                                if (outsideAlertCount >= MAX_OUTSIDE_ALERTS_PER_PO) break;
                                 if (outsideMsg.threadId === m.threadId) continue;
                                 // DEDUP: Skip messages we've already alerted on (persisted across restarts)
                                 if (this.seenOutsideThreadMsgIds.has(outsideMsg.id!)) continue;
+                                // DEDUP: Skip if we already alerted on a different message in this same thread
+                                if (outsideMsg.threadId && seenOutsideThreadIds.has(outsideMsg.threadId)) continue;
+
                                 const { data: msgData } = await gmail.users.messages.get({
                                     userId: 'me', id: outsideMsg.id!, format: 'metadata',
                                     metadataHeaders: ['Subject', 'From'],
                                 });
                                 const snippet = msgData.snippet || '';
-                                const hasEta = /ship|eta|tracking|dispatch|deliver|expect/i.test(snippet);
+                                // Tighter keyword filter: require shipping-context patterns, not bare words
+                                // like "ship" which appear in routine vendor emails about pricing/invoices.
+                                const hasEta = /\b(shipped|will ship|shipment|ship date|tracking\s*#|tracking\s*number|dispatch(ed)?|deliver(ed|y|ing)|expected\s*(delivery|arrival)|est\.?\s*(delivery|arrival)|eta\b)/i.test(snippet);
                                 const outsideTracking: string[] = [];
                                 for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
                                     const match = snippet.match(regex);
@@ -1010,6 +1027,8 @@ export class OpsManager {
                                 if (hasEta || outsideTracking.length > 0) {
                                     // Mark as seen BEFORE sending to prevent duplicates on concurrent runs
                                     this.seenOutsideThreadMsgIds.add(outsideMsg.id!);
+                                    if (outsideMsg.threadId) seenOutsideThreadIds.add(outsideMsg.threadId);
+                                    outsideAlertCount++;
                                     // Persist to Supabase so restarts don't re-alert
                                     supabase.from('outside_thread_alerts').upsert({
                                         gmail_message_id: outsideMsg.id!,
