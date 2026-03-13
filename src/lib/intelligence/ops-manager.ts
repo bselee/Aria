@@ -936,57 +936,18 @@ export class OpsManager {
                 }
 
                 // ── Vendor follow-up + outside-thread search (non-responders only) ──
+                // DECISION(2026-03-13): Reordered logic — search for outside-thread
+                // emails FIRST. If the vendor already communicated (even outside the PO
+                // thread), skip the follow-up entirely. This prevents nagging vendors
+                // like Stockie who responded in a separate thread.
                 const vendorReplied = responseAt !== null;
                 const poIsOlderThan3Days = sentAt < Date.now() - 3 * 86_400_000;
 
                 if (!vendorReplied && trackingNumbers.length === 0 && poIsOlderThan3Days && vendorEmail) {
-                    // 1. Follow-up email in original thread (once per PO)
-                    try {
-                        const { data: poRow } = await supabase
-                            .from("purchase_orders")
-                            .select("follow_up_sent_at")
-                            .eq("po_number", poNumber)
-                            .maybeSingle();
-
-                        if (!poRow?.follow_up_sent_at) {
-                            const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
-                                month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
-                            });
-                            const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
-                            const rawEmail = buildFollowUpEmail({
-                                to: vendorEmail,
-                                subject: `Re: ${subject}`,
-                                inReplyTo: firstMsgId,
-                                references: firstMsgId,
-                                body: `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Could you share an expected ship date or tracking number?\n\nThank you!`,
-                            });
-                            await gmail.users.messages.send({
-                                userId: 'me',
-                                requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
-                            });
-                            await supabase.from("purchase_orders").upsert({
-                                po_number: poNumber,
-                                follow_up_sent_at: new Date().toISOString(),
-                                updated_at: new Date().toISOString(),
-                            }, { onConflict: "po_number" });
-                            console.log(`📧 [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
-                            this.bot.telegram.sendMessage(
-                                process.env.TELEGRAM_CHAT_ID || "",
-                                `📧 Sent ETA follow-up to <b>${vendorName}</b> for PO #${poNumber} (${sentDateStr}, no response in 3+ days)`,
-                                { parse_mode: "HTML" }
-                            );
-                        }
-                    } catch (e: any) {
-                        console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
-                    }
-
-                    // 2. Outside-thread search: look for vendor replies in other Gmail threads
-                    // DECISION(2026-03-13): Tightened keyword filter and added per-thread dedup.
-                    // Old regex /ship|eta|tracking/i was too broad — "ship" appears in routine
-                    // vendor emails about pricing/invoices. Now requires shipping-context patterns
-                    // like "shipped", "will ship", "tracking number", "expected delivery", etc.
-                    // Also dedup by threadId (not just messageId) so multiple messages in the
-                    // same conversation don't each generate a separate alert.
+                    // 1. Outside-thread search FIRST: look for vendor replies in other Gmail threads
+                    // If we find ANY communication from the vendor domain, treat them as "responded"
+                    // and suppress the follow-up email.
+                    let vendorCommunicatedOutsideThread = false;
                     const vendorDomain = vendorEmail.split('@')[1];
                     if (vendorDomain && !vendorDomain.includes('buildasoil.com')) {
                         try {
@@ -1004,6 +965,9 @@ export class OpsManager {
                             for (const outsideMsg of outsideSearch?.messages || []) {
                                 if (outsideAlertCount >= MAX_OUTSIDE_ALERTS_PER_PO) break;
                                 if (outsideMsg.threadId === m.threadId) continue;
+                                // Any email from the vendor domain counts as communication,
+                                // even if it doesn't match shipping keywords.
+                                vendorCommunicatedOutsideThread = true;
                                 // DEDUP: Skip messages we've already alerted on (persisted across restarts)
                                 if (this.seenOutsideThreadMsgIds.has(outsideMsg.id!)) continue;
                                 // DEDUP: Skip if we already alerted on a different message in this same thread
@@ -1056,6 +1020,51 @@ export class OpsManager {
                         } catch (e: any) {
                             console.warn(`[po-sync] Outside-thread search failed for ${vendorDomain}: ${e.message}`);
                         }
+                    }
+
+                    // 2. Follow-up email in original thread (once per PO, only if vendor
+                    //    has NOT communicated at all — including outside-thread emails)
+                    if (!vendorCommunicatedOutsideThread) {
+                        try {
+                            const { data: poRow } = await supabase
+                                .from("purchase_orders")
+                                .select("follow_up_sent_at")
+                                .eq("po_number", poNumber)
+                                .maybeSingle();
+
+                            if (!poRow?.follow_up_sent_at) {
+                                const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
+                                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
+                                });
+                                const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
+                                const rawEmail = buildFollowUpEmail({
+                                    to: vendorEmail,
+                                    subject: `Re: ${subject}`,
+                                    inReplyTo: firstMsgId,
+                                    references: firstMsgId,
+                                    body: `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Could you share an expected ship date or tracking number?\n\nThank you!`,
+                                });
+                                await gmail.users.messages.send({
+                                    userId: 'me',
+                                    requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
+                                });
+                                await supabase.from("purchase_orders").upsert({
+                                    po_number: poNumber,
+                                    follow_up_sent_at: new Date().toISOString(),
+                                    updated_at: new Date().toISOString(),
+                                }, { onConflict: "po_number" });
+                                console.log(`📧 [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
+                                this.bot.telegram.sendMessage(
+                                    process.env.TELEGRAM_CHAT_ID || "",
+                                    `📧 Sent ETA follow-up to <b>${vendorName}</b> for PO #${poNumber} (${sentDateStr}, no response in 3+ days)`,
+                                    { parse_mode: "HTML" }
+                                );
+                            }
+                        } catch (e: any) {
+                            console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
+                        }
+                    } else {
+                        console.log(`📧 [po-sync] Skipping follow-up for PO #${poNumber} — vendor ${vendorName} already communicated outside PO thread`);
                     }
                 }
             }
