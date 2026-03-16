@@ -10,6 +10,7 @@ import { recall } from "./memory";
  * @purpose Scans inbox for routine informational emails (order confirmations, PO updates, tracking, invoices)
  *          that don't require human action, sends a polite "Thanks!" reply if applicable, and archives them.
  * @author Antigravity
+ * @updated 2026-03-13 — cost-data upgrade guard + full body text for inline invoices (PO #124462 fix)
  */
 export class AcknowledgementAgent {
     private tokenIdentifier: string;
@@ -172,7 +173,23 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 console.log(`   Evaluating: "${subject}" from ${senderEmail}`);
 
                 // Guardrail 2: Classify intent
-                const intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
+                let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
+
+                // DECISION(2026-03-13): Post-classification cost-data guard.
+                // PO #124462 showed that the LLM classified Ed's cost breakdown
+                // ("TOTAL $1140.77 BREAKDOWN...") as ROUTINE_INFO, which triggered an
+                // auto-reply instead of routing to InlineInvoiceHandler.
+                // If classified as ROUTINE_INFO but the email contains dollar amounts
+                // AND invoice-like keywords, upgrade to INLINE_INVOICE.
+                if (intent === "ROUTINE_INFO" && !hasPdf) {
+                    const checkText = (m.body_text || snippet).toLowerCase();
+                    const hasDollarAmount = /\$[\d,]+\.\d{2}/.test(checkText) || /\b\d{2,},?\d*\.\d{2}\b/.test(checkText);
+                    const hasInvoiceSignals = /\b(total|breakdown|subtotal|amount\s+due|freight|invoice|plus\b.*\$)/.test(checkText);
+                    if (hasDollarAmount && hasInvoiceSignals) {
+                        console.log(`     -> Upgrading ROUTINE_INFO → INLINE_INVOICE (cost data detected in body)`);
+                        intent = "INLINE_INVOICE";
+                    }
+                }
 
                 if (intent === "ROUTINE_INFO") {
                     // It's routine! Let's handle it.
@@ -237,7 +254,10 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         const { Telegraf } = await import('telegraf');
                         const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
                         const handler = new InlineInvoiceHandler(bot);
-                        const bodyText = m.body_snippet || '';
+                        // DECISION(2026-03-13): Use full body_text instead of snippet.
+                        // PO #124462 showed the snippet (~200 chars) truncated Ed's cost
+                        // breakdown, making the LLM parser unable to extract accurate data.
+                        const bodyText = m.body_text || m.body_snippet || '';
                         const result = await handler.process(bodyText, subject, senderEmail, rfcMessageId || gmailMessageId, threadId, hasPdf);
                         if (result.processed) {
                             console.log(`     📧 Inline invoice processed: ${result.logs.join(' | ')}`);

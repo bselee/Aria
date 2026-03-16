@@ -5,7 +5,7 @@
  *          attaching a PDF invoice.
  * @author  Will
  * @created 2026-03-12
- * @updated 2026-03-12
+ * @updated 2026-03-13
  * @deps    invoice-parser (InvoiceSchema, InvoiceData), llm (unifiedObjectGeneration)
  */
 
@@ -18,18 +18,27 @@ import { unifiedObjectGeneration } from './llm';
  * DECISION(2026-03-12): Fast regex heuristic, not LLM. False positives are OK
  * because parseInlineInvoice sets confidence=low on non-invoice content.
  *
+ * DECISION(2026-03-13): Expanded keywords after PO #124462 failure. Real vendors
+ * use casual language: "BREAKDOWN", "UPS GROUND", "PLUS $X", "SHIPPED".
+ * Added PO-thread context boost: if subject references a PO# and email has $,
+ * lower keyword threshold from 2 → 1.
+ *
  * @param   emailBody        - Plain-text email body
  * @param   hasPdfAttachment - Whether the email already has a PDF
+ * @param   emailSubject     - Optional subject line for PO-thread context
  * @returns true if the email likely contains inline invoice data
  */
-export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean): boolean {
+export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean, emailSubject?: string): boolean {
     if (hasPdfAttachment) return false;
 
     const dollarPattern = /\$[\d,]+\.\d{2}/;
-    if (!dollarPattern.test(emailBody)) return false;
+    // Also match raw amounts like "1140.77" near money-context words
+    const rawAmountPattern = /\b\d{2,},?\d*\.\d{2}\b/;
+    if (!dollarPattern.test(emailBody) && !rawAmountPattern.test(emailBody)) return false;
 
     const text = emailBody.toLowerCase();
     const invoiceKeywords = [
+        // Formal invoice terms
         /\btotal\b/,
         /\bsubtotal\b/,
         /\bamount\s+due\b/,
@@ -40,10 +49,29 @@ export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean
         /\bpayment\s+due\b/,
         /\bcost\s*:/,
         /\bcharge\s*:/,
+        // Vendor-common casual terms (learned from PO #124462)
+        /\bbreakdown\b/,
+        /\bplus\b/,
+        /\bground\b/,
+        /\bshipp(ed|ing)\b/,
+        /\bups\b/,
+        /\bfedex\b/,
+        /\bbags?\b.*\d/,
+        /\d+\s*#/,
     ];
 
     const matchCount = invoiceKeywords.filter(kw => kw.test(text)).length;
-    return matchCount >= 2;
+
+    // DECISION(2026-03-13): PO-thread context awareness.
+    // If the email subject references a BuildASoil PO#, this is a vendor replying
+    // to an active purchase order. Cost data in PO threads is almost always an
+    // invoice/cost breakdown — lower threshold from 2 to 1.
+    const isPOThread = emailSubject
+        ? /\bPO\s*#?\s*\d+/i.test(emailSubject) || /\bpurchase\s*order\b/i.test(emailSubject)
+        : false;
+
+    const threshold = isPOThread ? 1 : 2;
+    return matchCount >= threshold;
 }
 
 const INLINE_INVOICE_SYSTEM_PROMPT = `You are a precise invoice data extractor.

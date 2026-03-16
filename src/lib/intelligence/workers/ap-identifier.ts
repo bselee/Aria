@@ -4,6 +4,7 @@
  *          Scans the AP inbox for unread PDFs, classifies their intent,
  *          uploads them to Supabase Storage, and adds them to the processing queue.
  * @author  Antigravity / Aria
+ * @updated 2026-03-13 — PDF filename override + PO-thread force-INVOICE (PO #124462 fix)
  */
 
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -176,8 +177,31 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
 
                 console.log(`   Evaluating Email: "${subject}" from ${from}`);
 
-                const intent = await this.classifyEmailIntent(subject, from, snippet);
-                console.log(`     -> Classified as: ${intent}`);
+                // DECISION(2026-03-13): Check PDF filenames BEFORE LLM classification.
+                // PO #124462 showed that a PDF named "BASPO-124462.pdf" was missed because
+                // the snippet said "tracking number + thank you", causing the LLM to classify
+                // it as HUMAN_INTERACTION. PDF filename is a stronger signal than snippet text.
+                const pdfFilenames: string[] = m.pdf_filenames || [];
+                const hasPOPdf = pdfFilenames.some((f: string) =>
+                    /\b(invoice|baspo|po[_\-]?\d+|bill|statement)\b/i.test(f)
+                );
+                // Also detect PO-thread context from subject line
+                const isPOThread = /\bPO\s*#?\s*\d+/i.test(subject) || /\bpurchase\s*order\b/i.test(subject);
+                const hasPdfAttachment = pdfFilenames.length > 0;
+
+                let intent: string;
+                if (hasPOPdf) {
+                    // Override: PDF filename clearly indicates an invoice document
+                    intent = "INVOICE";
+                    console.log(`     -> Forced INVOICE (PDF filename match: ${pdfFilenames.join(', ')})`);
+                } else if (isPOThread && hasPdfAttachment) {
+                    // Override: PDF attached to a PO thread is almost certainly an invoice
+                    intent = "INVOICE";
+                    console.log(`     -> Forced INVOICE (PO thread + PDF attached)`);
+                } else {
+                    intent = await this.classifyEmailIntent(subject, from, snippet);
+                    console.log(`     -> Classified as: ${intent}`);
+                }
 
                 if (intent === "ADVERTISEMENT") {
                     try {

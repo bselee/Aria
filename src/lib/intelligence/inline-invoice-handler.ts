@@ -38,7 +38,7 @@ export class InlineInvoiceHandler {
 
         try {
             // Gate 1: Heuristic Detection
-            if (!detectInlineInvoice(bodyText, hasPdfAttachment)) {
+            if (!detectInlineInvoice(bodyText, hasPdfAttachment, subject)) {
                 logs.push("Skipped: No inline invoice patterns detected.");
                 return { processed: false, logs };
             }

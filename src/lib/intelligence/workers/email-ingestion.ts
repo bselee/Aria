@@ -8,7 +8,36 @@ import { createClient } from "../../supabase";
  *          inserts them into the Supabase `email_inbox_queue` so that downstream
  *          agents can process them without duplicate Gmail API calls or race conditions.
  * @author Antigravity
+ * @updated 2026-03-13 — stores full body text + pdf filenames (PO #124462 fix)
  */
+/**
+ * Decode base64url-encoded Gmail body data to UTF-8 string.
+ */
+function decodeBase64(data: string): string {
+    return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+}
+
+/**
+ * Recursively extract plain-text body from a Gmail message payload.
+ * Handles multipart/mixed, multipart/related, and nested parts.
+ */
+function extractFullBodyText(payload: any): string {
+    const parts: string[] = [];
+    if (payload?.body?.data) {
+        parts.push(decodeBase64(payload.body.data));
+    }
+    const walkParts = (arr: any[]) => {
+        for (const part of arr) {
+            if (part.mimeType === "text/plain" && part.body?.data) {
+                parts.push(decodeBase64(part.body.data));
+            }
+            if (part.parts?.length) walkParts(part.parts);
+        }
+    };
+    if (payload?.parts) walkParts(payload.parts);
+    return parts.join("\n");
+}
+
 export class EmailIngestionWorker {
     private tokenIdentifier: string;
 
@@ -61,12 +90,14 @@ export class EmailIngestionWorker {
                 const payload = msg.data.payload;
                 const headers = payload?.headers || [];
 
-                // Recursively check parts for PDF
+                // Recursively check parts for PDF and collect PDF filenames
                 let hasPdf = false;
+                const pdfFilenames: string[] = [];
                 const walkParts = (parts: any[]) => {
                     for (const part of parts) {
                         if (part.filename && part.filename.toLowerCase().endsWith(".pdf")) {
                             hasPdf = true;
+                            pdfFilenames.push(part.filename);
                         }
                         if (part.parts?.length) walkParts(part.parts);
                     }
@@ -82,6 +113,12 @@ export class EmailIngestionWorker {
                 const snippet = msg.data.snippet || "";
                 const threadId = msg.data.threadId || m.id!;
 
+                // DECISION(2026-03-13): Extract and store full body text so downstream
+                // agents (AcknowledgementAgent, InlineInvoiceHandler) have complete data,
+                // not just the truncated Gmail snippet (~200 chars). PO #124462 showed
+                // that snippet truncation causes detection failures.
+                const bodyText = extractFullBodyText(payload);
+
                 // Insert into Supabase Queue
                 const { error } = await supabase.from('email_inbox_queue').insert({
                     gmail_message_id: m.id!,
@@ -90,6 +127,8 @@ export class EmailIngestionWorker {
                     from_email: fromEmail,
                     subject,
                     body_snippet: snippet,
+                    body_text: bodyText || null,
+                    pdf_filenames: pdfFilenames.length > 0 ? pdfFilenames : null,
                     has_pdf: hasPdf,
                     status: 'unprocessed',
                     source_inbox: this.tokenIdentifier

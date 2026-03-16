@@ -966,9 +966,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         const feeSummary = result.feeChanges
                             .map(fc => `${fc.feeType}: $${fc.amount}`)
                             .join(", ") || "none";
+                        const carrier = result.trackingUpdate?.carrierName ?? "unknown carrier";
+                        const tracking = result.trackingUpdate?.trackingNumbers?.join(", ") ?? "no tracking";
                         await remember({
                             category: "decision",
-                            content: `PO ${orderId} reconciled (${verdict}): ${result.vendorName} invoice #${result.invoiceNumber}. $${result.totalDollarImpact.toFixed(2)} impact. Price changes: ${priceChangeSummary}. Fees: ${feeSummary}. Forced approval: ${forceApproval}.`,
+                            content: `PO ${orderId} reconciled (${verdict}): ${result.vendorName} invoice #${result.invoiceNumber}. $${result.totalDollarImpact.toFixed(2)} impact. Price changes: ${priceChangeSummary}. Fees: ${feeSummary}. Carrier: ${carrier}. Tracking: ${tracking}. Forced approval: ${forceApproval}.`,
                             tags: ["reconciliation", verdict, orderId, vendorSlug],
                             source: "email",
                             relatedTo: result.vendorName,
