@@ -3,8 +3,10 @@
  * @purpose Agent 1 of the decoupled AP pipeline (The "Eyes").
  *          Scans the AP inbox for unread PDFs, classifies their intent,
  *          uploads them to Supabase Storage, and adds them to the processing queue.
+ *          Also handles PAID_INVOICE detection — extracts vendor/invoice/amount,
+ *          cross-references with Finale POs, and creates draft POs when unmatched.
  * @author  Antigravity / Aria
- * @updated 2026-03-13 — PDF filename override + PO-thread force-INVOICE (PO #124462 fix)
+ * @updated 2026-03-16 — Added PAID_INVOICE detection + Finale PO matching + draft creation
  */
 
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -13,12 +15,21 @@ import { createClient } from "../../supabase";
 import { z } from "zod";
 import { unifiedObjectGeneration } from "../llm";
 import { recall } from "../memory";
+import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
+import { FinaleClient } from "../../finale/client";
+import { Telegraf } from "telegraf";
 
 export class APIdentifierAgent {
 
+    private bot: Telegraf | null;
+
+    constructor(bot?: Telegraf) {
+        this.bot = bot || null;
+    }
+
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         const schema = z.object({
-            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION", "PAID_INVOICE"]),
         });
 
         // Recall rules to see if this vendor has specific handling instructions
@@ -37,7 +48,8 @@ ${memoryContext}
 INVOICE - Standard vendor bill (may or may not have a PO).
 STATEMENT - Account statement or aging summary.
 ADVERTISEMENT - Marketing, spam, or newsletter.
-HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
+HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.
+PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Invoice INV___ paid $___", "payment successful", "balance $0.00").`;
 
         try {
             const res = await unifiedObjectGeneration({
@@ -198,6 +210,11 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                     // Override: PDF attached to a PO thread is almost certainly an invoice
                     intent = "INVOICE";
                     console.log(`     -> Forced INVOICE (PO thread + PDF attached)`);
+                } else if (detectPaidInvoice(subject, m.body_text || snippet, hasPdfAttachment)) {
+                    // DECISION(2026-03-16): Fast regex pre-check for paid invoice confirmations.
+                    // Fires BEFORE LLM classification to avoid misclassifying as HUMAN_INTERACTION.
+                    intent = "PAID_INVOICE";
+                    console.log(`     -> Forced PAID_INVOICE (regex heuristic match)`);
                 } else {
                     intent = await this.classifyEmailIntent(subject, from, snippet);
                     console.log(`     -> Classified as: ${intent}`);
@@ -238,6 +255,20 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
                             requestBody: { addLabelIds: [(await getLabels(sourceInbox)).apSeen] }
                         });
                     } catch (e) { /* ignore */ }
+                    continue;
+                }
+
+                // ── PAID INVOICE HANDLER ──────────────────────────────────────
+                // DECISION(2026-03-16): Detect paid invoice confirmations, extract
+                // vendor/invoice/amount via LLM, cross-reference with Finale POs,
+                // and create a draft PO when no match is found.
+                if (intent === "PAID_INVOICE") {
+                    try {
+                        await this.handlePaidInvoice(m, gmail, supabase, sourceInbox, getLabels);
+                    } catch (err: any) {
+                        console.error(`     ❌ PAID_INVOICE handler failed:`, err.message);
+                        await this.logActivity(supabase, from, subject, "PAID_INVOICE", `Handler error: ${err.message}`);
+                    }
                     continue;
                 }
 
@@ -359,5 +390,220 @@ HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human
         } catch (err: any) {
             console.error("❌ [AP-Identifier] Error processing AP Inbox:", err.message);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PAID INVOICE HANDLER
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Process a paid invoice confirmation email:
+     * 1. Extract vendor, invoice #, amount via LLM
+     * 2. Search Finale for matching PO (by PO# in invoice, then by vendor + amount)
+     * 3. If matched → log it
+     * 4. If no match → create a draft PO with placeholder SKU
+     * 5. Alert via Telegram
+     * 6. Label email as AP-Seen
+     */
+    private async handlePaidInvoice(
+        emailRow: any,
+        gmail: any,
+        supabase: any,
+        sourceInbox: string,
+        getLabels: (inbox: string) => Promise<{ invoiceFwd: string; statements: string; apSeen: string }>
+    ): Promise<void> {
+        const subject = emailRow.subject || 'No Subject';
+        const from = emailRow.from_email || 'Unknown';
+        const bodyText = emailRow.body_text || emailRow.body_snippet || '';
+
+        console.log(`     💳 Processing paid invoice: "${subject}"`);
+
+        // Step 1: LLM extraction
+        const extracted = await parsePaidInvoice(bodyText, subject, from);
+        console.log(`     📋 Extracted: vendor="${extracted.vendorName}", inv#=${extracted.invoiceNumber}, $${extracted.amountPaid}, PO#=${extracted.poNumber || 'none'}`);
+
+        const finale = new FinaleClient();
+        let matchedPO: { orderId: string; total: number; status: string } | null = null;
+
+        // Step 2a: If the email references a PO number, try direct lookup first
+        if (extracted.poNumber) {
+            try {
+                const summary = await finale.getOrderSummary(extracted.poNumber);
+                if (summary) {
+                    matchedPO = { orderId: summary.orderId, total: summary.total, status: summary.status };
+                    console.log(`     ✅ Matched by PO# ${summary.orderId} (status: ${summary.status})`);
+                }
+            } catch {
+                console.log(`     ⚠️ Direct PO# lookup for ${extracted.poNumber} failed, trying fuzzy match...`);
+            }
+        }
+
+        // Step 2b: Fuzzy match by vendor name + date + amount
+        if (!matchedPO) {
+            const candidates = await finale.findPOByVendorAndDate(
+                extracted.vendorName,
+                extracted.datePaid || new Date().toISOString().split('T')[0],
+                60   // 60-day window — paid invoices can arrive well after the PO
+            );
+
+            if (candidates.length > 0) {
+                // Prefer amount match, then most recent
+                const amountMatch = candidates.find(c =>
+                    Math.abs(c.total - extracted.amountPaid) < 1.00  // within $1 tolerance
+                );
+                const best = amountMatch || candidates[0];
+                matchedPO = { orderId: best.orderId, total: best.total, status: best.status };
+                console.log(`     ✅ Fuzzy-matched to PO #${best.orderId} ($${best.total}, ${best.status})`);
+            }
+        }
+
+        // Step 3: Log to Supabase
+        try {
+            await supabase.from('paid_invoices').insert({
+                vendor_name: extracted.vendorName,
+                invoice_number: extracted.invoiceNumber,
+                amount_paid: extracted.amountPaid,
+                date_paid: extracted.datePaid,
+                po_number: matchedPO?.orderId || null,
+                po_matched: !!matchedPO,
+                product_description: extracted.productDescription,
+                vendor_address: extracted.vendorAddress,
+                email_from: from,
+                email_subject: subject,
+                gmail_message_id: emailRow.gmail_message_id,
+                confidence: extracted.confidence,
+                source_inbox: sourceInbox,
+            });
+        } catch (dbErr: any) {
+            // Table might not exist yet — log but don't block
+            console.warn(`     ⚠️ paid_invoices insert failed (table may not exist):`, dbErr.message);
+        }
+
+        // Step 4: If no PO match, create a draft PO for Will to review
+        let draftInfo: { orderId: string; finaleUrl: string } | null = null;
+        if (!matchedPO) {
+            try {
+                const vendorPartyId = await finale.findVendorPartyByName(extracted.vendorName);
+
+                if (vendorPartyId) {
+                    // DECISION(2026-03-16): Create draft PO with placeholder SKU.
+                    // Real SKU correlation is complex — for now, use a single
+                    // generic line item at the paid amount. Will adds the real SKU.
+                    const memo = [
+                        `[Aria] Auto-created from paid invoice confirmation`,
+                        `Invoice: ${extracted.invoiceNumber}`,
+                        `Amount: $${extracted.amountPaid.toFixed(2)}`,
+                        `Date: ${extracted.datePaid}`,
+                        extracted.productDescription ? `Product: ${extracted.productDescription}` : null,
+                        `Source email: ${from}`,
+                        `⚠️ REMINDER: Add the correct vendor SKU to this PO before committing.`,
+                    ].filter(Boolean).join('\n');
+
+                    const result = await finale.createDraftPurchaseOrder(
+                        vendorPartyId,
+                        [{
+                            productId: 'PLACEHOLDER-PAID-INVOICE',
+                            quantity: 1,
+                            unitPrice: extracted.amountPaid,
+                        }],
+                        memo
+                    );
+
+                    draftInfo = { orderId: result.orderId, finaleUrl: result.finaleUrl };
+                    console.log(`     📝 Created draft PO #${result.orderId} for review`);
+                } else {
+                    console.warn(`     ⚠️ Could not find vendor party for "${extracted.vendorName}" — no draft PO created`);
+                }
+            } catch (draftErr: any) {
+                console.error(`     ❌ Draft PO creation failed:`, draftErr.message);
+            }
+        }
+
+        // Step 5: Telegram alert
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (chatId && this.bot) {
+            let message: string;
+            if (matchedPO) {
+                message = [
+                    `✅ <b>Paid Invoice Matched</b>`,
+                    ``,
+                    `<b>Vendor:</b> ${this.escapeHtml(extracted.vendorName)}`,
+                    `<b>Invoice:</b> ${this.escapeHtml(extracted.invoiceNumber)} — $${extracted.amountPaid.toFixed(2)}`,
+                    `<b>Matched:</b> PO #${matchedPO.orderId} ($${matchedPO.total.toFixed(2)}, ${matchedPO.status})`,
+                    `<b>Date Paid:</b> ${extracted.datePaid}`,
+                    extracted.productDescription ? `<b>Product:</b> ${this.escapeHtml(extracted.productDescription)}` : '',
+                    ``,
+                    `📋 Logged to paid_invoices`,
+                ].filter(Boolean).join('\n');
+            } else if (draftInfo) {
+                message = [
+                    `⚠️ <b>Paid Invoice — No PO Found</b>`,
+                    ``,
+                    `<b>Vendor:</b> ${this.escapeHtml(extracted.vendorName)}`,
+                    `<b>Invoice:</b> ${this.escapeHtml(extracted.invoiceNumber)} — $${extracted.amountPaid.toFixed(2)}`,
+                    `<b>Date Paid:</b> ${extracted.datePaid}`,
+                    extracted.productDescription ? `<b>Product:</b> ${this.escapeHtml(extracted.productDescription)}` : '',
+                    ``,
+                    `📝 Created Draft PO #${draftInfo.orderId} for review`,
+                    `⚠️ <i>Add the correct vendor SKU before committing</i>`,
+                    ``,
+                    `<a href="${draftInfo.finaleUrl}">Open in Finale →</a>`,
+                ].filter(Boolean).join('\n');
+            } else {
+                message = [
+                    `🔍 <b>Paid Invoice — Manual Review Needed</b>`,
+                    ``,
+                    `<b>Vendor:</b> ${this.escapeHtml(extracted.vendorName)}`,
+                    `<b>Invoice:</b> ${this.escapeHtml(extracted.invoiceNumber)} — $${extracted.amountPaid.toFixed(2)}`,
+                    `<b>Date Paid:</b> ${extracted.datePaid}`,
+                    extracted.productDescription ? `<b>Product:</b> ${this.escapeHtml(extracted.productDescription)}` : '',
+                    ``,
+                    `❌ Could not find vendor in Finale — no draft PO created.`,
+                    `Please create PO manually.`,
+                ].filter(Boolean).join('\n');
+            }
+
+            try {
+                await this.bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
+            } catch (tgErr: any) {
+                console.warn(`     ⚠️ Telegram alert failed:`, tgErr.message);
+            }
+        }
+
+        // Step 6: Label email and log activity
+        try {
+            const labels = await getLabels(sourceInbox);
+            await gmail.users.messages.modify({
+                userId: "me",
+                id: emailRow.gmail_message_id,
+                requestBody: {
+                    addLabelIds: [labels.apSeen],
+                    removeLabelIds: ["UNREAD"]
+                }
+            });
+        } catch (e) { /* ignore */ }
+
+        const action = matchedPO
+            ? `Matched to PO #${matchedPO.orderId}`
+            : draftInfo
+                ? `Draft PO #${draftInfo.orderId} created`
+                : `No PO match, vendor not found in Finale`;
+
+        await this.logActivity(supabase, from, subject, 'PAID_INVOICE', action, {
+            invoiceNumber: extracted.invoiceNumber,
+            amountPaid: extracted.amountPaid,
+            vendorName: extracted.vendorName,
+            matchedPO: matchedPO?.orderId || null,
+            draftPO: draftInfo?.orderId || null,
+            confidence: extracted.confidence,
+        });
+    }
+
+    /** Escape HTML special characters for Telegram messages. */
+    private escapeHtml(str: string): string {
+        return str
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     }
 }

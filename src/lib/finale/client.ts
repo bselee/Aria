@@ -1449,15 +1449,63 @@ export class FinaleClient {
     }
 
     /**
-     * Get current stock level for a product via REST API.
-     * Returns quantity on hand across all facilities.
+     * Get current stock level for a product.
+     *
+     * DECISION(2026-03-16): Canonical stock retrieval method.
+     * 
+     * ⚠️  DO NOT use REST `prodData.quantityOnHand` — it returns undefined for
+     * most products (Finale API quirk, discovered during ULINE ordering work).
+     *
+     * ✅  Use GraphQL `productViewConnection.stockOnHand` — this is the same
+     * query that powers getSalesQty(), getBOMConsumption(), and the Finale
+     * Product List screen. It returns real stock values.
+     *
+     * Fallback chain: GraphQL stockOnHand → GraphQL unitsInStock → REST quantityOnHand
+     *
+     * @param   productId - Finale product SKU
+     * @returns On-hand quantity, or null if not tracked
      */
     async getStockLevel(productId: string): Promise<number | null> {
+        // Primary: GraphQL productViewConnection (reliable)
+        try {
+            const query = {
+                query: `{
+                    productViewConnection(first: 1, productId: "${productId}") {
+                        edges { node {
+                            stockOnHand
+                            stockAvailable
+                            unitsInStock
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+
+            if (res.ok) {
+                const result = await res.json();
+                const node = result.data?.productViewConnection?.edges?.[0]?.node;
+                if (node) {
+                    const parseVal = (val: string | null | undefined): number | null => {
+                        if (!val || val === '--' || val === 'null') return null;
+                        const n = parseFloat(val.replace(/,/g, ''));
+                        return isNaN(n) ? null : n;
+                    };
+                    const stock = parseVal(node.stockOnHand) ?? parseVal(node.unitsInStock);
+                    if (stock !== null) return stock;
+                }
+            }
+        } catch { /* fall through to REST */ }
+
+        // Fallback: REST API (rarely has data, but try it)
         try {
             const data = await this.get(
                 `/${this.accountPath}/api/product/${encodeURIComponent(productId)}`
             );
-            // Finale stores stock in quantityOnHand or stockLevel
             return data.quantityOnHand ?? data.stockLevel ?? null;
         } catch {
             return null;
@@ -2686,6 +2734,115 @@ export class FinaleClient {
     }
 
     /**
+     * Search for a vendor's partyId by name.
+     *
+     * DECISION(2026-03-16): Finale has no direct "search parties by name" API.
+     * Instead, we search recent POs and extract the supplier partyId from matches.
+     * Falls back to scanning all open/committed POs if the date-windowed search
+     * misses (e.g., vendor hasn't been ordered from recently).
+     *
+     * @param   vendorName - Vendor name to search for (case-insensitive partial match)
+     * @returns partyId if found, null otherwise
+     */
+    async findVendorPartyByName(vendorName: string): Promise<string | null> {
+        try {
+            const vendorLower = vendorName.toLowerCase();
+
+            // Strategy 1: Search recent POs (last 90 days) for this vendor
+            const now = new Date();
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - 90);
+            const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const endStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 100
+                        type: ["PURCHASE_ORDER"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            supplier { name partyUrl }
+                        }}
+                    }
+                }`
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+
+            if (!res.ok) return null;
+            const result = await res.json();
+            const edges = result.data?.orderViewConnection?.edges || [];
+
+            for (const edge of edges) {
+                const supplierName = (edge.node.supplier?.name || '').toLowerCase();
+                const partyUrl = edge.node.supplier?.partyUrl || '';
+                if (!partyUrl) continue;
+
+                // Check both directions for partial match
+                if (supplierName.includes(vendorLower) || vendorLower.includes(supplierName)) {
+                    const partyId = partyUrl.split('/').pop();
+                    if (partyId) {
+                        console.log(`[finale] findVendorPartyByName: "${vendorName}" → partyId ${partyId} (from PO history)`);
+                        return partyId;
+                    }
+                }
+            }
+
+            // Strategy 2: Search ALL open/committed POs (no date filter)
+            const openQuery = {
+                query: `{
+                    orderViewConnection(
+                        first: 200
+                        type: ["PURCHASE_ORDER"]
+                        statusId: ["ORDER_CREATED", "ORDER_COMMITTED"]
+                    ) {
+                        edges { node {
+                            supplier { name partyUrl }
+                        }}
+                    }
+                }`
+            };
+
+            const openRes = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(openQuery),
+            });
+
+            if (!openRes.ok) return null;
+            const openResult = await openRes.json();
+            const openEdges = openResult.data?.orderViewConnection?.edges || [];
+
+            for (const edge of openEdges) {
+                const supplierName = (edge.node.supplier?.name || '').toLowerCase();
+                const partyUrl = edge.node.supplier?.partyUrl || '';
+                if (!partyUrl) continue;
+
+                if (supplierName.includes(vendorLower) || vendorLower.includes(supplierName)) {
+                    const partyId = partyUrl.split('/').pop();
+                    if (partyId) {
+                        console.log(`[finale] findVendorPartyByName: "${vendorName}" → partyId ${partyId} (from open POs)`);
+                        return partyId;
+                    }
+                }
+            }
+
+            console.warn(`[finale] findVendorPartyByName: no party found for "${vendorName}"`);
+            return null;
+        } catch (err: any) {
+            console.error(`[finale] findVendorPartyByName error:`, err.message);
+            return null;
+        }
+    }
+
+    /**
      * Resolve a partygroup URL to the supplier name.
      * Caches results so we don't re-fetch for the same vendor.
      */
@@ -3383,6 +3540,8 @@ export class FinaleClient {
         purchasedQty: number;
         soldQty: number;
         openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }>;
+        stockOnHand: number | null;
+        stockAvailable: number | null;
     }> {
         const end = new Date();
         const begin = new Date();
@@ -3434,6 +3593,13 @@ export class FinaleClient {
                         }
                     }}
                 }
+                stockInfo: productViewConnection(first: 1, productId: "${sku}") {
+                    edges { node {
+                        stockOnHand
+                        stockAvailable
+                        unitsInStock
+                    }}
+                }
             }`
         };
 
@@ -3453,9 +3619,9 @@ export class FinaleClient {
                     body: JSON.stringify(query),
                 });
             }
-            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
             const result = await res.json();
-            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
 
             let purchasedQty = 0;
             for (const edge of result.data?.purchasedIn?.edges || []) {
@@ -3484,6 +3650,9 @@ export class FinaleClient {
             const openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }> = [];
             for (const edge of result.data?.committedPOs?.edges || []) {
                 const po = edge.node;
+                // DECISION(2026-03-16): Only 'Committed' status means truly open/outstanding.
+                // ORDER_LOCKED, Completed, Received, etc. are already fulfilled.
+                // Previously this filter let ORDER_LOCKED POs through, inflating on-order qty.
                 if (po.status !== 'Committed') continue;
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
@@ -3497,9 +3666,21 @@ export class FinaleClient {
                 }
             }
 
-            return { purchasedQty, soldQty, openPOs };
+            // Parse stock from the piggy-backed productViewConnection query
+            const stockNode = result.data?.stockInfo?.edges?.[0]?.node;
+            const parseStockVal = (val: string | null | undefined): number | null => {
+                if (!val || val === '--' || val === 'null') return null;
+                const n = parseFloat(val.replace(/,/g, ''));
+                return isNaN(n) ? null : n;
+            };
+            const stockOnHand = stockNode
+                ? (parseStockVal(stockNode.stockOnHand) ?? parseStockVal(stockNode.unitsInStock))
+                : null;
+            const stockAvailable = stockNode ? parseStockVal(stockNode.stockAvailable) : null;
+
+            return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable };
         } catch {
-            return { purchasedQty: 0, soldQty: 0, openPOs: [] };
+            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
         }
     }
 
@@ -3642,8 +3823,11 @@ export class FinaleClient {
                         ? `${rawLeadTime}d (Finale)`
                         : '14d default';
 
-                    // Stock from REST (GraphQL returns "--" for most products in bulk scans)
-                    const stockOnHand = parseFinaleNumber(prodData.quantityOnHand ?? prodData.stockLevel ?? 0);
+                    // DECISION(2026-03-16): Use GraphQL stock from getProductActivity().
+                    // REST prodData.quantityOnHand is always undefined for these products,
+                    // which caused all stock to default to 0 → every item flagged critical.
+                    // GraphQL productViewConnection returns real stock (same as getSalesQty).
+                    const stockOnHand = activity.stockOnHand ?? parseFinaleNumber(prodData.quantityOnHand ?? prodData.stockLevel ?? 0);
 
                     // Open PO supply
                     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);

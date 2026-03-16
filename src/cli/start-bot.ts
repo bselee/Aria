@@ -2133,9 +2133,16 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     console.log('   📦 PO Sync:           Every 30 min');
     console.log('   🧹 Ad Cleanup:        Every hour');
 
+    // Immediate healthcheck ping on boot
+    const hcUrl = process.env.HEALTHCHECK_PING_URL;
+    if (hcUrl) fetch(hcUrl).catch(() => {});
+
     // ── MEMORY MONITORING (OOM prevention) ──
     // DECISION(2026-03-09): Log memory usage hourly for PM2 log analysis.
     // Also provides /memory command for on-demand diagnostics.
+    // DECISION(2026-03-16): Added Healthchecks.io dead-man's switch ping.
+    // If the bot stops pinging for 30 min, HC.io sends an email alert
+    // independently of this machine. One-line fire-and-forget.
     setInterval(() => {
         const mem = process.memoryUsage();
         const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
@@ -2143,6 +2150,10 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             `[memory] RSS: ${mb(mem.rss)}MB | Heap: ${mb(mem.heapUsed)}/${mb(mem.heapTotal)}MB` +
             ` | External: ${mb(mem.external)}MB | Chats: ${Object.keys(chatHistory).length}`
         );
+
+        // Healthchecks.io dead-man's switch — fire-and-forget
+        const hcUrl = process.env.HEALTHCHECK_PING_URL;
+        if (hcUrl) fetch(hcUrl).catch(() => {});
     }, 15 * 60 * 1000); // every 15 minutes
 
     let lastMemAlertSent = 0;

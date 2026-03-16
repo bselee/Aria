@@ -417,7 +417,7 @@ export class OpsManager {
 
         // Initialize dedicated AP agents
         this.apAgent = new APAgent(bot);
-        this.apIdentifier = new APIdentifierAgent();
+        this.apIdentifier = new APIdentifierAgent(bot);
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
         this.apForwarder = new APForwarderAgent();
@@ -473,7 +473,7 @@ export class OpsManager {
 
         // Supervisor checking errors
         cron.schedule("*/5 * * * *", () => {
-            this.supervisor.supervise();
+            this.safeRun("Supervisor", () => this.supervisor.supervise());
         });
 
         // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
@@ -515,6 +515,19 @@ export class OpsManager {
             this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
         }, { timezone: "America/Denver" });
 
+        // ── ULINE FRIDAY AUTO-ORDER ──────────────────────────
+        // DECISION(2026-03-16): Fully autonomous ULINE ordering pipeline.
+        // Runs every Friday at 8:30 AM Denver time. Flow:
+        //   1. Scan Finale purchasing intelligence for ULINE items below reorder threshold
+        //   2. Create a draft PO in Finale with those items
+        //   3. Open Chrome → fill ULINE Quick Order cart via Paste Items
+        //   4. Send Telegram notification with full manifest
+        // Will just needs to review the cart and click checkout.
+        // If zero items need reordering, sends a brief "all stocked" message.
+        cron.schedule("30 8 * * 5", () => {
+            this.safeRun("UlineFridayOrder", () => this.runFridayUlineOrder());
+        }, { timezone: "America/Denver" });
+
         // Email Maintenance (Advertisements) every hour
         cron.schedule("0 * * * *", () => {
             this.safeRun("AdMaintenance", () => this.processAdvertisements());
@@ -548,6 +561,28 @@ export class OpsManager {
         cron.schedule("0 */4 * * *", () => {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar());
         });
+
+        // Morning Heartbeat @ 7:00 AM weekdays
+        // DECISION(2026-03-16): After a 3-day outage with zero alerting, this
+        // provides a simple "I'm alive" signal every weekday morning. If you
+        // don't see this message by 7:05 AM, investigate immediately.
+        cron.schedule("0 7 * * 1-5", () => {
+            this.safeRun("MorningHeartbeat", async () => {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (!chatId) return;
+                const mem = process.memoryUsage();
+                const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+                const uptimeHrs = Math.round(process.uptime() / 3600 * 10) / 10;
+                await this.bot.telegram.sendMessage(
+                    chatId,
+                    `☀️ <b>Aria Morning Check-In</b>\n\n` +
+                    `✅ Bot is online and healthy\n` +
+                    `⏱ Uptime: ${uptimeHrs}h | Memory: ${heapMB}MB\n` +
+                    `📋 Next: Build Risk (7:30), Daily Summary (8:00)`,
+                    { parse_mode: "HTML" }
+                );
+            });
+        }, { timezone: "America/Denver" });
 
         // Build Risk Analysis @ 7:30 AM weekdays
         // DECISION(2026-03-11): Was missing from start() despite sendBuildRiskReport()
@@ -647,13 +682,15 @@ export class OpsManager {
         // on the next relevant poll cycle, and stale dedup keys from yesterday
         // are irrelevant (build completions and PO receivings are date-scoped).
         cron.schedule("0 0 * * *", () => {
-            const sizeBefore = this.seenCompletedBuildIds.size +
-                this.seenReceivedPOIds.size +
-                this.seenOutsideThreadMsgIds.size;
-            this.seenCompletedBuildIds.clear();
-            this.seenReceivedPOIds.clear();
-            this.seenOutsideThreadMsgIds.clear();
-            console.log(`[ops-manager] Daily dedup reset: cleared ${sizeBefore} entries across 3 Sets`);
+            this.safeRun("DedupSetReset", () => {
+                const sizeBefore = this.seenCompletedBuildIds.size +
+                    this.seenReceivedPOIds.size +
+                    this.seenOutsideThreadMsgIds.size;
+                this.seenCompletedBuildIds.clear();
+                this.seenReceivedPOIds.clear();
+                this.seenOutsideThreadMsgIds.clear();
+                console.log(`[ops-manager] Daily dedup reset: cleared ${sizeBefore} entries across 3 Sets`);
+            });
         }, { timezone: "America/Denver" });
 
     }
@@ -2255,5 +2292,81 @@ Data: ${JSON.stringify(data)}`;
             console.error('[cal-sync] syncPurchasingCalendar error:', err.message);
         }
         return counts;
+    }
+
+    /**
+     * Friday morning autonomous ULINE ordering pipeline.
+     *
+     * DECISION(2026-03-16): Full end-to-end automation:
+     *   1. Scan Finale purchasing intelligence for ULINE items below threshold
+     *   2. Create draft PO in Finale
+     *   3. Fill ULINE Quick Order cart via Chrome automation
+     *   4. Send Telegram notification with manifest, PO link, and cart status
+     *
+     * Runs via cron at 8:30 AM Denver every Friday. Never throws — errors are
+     * caught and reported via Telegram. Will just reviews cart and checks out.
+     */
+    async runFridayUlineOrder() {
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!chatId) return;
+
+        console.log('[uline-friday] 🛒 Starting Friday ULINE auto-order...');
+
+        const { runAutonomousUlineOrder } = await import('../../cli/order-uline');
+        const result = await runAutonomousUlineOrder();
+
+        // Case 1: Pipeline error
+        if (!result.success) {
+            await this.bot.telegram.sendMessage(
+                chatId,
+                `🚨 <b>ULINE Friday Order — Failed</b>\n\n` +
+                `<b>Error:</b> <code>${result.error || 'Unknown error'}</code>\n\n` +
+                `Run manually: <code>node --import tsx src/cli/order-uline.ts --auto-reorder --create-po</code>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        // Case 2: Nothing to order
+        if (result.itemCount === 0) {
+            await this.bot.telegram.sendMessage(
+                chatId,
+                `✅ <b>ULINE Friday Order — All Stocked</b>\n\n` +
+                `Purchasing intelligence scanned all ULINE items.\n` +
+                `Everything is above reorder threshold — no order needed this week. 🎉`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        // Case 3: Items ordered — build rich notification
+        const itemLines = result.items
+            .map(i => `  <code>${i.ulineModel}</code> × ${i.qty}  ($${(i.qty * i.unitPrice).toFixed(2)})`)
+            .join('\n');
+
+        const poLine = result.finalePO && result.finaleUrl
+            ? `📄 <a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
+            : result.finalePO
+                ? `📄 Finale PO #${result.finalePO}`
+                : '⚠️ PO creation skipped';
+
+        const cartIcon = result.cartResult.includes('⚠️') ? '⚠️' : '🛒';
+
+        let msg = `🛒 <b>ULINE Friday Order — Ready for Checkout</b>\n\n`;
+        msg += `${poLine}\n`;
+        msg += `💰 Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n`;
+        msg += `📦 ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n`;
+        msg += `${itemLines}\n\n`;
+        msg += `${cartIcon} Cart: ${result.cartResult}\n\n`;
+        msg += `<i>Review your ULINE cart and checkout when ready.</i>\n`;
+        msg += `<i>🔗 <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a></i>`;
+
+        await this.bot.telegram.sendMessage(chatId, msg, {
+            parse_mode: 'HTML',
+            // @ts-expect-error Telegraf types lag behind Bot API
+            disable_web_page_preview: true,
+        });
+
+        console.log(`[uline-friday] ✅ Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
     }
 }

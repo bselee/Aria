@@ -60,6 +60,8 @@ interface DetectedRequest {
     eta: string | null;
     timestamp: string;
     finaleContext: string | null;  // Real-time stock/risk context from Finale
+    skuDescriptions: Map<string, string>;  // SKU (lowercase) → human-readable product name
+    skuPOStatus: Map<string, string>;      // SKU (lowercase) → "On order PO#123 (×50)" or "❌ No PO"
     messageTs: string;             // Original Slack ts for thread replies & reactions
     threadTs?: string;             // Thread parent ts, if applicable
 }
@@ -67,14 +69,18 @@ interface DetectedRequest {
 // Per-SKU Finale stock detail for intelligent replies
 interface SkuStockDetail {
     sku: string;
+    productName: string | null;   // Human-readable description from Finale
     onHand: number | null;
     onOrder: number | null;
     stockoutDays: number | null;
     incomingPOs: number;
+    incomingPODetails: Array<{ orderId: string; quantity: number; supplier: string }>;  // Actual PO IDs awaiting arrival
     found: boolean;
     recommendation: string; // Human-readable one-liner
     vendorName: string | null;    // Primary supplier name from Finale
     vendorPartyUrl: string | null; // For PO matching
+    unitCost: number | null;       // Last known supplier cost from Finale
+    reorderQty: number | null;     // Finale-calculated reorder qty based on demand velocity
     needsReorder: boolean;         // True if stockout ≤ 30d or out of stock
 }
 
@@ -563,9 +569,14 @@ export class SlackWatchdog {
         );
 
         // Build the finaleContext string for Telegram
+        // DECISION(2026-03-16): Show "SKU — Product Name: stock data" so Will
+        // can immediately see what each SKU is without looking it up.
         if (finalDetails.length > 0) {
             finaleContext = finalDetails.map(d => {
-                if (!d.found) return `  *${d.sku}*: not found in Finale`;
+                const label = d.productName
+                    ? `*${d.sku}* — ${d.productName}`
+                    : `*${d.sku}*`;
+                if (!d.found) return `  ${label}: not found in Finale`;
                 const parts: string[] = [];
                 if (d.onHand !== null) parts.push(`${d.onHand.toLocaleString()} on hand`);
                 if (d.onOrder !== null && d.onOrder > 0) parts.push(`${d.onOrder} on order`);
@@ -573,8 +584,17 @@ export class SlackWatchdog {
                     if (d.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${d.stockoutDays}d!`);
                     else parts.push(`${d.stockoutDays}d runway`);
                 }
-                if (d.incomingPOs > 0) parts.push(`${d.incomingPOs} PO incoming`);
-                return `  *${d.sku}*: ${parts.join(' · ') || 'in Finale, no stock data'}`;
+                // DECISION(2026-03-16): Show actual PO numbers, not just a count.
+                // "On order PO#12345 (×50)" is infinitely more useful than "1 PO incoming".
+                if (d.incomingPODetails.length > 0) {
+                    const poList = d.incomingPODetails
+                        .map(po => `PO#${po.orderId} (×${po.quantity})`)
+                        .join(', ');
+                    parts.push(`📋 ${poList}`);
+                } else {
+                    parts.push(`❌ No PO`);
+                }
+                return `  ${label}: ${parts.join(' · ') || 'in Finale, no stock data'}`;
             }).join('\n');
         }
 
@@ -616,6 +636,86 @@ export class SlackWatchdog {
             });
         }
 
+        // Build SKU → description + PO status lookups for the Telegram digest
+        const skuDescriptions = new Map<string, string>();
+        const skuPOStatus = new Map<string, string>();
+        for (const d of finalDetails) {
+            if (d.productName) skuDescriptions.set(d.sku.toLowerCase(), d.productName);
+            // Always show PO status: either "On order PO#XXXXX (×qty)" or "❌ No PO"
+            if (d.found) {
+                if (d.incomingPODetails.length > 0) {
+                    const poList = d.incomingPODetails
+                        .map(po => `PO#${po.orderId} (×${po.quantity})`)
+                        .join(', ');
+                    skuPOStatus.set(d.sku.toLowerCase(), `📝 On order ${poList}`);
+                } else {
+                    skuPOStatus.set(d.sku.toLowerCase(), '❌ No PO');
+                }
+            }
+        }
+        // Also include the fuzzy-matched product name if available
+        if (match?.product && match.product.sku !== 'N/A') {
+            skuDescriptions.set(match.product.sku.toLowerCase(), match.product.name);
+        }
+
+        // Step 7c: Auto-create draft POs for requested items with no existing PO
+        // DECISION(2026-03-16): When someone requests products and they have no PO on order,
+        // proactively create draft POs in Finale grouped by vendor. Will reviews/commits them.
+        const noPOItems = finalDetails.filter(d =>
+            d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl
+        );
+        if (noPOItems.length > 0 && !boxReport) {
+            // Group by vendor
+            const byVendor = new Map<string, SkuStockDetail[]>();
+            for (const item of noPOItems) {
+                const key = item.vendorPartyUrl!;
+                const group = byVendor.get(key) || [];
+                group.push(item);
+                byVendor.set(key, group);
+            }
+
+            for (const [partyUrl, items] of Array.from(byVendor.entries())) {
+                const vendorPartyId = partyUrl.split('/').pop() || '';
+                if (!vendorPartyId) continue;
+
+                const vendorName = items[0].vendorName || 'Unknown Vendor';
+                const lineItems = items.map(d => ({
+                    productId: d.sku,
+                    // DECISION(2026-03-16): Use Finale's demand-based reorderQuantityToOrder
+                    // so draft POs reflect actual need, not placeholder 1s.
+                    // Falls back to 1 only if Finale has no demand data for this SKU.
+                    quantity: Math.max(1, d.reorderQty ?? 1),
+                    unitPrice: d.unitCost || 0,
+                }));
+
+                try {
+                    const result = await this.finaleClient.createDraftPurchaseOrder(
+                        vendorPartyId,
+                        lineItems,
+                        `Slack request from ${userName} in #${channelName}: ${items.map(d => d.sku).join(', ')}`,
+                    );
+
+                    console.log(`  📝 Draft PO #${result.orderId} created for ${vendorName} (${items.length} items)`);
+
+                    // Update PO status for the digest
+                    for (const item of items) {
+                        skuPOStatus.set(item.sku.toLowerCase(), `🆕 Draft PO Created #${result.orderId}`);
+                    }
+
+                    // Send immediate Telegram notification for draft PO creation
+                    await this.sendDraftPOCreatedToTelegram(
+                        result.orderId, result.finaleUrl, vendorName,
+                        items, userName, channelName,
+                    );
+                } catch (err: any) {
+                    console.error(`  ❌ Draft PO creation failed for ${vendorName}:`, err.message);
+                    for (const item of items) {
+                        skuPOStatus.set(item.sku.toLowerCase(), `❌ No PO (auto-create failed)`);
+                    }
+                }
+            }
+        }
+
         // Step 8: Queue the detected request (Telegram digest for Will)
         const request: DetectedRequest = {
             channel: channelName,
@@ -630,6 +730,8 @@ export class SlackWatchdog {
             eta,
             timestamp: new Date().toISOString(),
             finaleContext,
+            skuDescriptions,
+            skuPOStatus,
             messageTs,
             threadTs,
         };
@@ -783,9 +885,11 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
      */
     private async getDetailedStockContext(sku: string): Promise<SkuStockDetail> {
         const emptyResult: SkuStockDetail = {
-            sku, onHand: null, onOrder: null, stockoutDays: null, incomingPOs: 0,
+            sku, productName: null, onHand: null, onOrder: null, stockoutDays: null,
+            incomingPOs: 0, incomingPODetails: [],
             found: false, recommendation: 'Not found in Finale',
-            vendorName: null, vendorPartyUrl: null, needsReorder: false,
+            vendorName: null, vendorPartyUrl: null, unitCost: null,
+            reorderQty: null, needsReorder: false,
         };
 
         try {
@@ -796,20 +900,34 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             const onOrder = profile.onOrder;
             const stockoutDays = profile.stockoutDays;
             const incomingPOs = profile.incomingPOs.length;
+            const incomingPODetails = profile.incomingPOs.map(po => ({
+                orderId: po.orderId,
+                quantity: po.quantity,
+                supplier: po.supplier,
+            }));
+            const reorderQty = profile.reorderQuantityToOrder;
 
-            // Resolve vendor from product detail (for PO matching)
+            // Resolve vendor + product name from product detail
             // DECISION(2026-03-04): We do the extra REST call because
             // knowing the vendor lets us find existing draft POs to add to.
+            // DECISION(2026-03-16): Also capture product name so Telegram
+            // digest shows "SKU — Description" instead of raw codes.
             let vendorName: string | null = null;
             let vendorPartyUrl: string | null = null;
+            let productName: string | null = null;
+            let unitCost: number | null = null;
             try {
                 const product = await this.finaleClient.lookupProduct(sku);
-                if (product && product.suppliers.length > 0) {
-                    const mainSupplier = product.suppliers.find(s => s.role === 'MAIN') || product.suppliers[0];
-                    vendorName = mainSupplier.name;
-                    vendorPartyUrl = mainSupplier.partyUrl;
+                if (product) {
+                    productName = product.name || null;
+                    if (product.suppliers.length > 0) {
+                        const mainSupplier = product.suppliers.find(s => s.role === 'MAIN') || product.suppliers[0];
+                        vendorName = mainSupplier.name;
+                        vendorPartyUrl = mainSupplier.partyUrl;
+                        unitCost = mainSupplier.cost;
+                    }
                 }
-            } catch { /* vendor resolution is best-effort */ }
+            } catch { /* vendor/name resolution is best-effort */ }
 
             // Determine if this SKU needs reorder
             const needsReorder = (
@@ -836,9 +954,10 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             }
 
             return {
-                sku, onHand, onOrder, stockoutDays, incomingPOs,
+                sku, productName, onHand, onOrder, stockoutDays,
+                incomingPOs, incomingPODetails,
                 found: true, recommendation,
-                vendorName, vendorPartyUrl, needsReorder,
+                vendorName, vendorPartyUrl, unitCost, reorderQty, needsReorder,
             };
         } catch {
             return { ...emptyResult, recommendation: 'Finale lookup error' };
@@ -1012,15 +1131,27 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
                 ? `📋 Active PO: #${req.activePO} — ${req.eta}`
                 : `📭 No active PO found`;
 
-            // Show all requested items (multi-SKU aware)
-            const allItems = req.analysis.allItems?.length > 1
-                ? req.analysis.allItems.join(', ')
-                : req.analysis.itemDescription;
+            // DECISION(2026-03-16): Use pre-resolved SKU descriptions so Will can
+            // instantly see what products people are asking for without manual lookup.
+
+            // Show all requested items with descriptions + PO status
+            const rawItems = req.analysis.allItems?.length > 1
+                ? req.analysis.allItems
+                : [req.analysis.itemDescription];
+
+            // Format each item as "SKU — Description | PO status"
+            const itemsWithDescriptions = rawItems.map(item => {
+                const desc = req.skuDescriptions.get(item.toLowerCase());
+                const po = req.skuPOStatus.get(item.toLowerCase()) || '';
+                let line = desc ? `\`${item}\` — ${desc}` : `\`${item}\``;
+                if (po) line += `\n      ${po}`;
+                return line;
+            });
 
             message +=
                 `${urgencyEmoji} *${req.userName}* in #${req.channel}\n` +
                 `💬 _"${req.originalText.substring(0, 120)}"_\n` +
-                `📦 Wants: ${allItems}` +
+                `📦 Wants:\n${itemsWithDescriptions.map(i => `  • ${i}`).join('\n')}` +
                 `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
                 `${matchLine}\n` +
                 `${poLine}\n`;
@@ -1105,6 +1236,53 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             console.log(`  \ud83d\udce8 Sent PO action for ${detail.sku} to Telegram`);
         } catch (err: any) {
             console.error(`  \u274c PO action Telegram failed for ${detail.sku}:`, err.message);
+        }
+    }
+
+    /**
+     * Sends a Telegram notification when a draft PO is auto-created for review.
+     * DECISION(2026-03-16): Aria proactively creates drafts for items with no PO,
+     * then notifies Will to review and commit in Finale.
+     */
+    private async sendDraftPOCreatedToTelegram(
+        orderId: string,
+        finaleUrl: string,
+        vendorName: string,
+        items: SkuStockDetail[],
+        requesterName: string,
+        channelName: string,
+    ) {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return;
+
+        const itemLines = items.map(d => {
+            const name = d.productName ? `${d.sku} — ${d.productName}` : d.sku;
+            const qty = Math.max(1, d.reorderQty ?? 1);
+            const stock = d.onHand !== null ? `${d.onHand.toLocaleString()} on hand` : 'stock unknown';
+            const runway = d.stockoutDays !== null ? `${d.stockoutDays}d runway` : '';
+            const context = [stock, runway].filter(Boolean).join(' · ');
+            return `  • ×${qty} ${name}\n      ${context}`;
+        }).join('\n');
+
+        const message =
+            `🆕 *Draft PO Created* — PO #${orderId}\n\n` +
+            `Vendor: *${vendorName}*\n` +
+            `Triggered by: ${requesterName} in #${channelName}\n\n` +
+            `Items (qty based on Finale demand):\n${itemLines}\n\n` +
+            `🔗 [Open in Finale](${finaleUrl})\n` +
+            `⚠️ _Verify quantities and commit when ready_`;
+
+        try {
+            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+            });
+            console.log(`  \ud83d\udce8 Sent draft PO #${orderId} notification to Telegram`);
+        } catch (err: any) {
+            console.error(`  \u274c Draft PO Telegram notification failed:`, err.message);
         }
     }
 }
