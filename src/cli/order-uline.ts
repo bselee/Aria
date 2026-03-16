@@ -268,6 +268,7 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
 
     const items: OrderLineItem[] = [];
     const skippedLowVelocity: Array<{ productId: string; dailyRate: number; explanation: string }> = [];
+    let lowestRunway = Infinity;
 
     // DECISION(2026-03-16): Minimum velocity filter for auto-reorder.
     // Items with < 0.1 units/day are typically one-off facility purchases
@@ -293,9 +294,13 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
                 continue;
             }
 
+            if (item.adjustedRunwayDays < lowestRunway) {
+                lowestRunway = item.adjustedRunwayDays;
+            }
+
             const urgencyIcon = item.urgency === 'critical' ? '🔴' : '🟡';
             console.log(`   ${urgencyIcon} ${item.productId}: ${item.explanation}`);
-            console.log(`      Suggested qty: ${item.suggestedQty} | Stock: ${Math.round(item.stockOnHand)} | On order: ${Math.round(item.stockOnOrder)}`);
+            console.log(`      Suggested qty: ${item.suggestedQty} | Stock: ${Math.round(item.stockOnHand)} | On order: ${Math.round(item.stockOnOrder)} | Runway: ${item.adjustedRunwayDays.toFixed(1)}d`);
 
             items.push({
                 finaleSku: item.productId,
@@ -309,9 +314,34 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
 
     const total = items.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
 
-    if (items.length === 0 && skippedLowVelocity.length === 0) {
+    // DECISION(2026-03-16): Smart Order Deferral
+    // ULINE orders are placed on Fridays. Minimum 7 days to next Friday + 5 days buffer/transit = 12 days.
+    // If our lowest runway across ALL needed items is > 12 days, we could technically 
+    // wait until next Friday to place this order without any item dropping to a 0-day runway.
+    // To prevent small frequent POs, we defer the order entirely if we have enough runway
+    // AND the total dollar amount is less than a threshold ($500).
+    // If the runway is critical (<= 12) we order regardless of price to prevent a stockout.
+    const SAFE_RUNWAY_DAYS = 12;
+    const MIN_ORDER_SIZE_FOR_EARLY_PO = 500;
+    
+    let deferred = false;
+    if (items.length > 0) {
+        if (lowestRunway > SAFE_RUNWAY_DAYS && total < MIN_ORDER_SIZE_FOR_EARLY_PO) {
+            console.log(`\n   ⏸️  DEFERRING ORDER:`);
+            console.log(`      • Shortest runway is ${lowestRunway.toFixed(1)} days (safe to wait until next week).`);
+            console.log(`      • Total is $${total.toFixed(2)} (under $${MIN_ORDER_SIZE_FOR_EARLY_PO} early PO threshold).`);
+            items.length = 0; // Empty the array to halt PO creation
+            deferred = true;
+        } else if (lowestRunway <= SAFE_RUNWAY_DAYS) {
+            console.log(`\n   🟢 MUST ORDER: Shortest runway is ${lowestRunway.toFixed(1)} days (will run out before next cycle).`);
+        } else {
+            console.log(`\n   🟢 LARGE ORDER: Shortest runway is safe (${lowestRunway.toFixed(1)}d), but total is $${total.toFixed(2)} (≥ $${MIN_ORDER_SIZE_FOR_EARLY_PO}).`);
+        }
+    }
+
+    if (items.length === 0 && skippedLowVelocity.length === 0 && !deferred) {
         console.log('\n   ✅ All ULINE items are adequately stocked — nothing to reorder');
-    } else {
+    } else if (items.length > 0) {
         console.log(`\n   📦 ${items.length} ULINE items need reordering (velocity ≥ ${MIN_DAILY_VELOCITY}/day)`);
     }
 

@@ -660,7 +660,7 @@ export class SlackWatchdog {
 
         // Step 7c: Auto-create draft POs for requested items with no existing PO
         // DECISION(2026-03-16): When someone requests products and they have no PO on order,
-        // proactively create draft POs in Finale grouped by vendor. Will reviews/commits them.
+        // proactively create draft POs in Finale grouped by vendor. These are intended to remain as Draft POs for planning.
         const noPOItems = finalDetails.filter(d =>
             d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl
         );
@@ -1241,8 +1241,8 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
 
     /**
      * Sends a Telegram notification when a draft PO is auto-created for review.
-     * DECISION(2026-03-16): Aria proactively creates drafts for items with no PO,
-     * then notifies Will to review and commit in Finale.
+     * DECISION(2026-03-16): Aria proactively creates drafts for items with no PO.
+     * These remain as draft POs to act as a planning and request tracking tool.
      */
     private async sendDraftPOCreatedToTelegram(
         orderId: string,
@@ -1271,7 +1271,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             `Triggered by: ${requesterName} in #${channelName}\n\n` +
             `Items (qty based on Finale demand):\n${itemLines}\n\n` +
             `🔗 [Open in Finale](${finaleUrl})\n` +
-            `⚠️ _Verify quantities and commit when ready_`;
+            `📝 _Intended to remain as a Draft PO for planning/review_`;
 
         try {
             await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
