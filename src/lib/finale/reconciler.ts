@@ -353,15 +353,31 @@ export async function approvePendingReconciliation(id: string): Promise<{
         } catch { /* non-blocking */ }
     }
 
-    // Pinecone: remember this approval outcome (non-blocking)
+    // Pinecone: remember this approval outcome with full cost detail (non-blocking)
     setImmediate(async () => {
         try {
             const { remember } = await import("../intelligence/memory");
             const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+
+            // Build enriched content with price changes and fee breakdowns
+            const priceDetail = entry.result.priceChanges
+                .filter(pc => pc.verdict !== "no_match")
+                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}`)
+                .join(", ");
+            const feeDetail = entry.result.feeChanges
+                .map(fc => `${fc.feeType}: $${fc.amount.toFixed(2)}`)
+                .join(", ");
+            const carrier = entry.result.trackingUpdate?.carrierName ?? "unknown carrier";
+            const tracking = entry.result.trackingUpdate?.trackingNumbers?.join(", ") ?? "no tracking";
+
             await remember({
                 category: "decision",
-                content: `PO ${entry.result.orderId} reconciliation approved by Will. ${applyResult.applied.length} changes applied, ${applyResult.errors.length} errors. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}.`,
-                tags: ["reconciliation", "approved", entry.result.orderId, vendorSlug],
+                content: `PO ${entry.result.orderId} reconciliation approved by Will. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. ` +
+                    `Price changes: ${priceDetail || "none"}. ` +
+                    `Fees: ${feeDetail || "none"}. ` +
+                    `Carrier: ${carrier}. Tracking: ${tracking}. ` +
+                    `Total impact: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}. ${applyResult.applied.length} applied, ${applyResult.errors.length} errors.`,
+                tags: ["reconciliation", "approved", "price_change", entry.result.orderId, vendorSlug],
                 source: "email",
                 relatedTo: entry.result.vendorName,
                 priority: "normal",
@@ -464,15 +480,27 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         } catch { /* non-blocking */ }
     }
 
-    // Pinecone: remember this rejection for future context (non-blocking)
+    // Pinecone: remember this rejection with full cost detail for future context (non-blocking)
     setImmediate(async () => {
         try {
             const { remember } = await import("../intelligence/memory");
             const vendorSlug = entry.result.vendorName.replace(/\s+/g, "_").toLowerCase().replace(/[^a-z0-9_]/g, "");
+
+            const priceDetail = entry.result.priceChanges
+                .filter(pc => pc.verdict !== "no_match")
+                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}`)
+                .join(", ");
+            const feeDetail = entry.result.feeChanges
+                .map(fc => `${fc.feeType}: $${fc.amount.toFixed(2)}`)
+                .join(", ");
+
             await remember({
                 category: "decision",
-                content: `PO ${entry.result.orderId} reconciliation REJECTED by Will. No changes applied. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. Impact would have been: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}.`,
-                tags: ["reconciliation", "rejected", entry.result.orderId, vendorSlug],
+                content: `PO ${entry.result.orderId} reconciliation REJECTED by Will. No changes applied. Vendor: ${entry.result.vendorName}. Invoice: ${entry.result.invoiceNumber}. ` +
+                    `Would-have-been price changes: ${priceDetail || "none"}. ` +
+                    `Would-have-been fees: ${feeDetail || "none"}. ` +
+                    `Impact would have been: $${(entry.result.totalDollarImpact ?? 0).toFixed(2)}.`,
+                tags: ["reconciliation", "rejected", "price_change", entry.result.orderId, vendorSlug],
                 source: "email",
                 relatedTo: entry.result.vendorName,
                 priority: "high",
@@ -1819,6 +1847,16 @@ export async function applyReconciliation(
         }
     }
 
+    // 4. Log all changes to price_change_audit (flat, queryable table)
+    // Fire-and-forget: don't block the return. The JSONB reconciliation_report
+    // in ap_activity_log is the durable record; this is the queryable view.
+    const approvedBy = approvedItems?.length ? "Will" : "system";
+    setImmediate(() => {
+        logPriceChangeAudit(result, approvedBy).catch((err: any) => {
+            console.warn(`⚠️ [reconciler] price_change_audit failed (non-fatal): ${err.message}`);
+        });
+    });
+
     return { applied, skipped, errors };
 }
 
@@ -2060,6 +2098,100 @@ export function buildReconciliationReport(
         warnings,
         match_strategy: matchStrategy,
     };
+}
+
+// ──────────────────────────────────────────────────
+// PRICE CHANGE AUDIT LOG — flat, queryable table
+// ──────────────────────────────────────────────────
+
+/**
+ * Write every price change and fee change to `price_change_audit` as flat rows.
+ * This is the primary audit table for answering questions like:
+ *   - "What did we pay vendor X for freight?"
+ *   - "Show all price changes for SKU BLM209"
+ *   - "Total tariffs this quarter"
+ *
+ * Non-blocking: logs and continues on failure so the reconciliation flow
+ * is never interrupted by an audit-write error.
+ *
+ * DECISION(2026-03-13): Separate from ap_activity_log.reconciliation_report
+ * (JSONB) because flat columns enable simple SQL aggregates and joins
+ * without JSONB path queries. Both stores are maintained for redundancy.
+ *
+ * @param result       The reconciliation result (prices, fees, tracking)
+ * @param approvedBy   'system' for auto-approve, 'Will' for manual
+ * @param source       'pdf_invoice' | 'inline_invoice' | 'manual'
+ */
+export async function logPriceChangeAudit(
+    result: ReconciliationResult,
+    approvedBy: string = "system",
+    source: string = "pdf_invoice"
+): Promise<void> {
+    try {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        const rows: Array<Record<string, unknown>> = [];
+
+        // Item price changes
+        for (const pc of result.priceChanges) {
+            if (pc.verdict === "no_match") continue; // unmatched lines aren't actionable
+            rows.push({
+                po_number: result.orderId,
+                vendor_name: result.vendorName,
+                invoice_number: result.invoiceNumber,
+                change_type: "item_price",
+                sku: pc.productId,
+                description: pc.description,
+                old_value: pc.poPrice,
+                new_value: pc.invoicePrice,
+                quantity: pc.quantity,
+                dollar_impact: pc.dollarImpact,
+                percent_change: pc.percentChange,
+                verdict: pc.verdict,
+                approved_by: approvedBy,
+                carrier_name: result.trackingUpdate?.carrierName ?? null,
+                tracking_numbers: result.trackingUpdate?.trackingNumbers ?? null,
+                source,
+            });
+        }
+
+        // Fee changes (freight, tax, tariff, labor, discount)
+        for (const fc of result.feeChanges) {
+            rows.push({
+                po_number: result.orderId,
+                vendor_name: result.vendorName,
+                invoice_number: result.invoiceNumber,
+                change_type: fc.feeType.toLowerCase(),
+                sku: null,
+                description: fc.description,
+                old_value: fc.existingAmount,
+                new_value: fc.amount,
+                quantity: null,
+                dollar_impact: fc.amount - fc.existingAmount,
+                percent_change: fc.existingAmount > 0
+                    ? (fc.amount - fc.existingAmount) / fc.existingAmount
+                    : null,
+                verdict: fc.verdict,
+                approved_by: approvedBy,
+                carrier_name: result.trackingUpdate?.carrierName ?? null,
+                tracking_numbers: result.trackingUpdate?.trackingNumbers ?? null,
+                source,
+            });
+        }
+
+        if (rows.length > 0) {
+            const { error } = await supabase.from("price_change_audit").insert(rows);
+            if (error) {
+                console.warn(`⚠️ [reconciler] price_change_audit insert failed: ${error.message}`);
+            } else {
+                console.log(`📊 [reconciler] Logged ${rows.length} row(s) to price_change_audit`);
+            }
+        }
+    } catch (err: any) {
+        // Non-blocking — never interrupt the reconciliation flow
+        console.warn(`⚠️ [reconciler] logPriceChangeAudit failed (non-fatal): ${err.message}`);
+    }
 }
 
 // ──────────────────────────────────────────────────

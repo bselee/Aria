@@ -2300,12 +2300,67 @@ export class FinaleClient {
     }
 
     /**
+     * Unlock a PO for editing, regardless of whether it's Committed or Completed.
+     * Returns the original statusId so the caller can restore it after edits.
+     *
+     * DECISION(2026-03-13): Extended to handle ORDER_COMPLETED POs using
+     * actionUrlEdit, discovered during SV invoice reconciliation. The same
+     * /edit endpoint works for both Committed and Completed POs.
+     *
+     * @param currentPO - The current PO document (mutated in place with unlocked state)
+     * @param orderId   - The order ID (for re-fetching)
+     * @returns The original statusId before unlocking
+     */
+    private async unlockForEditing(currentPO: any, orderId: string): Promise<string> {
+        const originalStatus = currentPO.statusId;
+
+        if ((originalStatus === "ORDER_LOCKED" || originalStatus === "ORDER_COMPLETED") && currentPO.actionUrlEdit) {
+            await this.post(currentPO.actionUrlEdit, {});
+            // Re-fetch after unlocking — status and available actions change
+            const unlocked = await this.getOrderDetails(orderId);
+            Object.assign(currentPO, unlocked);
+        }
+
+        return originalStatus;
+    }
+
+    /**
+     * Restore a PO to its original status after editing.
+     * Committed (ORDER_LOCKED) and Completed (ORDER_COMPLETED) POs are
+     * re-committed/re-completed via actionUrlComplete.
+     *
+     * @param orderId       - The order ID
+     * @param originalStatus - The status before we unlocked for editing
+     */
+    private async restoreOrderStatus(orderId: string, originalStatus: string): Promise<void> {
+        if (originalStatus !== "ORDER_LOCKED" && originalStatus !== "ORDER_COMPLETED") {
+            return; // Was a draft — leave as-is
+        }
+
+        const afterEdits = await this.getOrderDetails(orderId);
+
+        // After unlocking, PO is in ORDER_CREATED. actionUrlComplete commits it.
+        // For formerly-completed POs, Finale auto-completes on commit.
+        if (afterEdits.statusId === "ORDER_CREATED" && afterEdits.actionUrlComplete) {
+            await this.post(afterEdits.actionUrlComplete, {});
+        } else if (afterEdits.statusId === "ORDER_LOCKED" && originalStatus === "ORDER_COMPLETED" && afterEdits.actionUrlComplete) {
+            // Edge case: committed but should be completed
+            await this.post(afterEdits.actionUrlComplete, {});
+        }
+        // If already in the right state, nothing to do
+    }
+
+    /**
      * Add a fee/charge adjustment to a PO's orderAdjustmentList.
      * This uses Finale's native fee system and automatically affects landed cost per unit.
-     * 
+     *
+     * Handles all PO states: Draft, Committed, and Completed.
+     * Committed/Completed POs are unlocked, edited, then restored to original state.
+     *
      * DECISION(2026-02-26): Uses GET → Modify → POST pattern. Must call actionUrlEdit
-     * first if the PO is in Committed status to unlock it for editing.
-     * 
+     * first if the PO is in Committed or Completed status to unlock it for editing.
+     * UPDATED(2026-03-13): Extended to handle ORDER_COMPLETED POs and auto-restore status.
+     *
      * @param orderId    - Finale order ID
      * @param feeType    - One of FINALE_FEE_TYPES keys (FREIGHT, TAX, TARIFF, etc.)
      * @param amount     - Dollar amount of the fee
@@ -2324,13 +2379,8 @@ export class FinaleClient {
         // 1. Fetch current PO state
         const currentPO = await this.getOrderDetails(orderId);
 
-        // 2. If PO is committed (ORDER_LOCKED), unlock it for editing
-        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
-            await this.post(currentPO.actionUrlEdit, {});
-            // Re-fetch after unlocking — status and available actions change
-            const unlocked = await this.getOrderDetails(orderId);
-            Object.assign(currentPO, unlocked);
-        }
+        // 2. Unlock if Committed or Completed
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
 
         // 3. Upsert: remove any existing entries for this fee type, then add the new one.
         //    Prevents duplicate adjustment lines if called more than once.
@@ -2352,11 +2402,8 @@ export class FinaleClient {
             { ...currentPO, orderAdjustmentList: adjustments }
         );
 
-        // 5. Re-commit if it was committed before
-        if (updated.actionUrlComplete) {
-            // Note: we don't auto-recommit — leave in editable state
-            // so the user can review in Finale UI if desired.
-        }
+        // 5. Restore original status (re-commit / re-complete)
+        await this.restoreOrderStatus(orderId, originalStatus);
 
         return updated;
     }
@@ -2379,12 +2426,8 @@ export class FinaleClient {
         // 1. Fetch current PO state
         const currentPO = await this.getOrderDetails(orderId);
 
-        // 2. Unlock if committed
-        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
-            await this.post(currentPO.actionUrlEdit, {});
-            const unlocked = await this.getOrderDetails(orderId);
-            Object.assign(currentPO, unlocked);
-        }
+        // 2. Unlock if Committed or Completed
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
 
         // 3. Consolidate: remove ALL entries for this fee type, add one at newAmount.
         //    This handles the case where a duplicate $0 + real amount entry exists.
@@ -2400,16 +2443,27 @@ export class FinaleClient {
         });
 
         // 4. POST back
-        return this.post(
+        const updated = await this.post(
             `/${this.accountPath}/api/order/${encodedId}`,
             { ...currentPO, orderAdjustmentList: adjustments }
         );
+
+        // 5. Restore original status
+        await this.restoreOrderStatus(orderId, originalStatus);
+
+        return updated;
     }
 
     /**
      * Update a specific line item's unit price on a PO.
-     * Used when invoice price differs from PO price within auto-approval threshold.
-     * 
+     * Used when invoice price differs from PO price within auto-approval threshold,
+     * or when reconciling vendor order confirmations against PO pricing.
+     *
+     * Handles all PO states: Draft, Committed, and Completed.
+     * Committed/Completed POs are unlocked, edited, then restored to original state.
+     *
+     * UPDATED(2026-03-13): Extended to handle ORDER_COMPLETED POs via unlockForEditing.
+     *
      * @param orderId     - Finale order ID
      * @param productId   - SKU of the line item to update
      * @param newUnitPrice - New unit price from the invoice
@@ -2423,18 +2477,16 @@ export class FinaleClient {
         const encodedId = encodeURIComponent(orderId);
         const currentPO = await this.getOrderDetails(orderId);
 
-        // Unlock if committed
-        if (currentPO.statusId === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
-            await this.post(currentPO.actionUrlEdit, {});
-            const unlocked = await this.getOrderDetails(orderId);
-            Object.assign(currentPO, unlocked);
-        }
+        // Unlock if Committed or Completed
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
 
         // Find the matching line item
         const items = currentPO.orderItemList || [];
         const targetItem = items.find((item: any) => item.productId === productId);
 
         if (!targetItem) {
+            // Restore status before throwing so we don't leave the PO in a draft state
+            await this.restoreOrderStatus(orderId, originalStatus);
             throw new Error(`Product ${productId} not found in PO ${orderId}`);
         }
 
@@ -2446,6 +2498,9 @@ export class FinaleClient {
             `/${this.accountPath}/api/order/${encodedId}`,
             currentPO
         );
+
+        // Restore original status (re-commit / re-complete)
+        await this.restoreOrderStatus(orderId, originalStatus);
 
         return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated };
     }
