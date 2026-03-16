@@ -69,6 +69,24 @@ Build a SKU mapping table. Watch for:
 - **`undefined` productId entries**: Skip these (empty/placeholder rows)
 - **Items already at correct price**: Skip to avoid unnecessary API calls
 
+### ⚠️ UOM Conversion (CRITICAL — applies to ALL vendors)
+
+**Finale always tracks by the smallest unit** (each, bag, roll, lb, kg). Vendors invoice by case/box/pallet/roll.
+
+When vendor qty ≠ Finale qty for the same item, you MUST divide:
+
+```
+finaleUnitPrice = vendorUnitPrice / (finaleQty / vendorQty)
+```
+
+Example: Vendor sells 1 box of 500 bags for $103. Finale has 500 individual bags.
+- Conversion factor = 500 / 1 = 500
+- Finale price = $103 / 500 = **$0.206/bag**
+
+**If you skip this, a $103 box becomes $103×500 = $51,500. Catastrophic.**
+
+Always sanity-check: **Finale PO subtotal must match vendor invoice subtotal (±$10).** If it doesn't, something is wrong — do not save.
+
 ## Step 4: Apply Price Updates
 
 Use `FinaleClient.updateOrderItemPrice()` which handles all PO states:

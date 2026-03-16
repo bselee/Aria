@@ -4,111 +4,62 @@ description: Scrape ULINE invoice detail pages and reconcile line items against 
 
 # ULINE Invoice Reconciliation Workflow
 
-> Use when: Reconciling ULINE invoices against Finale POs — extracting per-item SKUs and pricing from uline.com, then updating Finale POs with correct prices, freight, and tax.
+> **When to use:** Reconciling ULINE invoices against Finale POs — updating per-item pricing, freight, and tax.
 
-## Prerequisites
-
-- User must be logged into uline.com in their real Chrome browser
-- Finale API credentials in `.env.local`
-- ULINE credentials in `.env.local` (`ULINE_EMAIL`, `ULINE_PASSWORD`)
-
-## Step 1: Scrape ULINE Invoice Details
-
-**Script**: `src/cli/scrape-uline-details.ts`
+## Quick Start
 
 ```bash
-# IMPORTANT: Close Chrome first — Playwright needs exclusive profile access
-node --import tsx src/cli/scrape-uline-details.ts
+# ⚠️ Close Chrome first — Playwright needs exclusive profile access
+
+# Full pipeline: scrape + update all current-year POs
+node --import tsx src/cli/reconcile-uline.ts
+
+# Preview changes without modifying Finale
+node --import tsx src/cli/reconcile-uline.ts --dry-run
+
+# Just scrape (no Finale updates)
+node --import tsx src/cli/reconcile-uline.ts --scrape-only
+
+# Use cached scrape data (skip re-scraping)
+node --import tsx src/cli/reconcile-uline.ts --update-only
+
+# Single PO
+node --import tsx src/cli/reconcile-uline.ts --po 124426
+
+# Different year
+node --import tsx src/cli/reconcile-uline.ts --year 2025
 ```
 
-This uses the **real Chrome profile** (persistent context) to bypass ULINE's bot detection. It:
-1. Navigates to `https://www.uline.com/MyAccount/Invoices`
-2. Collects all invoice links from the grid
-3. Visits each `InvoiceDetail` page
-4. Scrapes the HTML table for: Item#, Description, Qty, Unit Price, Extended Price
-5. Outputs structured JSON to `~/OneDrive/Desktop/Sandbox/uline-invoice-details.json`
+## What It Does
 
-### Key Technical Details
+1. **Scrapes** all invoice detail pages from uline.com (persistent Chrome profile)
+2. **Maps** ULINE item numbers to Finale SKUs (7 cross-references + 31 direct matches)
+3. **Updates** Finale PO line-item prices to match ULINE invoice (source of truth)
+4. **Adds** freight entries with descriptive labels (avoids duplicates)
+5. **Restores** PO status (re-commits completed POs)
 
-- **DO NOT use injected cookies** — ULINE's Kendo grid won't render in a synthetic browser context. Only the persistent Chrome profile approach works.
-- **Selector**: Invoice links use `a[href*="InvoiceDetail"]` (NOT `.k-grid-content`)
-- **Page structure**: Standard HTML `<table>`, not Kendo grid widgets
-- **Line items table**: Identified by finding a `<th>` containing "Item #"
-- **Order info row**: Identified by first cell matching 7-digit customer number pattern
+## Key Rules
 
-## Step 2: Match ULINE Items to Finale SKUs
+- **ULINE invoice price = source of truth. Always.**
+- **UOM CONVERSION (CRITICAL):** Finale tracks by the smallest unit (each, bag, roll, lb, kg). Vendors invoice by case/box/pallet. **Always divide vendor unit price by the conversion factor.** Formula: `finalePrice = vendorPrice / (finaleQty / vendorQty)`. Example: ULINE sells 1 box of 500 bags for $103 → Finale price = $103 / 500 = $0.206/bag. This applies to ALL vendors, not just ULINE.
+- **Subtotal sanity check:** After price updates, Finale PO subtotal must match ULINE invoice subtotal (±$10). If it doesn't, something is wrong — do not save.
+- **$0 items** (caps, jugs, lids) are bundled components — skip in reconciliation
+- **Close Chrome** before running — Playwright needs exclusive profile access
+- **DO NOT use injected cookies** — ULINE's grid won't render. Must use persistent Chrome profile.
 
-ULINE item numbers (e.g., `S-14454C`, `H-754`) map directly to Finale product IDs.
-Some items have **component entries** with $0 price (e.g., `S-13505B-JUG`, `S-13505CAP`) — these are caps/jugs bundled with the main item. Skip $0 items.
+## SKU Mapping
 
-## Step 3: Add Freight to Finale POs
+| ULINE | Finale | Description |
+|-------|--------|-------------|
+| S-15837B | FJG101 | Jugs |
+| S-13505B | FJG102 | Bottles (120-pack) |
+| S-13506B | FJG103 | Bottles (240-pack) |
+| S-10748B | FJG104 | Bottles (60-pack) |
+| S-12229 | 10113 | |
+| S-4551 | ULS455 | |
+| H-1621 | Ho-1621 | |
 
-**Script pattern**: `tmp/add-freight-reconcile.ts` (or `tmp/fix-124143-freight.ts`)
-
-```typescript
-import * as dotenv from "dotenv";
-dotenv.config({ path: ".env.local" });
-import { FinaleClient } from "../src/lib/finale/client";
-
-const FREIGHT_PROMO = `/buildasoilorganics/api/productpromo/10007`;
-
-async function run() {
-    const finale = new FinaleClient();
-    const post = (finale as any).post.bind(finale);
-
-    const poId = '124338';
-    const po = await finale.getOrderDetails(poId);
-
-    // Unlock if needed
-    if (po.actionUrlEdit && (po.statusId === 'ORDER_LOCKED' || po.statusId === 'ORDER_COMPLETED')) {
-        await post(po.actionUrlEdit, {});
-    }
-
-    const unlocked = await finale.getOrderDetails(poId);
-    const adjustments = [...(unlocked.orderAdjustmentList || [])];
-
-    // ⚠️ CHECK FOR EXISTING FREIGHT FIRST — avoid duplicates!
-    // Compare amounts before appending
-    adjustments.push({
-        amount: 30.35,
-        description: 'Freight - ULINE Inv 203591102',
-        productPromoUrl: FREIGHT_PROMO,
-    });
-
-    await post(`/buildasoilorganics/api/order/${poId}`, {
-        ...unlocked, orderAdjustmentList: adjustments
-    });
-
-    // Re-commit
-    const after = await finale.getOrderDetails(poId);
-    if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
-}
-run().catch(console.error);
-```
-
-### Critical: Avoiding Duplicate Freight
-
-**ALWAYS check existing adjustments** before appending. If a generic "Freight" entry exists at the same amount you're about to add, **remove it first** and replace with the descriptive version.
-
-```typescript
-// Remove generic freight that matches our amount, keep everything else
-const cleaned = adjustments.filter(a =>
-    a.productPromoUrl !== FREIGHT_PROMO ||
-    a.amount !== newAmount  // keep if different amount
-);
-cleaned.push({ amount: newAmount, description: 'Freight - ULINE Inv XXXXX', productPromoUrl: FREIGHT_PROMO });
-```
-
-## Step 4: Cross-Reference FedEx COLLECT Freight
-
-FedEx freight CSV files (from `~/OneDrive/Desktop/Sandbox/`) contain shipments for ALL vendors.
-
-To filter to Finale POs:
-- Look for PO_NUMBER column values matching 6-digit Finale PO format (12xxxx)
-- These are always COLLECT shipments (FedEx billing BuildASoil directly)
-- The corresponding ULINE invoices typically show $1.50 nominal freight
-
-Add FedEx freight as additional FREIGHT entries on the same PO, with descriptive labels like `FedEx Freight - Inv XXXXXXXXX`.
+All other SKUs match directly between ULINE and Finale.
 
 ## Fee Type IDs
 
@@ -119,22 +70,10 @@ Add FedEx freight as additional FREIGHT entries on the same PO, with descriptive
 | TARIFF | 10014 | `/buildasoilorganics/api/productpromo/10014` |
 | SHIPPING | 10017 | `/buildasoilorganics/api/productpromo/10017` |
 
-## Key Learnings
+## Technical Notes
 
-1. **ULINE bot detection**: Injected cookies authenticate but Kendo grid doesn't render. MUST use persistent Chrome profile (`chromium.launchPersistentContext`).
-2. **Close Chrome first**: Playwright needs exclusive access to the Chrome profile directory.
-3. **No PDF needed**: The InvoiceDetail HTML page has all line-item data in a clean `<table>`.
-4. **$0 line items**: ULINE bundles caps/jugs/lids as separate $0 line items — skip these in reconciliation.
-5. **Check tmp/ first**: Prior reconciliation scripts live in `tmp/` (e.g., `fix-124143-freight.ts`, `add-freight-reconcile.ts`). Always check for existing patterns before writing new scripts.
-6. **Duplicate freight trap**: Always audit existing adjustments before appending. Generic "Freight" entries may already exist at the same amount.
-
-## Available Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `src/cli/scrape-uline-details.ts` | Scrape all invoice line items from uline.com |
-| `src/cli/scrape-uline-invoices.ts` | Export summary CSV from uline.com |
-| `src/cli/probe-uline-pos.ts` | Inspect ULINE POs in Finale |
-| `tmp/add-freight-reconcile.ts` | Bulk add freight entries to Finale POs |
-| `tmp/fix-duplicate-freight.ts` | Clean up duplicate freight adjustments |
-| `tmp/audit-freight.ts` | Verify current freight state on POs |
+- **Selectors**: Invoice links use `a[href*="InvoiceDetail"]` (standard HTML table)
+- **Page structure**: Standard HTML `<table>`, NOT Kendo grid widgets
+- **Output**: Cached at `~/OneDrive/Desktop/Sandbox/uline-invoice-details.json`
+- **Duplicate freight**: Script checks existing adjustments before appending
+- **Bot detection**: ULINE blocks synthetic browsers. Only the persistent Chrome profile approach works.
