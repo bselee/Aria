@@ -219,6 +219,22 @@ interface MatchResult {
     error?: string;
 }
 
+function findCorrelatedReception(po: any, dateStr: string): string | null {
+    if (!po?.shipments || po.shipments.length === 0) return null;
+    const targetMs = new Date(dateStr).getTime();
+    if (isNaN(targetMs)) return null;
+
+    for (const sh of po.shipments) {
+        if (!sh.receiveDate) continue;
+        const recMs = new Date(sh.receiveDate).getTime();
+        const diffDays = Math.abs(targetMs - recMs) / 86400000;
+        if (diffDays <= 4) { // within 4 days (covers 2-3 days + weekend leeway)
+            return `Rec ${sh.shipmentId} on ${sh.receiveDate}`;
+        }
+    }
+    return null;
+}
+
 function extractFinalePoId(entry: FedExEntry): string | null {
     const match = entry.poNumber.match(FINALE_PO_RE) || entry.refNum.match(FINALE_PO_RE);
     return match ? match[1] : null;
@@ -301,6 +317,15 @@ async function main() {
     const finale = new FinaleClient();
     const results: MatchResult[] = [];
 
+    console.log(`Fetching recent POs for reception correlation...`);
+    let allPOs: any[] = [];
+    try {
+        allPOs = await finale.getRecentPurchaseOrders(400);
+        console.log(`✅ Loaded ${allPOs.length} POs\n`);
+    } catch {
+        console.log(`⚠️ Failed to fetch POs for correlation\n`);
+    }
+
     const withPoRef: { fedex: FedExEntry; poId: string }[] = [];
     const withoutPoRef: FedExEntry[] = [];
 
@@ -357,11 +382,18 @@ async function main() {
                 } else if (REPORT_ONLY || DRY_RUN) {
                     console.log(`🔵 PO ${poId} | $${fedex.amtDue.toFixed(2)} | ${DRY_RUN ? 'WOULD ADD' : 'NEEDS'} freight | ${vendor} | FedEx ${fedex.invoiceNumber}`);
                 } else {
+                    let memo = '';
+                    const cachedPo = allPOs.find((p: any) => p.orderId === poId);
+                    if (cachedPo) {
+                        const corr = findCorrelatedReception(cachedPo, fedex.shipDate);
+                        if (corr) memo = ` — ${corr}`;
+                    }
+
                     // Add freight — use unique label per delivery
-                    const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})`;
+                    const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
                     await addFreightToPO(finale, poId, fedex.amtDue, label, po);
                     result.freightAdded = true;
-                    console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}`);
+                    console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}${memo ? ` | ${memo}` : ''}`);
                 }
             } catch (err: any) {
                 result.error = err.message;
@@ -383,12 +415,6 @@ async function main() {
         } catch (err: any) {
             console.log(`⚠️  FedEx API auth failed: ${err.message}`);
             console.log('   Falling back to manual report\n');
-        }
-
-        // Fetch POs for date matching if we can resolve vendor
-        let allPOs: any[] = [];
-        if (token) {
-            allPOs = await finale.getRecentPurchaseOrders(400);
         }
 
         for (const fedex of withoutPoRef) {
@@ -415,6 +441,19 @@ async function main() {
                         const delDate = new Date(track.deliveryDate);
                         const vendorPOs = allPOs.filter(po => {
                             if (!po.vendorName.toLowerCase().includes(vendorName.split(' ')[0].toLowerCase())) return false;
+                            
+                            // Check shipments proximity
+                            if (po.shipments && po.shipments.length > 0) {
+                                for (const shipment of po.shipments) {
+                                    if (shipment.receiveDate) {
+                                        const recDate = new Date(shipment.receiveDate);
+                                        const recDiff = Math.abs((delDate.getTime() - recDate.getTime()) / 86400000);
+                                        if (recDiff <= 4) return true; // Matches reception
+                                    }
+                                }
+                            }
+
+                            // Fallback to orderDate
                             const poDate = new Date(po.orderDate);
                             const daysDiff = (delDate.getTime() - poDate.getTime()) / 86400000;
                             return daysDiff >= -3 && daysDiff <= 45;
@@ -451,10 +490,14 @@ async function main() {
                                         if (REPORT_ONLY || DRY_RUN) {
                                             console.log(`🔵 FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ${DRY_RUN ? 'WOULD ADD' : 'NEEDS freight'}`);
                                         } else {
-                                            const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})`;
+                                            let memo = '';
+                                            const corr = findCorrelatedReception(po, track.deliveryDate);
+                                            if (corr) memo = ` — ${corr}`;
+
+                                            const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
                                             await addFreightToPO(finale, po.orderId, fedex.amtDue, label, details);
                                             result.freightAdded = true;
-                                            console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight`);
+                                            console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight${memo ? ` | ${memo}` : ''}`);
                                         }
                                         matched = true;
                                         break;

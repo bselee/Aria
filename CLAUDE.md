@@ -126,6 +126,7 @@ Calendar auth is a **separate OAuth flow** from Gmail — it uses `GOOGLE_CLIENT
 | `src/lib/pdf/` | extractor, classifier, invoice-parser, po-parser, bol-parser, statement-parser, editor |
 | `src/lib/matching/invoice-po-matcher.ts` | Invoice ↔ PO matching with discrepancy detection |
 | `src/lib/supabase.ts` | Singleton Supabase client (lazy init — returns null if env vars missing) |
+| `src/lib/storage/vendor-invoices.ts` | Unified vendor invoice archive. `upsertVendorInvoice()`, `lookupVendorInvoices()`, `vendorSpendSummary()`, `markInvoicePaid()`. Dedup on `(vendor_name, invoice_number)`. |
 | `src/lib/anthropic.ts` | Lazy-init Anthropic singleton (`getAnthropicClient()`) — the correct escape hatch for direct SDK access |
 | `src/lib/intelligence/pinecone.ts` | Pinecone vector store for operational context + deduplication state (index: `gravity-memory`, 1024d, namespace: `aria-memory`) |
 | `src/lib/intelligence/vendor-memory.ts` | Vendor document handling patterns in Pinecone (namespace: `vendor-memory`). Stores how each vendor sends docs. `seedKnownVendorPatterns()` called on boot. |
@@ -154,6 +155,47 @@ Reconciliation safety thresholds (defined in `reconciler.ts`, do not change with
 - **>3% but <10× magnitude** → flag for Telegram bot approval before applying
 - **≥10× magnitude shift** → REJECT outright (OCR/decimal error)
 - **Total PO impact >$500** → require manual approval regardless of per-line %
+
+### Vendor Reconciliation CLIs
+
+Vendor-specific reconcilers match external invoices to Finale POs, apply corrected prices, and archive to `vendor_invoices`. They are **run manually** — not part of the AP auto-pipeline.
+
+**Common pattern (all reconcilers):**
+1. Scrape/fetch invoice data (Playwright, CSV, Gmail, REST API)
+2. Match to Finale POs by date proximity + vendor/SKU overlap
+3. Apply UOM conversion: `finalePrice = vendorPrice / (finaleQty / vendorQty)` — critical when vendors sell by the box but Finale tracks units
+4. Update PO line-item prices + add freight adjustment
+5. Archive to `vendor_invoices` via `upsertVendorInvoice()`
+6. Restore original PO lock status
+
+| Vendor | Script | Fetch Method | Key Challenge |
+|--------|--------|-------------|---------------|
+| ULINE | `reconcile-uline.ts` | Playwright persistent Chrome | Bot detection; box→unit UOM conversion |
+| FedEx | `reconcile-fedex.ts` | CSV download + Track API | Origin city → vendor name mapping |
+| TeraGanix | `reconcile-teraganix.ts` | Gmail email parse (Shopify) | Case multipliers (e.g. EM102×12) |
+| Axiom Print | `reconcile-axiom.ts` | REST API (newapi.axiomprint.com) | Split invoices; 2-pass date+SKU matching |
+
+Supporting scripts: `fetch-fedex-csv.ts` (Playwright-driven FedEx Billing CSV download), `order-uline.ts` (draft ULINE orders from Finale POs), `axiom-merge-split-invoices.ts` (one-time split-invoice merge).
+
+**Playwright persistent Chrome:** ULINE and FedEx scripts require closing Chrome before running. They attach to Will's real Chrome profile (`launchPersistentContext`) to reuse existing session cookies — Playwright-driven login triggers bot detection and fails.
+
+**CLI flags (consistent across all reconcilers):** `--dry-run` (preview only), `--scrape-only` (fetch without updating Finale), `--update-only` (skip scrape, use cached data), `--report-only` (FedEx), `--po <id>` (target a specific PO).
+
+```bash
+# ULINE
+node --import tsx src/cli/reconcile-uline.ts [--dry-run | --scrape-only | --update-only]
+
+# FedEx — download CSV first, then reconcile
+node --import tsx src/cli/fetch-fedex-csv.ts
+node --import tsx src/cli/reconcile-fedex.ts [--dry-run | --report-only]
+
+# TeraGanix (reads Gmail automatically)
+node --import tsx src/cli/reconcile-teraganix.ts [--dry-run]
+
+# Axiom Print
+node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts [--scrape-only | --update-only | --dry-run]
+node --import tsx src/cli/axiom-merge-split-invoices.ts  # one-time split invoice merge
+```
 
 ### Purchasing Intelligence (`getPurchasingIntelligence()`)
 
@@ -247,6 +289,10 @@ Reusable procedure files for common multi-step operations. Propagated to all AI 
 | `debug-fix.md` | Sub-agent invoked by test-loop to diagnose and fix a single failure |
 | `plan-fix.md` | Read-only pre-flight planner — maps failures before letting test-loop auto-fix |
 | `vendor-invoice-archive.md` | **MANDATORY** — every new vendor reconciler/intake process MUST archive invoices to `vendor_invoices` via `upsertVendorInvoice()` |
+| `reconcile-uline.md` | ULINE scraping workflow, UOM conversion, SKU cross-reference table |
+| `reconcile-fedex.md` | FedEx CSV parsing, Track API vendor mapping |
+| `reconcile-axiom.md` | Axiom REST API, paginated PO fetch, split invoice merging |
+| `reconcile-vendor-po.md` | Generic vendor email reconciliation template |
 
 ### Cross-Tool Availability
 Agents are propagated to all AI coding tools:

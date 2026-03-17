@@ -133,6 +133,7 @@ export interface FullPO {
     total: number;
     items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
+    shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null }>;
 }
 
 export interface DraftPOReview {
@@ -3016,6 +3017,12 @@ export class FinaleClient {
                                     receiveDate
                                     total
                                     supplier { name }
+                                    shipmentList {
+                                        shipmentId
+                                        status
+                                        shipDate
+                                        receiveDate
+                                    }
                                     itemList(first: 50) {
                                         edges {
                                             node {
@@ -3056,6 +3063,12 @@ export class FinaleClient {
                     const parsed = new Date(d);
                     return isNaN(parsed.getTime()) ? null : parsed.toISOString().split('T')[0];
                 };
+                const shipments = (po.shipmentList || []).map((s: any) => ({
+                    shipmentId: s.shipmentId,
+                    status: s.status,
+                    receiveDate: toISODate(s.receiveDate),
+                    shipDate: toISODate(s.shipDate),
+                }));
                 return {
                     orderId: po.orderId,
                     vendorName: po.supplier?.name ?? '',
@@ -3066,6 +3079,7 @@ export class FinaleClient {
                     total: parseFinaleNumber(po.total),
                     items,
                     finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
+                    shipments
                 } as FullPO;
             });
         } catch (err: any) {

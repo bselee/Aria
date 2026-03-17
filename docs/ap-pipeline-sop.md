@@ -11,6 +11,15 @@
 
 Every 15 minutes, Aria scans the `ap@buildasoil.com` inbox. For each unread email it classifies intent, downloads any PDF attachments, forwards to `buildasoilap@bill.com` (payment), and runs reconciliation against Finale (audit + cost tracking). The two paths — bill.com forwarding and Finale reconciliation — are **fully independent**. A reconciliation failure never blocks payment.
 
+> **🚀 vNext Architecture Note:** The AP pipeline is evolving toward a **Fast-Triage Waterfall** paradigm.
+> Instead of blindly deep-parsing every PDF, Aria will:
+> 1. Sniff the sender/subject.
+> 2. Cross-check Finale instantly for Expected / Open POs.
+> 3. **Fork to Path A (Non-Inventory / Closed):** Ultra-fast, cheap extraction (Total + Vendor only) to pad the `vendor_invoices` historical spend archive.
+> 4. **Fork to Path B (Open Inventory PO):** Deep LLM Parse, *handed the expected PO line items upfront* for 10x faster, near-100% accurate price verification.
+> 
+> *The diagram below reflects the current active processing loop, which is actively being optimized toward this waterfall.*
+
 ```
 Gmail ap@buildasoil.com
         │
@@ -421,3 +430,21 @@ The `daily recap` (sent at 8:00 AM weekdays) summarizes all entries from the cur
 3. **Vendor+date fallback** — Finale API may be slow; the fallback is best-effort. A timeout is caught and logged; the invoice proceeds to "No PO Found" flow.
 4. **Multi-PDF emails** — Each PDF is processed independently. A single email with two invoices creates two separate reconciliation flows.
 5. **Duplicate invoice numbers from different vendors** — The duplicate detection query matches on both `invoiceNumber` AND `orderId`. Same invoice number from two different vendors against two different POs will not false-positive as duplicates.
+
+---
+
+## 🔮 Future Brilliance (The AP Roadmap)
+
+To make this system truly untouchable, the following concepts are queued for future phases:
+
+1. **Three-Way Matching (PO + Invoice + Reception):**
+   Aria shouldn't just match the Invoice to the PO; she should cross-check Finale's *Received* quantity. If 10 units are billed but the warehouse only checked in 8, Aria flags a "Short Shipment" discrepancy and holds the payment approval until a credit memo is received.
+
+2. **Automated Vendor Pushback (Dispute Generation):**
+   If an invoice is rejected due to a magnitude error (e.g., billed $500 instead of $50), Aria can automatically draft a firm/polite email reply asking the vendor for a corrected invoice, queueing it for Will to review and hit "Send."
+
+3. **Predictive Cash Flow Forecasting:**
+   Because Aria extracts `paymentTerms`, `invoiceDate`, and `dueDate` across all historical and active spend, she can project a 30-60-90 day cash requirement timeline on the Aria Dashboard, showing exactly what liabilities are coming due next week.
+
+4. **Month-End Statement Reconciliation:**
+   Vendors often send "Statements" showing 5+ outstanding invoices. Aria can parse the Statement array, cross-check it against the `vendor_invoices` table, and instantly flag any missing invoices that never actually arrived in the Inbox.

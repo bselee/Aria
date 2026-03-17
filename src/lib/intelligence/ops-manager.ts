@@ -483,7 +483,7 @@ export class OpsManager {
             // TODO(will)[2026-03-11]: Re-enable when token-ap.json is created via:
             //   npx tsx src/cli/gmail-auth.ts ap
             // Disabled because the AP Gmail account isn't authorized yet.
-            // this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
+            this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
         });
 
         // AP Identifier scans for unread PDFs every 15 minutes and queues them
