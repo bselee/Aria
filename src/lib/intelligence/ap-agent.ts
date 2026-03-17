@@ -22,6 +22,7 @@ import {
     buildReconciliationReport,
 } from "../finale/reconciler";
 import { recordFeedback } from "./feedback-loop";
+import { upsertVendorInvoice } from "../storage/vendor-invoices";
 
 /**
  * @file    ap-agent.ts
@@ -739,6 +740,32 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 document_id: docData?.id || null,
                 raw_data: invoiceData
             }, { onConflict: "invoice_number" });
+
+            // 3a. Archive into unified vendor_invoices table (non-blocking)
+            try {
+                await upsertVendorInvoice({
+                    vendor_name: invoiceData.vendorName,
+                    invoice_number: invoiceData.invoiceNumber,
+                    invoice_date: invoiceData.invoiceDate,
+                    due_date: invoiceData.dueDate || null,
+                    po_number: finalePONumber || null,
+                    subtotal: invoiceData.subtotal,
+                    freight: invoiceData.freight || 0,
+                    tax: invoiceData.tax || 0,
+                    total: invoiceData.total,
+                    status: matched ? 'received' : 'received',
+                    source: 'email_attachment',
+                    source_ref: messageId || `email-${from}`,
+                    line_items: invoiceData.lineItems?.map(li => ({
+                        sku: li.sku || li.description,
+                        description: li.description,
+                        qty: li.quantity,
+                        unit_price: li.unitPrice,
+                        ext_price: li.extendedPrice || (li.quantity * li.unitPrice),
+                    })),
+                    raw_data: invoiceData as unknown as Record<string, unknown>,
+                });
+            } catch { /* dedup collision or non-critical failure */ }
 
             // 3b. Log Bill.com forward event with full invoice detail
             // The actual forward happened upstream in processUnreadInvoices before this buffer was queued.

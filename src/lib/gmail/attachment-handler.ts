@@ -7,6 +7,7 @@ import { parsePurchaseOrder } from "../../lib/pdf/po-parser";
 import { parseVendorStatement } from "../../lib/pdf/statement-parser";
 import { matchInvoiceToPO } from "../../lib/matching/invoice-po-matcher";
 import { uploadPDF } from "../../lib/storage/supabase-storage";
+import { upsertVendorInvoice } from "../../lib/storage/vendor-invoices";
 import { createClient } from "../../lib/supabase";
 import { ShipmentTracker } from "../../lib/carriers/aftership";
 import { parseBOL } from "../../lib/pdf/bol-parser";
@@ -193,6 +194,29 @@ export async function processDocument(
                     document_id: savedDoc?.id,
                     raw_data: extractedData,
                 }, { onConflict: "invoice_number" });
+
+                // Also archive into the unified vendor_invoices table
+                const ed = extractedData as Record<string, unknown>;
+                await upsertVendorInvoice({
+                    vendor_name: String(ed.vendorName ?? meta.emailFrom ?? "Unknown"),
+                    invoice_number: String(ed.invoiceNumber ?? ""),
+                    invoice_date: ed.invoiceDate ? String(ed.invoiceDate) : null,
+                    due_date: ed.dueDate ? String(ed.dueDate) : null,
+                    po_number: ed.poNumber ? String(ed.poNumber) : null,
+                    subtotal: Number(ed.subtotal) || 0,
+                    freight: Number(ed.freight) || 0,
+                    tax: Number(ed.tax) || 0,
+                    total: Number(ed.total) || 0,
+                    status: matchResult?.autoApprove ? "reconciled" : "received",
+                    source: "email_attachment",
+                    source_ref: meta.sourceRef,
+                    pdf_storage_path: storagePath || null,
+                    line_items: Array.isArray(ed.lineItems) ? ed.lineItems as any : [],
+                    raw_data: ed as Record<string, unknown>,
+                    reconciled_at: matchResult?.autoApprove ? new Date().toISOString() : null,
+                }).catch((err: Error) => {
+                    console.warn("[attachment-handler] vendor_invoices upsert failed:", err.message);
+                });
             }
         } catch (dbErr: any) {
             console.error("❌ Database sync failed:", dbErr.message);

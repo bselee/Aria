@@ -194,18 +194,29 @@ All Finale PO mutations use **GET → Modify → POST**. If the PO status is `OR
 Finale fee types map to `productpromo` IDs: FREIGHT=10007, TAX=10008, TARIFF=10014, LABOR=10016, SHIPPING=10017. These feed into landed cost automatically.
 
 ### Running Supabase Migrations
-Migration files live in `supabase/migrations/YYYYMMDD_descriptive_name.sql`. Always use `ADD COLUMN IF NOT EXISTS` for idempotency. Apply via:
+**Supabase CLI** is installed as a dev dependency (`npx supabase`). Non-destructive, additive migrations (CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS) should be applied directly without asking for approval:
 
 ```bash
+# Primary method — always try this first
 node _run_migration.js supabase/migrations/<filename>.sql
 ```
 
 `_run_migration.js` connects via the Supabase connection pooler (`aws-0-us-west-2.pooler.6543`) — direct `db.*.supabase.co` DNS does not resolve in this environment. It falls through connection strategies automatically. If it doesn't exist, paste the SQL into the [Supabase SQL Editor](https://supabase.com/dashboard/project/_/sql). The `pg` package must be installed (`npm install pg` if missing). Uses `SUPABASE_DB_PASSWORD` env var, falls back to `SUPABASE_SERVICE_ROLE_KEY`.
 
+**Migration rules:**
+- Non-destructive migrations (new tables, new columns, new indexes) → **apply automatically, do not ask**
+- Destructive migrations (DROP, ALTER TYPE, DELETE data) → **always ask Will first**
+
 Full migration workflow: `.agents/workflows/migration.md`.
 
 ### Database Schema (Supabase)
-Key tables: `documents`, `vendors`, `vendor_profiles`, `invoices`, `purchase_orders`, `shipments`, `ap_activity_log`. See `supabase/migrations/` for schema. Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `tracking_numbers TEXT[]` (GIN-indexed for overlap queries).
+Key tables: `documents`, `vendors`, `vendor_profiles`, `invoices`, `vendor_invoices`, `purchase_orders`, `shipments`, `ap_activity_log`. See `supabase/migrations/` for schema.
+
+**`vendor_invoices`** — Unified archive of every vendor invoice across all intake channels. Single source of truth for "What did we pay vendor X this year?" Dedup index on `(vendor_name, invoice_number)`. Sources: `email_attachment`, `portal_scrape`, `csv_import`, `sandbox_drop`, `payment_confirm`, `manual`.
+
+> **⚠️ MANDATORY:** Every new vendor script/reconciler/intake process MUST call `upsertVendorInvoice()` from `src/lib/storage/vendor-invoices.ts`. See `.agents/workflows/vendor-invoice-archive.md` for the exact pattern.
+
+Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `tracking_numbers TEXT[]` (GIN-indexed for overlap queries).
 
 ### Slack Watchdog Behavior
 - **Eyes-only mode** — Aria NEVER posts in Slack. The only Slack action is adding a 👀 reaction using Will's user token (`SLACK_ACCESS_TOKEN`).
@@ -235,6 +246,7 @@ Reusable procedure files for common multi-step operations. Propagated to all AI 
 | `test-loop.md` | Self-healing test → fix → re-test loop using vitest + tsc + ESLint |
 | `debug-fix.md` | Sub-agent invoked by test-loop to diagnose and fix a single failure |
 | `plan-fix.md` | Read-only pre-flight planner — maps failures before letting test-loop auto-fix |
+| `vendor-invoice-archive.md` | **MANDATORY** — every new vendor reconciler/intake process MUST archive invoices to `vendor_invoices` via `upsertVendorInvoice()` |
 
 ### Cross-Tool Availability
 Agents are propagated to all AI coding tools:

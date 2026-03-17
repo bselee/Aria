@@ -91,6 +91,8 @@ Invoke with `/command-name` in any agent session.
 |---|---|---|
 | `/github` | `github.md` | Git commit & push — branching, conventional commits, PR rules, release tagging |
 | `/migration` | `migration.md` | SQL migration flow — create, apply, and verify Supabase migrations |
+| `/vendor-invoice-archive` | `vendor-invoice-archive.md` | **MANDATORY** — every new vendor process MUST archive invoices to `vendor_invoices` |
+| `/reconcile-vendor-po` | `reconcile-vendor-po.md` | Reconcile vendor order confirmations against Finale POs |
 | `/debug-fix` | `debug-fix.md` | Debug & fix specialist — diagnose and repair a single failing test or lint error |
 | `/plan-fix` | `plan-fix.md` | Pre-flight fix planner — read-only failure analysis with ranked fix order |
 | `/test-fix-loop` | `test-fix-loop.md` | Test loop agent rules — global rules applied to all test workflow agents |

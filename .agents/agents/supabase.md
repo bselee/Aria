@@ -69,6 +69,15 @@ Tracks when builds are marked complete.
 ### `proactive_alerts`
 Alerts surfaced to the dashboard (build risk, reorder, AP issues).
 
+### `vendor_invoices`
+Unified archive of every vendor invoice across all intake channels. Single source of truth for AP research.
+- Dedup index: `(vendor_name, invoice_number)`
+- Sources: `email_attachment`, `portal_scrape`, `csv_import`, `sandbox_drop`, `payment_confirm`, `manual`
+- Helper: `src/lib/storage/vendor-invoices.ts` → `upsertVendorInvoice()`, `lookupVendorInvoices()`
+- CLI: `node --import tsx src/cli/invoice-lookup.ts --vendor <NAME> --year 2026`
+
+> **⚠️ MANDATORY:** Every new vendor script/reconciler/intake process MUST call `upsertVendorInvoice()`. See `.agents/workflows/vendor-invoice-archive.md`.
+
 ### `purchasing_calendar_events`
 Google Calendar events related to purchasing/builds.
 
@@ -85,11 +94,14 @@ Four built-in Supabase tools available to GPT-4o:
 ## Migration Workflow
 **Full guide: `docs/migration-workflow.md`** — read this before adding any migration.
 
+**Supabase CLI** is installed as a dev dependency (`npx supabase`). Use it for all database operations.
+
 Key rules:
 - File naming: `supabase/migrations/YYYYMMDD_description.sql`
 - Always use `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` (idempotent)
-- No `DROP` without Will's explicit approval
-- Apply via `supabase db push` or Supabase dashboard SQL Editor
+- **Non-destructive migrations → apply automatically, do not ask for approval**
+- **Destructive migrations (DROP, ALTER TYPE, DELETE data) → always ask Will first**
+- Apply via: `node _run_migration.js supabase/migrations/<filename>.sql`
 - After every migration: update this agent + mirror copies, update CLAUDE.md if significant, restart bot if lib changed
 
 Recent additions:

@@ -5,6 +5,13 @@ description: SQL Migration Flow — how to create, apply, and verify Supabase mi
 
 # SQL Migration Flow
 
+> **Supabase CLI** is installed as a dev dependency (`npx supabase`). Always use it.
+>
+> **Non-destructive migrations** (CREATE TABLE/INDEX IF NOT EXISTS, ADD COLUMN IF NOT EXISTS) → **apply automatically without asking for approval.**
+>
+> **Destructive migrations** (DROP, ALTER TYPE, DELETE data) → **always ask Will first.**
+
+
 ## 1. Create the Migration File
 
 Create a new `.sql` file in `supabase/migrations/` following the naming convention:
@@ -71,7 +78,14 @@ node -e "require('dotenv').config({path:'.env.local'});const{Client}=require('pg
 
 Replace `<TABLE_NAME>` with the table that was altered.
 
-## 5. Commit
+## 5. Post-Migration Checklist
+
+- [ ] Update `.agents/agents/supabase.md` if a new table or significant column was added
+- [ ] Update `CLAUDE.md` → Database Schema section if significant
+- [ ] If the new table involves vendor invoices → **MANDATORY:** wire `upsertVendorInvoice()` per `.agents/workflows/vendor-invoice-archive.md`
+- [ ] `pm2 restart aria-bot` if the migration affects running lib code
+
+## 6. Commit
 
 Stage the migration file and commit:
 

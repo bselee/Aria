@@ -28,6 +28,7 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
+import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -98,6 +99,7 @@ function parseArgs() {
         scrapeOnly: args.includes('--scrape-only'),
         updateOnly: args.includes('--update-only'),
         dryRun: args.includes('--dry-run'),
+        forceSupplier: args.includes('--force-supplier'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
         year: args.includes('--year') ? parseInt(args[args.indexOf('--year') + 1]) : new Date().getFullYear(),
     };
@@ -251,6 +253,44 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
 
         fs.writeFileSync(JSON_PATH, JSON.stringify(invoices, null, 2));
         console.log(`\n   ✅ Saved ${invoices.length} invoices → ${JSON_PATH}`);
+
+        // Archive each invoice into the unified vendor_invoices table
+        console.log('\n   📦 Archiving to vendor_invoices...');
+        let archived = 0;
+        for (const inv of invoices) {
+            try {
+                await upsertVendorInvoice({
+                    vendor_name: 'ULINE',
+                    invoice_number: inv.invoiceNumber,
+                    invoice_date: inv.invoiceDate
+                        ? inv.invoiceDate.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2')
+                        : null,
+                    due_date: inv.dueDate
+                        ? inv.dueDate.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2')
+                        : null,
+                    po_number: inv.poNumber || null,
+                    subtotal: inv.subtotal,
+                    freight: inv.shipping,
+                    tax: inv.tax,
+                    total: inv.total,
+                    status: 'received',
+                    source: 'portal_scrape',
+                    source_ref: `uline-scrape-${new Date().toISOString().slice(0, 10)}`,
+                    line_items: inv.items.filter(i => i.unitPrice > 0).map(i => ({
+                        sku: toFinaleId(i.itemNumber),
+                        description: i.description,
+                        qty: i.qtyOrdered,
+                        unit_price: i.unitPrice,
+                        ext_price: i.extendedPrice,
+                    })),
+                    raw_data: inv as unknown as Record<string, unknown>,
+                });
+                archived++;
+            } catch (err: any) {
+                console.warn(`   ⚠️ Archive failed for ${inv.invoiceNumber}: ${err.message}`);
+            }
+        }
+        console.log(`   ✅ Archived ${archived}/${invoices.length} invoices`);
     } finally {
         await context.close();
     }
@@ -271,10 +311,12 @@ interface ReconcileResult {
 
 async function reconcilePO(
     finale: FinaleClient,
+    get: Function,
     post: Function,
     poId: string,
     invoices: UlineInvoice[],
     dryRun: boolean,
+    forceSupplier: boolean,
 ): Promise<ReconcileResult> {
     const result: ReconcileResult = { po: poId, priceChanges: 0, freightAdded: 0, taxAdded: 0, status: '', errors: [] };
 
@@ -329,18 +371,63 @@ async function reconcilePO(
             const finaleQty = item.quantity;
             const ulineQty = uItem.qty;
 
+            let priceChanged = false;
+
             if (ulineQty > 0 && finaleQty !== ulineQty) {
                 const factor = finaleQty / ulineQty;
                 correctPrice = uItem.unitPrice / factor;
                 if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                     console.log(`     ${fId}: $${item.unitPrice.toFixed(4)} → $${correctPrice.toFixed(4)} (ULINE $${uItem.unitPrice} ÷ ${factor} UOM factor)`);
                     if (!dryRun) item.unitPrice = correctPrice;
+                    priceChanged = true;
                     result.priceChanges++;
                 }
             } else if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                 console.log(`     ${fId}: $${item.unitPrice} → $${correctPrice}`);
                 if (!dryRun) item.unitPrice = correctPrice;
+                priceChanged = true;
                 result.priceChanges++;
+            }
+
+            if ((priceChanged || forceSupplier) && !dryRun) {
+                try {
+                    const productUrl = `/buildasoilorganics/api/product/${fId}`;
+                    const prodDetails = await get(productUrl);
+                    
+                    // Origin URL is typically the vendor party URL in Finale POs
+                    const vendorPartyUrl = unlocked.originUrl || unlocked.partyUrl; 
+                    
+                    let supplierUpdated = false;
+                    if (prodDetails.supplierList && prodDetails.supplierList.length > 0) {
+                        for (const sup of prodDetails.supplierList) {
+                            if (vendorPartyUrl && sup.supplierPartyUrl === vendorPartyUrl) {
+                                sup.price = correctPrice;
+                                supplierUpdated = true;
+                                break;
+                            }
+                        }
+                        if (!supplierUpdated) {
+                            for (const sup of prodDetails.supplierList) {
+                                if (sup.supplierPrefOrderId?.includes('MAIN')) {
+                                    sup.price = correctPrice;
+                                    supplierUpdated = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!supplierUpdated) {
+                            prodDetails.supplierList[0].price = correctPrice;
+                            supplierUpdated = true;
+                        }
+                    }
+
+                    if (supplierUpdated) {
+                        await post(productUrl, prodDetails);
+                        console.log(`       [Global supplier price updated to $${correctPrice.toFixed(4)}]`);
+                    }
+                } catch (e: any) {
+                    console.error(`       [⚠️ Failed to update global supplier price for ${fId}: ${e.message}]`);
+                }
             }
         }
 
@@ -455,13 +542,14 @@ async function main() {
     console.log(`   ${poIds.length} POs to process (year=${args.year}${args.singlePO ? `, PO=${args.singlePO}` : ''})\n`);
 
     const finale = new FinaleClient();
+    const get = (finale as any).get.bind(finale);
     const post = (finale as any).post.bind(finale);
     const results: ReconcileResult[] = [];
 
     for (let i = 0; i < poIds.length; i++) {
         const poId = poIds[i];
         console.log(`   [${i + 1}/${poIds.length}] PO ${poId}...`);
-        const result = await reconcilePO(finale, post, poId, byPO[poId], args.dryRun);
+        const result = await reconcilePO(finale, get, post, poId, byPO[poId], args.dryRun, args.forceSupplier);
         results.push(result);
 
         const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';

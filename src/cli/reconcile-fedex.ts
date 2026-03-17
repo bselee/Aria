@@ -30,6 +30,7 @@ import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import { FinaleClient } from '../lib/finale/client';
+import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -254,6 +255,31 @@ async function main() {
     console.log(`📄 CSV: ${path.basename(targetCsv)}`);
     const entries = parseFedExCSV(targetCsv);
     console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
+
+    // Archive all FedEx entries into vendor_invoices
+    console.log(`📦 Archiving FedEx invoices to vendor_invoices...`);
+    let archived = 0;
+    for (const e of entries) {
+        try {
+            await upsertVendorInvoice({
+                vendor_name: 'FedEx',
+                invoice_number: e.invoiceNumber,
+                invoice_date: e.shipDate
+                    ? e.shipDate.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2')
+                    : null,
+                total: e.amtDue,
+                freight: e.amtDue,
+                po_number: extractFinalePoId(e) || null,
+                status: 'received',
+                source: 'csv_import',
+                source_ref: `fedex-csv-${path.basename(targetCsv)}`,
+                notes: `Terms: ${e.terms} | From: ${e.shipFrom} → ${e.shipTo}`,
+                raw_data: e as unknown as Record<string, unknown>,
+            });
+            archived++;
+        } catch { /* dedup collision is fine */ }
+    }
+    console.log(`✅ Archived ${archived}/${entries.length} FedEx invoices\n`);
 
     // --- Step 2: Categorize entries ---
     const collectEntries = entries.filter(e => e.terms === 'COLLECT');

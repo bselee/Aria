@@ -2986,7 +2986,7 @@ export class FinaleClient {
      * Includes Finale's deliverDate (quoted expected delivery) as expectedDate.
      * Never throws — returns empty array on any error.
      */
-    async getRecentPurchaseOrders(daysBack: number = 7): Promise<FullPO[]> {
+    async getRecentPurchaseOrders(daysBack: number = 7, limit: number = 500): Promise<FullPO[]> {
         try {
             const now = new Date();
             const end = new Date(now);
@@ -3001,7 +3001,7 @@ export class FinaleClient {
                 query: `
                     query {
                         orderViewConnection(
-                            first: 500
+                            first: ${limit}
                             type: ["PURCHASE_ORDER"]
                             orderDate: { begin: "${beginStr}", end: "${endStr}" }
                             sort: [{ field: "orderDate", mode: "desc" }]
