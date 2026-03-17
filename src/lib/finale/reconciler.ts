@@ -55,40 +55,43 @@ export async function storePendingApproval(result: ReconciliationResult, client:
     const id = `recon_${result.orderId}_${Date.now()}`;
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    // C3 FIX: Cache the FinaleClient instance (not serializable to JSONB).
+    // Cache the FinaleClient instance (not serializable to JSONB).
     // On reload after restart, we re-instantiate from env vars (stateless).
-    pendingApprovals.set(id, {
-        id,
+    // We omit ID for now since we'll get it from Supabase.
+
+    // Persist to Supabase — this is the durable source of truth.
+    let dbId = id; // Fallback or placeholder until SB returns it
+    try {
+        const supabase = createClient();
+        if (supabase) {
+            const { data, error } = await supabase.from("ap_pending_approvals").insert({
+                invoice_number: result.invoiceNumber,
+                vendor_name: result.vendorName,
+                order_id: result.orderId,
+                reconciliation_result: result as unknown as Record<string, unknown>,
+                verdict_type: result.overallVerdict,
+                telegram_chat_id: process.env.TELEGRAM_CHAT_ID ?? null,
+                expires_at: expiresAt.toISOString(),
+                status: "pending",
+            }).select("id").single();
+            
+            if (error) throw error;
+            if (data?.id) dbId = data.id;
+        }
+    } catch (err: any) {
+        console.warn(`[reconciler] Failed to persist approval to Supabase: ${err.message}`);
+        // Non-fatal — will fallback to in-memory ID but won't survive restart
+    }
+
+    pendingApprovals.set(dbId, {
+        id: dbId,
         result,
         client,
         createdAt: Date.now(),
         status: "pending",
     });
 
-    // Persist to Supabase — this is the durable source of truth.
-    // C3 FIX: No more setTimeout expiry — expiry is handled by the `expires_at` column.
-    // Callers check `expires_at > now()` when reading.
-    try {
-        const supabase = createClient();
-        if (supabase) {
-            await supabase.from("pending_reconciliations").upsert({
-                approval_id: id,
-                invoice_number: result.invoiceNumber,
-                vendor_name: result.vendorName,
-                po_number: result.orderId,
-                order_id: result.orderId,
-                result: result as unknown as Record<string, unknown>,
-                telegram_chat_id: process.env.TELEGRAM_CHAT_ID ?? null,
-                expires_at: expiresAt.toISOString(),
-                status: "pending",
-            }, { onConflict: "approval_id" });
-        }
-    } catch (err: any) {
-        console.warn(`[reconciler] Failed to persist approval ${id} to Supabase: ${err.message}`);
-        // Non-fatal — will work for this session but won't survive restart
-    }
-
-    return id;
+    return dbId;
 }
 
 /**
@@ -100,9 +103,9 @@ export async function updatePendingApprovalMessageId(approvalId: string, telegra
     try {
         const supabase = createClient();
         if (supabase) {
-            await supabase.from("pending_reconciliations")
-                .update({ telegram_message_id: telegramMessageId })
-                .eq("approval_id", approvalId);
+            await supabase.from("ap_pending_approvals")
+                .update({ telegram_message_id: telegramMessageId.toString() })
+                .eq("id", approvalId);
         }
     } catch { /* non-blocking */ }
 }
@@ -125,10 +128,10 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
         const supabase = createClient();
         if (!supabase) return [];
 
-        // C3 FIX: Filter by status='pending' (new column) and expires_at > now()
+        // Filter by status='pending' and expires_at > now()
         const { data, error } = await supabase
-            .from("pending_reconciliations")
-            .select("approval_id, result, telegram_chat_id, expires_at")
+            .from("ap_pending_approvals")
+            .select("id, reconciliation_result, telegram_chat_id, expires_at")
             .eq("status", "pending")
             .gt("expires_at", new Date().toISOString());
 
@@ -146,9 +149,9 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
 
         for (const row of data) {
             try {
-                const result = row.result as ReconciliationResult;
+                const result = row.reconciliation_result as ReconciliationResult;
                 const expiresAt = new Date(row.expires_at);
-                const approvalId: string = row.approval_id;
+                const approvalId: string = row.id;
 
                 // Skip if already in memory (process didn't actually restart — just a race)
                 if (pendingApprovals.has(approvalId)) continue;
@@ -173,7 +176,7 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
                     expiresAt,
                 });
             } catch (rowErr: any) {
-                console.warn(`[reconciler] Skipping malformed pending_reconciliations row: ${rowErr.message}`);
+                console.warn(`[reconciler] Skipping malformed ap_pending_approvals row: ${rowErr.message}`);
             }
         }
 
@@ -199,9 +202,9 @@ export async function getPendingApproval(id: string): Promise<PendingApproval | 
         const supabase = createClient();
         if (!supabase) return undefined;
 
-        const { data } = await supabase.from("pending_reconciliations")
+        const { data } = await supabase.from("ap_pending_approvals")
             .select("*")
-            .eq("approval_id", id)
+            .eq("id", id)
             .eq("status", "pending")
             .gt("expires_at", new Date().toISOString())
             .single();
@@ -211,8 +214,8 @@ export async function getPendingApproval(id: string): Promise<PendingApproval | 
         // Re-instantiate FinaleClient (stateless — reads creds from env)
         const client = new FinaleClient();
         const entry: PendingApproval = {
-            id: data.approval_id,
-            result: data.result as ReconciliationResult,
+            id: data.id,
+            result: data.reconciliation_result as ReconciliationResult,
             client,
             createdAt: new Date(data.created_at).getTime(),
             status: "pending",
@@ -273,23 +276,17 @@ export async function approvePendingReconciliation(id: string): Promise<{
     entry.status = "approved";
     pendingApprovals.delete(id);
 
-    // C3 FIX: Update Supabase status to "approved" instead of deleting
+    // Update Supabase status to "approved"
     try {
         const sbStatus = createClient();
         if (sbStatus) {
-            await sbStatus.from("pending_reconciliations")
-                .update({ status: "approved" })
-                .eq("approval_id", id);
+            await sbStatus.from("ap_pending_approvals")
+                .update({ status: "approved", updated_at: new Date().toISOString() })
+                .eq("id", id);
         }
     } catch { /* non-blocking */ }
 
-    // Remove from Supabase persistence now that it's resolved
-    setImmediate(async () => {
-        try {
-            const sb = createClient();
-            if (sb) await sb.from("pending_reconciliations").delete().eq("approval_id", id);
-        } catch { /* non-blocking */ }
-    });
+    // Optional: We can keep it in DB for audit trail, so omitting the delete!
 
     // Write RECONCILIATION entry to ap_activity_log for duplicate detection.
     // Future re-processes of this invoice+PO combo will hit checkDuplicateReconciliation().
@@ -421,10 +418,10 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
     entry.status = "rejected";
     pendingApprovals.delete(id);
 
-    // C3 FIX: Update Supabase status to "rejected" instead of deleting
+    // Update Supabase status to "rejected"
     try {
         const sb = createClient();
-        if (sb) await sb.from("pending_reconciliations").update({ status: "rejected" }).eq("approval_id", id);
+        if (sb) await sb.from("ap_pending_approvals").update({ status: "rejected", updated_at: new Date().toISOString() }).eq("id", id);
     } catch { /* non-blocking */ }
 
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
@@ -546,32 +543,45 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
  * so that they are caught on any subsequent re-processing of the same email.
  */
 async function checkDuplicateReconciliation(
-    invoiceNumber: string,
+    invoice: InvoiceData,
     orderId: string
 ): Promise<{ isDuplicate: boolean; processedAt?: string; actionTaken?: string }> {
     try {
         const supabase = createClient();
         if (!supabase) return { isDuplicate: false };
 
-        const { data, error } = await supabase
+        const invoiceDate = invoice.date ? new Date(invoice.date) : new Date();
+
+        // 1. Fuzzy Vendor Name, Exact Invoice Number
+        const vendorPattern = `%${invoice.vendorName.trim()}%`;
+        const { data: exactMatch, error: exactErr } = await supabase
             .from("ap_activity_log")
-            .select("created_at, action_taken")
+            .select("created_at, action_taken, metadata")
             .eq("intent", "RECONCILIATION")
-            .filter("metadata->>invoiceNumber", "eq", invoiceNumber)
-            .filter("metadata->>orderId", "eq", orderId)
+            .filter("metadata->>invoiceNumber", "eq", invoice.invoiceNumber)
+            .ilike("metadata->>vendorName", vendorPattern)
             .order("created_at", { ascending: false })
             .limit(1);
 
-        if (error || !data || data.length === 0) return { isDuplicate: false };
+        if (!exactErr && exactMatch && exactMatch.length > 0) {
+            const entry = exactMatch[0];
+            const metaTotal = entry.metadata?.total !== undefined ? Number(entry.metadata.total) : null;
+            
+            // Fuzzy $1 tolerance if there's a difference
+            if (metaTotal !== null && invoice.total !== null) {
+                 if (Math.abs(metaTotal - invoice.total) <= 1.0) {
+                     const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+                     return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+                 }
+            } else {
+                 const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+                 return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+            }
+        }
 
-        const entry = data[0];
-        const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", {
-            month: "2-digit",
-            day: "2-digit",
-            year: "numeric",
-        });
+        return { isDuplicate: false };
 
-        return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+
     } catch (err: any) {
         console.warn(`⚠️ Duplicate check failed, proceeding anyway: ${err.message}`);
         return { isDuplicate: false };
@@ -743,6 +753,7 @@ export interface ReconciliationResult {
     orderId: string;
     invoiceNumber: string;
     vendorName: string;
+    invoiceTotal: number | null;
     priceChanges: PriceChange[];
     feeChanges: FeeChange[];
     trackingUpdate: TrackingUpdate | null;
@@ -876,7 +887,7 @@ export async function reconcileInvoiceToPO(
     // ── Guard 0: Duplicate detection ──────────────────────────────────────────
     // Fast-fail before any Finale reads. If this invoice+PO combo was already
     // reconciled, stop cold and alert loudly — do not re-apply anything.
-    const dupeCheck = await checkDuplicateReconciliation(invoice.invoiceNumber, orderId);
+    const dupeCheck = await checkDuplicateReconciliation(invoice, orderId);
     if (dupeCheck.isDuplicate) {
         const dupeSummary =
             `🔁 DUPLICATE INVOICE: Invoice #${invoice.invoiceNumber} was already ` +
@@ -1092,6 +1103,7 @@ export async function reconcileInvoiceToPO(
         orderId,
         invoiceNumber: invoice.invoiceNumber,
         vendorName: invoice.vendorName,
+        invoiceTotal: invoice.total,
         priceChanges,
         feeChanges,
         trackingUpdate,
@@ -1960,6 +1972,7 @@ export function buildAuditMetadata(
         invoiceNumber: result.invoiceNumber,
         orderId: result.orderId,
         vendorName: result.vendorName,
+        total: result.invoiceTotal,
         verdict: result.overallVerdict,
         totalDollarImpact: result.totalDollarImpact,
         priceChanges: result.priceChanges.map(pc => ({

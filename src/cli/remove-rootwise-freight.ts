@@ -6,12 +6,9 @@ dotenv.config({ path: '.env.local' });
 async function removeAdjustments(finale: FinaleClient, poId: string, invoiceNumbers: string[]) {
     try {
         const order = await finale.getOrderDetails(poId);
-        const originalStatus = order.statusId;
-
-        // Unlock if needed
-        if (originalStatus === 'ORDER_COMMITTED' || originalStatus === 'ORDER_COMPLETED') {
-            await finale['unlockForEditing'](poId, originalStatus);
-        }
+        
+        // Unlock using the proper signature
+        const originalStatus = await (finale as any).unlockForEditing(order, poId);
 
         const originalAdj = order.orderAdjustmentList || [];
         const newAdj = originalAdj.filter((a: any) => {
@@ -25,9 +22,8 @@ async function removeAdjustments(finale: FinaleClient, poId: string, invoiceNumb
 
         if (originalAdj.length !== newAdj.length) {
             order.orderAdjustmentList = newAdj;
-            const encodedId = Buffer.from(order.orderUrl || 'purchase/order/' + poId).toString('base64');
-            
-            await finale['post'](`/${finale['accountPath']}/api/order/${encodedId}`, order);
+            const encodedId = encodeURIComponent(poId);
+            await (finale as any).post(`/${finale['accountPath']}/api/order/${encodedId}`, order);
             console.log(`Successfully updated PO ${poId}`);
         } else {
             console.log(`PO ${poId} had no matching adjustments to remove.`);
@@ -35,7 +31,7 @@ async function removeAdjustments(finale: FinaleClient, poId: string, invoiceNumb
 
         // Restore status
         if (originalStatus === 'ORDER_COMMITTED' || originalStatus === 'ORDER_COMPLETED') {
-            await finale['restoreOrderStatus'](poId, originalStatus);
+            await (finale as any).restoreOrderStatus(poId, originalStatus);
         }
     } catch (e: any) {
         console.error(`Error on PO ${poId}: ${e.message}`);

@@ -317,11 +317,11 @@ async function main() {
     const finale = new FinaleClient();
     const results: MatchResult[] = [];
 
-    console.log(`Fetching recent POs for reception correlation...`);
+    console.log(`\nFetching recent POs for reception correlation...`);
     let allPOs: any[] = [];
     try {
-        allPOs = await finale.getRecentPurchaseOrders(400);
-        console.log(`✅ Loaded ${allPOs.length} POs\n`);
+        allPOs = await finale.getRecentPurchaseOrders(400, 2000);
+        console.log(`Fetched ${allPOs.length} POs for correlation.`);
     } catch {
         console.log(`⚠️ Failed to fetch POs for correlation\n`);
     }
@@ -448,7 +448,7 @@ async function main() {
                                     if (shipment.receiveDate) {
                                         const recDate = new Date(shipment.receiveDate);
                                         const recDiff = Math.abs((delDate.getTime() - recDate.getTime()) / 86400000);
-                                        if (recDiff <= 4) return true; // Matches reception
+                                        if (recDiff <= 7) return true; // Matches reception
                                     }
                                 }
                             }
@@ -457,6 +457,21 @@ async function main() {
                             const poDate = new Date(po.orderDate);
                             const daysDiff = (delDate.getTime() - poDate.getTime()) / 86400000;
                             return daysDiff >= -3 && daysDiff <= 45;
+                        });
+
+                        // Sort vendor POs by best match (receptions within 4 days first)
+                        vendorPOs.sort((a, b) => {
+                            const aCorr = findCorrelatedReception(a, track.deliveryDate);
+                            const bCorr = findCorrelatedReception(b, track.deliveryDate);
+                            if (aCorr && !bCorr) return -1;
+                            if (!aCorr && bCorr) return 1;
+                            
+                            // fallback to closest order date
+                            const poDateA = new Date(a.orderDate);
+                            const poDateB = new Date(b.orderDate);
+                            const diffA = Math.abs(delDate.getTime() - poDateA.getTime());
+                            const diffB = Math.abs(delDate.getTime() - poDateB.getTime());
+                            return diffA - diffB;
                         });
 
                         if (vendorPOs.length === 0) {
@@ -478,13 +493,16 @@ async function main() {
                                         break;
                                     }
 
-                                    // If PO has no freight at all, it's a candidate
-                                    const hasAnyFreight = adj.some((a: any) =>
-                                        (a.description || '').toLowerCase().includes('freight')
-                                    );
+                                    // For Rootwise, enforce a correlated reception match if we are ignoring the hasAnyFreight rule
+                                    const corr = findCorrelatedReception(po, track.deliveryDate);
+                                    let isValidCandidate = !hasAnyFreight;
+                                    
+                                    if (vendorName.includes('Rootwise')) {
+                                        isValidCandidate = !!corr; 
+                                    }
 
-                                    if (!hasAnyFreight || vendorName.includes('Rootwise')) {
-                                        // Rootwise can have multiple freight entries per PO
+                                    if (isValidCandidate) {
+                                        // Found correct PO candidate
                                         result.finalePoId = po.orderId;
 
                                         if (REPORT_ONLY || DRY_RUN) {

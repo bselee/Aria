@@ -508,6 +508,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             const extracted = await extractPDF(buffer);
             const invoiceData: InvoiceData = await parseInvoice(extracted.rawText);
 
+            // 1a. Vendor Alias Resolution (Tier 2 update)
+            invoiceData.vendorName = await this.resolveVendorAlias(supabase, invoiceData.vendorName);
 
             // 1b. Vendor pattern check — consult stored handling rules before proceeding.
             // Non-blocking: if Pinecone is down, processing continues normally.
@@ -843,6 +845,26 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 });
             } catch { /* swallow */ }
         }
+    }
+
+    private async resolveVendorAlias(supabase: any, vendorName: string): Promise<string> {
+        if (!vendorName || !supabase) return vendorName;
+        try {
+            // ILIKE case-handling fallback + trim
+            const { data, error } = await supabase
+                .from("vendor_aliases")
+                .select("finale_supplier_name")
+                .ilike("alias", vendorName.trim())
+                .limit(1);
+                
+            if (!error && data && data.length > 0) {
+                console.log(`     → Vendor alias resolved: "${vendorName}" → "${data[0].finale_supplier_name}"`);
+                return data[0].finale_supplier_name;
+            }
+        } catch (err: any) {
+            console.warn(`     ⚠️ Vendor alias lookup failed: ${err.message}`);
+        }
+        return vendorName;
     }
 
     private async sendNotification(
