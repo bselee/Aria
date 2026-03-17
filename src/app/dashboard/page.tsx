@@ -40,6 +40,8 @@ import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
+import AxiomReviewQueuePanel from "@/components/dashboard/AxiomReviewQueuePanel";
+
 
 // ── Column width defaults (px) ──────────────────────────────────────
 const DEFAULT_LEFT_W = 360;
@@ -70,6 +72,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
     "purchasing": <PurchasingPanel />,
     "build-schedule": <BuildSchedulePanel />,
     "active-purchases": <ActivePurchasesPanel />,
+    "axiom-queue": <AxiomReviewQueuePanel />,
 };
 
 // ── Layout types ────────────────────────────────────────────────────
@@ -80,7 +83,7 @@ type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings"],
-    midLeft: ["invoice-queue", "active-purchases"],
+    midLeft: ["axiom-queue", "invoice-queue", "active-purchases"],
     midRight: ["reorder", "purchasing"],
     farRight: ["build-schedule"],
     right: ["activity"]

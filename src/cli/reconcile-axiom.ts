@@ -38,9 +38,9 @@ dotenv.config({ path: '.env.local' });
 import { chromium, type Page, type BrowserContext } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 

@@ -11,6 +11,7 @@
     "typecheck:cli": "node --max-old-space-size=24576 ./node_modules/typescript/bin/tsc --noEmit --project tsconfig.cli.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "reconcile:axiom": "node --import tsx src/cli/reconcile-axiom.ts",
     "typecheck:all": "npm run typecheck && npm run typecheck:cli"
   },
   "dependencies": {

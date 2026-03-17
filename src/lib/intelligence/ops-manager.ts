@@ -34,6 +34,7 @@ import { BuildParser } from "./build-parser";
 import { FinaleClient, finaleClient } from "../finale/client";
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
+import { scanAxiomDemand } from "../purchasing/axiom-scanner";
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
@@ -513,6 +514,13 @@ export class OpsManager {
         // Friday Summary @ 8:01 AM
         cron.schedule("1 8 * * 5", () => {
             this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
+        }, { timezone: "America/Denver" });
+
+        // ── AXIOM LABEL SCANNER ─────────────────────────────
+        // DECISION(2026-03-17): Runs purely autonomously to identify label demand
+        // and add them to the queue for review on the dashboard.
+        cron.schedule("15 8 * * 1-5", () => {
+            this.safeRun("AxiomDemandScan", () => this.runAxiomDemandScan());
         }, { timezone: "America/Denver" });
 
         // ── ULINE FRIDAY AUTO-ORDER ──────────────────────────
@@ -2368,5 +2376,31 @@ Data: ${JSON.stringify(data)}`;
         });
 
         console.log(`[uline-friday] ✅ Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
+    }
+
+    /**
+     * ── AXIOM DEMAND SCANNER ─────────────────────────────────
+     * Periodically scans Finale for suggested reorder quantities for Axiom labels,
+     * and queues them up in Supabase for user review on the dashboard.
+     */
+    async runAxiomDemandScan() {
+        console.log(`[ops-manager] Starting Axiom Demand Scan...`);
+        try {
+            const result = await scanAxiomDemand(finaleClient);
+            console.log(`[ops-manager] Completed Axiom Demand Scan: ${result.queuedCount} items queued/updated.`);
+
+            if (result.queuedCount > 0) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId) {
+                    await this.bot.telegram.sendMessage(
+                        chatId,
+                        `🏷️ <b>Axiom Labels Demand Scan</b>\n\nQueued/Updated ${result.queuedCount} items for reorder.\n<a href="https://buildasoil.dash.app/">Review on Dashboard</a>`,
+                        { parse_mode: 'HTML' } // Use standard dash link since Aria dashboard doesn't exist yet/used murp.app
+                    ).catch((e: any) => console.warn('[ops-manager] Axiom scan alert failed:', e.message));
+                }
+            }
+        } catch (error: any) {
+             console.error(`[ops-manager] Axiom Demand Scan error:`, error.message);
+        }
     }
 }
