@@ -56,3 +56,6 @@ tsconfig.tsbuildinfo
 .tsbuildinfo.cli
 
 tmp/
+
+.worktrees/
+worktrees/
