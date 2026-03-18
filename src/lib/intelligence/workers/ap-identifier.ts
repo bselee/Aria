@@ -143,14 +143,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             console.log(`   Found ${messages.length} email(s) in queue to identify.`);
 
             // Labels are account-scoped in Gmail — fetch and cache per source inbox
-            const labelCache: Record<string, { invoiceFwd: string; statements: string; apSeen: string }> = {};
+            const labelCache: Record<string, { invoiceFwd: string; statements: string }> = {};
             const getLabels = async (inbox: string) => {
                 if (!labelCache[inbox]) {
                     const gm = await getGmailClient(inbox);
                     labelCache[inbox] = {
                         invoiceFwd: await this.getOrCreateLabel(gm, "Invoice Forward"),
                         statements: await this.getOrCreateLabel(gm, "Statements"),
-                        apSeen: await this.getOrCreateLabel(gm, "AP-Seen"),
                     };
                 }
                 return labelCache[inbox];
@@ -239,7 +238,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             id: m.gmail_message_id,
                             requestBody: {
                                 addLabelIds: [(await getLabels(sourceInbox)).statements],
-                                removeLabelIds: ["UNREAD"]
+                                removeLabelIds: ["INBOX", "UNREAD"]
                             }
                         });
                         await this.logActivity(supabase, from, subject, "STATEMENT", "Labeled as Statement, marked read");
@@ -252,7 +251,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         await gmail.users.messages.modify({
                             userId: "me",
                             id: m.gmail_message_id,
-                            requestBody: { addLabelIds: [(await getLabels(sourceInbox)).apSeen] }
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                         });
                     } catch (e) { /* ignore */ }
                     continue;
@@ -368,7 +367,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             id: m.gmail_message_id,
                             requestBody: {
                                 addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
-                                removeLabelIds: ["UNREAD"]  // Decoupled! We mark as read IMMEDIATELY upon successful queuing
+                                removeLabelIds: ["INBOX", "UNREAD"]  // Decoupled! We mark as read IMMEDIATELY upon successful queuing
                             }
                         });
                     } catch (e) { /* ignore */ }
@@ -382,7 +381,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         await gmail.users.messages.modify({
                             userId: "me",
                             id: m.gmail_message_id,
-                            requestBody: { addLabelIds: [(await getLabels(sourceInbox)).apSeen] }
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                         });
                     } catch (e) { /* ignore */ }
                 }
@@ -410,7 +409,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         gmail: any,
         supabase: any,
         sourceInbox: string,
-        getLabels: (inbox: string) => Promise<{ invoiceFwd: string; statements: string; apSeen: string }>
+        getLabels: (inbox: string) => Promise<{ invoiceFwd: string; statements: string }>
     ): Promise<void> {
         const subject = emailRow.subject || 'No Subject';
         const from = emailRow.from_email || 'Unknown';
@@ -577,8 +576,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 userId: "me",
                 id: emailRow.gmail_message_id,
                 requestBody: {
-                    addLabelIds: [labels.apSeen],
-                    removeLabelIds: ["UNREAD"]
+                    removeLabelIds: ["INBOX", "UNREAD"]
                 }
             });
         } catch (e) { /* ignore */ }

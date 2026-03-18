@@ -320,7 +320,7 @@ async function main() {
     console.log(`\nFetching recent POs for reception correlation...`);
     let allPOs: any[] = [];
     try {
-        allPOs = await finale.getRecentPurchaseOrders(400, 2000);
+        allPOs = await finale.getRecentPurchaseOrders(400, 1000);
         console.log(`Fetched ${allPOs.length} POs for correlation.`);
     } catch {
         console.log(`⚠️ Failed to fetch POs for correlation\n`);
@@ -493,11 +493,22 @@ async function main() {
                                         break;
                                     }
 
-                                    // For Rootwise, enforce a correlated reception match if we are ignoring the hasAnyFreight rule
+                                    // If PO has no freight at all, it's a candidate
+                                    const hasAnyFreight = adj.some((a: any) =>
+                                        (a.description || '').toLowerCase().includes('freight')
+                                    );
+
+                                    // For vendors that ship multiple LTL pallets for a single PO (e.g., Rootwise, Granite Mill, Gro Kashi),
+                                    // we ignore the standard "PO has no freight" rule and STRICTLY enforce a correlated reception match.
+                                    // This prevents assigning freight to the wrong PO just because it happens to be open.
                                     const corr = findCorrelatedReception(po, track.deliveryDate);
                                     let isValidCandidate = !hasAnyFreight;
                                     
-                                    if (vendorName.includes('Rootwise')) {
+                                    const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v => 
+                                        vendorName.toLowerCase().includes(v)
+                                    );
+
+                                    if (isMultiRecVendor) {
                                         isValidCandidate = !!corr; 
                                     }
 

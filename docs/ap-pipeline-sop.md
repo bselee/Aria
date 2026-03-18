@@ -433,6 +433,50 @@ The `daily recap` (sent at 8:00 AM weekdays) summarizes all entries from the cur
 
 ---
 
+## FedEx LTL Freight Reconciliation
+
+**File:** `src/cli/reconcile-fedex.ts`
+
+To handle inbound freight tracking and assignment, the AP Agent incorporates a dedicated workflow explicitly for correlating **FedEx LTL inbound** freight invoices against the corresponding Finale Purchase Orders. Run this script approximately once a month (or as billing dictates).
+
+### 1. General Matching Strategy
+When parsing a FedEx CSV:
+1. The script groups FedEx items into **COLLECT** (BuildASoil pays) and **PREPAID** (vendor pays) categories. It only acts on COLLECT.
+2. It attempts to find an explicit PO Reference embedded in the FedEx invoice text.
+3. If no explicit PO exists, it queries the **FedEx Track API** for the tracking number to extract the `matchedVendor`, `deliveryDate`, and shipment metrics.
+4. It searches for recent Finale Purchase Orders (up to 1,000 deep) belonging to that vendor to find the best candidate.
+
+### 2. Multi-Reception Vendors (Rootwise, Granite Mill, Gro Kashi)
+Some vendors fulfill large POs by shipping multiple LTL pallets on different dates. When parsing FedEx invoices for these vendors, determining the correct PO is tricky because:
+- A single PO may have several separate deliveries (`receptions`) on completely different days.
+- A vendor might have multiple open POs concurrently.
+
+To solve this, the script uses a **7-Day Reception Proximity Map**:
+- The script bypasses the standard rule of "find the first open PO without freight."
+- Instead, it extracts the `shipments` array from the candidate Finale POs.
+- It calculates the absolute delta between the **FedEx Delivery Date** and every recorded **Finale Reception Date** (`receiveDate`) on the PO.
+- A match is ONLY considered valid if the delivery occurred within a `≤ 7 day` window of a specific shipment reception.
+
+**Supported Multi-Reception Vendors:**
+- `Rootwise` (Rootwise Soil Dynamics)
+- `Granite` (Granite Mill)
+- `Gro Kashi` / `Grokashi`
+
+### 3. Usage & Manual Overrides
+To execute the reconciliation run:
+```bash
+# Preview mode (safe - reports what it WOULD do)
+npm run reconcile:fedex -- --dry-run
+
+# Live mode (writes adjustments to Finale)
+npm run reconcile:fedex
+```
+
+If multiple POs overlap receptions on the *exact same day* (e.g. if two Rootwise POs both received a pallet on Feb 13th), the script attempts to sort the tie by whichever PO's original `orderDate` is closer.
+Should an anomaly occur (i.e. FedEx applies a freight invoice to the *other* overlapping PO), manually adjust via script (e.g. `src/cli/force-124138.ts`) or manually inside the Finale UI by relocating the "Freight" line item adjustment.
+
+---
+
 ## 🔮 Future Brilliance (The AP Roadmap)
 
 To make this system truly untouchable, the following concepts are queued for future phases:

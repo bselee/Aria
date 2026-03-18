@@ -11,6 +11,7 @@ import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 // matchInvoiceToPO kept for manual re-match flow in start-bot.ts invoice_has_po_ handler
 // but is no longer in the hot path — ap-agent queries Finale directly
 import { FinaleClient } from "../finale/client";
+import Fuse from "fuse.js";
 import PDFDocument from "pdfkit";
 import {
     reconcileInvoiceToPO,
@@ -30,7 +31,45 @@ import { upsertVendorInvoice } from "../storage/vendor-invoices";
  *          Downloads attached PDF invoices, parses data, correlates with POs,
  *          and notifies the team of discrepancies or matching statuses.
  * @author  Antigravity / Aria
+ * @updated 2026-03-18
  */
+
+// ─── Vendor Routing Rules ────────────────────────────────────────────────────
+// DECISION(2026-03-18): Deterministic routing for known vendor types.
+// Runs BEFORE LLM classification to save API calls and ensure correctness.
+// - 'autopay'  → vendor is on autopay; mark read, do NOT forward to Bill.com
+// - 'dropship' → forward to Bill.com, mark read, skip PO matching/reconciliation
+// - 'ignore'   → skip entirely (e.g., internal forwarded emails from Will's inbox)
+interface VendorRoutingRule {
+    /** Match criteria — at least one must be provided */
+    match: {
+        domain?: string;          // e.g., 'wwex.com' — matches sender email domain
+        fromExact?: string;       // e.g., 'bill.selee@buildasoil.com' — exact sender match
+        senderContains?: string;  // e.g., 'logan labs' — case-insensitive substring in From header
+    };
+    action: 'autopay' | 'dropship' | 'ignore';
+    label: string;  // Human-readable label for logging
+}
+
+const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
+    // WWEX / Worldwide Express — autopay, do NOT forward to Bill.com
+    { match: { domain: 'wwex.com' }, action: 'autopay', label: 'Worldwide Express (Autopay)' },
+
+    // Logan Labs — testing lab, treated as dropship. Forward to Bill.com, no PO matching.
+    { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
+
+    // AutoPot — dropship vendor. Forward to Bill.com, no PO matching.
+    { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
+
+    // Evergreen Growers — dropship vendor. Forward to Bill.com, no PO matching.
+    // NOTE: Bill.com has historically had trouble recognizing their PDF invoices.
+    // They also send monthly statements which should be forwarded as well.
+    { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
+
+    // Internal: bill.selee@buildasoil.com — ap@ is now the source of truth.
+    // Do not process forwarded invoices/statements from Will's personal inbox.
+    { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
+];
 export class APAgent {
     private bot: Telegraf;
     private slack: WebClient | null;
@@ -41,6 +80,25 @@ export class APAgent {
         const slackToken = process.env.SLACK_BOT_TOKEN;
         this.slack = slackToken ? new WebClient(slackToken) : null;
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
+    }
+
+    /**
+     * Match a sender against the deterministic vendor routing rules.
+     * Returns the first matching rule, or null if no rule matches.
+     */
+    private matchVendorRouting(fromHeader: string): VendorRoutingRule | null {
+        const fromLower = fromHeader.toLowerCase();
+        // Extract bare email from "Display Name <email@domain.com>" format
+        const emailMatch = fromLower.match(/<([^>]+)>/);
+        const bareEmail = emailMatch ? emailMatch[1] : fromLower.trim();
+        const domain = bareEmail.split('@')[1] || '';
+
+        for (const rule of VENDOR_ROUTING_RULES) {
+            if (rule.match.domain && domain === rule.match.domain) return rule;
+            if (rule.match.fromExact && bareEmail === rule.match.fromExact.toLowerCase()) return rule;
+            if (rule.match.senderContains && fromLower.includes(rule.match.senderContains.toLowerCase())) return rule;
+        }
+        return null;
     }
 
     private decodeBase64(data: string): string {
@@ -153,10 +211,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
-            // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent
+            // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent.
+            // Exclude bill.selee@buildasoil.com at the query level — ap@ is now the active inbox.
             const { data } = await gmail.users.messages.list({
                 userId: "me",
-                q: "is:unread in:inbox -label:AP-Seen newer_than:3d",
+                q: "is:unread in:inbox -from:bill.selee@buildasoil.com newer_than:3d",
                 maxResults: 15
             });
 
@@ -171,7 +230,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // Pre-fetch labels to optimize
             const invoiceFwdLabelId = await this.getOrCreateLabel(gmail, "Invoice Forward");
             const statementsLabelId = await this.getOrCreateLabel(gmail, "Statements");
-            const apSeenLabelId = await this.getOrCreateLabel(gmail, "AP-Seen");
 
             for (const m of messages) {
                 let msg: any;
@@ -203,6 +261,123 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                 console.log(`   Evaluating Email: "${subject}" from ${from} `);
 
+                // ── Pre-classification: Deterministic vendor routing ──────────────
+                // Known vendors are routed without burning an LLM call.
+                const routingRule = this.matchVendorRouting(from);
+                if (routingRule) {
+                    console.log(`     -> Vendor routing match: ${routingRule.label} (${routingRule.action})`);
+
+                    if (routingRule.action === 'ignore') {
+                        // Skip entirely — archive and mark read so we don't scan again
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                        });
+                        console.log(`     ⏭️ Ignored (${routingRule.label})`);
+                        continue;
+                    }
+
+                    if (routingRule.action === 'autopay') {
+                        // Autopay vendor — mark as read, do NOT forward to Bill.com
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: {
+                                removeLabelIds: ["INBOX", "UNREAD"]
+                            }
+                        });
+                        await this.logActivity(supabase, from, subject, "AUTOPAY",
+                            `${routingRule.label} — autopay vendor, marked read, no Bill.com forward`);
+                        console.log(`     ✅ Autopay: marked read, no forward`);
+                        continue;
+                    }
+
+                    if (routingRule.action === 'dropship') {
+                        // Dropship vendor — forward PDFs to Bill.com, mark read, skip PO matching
+                        let forwardedAny = false;
+                        const pdfPartsDropship: any[] = [];
+                        function walkPartsDropship(parts: any[]): void {
+                            for (const part of parts) {
+                                if (part.mimeType === "application/pdf" && part.filename) {
+                                    pdfPartsDropship.push(part);
+                                }
+                                if (part.parts?.length) walkPartsDropship(part.parts);
+                            }
+                        }
+                        walkPartsDropship(payload?.parts || []);
+
+                        for (const part of pdfPartsDropship) {
+                            if (part.body?.attachmentId) {
+                                console.log(`     📎 Downloading ${part.filename} for dropship forward...`);
+                                const attachment = await gmail.users.messages.attachments.get({
+                                    userId: "me",
+                                    messageId: m.id!,
+                                    id: part.body.attachmentId
+                                });
+                                const base64Data = attachment.data.data;
+                                if (base64Data) {
+                                    const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+                                    if (forwarded) forwardedAny = true;
+                                    console.log(`     ${forwarded ? '✅' : '❌'} Bill.com forward: ${part.filename}`);
+
+                                    // Archive into vendor_invoices (non-blocking, best-effort)
+                                    try {
+                                        await upsertVendorInvoice({
+                                            vendor_name: routingRule.label.replace(/ \(.*\)$/, ''),
+                                            invoice_number: null,
+                                            invoice_date: new Date().toISOString().split('T')[0],
+                                            po_number: null,
+                                            subtotal: 0,
+                                            freight: 0,
+                                            tax: 0,
+                                            total: 0,
+                                            status: 'received',
+                                            source: 'email_dropship',
+                                            source_ref: m.id!,
+                                        });
+                                    } catch { /* dedup or non-critical */ }
+                                }
+                            }
+                        }
+
+                        // If no PDFs found, still try to forward the email body as a generated PDF
+                        if (!forwardedAny && pdfPartsDropship.length === 0) {
+                            const emailText = this.extractEmailText(payload, snippet);
+                            if (emailText.length > 100) {
+                                console.log(`     📄 No PDF — generating fallback from email body...`);
+                                try {
+                                    const pdfBuf = await this.generatePDF(emailText, `Dropship Invoice — ${routingRule.label}`);
+                                    const pdfBase64 = pdfBuf.toString('base64');
+                                    const fakeFilename = `dropship_${routingRule.label.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.pdf`;
+                                    const forwarded = await this.forwardToBillCom(gmail, subject, fakeFilename, pdfBase64);
+                                    if (forwarded) forwardedAny = true;
+                                    console.log(`     ${forwarded ? '✅' : '❌'} Bill.com forward (generated PDF)`);
+                                } catch (genErr: any) {
+                                    console.error(`     ❌ Fallback PDF generation failed: ${genErr.message}`);
+                                }
+                            }
+                        }
+
+                        // Mark as read
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: {
+                                addLabelIds: [invoiceFwdLabelId],
+                                removeLabelIds: ["INBOX", "UNREAD"]
+                            }
+                        });
+                        const pdfNames = pdfPartsDropship.map((p: any) => p.filename).join(", ") || 'generated PDF';
+                        await this.logActivity(supabase, from, subject, "DROPSHIP",
+                            `${routingRule.label} — forwarded to Bill.com (${pdfNames}), no PO matching`,
+                            { attachments: pdfNames, dropship: true, vendor: routingRule.label });
+                        console.log(`     ✅ Dropship complete: forwarded, marked read, no PO matching`);
+                        continue;
+                    }
+                }
+
+                // ── Standard LLM classification (no vendor routing match) ─────────
                 const intent = await this.classifyEmailIntent(subject, from, snippet);
                 console.log(`     -> Classified as: ${intent} `);
 
@@ -238,7 +413,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         id: m.id!,
                         requestBody: {
                             addLabelIds: [statementsLabelId],
-                            removeLabelIds: ["UNREAD"]
+                            removeLabelIds: ["INBOX", "UNREAD"]
                         }
                     });
                     await this.logActivity(supabase, from, subject, "STATEMENT", "Labeled as Statement, marked read");
@@ -246,13 +421,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }
 
                 if (intent === "HUMAN_INTERACTION") {
-                    // We just leave it unread in the inbox so the user is forced to engage,
-                    // but we tag it with AP-Seen so the agent doesn't scan it again.
+                    // We archive it and mark it read to ensure the pipeline isn't stalled and humans are alerted appropriately
                     await gmail.users.messages.modify({
                         userId: "me",
                         id: m.id!,
                         requestBody: {
-                            addLabelIds: [apSeenLabelId]
+                            removeLabelIds: ["INBOX", "UNREAD"]
                         }
                     });
                     // Do not logActivity to avoid dashboard clutter
@@ -276,12 +450,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         }
                     } catch { /* swallow */ }
                     
-                    // Tag it so it isn't scanned again, but leave it UNREAD so humans know they have to click it
+                    // Archive and mark read, team was alerted via Telegram
                     await gmail.users.messages.modify({
                         userId: "me",
                         id: m.id!,
                         requestBody: {
-                            addLabelIds: [apSeenLabelId]
+                            removeLabelIds: ["INBOX", "UNREAD"]
                         }
                     });
                     await this.logActivity(supabase, from, subject, "PREPAYMENT", "Alerted team for manual prepayment.");
@@ -336,7 +510,28 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         if (base64Data) {
                             processedAnyPDF = true;
 
-                            // 1. Forward strictly to buildasoilap@bill.com IMMEDIATELY
+                            // 1. Upload PDF to Supabase Storage BEFORE forwarding
+                            const buffer = Buffer.from(base64Data, "base64");
+                            let pdfStoragePath: string | null = null;
+                            if (supabase) {
+                                try {
+                                    const safeFilename = m.id + "-" + part.filename!.replace(/[^a-zA-Z0-9.-]/g, "_");
+                                    const { data: uploadData, error: uploadErr } = await supabase.storage.from("vendor_invoices").upload(safeFilename, buffer, {
+                                        contentType: "application/pdf",
+                                        upsert: true
+                                    });
+                                    if (!uploadErr && uploadData) {
+                                        pdfStoragePath = uploadData.path;
+                                        console.log(`     ✅ PDF safely archived prior to Bill.com forward (${pdfStoragePath})`);
+                                    } else {
+                                        console.warn(`     ⚠️ PDF Storage upload failed:`, uploadErr?.message || 'Unknown error');
+                                    }
+                                } catch (e: any) {
+                                    console.warn(`     ⚠️ PDF Storage archival error:`, e.message);
+                                }
+                            }
+
+                            // 2. Forward strictly to buildasoilap@bill.com IMMEDIATELY
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
                             const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
                             if (!forwarded) {
@@ -344,18 +539,17 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 try {
                                     await this.bot.telegram.sendMessage(
                                         process.env.TELEGRAM_CHAT_ID || "",
-                                        `🚨 * BILL\.COM FORWARD FAILED *\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\.com\. Please forward manually\.`,
+                                        `🚨 * BILL\\.COM FORWARD FAILED *\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\\.com\\. Please forward manually\\.`,
                                         { parse_mode: "MarkdownV2" }
                                     );
                                 } catch { /* swallow — can't alert about the alert failure */ }
                             }
 
-                            // 2. Process Database & Extraction matching in the background
+                            // 3. Process Database & Extraction matching in the background
                             // We do this non-blocking so it doesn't hold up the pipeline if it fails
-                            const buffer = Buffer.from(base64Data, "base64");
                             const capturedFilename = part.filename!;
                             const capturedMessageId = m.id!;
-                            this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, false, capturedMessageId).catch(async (err) => {
+                            this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, false, capturedMessageId, pdfStoragePath).catch(async (err) => {
                                 console.error(`     ❌ Background processing failed for ${capturedFilename}:`, err);
                                 try {
                                     await this.bot.telegram.sendMessage(
@@ -386,7 +580,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         id: m.id!,
                         requestBody: {
                             addLabelIds: [invoiceFwdLabelId],
-                            removeLabelIds: ["UNREAD"]
+                            removeLabelIds: ["INBOX", "UNREAD"]
                         }
                     });
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
@@ -433,7 +627,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 id: m.id!,
                                 requestBody: {
                                     addLabelIds: [invoiceFwdLabelId],
-                                    removeLabelIds: ["UNREAD"]
+                                    removeLabelIds: ["INBOX", "UNREAD"]
                                 }
                             });
                             await this.logActivity(supabase, from, subject, "INVOICE", "Generated PDF from inline data", { attachments: filename, inline: true });
@@ -441,13 +635,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             console.error(`     ❌ Failed to process inline invoice: ${err.message}`);
                         }
                     } else {
-                        // Tag with AP-Seen but leave unread to force humans
-                        console.log(`     ⚠️ No clear inline invoice or link found. Leaving unread for human check.`);
+                        // Archive and mark read to keep inbox clean, relies on Supabase logging for tracking
+                        console.log(`     ⚠️ No clear inline invoice or link found. Archiving and marking read for exception review.`);
                         await gmail.users.messages.modify({
                             userId: "me",
                             id: m.id!,
                             requestBody: {
-                                addLabelIds: [apSeenLabelId]
+                                removeLabelIds: ["INBOX", "UNREAD"]
                             }
                         });
                         // Do not logActivity to avoid dashboard clutter
@@ -477,7 +671,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             `--${boundary}`,
             `Content-Type: text/plain; charset="UTF-8"`,
             ``,
-            `Forwarded Invoice via Aria AP Agent.`,
+            `Forwarded invoice.`,
             ``,
             `--${boundary}`,
             `Content-Type: application/pdf; name="${filename}"`,
@@ -502,7 +696,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         }
     }
 
-    public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string) {
+    public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string, pdfStoragePath: string | null = null) {
         try {
             // 1. Extract + parse
             const extracted = await extractPDF(buffer);
@@ -758,6 +952,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     status: matched ? 'received' : 'received',
                     source: 'email_attachment',
                     source_ref: messageId || `email-${from}`,
+                    pdf_storage_path: pdfStoragePath,
                     line_items: invoiceData.lineItems?.map(li => ({
                         sku: li.sku || li.description,
                         description: li.description,
@@ -850,7 +1045,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     private async resolveVendorAlias(supabase: any, vendorName: string): Promise<string> {
         if (!vendorName || !supabase) return vendorName;
         try {
-            // ILIKE case-handling fallback + trim
+            // 1. ILIKE case-handling fallback + trim
             const { data, error } = await supabase
                 .from("vendor_aliases")
                 .select("finale_supplier_name")
@@ -858,9 +1053,25 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 .limit(1);
                 
             if (!error && data && data.length > 0) {
-                console.log(`     → Vendor alias resolved: "${vendorName}" → "${data[0].finale_supplier_name}"`);
+                console.log(`     → Vendor alias resolved (exact): "${vendorName}" → "${data[0].finale_supplier_name}"`);
                 return data[0].finale_supplier_name;
             }
+
+            // 2. Fuzzy matching fallback (Fuse.js)
+            const { data: allAliases, error: allErr } = await supabase
+                .from("vendor_aliases")
+                .select("alias, finale_supplier_name");
+                
+            if (!allErr && allAliases && allAliases.length > 0) {
+                const fuse = new Fuse(allAliases, { keys: ["alias"], threshold: 0.25 });
+                const matches = fuse.search(vendorName.trim());
+                if (matches.length > 0) {
+                    const bestMatch = matches[0].item;
+                    console.log(`     → Vendor alias resolved (fuzzy): "${vendorName}" → "${bestMatch.finale_supplier_name}" (matched pattern: "${bestMatch.alias}")`);
+                    return bestMatch.finale_supplier_name;
+                }
+            }
+
         } catch (err: any) {
             console.warn(`     ⚠️ Vendor alias lookup failed: ${err.message}`);
         }
@@ -1390,6 +1601,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             BILL_FORWARD: "📤",
             RECONCILIATION: "📊",
             PROCESSING_ERROR: "⚠️",
+            AUTOPAY: "💳",
+            DROPSHIP: "📦",
         };
 
         let msg = `📊 *AP Agent Daily Recap* — ${actionableCount} email${actionableCount !== 1 ? 's' : ''} processed\n`;

@@ -2374,9 +2374,15 @@ export class FinaleClient {
     }
 
     /**
-     * Restore a PO to its original status after editing.
-     * Committed (ORDER_LOCKED) and Completed (ORDER_COMPLETED) POs are
-     * re-committed/re-completed via actionUrlComplete.
+     * Restore a PO to committed (ORDER_LOCKED) status after editing.
+     *
+     * DECISION(2026-03-18): "No reception, no complete."
+     * Uses direct statusId override (POST with statusId: "ORDER_LOCKED")
+     * instead of actionUrlComplete, which Finale auto-promotes to
+     * ORDER_COMPLETED even when zero units have been received.
+     *
+     * Direct statusId POST is reliable — tested and confirmed working.
+     * PO always ends up committed, never auto-completed by our code.
      *
      * @param orderId       - The order ID
      * @param originalStatus - The status before we unlocked for editing
@@ -2388,15 +2394,15 @@ export class FinaleClient {
 
         const afterEdits = await this.getOrderDetails(orderId);
 
-        // After unlocking, PO is in ORDER_CREATED. actionUrlComplete commits it.
-        // For formerly-completed POs, Finale auto-completes on commit.
-        if (afterEdits.statusId === "ORDER_CREATED" && afterEdits.actionUrlComplete) {
-            await this.post(afterEdits.actionUrlComplete, {});
-        } else if (afterEdits.statusId === "ORDER_LOCKED" && originalStatus === "ORDER_COMPLETED" && afterEdits.actionUrlComplete) {
-            // Edge case: committed but should be completed
-            await this.post(afterEdits.actionUrlComplete, {});
+        if (afterEdits.statusId === "ORDER_CREATED") {
+            // Direct statusId override → ORDER_LOCKED (committed).
+            // Do NOT use actionUrlComplete — Finale auto-promotes to COMPLETED.
+            await this.post(
+                `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
+                { ...afterEdits, statusId: "ORDER_LOCKED" }
+            );
         }
-        // If already in the right state, nothing to do
+        // If already ORDER_LOCKED, nothing to do.
     }
 
     /**

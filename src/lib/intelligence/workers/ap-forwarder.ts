@@ -98,7 +98,7 @@ export class APForwarderAgent {
                         `--${boundary}`,
                         `Content-Type: text/plain; charset="UTF-8"`,
                         ``,
-                        `Forwarded Invoice via Aria AP Agent.`,
+                        `Forwarded invoice.`,
                         ``,
                         `--${boundary}`,
                         `Content-Type: application/pdf; name="${item.pdf_filename}"`,

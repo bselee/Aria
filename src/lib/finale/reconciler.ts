@@ -6,7 +6,7 @@
  *          and orchestrates Finale writes (or flags for human review).
  * @author  Aria (Antigravity)
  * @created 2026-02-26
- * @updated 2026-02-26
+ * @updated 2026-03-18
  * @deps    finale/client, pdf/invoice-parser, supabase
  *
  * DECISION(2026-02-26): Price update safety guardrails:
@@ -17,6 +17,11 @@
  * 
  * These thresholds prevent catastrophic pricing errors like $2.60 → $26,000
  * which can happen from OCR misreads, decimal slips, or unit-of-measure confusion.
+ *
+ * DECISION(2026-03-18): Per-fee-type auto-approve caps.
+ *   Freight is normal cost of business — auto-approve up to $2,000.
+ *   Product pricing is where real discrepancies occur — keep those tight.
+ *   See FEE_AUTO_APPROVE_BY_TYPE in RECONCILIATION_CONFIG for full mapping.
  */
 
 import { FinaleClient } from "./client";
@@ -625,11 +630,22 @@ const RECONCILIATION_CONFIG = {
     HIGH_VALUE_THRESHOLD: 5000,
 
     /**
-     * Maximum fee/charge (freight, tariff, labor, tax) that can be auto-applied
-     * without Telegram approval. Prevents a $50,000 tariff from being silently
-     * written to Finale. The delta (invoice fee - existing PO fee) is what's measured.
+     * DECISION(2026-03-18): Per-fee-type auto-approve caps.
+     * Freight is normal cost of business ($200–$1,500 for most LTL).
+     * Product pricing is where real discrepancies occur — keep those tight.
+     * The delta (invoice fee − existing PO fee) is what's measured.
      */
-    FEE_AUTO_APPROVE_CAP_DOLLARS: 250,
+    FEE_AUTO_APPROVE_BY_TYPE: {
+        FREIGHT:      2000,   // LTL/parcel is routine. Flag only full-truckload territory.
+        SHIPPING:     500,    // Fuel surcharge — proportional to freight, smaller.
+        TAX:          1000,   // Sales tax is formulaic. Either correct or wildly off.
+        TARIFF:       250,    // Duties/tariffs are unpredictable — keep tight.
+        LABOR:        250,    // Unusual charges — always review.
+        DISCOUNT_20:  500,    // Discounts reduce the total — lower risk.
+    } as Record<string, number>,
+
+    /** Fallback cap for fee types not listed above. */
+    FEE_AUTO_APPROVE_DEFAULT: 250,
 
     /**
      * M2 FIX: Balance check gating thresholds.
@@ -648,6 +664,22 @@ const RECONCILIATION_CONFIG = {
      */
     VENDOR_FUZZY_THRESHOLD: 0.5,
 } as const;
+
+// ──────────────────────────────────────────────────
+// FEE AUTO-APPROVE HELPERS
+// ──────────────────────────────────────────────────
+
+/**
+ * Look up the auto-approve dollar cap for a given fee type.
+ * Returns the type-specific cap if configured, otherwise the default.
+ *
+ * @param feeType - One of FREIGHT, SHIPPING, TAX, TARIFF, LABOR, DISCOUNT_20
+ * @returns Dollar amount above which the fee delta requires manual approval
+ */
+function getFeeAutoApproveCap(feeType: string): number {
+    return RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_BY_TYPE[feeType]
+        ?? RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_DEFAULT;
+}
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -1592,17 +1624,18 @@ export function reconcileFees(
 
         // Only add if it's new or materially different
         if (Math.abs(invoiceAmount - existingAmount) > 0.01) {
-            // Guard 3: Fee threshold — delta above cap requires Telegram approval.
+            // Guard 3: Fee threshold — delta above per-type cap requires Telegram approval.
             // The delta (not the full fee amount) is what matters: a $300 freight
             // charge on a PO that already has $280 freight is only a $20 change.
             const feeDelta = Math.abs(invoiceAmount - existingAmount);
+            const cap = getFeeAutoApproveCap(mapping.feeType);
             const verdict: "auto_approve" | "needs_approval" =
-                feeDelta > RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS
+                feeDelta > cap
                     ? "needs_approval"
                     : "auto_approve";
             const reason = verdict === "needs_approval"
-                ? `Fee delta $${feeDelta.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS} auto-approve cap — requires approval`
-                : `Fee delta $${feeDelta.toFixed(2)} within $${RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS} auto-approve cap`;
+                ? `Fee delta $${feeDelta.toFixed(2)} exceeds $${cap} ${mapping.feeType} auto-approve cap — requires approval`
+                : `Fee delta $${feeDelta.toFixed(2)} within $${cap} ${mapping.feeType} auto-approve cap`;
 
             changes.push({
                 feeType: mapping.feeType,
@@ -1629,11 +1662,12 @@ export function reconcileFees(
 
         if (Math.abs(negatedAmount - existingAmount) > 0.01) {
             const feeDelta = Math.abs(negatedAmount - existingAmount);
+            const discountCap = getFeeAutoApproveCap('DISCOUNT_20');
             const verdict: "auto_approve" | "needs_approval" =
-                feeDelta > RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS
+                feeDelta > discountCap
                     ? "needs_approval" : "auto_approve";
             const reason = verdict === "needs_approval"
-                ? `Discount delta $${feeDelta.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS} cap — requires approval`
+                ? `Discount delta $${feeDelta.toFixed(2)} exceeds $${discountCap} DISCOUNT auto-approve cap — requires approval`
                 : `Discount $${discountAmount.toFixed(2)} applied as -$${discountAmount.toFixed(2)}`;
             changes.push({
                 feeType: "DISCOUNT_20",
@@ -1677,8 +1711,9 @@ export function reconcileFees(
 
                 if (Math.abs(derivedFreight - existingAmount) > 0.01) {
                     const feeDelta = Math.abs(derivedFreight - existingAmount);
+                    const freightCap = getFeeAutoApproveCap('FREIGHT');
                     const verdict: "auto_approve" | "needs_approval" =
-                        feeDelta > RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_CAP_DOLLARS
+                        feeDelta > freightCap
                             ? "needs_approval"
                             : "auto_approve";
                     changes.push({

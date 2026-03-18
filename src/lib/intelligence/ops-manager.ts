@@ -35,6 +35,7 @@ import { FinaleClient, finaleClient } from "../finale/client";
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
+import { runPOSweep } from "../matching/po-sweep";
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
@@ -549,6 +550,13 @@ export class OpsManager {
         // PO Sync every 30 minutes
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("POSync", () => this.syncPOConversations());
+        });
+
+        // PO-First AP Sweep (invoice reconciliation backfill) every 4 hours
+        // DECISION(2026-03-18): Provides a fallback net for invoices that couldn't be
+        // matched at ingestion time due to missing PO data or delay in Finale commitment.
+        cron.schedule("30 */4 * * *", () => {
+            this.safeRun("POSweep", () => runPOSweep(60, false));
         });
 
         // Build Completion Watcher every 30 minutes

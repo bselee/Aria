@@ -52,21 +52,9 @@ export class EmailIngestionWorker {
             const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
-            // Ensure our Aria-Ingested label exists so we don't process emails multiple times
-            // but we also don't archive them away from the human inbox prematurely.
-            const res = await gmail.users.labels.list({ userId: "me" });
-            let ingestedLabelId = res.data.labels?.find(l => l.name?.toLowerCase() === "aria-ingested")?.id;
-            if (!ingestedLabelId) {
-                const created = await gmail.users.labels.create({
-                    userId: "me",
-                    requestBody: { name: "Aria-Ingested", labelListVisibility: "labelShow", messageListVisibility: "show" }
-                });
-                ingestedLabelId = created.data.id!;
-            }
-
             const { data } = await gmail.users.messages.list({
                 userId: "me",
-                q: `is:unread in:inbox -label:Aria-Ingested newer_than:3d`,
+                q: `is:unread in:inbox newer_than:3d`,
                 maxResults
             });
 
@@ -77,7 +65,19 @@ export class EmailIngestionWorker {
 
             let insertedCount = 0;
 
-            for (const m of messages) {
+            // Pre-filter against Supabase to avoid fetching full payloads for emails we already queued
+            const messageIds = messages.map(m => m.id!);
+            const { data: existing } = await supabase
+                .from('email_inbox_queue')
+                .select('gmail_message_id')
+                .in('gmail_message_id', messageIds);
+            
+            const existingIds = new Set(existing?.map(e => e.gmail_message_id) || []);
+            const newMessages = messages.filter(m => !existingIds.has(m.id!));
+
+            if (newMessages.length === 0) return;
+
+            for (const m of newMessages) {
                 let msg: any;
                 try {
                     // Fetch full message metadata and parts
@@ -138,16 +138,8 @@ export class EmailIngestionWorker {
                     console.error(`   ❌ Failed to insert ${m.id} to queue:`, error.message);
                 } else {
                     insertedCount++;
-                    // Mark as Aria-Ingested in Gmail so we skip it next run
-                    await gmail.users.messages.modify({
-                        userId: "me",
-                        id: m.id!,
-                        requestBody: { addLabelIds: [ingestedLabelId!] }
-                    });
                 }
-            }
-
-            if (insertedCount > 0) {
+            }            if (insertedCount > 0) {
                 console.log(`✅ [EmailIngestionWorker] Ingested ${insertedCount} new emails into the queue.`);
             }
 

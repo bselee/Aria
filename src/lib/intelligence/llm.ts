@@ -3,14 +3,24 @@
  * @purpose Unified LLM entry point with automatic fallback chain.
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-03-09
+ * @updated 2026-03-18
  * @deps    @ai-sdk/google, @ai-sdk/openai, @ai-sdk/anthropic, ai, zod
  * @env     GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY
+ * @env     GEMINI_RPM_LIMIT (optional, default 500), GEMINI_RPD_LIMIT (optional, default 0 = unlimited)
  *
  * DECISION(2026-03-09): Chain is Gemini (free) → OpenRouter (cheap fallback) → paid cloud.
  * Ollama removed — it holds 1-2GB RAM resident on the local machine, causing OOM
  * for both the Aria process and general machine usability.
  * The chain auto-skips any provider without an API key configured.
+ *
+ * DECISION(2026-03-18): Added shared Gemini rate limiter to prevent quota exhaustion.
+ * All Gemini calls (text + object generation) acquire a slot before calling the API.
+ * If the rate limiter blocks (daily cap), the chain falls back to OpenRouter immediately.
+ *
+ * DECISION(2026-03-18): Llama 3.3 70B REMOVED from fallback chain — unreliable at
+ * structured JSON extraction (Zod schemas), tool calling, and invoice parsing.
+ * Replaced with curated models from models.ts: Claude Haiku 4.5, Gemini 2.0 Flash
+ * (via OpenRouter — different quota pool), and GPT-4o Mini.
  */
 
 import { google } from '@ai-sdk/google';
@@ -18,6 +28,11 @@ import { openai, createOpenAI } from '@ai-sdk/openai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { generateText, generateObject, ModelMessage } from 'ai';
 import { z } from 'zod';
+import { geminiLimiter } from './rate-limiter';
+import {
+    DIRECT_MODELS,
+    OPENROUTER_STRUCTURED_CHAIN,
+} from './models';
 
 export type LLMOptions = {
     system?: string;
@@ -34,55 +49,49 @@ type ProviderEntry = {
     available: boolean;
 };
 
-// ROLLBACK: OpenRouter is the preferred fallback after Gemini.
-// Cheaper than OpenAI/Anthropic direct, and no local RAM cost like Ollama.
+// DECISION(2026-03-18): OpenRouter fallback models loaded from centralized config.
+// All models are proven for structured JSON extraction, tool calling, and invoice analysis.
+// Llama REMOVED — replaced with Claude Haiku 4.5, Gemini Flash (OR quota), GPT-4o Mini.
 function getOpenRouterProvider(): ProviderEntry[] {
     if (!process.env.OPENROUTER_API_KEY) return [];
     const openrouter = createOpenAI({
         baseURL: 'https://openrouter.ai/api/v1',
         apiKey: process.env.OPENROUTER_API_KEY,
     });
-    return [
-        {
-            name: 'OpenRouter Claude 3.5 Haiku',
-            model: () => openrouter('anthropic/claude-3.5-haiku'),
-            available: true,
-        },
-        {
-            name: 'OpenRouter Llama 3.3 70B',
-            model: () => openrouter('meta-llama/llama-3.3-70b-instruct'),
-            available: true,
-        },
-    ];
+    return OPENROUTER_STRUCTURED_CHAIN.map(entry => ({
+        name: entry.name,
+        model: () => openrouter(entry.slug),
+        available: true,
+    }));
 }
 
-// DECISION(2026-03-09): Task-appropriate provider chain for background agent work.
+// DECISION(2026-03-18): Task-appropriate provider chain for background agent work.
 //
 // The chain is designed with cost + resource awareness:
 //   1. Gemini (free tier, fast, reliable) — handles the majority of background calls
 //   2. OpenRouter (cheap) — activates when Gemini is down or quota-exhausted.
-//      Provides Claude 3.5 Haiku and Llama 3.3 70B at low per-token cost.
+//      Provides Claude Haiku 4.5, Gemini Flash (OR quota), GPT-4o Mini.
+//      ALL models proven for structured JSON, tool calling, and invoice analysis.
 //   3. OpenAI / Anthropic (paid, direct) — last-resort escalation.
 //
-// Ollama removed (2026-03-09): held 1-2GB RAM resident, crushing the local machine.
-// Bot chat uses Gemini directly (hardcoded in start-bot.ts), bypassing this chain.
-// Chain: Gemini (free) → OpenRouter (cheap) → OpenAI → Anthropic
+// Llama 3.3 70B REMOVED (2026-03-18): unreliable at Zod schemas and tool calling.
+// Chain: Gemini (free) → OpenRouter (cheap, curated) → OpenAI → Anthropic
 function getProviderChain(): ProviderEntry[] {
     return [
         {
-            name: 'Gemini 2.0 Flash',
-            model: () => google('gemini-2.0-flash'),
+            name: 'Gemini 2.5 Flash',
+            model: () => google(DIRECT_MODELS.geminiFlash),
             available: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
         },
-        ...getOpenRouterProvider(),  // Cheap fallback — slots in right after Gemini
+        ...getOpenRouterProvider(),  // Cheap fallback — curated models from models.ts
         {
             name: 'OpenAI GPT-4o',
-            model: () => openai.chat('gpt-4o'),
+            model: () => openai.chat(DIRECT_MODELS.gpt4o),
             available: !!process.env.OPENAI_API_KEY,
         },
         {
             name: 'Anthropic Claude Sonnet 4.6',
-            model: () => anthropic('claude-sonnet-4-6'),
+            model: () => anthropic(DIRECT_MODELS.claudeSonnet),
             available: !!process.env.ANTHROPIC_API_KEY,
         },
     ].filter(p => p.available);
@@ -115,6 +124,7 @@ function markProviderDead(name: string, reason: string) {
  */
 export function getProviderStatus(): Array<{ name: string; status: 'healthy' | 'dead'; detail: string }> {
     const chain = getProviderChain();
+    const limiterStatus = geminiLimiter.getStatus();
     return chain.map(p => {
         const deadUntil = deadProviders.get(p.name);
         if (deadUntil && Date.now() < deadUntil) {
@@ -124,6 +134,14 @@ export function getProviderStatus(): Array<{ name: string; status: 'healthy' | '
                 name: p.name,
                 status: 'dead' as const,
                 detail: `circuit broken (${remainingMin}m remaining)`,
+            };
+        }
+        // Enrich Gemini entry with rate limiter stats
+        if (p.name.toLowerCase().includes('gemini')) {
+            return {
+                name: p.name,
+                status: 'healthy' as const,
+                detail: `ready (${limiterStatus.rpm}/${limiterStatus.maxRpm} RPM, ${limiterStatus.rpd}/${limiterStatus.maxRpd} RPD, ${limiterStatus.queueDepth} queued)`,
             };
         }
         return {
@@ -157,6 +175,10 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
 
 
         try {
+            // DECISION(2026-03-18): Rate-limit Gemini calls to stay within quota
+            if (provider.name.toLowerCase().includes('gemini')) {
+                await geminiLimiter.acquire();
+            }
             const { text } = await generateText({
                 model: provider.model(),
                 system: options.system,
@@ -209,6 +231,10 @@ export async function unifiedObjectGeneration<T>(
 
 
         try {
+            // DECISION(2026-03-18): Rate-limit Gemini calls to stay within quota
+            if (provider.name.toLowerCase().includes('gemini')) {
+                await geminiLimiter.acquire();
+            }
             const { object } = await (generateObject({
                 model: provider.model(),
                 schema: options.schema,

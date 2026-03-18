@@ -1,12 +1,26 @@
-import { findCorrelatedReception } from '../cli/reconcile-fedex';
 import { FinaleClient } from '../lib/finale/client';
 import * as dotenv from 'dotenv';
-
 dotenv.config({ path: '.env.local' });
+
+export function findCorrelatedReception(po: any, deliveryDateStr: string): string | null {
+    if (!po.shipments || po.shipments.length === 0) return null;
+
+    const dDate = new Date(deliveryDateStr);
+    for (const [index, shipment] of po.shipments.entries()) {
+        const recDate = shipment.receiveDate ? new Date(shipment.receiveDate) : null;
+        if (recDate) {
+            const diff = Math.abs((dDate.getTime() - recDate.getTime()) / 86400000);
+            if (diff <= 7) {
+                return `Rec ${po.orderId}-${index + 1} on ${recDate.toLocaleDateString()}`;
+            }
+        }
+    }
+    return null;
+}
 
 async function main() {
     const finale = new FinaleClient();
-    const pos = await finale.getRecentPurchaseOrders(400, 2000);
+    const pos = await finale.getRecentPurchaseOrders(400, 1000);
     const po124138 = pos.find(p => p.orderId === '124138');
     
     if (!po124138) {

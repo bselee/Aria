@@ -3,7 +3,7 @@
  * @purpose Dashboard chat API — Gemini primary, OpenRouter fallback, with full tool calling
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-03-09
+ * @updated 2026-03-18
  * @deps    ai, @ai-sdk/google, @ai-sdk/openai, zod, @/config/persona
  * @env     GOOGLE_GENERATIVE_AI_API_KEY, OPENROUTER_API_KEY, PERPLEXITY_API_KEY
  *
@@ -12,7 +12,10 @@
  * with `tool()` handles automatic tool calling loops via `stopWhen: stepCountIs()`,
  * so we no longer need the manual tool loop.
  *
- * Provider chain: Gemini 2.5 Flash → OpenRouter (Claude 3.5 Haiku) → error
+ * DECISION(2026-03-18): Llama 3.3 70B REMOVED from fallback chain — unreliable at
+ * tool calling and structured output. Replaced with curated models from models.ts.
+ *
+ * Provider chain: Gemini 2.5 Flash → OpenRouter (Claude Haiku 4.5 / Gemini Flash / GPT-4o Mini) → error
  */
 
 import { NextResponse } from 'next/server';
@@ -21,6 +24,11 @@ import { google } from '@ai-sdk/google';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
 import { SYSTEM_PROMPT } from '@/config/persona';
+import { geminiLimiter } from '@/lib/intelligence/rate-limiter';
+import {
+    DIRECT_MODELS,
+    OPENROUTER_CHAT_CHAIN,
+} from '@/lib/intelligence/models';
 
 const RUNTIME_RULES = `
 
@@ -242,16 +250,15 @@ const dashboardTools = {
     }),
 };
 
-// ── Provider chain: Gemini → OpenRouter → error ────────────────────────
-// DECISION(2026-03-09): Build the model lazily so env vars are read at request time.
-// Each entry returns a model compatible with AI SDK's generateText.
+// ── Provider chain: Gemini → OpenRouter (curated) → error ──────────────
+// DECISION(2026-03-18): Llama REMOVED. All fallback models from centralized models.ts.
 function getModelChain(): Array<{ name: string; model: () => ReturnType<typeof google> }> {
     const chain: Array<{ name: string; model: () => any }> = [];
 
     if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
         chain.push({
             name: 'Gemini 2.5 Flash',
-            model: () => google('gemini-2.5-flash'),
+            model: () => google(DIRECT_MODELS.gemini25Flash),
         });
     }
 
@@ -263,14 +270,12 @@ function getModelChain(): Array<{ name: string; model: () => ReturnType<typeof g
             baseURL: 'https://openrouter.ai/api/v1',
             apiKey: process.env.OPENROUTER_API_KEY,
         });
-        chain.push({
-            name: 'OpenRouter Claude 3.5 Haiku',
-            model: () => openrouter('anthropic/claude-3.5-haiku'),
-        });
-        chain.push({
-            name: 'OpenRouter Llama 3.3 70B',
-            model: () => openrouter('meta-llama/llama-3.3-70b-instruct'),
-        });
+        for (const entry of OPENROUTER_CHAT_CHAIN) {
+            chain.push({
+                name: entry.name,
+                model: () => openrouter(entry.slug),
+            });
+        }
     }
 
     return chain;
@@ -331,6 +336,10 @@ export async function POST(req: Request) {
 
         for (const provider of chain) {
             try {
+                // DECISION(2026-03-18): Rate-limit Gemini calls to prevent quota exhaustion
+                if (provider.name.toLowerCase().includes('gemini')) {
+                    await geminiLimiter.acquire();
+                }
                 // DECISION(2026-03-09): Using stopWhen: stepCountIs(5) — maxSteps was
                 // completely removed in AI SDK v6 and silently ignored.
                 const result = await generateText({

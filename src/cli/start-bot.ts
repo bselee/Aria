@@ -1,14 +1,16 @@
 /**
  * @file    start-bot.ts
  * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
- *          Gemini (primary chat), and Vercel AI SDK tool calling.
+ *          Gemini (primary chat) with automatic OpenRouter fallback, and
+ *          Vercel AI SDK tool calling.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-03-06
+ * @updated 2026-03-18
  *
- * DECISION(2026-03-06): Replaced OpenRouter (paid) with Gemini (free) for chat.
- * Tools now use Vercel AI SDK tool() format with co-located execute() functions.
- * OpenRouter can be re-enabled by setting OPENROUTER_API_KEY in llm.ts chain.
+ * DECISION(2026-03-18): Chat now uses a full provider chain with tool support:
+ *   Gemini Flash → OpenRouter Claude Haiku 4.5 → OpenRouter Gemini Flash →
+ *   OpenRouter GPT-4o Mini → unifiedTextGeneration (last resort, no tools).
+ * Previously Gemini was called directly and failures lost tool calling entirely.
  */
 
 import * as dotenv from 'dotenv';
@@ -19,6 +21,7 @@ import { Telegraf } from 'telegraf';
 import axios from 'axios';
 import OpenAI from 'openai';
 import { google as googleAI } from '@ai-sdk/google';
+import { createOpenAI } from '@ai-sdk/openai';
 import { generateText, stepCountIs } from 'ai';
 import { getAriaTools } from './aria-tools';
 import {
@@ -28,11 +31,11 @@ import {
 } from '../config/persona';
 import { OpsManager } from '../lib/intelligence/ops-manager';
 import { getProviderStatus } from '../lib/intelligence/llm';
+import { geminiLimiter } from '../lib/intelligence/rate-limiter';
+import { DIRECT_MODELS, OPENROUTER_CHAT_CHAIN } from '../lib/intelligence/models';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
-// DECISION(2026-03-06): unifiedTextGeneration kept as fallback if Gemini fails on chat.
-// Primary chat now uses generateText with google('gemini-2.0-flash') directly.
 import { FinaleClient } from '../lib/finale/client';
 import { SlackWatchdog } from '../lib/slack/watchdog';
 import { APAgent } from '../lib/intelligence/ap-agent';
@@ -1434,6 +1437,94 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
 // SHARED LLM PROCESSING — Telegram handler + Dashboard HTTP bridge
 // ──────────────────────────────────────────────────
 
+// DECISION(2026-03-18): Unified chat provider chain with full tool calling at every tier.
+// Previously, Gemini was called directly and on failure fell back to unifiedTextGeneration
+// which lost tool calling entirely. Now every provider in the chain supports tools.
+//
+// Chain: Gemini Flash (direct, rate-limited) → OpenRouter (Claude Haiku 4.5 → Gemini Flash → GPT-4o Mini) → plain text (no tools, last resort)
+type ChatFallbackResult = {
+    reply: string;
+    steps: any[];
+    providerUsed: string;
+};
+
+async function generateChatWithFallback(options: {
+    system: string;
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+    tools: any;
+}): Promise<ChatFallbackResult> {
+    // Build the provider chain — Gemini direct first, then OpenRouter models
+    const providers: Array<{ name: string; model: () => any; isGeminiDirect?: boolean }> = [];
+
+    // 1. Gemini direct (via native SDK, rate-limited)
+    if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+        providers.push({
+            name: 'Gemini 2.0 Flash',
+            model: () => googleAI(DIRECT_MODELS.geminiFlash),
+            isGeminiDirect: true,
+        });
+    }
+
+    // 2. OpenRouter fallback chain — curated models from centralized config
+    if (process.env.OPENROUTER_API_KEY) {
+        const openrouter = createOpenAI({
+            baseURL: 'https://openrouter.ai/api/v1',
+            apiKey: process.env.OPENROUTER_API_KEY,
+        });
+        for (const entry of OPENROUTER_CHAT_CHAIN) {
+            providers.push({
+                name: entry.name,
+                model: () => openrouter(entry.slug),
+            });
+        }
+    }
+
+    // Try each provider in order — all support tool calling
+    let lastError: Error | null = null;
+    for (const provider of providers) {
+        try {
+            // Rate-limit Gemini direct calls
+            if (provider.isGeminiDirect) {
+                await geminiLimiter.acquire();
+            }
+
+            const result = await generateText({
+                model: provider.model(),
+                system: options.system,
+                messages: options.messages,
+                tools: options.tools,
+                stopWhen: stepCountIs(5),
+                maxRetries: 0,
+            });
+
+            const reply = result.text || '';
+            console.log(`🤖 Chat via ${provider.name}: ${result.steps?.length || 1} step(s), ${reply.length} chars`);
+
+            return {
+                reply,
+                steps: result.steps || [],
+                providerUsed: provider.name,
+            };
+        } catch (err: any) {
+            lastError = err;
+            console.warn(`⚠️ ${provider.name} failed: ${err.message}. Trying next provider...`);
+        }
+    }
+
+    // Last resort: unifiedTextGeneration (no tools, but at least responds)
+    console.warn(`⚠️ All chat providers failed. Falling back to unifiedTextGeneration (no tools).`);
+    try {
+        const reply = await unifiedTextGeneration({
+            system: options.system,
+            messages: options.messages as any,
+        });
+        return { reply, steps: [], providerUsed: 'unifiedTextGeneration (no tools)' };
+    } catch (finalErr: any) {
+        // If even this fails, throw the original error
+        throw lastError || finalErr;
+    }
+}
+
 async function processTextMessage(text: string, chatId: number): Promise<string> {
     if (!chatHistory[chatId]) chatHistory[chatId] = [];
     chatLastActive[chatId] = Date.now();
@@ -1506,61 +1597,47 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     let reply = "";
 
-    try {
-        // DECISION(2026-03-06): Use Gemini via Vercel AI SDK with shared Aria tools.
-        // generateText handles the full tool call loop automatically via stopWhen.
-        // Previously used OpenRouter → openai.chat.completions.create with manual tool loop.
-        const tools = getAriaTools({ finale, perplexity, bot, chatId });
-        const conversationMessages = chatHistory[chatId]
-            .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-            .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    // DECISION(2026-03-18): Full provider chain with tool calling fallback.
+    // Gemini → OpenRouter (Claude Haiku 4.5 → Gemini Flash → GPT-4o Mini) → plain text fallback.
+    const tools = getAriaTools({ finale, perplexity, bot, chatId });
+    const conversationMessages = chatHistory[chatId]
+        .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+        .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    const systemPrompt = SYSTEM_PROMPT + memoryContext + runtimeRules;
 
-        const { text: geminiReply, steps } = await generateText({
-            model: googleAI('gemini-2.0-flash'),
-            system: SYSTEM_PROMPT + memoryContext + runtimeRules,
-            messages: conversationMessages,
-            tools,
-            stopWhen: stepCountIs(5),
-        });
-        reply = geminiReply;
-        chatHistory[chatId].push({ role: 'assistant', content: reply });
+    const { reply: chatReply, steps, providerUsed } = await generateChatWithFallback({
+        system: systemPrompt,
+        messages: conversationMessages,
+        tools,
+    });
+    reply = chatReply;
+    chatHistory[chatId].push({ role: 'assistant', content: reply });
 
-        // Auto-learn: store tool usage patterns in memory (fire-and-forget)
-        const toolsUsed = steps
-            .flatMap(s => s.toolCalls || [])
-            .map((tc: any) => tc.toolName);
-        if (toolsUsed.length > 0) {
-            setImmediate(async () => {
-                try {
-                    const { remember } = await import('../lib/intelligence/memory');
-                    const firstTool = toolsUsed[0];
-                    const category =
-                        firstTool.includes('vendor') ? 'vendor_pattern' :
-                            firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
-                                firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
-                                    'conversation';
-                    const tagMatches = (text + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
-                    const tags = [...new Set(tagMatches)].slice(0, 5);
-                    await remember({
-                        category,
-                        content: `Q: "${text.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
-                        tags,
-                        source: 'telegram_auto',
-                        priority: 'low',
-                    });
-                } catch { /* non-critical, never block the response */ }
-            });
-        }
-    } catch (geminiErr: any) {
-        // Fallback: if Gemini fails, use the unified chain (which includes Ollama)
-        console.warn(`⚠️ Gemini chat failed: ${geminiErr.message}. Falling back to unified chain.`);
-        reply = await unifiedTextGeneration({
-            system: SYSTEM_PROMPT + memoryContext + runtimeRules,
-            messages: chatHistory[chatId]
-                .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-                .map((m: any) => ({ role: m.role, content: m.content })) as any,
+    // Auto-learn: store tool usage patterns in memory (fire-and-forget)
+    const toolsUsed = steps
+        .flatMap(s => s.toolCalls || [])
+        .map((tc: any) => tc.toolName);
+    if (toolsUsed.length > 0) {
+        setImmediate(async () => {
+            try {
+                const { remember } = await import('../lib/intelligence/memory');
+                const firstTool = toolsUsed[0];
+                const category =
+                    firstTool.includes('vendor') ? 'vendor_pattern' :
+                        firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
+                            firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
+                                'conversation';
+                const tagMatches = (text + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                const tags = [...new Set(tagMatches)].slice(0, 5);
+                await remember({
+                    category,
+                    content: `Q: "${text.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
+                    tags,
+                    source: 'telegram_auto',
+                    priority: 'low',
+                });
+            } catch { /* non-critical, never block the response */ }
         });
-        chatHistory[chatId].push({ role: 'assistant', content: reply });
     }
 
     return reply;
@@ -1735,59 +1812,46 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
         let reply = "";
 
-        try {
-            // DECISION(2026-03-06): Same Gemini + tools pattern as processTextMessage.
-            const tools = getAriaTools({ finale, perplexity, bot, chatId });
-            const conversationMessages = chatHistory[chatId]
-                .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-                .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+        // DECISION(2026-03-18): Full provider chain with tool calling fallback.
+        const tools = getAriaTools({ finale, perplexity, bot, chatId });
+        const conversationMessages = chatHistory[chatId]
+            .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+            .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+        const systemPrompt = SYSTEM_PROMPT + memoryContext + runtimeRules;
 
-            const { text: geminiReply, steps } = await generateText({
-                model: googleAI('gemini-2.0-flash'),
-                system: SYSTEM_PROMPT + memoryContext + runtimeRules,
-                messages: conversationMessages,
-                tools,
-                stopWhen: stepCountIs(5),
-            });
-            reply = geminiReply;
-            chatHistory[chatId].push({ role: 'assistant', content: reply });
+        const { reply: chatReply, steps, providerUsed } = await generateChatWithFallback({
+            system: systemPrompt,
+            messages: conversationMessages,
+            tools,
+        });
+        reply = chatReply;
+        chatHistory[chatId].push({ role: 'assistant', content: reply });
 
-            // Auto-learn: store tool usage patterns in memory (fire-and-forget)
-            const toolsUsed = steps
-                .flatMap(s => s.toolCalls || [])
-                .map((tc: any) => tc.toolName);
-            if (toolsUsed.length > 0) {
-                setImmediate(async () => {
-                    try {
-                        const { remember } = await import('../lib/intelligence/memory');
-                        const firstTool = toolsUsed[0];
-                        const category =
-                            firstTool.includes('vendor') ? 'vendor_pattern' :
-                                firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
-                                    firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
-                                        'conversation';
-                        const tagMatches = (userText + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
-                        const tags = [...new Set(tagMatches)].slice(0, 5);
-                        await remember({
-                            category,
-                            content: `Q: "${userText.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
-                            tags,
-                            source: 'telegram_auto',
-                            priority: 'low',
-                        });
-                    } catch { /* non-critical, never block the response */ }
-                });
-            }
-        } catch (geminiErr: any) {
-            // Fallback: if Gemini fails, use the unified chain (which includes Ollama)
-            console.warn(`⚠️ Gemini chat failed: ${geminiErr.message}. Falling back to unified chain.`);
-            reply = await unifiedTextGeneration({
-                system: SYSTEM_PROMPT + memoryContext + runtimeRules,
-                messages: chatHistory[chatId]
-                    .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-                    .map((m: any) => ({ role: m.role, content: m.content })) as any,
+        // Auto-learn: store tool usage patterns in memory (fire-and-forget)
+        const toolsUsed = steps
+            .flatMap(s => s.toolCalls || [])
+            .map((tc: any) => tc.toolName);
+        if (toolsUsed.length > 0) {
+            setImmediate(async () => {
+                try {
+                    const { remember } = await import('../lib/intelligence/memory');
+                    const firstTool = toolsUsed[0];
+                    const category =
+                        firstTool.includes('vendor') ? 'vendor_pattern' :
+                            firstTool.includes('product') || firstTool.includes('sku') || firstTool.includes('consumption') || firstTool.includes('purchase') ? 'product_note' :
+                                firstTool.includes('invoice') || firstTool.includes('purchase_order') ? 'process' :
+                                    'conversation';
+                    const tagMatches = (userText + ' ' + reply).match(/\b([A-Z][A-Z0-9-]{2,15})\b/g) || [];
+                    const tags = [...new Set(tagMatches)].slice(0, 5);
+                    await remember({
+                        category,
+                        content: `Q: "${userText.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
+                        tags,
+                        source: 'telegram_auto',
+                        priority: 'low',
+                    });
+                } catch { /* non-critical, never block the response */ }
             });
-            chatHistory[chatId].push({ role: 'assistant', content: reply });
         }
 
         // Mirror to dashboard (fire-and-forget)

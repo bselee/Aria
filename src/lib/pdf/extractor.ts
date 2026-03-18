@@ -1,12 +1,22 @@
 /**
  * @file    extractor.ts
  * @purpose Handles PDF text extraction with support for text-based and scanned PDFs.
+ * @updated 2026-03-18
  * @deps    pdf-parse, pdfjs-dist, anthropic-sdk
+ *
+ * DECISION(2026-03-18): Strategy C now uses OpenRouter's native `models` array
+ * for automatic failover across Claude Haiku 4.5 / Gemini Flash / GPT-4o Mini
+ * in a single HTTP call. Provider restricted to anthropic/google/openai only.
  */
 
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
 import { getAnthropicClient } from "../anthropic";
+import {
+    OPENROUTER_MODELS,
+    OPENROUTER_VISION_MODELS_ARRAY,
+    OPENROUTER_PROVIDER_OPTS,
+} from "../intelligence/models";
 
 export interface PDFExtractionResult {
     rawText: string;
@@ -93,8 +103,10 @@ const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. 
 
 /**
  * For scanned/image PDFs — passes the raw PDF bytes to an LLM with native PDF support.
- * Strategy order: Anthropic (A) → OpenAI Files API (B) → OpenRouter (C) → Gemini direct (D, last resort).
- * Gemini direct is last because the free-tier quota is 0 — it will always fail unless on a paid plan.
+ * Strategy order: Anthropic (A) → OpenAI Files API (B) → OpenRouter models array (C) → Gemini direct (D).
+ * Strategy C uses OpenRouter's native `models` array for automatic failover across
+ * Claude Haiku 4.5, Gemini Flash, and GPT-4o Mini in a single HTTP call.
+ * Gemini direct is last because the free-tier quota may be limited.
  */
 async function extractScannedPDF(
     buffer: Buffer,
@@ -217,12 +229,15 @@ async function extractScannedPDF(
         }
     }
 
-    // Strategy C: OpenRouter — Gemini 2.5 Flash Lite via OpenAI-compatible endpoint
-    // Uses chat completions + image_url with PDF data URI (Gemini supports application/pdf)
+    // Strategy C: OpenRouter — curated model fallback via `models` array.
+    // Uses Claude Haiku 4.5 as primary with automatic failover to Gemini Flash and GPT-4o Mini.
+    // Provider restricted to anthropic/google/openai only (no random providers).
+    // DECISION(2026-03-18): Replaced single Gemini 2.5 Flash Lite call with `models` array
+    // for OpenRouter-native failover across all 3 trusted providers in one HTTP call.
     console.log(`[extractor] Strategy C — extractedText empty: ${!extractedText}, OpenRouter key: ${process.env.OPENROUTER_API_KEY ? "SET" : "MISSING"}`);
     if (!extractedText && process.env.OPENROUTER_API_KEY) {
         try {
-            console.log("[extractor] Calling OpenRouter (Gemini 2.0 Flash)...");
+            console.log(`[extractor] Calling OpenRouter (models: ${OPENROUTER_VISION_MODELS_ARRAY.join(', ')})...`);
             const controller = new AbortController();
             const timeoutId = setTimeout(() => {
                 console.warn("[extractor] OpenRouter fetch timed out after 60s — aborting");
@@ -236,10 +251,12 @@ async function extractScannedPDF(
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
                         "HTTP-Referer": "https://aria.buildasoil.com",
-                        "X-Title": "Aria AP Agent",
+                        "X-Title": "BuildASoil AP",
                     },
                     body: JSON.stringify({
-                        model: "google/gemini-2.5-flash-lite",
+                        model: OPENROUTER_MODELS.claudeHaiku,
+                        models: [...OPENROUTER_VISION_MODELS_ARRAY],
+                        provider: OPENROUTER_PROVIDER_OPTS,
                         messages: [{
                             role: "user",
                             content: [
@@ -256,8 +273,9 @@ async function extractScannedPDF(
                 const orData = await orRes.json() as any;
                 if (orData.error) throw new Error(JSON.stringify(orData.error));
                 extractedText = orData.choices?.[0]?.message?.content || "";
-                if (extractedText) successStrategy = "openrouter";
-                console.log(`[extractor] Strategy C result — ${extractedText.length} chars`);
+                const usedModel = orData.model || 'unknown';
+                if (extractedText) successStrategy = `openrouter (${usedModel})`;
+                console.log(`[extractor] Strategy C result — ${extractedText.length} chars, model: ${usedModel}`);
             } finally {
                 clearTimeout(timeoutId);
             }
@@ -272,7 +290,7 @@ async function extractScannedPDF(
     if (!extractedText && process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
         try {
             const geminiRes = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
                 {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
