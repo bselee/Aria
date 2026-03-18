@@ -279,8 +279,8 @@ describe("reconcileFees", () => {
     });
 
     it("should flag large fee deltas as needs_approval", () => {
-        // Freight of $500 exceeds $250 auto-approve cap
-        const invoice = makeInvoice({ freight: 500 });
+        // Freight of $2500 exceeds $2000 auto-approve cap
+        const invoice = makeInvoice({ freight: 2500 });
         const po = makePO([]);
         const changes = reconcileFees(invoice, po);
         const freightChange = changes.find(c => c.feeType === "FREIGHT");
