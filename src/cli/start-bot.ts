@@ -29,7 +29,7 @@ import {
     VOICE_CONFIG,
     TELEGRAM_CONFIG
 } from '../config/persona';
-import { OpsManager } from '../lib/intelligence/ops-manager';
+import { OpsManager, cronLastRun } from '../lib/intelligence/ops-manager';
 import { getProviderStatus } from '../lib/intelligence/llm';
 import { geminiLimiter } from '../lib/intelligence/rate-limiter';
 import { DIRECT_MODELS, OPENROUTER_CHAT_CHAIN } from '../lib/intelligence/models';
@@ -891,6 +891,46 @@ bot.command('housekeeping', async (ctx) => {
     } catch (err: any) {
         await ctx.reply(`❌ Housekeeping failed: ${err.message}`);
     }
+});
+
+// /crons — Show status of all scheduled cron tasks
+// DECISION(2026-03-18): On-demand visibility into the cron scheduler.
+// Shows last-run time, duration, and status for every registered task.
+bot.command('crons', async (ctx) => {
+    ctx.sendChatAction('typing');
+
+    if (cronLastRun.size === 0) {
+        await ctx.reply('⏳ No cron tasks have run since last restart.\n\n_Try again after a few minutes._', { parse_mode: 'Markdown' });
+        return;
+    }
+
+    // Sort by most recent run first
+    const entries = [...cronLastRun.entries()].sort(
+        (a, b) => b[1].lastRun.getTime() - a[1].lastRun.getTime()
+    );
+
+    let msg = `⏰ <b>Cron Status</b> (${entries.length} tasks since restart)\n\n`;
+
+    for (const [name, info] of entries) {
+        const icon = info.status === 'success' ? '✅' : '❌';
+        const ago = Math.round((Date.now() - info.lastRun.getTime()) / 60000);
+        const agoStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+        const durStr = info.durationMs < 1000
+            ? `${info.durationMs}ms`
+            : `${(info.durationMs / 1000).toFixed(1)}s`;
+
+        msg += `${icon} <b>${name}</b>\n`;
+        msg += `    ${agoStr} · ${durStr}`;
+        if (info.error) msg += ` · <i>${info.error.slice(0, 60)}</i>`;
+        msg += '\n';
+    }
+
+    // Telegram message limit is 4096 chars
+    if (msg.length > 4000) {
+        msg = msg.slice(0, 3990) + '\n\n<i>...truncated</i>';
+    }
+
+    await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 // ──────────────────────────────────────────────────

@@ -6,7 +6,7 @@
  *          Posts completed build notifications to the MFG Google Calendar.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-03-04
+ * @updated 2026-03-18
  * @deps    googleapis, node-cron, telegraf, @slack/web-api, builds/build-risk
  */
 
@@ -36,6 +36,17 @@ import FirecrawlApp from "@mendable/firecrawl-js";
 import { generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
 import { runPOSweep } from "../matching/po-sweep";
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as fs from "fs";
+import * as path from "path";
+
+const execAsync = promisify(exec);
+
+// DECISION(2026-03-18): 5-minute timeout for vendor reconciliation child processes.
+// Prevents hung Playwright browsers or network stalls from running indefinitely.
+const RECONCILE_TIMEOUT_MS = 5 * 60 * 1000;
+const RECONCILE_MAX_BUFFER = 10 * 1024 * 1024; // 10MB stdout cap
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
@@ -380,6 +391,12 @@ function buildFollowUpEmail(opts: {
 /**
  * Main Operations Manager Class
  */
+// DECISION(2026-03-18): Lightweight cron registry tracks last-run times and status
+// for every scheduled task. Exposed via getCronStatus() for the /crons command.
+const cronLastRun = new Map<string, { lastRun: Date; durationMs: number; status: 'success' | 'error'; error?: string }>();
+
+export { cronLastRun };
+
 export class OpsManager {
     private bot: Telegraf;
     private slack: WebClient | null;
@@ -429,14 +446,66 @@ export class OpsManager {
     }
 
     /**
-     * Safely executes a scheduled task, catching unhandled errors and handing them off 
-     * to the Supervisor exception queue instead of crashing silently or blindly alerting.
+     * Safely executes a scheduled task with duration tracking, DB audit logging,
+     * and crash escalation. Every run is recorded to cron_runs for observability.
+     *
+     * DECISION(2026-03-18): Enhanced from bare try/catch to include:
+     * - performance.now() duration tracking
+     * - In-memory cronLastRun registry for /crons command
+     * - Supabase cron_runs table audit trail
+     * - Supervisor exception queue on failure
      */
     private async safeRun(taskName: string, task: () => Promise<any> | any) {
+        const startTime = performance.now();
+        let cronRunId: number | null = null;
+
+        // Record start in cron_runs (fire-and-forget — don't block the task)
+        try {
+            const supabase = createClient();
+            const { data } = await supabase.from('cron_runs').insert({
+                task_name: taskName,
+                status: 'running',
+            }).select('id').single();
+            cronRunId = data?.id ?? null;
+        } catch { /* non-critical */ }
+
         try {
             await task();
+
+            // Record success
+            const durationMs = Math.round(performance.now() - startTime);
+            cronLastRun.set(taskName, { lastRun: new Date(), durationMs, status: 'success' });
+
+            // Update cron_runs with success
+            if (cronRunId) {
+                try {
+                    const supabase = createClient();
+                    await supabase.from('cron_runs').update({
+                        finished_at: new Date().toISOString(),
+                        duration_ms: durationMs,
+                        status: 'success',
+                    }).eq('id', cronRunId);
+                } catch { /* non-critical */ }
+            }
         } catch (error: any) {
-            console.error(`🚨 [${taskName}] Crashed during execution. Handing to Supervisor...`, error.message);
+            const durationMs = Math.round(performance.now() - startTime);
+            cronLastRun.set(taskName, { lastRun: new Date(), durationMs, status: 'error', error: error.message });
+
+            console.error(`🚨 [${taskName}] Crashed after ${durationMs}ms. Handing to Supervisor...`, error.message);
+
+            // Update cron_runs with error
+            if (cronRunId) {
+                try {
+                    const supabase = createClient();
+                    await supabase.from('cron_runs').update({
+                        finished_at: new Date().toISOString(),
+                        duration_ms: durationMs,
+                        status: 'error',
+                        error_message: error.message || 'Unknown error',
+                    }).eq('id', cronRunId);
+                } catch { /* non-critical */ }
+            }
+
             try {
                 // Hand over to the exceptions queue
                 const supabase = createClient();
@@ -462,6 +531,14 @@ export class OpsManager {
     }
 
     /**
+     * Returns the current status of all registered cron tasks.
+     * Used by the /crons Telegram command for on-demand visibility.
+     */
+    getCronStatus(): Map<string, { lastRun: Date; durationMs: number; status: 'success' | 'error'; error?: string }> {
+        return cronLastRun;
+    }
+
+    /**
      * Start all scheduled tasks
      */
     start() {
@@ -481,11 +558,19 @@ export class OpsManager {
         // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
         cron.schedule("*/5 * * * *", () => {
             this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
-            // TODO(will)[2026-03-11]: Re-enable when token-ap.json is created via:
-            //   npx tsx src/cli/gmail-auth.ts ap
-            // Disabled because the AP Gmail account isn't authorized yet.
-            this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
         });
+
+        // AP Email Ingestion — twice daily at 8 AM and 2 PM weekdays
+        // DECISION(2026-03-18): Limited to 2x/day to avoid overwhelming the Google
+        // API. The AP inbox receives far less volume than the default inbox, so
+        // twice-daily polling is sufficient. Token guard prevents silent failures
+        // until token-ap.json is created via: npx tsx src/cli/gmail-auth.ts ap
+        cron.schedule("0 8,14 * * 1-5", () => {
+            const apTokenPath = path.join(process.cwd(), 'token-ap.json');
+            if (fs.existsSync(apTokenPath)) {
+                this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
+            }
+        }, { timezone: "America/Denver" });
 
         // AP Identifier scans for unread PDFs every 15 minutes and queues them
         cron.schedule("*/15 * * * *", () => {
@@ -507,8 +592,10 @@ export class OpsManager {
             this.safeRun("DailySummary", () => this.sendDailySummary());
         }, { timezone: "America/Denver" });
 
-        // Active Purchases Ledger to Slack @ 8:15 AM weekdays
-        cron.schedule("15 8 * * 1-5", () => {
+        // Active Purchases Ledger to Slack @ 8:10 AM weekdays
+        // DECISION(2026-03-18): Staggered from 8:15 to 8:10 to avoid 3-way collision
+        // with AxiomDemandScan (8:15) and KaizenSelfReview (8:20, Fridays).
+        cron.schedule("10 8 * * 1-5", () => {
             this.safeRun("SlackPurchasesReport", () => this.postActivePurchasesToSlack());
         }, { timezone: "America/Denver" });
 
@@ -547,6 +634,13 @@ export class OpsManager {
             this.safeRun("TrackingAgent", () => this.trackingAgent.processUnreadEmails());
         });
 
+        // Slack Tracking ETA Sync every 2 hours
+        // DECISION(2026-03-18): Pushes live freight tracking ETAs directly into the
+        // corresponding Slack Watchdog threads where Will or coworkers originally asked.
+        cron.schedule("0 */2 * * *", () => {
+            this.safeRun("SlackETASync", () => this.pollSlackETAUpdates());
+        });
+
         // PO Sync every 30 minutes
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("POSync", () => this.syncPOConversations());
@@ -558,6 +652,41 @@ export class OpsManager {
         cron.schedule("30 */4 * * *", () => {
             this.safeRun("POSweep", () => runPOSweep(60, false));
         });
+
+        // ── VENDOR RECONCILIATIONS ──────────────────────────
+        // DECISION(2026-03-18): Scheduling automated vendor reconciliations for Axiom,
+        // FedEx, TeraGanix, and ULINE. Scheduled sequentially in the early AM hours
+        // on weekdays to avoid interfering with Will's active Chrome sessions,
+        // especially for Playwright-based scrapers like ULINE.
+        
+        // Axiom Reconciliation @ 1:00 AM Weekdays
+        cron.schedule("0 1 * * 1-5", () => {
+            this.safeRun("ReconcileAxiom", async () => {
+                await this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts");
+            });
+        }, { timezone: "America/Denver" });
+
+        // FedEx Reconciliation @ 1:30 AM Weekdays
+        cron.schedule("30 1 * * 1-5", () => {
+            this.safeRun("ReconcileFedEx", async () => {
+                await this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts");
+            });
+        }, { timezone: "America/Denver" });
+
+        // TeraGanix Reconciliation @ 2:00 AM Weekdays
+        cron.schedule("0 2 * * 1-5", () => {
+            this.safeRun("ReconcileTeraGanix", async () => {
+                await this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts");
+            });
+        }, { timezone: "America/Denver" });
+
+        // ULINE Reconciliation @ 3:00 AM Weekdays
+        // Needs Chrome closed. 3 AM is the safest time.
+        cron.schedule("0 3 * * 1-5", () => {
+            this.safeRun("ReconcileULINE", async () => {
+                await this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts");
+            });
+        }, { timezone: "America/Denver" });
 
         // Build Completion Watcher every 30 minutes
         // Polls Finale for newly-completed build orders, sends Telegram alert,
@@ -658,8 +787,10 @@ export class OpsManager {
 
         // ── KAIZEN FEEDBACK LOOP CRONS ─────────────────────
 
-        // Weekly Kaizen Self-Review — Fridays 8:15 AM Denver
-        cron.schedule("15 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
+        // Weekly Kaizen Self-Review — Fridays 8:20 AM Denver
+        // DECISION(2026-03-18): Staggered from 8:15 to 8:20 to avoid collision
+        // with AxiomDemandScan (8:15) and SlackPurchasesReport (8:10).
+        cron.schedule("20 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
             const report = await generateSelfReview(7);
             const chatId = process.env.TELEGRAM_CHAT_ID;
             if (chatId) {
@@ -678,6 +809,21 @@ export class OpsManager {
         // Nightly Housekeeping — 11:00 PM Denver (prune stale data everywhere)
         cron.schedule("0 23 * * *", () => this.safeRun("NightlyHousekeeping", async () => {
             const report = await runHousekeeping();
+
+            // Prune cron_runs older than 30 days
+            try {
+                const supabase = createClient();
+                const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+                const { count } = await supabase.from('cron_runs')
+                    .delete({ count: 'exact' })
+                    .lt('started_at', cutoff);
+                if (count && count > 0) {
+                    console.log(`[ops-manager] Pruned ${count} cron_runs entries older than 30 days`);
+                }
+            } catch (err: any) {
+                console.warn('[ops-manager] cron_runs pruning failed (non-fatal):', err.message);
+            }
+
             // Only alert Will via Telegram if cleanup was surprisingly large
             if (report.totalReclaimed > 500) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -709,6 +855,46 @@ export class OpsManager {
             });
         }, { timezone: "America/Denver" });
 
+    }
+
+    /**
+     * Runs a vendor reconciliation as a child process with timeout and Telegram notification.
+     *
+     * DECISION(2026-03-18): Centralized from 4 inline execAsync blocks to a single method.
+     * Adds timeout (5 min), maxBuffer (10 MB), and Telegram notification with results.
+     * Previously, reconciliation results were only logged to console — Will had no
+     * visibility into whether overnight reconciliations succeeded or failed.
+     *
+     * @param vendorName  - Human-readable name ("Axiom", "FedEx", etc.)
+     * @param command     - Full CLI command to execute
+     */
+    private async runReconciliation(vendorName: string, command: string): Promise<void> {
+        const startMs = performance.now();
+        const { stdout, stderr } = await execAsync(command, {
+            timeout: RECONCILE_TIMEOUT_MS,
+            maxBuffer: RECONCILE_MAX_BUFFER,
+        });
+
+        if (stderr && !stderr.includes("Debugger attached")) {
+            console.warn(`[Reconcile${vendorName}] Stderr: ${stderr}`);
+        }
+
+        const durationSec = Math.round((performance.now() - startMs) / 1000);
+
+        // Extract a brief summary from stdout (last 5 non-empty lines)
+        const lines = stdout.split('\n').filter((l: string) => l.trim()).slice(-5);
+        const summary = lines.join('\n');
+
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (chatId) {
+            await this.bot.telegram.sendMessage(
+                chatId,
+                `✅ <b>${vendorName} Reconciliation Complete</b>\n\n` +
+                `⏱ Duration: ${durationSec}s\n` +
+                `<pre>${summary.slice(0, 500)}</pre>`,
+                { parse_mode: "HTML" }
+            ).catch(() => { });
+        }
     }
 
     /**
@@ -2409,6 +2595,120 @@ Data: ${JSON.stringify(data)}`;
             }
         } catch (error: any) {
              console.error(`[ops-manager] Axiom Demand Scan error:`, error.message);
+        }
+    }
+
+    /**
+     * ── SLACK ETA SYNC ─────────────────────────────────────────
+     * Periodically queries sys_chat_logs for POs requested in Slack threads,
+     * checks live tracking ETAs for those POs, and pushes ETA updates
+     * to the exact original Slack thread if the ETA display string changed.
+     */
+    private async pollSlackETAUpdates() {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        console.log("🚚 [Slack ETA Sync] Checking for live ETA updates...");
+
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        
+        // Find POs mentioned in Slack in the last 30 days that have channelId and threadTs
+        const { data: logs, error: logsError } = await supabase
+            .from('sys_chat_logs')
+            .select('metadata')
+            .eq('source', 'slack')
+            .gte('created_at', thirtyDaysAgo.toISOString())
+            .not('metadata->activePO', 'is', null);
+
+        if (logsError || !logs || logs.length === 0) return;
+
+        // Group unique Slack channels/threads by active PO
+        const poToThreads = new Map<string, Set<string>>();
+        for (const log of logs) {
+            const m = log.metadata;
+            if (m && m.activePO && m.channelId && m.threadTs) {
+                const po = m.activePO;
+                const threadKey = `${m.channelId}:::${m.threadTs}`;
+                if (!poToThreads.has(po)) poToThreads.set(po, new Set());
+                poToThreads.get(po)!.add(threadKey);
+            }
+        }
+
+        if (poToThreads.size === 0) return;
+
+        let sentUpdatesCount = 0;
+
+        // Check tracking for each mapped PO
+        for (const [poNumber, threads] of poToThreads.entries()) {
+            const { data: po } = await supabase
+                .from('purchase_orders')
+                .select('tracking_numbers, status, last_eta_update')
+                .eq('po_number', poNumber)
+                .neq('status', 'received')
+                .not('tracking_numbers', 'eq', '{}')
+                .maybeSingle();
+
+            if (!po || !po.tracking_numbers || po.tracking_numbers.length === 0) continue;
+
+            const previousETAs = (po.last_eta_update as Record<string, string>) || {};
+            const newETAs: Record<string, string> = { ...previousETAs };
+            let hasUpdates = false;
+            const messagesToSend: string[] = [];
+
+            // Check live ETA for each tracking number on the PO
+            for (const t of po.tracking_numbers) {
+                const ts = await getTrackingStatus(t);
+                if (!ts) continue;
+
+                // Did the public-facing status change? (e.g. "In transit" -> "Out for delivery")
+                const currentStatus = ts.display;
+                if (previousETAs[t] !== currentStatus) {
+                    newETAs[t] = currentStatus;
+                    hasUpdates = true;
+                    
+                    const carrier = t.includes(":::") ? t.split(":::")[0] : isFedExNumber(t) ? "FedEx" : "Carrier";
+                    const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
+                    const link = ts.public_url ? `<${ts.public_url}|${displayNum}>` : displayNum;
+                    
+                    messagesToSend.push(`🚚 *PO#${poNumber} Update*: ${carrier} tracking ${link} is now *${currentStatus}*`);
+                }
+            }
+
+            // Post ETA update directly into the original Slack thread where the user asked
+            if (hasUpdates && messagesToSend.length > 0) {
+                const combinedMessage = messagesToSend.join('\n');
+                
+                if (this.slack) {
+                    for (const threadKey of threads) {
+                        const [channel, thread_ts] = threadKey.split(":::");
+                        try {
+                            await this.slack.chat.postMessage({
+                                channel,
+                                thread_ts,
+                                text: combinedMessage
+                            });
+                            console.log(`  💬 [Slack Watchdog] Pushed ETA update to thread for PO#${poNumber}`);
+                            sentUpdatesCount++;
+                        } catch (err: any) {
+                            console.error(`  ❌ Failed to post ETA to Slack thread: ${err.message}`);
+                        }
+                    }
+                }
+
+                // Persist the new state so we don't send duplicate alerts
+                const updateRes = await supabase.from('purchase_orders')
+                    .update({ last_eta_update: newETAs })
+                    .eq('po_number', poNumber);
+                    
+                if (updateRes.error) {
+                    console.error(`  ❌ Failed to save last_eta_update for PO#${poNumber}:`, updateRes.error.message);
+                }
+            }
+        }
+
+        if (sentUpdatesCount > 0) {
+            console.log(`🚚 [Slack ETA Sync] Sent ${sentUpdatesCount} thread updates.`);
         }
     }
 }
