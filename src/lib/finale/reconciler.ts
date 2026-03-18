@@ -1786,8 +1786,15 @@ export async function applyReconciliation(
         }
 
         try {
-            await client.updateOrderItemPrice(result.orderId, pc.productId, pc.invoicePrice);
-            applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}`);
+            const updateRes = await client.updateOrderItemPrice(result.orderId, pc.productId, pc.invoicePrice);
+            
+            // NEW(2026-03-18): Sync the underlying SKU supplier pricing so FUTURE orders are correct
+            let skuBaseUpdated = false;
+            if (updateRes.supplierPartyUrl) {
+                skuBaseUpdated = await client.updateProductSupplierPrice(pc.productId, updateRes.supplierPartyUrl, pc.invoicePrice);
+            }
+            
+            applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
         } catch (err: any) {
             errors.push(`${pc.productId}: Failed — ${err.message}`);
         }

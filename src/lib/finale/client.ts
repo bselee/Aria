@@ -2528,9 +2528,12 @@ export class FinaleClient {
         orderId: string,
         productId: string,
         newUnitPrice: number
-    ): Promise<{ updated: boolean; oldPrice: number; newPrice: number; orderData: any }> {
+    ): Promise<{ updated: boolean; oldPrice: number; newPrice: number; orderData: any; supplierPartyUrl?: string }> {
         const encodedId = encodeURIComponent(orderId);
         const currentPO = await this.getOrderDetails(orderId);
+        
+        const supplierRole = (currentPO.orderRoleList || []).find((r: any) => r.roleTypeId === "SUPPLIER");
+        const supplierPartyUrl = supplierRole?.partyId ? `/${this.accountPath}/api/partygroup/${supplierRole.partyId}` : undefined;
 
         // Unlock if Committed or Completed
         const originalStatus = await this.unlockForEditing(currentPO, orderId);
@@ -2557,7 +2560,53 @@ export class FinaleClient {
         // Restore original status (re-commit / re-complete)
         await this.restoreOrderStatus(orderId, originalStatus);
 
-        return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated };
+        return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated, supplierPartyUrl };
+    }
+    /**
+     * Updates the base supplier pricing for a SKU in Finale.
+     * This ensures the NEXT PO automatically gets the most current pricing.
+     * It finds the supplier's entry in the product's supplierList and updates the price.
+     *
+     * @param productId - SKU to update
+     * @param supplierPartyUrl - The full API URL of the supplier
+     * @param newPrice - The new base cost
+     * @returns boolean - True if the supplier was found and updated, false otherwise.
+     */
+    async updateProductSupplierPrice(
+        productId: string,
+        supplierPartyUrl: string,
+        newPrice: number
+    ): Promise<boolean> {
+        const encodedSku = encodeURIComponent(productId);
+        const url = `/${this.accountPath}/api/product/${encodedSku}`;
+        
+        try {
+            // 1. Fetch the product
+            const product = await this.get(url);
+            
+            // 2. Find the supplier in the list
+            let updated = false;
+            for (const sup of product.supplierList || []) {
+                if (sup.supplierPartyUrl === supplierPartyUrl) {
+                    if (sup.price !== newPrice) {
+                        sup.price = newPrice;
+                        updated = true;
+                    }
+                }
+            }
+
+            // 3. POST back if changed
+            if (updated) {
+                await this.post(url, product);
+                return true;
+            }
+            return false;
+        } catch (error: any) {
+            console.warn(`⚠️ [FinaleClient] Failed to update product supplier price for SKU ${productId}:`, error.message);
+            // Don't throw — if this fails, we still want the primary PO reconciliation to succeed.
+            // This is an optimization for *future* POs, not a critical failure for the *current* PO.
+            return false;
+        }
     }
 
     /**
