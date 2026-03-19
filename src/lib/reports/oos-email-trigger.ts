@@ -21,7 +21,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { createClient } from '../supabase';
-import { getTrackingStatus } from '../intelligence/ops-manager';
+import { getTrackingStatus } from '../carriers/tracking-service';
 
 // ──────────────────────────────────────────────────
 // BOM BLOCKING ANALYSIS TYPES

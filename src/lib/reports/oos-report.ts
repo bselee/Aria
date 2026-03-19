@@ -17,7 +17,7 @@ import { gmail as GmailApi } from '@googleapis/gmail';
 import ExcelJS from 'exceljs';
 import path from 'path';
 import fs from 'fs';
-import { getTrackingStatus } from '../intelligence/ops-manager';
+import { getTrackingStatus, carrierUrl, detectCarrier as detectCarrierSlug } from '../carriers/tracking-service';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -78,44 +78,20 @@ export interface OOSReportResult {
 // CARRIER URL GENERATION (mirrors ops-manager.ts)
 // ──────────────────────────────────────────────────
 
-const LTL_DIRECT_LINKS: Record<string, string> = {
-    "Old Dominion Freight Line": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
-    "Old Dominion": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
-    "Saia": "https://www.saia.com/tracking?pro={PRO}",
-    "Estes": "https://www.estes-express.com/tracking?pro={PRO}",
-    "R&L Carriers": "https://www.rlcarriers.com/freight/shipping/shipment-tracing?pro={PRO}",
-    "XPO Logistics": "https://app.xpo.com/track/pro/{PRO}",
-    "Dayton Freight": "https://www.daytonfreight.com/tracking/?pro={PRO}",
-    "FedEx Freight": "https://www.fedex.com/fedextrack/?tracknumbers={PRO}",
-    "TForce Freight": "https://www.tforcefreight.com/ltl/apps/Tracking?type=P&HAWB={PRO}",
-};
+// REFACTOR(2026-03-19): Removed duplicated LTL_DIRECT_LINKS, carrierUrl(), and
+// detectCarrier() — now imported from ../carriers/tracking-service.ts
 
-function carrierUrl(trackingNumber: string): string {
-    if (trackingNumber.includes(":::")) {
-        const [carrierName, actualNumber] = trackingNumber.split(":::", 2);
-        const knownCarrier = Object.keys(LTL_DIRECT_LINKS).find(k =>
-            carrierName.toLowerCase().includes(k.toLowerCase())
-        );
-        if (knownCarrier) {
-            return LTL_DIRECT_LINKS[knownCarrier].replace("{PRO}", encodeURIComponent(actualNumber));
-        }
-        return `https://parcelsapp.com/en/tracking/${actualNumber}`;
-    }
-
-    if (/^1Z/i.test(trackingNumber)) return `https://www.ups.com/track?tracknum=${trackingNumber}`;
-    if (/^(94|92|93|95)/.test(trackingNumber)) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${trackingNumber}`;
-    if (/^JD/i.test(trackingNumber)) return `https://www.dhl.com/us-en/home/tracking.html?tracking-id=${trackingNumber}`;
-    if (/\b(96\d{18}|\d{15}|\d{12})\b/.test(trackingNumber)) return `https://www.fedex.com/fedextrack/?tracknumbers=${trackingNumber}`;
-    return `https://parcelsapp.com/en/tracking/${trackingNumber}`;
-}
-
+/**
+ * Map tracking-service's lowercase slug to display name for the OOS report.
+ */
 function detectCarrier(trackingNumber: string): string {
-    if (trackingNumber.includes(":::")) return trackingNumber.split(":::")[0];
-    if (/^1Z/i.test(trackingNumber)) return "UPS";
-    if (/^(94|92|93|95)/.test(trackingNumber)) return "USPS";
-    if (/^JD/i.test(trackingNumber)) return "DHL";
-    if (/^(96\d{18}|\d{15}|\d{12})$/.test(trackingNumber)) return "FedEx";
-    return "Unknown";
+    if (trackingNumber.includes(':::')) return trackingNumber.split(':::')[0];
+    const slug = detectCarrierSlug(trackingNumber);
+    if (slug === 'ups') return 'UPS';
+    if (slug === 'usps') return 'USPS';
+    if (slug === 'dhl') return 'DHL';
+    if (slug === 'fedex') return 'FedEx';
+    return 'Unknown';
 }
 
 // ──────────────────────────────────────────────────
