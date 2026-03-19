@@ -2,11 +2,18 @@
  * @file   ap-identifier.ts
  * @purpose Agent 1 of the decoupled AP pipeline (The "Eyes").
  *          Scans the AP inbox for unread PDFs, classifies their intent,
- *          uploads them to Supabase Storage, and adds them to the processing queue.
+ *          uploads them to Supabase Storage, and queues them for Bill.com forwarding.
  *          Also handles PAID_INVOICE detection — extracts vendor/invoice/amount,
  *          cross-references with Finale POs, and creates draft POs when unmatched.
+ *
+ *          Pipeline flow:
+ *            email_inbox_queue → AP Identifier → ap_inbox_queue (PENDING_FORWARD)
+ *                                                → AP Forwarder → Bill.com
+ *
  * @author  Antigravity / Aria
- * @updated 2026-03-16 — Added PAID_INVOICE detection + Finale PO matching + draft creation
+ * @updated 2026-03-19 — Fixed pipeline gap: items now queue as PENDING_FORWARD
+ *          instead of PENDING_EXTRACTION (which had no consumer). Added cross-inbox
+ *          dedup and tightened invoice classification heuristics.
  */
 
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -188,27 +195,47 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 console.log(`   Evaluating Email: "${subject}" from ${from}`);
 
-                // DECISION(2026-03-13): Check PDF filenames BEFORE LLM classification.
-                // PO #124462 showed that a PDF named "BASPO-124462.pdf" was missed because
-                // the snippet said "tracking number + thank you", causing the LLM to classify
-                // it as HUMAN_INTERACTION. PDF filename is a stronger signal than snippet text.
+                // ── PDF filename heuristics (pre-LLM) ────────────────────────
+                // DECISION(2026-03-19): Tightened from original (2026-03-13) heuristic.
+                // Previous version matched 'baspo' and 'po[_-]?\d+' in filenames,
+                // which incorrectly forced PO confirmation docs (e.g. BASPO-124498.pdf)
+                // to INVOICE. Now we split into positive signals (invoice-like names)
+                // and negative signals (PO docs, BOLs, acks, certs) for cleaner routing.
                 const pdfFilenames: string[] = m.pdf_filenames || [];
-                const hasPOPdf = pdfFilenames.some((f: string) =>
-                    /\b(invoice|baspo|po[_\-]?\d+|bill|statement)\b/i.test(f)
+
+                // Positive: filename clearly says "invoice" or "inv_" (vendor invoices)
+                const hasInvoicePdf = pdfFilenames.some((f: string) =>
+                    /\b(invoice|inv[_\-])/i.test(f)
                 );
-                // Also detect PO-thread context from subject line
+                // Negative: PO documents returned by vendor, BOLs, acks, certs
+                const isNonInvoicePdf = pdfFilenames.every((f: string) =>
+                    /\b(baspo|bol\b|acknowledgement|ordack|confirm|cert|org\s*cert|shipped\s*paperwork)/i.test(f)
+                );
+                // PO-thread context from subject line
                 const isPOThread = /\bPO\s*#?\s*\d+/i.test(subject) || /\bpurchase\s*order\b/i.test(subject);
                 const hasPdfAttachment = pdfFilenames.length > 0;
+                // Subject signals for non-invoice PO emails
+                const isReadyNotification = /\*\*READY\*\*/i.test(subject);
+                const isOrderAck = /acknowledgement|order\s*confirm/i.test(subject);
 
                 let intent: string;
-                if (hasPOPdf) {
+                if (hasInvoicePdf && !isNonInvoicePdf) {
                     // Override: PDF filename clearly indicates an invoice document
                     intent = "INVOICE";
                     console.log(`     -> Forced INVOICE (PDF filename match: ${pdfFilenames.join(', ')})`);
-                } else if (isPOThread && hasPdfAttachment) {
-                    // Override: PDF attached to a PO thread is almost certainly an invoice
+                } else if (isReadyNotification || isOrderAck) {
+                    // DECISION(2026-03-19): "PO READY" notifications and order acks
+                    // are vendor confirmations, not invoices. Skip without LLM call.
+                    intent = "HUMAN_INTERACTION";
+                    console.log(`     -> Forced HUMAN_INTERACTION (PO ready/ack, not invoice)`);
+                } else if (isNonInvoicePdf && hasPdfAttachment) {
+                    // All attached PDFs are PO docs, BOLs, or certs — not invoices
+                    intent = "HUMAN_INTERACTION";
+                    console.log(`     -> Forced HUMAN_INTERACTION (PDFs are PO docs/BOLs, not invoices)`);
+                } else if (isPOThread && hasPdfAttachment && !isNonInvoicePdf) {
+                    // PO thread with a PDF that isn't clearly a PO doc — likely an invoice
                     intent = "INVOICE";
-                    console.log(`     -> Forced INVOICE (PO thread + PDF attached)`);
+                    console.log(`     -> Forced INVOICE (PO thread + non-PO PDF attached)`);
                 } else if (detectPaidInvoice(subject, m.body_text || snippet, hasPdfAttachment)) {
                     // DECISION(2026-03-16): Fast regex pre-check for paid invoice confirmations.
                     // Fires BEFORE LLM classification to avoid misclassifying as HUMAN_INTERACTION.
@@ -294,7 +321,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             const capturedFilename = part.filename;
                             const uniqueMsgId = pdfParts.length > 1 ? `${m.gmail_message_id}_${attachmentIndex}` : m.gmail_message_id;
 
-                            // Check if already queued
+                            // ── Dedup Check 1: same message_id (same inbox re-scan) ──
                             const { data: existing } = await supabase
                                 .from("ap_inbox_queue")
                                 .select("id")
@@ -304,6 +331,28 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             if (existing) {
                                 console.log(`     ⚠️ Already queued ${capturedFilename}, skipping...`);
                                 attachmentIndex++;
+                                continue;
+                            }
+
+                            // ── Dedup Check 2: cross-inbox duplicate ─────────────────
+                            // DECISION(2026-03-19): Same invoice arrives on both ap and
+                            // default inboxes with different gmail_message_ids. Match on
+                            // (email_from, pdf_filename, email_subject) within 24h to
+                            // prevent duplicate Bill.com forwards.
+                            const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+                            const { data: crossInboxDup } = await supabase
+                                .from("ap_inbox_queue")
+                                .select("id, source_inbox")
+                                .eq("email_from", from)
+                                .eq("pdf_filename", capturedFilename)
+                                .eq("email_subject", subject)
+                                .gte("created_at", twentyFourHoursAgo)
+                                .maybeSingle();
+
+                            if (crossInboxDup) {
+                                console.log(`     ⚠️ Cross-inbox duplicate: ${capturedFilename} already queued from ${crossInboxDup.source_inbox}, skipping ${sourceInbox} copy`);
+                                attachmentIndex++;
+                                processedAnyPDF = true; // still mark as handled so label is applied
                                 continue;
                             }
 
@@ -331,8 +380,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 throw new Error(`Storage upload failed: ${uploadError.message}`);
                             }
 
-                            // Insert into Queue
-                            const queueStatus = 'PENDING_EXTRACTION';
+                            // DECISION(2026-03-19): Queue directly as PENDING_FORWARD.
+                            // Previously set to PENDING_EXTRACTION, but no extraction
+                            // worker existed — invoices got stuck permanently. The PDF is
+                            // already in Storage; the AP Forwarder downloads and sends it
+                            // to Bill.com. Reconciliation happens independently afterwards.
+                            // This matches the SOP: "forward immediately, reconcile later."
+                            const queueStatus = 'PENDING_FORWARD';
 
                             const { error: insertError } = await supabase.from("ap_inbox_queue").insert({
                                 message_id: uniqueMsgId,
@@ -349,7 +403,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 throw new Error(`Queue insert failed: ${insertError.message}`);
                             }
 
-                            console.log(`     ✅ Queued ${capturedFilename} as ${queueStatus}`);
+                            console.log(`     ✅ Queued ${capturedFilename} → ${queueStatus} (ready for Bill.com)`);
                             processedAnyPDF = true;
                             attachmentIndex++;
 
@@ -372,7 +426,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         });
                     } catch (e) { /* ignore */ }
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    const logNote = `Queued for extraction (${pdfNames})`;
+                    const logNote = `Queued for Bill.com forward (${pdfNames})`;
                     await this.logActivity(supabase, from, subject, intent, logNote, { attachments: pdfNames });
                 } else {
                     console.log(`     ⚠️ No PDF found on ${intent}. Leaving unread for human check.`);

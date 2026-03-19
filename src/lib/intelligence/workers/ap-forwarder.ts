@@ -4,10 +4,22 @@ import { createClient } from "../../supabase";
 
 /**
  * @file ap-forwarder.ts
- * @purpose Agent 4 of the decoupled AP pipeline.
- *          Polls the ap_inbox_queue for PENDING_FORWARD items, downloads the
- *          associated PDF from Storage, and forwards it to Bill.com.
- * @author Antigravity
+ * @purpose Agent 2 of the decoupled AP pipeline (The "Hands").
+ *          Polls ap_inbox_queue for PENDING_FORWARD items, downloads the
+ *          associated PDF from Storage, constructs a MIME message, and sends
+ *          it to buildasoilap@bill.com. Updates status to FORWARDED on success.
+ *
+ *          Pipeline flow:
+ *            AP Identifier → ap_inbox_queue (PENDING_FORWARD)
+ *              → AP Forwarder (PROCESSING_FORWARD → FORWARDED / ERROR_FORWARDING)
+ *
+ *          Status lifecycle:
+ *            PENDING_FORWARD → PROCESSING_FORWARD → FORWARDED
+ *                                                 → ERROR_FORWARDING (on failure)
+ *
+ * @author Antigravity / Aria
+ * @updated 2026-03-19 — Changed success status from PROCESSED to FORWARDED for
+ *          clearer pipeline semantics.
  */
 export class APForwarderAgent {
     private async logActivity(supabase: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
@@ -114,10 +126,10 @@ export class APForwarderAgent {
                         requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") }
                     });
 
-                    // Update status to FORWARDED
+                    // Update status to FORWARDED (sent to Bill.com)
                     await supabase
                         .from('ap_inbox_queue')
-                        .update({ status: 'PROCESSED' })
+                        .update({ status: 'FORWARDED' })
                         .eq('id', item.id);
 
                     await this.logActivity(
