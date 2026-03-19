@@ -45,6 +45,13 @@ import {
 } from '../carriers/tracking-service';
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
 import { runPOSweep } from "../matching/po-sweep";
+import {
+    recordCronRun,
+    getAllCronRunStatuses,
+    formatCronStatusReport,
+    formatCompactStatus,
+    type CronRunStatus,
+} from '../scheduler/cron-registry';
 import { exec } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
@@ -62,14 +69,10 @@ const RECONCILE_MAX_BUFFER = 10 * 1024 * 1024; // 10MB stdout cap
 // carrierUrl, parseTrackingContent, FedEx OAuth, EasyPost, getLTLTrackingStatus,
 // getTrackingStatus, buildFollowUpEmail. All now imported from tracking-service.
 
-/**
- * Main Operations Manager Class
- */
-// DECISION(2026-03-18): Lightweight cron registry tracks last-run times and status
-// for every scheduled task. Exposed via getCronStatus() for the /crons command.
-const cronLastRun = new Map<string, { lastRun: Date; durationMs: number; status: 'success' | 'error'; error?: string }>();
-
-export { cronLastRun };
+// DECISION(2026-03-19): Cron registry extracted to src/lib/scheduler/cron-registry.ts.
+// The old cronLastRun Map is replaced by recordCronRun/getAllCronRunStatuses imports.
+// Kept as a re-export alias for backward compatibility with any external consumers.
+export const cronLastRun = getAllCronRunStatuses();
 
 export class OpsManager {
     private bot: Telegraf;
@@ -146,9 +149,8 @@ export class OpsManager {
         try {
             await task();
 
-            // Record success
             const durationMs = Math.round(performance.now() - startTime);
-            cronLastRun.set(taskName, { lastRun: new Date(), durationMs, status: 'success' });
+            recordCronRun(taskName, durationMs, 'success');
 
             // Update cron_runs with success
             if (cronRunId) {
@@ -163,7 +165,7 @@ export class OpsManager {
             }
         } catch (error: any) {
             const durationMs = Math.round(performance.now() - startTime);
-            cronLastRun.set(taskName, { lastRun: new Date(), durationMs, status: 'error', error: error.message });
+            recordCronRun(taskName, durationMs, 'error', error.message);
 
             console.error(`🚨 [${taskName}] Crashed after ${durationMs}ms. Handing to Supervisor...`, error.message);
 
@@ -204,12 +206,22 @@ export class OpsManager {
         }
     }
 
+    getCronStatus(): Map<string, CronRunStatus> {
+        return getAllCronRunStatuses();
+    }
+
     /**
-     * Returns the current status of all registered cron tasks.
-     * Used by the /crons Telegram command for on-demand visibility.
+     * Returns the full HTML-formatted cron status report for Telegram.
      */
-    getCronStatus(): Map<string, { lastRun: Date; durationMs: number; status: 'success' | 'error'; error?: string }> {
-        return cronLastRun;
+    getCronStatusReport(): string {
+        return formatCronStatusReport();
+    }
+
+    /**
+     * Returns a one-line compact status summary.
+     */
+    getCronCompactStatus(): string {
+        return formatCompactStatus();
     }
 
     /**
@@ -266,12 +278,9 @@ export class OpsManager {
             this.safeRun("DailySummary", () => this.sendDailySummary());
         }, { timezone: "America/Denver" });
 
-        // Active Purchases Ledger to Slack @ 8:10 AM weekdays
-        // DECISION(2026-03-18): Staggered from 8:15 to 8:10 to avoid 3-way collision
-        // with AxiomDemandScan (8:15) and KaizenSelfReview (8:20, Fridays).
-        cron.schedule("10 8 * * 1-5", () => {
-            this.safeRun("SlackPurchasesReport", () => this.postActivePurchasesToSlack());
-        }, { timezone: "America/Denver" });
+        // DECISION(2026-03-19): Active Purchases Ledger cron REMOVED.
+        // Now included as a section in the unified morning OOS Digest post.
+        // See OOSReportGenerator cron below — appends Active Purchases to slackBody.
 
         // Friday Summary @ 8:01 AM
         cron.schedule("1 8 * * 5", () => {
@@ -446,6 +455,39 @@ export class OpsManager {
                             `📁 Saved to: <code>${result.outputPath}</code>`,
                             { parse_mode: "HTML" }
                         );
+                    }
+
+                    // DECISION(2026-03-19): Single unified morning Slack post.
+                    // Combines OOS Digest + Active Purchases into one message.
+                    // Replaced separate Active Purchases Ledger, Daily Summary,
+                    // and Weekly Summary Slack posts.
+                    if (result.slackBody) {
+                        try {
+                            let combinedMsg = result.slackBody;
+
+                            // Append Active Purchases section
+                            const activePOs = await this.getActivePurchasesList(14);
+                            if (activePOs.length > 0) {
+                                combinedMsg += `\n\n*Active Purchases*  _14-day window_`;
+                                for (const p of activePOs) {
+                                    const icon = p.isReceived ? '✅' : (p.trackingNumbers?.length ? '🟢' : '🟡');
+                                    const poLink = `<${p.finaleUrl}|${p.orderId}>`;
+                                    if (p.isReceived && p.receiveDate) {
+                                        combinedMsg += `\n${icon} ${poLink} — ${p.vendorName} · Received ${this.fmtDate(p.receiveDate)}`;
+                                    } else {
+                                        const trackPart = p.trackingNumbers?.length
+                                            ? p.trackingNumbers.map((t: string) => `<${carrierUrl(t)}|${t.includes(':::') ? t.split(':::')[1].slice(-8) : t.slice(-8)}>`).join(' ')
+                                            : '_awaiting tracking_';
+                                        combinedMsg += `\n${icon} ${poLink} — ${p.vendorName} · ${this.fmtDate(p.orderDate)} → ${this.fmtDate(p.expectedDate)} · ${trackPart}`;
+                                    }
+                                }
+                            }
+
+                            await this.postToSlack(combinedMsg, "Morning Purchasing Digest");
+                            console.log(`📋 [OOS] Slack morning digest posted (${combinedMsg.length} chars)`);
+                        } catch (slackErr: any) {
+                            console.error('❌ Slack morning digest failed:', slackErr.message);
+                        }
                     }
                 }
             });
@@ -1026,9 +1068,8 @@ export class OpsManager {
             { parse_mode: "Markdown" }
         );
 
-        // 2. Cross-post to Slack #purchasing
-        const slackMsg = `:chart_with_upwards_trend: *Morning Operations Summary*\n\n${summary}`;
-        await this.postToSlack(slackMsg, "Daily Summary");
+        // DECISION(2026-03-19): Daily Summary removed from Slack.
+        // Now Telegram-only. Slack gets the unified OOS Digest morning post instead.
     }
 
     /**
@@ -1048,9 +1089,8 @@ export class OpsManager {
             { parse_mode: "Markdown" }
         );
 
-        // 2. Cross-post to Slack #purchasing
-        const slackMsg = `:calendar: *Friday Weekly Operations Review*\n\n${summary}`;
-        await this.postToSlack(slackMsg, "Weekly Summary");
+        // DECISION(2026-03-19): Weekly Summary removed from Slack.
+        // Now Telegram-only. Slack gets the unified OOS Digest morning post instead.
     }
 
     /**
@@ -1163,7 +1203,7 @@ export class OpsManager {
             const purchases = await this.getActivePurchasesList(14);
             if (purchases.length === 0) return; // Silent if no active purchases
 
-            let msg = `:ledger: *Active Purchases Ledger*\n_Running list of incoming shipments from the last 14 days (auto-clears 5 days after receipt)_\n\n`;
+            let msg = `*Active Purchases*\n_Running list of incoming shipments from the last 14 days (auto-clears 5 days after receipt)_\n\n`;
 
             for (const p of purchases) {
                 const rcvd = p.isReceived;
@@ -1199,9 +1239,9 @@ export class OpsManager {
                 msg += block + "\n";
             }
 
-            await this.postToSlack(msg, "Active Purchases Ledger");
+            await this.postToSlack(msg, "Active Purchases");
         } catch (e: any) {
-            console.error(`❌ Active Purchases Ledger failed:`, e.message);
+            console.error(`❌ Active Purchases posting failed:`, e.message);
         }
     }
 

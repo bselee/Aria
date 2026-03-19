@@ -29,7 +29,7 @@ import {
     VOICE_CONFIG,
     TELEGRAM_CONFIG
 } from '../config/persona';
-import { OpsManager, cronLastRun } from '../lib/intelligence/ops-manager';
+import { OpsManager } from '../lib/intelligence/ops-manager';
 import { getProviderStatus } from '../lib/intelligence/llm';
 import { geminiLimiter } from '../lib/intelligence/rate-limiter';
 import { DIRECT_MODELS, OPENROUTER_CHAT_CHAIN } from '../lib/intelligence/models';
@@ -894,43 +894,121 @@ bot.command('housekeeping', async (ctx) => {
 });
 
 // /crons — Show status of all scheduled cron tasks
-// DECISION(2026-03-18): On-demand visibility into the cron scheduler.
-// Shows last-run time, duration, and status for every registered task.
+// DECISION(2026-03-19): Upgraded to use centralized cron-registry.ts which
+// provides categorized output with descriptions instead of a flat list.
 bot.command('crons', async (ctx) => {
     ctx.sendChatAction('typing');
 
-    if (cronLastRun.size === 0) {
-        await ctx.reply('⏳ No cron tasks have run since last restart.\n\n_Try again after a few minutes._', { parse_mode: 'Markdown' });
+    const report = opsManager.getCronStatusReport();
+
+    // Telegram message limit is 4096 chars
+    const msg = report.length > 4000
+        ? report.slice(0, 3990) + '\n\n<i>...truncated</i>'
+        : report;
+
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
+// /notify <request_id> — Approve sending an Amazon order update to the Slack requester
+// DECISION(2026-03-19): Manual review gate before any Slack notification.
+// Will reviews the Amazon order match on Telegram and approves with /notify.
+// The Slack message is factual and precise, no emojis, plain text.
+bot.command('notify', async (ctx) => {
+    ctx.sendChatAction('typing');
+
+    const requestId = ctx.message.text.split(' ').slice(1).join(' ').trim();
+    if (!requestId) {
+        await ctx.reply('Usage: /notify <request_id>\n\nCopy the ID from an Amazon order notification.');
         return;
     }
 
-    // Sort by most recent run first
-    const entries = [...cronLastRun.entries()].sort(
-        (a, b) => b[1].lastRun.getTime() - a[1].lastRun.getTime()
-    );
+    try {
+        const { createClient } = await import('../lib/supabase');
+        const supabase = createClient();
+        if (!supabase) {
+            await ctx.reply('Database unavailable.');
+            return;
+        }
 
-    let msg = `⏰ <b>Cron Status</b> (${entries.length} tasks since restart)\n\n`;
+        const { data: req, error } = await supabase
+            .from('slack_requests')
+            .select('*')
+            .eq('id', requestId)
+            .single();
 
-    for (const [name, info] of entries) {
-        const icon = info.status === 'success' ? '✅' : '❌';
-        const ago = Math.round((Date.now() - info.lastRun.getTime()) / 60000);
-        const agoStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
-        const durStr = info.durationMs < 1000
-            ? `${info.durationMs}ms`
-            : `${(info.durationMs / 1000).toFixed(1)}s`;
+        if (error || !req) {
+            await ctx.reply(`Request not found: ${requestId}`);
+            return;
+        }
 
-        msg += `${icon} <b>${name}</b>\n`;
-        msg += `    ${agoStr} · ${durStr}`;
-        if (info.error) msg += ` · <i>${info.error.slice(0, 60)}</i>`;
-        msg += '\n';
+        if (req.notified_at) {
+            await ctx.reply(`Already notified on ${new Date(req.notified_at).toLocaleString('en-US', { timeZone: 'America/Denver' })}`);
+            return;
+        }
+
+        if (req.channel_id === 'unmatched') {
+            await ctx.reply('This order has no matched Slack request. Nothing to notify.');
+            return;
+        }
+
+        // Build the Slack message — factual, no emojis, precise
+        const items = (req.amazon_items || [])
+            .map((i: any) => `  ${i.quantity}x ${i.name}${i.price ? ` ($${i.price.toFixed(2)})` : ''}`)
+            .join('\n');
+
+        let slackMessage = '';
+        if (req.status === 'shipped' && req.tracking_number) {
+            slackMessage = `Your order has shipped.\n\n`;
+            slackMessage += `Order: ${req.amazon_order_id}\n`;
+            if (req.carrier) slackMessage += `Carrier: ${req.carrier}\n`;
+            slackMessage += `Tracking: ${req.tracking_number}\n`;
+            if (req.estimated_delivery) {
+                const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
+                    weekday: 'long', month: 'long', day: 'numeric',
+                    timeZone: 'America/Denver',
+                });
+                slackMessage += `Expected delivery: ${eta}\n`;
+            }
+            if (items) slackMessage += `\nItems:\n${items}\n`;
+        } else {
+            slackMessage = `Your order has been placed.\n\n`;
+            slackMessage += `Order: ${req.amazon_order_id}\n`;
+            if (req.estimated_delivery) {
+                const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
+                    weekday: 'long', month: 'long', day: 'numeric',
+                    timeZone: 'America/Denver',
+                });
+                slackMessage += `Expected delivery: ${eta}\n`;
+            }
+            if (items) slackMessage += `\nItems:\n${items}\n`;
+        }
+
+        // Send to Slack in the original thread
+        const slackToken = process.env.SLACK_BOT_TOKEN;
+        if (!slackToken) {
+            await ctx.reply('SLACK_BOT_TOKEN not configured.');
+            return;
+        }
+
+        const { WebClient } = await import('@slack/web-api');
+        const slack = new WebClient(slackToken);
+
+        await slack.chat.postMessage({
+            channel: req.channel_id,
+            text: slackMessage,
+            thread_ts: req.thread_ts || req.message_ts,
+        });
+
+        // Mark as notified
+        await supabase
+            .from('slack_requests')
+            .update({ notified_at: new Date().toISOString() })
+            .eq('id', requestId);
+
+        await ctx.reply(`Sent to ${req.requester_name} in Slack.`);
+    } catch (err: any) {
+        await ctx.reply(`Failed: ${err.message}`);
     }
-
-    // Telegram message limit is 4096 chars
-    if (msg.length > 4000) {
-        msg = msg.slice(0, 3990) + '\n\n<i>...truncated</i>';
-    }
-
-    await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 // ──────────────────────────────────────────────────
@@ -1629,6 +1707,14 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 - "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
 - Any generic offer that could apply to ANY response (if it has no specifics, cut it)
 
+### ACTION BIAS — do it, don't note it:
+- NEVER say "I've noted that" or "I'll keep that in mind" unless you ALSO performed the action.
+- If Will says "X emails never need viewing, archive them" → you have tools. USE THEM. Store the preference, confirm what you did.
+- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" → ATTEMPT IT with your tools. Report what you did, not what you "noted".
+- "I can't set an automated rule" is WRONG — you have Pinecone memory, you have tools. Store the preference and explain how it works.
+- The only acceptable response to an actionable request is: (1) I did it, here's what happened, or (2) I tried and here's why it failed.
+- Passive acknowledgment without action is NEVER acceptable when tools exist to do the work.`;
+
 ### Persona — always ON:
 - Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
 - End responses with genuine engagement when there's something real to engage with — a specific observation, a risk you noticed, a quick recommendation.
@@ -1843,6 +1929,14 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 - "It might be worth double-checking" — you checked. Report what you found, that's it.
 - "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
 - Any generic offer that could apply to ANY response (if it has no specifics, cut it)
+
+### ACTION BIAS — do it, don't note it:
+- NEVER say "I've noted that" or "I'll keep that in mind" unless you ALSO performed the action.
+- If Will says "X emails never need viewing, archive them" → you have tools. USE THEM. Store the preference, confirm what you did.
+- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" → ATTEMPT IT with your tools. Report what you did, not what you "noted".
+- "I can't set an automated rule" is WRONG — you have Pinecone memory, you have tools. Store the preference and explain how it works.
+- The only acceptable response to an actionable request is: (1) I did it, here's what happened, or (2) I tried and here's why it failed.
+- Passive acknowledgment without action is NEVER acceptable when tools exist to do the work.
 
 ### Persona — always ON:
 - Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
@@ -2101,6 +2195,31 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
                 `\n\n✅ PO #${result.orderId} committed in Finale and emailed to ${result.sentTo}`
             );
+
+            // DECISION(2026-03-19): Generate a copy-paste Slack response for Will.
+            // After committing a PO, Will needs to reply in Slack with the PO#, a
+            // clickable link, and the expected arrival date. We compute 14d from today
+            // as the default expected date and send it as a separate message so he can
+            // copy it directly into the Slack thread.
+            const expectedDate = new Date();
+            expectedDate.setDate(expectedDate.getDate() + 14);
+            const expectedDateStr = expectedDate.toLocaleDateString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric',
+                timeZone: 'America/Denver',
+            });
+
+            const slackResponse = [
+                `📋 *Copy-paste for Slack:*`,
+                ``,
+                `\`\`\``,
+                `✅ Ordered — PO #${result.orderId}`,
+                `🔗 ${pending.review.finaleUrl}`,
+                `📅 Expected arrival: ~${expectedDateStr}`,
+                `\`\`\``,
+            ].join('\n');
+
+            await ctx.reply(slackResponse, { parse_mode: 'Markdown' });
+
             // Pinecone auto-learn
             setImmediate(async () => {
                 try {
