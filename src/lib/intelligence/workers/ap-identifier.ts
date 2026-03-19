@@ -298,7 +298,30 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     continue;
                 }
 
-                // --- INVOICE QUEUEING ---
+                // ── INBOX GATE ──────────────────────────────────────────────
+                // DECISION(2026-03-19): Only the AP inbox (ap@buildasoil.com)
+                // should forward invoices to Bill.com. The default inbox
+                // (bill.selee@buildasoil.com) receives PO threads, quotes,
+                // and vendor correspondence that may have PDFs attached but
+                // are NOT invoices. Label and archive, but do NOT queue.
+                if (sourceInbox !== 'ap') {
+                    console.log(`     ⚠️ Invoice detected on '${sourceInbox}' inbox — labeling only, not queuing for Bill.com`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.gmail_message_id,
+                            requestBody: {
+                                addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
+                                removeLabelIds: ["INBOX", "UNREAD"]
+                            }
+                        });
+                    } catch (e) { /* ignore */ }
+                    await this.logActivity(supabase, from, subject, intent,
+                        `Invoice detected on ${sourceInbox} inbox — labeled only, not forwarded`);
+                    continue;
+                }
+
+                // --- INVOICE QUEUEING (ap inbox only) ---
                 let processedAnyPDF = false;
 
                 const pdfParts: any[] = [];
