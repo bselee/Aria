@@ -59,3 +59,37 @@ tmp/
 
 .worktrees/
 worktrees/
+
+# ─── Agent configs (only .agents, .cursor, .claude, .firecrawl are tracked) ───
+.adal/
+.augment/
+.cline/
+.clinerules
+.codebuddy/
+.commandcode/
+.continue/
+.crush/
+.cursorrules
+.env.local.corrupted
+.factory/
+.goose/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.vibe/
+.windsurf/
+.windsurfrules
+.zencoder/
+

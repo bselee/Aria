@@ -1,0 +1,2 @@
+# Treat lock files as generated — better delta compression, excluded from diffs
+package-lock.json -diff linguist-generated=true
