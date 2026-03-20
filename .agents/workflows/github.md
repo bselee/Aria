@@ -95,16 +95,27 @@ If your commit message contains "and" between two unrelated things, split it.
 
 ## 4. COMMIT & PUSH WORKFLOW (STEP BY STEP)
 
-```bash
+```powershell
 # 1. Stage your changes
 git add -A
 
 # 2. Commit with a conventional commit message
 git commit -m "type(scope): description"
 
-# 3. Push to main
-git push origin main
+# 3. Push to main (--quiet --no-progress prevents terminal hang)
+git push --quiet --no-progress origin main 2>&1 | Out-String
+
+# 4. Verify
+Write-Host "PUSHED OK"
 ```
+
+**CRITICAL — PowerShell push flags:**
+- Always use `--quiet --no-progress` on `git push`.
+- Always pipe stderr: `2>&1 | Out-String`.
+- Without these flags, the progress output (carriage-return-based progress bar)
+  causes the Antigravity terminal multiplexer to hang indefinitely.
+- The push itself completes in ~3 seconds, but the terminal never returns.
+- This is NOT a git or network problem — it's a terminal output buffering issue.
 
 That's it. No branches, no PRs, no ceremony.
 
