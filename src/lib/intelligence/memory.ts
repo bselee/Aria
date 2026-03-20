@@ -303,6 +303,45 @@ export async function seedMemories(): Promise<void> {
             relatedTo: 'Will',
             source: 'manual',
         },
+        // DECISION(2026-03-19): Store email handling preferences so Aria's chat path
+        // also knows about auto-archive senders. AP Agent handles these deterministically
+        // via VENDOR_ROUTING_RULES, but the LLM classification path checks Pinecone too.
+        {
+            id: 'seed-preference-email-pioneer-propane',
+            category: 'preference',
+            content: 'Pioneer Propane emails never need viewing. Mark as read and archive. Not forwarded to Bill.com at this time — recurring utility expense.',
+            tags: ['email', 'auto-archive', 'pioneer-propane', 'autopay'],
+            relatedTo: 'Pioneer Propane',
+            source: 'manual',
+            priority: 'normal',
+        },
+        {
+            id: 'seed-preference-email-gorgias',
+            category: 'preference',
+            content: 'Gorgias (support software) emails never need viewing. Mark as read and archive. Not forwarded to Bill.com — recurring SaaS subscription.',
+            tags: ['email', 'auto-archive', 'gorgias', 'software', 'autopay'],
+            relatedTo: 'Gorgias',
+            source: 'manual',
+            priority: 'normal',
+        },
+        {
+            id: 'seed-preference-email-google',
+            category: 'preference',
+            content: 'Google Workspace and Google Cloud emails never need viewing in AP inbox. Mark as read and archive. Not forwarded to Bill.com — recurring software subscription.',
+            tags: ['email', 'auto-archive', 'google', 'software', 'autopay'],
+            relatedTo: 'Google',
+            source: 'manual',
+            priority: 'normal',
+        },
+        {
+            id: 'seed-preference-email-wwex',
+            category: 'preference',
+            content: 'WWEX / Worldwide Express emails are autopay. Mark as read and archive. Not forwarded to Bill.com to avoid double-payment.',
+            tags: ['email', 'auto-archive', 'wwex', 'autopay', 'freight'],
+            relatedTo: 'Worldwide Express',
+            source: 'manual',
+            priority: 'normal',
+        },
     ];
 
     for (const seed of seeds) {

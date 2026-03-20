@@ -37,9 +37,10 @@ import { upsertVendorInvoice } from "../storage/vendor-invoices";
 // ─── Vendor Routing Rules ────────────────────────────────────────────────────
 // DECISION(2026-03-18): Deterministic routing for known vendor types.
 // Runs BEFORE LLM classification to save API calls and ensure correctness.
-// - 'autopay'  → vendor is on autopay; mark read, do NOT forward to Bill.com
-// - 'dropship' → forward to Bill.com, mark read, skip PO matching/reconciliation
-// - 'ignore'   → skip entirely (e.g., internal forwarded emails from Will's inbox)
+// - 'autopay'       → vendor is on autopay or recurring subscription; mark read, no Bill.com forward
+// - 'dropship'      → forward to Bill.com, mark read, skip PO matching/reconciliation
+// - 'ignore'        → skip entirely (e.g., internal forwarded emails from Will's inbox)
+// - 'amazon_order'  → route to Amazon order parser for tracking + Slack request matching
 interface VendorRoutingRule {
     /** Match criteria — at least one must be provided */
     match: {
@@ -47,27 +48,39 @@ interface VendorRoutingRule {
         fromExact?: string;       // e.g., 'bill.selee@buildasoil.com' — exact sender match
         senderContains?: string;  // e.g., 'logan labs' — case-insensitive substring in From header
     };
-    action: 'autopay' | 'dropship' | 'ignore';
+    action: 'autopay' | 'dropship' | 'ignore' | 'amazon_order';
     label: string;  // Human-readable label for logging
 }
 
 const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
-    // WWEX / Worldwide Express — autopay, do NOT forward to Bill.com
+    // ── Autopay / recurring (mark read, no Bill.com forward) ─────────────
+    // WWEX / Worldwide Express
     { match: { domain: 'wwex.com' }, action: 'autopay', label: 'Worldwide Express (Autopay)' },
+    // DECISION(2026-03-19): Recurring utility and software subscriptions.
+    // Not forwarded to Bill.com at this time. Saves LLM classification calls.
+    { match: { senderContains: 'pioneer propane' }, action: 'autopay', label: 'Pioneer Propane' },
+    { match: { domain: 'gorgias.com' }, action: 'autopay', label: 'Gorgias' },
+    { match: { senderContains: 'gorgias' }, action: 'autopay', label: 'Gorgias' },
+    { match: { domain: 'google.com' }, action: 'autopay', label: 'Google' },
+    { match: { senderContains: 'google workspace' }, action: 'autopay', label: 'Google Workspace' },
+    { match: { senderContains: 'google cloud' }, action: 'autopay', label: 'Google Cloud' },
 
-    // Logan Labs — testing lab, treated as dropship. Forward to Bill.com, no PO matching.
+    // ── Amazon (route to order parser for tracking) ──────────────────────
+    // DECISION(2026-03-19): Amazon order/shipping confirmation emails are
+    // parsed for order #, items, tracking, and matched to pending Slack
+    // requests so the requester can be notified when their order ships.
+    { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },
+    { match: { senderContains: 'ship-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Shipping' },
+    { match: { senderContains: 'shipment-tracking@amazon' }, action: 'amazon_order', label: 'Amazon Tracking' },
+    { match: { senderContains: 'order-update@amazon' }, action: 'amazon_order', label: 'Amazon Order Update' },
+
+    // ── Dropship vendors (forward to Bill.com, no PO matching) ──────────
     { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
-
-    // AutoPot — dropship vendor. Forward to Bill.com, no PO matching.
     { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
-
-    // Evergreen Growers — dropship vendor. Forward to Bill.com, no PO matching.
     // NOTE: Bill.com has historically had trouble recognizing their PDF invoices.
-    // They also send monthly statements which should be forwarded as well.
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
 
-    // Internal: bill.selee@buildasoil.com — ap@ is now the source of truth.
-    // Do not process forwarded invoices/statements from Will's personal inbox.
+    // ── Internal ignores ────────────────────────────────────────────────
     { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
 ];
 export class APAgent {
@@ -279,7 +292,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     }
 
                     if (routingRule.action === 'autopay') {
-                        // Autopay vendor — mark as read, do NOT forward to Bill.com
+                        // Autopay / recurring — mark as read, do NOT forward to Bill.com
                         await gmail.users.messages.modify({
                             userId: "me",
                             id: m.id!,
@@ -288,8 +301,40 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             }
                         });
                         await this.logActivity(supabase, from, subject, "AUTOPAY",
-                            `${routingRule.label} — autopay vendor, marked read, no Bill.com forward`);
-                        console.log(`     ✅ Autopay: marked read, no forward`);
+                            `${routingRule.label} — marked read, no Bill.com forward`);
+                        console.log(`     ✅ Autopay: ${routingRule.label} — marked read, no forward`);
+                        continue;
+                    }
+
+                    if (routingRule.action === 'amazon_order') {
+                        // DECISION(2026-03-19): Amazon emails are routed to a dedicated
+                        // parser that extracts order data and matches to Slack requests.
+                        // Mark as read but do NOT archive — Will may want to reference.
+                        try {
+                            const { AmazonOrderParser } = await import('./workers/amazon-order-parser');
+                            const parser = new AmazonOrderParser();
+                            const emailText = this.extractEmailText(payload, snippet);
+                            await parser.processEmail({
+                                gmailMessageId: m.id!,
+                                from,
+                                subject,
+                                bodyText: emailText,
+                                type: routingRule.label,
+                            });
+                            // Mark as read only (keep in inbox for Will's reference)
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.id!,
+                                requestBody: { removeLabelIds: ["UNREAD"] }
+                            });
+                            await this.logActivity(supabase, from, subject, "AMAZON_ORDER",
+                                `${routingRule.label} — parsed and processed`);
+                            console.log(`     📦 Amazon: ${routingRule.label} — parsed`);
+                        } catch (err: any) {
+                            console.error(`     ❌ Amazon parser failed:`, err.message);
+                            await this.logActivity(supabase, from, subject, "AMAZON_ORDER",
+                                `${routingRule.label} — parser error: ${err.message}`);
+                        }
                         continue;
                     }
 
@@ -1584,7 +1629,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         // Group by intent — exclude ads from the recap (they're still logged to DB)
         const grouped: Record<string, typeof logs> = {};
         for (const log of logs) {
-            if (log.intent === "ADVERTISEMENT") continue; // ads are archived, no need to report
+            if (log.intent === "ADVERTISEMENT") continue;
             if (!grouped[log.intent]) grouped[log.intent] = [];
             grouped[log.intent].push(log);
         }

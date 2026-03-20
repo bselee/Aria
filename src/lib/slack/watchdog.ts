@@ -64,6 +64,7 @@ interface DetectedRequest {
     skuPOStatus: Map<string, string>;      // SKU (lowercase) → "On order PO#123 (×50)" or "❌ No PO"
     messageTs: string;             // Original Slack ts for thread replies & reactions
     threadTs?: string;             // Thread parent ts, if applicable
+    extractedUrls: string[];       // URLs found in the Slack message (for Amazon/one-off orders)
 }
 
 // Per-SKU Finale stock detail for intelligent replies
@@ -302,8 +303,19 @@ export class SlackWatchdog {
                 for (const ch of (result.channels || [])) {
                     if (!ch.is_member && !ch.is_im) continue;
 
-                    const name = ch.name || ch.id || "dm";
                     const isDM = ch.is_im === true;
+
+                    // DECISION(2026-03-19): DMs don't have a `name` property — Slack
+                    // returns undefined, so it was falling through to the raw channel ID
+                    // (e.g. "D04PQB36AS1"). For DMs, resolve the partner's real name
+                    // so the digest reads "DM with Parker McMahon" instead of gibberish.
+                    let name: string;
+                    if (isDM && ch.user) {
+                        const partnerName = await this.resolveUserName(ch.user);
+                        name = `DM with ${partnerName}`;
+                    } else {
+                        name = ch.name || ch.id || "unknown-channel";
+                    }
 
                     if (isDM || MONITORED_CHANNEL_NAMES.has(name)) {
                         // Full-monitor: process ALL messages
@@ -661,8 +673,12 @@ export class SlackWatchdog {
         // Step 7c: Auto-create draft POs for requested items with no existing PO
         // DECISION(2026-03-16): When someone requests products and they have no PO on order,
         // proactively create draft POs in Finale grouped by vendor. These are intended to remain as Draft POs for planning.
+        // DECISION(2026-03-19): Only create draft POs for items that genuinely need
+        // reordering (stockout ≤30d OR out of stock). Previously any requested SKU
+        // with no PO got a draft — even with plenty of stock (e.g., 14kg of ACP101).
+        // The needsReorder flag already captures the right threshold.
         const noPOItems = finalDetails.filter(d =>
-            d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl
+            d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl && d.needsReorder
         );
         if (noPOItems.length > 0 && !boxReport) {
             // Group by vendor
@@ -716,7 +732,18 @@ export class SlackWatchdog {
             }
         }
 
-        // Step 8: Queue the detected request (Telegram digest for Will)
+        // Step 8: Extract URLs from the Slack message for Amazon/one-off context
+        // DECISION(2026-03-19): Teammates often paste links to products (Amazon,
+        // supplier sites). Surface these in the digest so Will can click through
+        // directly instead of searching manually.
+        const extractedUrls: string[] = [];
+        // Slack formats links as <https://url|label> or <https://url>
+        const slackLinkPattern = /<(https?:\/\/[^|>]+)(?:\|[^>]*)?>/g;
+        for (const urlMatch of text.matchAll(slackLinkPattern)) {
+            extractedUrls.push(urlMatch[1]);
+        }
+
+        // Step 9: Queue the detected request (Telegram digest for Will)
         const request: DetectedRequest = {
             channel: channelName,
             channelId,
@@ -734,6 +761,7 @@ export class SlackWatchdog {
             skuPOStatus,
             messageTs,
             threadTs,
+            extractedUrls,
         };
 
         this.pendingRequests.push(request);
@@ -748,6 +776,9 @@ export class SlackWatchdog {
                 content: text,
                 metadata: {
                     channel: channelName,
+                    channelId,
+                    messageTs,
+                    threadTs,
                     userName,
                     confidence: analysis.confidence,
                     matchedProduct: match?.product?.name || null,
@@ -757,7 +788,36 @@ export class SlackWatchdog {
             });
         });
 
-        // Step 9: Mark as processed in dedup set
+        // DECISION(2026-03-19): Persist Amazon/one-off requests to slack_requests
+        // table so we can match Amazon confirmation emails back to the requester
+        // and notify them in their original Slack thread when the order ships.
+        const hasFinaleMatch = match?.product || finalDetails.some(d => d.found);
+        if (!hasFinaleMatch) {
+            setImmediate(async () => {
+                try {
+                    const supabase = createClient();
+                    if (!supabase) return;
+                    await supabase.from('slack_requests').insert({
+                        channel_id: channelId,
+                        channel_name: channelName,
+                        message_ts: messageTs,
+                        thread_ts: threadTs || null,
+                        requester_user_id: userId,
+                        requester_name: userName,
+                        original_text: text,
+                        items_requested: rawItems,
+                        quantity: analysis.quantity || null,
+                        extracted_urls: extractedUrls.length > 0 ? extractedUrls : null,
+                        status: 'pending',
+                    });
+                    console.log(`  📋 Slack request stored for Amazon order matching`);
+                } catch (err: any) {
+                    console.warn(`  ⚠️ Failed to store slack_request:`, err.message);
+                }
+            });
+        }
+
+        // Step 10: Mark as processed in dedup set
         this.processedRequests.add(dedupKey);
     }
 
@@ -792,12 +852,14 @@ POSITIVE — isProductRequest=true AND hasExplicitAsk=true:
 - "Running low on Z — need to restock"
 - "I need [X] for [project] by [date]"
 - "Can you grab some X?"
+- "Here is a list of items we could possibly order soon: SKU1, SKU2..."
+- "We're going to need [SKU] soon"
 - Messages with a clear directive directed at a buyer/manager
+- ANY message containing a list of raw SKUs (e.g. "BB106, FJG104, ALK101") tagged to buyers, even if the wording uses "possibly" or "maybe".
 
 PARTIAL — isProductRequest=true BUT hasExplicitAsk=false (do NOT alert):
 - "I'd like some X" / "It would be nice to have X" — desire, not a request
 - "X would be great" / "X would help" — wishful thinking
-- "Really I'd like X in here... but..." — trailing 'but' = they're NOT actually asking
 - "I was thinking about getting X" — hypothetical, no ask
 - Casual mention of a product in passing conversation
 
@@ -808,10 +870,10 @@ NEGATIVE — isProductRequest=false:
 - Meeting scheduling
 - Anything without a specific product mentioned
 
-KEY RULE: If the message trails off ("but...", "though...", "maybe...") or uses hedging language without a clear ask, set hasExplicitAsk=false. A real request has someone directing action.
-Set confidence < 0.5 for anything ambiguous.
+KEY RULE: A real request has someone directing action. If they list actual SKUs (like BB106, BASTM6-107, EM5L105) and ping buyers, it IS an explicit ask, even if they say "possibly" or "might need". Do NOT let trailing "but..." statements override a clear list of SKUs requested by a warehouse worker.
+Set confidence < 0.5 for anything truly ambiguous (no SKUs, unspecific names).
 
-MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, BLM209, ALK101, NC104"), set itemDescription to the first/primary one AND populate allItems with EVERY item mentioned as separate entries. Preserve exact SKU codes (like BLM207, S-445) as-is.`,
+MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, BB106, FJG104, ALK101, BASTM6-107"), set itemDescription to the first/primary one AND populate allItems with EVERY item mentioned as separate entries. Preserve exact SKU codes (like BLM207, S-445, 3.0BAGCF) as-is.`,
             prompt: text,
             schema: RequestExtractionSchema,
             schemaName: "ProductRequestAnalysis",
@@ -883,13 +945,13 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
      * Returns structured SkuStockDetail for use in both Slack replies and Telegram.
      * Also resolves the vendor/supplier for PO matching on urgent items.
      */
-    private async getDetailedStockContext(sku: string): Promise<SkuStockDetail> {
-        const emptyResult: SkuStockDetail = {
+    private async getDetailedStockContext(sku: string): Promise<SkuStockDetail & { demandQuantity?: number | null }> {
+        const emptyResult: SkuStockDetail & { demandQuantity?: number | null } = {
             sku, productName: null, onHand: null, onOrder: null, stockoutDays: null,
             incomingPOs: 0, incomingPODetails: [],
             found: false, recommendation: 'Not found in Finale',
             vendorName: null, vendorPartyUrl: null, unitCost: null,
-            reorderQty: null, needsReorder: false,
+            reorderQty: null, needsReorder: false, demandQuantity: null
         };
 
         try {
@@ -906,6 +968,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
                 supplier: po.supplier,
             }));
             const reorderQty = profile.reorderQuantityToOrder;
+            const demandQuantity = profile.demandQuantity;
 
             // Resolve vendor + product name from product detail
             // DECISION(2026-03-04): We do the extra REST call because
@@ -949,6 +1012,8 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
                 recommendation = `Already on order — ${incomingPOs} PO${incomingPOs > 1 ? 's' : ''} incoming.`;
             } else if (onHand !== null && onHand === 0) {
                 recommendation = `We're out! Getting this ordered ASAP.`;
+            } else if (reorderQty !== null && reorderQty > 0) {
+                recommendation = `Finale suggests ordering ${reorderQty}. (Demand velocity: ${demandQuantity ?? 'untracked'})`;
             } else {
                 recommendation = `In Finale — checking on it.`;
             }
@@ -957,7 +1022,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
                 sku, productName, onHand, onOrder, stockoutDays,
                 incomingPOs, incomingPODetails,
                 found: true, recommendation,
-                vendorName, vendorPartyUrl, unitCost, reorderQty, needsReorder,
+                vendorName, vendorPartyUrl, unitCost, reorderQty, needsReorder, demandQuantity,
             };
         } catch {
             return { ...emptyResult, recommendation: 'Finale lookup error' };
@@ -980,12 +1045,24 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
 
         const parts: string[] = [];
         if (detail.onHand !== null) parts.push(`${detail.onHand.toLocaleString()} on hand`);
+        else parts.push(`Stock untracked/dropship`);
+
         if (detail.onOrder !== null && detail.onOrder > 0) parts.push(`${detail.onOrder} on order`);
+        
         if (detail.stockoutDays !== null) {
             if (detail.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${detail.stockoutDays}d!`);
             else if (detail.stockoutDays <= 30) parts.push(`Stockout in ${detail.stockoutDays}d`);
             else parts.push(`${detail.stockoutDays}d runway`);
         }
+        
+        if (detail.demandQuantity !== null && detail.demandQuantity > 0) {
+            parts.push(`Demand qty: ${detail.demandQuantity}`);
+        }
+        
+        if (detail.reorderQty !== null && detail.reorderQty > 0) {
+            parts.push(`Finale suggests ordering: ${detail.reorderQty}`);
+        }
+
         if (detail.incomingPOs > 0) parts.push(`${detail.incomingPOs} PO incoming`);
         return parts.length > 0 ? parts.join(' · ') : `in Finale, no stock data`;
     }
@@ -1090,10 +1167,13 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             this.userNames.set(userId, name);
             return name;
         } catch {
-            // DECISION(2026-03-11): Never expose raw user IDs (e.g., "U056HD83BK5").
-            // If we can't resolve the name, use a human-readable fallback.
-            // The only consumer now is Telegram digest — Slack replies are removed.
-            return 'a team member';
+            // DECISION(2026-03-19): Always show the real person's name in PO notes
+            // and digests. If we can't resolve via Slack API, include the raw userId
+            // so Will can identify who asked. 'a team member' was too anonymous —
+            // PO memos need accountability tracing.
+            const fallback = `Slack user ${userId}`;
+            this.userNames.set(userId, fallback);
+            return fallback;
         }
     }
 
@@ -1123,13 +1203,23 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
             const urgencyEmoji = req.analysis.urgency === "high" ? "🔴" :
                 req.analysis.urgency === "medium" ? "🟡" : "🟢";
 
+            // DECISION(2026-03-19): Detect Amazon/one-off orders — items with no
+            // Finale catalog match AND no meaningful Finale stock data. These are
+            // commodity/supply items that Will orders directly on Amazon.
+            const hasFinaleData = req.matchedProduct || (req.finaleContext && !req.finaleContext.includes('not found in Finale'));
+            const isAmazonOneOff = !hasFinaleData;
+
             const matchLine = req.matchedProduct
                 ? `✅ Catalog match: \`${req.matchedProduct.sku}\` — ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
-                : `⚠️ No catalog match — see Finale data below`;
+                : isAmazonOneOff
+                    ? `🛒 Amazon/one-off order — not in Finale catalog`
+                    : `⚠️ No catalog match — see Finale data below`;
 
-            const poLine = req.activePO
-                ? `📋 Active PO: #${req.activePO} — ${req.eta}`
-                : `📭 No active PO found`;
+            const poLine = isAmazonOneOff
+                ? ''  // Skip PO line for Amazon orders — irrelevant
+                : req.activePO
+                    ? `📋 Active PO: #${req.activePO} — ${req.eta}`
+                    : `📭 No active PO found`;
 
             // DECISION(2026-03-16): Use pre-resolved SKU descriptions so Will can
             // instantly see what products people are asking for without manual lookup.
@@ -1144,20 +1234,31 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
                 const desc = req.skuDescriptions.get(item.toLowerCase());
                 const po = req.skuPOStatus.get(item.toLowerCase()) || '';
                 let line = desc ? `\`${item}\` — ${desc}` : `\`${item}\``;
-                if (po) line += `\n      ${po}`;
+                if (po && !isAmazonOneOff) line += `\n      ${po}`;
                 return line;
             });
 
+            // DECISION(2026-03-19): DM channels show as "DM with Name" — don't
+            // redundantly say "Name in #DM with Name". For DMs, just show "Name (DM)".
+            const isDMChannel = req.channel.startsWith('DM with ');
+            const locationLabel = isDMChannel ? '(DM)' : `in #${req.channel}`;
+
             message +=
-                `${urgencyEmoji} *${req.userName}* in #${req.channel}\n` +
+                `${urgencyEmoji} *${req.userName}* ${locationLabel}\n` +
                 `💬 _"${req.originalText.substring(0, 120)}"_\n` +
                 `📦 Wants:\n${itemsWithDescriptions.map(i => `  • ${i}`).join('\n')}` +
                 `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
                 `${matchLine}\n` +
-                `${poLine}\n`;
+                `${poLine ? poLine + '\n' : ''}`;
+
+            // Surface extracted URLs prominently for Amazon/one-off orders
+            if (req.extractedUrls.length > 0) {
+                message += `🔗 Links:\n${req.extractedUrls.map(u => `  • ${u}`).join('\n')}\n`;
+            }
 
             // Add Finale stock context (per-SKU breakdown if multiple)
-            if (req.finaleContext) {
+            // Skip for Amazon/one-off orders — "not found in Finale" is already stated
+            if (req.finaleContext && !isAmazonOneOff) {
                 message += `📈 Finale:\n${req.finaleContext}\n`;
             }
 
@@ -1194,8 +1295,16 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
 
         let message = `📦 *Reorder Needed: ${detail.sku}*\n\n`;
         message += `Requested by ${requesterName} in #${channelName}\n`;
-        message += `Stock: ${detail.onHand?.toLocaleString() ?? '?'} on hand`;
+        message += `Stock: ${detail.onHand?.toLocaleString() ?? 'Untracked'} on hand`;
         if (detail.stockoutDays !== null) message += ` \u00b7 ${detail.stockoutDays}d until stockout`;
+        message += `\n`;
+        
+        if (detail.demandQuantity !== null && detail.demandQuantity > 0) {
+            message += `Demand velocity: ${detail.demandQuantity}\n`;
+        }
+        if (detail.reorderQty !== null && detail.reorderQty > 0) {
+            message += `Finale suggests: ${detail.reorderQty} units\n`;
+        }
         message += `\n`;
 
         if (detail.vendorName) {
@@ -1243,6 +1352,8 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
      * Sends a Telegram notification when a draft PO is auto-created for review.
      * DECISION(2026-03-16): Aria proactively creates drafts for items with no PO.
      * These remain as draft POs to act as a planning and request tracking tool.
+     * DECISION(2026-03-19): Now includes expected arrival date (today + 14 days)
+     * and the requester's real name for PO accountability.
      */
     private async sendDraftPOCreatedToTelegram(
         orderId: string,
@@ -1256,19 +1367,35 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "BLM207, B
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
 
+        // DECISION(2026-03-19): Default expected arrival = today + 14 days.
+        // Once committed, the actual vendor lead time may differ, but 14d is
+        // a reasonable planning baseline for the initial draft PO notification.
+        const expectedDate = new Date();
+        expectedDate.setDate(expectedDate.getDate() + 14);
+        const expectedDateStr = expectedDate.toLocaleDateString('en-US', {
+            weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
+            timeZone: 'America/Denver',
+        });
+
         const itemLines = items.map(d => {
             const name = d.productName ? `${d.sku} — ${d.productName}` : d.sku;
             const qty = Math.max(1, d.reorderQty ?? 1);
-            const stock = d.onHand !== null ? `${d.onHand.toLocaleString()} on hand` : 'stock unknown';
-            const runway = d.stockoutDays !== null ? `${d.stockoutDays}d runway` : '';
-            const context = [stock, runway].filter(Boolean).join(' · ');
+            
+            const contextParts: string[] = [];
+            contextParts.push(d.onHand !== null ? `${d.onHand.toLocaleString()} on hand` : 'Stock untracked');
+            if (d.stockoutDays !== null) contextParts.push(`${d.stockoutDays}d runway`);
+            if (d.demandQuantity !== null && d.demandQuantity > 0) contextParts.push(`Demand: ${d.demandQuantity}`);
+            if (d.reorderQty !== null && d.reorderQty > 0) contextParts.push(`Sug. Reorder: ${d.reorderQty}`);
+            
+            const context = contextParts.join(' · ');
             return `  • ×${qty} ${name}\n      ${context}`;
         }).join('\n');
 
         const message =
             `🆕 *Draft PO Created* — PO #${orderId}\n\n` +
             `Vendor: *${vendorName}*\n` +
-            `Triggered by: ${requesterName} in #${channelName}\n\n` +
+            `Requested by: *${requesterName}* in #${channelName}\n` +
+            `📅 Expected arrival: ~${expectedDateStr} (14d from today)\n\n` +
             `Items (qty based on Finale demand):\n${itemLines}\n\n` +
             `🔗 [Open in Finale](${finaleUrl})\n` +
             `📝 _Intended to remain as a Draft PO for planning/review_`;

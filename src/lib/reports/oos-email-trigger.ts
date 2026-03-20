@@ -14,7 +14,7 @@ import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../gmail/auth';
 import { FinaleClient } from '../finale/client';
 import { parseStockieCSV, enrichOOSItems, generateOOSExcel } from './oos-report';
-import type { OOSReportResult, EnrichedOOSItem } from './oos-report';
+import type { OOSReportResult, EnrichedOOSItem, EnrichedPOInfo } from './oos-report';
 import { CalendarClient } from '../google/calendar';
 import { BuildParser, type ParsedBuild } from '../intelligence/build-parser';
 import path from 'path';
@@ -272,6 +272,12 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
 
     // Email the report to colleagues with enriched detail in the body
     await emailReport(gmail, result, enrichedItems, scheduledBuilds, buildBlockingMap);
+
+    // Build Slack mrkdwn body for cross-posting to #purchasing
+    // DECISION(2026-03-19): Single unified morning Slack post mirrors the email body.
+    // Built here so ops-manager can append Active Purchases and post once.
+    result.slackBody = buildSlackBody(result, enrichedItems, scheduledBuilds, buildBlockingMap);
+    console.log(`📋 [OOS-Trigger] Slack body built (${result.slackBody.length} chars)`);
 
     // Label the email as processed to avoid re-triggering
     await labelEmailAsProcessed(gmail, messageId);
@@ -842,6 +848,192 @@ function sect(title: string, accent: string, routeKey: string, content: string):
 function trunc(str: string, max: number): string {
     return str.length <= max ? str : str.slice(0, max - 1) + '\u2026';
 }
+
+// ──────────────────────────────────────────────────
+// SLACK BODY BUILDER (mirrors buildEmailBody for #purchasing)
+// ──────────────────────────────────────────────────
+
+/**
+ * Build a Slack mrkdwn version of the OOS report that mirrors the email body.
+ * Same sections: Needs Ordering, Needs Review, Aging, On Order, Received,
+ * Internal Builds, Not in Finale. Toned-down formatting — no heavy separators,
+ * title-case headers, single-line items.
+ *
+ * DECISION(2026-03-19): This is the single source of OOS visibility in Slack.
+ * Ops-manager appends Active Purchases to create one unified morning post.
+ *
+ * @param result          - Categorized report result from generateOOSExcel
+ * @param items           - Enriched OOS items with PO/tracking data
+ * @param scheduledBuilds - Calendar builds parsed from Google Calendar
+ * @param buildBlockingMap - Per-SKU BOM blocking analysis
+ * @returns Slack mrkdwn text ready for chat.postMessage
+ */
+export function buildSlackBody(
+    result: OOSReportResult,
+    items: EnrichedOOSItem[],
+    scheduledBuilds: ParsedBuild[],
+    buildBlockingMap: Map<string, BuildBlockingInfo>,
+): string {
+    const urgent = items.filter(i => result.needsOrder.includes(i.sku));
+    const aging = items.filter(i => result.agingPOs.includes(i.sku));
+    const onOrder = items.filter(i => result.onOrder.includes(i.sku));
+    const builds = items.filter(i => result.internalBuild.includes(i.sku));
+    const missing = items.filter(i => result.notInFinale.includes(i.sku));
+    const receivedItems = items.filter(i => result.received.includes(i.sku));
+    const reviewItems = items.filter(i => result.needsReview.includes(i.sku));
+
+    // Build schedule map (same logic as email builder)
+    const buildScheduleMap = new Map<string, ParsedBuild>();
+    for (const b of scheduledBuilds) {
+        const key = b.sku.toUpperCase();
+        if (!buildScheduleMap.has(key) || b.buildDate < buildScheduleMap.get(key)!.buildDate) {
+            buildScheduleMap.set(key, b);
+        }
+    }
+
+    const findScheduledBuild = (sku: string): ParsedBuild | undefined => {
+        const upper = sku.toUpperCase();
+        if (buildScheduleMap.has(upper)) return buildScheduleMap.get(upper);
+        for (const [calSku, build] of buildScheduleMap) {
+            if (upper.startsWith(calSku) && calSku.length >= 4) return build;
+        }
+        for (const [calSku, build] of buildScheduleMap) {
+            if (calSku.startsWith(upper) && upper.length >= 4) return build;
+        }
+        return undefined;
+    };
+
+    // Tagline — congruent with email
+    const tagline = urgent.length === 0
+        ? 'Everything has a PO or a plan. Nice.'
+        : urgent.length <= 2
+            ? `${urgent.length} item${urgent.length > 1 ? 's' : ''} without a PO. Probably worth a call.`
+            : `${urgent.length} items sitting with no PO. Time to pick up the phone.`;
+
+    const shortDate = new Date().toLocaleDateString('en-US', {
+        weekday: 'long', month: 'long', day: 'numeric',
+        timeZone: 'America/Denver',
+    });
+
+    let msg = `*Stock Out Digest* — ${shortDate}  ·  ${result.totalItems} items flagged\n`;
+    msg += `${tagline}\n\n`;
+
+    // Stat bar
+    msg += `${urgent.length} Need PO  ·  ${reviewItems.length} Review  ·  ${aging.length} Aging  ·  ${onOrder.length} On Order  ·  ${receivedItems.length} Received  ·  ${builds.length} Builds  ·  ${missing.length} Not Found`;
+
+    // ── Needs Ordering ──
+    if (urgent.length > 0) {
+        msg += `\n\n*Needs Ordering — No PO on File*  _Purchasing_`;
+        for (const item of urgent) {
+            const supplier = item.finaleSupplier.split(';')[0]?.replace(/\s*\(\$[\d.]+\)/, '') || '—';
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 40)} — ${supplier}`;
+        }
+    }
+
+    // ── Needs Review ──
+    if (reviewItems.length > 0) {
+        msg += `\n\n*Needs Review — Do Not Reorder*  _Purchasing_`;
+        for (const item of reviewItems) {
+            const shortStatus = item.actionRequired
+                .replace(/^REVIEW — /, '')
+                .replace(/\. Take down listing or reorder\?$/, '');
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 40)} — _${shortStatus}_`;
+        }
+    }
+
+    // ── Aging POs ──
+    if (aging.length > 0) {
+        msg += `\n\n*Aging POs — Follow Up with Vendor*  _Purchasing / Logistics_`;
+        for (const item of aging) {
+            const po = item.openPOs[0];
+            const age = po ? Math.floor((Date.now() - new Date(po.orderDate).getTime()) / 86_400_000) : 0;
+            const tracking = slackTrackingLink(po);
+            const poLink = po ? `<${po.finaleUrl}|${po.orderId}>` : '—';
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 35)} — ${poLink} · ${age}d old · ${tracking}`;
+        }
+    }
+
+    // ── On Order ──
+    if (onOrder.length > 0) {
+        msg += `\n\n*On Order — POs in Progress*  _Purchasing / Logistics_`;
+        for (const item of onOrder) {
+            const po = item.openPOs[0];
+            const eta = relativeETA(po?.expectedDelivery || null);
+            const tracking = slackTrackingLink(po);
+            const poLink = po ? `<${po.finaleUrl}|${po.orderId}>` : '—';
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 35)} — ${poLink} · ${eta.text} · ${tracking}`;
+        }
+    }
+
+    // ── Received ──
+    if (receivedItems.length > 0) {
+        msg += `\n\n*Received — Still OOS*  _Receiving / Ops_`;
+        for (const item of receivedItems) {
+            const po = item.openPOs[0];
+            const poLink = po ? `<${po.finaleUrl}|${po.orderId}>` : '—';
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 40)} — ${poLink} · Received`;
+        }
+    }
+
+    // ── Internal Builds ──
+    if (builds.length > 0) {
+        const MAX_DISPLAY = 5;
+        msg += `\n\n*Internal Builds*  _Manufacturing_`;
+        const displayed = builds.slice(0, MAX_DISPLAY);
+        for (const item of displayed) {
+            const sched = findScheduledBuild(item.sku);
+            const blocking = buildBlockingMap.get(item.sku.toUpperCase());
+            const isBlocked = blocking && blocking.components.some(c => c.isBlocking);
+
+            let schedPart: string;
+            if (sched) {
+                const rel = relativeETA(sched.buildDate);
+                const facility = sched.designation === 'SOIL' ? 'Soil' : 'MFG';
+                schedPart = `${rel.text} · ${facility} · ${sched.quantity} units`;
+            } else {
+                schedPart = 'No build scheduled';
+            }
+
+            let statusPart: string;
+            if (isBlocked) {
+                const blockers = blocking!.components.filter(c => c.isBlocking);
+                const names = blockers.slice(0, 2).map(b => b.componentSku).join(', ');
+                statusPart = `BLOCKED: awaiting ${names}`;
+            } else if (!blocking || !blocking.hasBOM) {
+                statusPart = 'No BOM — needs setup';
+            } else if (sched) {
+                statusPart = 'Components ready';
+            } else {
+                statusPart = 'Ready to build';
+            }
+
+            msg += `\n\`${item.sku}\`  ${trunc(item.productName, 35)} — ${schedPart} · ${statusPart}`;
+        }
+        if (builds.length > MAX_DISPLAY) {
+            msg += `\n_+${builds.length - MAX_DISPLAY} more builds_`;
+        }
+    }
+
+    // ── Not in Finale ──
+    if (missing.length > 0) {
+        msg += `\n\n*Not in Finale*  _Setup / Admin_`;
+        msg += `\n` + missing.map(i => `\`${i.sku}\``).join('  ');
+    }
+
+    msg += `\n\n_Full spreadsheet attached to the email report_`;
+
+    return msg;
+}
+
+/** Format tracking info for Slack — link if available, italic fallback */
+function slackTrackingLink(po?: EnrichedPOInfo): string {
+    if (!po) return '_awaiting ship_';
+    if (po.trackingLinks?.length) {
+        return `<${po.trackingLinks[0]}|${po.carrier || 'Track'} \u2192>`;
+    }
+    return '_awaiting ship_';
+}
+
 
 // ──────────────────────────────────────────────────
 // HELPERS
