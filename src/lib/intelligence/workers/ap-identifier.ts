@@ -26,6 +26,47 @@ import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
 import { FinaleClient } from "../../finale/client";
 import { Telegraf } from "telegraf";
 
+// ── SENDER BLOCKLIST ──────────────────────────────────────────────
+// DECISION(2026-03-20): Emails from these senders/domains must NEVER
+// be forwarded to Bill.com. They are either internal, autopay leases,
+// or system-generated bounces. Marked read + archived silently.
+const SENDER_BLOCKLIST: Array<{ type: 'domain' | 'contains' | 'exact'; value: string; label: string }> = [
+    // Internal — our own outbound emails should never be treated as invoices
+    { type: 'exact', value: 'bill.selee@buildasoil.com', label: 'Internal (bill.selee)' },
+    { type: 'exact', value: 'ap@buildasoil.com', label: 'Internal (ap)' },
+
+    // Toyota Commercial Finance — lease autopay, PDF says "Do Not Pay"
+    { type: 'contains', value: 'billtrust.com', label: 'Toyota/TICF (Autopay Lease)' },
+    { type: 'contains', value: 'toyota', label: 'Toyota (Autopay Lease)' },
+
+    // Bounce / NDR addresses — never invoices
+    { type: 'contains', value: 'postmaster@', label: 'Postmaster (Bounce)' },
+    { type: 'contains', value: 'mailer-daemon', label: 'Mailer Daemon (Bounce)' },
+    { type: 'contains', value: 'noreply@google.com', label: 'Google System' },
+];
+
+// ── SUBJECT BLOCKLIST ──────────────────────────────────────────────
+// Subjects matching these patterns are auto-archived, never forwarded.
+const SUBJECT_SKIP_PATTERNS: RegExp[] = [
+    /undeliverable/i,
+    /delivery.*failed/i,
+    /returned.*mail/i,
+    /auto[-\s]?reply/i,
+    /out of office/i,
+];
+
+// ── PDF CONTENT BLOCKLIST ─────────────────────────────────────────
+// If the first ~2KB of extracted PDF text matches any of these, the
+// invoice is blocked from Bill.com forwarding.
+const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+    { pattern: /do\s*not\s*pay/i, reason: 'PDF contains "Do Not Pay"' },
+    { pattern: /this\s+is\s+not\s+a\s+bill/i, reason: 'PDF states "This is not a bill"' },
+    { pattern: /informational\s+purposes\s+only/i, reason: 'PDF is informational only' },
+    { pattern: /already\s+paid/i, reason: 'PDF says "Already Paid"' },
+    { pattern: /balance\s*:?\s*\$?\s*0\.00/i, reason: 'PDF shows $0.00 balance' },
+    { pattern: /paid\s+in\s+full/i, reason: 'PDF says "Paid in Full"' },
+];
+
 export class APIdentifierAgent {
 
     private bot: Telegraf | null;
@@ -171,6 +212,50 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     .update({ processed_by_ap: true })
                     .eq('id', m.id);
 
+                const subject = m.subject || "No Subject";
+                const from = m.from_email || "Unknown Sender";
+                const snippet = m.body_snippet || "";
+                const fromLower = from.toLowerCase();
+
+                // ── SENDER BLOCKLIST CHECK ─────────────────────────────────
+                // DECISION(2026-03-20): Block internal, Toyota/TICF, and bounce
+                // emails before any other processing. These must NEVER reach
+                // Bill.com regardless of PDF content or subject.
+                const blockedSender = SENDER_BLOCKLIST.find(rule => {
+                    if (rule.type === 'exact') return fromLower === rule.value.toLowerCase();
+                    if (rule.type === 'domain') return fromLower.includes(`@${rule.value.toLowerCase()}`);
+                    return fromLower.includes(rule.value.toLowerCase());
+                });
+                if (blockedSender) {
+                    console.log(`   🚫 Blocked sender: "${subject}" from ${from} — ${blockedSender.label}`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.gmail_message_id,
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                        });
+                    } catch (e) { /* ignore */ }
+                    await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                        `Blocked: ${blockedSender.label} — archived without forwarding`);
+                    continue;
+                }
+
+                // ── SUBJECT SKIP CHECK ─────────────────────────────────────
+                const subjectBlocked = SUBJECT_SKIP_PATTERNS.find(p => p.test(subject));
+                if (subjectBlocked) {
+                    console.log(`   🚫 Blocked subject: "${subject}" — matches skip pattern`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.gmail_message_id,
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                        });
+                    } catch (e) { /* ignore */ }
+                    await this.logActivity(supabase, from, subject, "BLOCKED_SUBJECT",
+                        `Blocked: subject matches skip pattern — archived without forwarding`);
+                    continue;
+                }
+
                 // Fetch full message payload from Gmail ONLY to get the PDF buffers 
                 // We could skip fetching if !m.has_pdf, but we'll fetch anyway to safely apply labels.
                 let msg: any;
@@ -188,10 +273,6 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     continue;
                 }
                 const payload = msg.data.payload;
-
-                const subject = m.subject || "No Subject";
-                const from = m.from_email || "Unknown Sender";
-                const snippet = m.body_snippet || "";
 
                 console.log(`   Evaluating Email: "${subject}" from ${from}`);
 
@@ -389,6 +470,41 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             const attachmentData = response.data.data;
                             if (!attachmentData) continue;
                             const buffer = Buffer.from(attachmentData, "base64url");
+
+                            // ── PDF CONTENT SAFETY CHECK ──────────────────────────
+                            // DECISION(2026-03-20): Before forwarding to Bill.com,
+                            // scan the first ~2KB of PDF text for block patterns
+                            // ("Do Not Pay", "This is not a bill", $0.00 balance).
+                            // This catches Toyota/TICF-style invoices that slip past
+                            // the sender blocklist via a different sender address.
+                            let pdfTextPreview = '';
+                            try {
+                                const { extractPDF } = await import('../../pdf/extractor');
+                                const extracted = await extractPDF(buffer);
+                                pdfTextPreview = extracted.rawText.slice(0, 2000);
+                            } catch {
+                                // PDF extraction failed — don't block, let it through
+                                console.warn(`     ⚠️ PDF text extraction failed for ${capturedFilename} — skipping content check`);
+                            }
+
+                            if (pdfTextPreview) {
+                                const blockedContent = PDF_BLOCK_PATTERNS.find(p => p.pattern.test(pdfTextPreview));
+                                if (blockedContent) {
+                                    console.log(`     🚫 PDF BLOCKED: ${capturedFilename} — ${blockedContent.reason}`);
+                                    await this.logActivity(supabase, from, subject, "BLOCKED_PDF_CONTENT",
+                                        `PDF blocked from Bill.com: ${blockedContent.reason} (${capturedFilename})`);
+                                    // Mark email as read and archive — do not forward
+                                    try {
+                                        await gmail.users.messages.modify({
+                                            userId: "me",
+                                            id: m.gmail_message_id,
+                                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                                        });
+                                    } catch (e) { /* ignore */ }
+                                    attachmentIndex++;
+                                    continue; // Skip this attachment, do NOT queue
+                                }
+                            }
 
                             // Upload to Supabase Storage
                             const storagePath = `${m.gmail_message_id}/${Date.now()}_${capturedFilename}`;

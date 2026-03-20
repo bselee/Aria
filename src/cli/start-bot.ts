@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file    start-bot.ts
  * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
  *          Gemini (primary chat) with automatic OpenRouter fallback, and
@@ -8,8 +8,8 @@
  * @updated 2026-03-18
  *
  * DECISION(2026-03-18): Chat now uses a full provider chain with tool support:
- *   Gemini Flash → OpenRouter Claude Haiku 4.5 → OpenRouter Gemini Flash →
- *   OpenRouter GPT-4o Mini → unifiedTextGeneration (last resort, no tools).
+ *   Gemini Flash â†’ OpenRouter Claude Haiku 4.5 â†’ OpenRouter Gemini Flash â†’
+ *   OpenRouter GPT-4o Mini â†’ unifiedTextGeneration (last resort, no tools).
  * Previously Gemini was called directly and failures lost tool calling entirely.
  */
 
@@ -30,6 +30,7 @@ import {
     TELEGRAM_CONFIG
 } from '../config/persona';
 import { OpsManager } from '../lib/intelligence/ops-manager';
+import { registerAllCommands } from './commands';
 import { getProviderStatus } from '../lib/intelligence/llm';
 import { geminiLimiter } from '../lib/intelligence/rate-limiter';
 import { DIRECT_MODELS, OPENROUTER_CHAT_CHAIN } from '../lib/intelligence/models';
@@ -51,7 +52,7 @@ import {
     type ReconciliationResult,
 } from '../lib/finale/reconciler';
 
-// chatId → pending invoice ID. Cleared after use (or on next text message).
+// chatId â†’ pending invoice ID. Cleared after use (or on next text message).
 const pendingPoEntry = new Map<number, string>();
 import {
     storePendingPOSend,
@@ -61,9 +62,9 @@ import {
     commitAndSendPO,
 } from '../lib/purchasing/po-sender';
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // HELPERS
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Build the Telegram message text for a restored (post-restart) approval prompt.
@@ -79,43 +80,43 @@ function buildRestoredApprovalMessage(result: ReconciliationResult, approvalId: 
     for (const pc of result.priceChanges ?? []) {
         if (pc.verdict === 'needs_approval') {
             const delta = (pc.poPrice != null && pc.invoicePrice != null)
-                ? ` ($${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)})`
+                ? ` ($${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)})`
                 : '';
-            changes.push(`• ${pc.description || pc.productId || '?'}${delta}`);
+            changes.push(`â€¢ ${pc.description || pc.productId || '?'}${delta}`);
         }
     }
     for (const fc of result.feeChanges ?? []) {
         if (fc.verdict === 'needs_approval') {
-            changes.push(`• ${fc.feeType}: $${(fc.amount ?? 0).toFixed(2)}`);
+            changes.push(`â€¢ ${fc.feeType}: $${(fc.amount ?? 0).toFixed(2)}`);
         }
     }
 
     const changeList = changes.length > 0
-        ? changes.slice(0, 5).join('\n') + (changes.length > 5 ? `\n…+${changes.length - 5} more` : '')
+        ? changes.slice(0, 5).join('\n') + (changes.length > 5 ? `\nâ€¦+${changes.length - 5} more` : '')
         : '(no itemized changes)';
 
     const impact = result.totalDollarImpact != null ? `$${result.totalDollarImpact.toFixed(2)}` : '?';
 
     return (
-        `🔄 *RESTORED APPROVAL* _(bot restarted — ${minutesLeft}m remaining)_\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `ðŸ”„ *RESTORED APPROVAL* _(bot restarted â€” ${minutesLeft}m remaining)_\n` +
+        `â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n` +
         `*Vendor:* ${vendor}\n` +
-        `*Invoice:* ${invNum}  →  *PO:* ${poNum}\n` +
+        `*Invoice:* ${invNum}  â†’  *PO:* ${poNum}\n` +
         `*Impact:* ${impact}\n\n` +
         `*Changes pending approval:*\n${changeList}\n\n` +
         `_Tap Approve or Reject below_`
     );
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CLIENT INITIALIZATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
 const perplexityKey = process.env.PERPLEXITY_API_KEY;
 
 if (!token) {
-    console.error('❌ TELEGRAM_BOT_TOKEN is not set in .env.local');
+    console.error('âŒ TELEGRAM_BOT_TOKEN is not set in .env.local');
     process.exit(1);
 }
 
@@ -131,23 +132,23 @@ const perplexity = perplexityKey ? new OpenAI({
 const finale = new FinaleClient();
 
 // DECISION(2026-03-06): Chat uses Gemini 2.0 Flash (free) via Vercel AI SDK.
-// Previously used OpenRouter → Claude 3.5 Haiku (paid).
+// Previously used OpenRouter â†’ Claude 3.5 Haiku (paid).
 // Rollback: set OPENROUTER_API_KEY in .env.local to re-enable in llm.ts chain.
-console.log('🚀 ARIA BOT BOOTING...');
-console.log(`🤖 Telegram: ✅ Connected`);
-console.log(`🧠 Chat LLM: ✅ Gemini 2.0 Flash (free)`);
-console.log(`🧠 Background LLM: ✅ Unified chain (Gemini → OpenRouter → OpenAI → Anthropic)`);
-console.log(`🔍 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configured'}`);
-console.log(`🎙️ ElevenLabs: ${elevenLabsKey ? '✅ Loaded' : '❌ Not Configured'}`);
-console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not Configured'}`);
+console.log('ðŸš€ ARIA BOT BOOTING...');
+console.log(`ðŸ¤– Telegram: âœ… Connected`);
+console.log(`ðŸ§  Chat LLM: âœ… Gemini 2.0 Flash (free)`);
+console.log(`ðŸ§  Background LLM: âœ… Unified chain (Gemini â†’ OpenRouter â†’ OpenAI â†’ Anthropic)`);
+console.log(`ðŸ” Perplexity: ${perplexityKey ? 'âœ… Loaded' : 'âŒ Not Configured'}`);
+console.log(`ðŸŽ™ï¸ ElevenLabs: ${elevenLabsKey ? 'âœ… Loaded' : 'âŒ Not Configured'}`);
+console.log(`ðŸ“¦ Finale: ${process.env.FINALE_API_KEY ? 'âœ… Connected' : 'âŒ Not Configured'}`);
 
 // DECISION(2026-02-26): Run the Slack watchdog inside the bot process so
 // /requests can read live pending requests. Eliminates need for IPC/shared DB.
 let globalWatchdog: SlackWatchdog | null = null;
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // COMMANDS
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 bot.start((ctx) => {
     const username = ctx.from?.first_name || 'Will';
@@ -156,864 +157,16 @@ bot.start((ctx) => {
 
 const BOT_START_TIME = new Date();
 
-bot.command('status', async (ctx) => {
-    const chatId = ctx.from?.id || ctx.chat.id;
-    const uptimeMs = Date.now() - BOT_START_TIME.getTime();
-    const uptimeMin = Math.floor(uptimeMs / 60000);
-    const uptimeHrs = Math.floor(uptimeMin / 60);
-    const uptimeStr = uptimeHrs > 0
-        ? `${uptimeHrs}h ${uptimeMin % 60}m`
-        : `${uptimeMin}m`;
-
-    const historyLen = chatHistory[chatId]?.length || 0;
-
-    // Check Supabase connectivity
-    let dbStatus = '❓ Not checked';
-    try {
-        const { createClient } = await import('../lib/supabase');
-        const db = createClient();
-        if (!db) {
-            dbStatus = '❌ Not configured';
-        } else {
-            const { error } = await db.from('vendors').select('id').limit(1);
-            dbStatus = error ? `❌ ${error.message}` : '✅ Connected';
-        }
-    } catch (e: any) {
-        dbStatus = `❌ ${e.message}`;
-    }
-
-    // Check memory/Pinecone
-    let memStatus = '❓ Not checked';
-    try {
-        const { recall } = await import('../lib/intelligence/memory');
-        const mems = await recall('vendor', { topK: 1 });
-        memStatus = mems.length > 0 ? `✅ ${mems.length} result(s) (seeded)` : '⚠️ No memories (run /seed)';
-    } catch (e: any) {
-        memStatus = `❌ ${e.message}`;
-    }
-
-    const recentHistory = (chatHistory[chatId] || [])
-        .slice(-4)
-        .map((m: any) => `  ${m.role === 'user' ? '👤' : '🤖'} ${String(m.content).slice(0, 60).replace(/\n/g, ' ')}...`)
-        .join('\n') || '  (empty)';
-
-    // Build LLM provider health report
-    const providerStatuses = getProviderStatus();
-    const llmHealthLines = providerStatuses.map(p => {
-        const icon = p.status === 'healthy' ? '✅' : '⚠️';
-        return `  ${icon} ${p.name} — ${p.detail}`;
-    }).join('\n');
-
-    ctx.reply(
-        `🛰️ *Aria Runtime Status*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `⏱️ Uptime: \`${uptimeStr}\`\n` +
-        `🚀 Started: \`${BOT_START_TIME.toLocaleTimeString('en-US', { timeZone: 'America/Denver' })} MT\`\n\n` +
-        `*Integrations:*\n` +
-        `🤖 Chat LLM: ✅ Gemini 2.0 Flash (free)\n` +
-        `🗄️ Supabase: ${dbStatus}\n` +
-        `🧠 Memory (Pinecone): ${memStatus}\n` +
-        `📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not configured'}\n` +
-        `🔍 Perplexity: ${perplexityKey ? '✅ Ready' : '❌ Not configured'}\n` +
-        `🦊 Slack Watchdog: ${globalWatchdog ? '✅ Running' : '❌ Not started'}\n` +
-        `🎙️ Voice: ${elevenLabsKey ? '✅ ElevenLabs' : '❌ Not configured'}\n\n` +
-        `*🧠 Background LLM Chain:*\n` +
-        `${llmHealthLines}\n\n` +
-        `*Conversation:*\n` +
-        `💬 History: \`${historyLen} messages\` in context\n` +
-        `${recentHistory}\n\n` +
-        `_/clear to reset conversation context_`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-// /clear — reset conversation history for this chat
-bot.command('clear', (ctx) => {
-    const chatId = ctx.from?.id || ctx.chat.id;
-    const count = chatHistory[chatId]?.length || 0;
-    chatHistory[chatId] = [];
-    delete chatLastActive[chatId];
-    ctx.reply(`🗑️ Cleared ${count} messages from context. Fresh start.`, { parse_mode: 'Markdown' });
-});
-
-// /memory — on-demand memory diagnostics for OOM debugging
-// DECISION(2026-03-09): Surfaces RSS, heap, and cache sizes so Will can
-// spot memory trends without SSH-ing into the server.
-bot.command('memory', async (ctx) => {
-    const mem = process.memoryUsage();
-    const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
-    const chatKeys = Object.keys(chatHistory).length;
-    const totalMsgs = Object.values(chatHistory).reduce((s, arr) => s + arr.length, 0);
-
-    const lines = [
-        `🧠 *Memory Diagnostics*`,
-        `━━━━━━━━━━━━━━━━━━━━`,
-        `📊 *Process Memory:*`,
-        `  RSS: \`${mb(mem.rss)} MB\``,
-        `  Heap Used: \`${mb(mem.heapUsed)} MB\``,
-        `  Heap Total: \`${mb(mem.heapTotal)} MB\``,
-        `  External: \`${mb(mem.external)} MB\``,
-        `  ArrayBuffers: \`${mb(mem.arrayBuffers)} MB\``,
-        ``,
-        `💬 *Chat History:*`,
-        `  Active chats: \`${chatKeys}\``,
-        `  Total messages: \`${totalMsgs}\``,
-        ``,
-        `⌛ *Uptime:* \`${((Date.now() - BOT_START_TIME.getTime()) / 3_600_000).toFixed(1)}h\``,
-    ];
-
-    await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
-});
-
-// /product <SKU> — Look up a product in Finale Inventory
-bot.command('product', async (ctx) => {
-    const sku = ctx.message.text.replace('/product', '').trim();
-
-    if (!sku) {
-        return ctx.reply(
-            `📦 *Finale Product Lookup*\n\n` +
-            `Usage: \`/product <SKU>\`\n\n` +
-            `Examples:\n` +
-            `  \`/product S-12527\`\n` +
-            `  \`/product BC101\`\n` +
-            `  \`/product PU102\`\n\n` +
-            `_Use the exact SKU from Finale._`,
-            { parse_mode: 'Markdown' }
-        );
-    }
-
-    ctx.sendChatAction('typing');
-
-    try {
-        const report = await finale.productReport(sku);
-        await ctx.reply(report.telegramMessage, {
-            parse_mode: 'Markdown',
-            // @ts-ignore — Telegraf types don't include disable_web_page_preview
-            disable_web_page_preview: true,
-        });
-    } catch (err: any) {
-        console.error(`Product lookup error for ${sku}:`, err.message);
-        ctx.reply(`❌ Error looking up \`${sku}\`: ${err.message}`);
-    }
-});
-
-// /receivings — post today's received POs to Telegram + Slack #purchasing
-bot.command('receivings', async (ctx) => {
-    ctx.sendChatAction('typing');
-
-    try {
-        const received = await finale.getTodaysReceivedPOs();
-        const digest = finale.formatReceivingsDigest(received);
-
-        // Send to Telegram (convert Slack mrkdwn to Telegram Markdown)
-        const telegramMsg = digest
-            .replace(/:package:/g, '📦')
-            .replace(/:white_check_mark:/g, '✅')
-            .replace(/<([^|]+)\|([^>]+)>/g, '[$2]($1)');  // Slack links → Markdown
-
-        await ctx.reply(telegramMsg, {
-            parse_mode: 'Markdown',
-            // @ts-ignore
-            disable_web_page_preview: true,
-        });
-
-        // Post to Slack #purchasing if token available
-        if (process.env.SLACK_BOT_TOKEN) {
-            try {
-                const { WebClient } = await import('@slack/web-api');
-                const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
-                await slack.chat.postMessage({
-                    channel: '#purchasing',
-                    text: digest,
-                    mrkdwn: true,
-                });
-                await ctx.reply('✅ _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
-            } catch (slackErr: any) {
-                console.error('Slack post error:', slackErr.message);
-                await ctx.reply('⚠️ _Telegram only — Slack post failed_', { parse_mode: 'Markdown' });
-            }
-        }
-    } catch (err: any) {
-        console.error('Receivings error:', err.message);
-        ctx.reply(`❌ Error fetching receivings: ${err.message}`);
-    }
-});
-
-// /remember — store something in Aria's memory
-bot.command('remember', async (ctx) => {
-    const text = ctx.message.text.replace(/^\/remember\s*/, '').trim();
-    if (!text) {
-        return ctx.reply('Usage: `/remember AAACooper sends multi-page invoices as statements`', { parse_mode: 'Markdown' });
-    }
-
-    try {
-        const { remember } = await import('../lib/intelligence/memory');
-        await remember({
-            category: 'general',
-            content: text,
-            source: 'telegram',
-            priority: 'normal',
-        });
-        await ctx.reply(`🧠 Got it. I'll remember that.`, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        ctx.reply(`❌ Memory error: ${err.message}`);
-    }
-});
-
-// /recall — search Aria's memory
-bot.command('recall', async (ctx) => {
-    const query = ctx.message.text.replace(/^\/recall\s*/, '').trim();
-    if (!query) {
-        return ctx.reply('Usage: `/recall AAACooper invoices`', { parse_mode: 'Markdown' });
-    }
-
-    ctx.sendChatAction('typing');
-    try {
-        const { recall } = await import('../lib/intelligence/memory');
-        const memories = await recall(query, { topK: 5 });
-
-        if (memories.length === 0) {
-            return ctx.reply('🧠 No relevant memories found.');
-        }
-
-        let reply = `🧠 *${memories.length} memories found:*\n\n`;
-        for (const mem of memories) {
-            const score = (mem.score * 100).toFixed(0);
-            reply += `• \\[${mem.category}\\] ${mem.content.slice(0, 150)}\n  _${score}% match · ${mem.storedAt?.slice(0, 10) || 'unknown'}_\n\n`;
-        }
-        await ctx.reply(reply, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        ctx.reply(`❌ Recall error: ${err.message}`);
-    }
-});
-
-// /seed — initialize Aria's memory with known vendor patterns
-bot.command('seed', async (ctx) => {
-    ctx.sendChatAction('typing');
-    try {
-        const { seedMemories } = await import('../lib/intelligence/memory');
-        await seedMemories();
-        await ctx.reply('🌱 ✅ Memory seeded with known vendor patterns and processes.');
-    } catch (err: any) {
-        ctx.reply(`❌ Seed error: ${err.message}`);
-    }
-});
-
-// /consumption — BOM consumption report for raw material SKUs
-bot.command('consumption', async (ctx) => {
-    const args = ctx.message.text.replace(/^\/consumption\s*/, '').trim().split(/\s+/);
-    const sku = args[0];
-    const days = parseInt(args[1]) || 90;
-
-    if (!sku) {
-        return ctx.reply('Usage: `/consumption 3.0BAGCF` or `/consumption 3.0BAGCF 60`\n_Default: last 90 days_', { parse_mode: 'Markdown' });
-    }
-
-    ctx.sendChatAction('typing');
-    await ctx.reply(`👀📊 Pulling consumption data for \`${sku}\` (last ${days} days)...`, { parse_mode: 'Markdown' });
-
-    try {
-        const { FinaleClient } = await import('../lib/finale/client');
-        // Reuse module-level finale singleton instead of creating a new instance
-        const consumptionClient = finale;
-        const report = await consumptionClient.getBOMConsumption(sku, days);
-        await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        console.error('Consumption error:', err.message);
-        await ctx.reply(`❌ Failed to get consumption for \`${sku}\`: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /simulate (or /build) — simulate a production build explosion
-bot.command(['simulate', 'build'], async (ctx) => {
-    const rawArgs = ctx.message.text.split(' ');
-    // Remove the command part (first element)
-    rawArgs.shift();
-
-    // We want to handle strings like `CRAFT8 15`, `CRAFT8 = 15`, `CRAFT8 x 15`
-    const argsStr = rawArgs.join(' ').replace(/=|x|X/g, ' ').trim();
-    const cleanArgs = argsStr.split(/\s+/).filter(Boolean);
-
-    const sku = cleanArgs[0];
-    const qty = parseInt(cleanArgs[1]) || 1;
-
-    if (!sku || isNaN(qty)) {
-        return ctx.reply('Usage: `/simulate CRAFT8 15` or `/build CRAFT8 = 15`', { parse_mode: 'Markdown' });
-    }
-
-    ctx.sendChatAction('typing');
-    try {
-        const { simulateBuild } = await import('../lib/builds/build-risk');
-        const report = await simulateBuild(sku, qty, (msg) => {
-            console.log(`[simulate] ${msg}`);
-        });
-        await ctx.reply(report, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        console.error('Simulation error:', err.message);
-        await ctx.reply(`❌ Simulation failed for \`${sku}\`: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /buildrisk — 30-day build risk analysis (Calendar → BOM → Stock + POs)
-bot.command('buildrisk', async (ctx) => {
-    ctx.sendChatAction('typing');
-    await ctx.reply('🏭 Running 30-Day Build Risk Analysis...\n_Fetching calendars, parsing builds, exploding BOMs, checking stock + POs (now 5x parallel)..._', { parse_mode: 'Markdown' });
-
-    try {
-        const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
-        const report = await runBuildRiskAnalysis(30, (msg) => {
-            console.log(`[buildrisk] ${msg}`);
-        });
-
-        await ctx.reply(report.telegramMessage, { parse_mode: 'Markdown' });
-
-        // Persist snapshot + generate smart reorder prescriptions (fire-and-forget)
-        setImmediate(async () => {
-            const { saveBuildRiskSnapshot } = await import('../lib/builds/build-risk-logger');
-            await saveBuildRiskSnapshot(report);
-
-            // Smart prescriptions: only send if not alerted in last 20h
-            try {
-                const { generateReorderPrescriptions, formatPrescriptionsTelegram } = await import('../lib/builds/reorder-engine');
-                const { createClient } = await import('../lib/supabase');
-                const prescriptions = await generateReorderPrescriptions(report.components, report.fgVelocity);
-                if (prescriptions.length > 0) {
-                    const db = createClient();
-                    const cutoff = new Date(Date.now() - 20 * 60 * 60 * 1000).toISOString();
-                    const { data: recent } = db
-                        ? await db.from('proactive_alerts').select('sku,risk_level').gte('alerted_at', cutoff)
-                        : { data: [] };
-                    const recentSet = new Set((recent ?? []).map((r: any) => `${r.sku}:${r.risk_level}`));
-                    const fresh = prescriptions.filter(p => !recentSet.has(`${p.componentSku}:${p.riskLevel}`));
-                    if (fresh.length > 0) {
-                        await ctx.reply(formatPrescriptionsTelegram(fresh), { parse_mode: 'Markdown' });
-                        if (db) {
-                            await db.from('proactive_alerts').upsert(
-                                fresh.map(p => ({
-                                    sku: p.componentSku, alert_type: 'reorder', risk_level: p.riskLevel,
-                                    stockout_days: p.stockoutDays, suggested_order_qty: p.suggestedOrderQty,
-                                    days_after_order: p.daysAfterOrder, alerted_at: new Date().toISOString(),
-                                })),
-                                { onConflict: 'sku,alert_type' }
-                            );
-                        }
-                    } else {
-                        await ctx.reply('🧠 _Smart reorder alerts already sent recently — no duplicates._', { parse_mode: 'Markdown' });
-                    }
-                }
-            } catch (err: any) {
-                console.warn('[buildrisk/prescriptions] non-fatal:', err.message);
-            }
-        });
-
-        // Follow-up: Ask about unrecognized SKUs
-        if (report.unrecognizedSkus.length > 0) {
-            let askMsg = `❓ *I couldn't find these SKUs in Finale:*\n\n`;
-            for (const u of report.unrecognizedSkus) {
-                askMsg += `• \`${u.sku}\` (${u.totalQty} units, needed ${u.earliestDate})\n`;
-                if (u.suggestions.length > 0) {
-                    askMsg += `  → Similar items found: ${u.suggestions.slice(0, 3).map(s => `\`${s}\``).join(', ')}\n`;
-                    askMsg += `  _Is one of these what you meant?_\n`;
-                } else {
-                    askMsg += `  _No similar SKUs found. What's the correct product name?_\n`;
-                }
-                askMsg += `\n`;
-            }
-            askMsg += `_Reply with the correct SKU mappings and I'll update the analysis._`;
-            await ctx.reply(askMsg, { parse_mode: 'Markdown' });
-        }
-
-        // Also post to Slack if configured
-        if (process.env.SLACK_BOT_TOKEN) {
-            try {
-                const { WebClient } = await import('@slack/web-api');
-                const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
-                await slack.chat.postMessage({
-                    channel: '#purchasing',
-                    text: report.slackMessage,
-                    mrkdwn: true,
-                });
-                await ctx.reply('📤 _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
-            } catch (slackErr: any) {
-                console.error('Slack post error:', slackErr.message);
-            }
-        }
-    } catch (err: any) {
-        console.error('Build risk error:', err.message);
-        await ctx.reply(`❌ Build risk analysis failed: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /requests — Show recent Slack product requests detected by the watchdog
-bot.command('requests', async (ctx) => {
-    ctx.sendChatAction('typing');
-
-    try {
-        // Try to pull recent requests from the shared watchdog instance
-        const pending = globalWatchdog?.getRecentRequests() || [];
-
-        if (pending.length === 0) {
-            await ctx.reply(
-                `🦊 *Slack Request Tracker*\n\n` +
-                `✅ No pending product requests right now.\n\n` +
-                `Monitoring: *#purchasing*, *#purchase-orders*, DMs\n` +
-                `Thread replies: ✅ Included\n` +
-                `_New requests appear as 🦊 Aria Slack Digest messages._`,
-                { parse_mode: 'Markdown' }
-            );
-            return;
-        }
-
-        let reply = `🦊 *Slack Request Tracker* — ${pending.length} pending\n\n`;
-        for (const req of pending) {
-            const urgencyEmoji = req.analysis.urgency === 'high' ? '🔴' :
-                req.analysis.urgency === 'medium' ? '🟡' : '🟢';
-            reply += `${urgencyEmoji} *${req.userName}* in #${req.channel}\n`;
-            reply += `  📦 ${req.analysis.itemDescription}`;
-            if (req.analysis.quantity) reply += ` (×${req.analysis.quantity})`;
-            reply += `\n`;
-            if (req.matchedProduct) {
-                reply += `  ✅ SKU: \`${req.matchedProduct.sku}\`\n`;
-            }
-            if (req.activePO) {
-                reply += `  📋 PO: #${req.activePO} — ${req.eta}\n`;
-            }
-            reply += `\n`;
-        }
-        reply += `_Channels: #purchasing, #purchase-orders, DMs + thread replies_`;
-        await ctx.reply(reply, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        await ctx.reply(`❌ Error: ${err.message}`);
-    }
-});
-
-// /builds — Show completed builds from the last 24 hours (or N days with /builds 7)
-bot.command('builds', async (ctx) => {
-    ctx.sendChatAction('typing');
-
-    const args = ctx.message.text.replace(/^\/builds\s*/, '').trim();
-    const days = Math.min(Math.max(parseInt(args) || 1, 1), 30);
-
-    try {
-        const { createClient } = await import('../lib/supabase');
-        const db = createClient();
-        if (!db) {
-            return ctx.reply('❌ Supabase not configured.', { parse_mode: 'Markdown' });
-        }
-
-        const since = new Date(Date.now() - days * 86400000).toISOString();
-        const { data, error } = await db
-            .from('build_completions')
-            .select('build_id,sku,quantity,completed_at,created_at')
-            .gte('created_at', since)
-            .order('created_at', { ascending: false })
-            .limit(50);
-
-        if (error) throw new Error(error.message);
-
-        if (!data || data.length === 0) {
-            const label = days === 1 ? 'today' : `the last ${days} days`;
-            return ctx.reply(`🏭 *Build Completions*\n\nNo completed builds recorded for ${label}.\n_The watcher checks every 30 min._`, { parse_mode: 'Markdown' });
-        }
-
-        // Group by date
-        const byDate = new Map<string, typeof data>();
-        for (const row of data) {
-            const dateKey = new Date(row.completed_at).toLocaleDateString('en-US', {
-                weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Denver',
-            });
-            if (!byDate.has(dateKey)) byDate.set(dateKey, []);
-            byDate.get(dateKey)!.push(row);
-        }
-
-        const totalUnits = data.reduce((s: number, r: any) => s + (r.quantity || 0), 0);
-        const label = days === 1 ? 'Today' : `Last ${days} Days`;
-        let reply = `🏭 *Build Completions — ${label}*\n`;
-        reply += `${data.length} build${data.length > 1 ? 's' : ''}  |  ${totalUnits.toLocaleString()} total units\n`;
-        reply += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-
-        for (const [dateStr, rows] of byDate) {
-            reply += `\n📅 *${dateStr}*\n`;
-            for (const row of rows) {
-                const time = new Date(row.completed_at).toLocaleTimeString('en-US', {
-                    hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver',
-                });
-                reply += `✅ \`${row.sku}\` × ${row.quantity.toLocaleString()} — ${time}\n`;
-            }
-        }
-
-        reply += `\n_Use /builds 7 for last 7 days_`;
-        await ctx.reply(reply, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        console.error('Builds command error:', err.message);
-        await ctx.reply(`❌ Error fetching builds: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /alerts — Show recent smart reorder/build prescriptions from the last 24 hours
-bot.command('alerts', async (ctx) => {
-    ctx.sendChatAction('typing');
-    try {
-        const { createClient } = await import('../lib/supabase');
-        const db = createClient();
-        if (!db) return ctx.reply('❌ Supabase not configured.');
-
-        const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        const { data, error } = await db
-            .from('proactive_alerts')
-            .select('sku,risk_level,stockout_days,suggested_order_qty,days_after_order,alerted_at')
-            .gte('alerted_at', since)
-            .order('alerted_at', { ascending: false });
-
-        if (error) throw new Error(error.message);
-
-        const { formatAlertsDigest } = await import('../lib/builds/reorder-engine');
-        await ctx.reply(formatAlertsDigest(data ?? []), { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        await ctx.reply(`❌ Error fetching alerts: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /correlate — Cross-inbox PO ↔ Invoice correlation and vendor intelligence
-bot.command('correlate', async (ctx) => {
-    ctx.sendChatAction('typing');
-    await ctx.reply('🔗 Running cross-inbox PO correlation...\n_Scanning bill.selee label:PO → matching with AP invoices_', { parse_mode: 'Markdown' });
-
-    try {
-        const { runCorrelationPipeline } = await import('../lib/intelligence/po-correlator');
-        const result = await runCorrelationPipeline();
-
-        // Split long messages if needed (Telegram 4096 char limit)
-        const report = result.formattedReport;
-        if (report.length > 4000) {
-            const lines = report.split('\n');
-            let chunk = '';
-            for (const line of lines) {
-                if (chunk.length + line.length > 3900) {
-                    await ctx.reply(chunk, { parse_mode: 'Markdown' });
-                    chunk = '';
-                }
-                chunk += line + '\n';
-            }
-            if (chunk.trim()) await ctx.reply(chunk, { parse_mode: 'Markdown' });
-        } else {
-            await ctx.reply(report, { parse_mode: 'Markdown' });
-        }
-    } catch (err: any) {
-        console.error('Correlation error:', err.message);
-        await ctx.reply(`❌ Correlation failed: ${err.message}`, { parse_mode: 'Markdown' });
-    }
-});
-
-// /voice
-bot.command('voice', async (ctx) => {
-    if (!elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
-
-    ctx.reply('🎙️ Aria is thinking... (Voice generation in progress)');
-
-    try {
-        let textToSpeak = await unifiedTextGeneration({
-            system: SYSTEM_PROMPT + "\n\nLimit your response to a single, clever sentence under 25 words for a voice greeting.",
-            prompt: "Say something witty and operational to Will to start the day."
-        });
-
-        // Pass to ElevenLabs
-        const voiceResponse = await axios.post(
-            `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_CONFIG.voiceId}`,
-            {
-                text: textToSpeak,
-                model_id: VOICE_CONFIG.modelId,
-                voice_settings: {
-                    stability: VOICE_CONFIG.stability,
-                    similarity_boost: VOICE_CONFIG.similarityBoost,
-                    style: VOICE_CONFIG.style,
-                },
-            },
-            {
-                headers: {
-                    'xi-api-key': elevenLabsKey,
-                    'Content-Type': 'application/json',
-                    'Accept': 'audio/mpeg',
-                },
-                responseType: 'arraybuffer',
-            }
-        );
-
-        await ctx.replyWithVoice({
-            source: Buffer.from(voiceResponse.data),
-            filename: 'aria-reply.ogg',
-        });
-
-        ctx.reply(`💬 _Text version: "${textToSpeak}"_`, { parse_mode: 'Markdown' });
-
-    } catch (err: any) {
-        console.error('Voice generation error:', err.message);
-        ctx.reply(`❌ Failed to find my voice: ${err.message}`);
-    }
-});
-
-// /populate
-bot.command('populate', async (ctx) => {
-    ctx.reply("🧠 Starting PO Memory Backfill (Last 2 Weeks)... This will take a moment.");
-    try {
-        const { processEmailAttachments } = require('../lib/gmail/attachment-handler');
-        const auth = await getAuthenticatedClient("default");
-        const gmail = GmailApi({ version: "v1", auth });
-
-        const twoWeeksAgo = new Date();
-        twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
-        const dateQuery = twoWeeksAgo.toISOString().split('T')[0].replace(/-/g, '/');
-
-        const { data: search } = await gmail.users.messages.list({
-            userId: "me",
-            q: `label:PO after:${dateQuery}`,
-            maxResults: 15
-        });
-
-        if (!search.messages?.length) return ctx.reply("📭 No recent POs found.");
-
-        let count = 0;
-        for (const m of search.messages) {
-            const { data: msg } = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata" });
-            const subject = msg.payload?.headers?.find(h => h.name === 'Subject')?.value || "No Subject";
-            const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "Unknown";
-            const date = msg.payload?.headers?.find(h => h.name === 'Date')?.value || "";
-
-            const { indexOperationalContext } = require('../lib/intelligence/pinecone');
-            await indexOperationalContext(
-                `po-thread-${m.id}`,
-                `PO Thread: ${subject} from ${from}. Date: ${date}`,
-                { source: "telegram_backfill", subject, from, date }
-            );
-
-            await processEmailAttachments("default", m.id!, { from, subject, date });
-            count++;
-        }
-        ctx.reply(`✨ Backfill complete! Processed ${count} PO threads.`);
-    } catch (err: any) {
-        ctx.reply(`❌ Backfill failed: ${err.message}`);
-    }
-});
-
-// ──────────────────────────────────────────────────
-// KAIZEN FEEDBACK LOOP COMMANDS
-// ──────────────────────────────────────────────────
-
-// /kaizen — Generate a self-review report of Aria's accuracy and performance
-bot.command('kaizen', async (ctx) => {
-    ctx.sendChatAction('typing');
-    await ctx.reply('🧘 Running Kaizen Self-Review... analyzing recent performance.', { parse_mode: 'Markdown' });
-
-    try {
-        const { generateSelfReview } = await import('../lib/intelligence/feedback-loop');
-        const args = ctx.message.text.replace(/^\/kaizen\s*/, '').trim();
-        const days = Math.min(Math.max(parseInt(args) || 7, 1), 90);
-        const report = await generateSelfReview(days);
-        await ctx.reply(report, { parse_mode: 'HTML' });
-    } catch (err: any) {
-        console.error('Kaizen report error:', err.message);
-        await ctx.reply(`❌ Kaizen report failed: ${err.message}`);
-    }
-});
-
-// /vendor <name> — Show vendor reliability scorecard
-bot.command('vendor', async (ctx) => {
-    const vendorName = ctx.message.text.replace(/^\/vendor\s*/, '').trim();
-    if (!vendorName) {
-        return ctx.reply(
-            '📊 *Vendor Reliability Scorecard*\n\n' +
-            'Usage: `/vendor Mountain Rose Herbs`\n\n' +
-            '_Analyzes correction rates, reconciliation outcomes, and response patterns for a specific vendor._',
-            { parse_mode: 'Markdown' }
-        );
-    }
-
-    ctx.sendChatAction('typing');
-    try {
-        const { getVendorReliability } = await import('../lib/intelligence/feedback-loop');
-        const score = await getVendorReliability(vendorName);
-
-        if (!score) {
-            return ctx.reply(`❌ Could not retrieve vendor data — Supabase unavailable.`);
-        }
-
-        if (score.eventCount === 0) {
-            return ctx.reply(
-                `📊 *Vendor: ${vendorName}*\n\n` +
-                `No feedback data collected yet for this vendor.\n` +
-                `_Data accumulates as invoices are processed and reconciled._`,
-                { parse_mode: 'Markdown' }
-            );
-        }
-
-        const pct = score.overallScore >= 0 ? score.overallScore : 0;
-        const emoji = pct >= 85 ? '🟢' : pct >= 60 ? '🟡' : '🔴';
-        let msg = `📊 *Vendor: ${vendorName}*\n`;
-        msg += `${emoji} Overall Score: *${pct}%*\n`;
-        msg += `Based on ${score.eventCount} events (last 90 days)\n`;
-        msg += `Trend: ${score.trend === 'improving' ? '⬆️ Improving' : score.trend === 'declining' ? '⬇️ Declining' : '➡️ Stable'}\n\n`;
-        if (score.onTimePercent >= 0) msg += `• On-Time Delivery: ${score.onTimePercent}%\n`;
-        if (score.invoiceAccuracy >= 0) msg += `• Invoice Accuracy: ${score.invoiceAccuracy}%\n`;
-        if (score.documentQuality >= 0) msg += `• Document Quality: ${score.documentQuality}%\n`;
-        if (score.avgResponseDays >= 0) msg += `• Avg Response: ${score.avgResponseDays} days\n`;
-        if (score.recentIssues.length > 0) {
-            msg += `\n⚠️ Recent Issues:\n`;
-            for (const issue of score.recentIssues) {
-                msg += `  • ${issue}\n`;
-            }
-        }
-        msg += `\n_Scores update as reconciliations and corrections accumulate._`;
-
-        await ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        await ctx.reply(`❌ Vendor lookup failed: ${err.message}`);
-    }
-});
-
-// /housekeeping — Manually trigger data cleanup
-bot.command('housekeeping', async (ctx) => {
-    ctx.sendChatAction('typing');
-    await ctx.reply('🧹 Running manual housekeeping...', { parse_mode: 'Markdown' });
-
-    try {
-        const { runHousekeeping } = await import('../lib/intelligence/feedback-loop');
-        const report = await runHousekeeping();
-        let msg = `🧹 *Housekeeping Complete*\n\n`;
-        msg += `Total reclaimed: *${report.totalReclaimed}* rows/vectors\n\n`;
-        if (report.feedbackEventsPruned > 0) msg += `• Feedback events: ${report.feedbackEventsPruned} pruned\n`;
-        if (report.chatLogsPruned > 0) msg += `• Chat logs: ${report.chatLogsPruned} pruned\n`;
-        if (report.exceptionsPruned > 0) msg += `• Exceptions: ${report.exceptionsPruned} pruned\n`;
-        if (report.alertsPruned > 0) msg += `• Alerts: ${report.alertsPruned} pruned\n`;
-        if (report.pineconeMemoriesPruned > 0) msg += `• Pinecone memories: ${report.pineconeMemoriesPruned} pruned\n`;
-        if (report.totalReclaimed === 0) msg += `_Nothing to clean — database is tidy._ ✨\n`;
-        msg += `\n_Runs automatically every night at 11 PM MT._`;
-        await ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-        await ctx.reply(`❌ Housekeeping failed: ${err.message}`);
-    }
-});
-
-// /crons — Show status of all scheduled cron tasks
-// DECISION(2026-03-19): Upgraded to use centralized cron-registry.ts which
-// provides categorized output with descriptions instead of a flat list.
-bot.command('crons', async (ctx) => {
-    ctx.sendChatAction('typing');
-
-    const report = opsManager.getCronStatusReport();
-
-    // Telegram message limit is 4096 chars
-    const msg = report.length > 4000
-        ? report.slice(0, 3990) + '\n\n<i>...truncated</i>'
-        : report;
-
-    await ctx.reply(msg, { parse_mode: 'HTML' });
-});
-
-// /notify <request_id> — Approve sending an Amazon order update to the Slack requester
-// DECISION(2026-03-19): Manual review gate before any Slack notification.
-// Will reviews the Amazon order match on Telegram and approves with /notify.
-// The Slack message is factual and precise, no emojis, plain text.
-bot.command('notify', async (ctx) => {
-    ctx.sendChatAction('typing');
-
-    const requestId = ctx.message.text.split(' ').slice(1).join(' ').trim();
-    if (!requestId) {
-        await ctx.reply('Usage: /notify <request_id>\n\nCopy the ID from an Amazon order notification.');
-        return;
-    }
-
-    try {
-        const { createClient } = await import('../lib/supabase');
-        const supabase = createClient();
-        if (!supabase) {
-            await ctx.reply('Database unavailable.');
-            return;
-        }
-
-        const { data: req, error } = await supabase
-            .from('slack_requests')
-            .select('*')
-            .eq('id', requestId)
-            .single();
-
-        if (error || !req) {
-            await ctx.reply(`Request not found: ${requestId}`);
-            return;
-        }
-
-        if (req.notified_at) {
-            await ctx.reply(`Already notified on ${new Date(req.notified_at).toLocaleString('en-US', { timeZone: 'America/Denver' })}`);
-            return;
-        }
-
-        if (req.channel_id === 'unmatched') {
-            await ctx.reply('This order has no matched Slack request. Nothing to notify.');
-            return;
-        }
-
-        // Build the Slack message — factual, no emojis, precise
-        const items = (req.amazon_items || [])
-            .map((i: any) => `  ${i.quantity}x ${i.name}${i.price ? ` ($${i.price.toFixed(2)})` : ''}`)
-            .join('\n');
-
-        let slackMessage = '';
-        if (req.status === 'shipped' && req.tracking_number) {
-            slackMessage = `Your order has shipped.\n\n`;
-            slackMessage += `Order: ${req.amazon_order_id}\n`;
-            if (req.carrier) slackMessage += `Carrier: ${req.carrier}\n`;
-            slackMessage += `Tracking: ${req.tracking_number}\n`;
-            if (req.estimated_delivery) {
-                const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
-                    weekday: 'long', month: 'long', day: 'numeric',
-                    timeZone: 'America/Denver',
-                });
-                slackMessage += `Expected delivery: ${eta}\n`;
-            }
-            if (items) slackMessage += `\nItems:\n${items}\n`;
-        } else {
-            slackMessage = `Your order has been placed.\n\n`;
-            slackMessage += `Order: ${req.amazon_order_id}\n`;
-            if (req.estimated_delivery) {
-                const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
-                    weekday: 'long', month: 'long', day: 'numeric',
-                    timeZone: 'America/Denver',
-                });
-                slackMessage += `Expected delivery: ${eta}\n`;
-            }
-            if (items) slackMessage += `\nItems:\n${items}\n`;
-        }
-
-        // Send to Slack in the original thread
-        const slackToken = process.env.SLACK_BOT_TOKEN;
-        if (!slackToken) {
-            await ctx.reply('SLACK_BOT_TOKEN not configured.');
-            return;
-        }
-
-        const { WebClient } = await import('@slack/web-api');
-        const slack = new WebClient(slackToken);
-
-        await slack.chat.postMessage({
-            channel: req.channel_id,
-            text: slackMessage,
-            thread_ts: req.thread_ts || req.message_ts,
-        });
-
-        // Mark as notified
-        await supabase
-            .from('slack_requests')
-            .update({ notified_at: new Date().toISOString() })
-            .eq('id', requestId);
-
-        await ctx.reply(`Sent to ${req.requester_name} in Slack.`);
-    } catch (err: any) {
-        await ctx.reply(`Failed: ${err.message}`);
-    }
-});
-
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// MODULAR COMMANDS â€” registered after OpsManager boot (see line ~2340)
+// DECISION(2026-03-20): Extracted 22 bot.command() handlers to
+// src/cli/commands/ modules (status, inventory, operations, memory-cmds,
+// kaizen). registerAllCommands() is called after deps are available.
+// See: commands/index.ts for the router.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // REUSABLE: Send email with PDF attachment via Gmail API
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer: Buffer, pdfFilename: string): Promise<void> {
     const { getAuthenticatedClient: getGmailAuth } = await import('../lib/gmail/auth');
@@ -1054,16 +207,16 @@ async function sendPdfEmail(to: string, subject: string, body: string, pdfBuffer
     });
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CONVERSATION HISTORY (shared across text + document handlers)
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const chatHistory: Record<string, any[]> = {};
 const chatLastActive: Record<string, number> = {};
 
 // DECISION(2026-03-09): Periodic GC for stale chat history entries.
 // Without this, every unique Telegram chatId creates an entry that lives forever.
-// Sweep every 30 minutes — evict chats inactive for 4+ hours.
+// Sweep every 30 minutes â€” evict chats inactive for 4+ hours.
 const CHAT_GC_INTERVAL = 30 * 60 * 1000;
 const CHAT_GC_TTL = 4 * 60 * 60 * 1000; // 4 hours
 const CHAT_MAX_KEYS = 100;
@@ -1094,14 +247,14 @@ setInterval(() => {
     }
 
     if (evicted > 0) {
-        console.log(`[chat-gc] Evicted ${evicted} stale chat(s) — ${Object.keys(chatHistory).length} remaining`);
+        console.log(`[chat-gc] Evicted ${evicted} stale chat(s) â€” ${Object.keys(chatHistory).length} remaining`);
     }
 }, CHAT_GC_INTERVAL);
 
-// ──────────────────────────────────────────────────
-// DOCUMENT/FILE HANDLER — PDFs, images, Word docs
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// DOCUMENT/FILE HANDLER â€” PDFs, images, Word docs
 // Memory-aware: checks Pinecone for vendor patterns
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 bot.on('document', async (ctx) => {
     const doc = ctx.message.document;
@@ -1116,17 +269,17 @@ bot.on('document', async (ctx) => {
         'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
 
     if (!SUPPORTED.some(m => mimeType.includes(m.split('/')[1]))) {
-        await ctx.reply(`📎 Got *${filename}* but I can't process \`${mimeType}\` files yet.\n_I handle: PDF, PNG, JPEG, DOC/DOCX, CSV, TXT, XLS/XLSX_`, { parse_mode: 'Markdown' });
+        await ctx.reply(`ðŸ“Ž Got *${filename}* but I can't process \`${mimeType}\` files yet.\n_I handle: PDF, PNG, JPEG, DOC/DOCX, CSV, TXT, XLS/XLSX_`, { parse_mode: 'Markdown' });
         return;
     }
 
     if (doc.file_size && doc.file_size > 20_000_000) {
-        await ctx.reply('⚠️ File too large (>20MB). Try emailing it to me instead.');
+        await ctx.reply('âš ï¸ File too large (>20MB). Try emailing it to me instead.');
         return;
     }
 
     ctx.sendChatAction('typing');
-    await ctx.reply(`📎 Processing *${filename}*... one moment.`, { parse_mode: 'Markdown' });
+    await ctx.reply(`ðŸ“Ž Processing *${filename}*... one moment.`, { parse_mode: 'Markdown' });
 
     try {
         // Download file from Telegram
@@ -1135,11 +288,11 @@ bot.on('document', async (ctx) => {
         if (!response.ok) throw new Error(`Download failed: ${response.status}`);
         const buffer = Buffer.from(await response.arrayBuffer());
 
-        // ── CSV / TEXT files: skip PDF pipeline, go straight to LLM ──
+        // â”€â”€ CSV / TEXT files: skip PDF pipeline, go straight to LLM â”€â”€
         const isTextFile = mimeType.includes('csv') || mimeType.includes('text/plain')
             || filename.endsWith('.csv') || filename.endsWith('.txt');
 
-        // ── Excel (XLS/XLSX): convert to CSV text, then analyze with LLM ──
+        // â”€â”€ Excel (XLS/XLSX): convert to CSV text, then analyze with LLM â”€â”€
         const isExcelFile = mimeType.includes('spreadsheet') || mimeType.includes('ms-excel')
             || filename.endsWith('.xlsx') || filename.endsWith('.xls');
 
@@ -1148,7 +301,7 @@ bot.on('document', async (ctx) => {
             let fileLabel: string;
 
             if (isExcelFile) {
-                // DECISION(2026-02-26): Use xlsx library to convert Excel → CSV text.
+                // DECISION(2026-02-26): Use xlsx library to convert Excel â†’ CSV text.
                 // This avoids the PDF extraction pipeline which fails on non-PDF binaries.
                 const XLSX = await import('xlsx');
                 const workbook = XLSX.read(buffer, { type: 'buffer' });
@@ -1165,10 +318,10 @@ bot.on('document', async (ctx) => {
                     }
                 }
                 textContent = parts.join('\n');
-                fileLabel = `📊 *Excel File* (${sheetNames.length} sheet${sheetNames.length > 1 ? 's' : ''}: ${sheetNames.join(', ')})`;
+                fileLabel = `ðŸ“Š *Excel File* (${sheetNames.length} sheet${sheetNames.length > 1 ? 's' : ''}: ${sheetNames.join(', ')})`;
             } else {
                 textContent = buffer.toString('utf-8');
-                fileLabel = `📊 *CSV/Text File*`;
+                fileLabel = `ðŸ“Š *CSV/Text File*`;
             }
 
             const lineCount = textContent.split('\n').length;
@@ -1220,7 +373,7 @@ bot.on('document', async (ctx) => {
                                             entry += ` Estimated annual usage: ~${annualUsage} units/year.`;
                                         }
                                     } else {
-                                        entry += ` No consumption/demand data in Finale — may need to check BOM explosion or build calendar.`;
+                                        entry += ` No consumption/demand data in Finale â€” may need to check BOM explosion or build calendar.`;
                                     }
 
                                     if (profile.stockoutDays !== null) entry += ` Finale stockout estimate: ${profile.stockoutDays} days.`;
@@ -1244,7 +397,7 @@ bot.on('document', async (ctx) => {
                         }
 
                         if (enrichments.length > 0) {
-                            finaleContext = `\n\n--- FINALE INVENTORY DATA (LIVE) ---\nReal-time data from Finale Inventory. "PURCHASED last 365 days" is the EXACT received quantity from Finale POs — use this to answer purchase questions directly. "Consumption" figures are TOTALS over 90 days, daily rates are pre-calculated.\n${enrichments.join('\n')}\n--- END FINALE DATA ---`;
+                            finaleContext = `\n\n--- FINALE INVENTORY DATA (LIVE) ---\nReal-time data from Finale Inventory. "PURCHASED last 365 days" is the EXACT received quantity from Finale POs â€” use this to answer purchase questions directly. "Consumption" figures are TOTALS over 90 days, daily rates are pre-calculated.\n${enrichments.join('\n')}\n--- END FINALE DATA ---`;
                         }
                     }
                 }
@@ -1253,35 +406,35 @@ bot.on('document', async (ctx) => {
             }
 
             let reply = `${fileLabel}\n`;
-            reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
-            reply += `📝 Lines: ${lineCount}\n`;
-            if (finaleContext) reply += `🔗 _Enriched with live Finale inventory data_\n`;
-            reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+            reply += `ðŸ“Ž File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+            reply += `ðŸ“ Lines: ${lineCount}\n`;
+            if (finaleContext) reply += `ðŸ”— _Enriched with live Finale inventory data_\n`;
+            reply += `\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n`;
 
             ctx.sendChatAction('typing');
             const analysis = await unifiedTextGeneration({
-                system: `You are Aria, an operations assistant for BuildASoil — a soil and growing supply manufacturer. You know this business deeply. Analyze uploaded data files and give DECISIVE, ACTIONABLE answers. Be specific with numbers, SKUs, and recommendations. Format for Telegram (markdown).
+                system: `You are Aria, an operations assistant for BuildASoil â€” a soil and growing supply manufacturer. You know this business deeply. Analyze uploaded data files and give DECISIVE, ACTIONABLE answers. Be specific with numbers, SKUs, and recommendations. Format for Telegram (markdown).
 
 CRITICAL RULES:
 1. **ANSWER THE QUESTION DIRECTLY.** Never say "you would need to check records" or "refer to purchase orders." YOU are the one who checks. If you have data, CALCULATE and ANSWER. If the data supports an estimate, give it clearly labeled as an estimate.
 
 2. **ALWAYS DO THE MATH.** When consumption data is available:
-   - If you have 90-day consumption, extrapolate: annual = (90-day value / 90) × 365
-   - If asked about "last year" purchases, estimate from consumption rate: items consumed ≈ items purchased for BOM components
+   - If you have 90-day consumption, extrapolate: annual = (90-day value / 90) Ã— 365
+   - If asked about "last year" purchases, estimate from consumption rate: items consumed â‰ˆ items purchased for BOM components
    - Show your calculation so Will can verify
 
 3. **BOM Components**: If a product shows 0 sales velocity but has stock, it IS a BOM input consumed through production builds. State this as fact.
-   - For BOM items, purchasing ≈ consumption over time (what goes in must be bought)
+   - For BOM items, purchasing â‰ˆ consumption over time (what goes in must be bought)
    - Use the FINALE INVENTORY DATA section (if present) for real consumption rates
 
 4. **Be specific, not generic**: Use actual SKUs, quantities, and product names. Never give vague summaries when you have real numbers.
 
 5. **Format answers as direct responses.** Example of GOOD response:
-   "PLQ101 - Quillaja Extract Powder 20: Purchased ~223 kg last year (based on 55 kg consumed over 90 days → 0.61 kg/day × 365 days)"
+   "PLQ101 - Quillaja Extract Powder 20: Purchased ~223 kg last year (based on 55 kg consumed over 90 days â†’ 0.61 kg/day Ã— 365 days)"
    
    Example of BAD response:
    "To determine purchases, you would need to check purchase records."`,
-                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above — do NOT ask for the complete data. Give the best answer possible from what you have.`
+                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above â€” do NOT ask for the complete data. Give the best answer possible from what you have.`
             });
 
             reply += analysis;
@@ -1291,7 +444,7 @@ CRITICAL RULES:
             const chatId = ctx.from?.id || ctx.chat.id;
             if (!chatHistory[chatId]) chatHistory[chatId] = [];
             chatLastActive[chatId] = Date.now();
-            chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
+            chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' â€” ' + caption : ''}` });
             chatHistory[chatId].push({ role: "assistant", content: reply });
             if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
 
@@ -1313,7 +466,7 @@ CRITICAL RULES:
             return;
         }
 
-        // ── PDF / Image / Word pipeline ──
+        // â”€â”€ PDF / Image / Word pipeline â”€â”€
         const { extractPDF } = await import('../lib/pdf/extractor');
         const { classifyDocument } = await import('../lib/pdf/classifier');
         const { pdfEditor } = await import('../lib/pdf/editor');
@@ -1325,22 +478,22 @@ CRITICAL RULES:
         const classification = await classifyDocument(extraction);
 
         const typeEmoji: Record<string, string> = {
-            INVOICE: '🧾', PURCHASE_ORDER: '📋', VENDOR_STATEMENT: '📊',
-            BILL_OF_LADING: '🚚', PACKING_SLIP: '📦', FREIGHT_QUOTE: '🏷️',
-            CREDIT_MEMO: '💳', COA: '🔬', SDS: '⚠️', CONTRACT: '📜',
-            PRODUCT_SPEC: '📐', TRACKING_NOTIFICATION: '📍', UNKNOWN: '📄',
+            INVOICE: 'ðŸ§¾', PURCHASE_ORDER: 'ðŸ“‹', VENDOR_STATEMENT: 'ðŸ“Š',
+            BILL_OF_LADING: 'ðŸšš', PACKING_SLIP: 'ðŸ“¦', FREIGHT_QUOTE: 'ðŸ·ï¸',
+            CREDIT_MEMO: 'ðŸ’³', COA: 'ðŸ”¬', SDS: 'âš ï¸', CONTRACT: 'ðŸ“œ',
+            PRODUCT_SPEC: 'ðŸ“', TRACKING_NOTIFICATION: 'ðŸ“', UNKNOWN: 'ðŸ“„',
         };
-        const emoji = typeEmoji[classification.type] || '📄';
+        const emoji = typeEmoji[classification.type] || 'ðŸ“„';
         const typeLabel = classification.type.replace(/_/g, ' ');
 
-        let reply = `${emoji} *${typeLabel}* — _${classification.confidence} confidence_\n`;
-        reply += `📎 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
-        reply += `📄 Pages: ${extraction.metadata.pageCount}\n`;
+        let reply = `${emoji} *${typeLabel}* â€” _${classification.confidence} confidence_\n`;
+        reply += `ðŸ“Ž File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+        reply += `ðŸ“„ Pages: ${extraction.metadata.pageCount}\n`;
         if (extraction.tables.length > 0) {
-            reply += `📊 Tables detected: ${extraction.tables.length}\n`;
+            reply += `ðŸ“Š Tables detected: ${extraction.tables.length}\n`;
         }
 
-        // ── CHECK MEMORY: Do we know this vendor's pattern? ──
+        // â”€â”€ CHECK MEMORY: Do we know this vendor's pattern? â”€â”€
         const docPreview = extraction.rawText.slice(0, 500);
         let vendorMemories: Awaited<ReturnType<typeof recall>> = [];
         try {
@@ -1358,10 +511,10 @@ CRITICAL RULES:
             vendorMemories[0].content.toLowerCase().includes('split');
 
         if (hasVendorPattern) {
-            reply += `\n🧠 _Memory: ${vendorMemories[0].content.slice(0, 100)}..._\n`;
+            reply += `\nðŸ§  _Memory: ${vendorMemories[0].content.slice(0, 100)}..._\n`;
         }
 
-        // ── Analyze pages with LLM ──
+        // â”€â”€ Analyze pages with LLM â”€â”€
         const isInvoiceWorkflow = classification.type === 'VENDOR_STATEMENT'
             || classification.type === 'INVOICE'
             || caption.toLowerCase().includes('invoice')
@@ -1373,12 +526,12 @@ CRITICAL RULES:
             ctx.sendChatAction('typing');
 
             // Use physical per-page extraction for accurate page text
-            // (form-feed splitting often fails — this splits via pdf-lib)
+            // (form-feed splitting often fails â€” this splits via pdf-lib)
             let analysisPages = extraction.pages;
             if (extraction.metadata.pageCount > 1 && extraction.pages.length < extraction.metadata.pageCount * 0.8) {
                 const { extractPerPage } = await import('../lib/pdf/extractor');
                 analysisPages = await extractPerPage(buffer);
-                reply += `🔬 Using per-page extraction (${analysisPages.length} pages)...\n`;
+                reply += `ðŸ”¬ Using per-page extraction (${analysisPages.length} pages)...\n`;
             }
 
             // Per-page analysis
@@ -1407,14 +560,14 @@ If no invoice number found, use null for invoiceNumber.`,
                 const otherPages = pages.filter(p => p.type === 'OTHER');
                 const invoiceNums = invoicePages.map(p => p.invoiceNumber).filter(Boolean) as string[];
 
-                reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
-                if (statementPages.length > 0) reply += `📊 Statement pages: ${statementPages.map(p => p.page).join(', ')}\n`;
-                if (invoicePages.length > 0) reply += `🧾 Invoice pages: ${invoicePages.map(p => p.page).join(', ')}\n`;
-                if (invoiceNums.length > 0) reply += `📝 Invoice #: ${invoiceNums.join(', ')}\n`;
+                reply += `\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n`;
+                if (statementPages.length > 0) reply += `ðŸ“Š Statement pages: ${statementPages.map(p => p.page).join(', ')}\n`;
+                if (invoicePages.length > 0) reply += `ðŸ§¾ Invoice pages: ${invoicePages.map(p => p.page).join(', ')}\n`;
+                if (invoiceNums.length > 0) reply += `ðŸ“ Invoice #: ${invoiceNums.join(', ')}\n`;
 
-                // ── SPLIT WORKFLOW (AAACooper-style): each page → separate PDF → email ──
+                // â”€â”€ SPLIT WORKFLOW (AAACooper-style): each page â†’ separate PDF â†’ email â”€â”€
                 if (isSplitPattern || (invoicePages.length > 1 && statementPages.length === 0)) {
-                    reply += `\n✂️ Splitting ${invoicePages.length} invoices into individual PDFs...`;
+                    reply += `\nâœ‚ï¸ Splitting ${invoicePages.length} invoices into individual PDFs...`;
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
                     const splitBuffers = await pdfEditor.splitPdf(buffer);
@@ -1432,7 +585,7 @@ If no invoice number found, use null for invoiceNumber.`,
                         await ctx.replyWithDocument({
                             source: pageBuffer,
                             filename: invFilename,
-                        }, { caption: `🧾 Invoice ${invNum}` });
+                        }, { caption: `ðŸ§¾ Invoice ${invNum}` });
 
                         // Email each to bill.com
                         try {
@@ -1446,30 +599,30 @@ If no invoice number found, use null for invoiceNumber.`,
                             emailsSent++;
                         } catch (emailErr: any) {
                             console.error(`Email failed for ${invNum}:`, emailErr.message);
-                            await ctx.reply(`⚠️ Email failed for ${invNum}: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                            await ctx.reply(`âš ï¸ Email failed for ${invNum}: ${emailErr.message}`, { parse_mode: 'Markdown' });
                         }
                     }
 
                     if (emailsSent > 0) {
-                        await ctx.reply(`📧 ✅ Sent ${emailsSent} invoice(s) to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
+                        await ctx.reply(`ðŸ“§ âœ… Sent ${emailsSent} invoice(s) to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
                     }
 
                     return; // Done
                 }
 
-                // ── REMOVE workflow: strip invoice pages, keep statement ──
+                // â”€â”€ REMOVE workflow: strip invoice pages, keep statement â”€â”€
                 if (invoicePages.length > 0 && statementPages.length > 0) {
                     const pagesToRemove = invoicePages.map(p => p.page - 1);
                     const cleanedBuffer = await pdfEditor.removePages(buffer, pagesToRemove);
 
-                    reply += `\n✂️ Removed ${invoicePages.length} invoice page(s) — ${statementPages.length} statement page(s) remain`;
+                    reply += `\nâœ‚ï¸ Removed ${invoicePages.length} invoice page(s) â€” ${statementPages.length} statement page(s) remain`;
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
                     const cleanFilename = filename.replace(/\.(pdf|PDF)$/, '_STATEMENT_ONLY.$1');
                     await ctx.replyWithDocument({
                         source: cleanedBuffer,
                         filename: cleanFilename,
-                    }, { caption: `📊 Statement only (invoices removed)` });
+                    }, { caption: `ðŸ“Š Statement only (invoices removed)` });
 
                     try {
                         await sendPdfEmail(
@@ -1479,19 +632,19 @@ If no invoice number found, use null for invoiceNumber.`,
                             cleanedBuffer,
                             cleanFilename,
                         );
-                        await ctx.reply(`📧 ✅ Sent statement to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
+                        await ctx.reply(`ðŸ“§ âœ… Sent statement to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
                     } catch (emailErr: any) {
                         console.error('Bill.com email error:', emailErr.message);
-                        await ctx.reply(`⚠️ PDF cleaned but email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                        await ctx.reply(`âš ï¸ PDF cleaned but email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
                     }
 
                     return;
                 }
 
-                // Single invoice — forward as-is
+                // Single invoice â€” forward as-is
                 if (invoicePages.length === 1 && statementPages.length === 0) {
                     const invNum = invoiceNums[0] || 'unknown';
-                    reply += `\n📧 Forwarding to bill.com...`;
+                    reply += `\nðŸ“§ Forwarding to bill.com...`;
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
                     try {
@@ -1502,9 +655,9 @@ If no invoice number found, use null for invoiceNumber.`,
                             buffer,
                             filename,
                         );
-                        await ctx.reply(`📧 ✅ Sent to \`buildasoilap@bill.com\` — Invoice ${invNum}`, { parse_mode: 'Markdown' });
+                        await ctx.reply(`ðŸ“§ âœ… Sent to \`buildasoilap@bill.com\` â€” Invoice ${invNum}`, { parse_mode: 'Markdown' });
                     } catch (emailErr: any) {
-                        await ctx.reply(`⚠️ Email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                        await ctx.reply(`âš ï¸ Email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
                     }
 
                     return;
@@ -1512,7 +665,7 @@ If no invoice number found, use null for invoiceNumber.`,
             }
         }
 
-        // ── DEFAULT: General document summary ──
+        // â”€â”€ DEFAULT: General document summary â”€â”€
         if (extraction.rawText.length > 50) {
             ctx.sendChatAction('typing');
             const summary = await unifiedTextGeneration({
@@ -1520,9 +673,9 @@ If no invoice number found, use null for invoiceNumber.`,
 Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any action needed.`,
                 prompt: `Document type: ${typeLabel}\nCaption: ${caption || '(none)'}\n\n${extraction.rawText.slice(0, 3000)}`
             });
-            reply += `\n━━━━━━━━━━━━━━━━━━━━\n${summary}`;
+            reply += `\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n${summary}`;
         } else {
-            reply += `\n⚠️ _Very little text extracted. This might be a scanned/image PDF._`;
+            reply += `\nâš ï¸ _Very little text extracted. This might be a scanned/image PDF._`;
         }
 
         // Store this interaction as a memory
@@ -1541,25 +694,25 @@ Be concise. Focus on: vendor name, amounts, dates, key items/SKUs, and any actio
         const chatId = ctx.from?.id || ctx.chat.id;
         if (!chatHistory[chatId]) chatHistory[chatId] = [];
         chatLastActive[chatId] = Date.now();
-        chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
+        chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' â€” ' + caption : ''}` });
         chatHistory[chatId].push({ role: "assistant", content: reply });
         if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
 
     } catch (err: any) {
         console.error(`Document processing error (${filename}):`, err.message);
-        await ctx.reply(`❌ Failed to process *${filename}*: ${err.message}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`âŒ Failed to process *${filename}*: ${err.message}`, { parse_mode: 'Markdown' });
     }
 });
 
-// ──────────────────────────────────────────────────
-// SHARED LLM PROCESSING — Telegram handler + Dashboard HTTP bridge
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// SHARED LLM PROCESSING â€” Telegram handler + Dashboard HTTP bridge
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // DECISION(2026-03-18): Unified chat provider chain with full tool calling at every tier.
 // Previously, Gemini was called directly and on failure fell back to unifiedTextGeneration
 // which lost tool calling entirely. Now every provider in the chain supports tools.
 //
-// Chain: Gemini Flash (direct, rate-limited) → OpenRouter (Claude Haiku 4.5 → Gemini Flash → GPT-4o Mini) → plain text (no tools, last resort)
+// Chain: Gemini Flash (direct, rate-limited) â†’ OpenRouter (Claude Haiku 4.5 â†’ Gemini Flash â†’ GPT-4o Mini) â†’ plain text (no tools, last resort)
 type ChatFallbackResult = {
     reply: string;
     steps: any[];
@@ -1571,7 +724,7 @@ async function generateChatWithFallback(options: {
     messages: Array<{ role: 'user' | 'assistant'; content: string }>;
     tools: any;
 }): Promise<ChatFallbackResult> {
-    // Build the provider chain — Gemini direct first, then OpenRouter models
+    // Build the provider chain â€” Gemini direct first, then OpenRouter models
     const providers: Array<{ name: string; model: () => any; isGeminiDirect?: boolean }> = [];
 
     // 1. Gemini direct (via native SDK, rate-limited)
@@ -1583,7 +736,7 @@ async function generateChatWithFallback(options: {
         });
     }
 
-    // 2. OpenRouter fallback chain — curated models from centralized config
+    // 2. OpenRouter fallback chain â€” curated models from centralized config
     if (process.env.OPENROUTER_API_KEY) {
         const openrouter = createOpenAI({
             baseURL: 'https://openrouter.ai/api/v1',
@@ -1597,7 +750,7 @@ async function generateChatWithFallback(options: {
         }
     }
 
-    // Try each provider in order — all support tool calling
+    // Try each provider in order â€” all support tool calling
     let lastError: Error | null = null;
     for (const provider of providers) {
         try {
@@ -1616,7 +769,7 @@ async function generateChatWithFallback(options: {
             });
 
             const reply = result.text || '';
-            console.log(`🤖 Chat via ${provider.name}: ${result.steps?.length || 1} step(s), ${reply.length} chars`);
+            console.log(`ðŸ¤– Chat via ${provider.name}: ${result.steps?.length || 1} step(s), ${reply.length} chars`);
 
             return {
                 reply,
@@ -1625,12 +778,12 @@ async function generateChatWithFallback(options: {
             };
         } catch (err: any) {
             lastError = err;
-            console.warn(`⚠️ ${provider.name} failed: ${err.message}. Trying next provider...`);
+            console.warn(`âš ï¸ ${provider.name} failed: ${err.message}. Trying next provider...`);
         }
     }
 
     // Last resort: unifiedTextGeneration (no tools, but at least responds)
-    console.warn(`⚠️ All chat providers failed. Falling back to unifiedTextGeneration (no tools).`);
+    console.warn(`âš ï¸ All chat providers failed. Falling back to unifiedTextGeneration (no tools).`);
     try {
         const reply = await unifiedTextGeneration({
             system: options.system,
@@ -1661,15 +814,15 @@ async function processTextMessage(text: string, chatId: number): Promise<string>
 You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
 
 ### Tool selection rules:
-- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
-- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
-- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
-- Weather → use get_weather
-- Emails → use list_recent_emails
+- "search the web" / "find" / "look up online" â†’ use perplexity_search immediately with your best interpretation of what they want
+- "give me X skus" / "list X products" / "find items with X" / "search for X" â†’ use search_products with the keyword
+- Product lookup by exact SKU (e.g. "S-12527") â†’ use lookup_product
+- Weather â†’ use get_weather
+- Emails â†’ use list_recent_emails
 
 ### Anti-clarification rules:
-- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
-- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
+- If Will's request contains a keyword and mentions products/skus/items/inventory â†’ call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
+- If Will's request mentions searching the web â†’ call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
 - If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
 - If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.
 
@@ -1678,53 +831,53 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
 - "product amount not money or cost" after a PO analysis = asking about unit quantities, not dollar amounts. Answer from the prior data.
 - "this sku" / "this one" / "that product" = the SKU most recently discussed or visible in the prior message. Use it.
 - "how many" / "what quantity" / "units" after a file analysis = re-interpret the prior analysis for quantity metrics.
-- NEVER say "It sounds like you're looking for..." — just answer directly from context.
+- NEVER say "It sounds like you're looking for..." â€” just answer directly from context.
 - NEVER say "Just provide the product name or SKU" if one was already discussed in this conversation.
 - NEVER say "let me handle it" or "I'll dive right in" without actually doing something.
-- If the user's message is short and ambiguous, look at the prior assistant message — it almost certainly provides the missing context.
+- If the user's message is short and ambiguous, look at the prior assistant message â€” it almost certainly provides the missing context.
 
-### LIVE DATA RULE — always validate with tools:
-Memory context (above) is BACKGROUND ONLY — it tells you patterns, processes, and history, NOT current values.
+### LIVE DATA RULE â€” always validate with tools:
+Memory context (above) is BACKGROUND ONLY â€” it tells you patterns, processes, and history, NOT current values.
 For ANYTHING that can change, you MUST call the appropriate tool to get live data. Do NOT answer from memory alone.
-- Prices / costs / unit cost → call lookup_product or get_purchase_history
-- Stock levels / on-hand / on-order → call lookup_product
-- PO status / open POs / what's in transit → call query_purchase_orders
-- Consumption rates / demand → call get_consumption
-- Vendor payment terms / contacts → call query_vendors
-- Invoice status → call query_invoices
+- Prices / costs / unit cost â†’ call lookup_product or get_purchase_history
+- Stock levels / on-hand / on-order â†’ call lookup_product
+- PO status / open POs / what's in transit â†’ call query_purchase_orders
+- Consumption rates / demand â†’ call get_consumption
+- Vendor payment terms / contacts â†’ call query_vendors
+- Invoice status â†’ call query_invoices
 Rule: if the answer could be stale (anything numeric, status-based, or date-based), CALL THE TOOL. Always.
 
 ### When a tool returns no result:
-- If lookup_product returns nothing: say "Not found in Finale — tried SKU [X]." Stop there.
+- If lookup_product returns nothing: say "Not found in Finale â€” tried SKU [X]." Stop there.
 - If search returns no match: say "No match in Finale for [X]." Stop there.
 - NEVER suggest Will go check something himself. You are the one who checks.
 
-### HOLLOW FILLER — never use these (they add zero value):
-- "What's next on the agenda?" / "What's our next task?" / "What's next?" — only reference next steps if you have a SPECIFIC, concrete one to name
-- "Let me know if you need anything else" — empty, skip it
-- "Hope that helps!" — never
-- "It might be worth double-checking" — you checked. Report what you found, that's it.
-- "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
+### HOLLOW FILLER â€” never use these (they add zero value):
+- "What's next on the agenda?" / "What's our next task?" / "What's next?" â€” only reference next steps if you have a SPECIFIC, concrete one to name
+- "Let me know if you need anything else" â€” empty, skip it
+- "Hope that helps!" â€” never
+- "It might be worth double-checking" â€” you checked. Report what you found, that's it.
+- "If you need this converted... let me know" â€” CONVERT IT NOW. Don't offer, do.
 - Any generic offer that could apply to ANY response (if it has no specifics, cut it)
 
-### ACTION BIAS — do it, don't note it:
+### ACTION BIAS â€” do it, don't note it:
 - NEVER say "I've noted that" or "I'll keep that in mind" unless you ALSO performed the action.
-- If Will says "X emails never need viewing, archive them" → you have tools. USE THEM. Store the preference, confirm what you did.
-- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" → ATTEMPT IT with your tools. Report what you did, not what you "noted".
-- "I can't set an automated rule" is WRONG — you have Pinecone memory, you have tools. Store the preference and explain how it works.
+- If Will says "X emails never need viewing, archive them" â†’ you have tools. USE THEM. Store the preference, confirm what you did.
+- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" â†’ ATTEMPT IT with your tools. Report what you did, not what you "noted".
+- "I can't set an automated rule" is WRONG â€” you have Pinecone memory, you have tools. Store the preference and explain how it works.
 - The only acceptable response to an actionable request is: (1) I did it, here's what happened, or (2) I tried and here's why it failed.
 - Passive acknowledgment without action is NEVER acceptable when tools exist to do the work.
 
-### Persona — always ON:
+### Persona â€” always ON:
 - Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
-- End responses with genuine engagement when there's something real to engage with — a specific observation, a risk you noticed, a quick recommendation.
+- End responses with genuine engagement when there's something real to engage with â€” a specific observation, a risk you noticed, a quick recommendation.
 - If a tool result reveals something interesting or concerning, comment on it briefly. That's not filler, that's signal.
 - Will likes directness. Get to the answer first, then add color.`;
 
     let reply = "";
 
     // DECISION(2026-03-18): Full provider chain with tool calling fallback.
-    // Gemini → OpenRouter (Claude Haiku 4.5 → Gemini Flash → GPT-4o Mini) → plain text fallback.
+    // Gemini â†’ OpenRouter (Claude Haiku 4.5 â†’ Gemini Flash â†’ GPT-4o Mini) â†’ plain text fallback.
     const tools = getAriaTools({ finale, perplexity, bot, chatId });
     const conversationMessages = chatHistory[chatId]
         .filter((m: any) => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
@@ -1757,7 +910,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 const tags = [...new Set(tagMatches)].slice(0, 5);
                 await remember({
                     category,
-                    content: `Q: "${text.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
+                    content: `Q: "${text.slice(0, 150)}" â†’ Tools: ${toolsUsed.join(', ')} â†’ A: "${reply.slice(0, 300)}"`,
                     tags,
                     source: 'telegram_auto',
                     priority: 'low',
@@ -1769,9 +922,9 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     return reply;
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // TEXT MESSAGE HANDLER
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 bot.on('text', async (ctx) => {
     const userText = ctx.message.text;
@@ -1789,12 +942,12 @@ bot.on('text', async (ctx) => {
         await logChatMessage({ source: 'telegram', role: 'user', content: userText });
     });
 
-    // ── "Please forward" shortcut — removed (dropship concept retired) ──────
+    // â”€â”€ "Please forward" shortcut â€” removed (dropship concept retired) â”€â”€â”€â”€â”€â”€
     // Previously this offered pending dropship invoice buttons.
     // Now all invoices go through normal PO matching.
 
-    // ── Manual PO# entry intercept ────────────────────────────────────────────
-    // When Will tapped "This Has a PO — Enter PO#", we're waiting for the number.
+    // â”€â”€ Manual PO# entry intercept â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // When Will tapped "This Has a PO â€” Enter PO#", we're waiting for the number.
     // Intercept it here, run reconciliation, and skip the LLM entirely.
     if (pendingPoEntry.has(chatId)) {
         const dropId = pendingPoEntry.get(chatId)!;
@@ -1819,12 +972,12 @@ bot.on('text', async (ctx) => {
             // Force-inject the user-supplied PO number regardless of what the parser found
             invoiceData.poNumber = poNumber;
 
-            await ctx.reply(`🔍 Running reconciliation for *${pending.invoiceNumber}* against Finale PO *${poNumber}*...`, { parse_mode: 'Markdown' });
+            await ctx.reply(`ðŸ” Running reconciliation for *${pending.invoiceNumber}* against Finale PO *${poNumber}*...`, { parse_mode: 'Markdown' });
 
             const recon = await reconcileInvoiceToPO(invoiceData, poNumber, finale);
 
             if (recon.overallVerdict === 'no_match') {
-                await ctx.reply(`❌ PO *${poNumber}* not found in Finale. Double-check the number and tap the button to try again.`, { parse_mode: 'Markdown' });
+                await ctx.reply(`âŒ PO *${poNumber}* not found in Finale. Double-check the number and tap the button to try again.`, { parse_mode: 'Markdown' });
                 return;
             }
 
@@ -1834,27 +987,27 @@ bot.on('text', async (ctx) => {
                 const applyResult = await applyReconciliation(recon, finale);
                 await removePendingDropship(dropId);
                 await ctx.reply(
-                    recon.summary + `\n\n✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${poNumber}.`,
+                    recon.summary + `\n\nâœ… Applied ${applyResult.applied.length} change(s) to Finale PO ${poNumber}.`,
                     { parse_mode: 'Markdown' }
                 );
             } else if (recon.overallVerdict === 'needs_approval') {
                 const approvalId = await storePendingApproval(recon, finale);
                 await ctx.reply(
-                    recon.summary + '\n\n☝️ Tap to approve or reject:',
+                    recon.summary + '\n\nâ˜ï¸ Tap to approve or reject:',
                     {
                         parse_mode: 'Markdown',
                         ...Markup.inlineKeyboard([
-                            Markup.button.callback('✅ Approve & Apply', `approve_${approvalId}`),
-                            Markup.button.callback('❌ Reject', `reject_${approvalId}`),
+                            Markup.button.callback('âœ… Approve & Apply', `approve_${approvalId}`),
+                            Markup.button.callback('âŒ Reject', `reject_${approvalId}`),
                         ])
                     }
                 );
             } else {
-                // no_change, duplicate, rejected — just show summary
+                // no_change, duplicate, rejected â€” just show summary
                 await ctx.reply(recon.summary, { parse_mode: 'Markdown' });
             }
         } catch (err: any) {
-            await ctx.reply(`❌ Reconciliation failed: ${err.message}`);
+            await ctx.reply(`âŒ Reconciliation failed: ${err.message}`);
         }
         return; // Do NOT fall through to LLM
     }
@@ -1870,7 +1023,7 @@ bot.on('text', async (ctx) => {
     ctx.sendChatAction('typing');
 
     try {
-        // ── Retrieve relevant memories for context ──
+        // â”€â”€ Retrieve relevant memories for context â”€â”€
         let memoryContext = '';
         try {
             const { getRelevantContext } = await import('../lib/intelligence/memory');
@@ -1884,15 +1037,15 @@ bot.on('text', async (ctx) => {
 You MUST use your tools to answer questions. NEVER ask clarifying questions when a tool can attempt the task.
 
 ### Tool selection rules:
-- "search the web" / "find" / "look up online" → use perplexity_search immediately with your best interpretation of what they want
-- "give me X skus" / "list X products" / "find items with X" / "search for X" → use search_products with the keyword
-- Product lookup by exact SKU (e.g. "S-12527") → use lookup_product
-- Weather → use get_weather
-- Emails → use list_recent_emails
+- "search the web" / "find" / "look up online" â†’ use perplexity_search immediately with your best interpretation of what they want
+- "give me X skus" / "list X products" / "find items with X" / "search for X" â†’ use search_products with the keyword
+- Product lookup by exact SKU (e.g. "S-12527") â†’ use lookup_product
+- Weather â†’ use get_weather
+- Emails â†’ use list_recent_emails
 
 ### Anti-clarification rules:
-- If Will's request contains a keyword and mentions products/skus/items/inventory → call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
-- If Will's request mentions searching the web → call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
+- If Will's request contains a keyword and mentions products/skus/items/inventory â†’ call search_products with that keyword. Do NOT ask "which products?" or "could you clarify?"
+- If Will's request mentions searching the web â†’ call perplexity_search with your best guess query. Do NOT ask "what are you looking for?"
 - If there are typos, interpret the intent and proceed. "lisst skus" = "list skus". "kashi" is a keyword to search.
 - If in doubt, ATTEMPT the action. It's better to return wrong results than to ask a question.
 
@@ -1901,46 +1054,46 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
 - "product amount not money or cost" after a PO analysis = asking about unit quantities, not dollar amounts. Answer from the prior data.
 - "this sku" / "this one" / "that product" = the SKU most recently discussed or visible in the prior message. Use it.
 - "how many" / "what quantity" / "units" after a file analysis = re-interpret the prior analysis for quantity metrics.
-- NEVER say "It sounds like you're looking for..." — just answer directly from context.
+- NEVER say "It sounds like you're looking for..." â€” just answer directly from context.
 - NEVER say "Just provide the product name or SKU" if one was already discussed in this conversation.
 - NEVER say "let me handle it" or "I'll dive right in" without actually doing something.
-- If the user's message is short and ambiguous, look at the prior assistant message — it almost certainly provides the missing context.
+- If the user's message is short and ambiguous, look at the prior assistant message â€” it almost certainly provides the missing context.
 
-### LIVE DATA RULE — always validate with tools:
-Memory context (above) is BACKGROUND ONLY — it tells you patterns, processes, and history, NOT current values.
+### LIVE DATA RULE â€” always validate with tools:
+Memory context (above) is BACKGROUND ONLY â€” it tells you patterns, processes, and history, NOT current values.
 For ANYTHING that can change, you MUST call the appropriate tool to get live data. Do NOT answer from memory alone.
-- Prices / costs / unit cost → call lookup_product or get_purchase_history
-- Stock levels / on-hand / on-order → call lookup_product
-- PO status / open POs / what's in transit → call query_purchase_orders
-- Consumption rates / demand → call get_consumption
-- Vendor payment terms / contacts → call query_vendors
-- Invoice status → call query_invoices
+- Prices / costs / unit cost â†’ call lookup_product or get_purchase_history
+- Stock levels / on-hand / on-order â†’ call lookup_product
+- PO status / open POs / what's in transit â†’ call query_purchase_orders
+- Consumption rates / demand â†’ call get_consumption
+- Vendor payment terms / contacts â†’ call query_vendors
+- Invoice status â†’ call query_invoices
 Rule: if the answer could be stale (anything numeric, status-based, or date-based), CALL THE TOOL. Always.
 
 ### When a tool returns no result:
-- If lookup_product returns nothing: say "Not found in Finale — tried SKU [X]." Stop there.
+- If lookup_product returns nothing: say "Not found in Finale â€” tried SKU [X]." Stop there.
 - If search returns no match: say "No match in Finale for [X]." Stop there.
 - NEVER suggest Will go check something himself. You are the one who checks.
 
-### HOLLOW FILLER — never use these (they add zero value):
-- "What's next on the agenda?" / "What's our next task?" / "What's next?" — only reference next steps if you have a SPECIFIC, concrete one to name
-- "Let me know if you need anything else" — empty, skip it
-- "Hope that helps!" — never
-- "It might be worth double-checking" — you checked. Report what you found, that's it.
-- "If you need this converted... let me know" — CONVERT IT NOW. Don't offer, do.
+### HOLLOW FILLER â€” never use these (they add zero value):
+- "What's next on the agenda?" / "What's our next task?" / "What's next?" â€” only reference next steps if you have a SPECIFIC, concrete one to name
+- "Let me know if you need anything else" â€” empty, skip it
+- "Hope that helps!" â€” never
+- "It might be worth double-checking" â€” you checked. Report what you found, that's it.
+- "If you need this converted... let me know" â€” CONVERT IT NOW. Don't offer, do.
 - Any generic offer that could apply to ANY response (if it has no specifics, cut it)
 
-### ACTION BIAS — do it, don't note it:
+### ACTION BIAS â€” do it, don't note it:
 - NEVER say "I've noted that" or "I'll keep that in mind" unless you ALSO performed the action.
-- If Will says "X emails never need viewing, archive them" → you have tools. USE THEM. Store the preference, confirm what you did.
-- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" → ATTEMPT IT with your tools. Report what you did, not what you "noted".
-- "I can't set an automated rule" is WRONG — you have Pinecone memory, you have tools. Store the preference and explain how it works.
+- If Will says "X emails never need viewing, archive them" â†’ you have tools. USE THEM. Store the preference, confirm what you did.
+- If Will gives a task like "mark as read", "archive", "create a filter", "set a preference" â†’ ATTEMPT IT with your tools. Report what you did, not what you "noted".
+- "I can't set an automated rule" is WRONG â€” you have Pinecone memory, you have tools. Store the preference and explain how it works.
 - The only acceptable response to an actionable request is: (1) I did it, here's what happened, or (2) I tried and here's why it failed.
 - Passive acknowledgment without action is NEVER acceptable when tools exist to do the work.
 
-### Persona — always ON:
+### Persona â€” always ON:
 - Aria is warm, sharp, and witty. Dry humor is welcome when it fits.
-- End responses with genuine engagement when there's something real to engage with — a specific observation, a risk you noticed, a quick recommendation.
+- End responses with genuine engagement when there's something real to engage with â€” a specific observation, a risk you noticed, a quick recommendation.
 - If a tool result reveals something interesting or concerning, comment on it briefly. That's not filler, that's signal.
 - Will likes directness. Get to the answer first, then add color.`;
 
@@ -1979,7 +1132,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                     const tags = [...new Set(tagMatches)].slice(0, 5);
                     await remember({
                         category,
-                        content: `Q: "${userText.slice(0, 150)}" → Tools: ${toolsUsed.join(', ')} → A: "${reply.slice(0, 300)}"`,
+                        content: `Q: "${userText.slice(0, 150)}" â†’ Tools: ${toolsUsed.join(', ')} â†’ A: "${reply.slice(0, 300)}"`,
                         tags,
                         source: 'telegram_auto',
                         priority: 'low',
@@ -1998,51 +1151,51 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
     } catch (err: any) {
         console.error('Chat Error:', err.message);
-        ctx.reply(`⚠️ Ops: ${err.message}`);
+        ctx.reply(`âš ï¸ Ops: ${err.message}`);
     }
 });
 
 
-// Boot — clear any competing session first, then start long-polling
+// Boot â€” clear any competing session first, then start long-polling
 (async () => {
     try {
         // Force-clear any existing long-poll session
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        console.log('🔄 Cleared previous Telegram session');
+        console.log('ðŸ”„ Cleared previous Telegram session');
     } catch (err: any) {
-        console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
+        console.log('âš ï¸ Webhook clear failed (non-fatal):', err.message);
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // RECONCILIATION APPROVAL INLINE BUTTONS
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // DECISION(2026-02-26): Using Telegram bot (not Slack) for approvals per Will.
     // When AP Agent detects a price change >3%, it sends inline keyboard buttons.
     // These handlers capture the button taps and apply/reject changes.
 
     bot.action(/^approve_(.+)$/, async (ctx) => {
         const approvalId = ctx.match[1];
-        console.log(`🔑 Approval button tapped: ${approvalId}`);
+        console.log(`ðŸ”‘ Approval button tapped: ${approvalId}`);
 
         await ctx.answerCbQuery('Processing approval...');
 
         try {
             const result = await approvePendingReconciliation(approvalId);
             const responseMsg = result.success
-                ? `${result.message}\n\nApplied:\n${result.applied.map(a => `  ✅ ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map(e => `  ❌ ${e}`).join('\n')}` : ''}`
-                : `⚠️ ${result.message}`;
+                ? `${result.message}\n\nApplied:\n${result.applied.map(a => `  âœ… ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map(e => `  âŒ ${e}`).join('\n')}` : ''}`
+                : `âš ï¸ ${result.message}`;
 
             await ctx.editMessageText(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
                 ? ctx.callbackQuery.message.text + '\n\n' + responseMsg
                 : responseMsg);
         } catch (err: any) {
-            await ctx.reply(`❌ Approval failed: ${err.message}`);
+            await ctx.reply(`âŒ Approval failed: ${err.message}`);
         }
     });
 
     bot.action(/^reject_(.+)$/, async (ctx) => {
         const approvalId = ctx.match[1];
-        console.log(`🔒 Rejection button tapped: ${approvalId}`);
+        console.log(`ðŸ”’ Rejection button tapped: ${approvalId}`);
 
         await ctx.answerCbQuery('Changes rejected');
 
@@ -2053,32 +1206,32 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             : message);
     });
 
-    // TEXT COMMAND FALLBACK for approvals — handles /approve_<id> and /reject_<id>
+    // TEXT COMMAND FALLBACK for approvals â€” handles /approve_<id> and /reject_<id>
     // typed as plain text. Useful when the inline buttons are no longer tappable
     // (e.g., old message scrolled past, or approval came from the test pipeline script).
     bot.hears(/^\/approve_(.+)$/, async (ctx) => {
         const approvalId = ctx.match[1];
-        console.log(`🔑 Approval text command: ${approvalId}`);
+        console.log(`ðŸ”‘ Approval text command: ${approvalId}`);
         try {
             const result = await approvePendingReconciliation(approvalId);
             const responseMsg = result.success
-                ? `${result.message}\n\nApplied:\n${result.applied.map((a: string) => `  ✅ ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map((e: string) => `  ❌ ${e}`).join('\n')}` : ''}`
-                : `⚠️ ${result.message}`;
+                ? `${result.message}\n\nApplied:\n${result.applied.map((a: string) => `  âœ… ${a}`).join('\n')}${result.errors.length > 0 ? `\n\nErrors:\n${result.errors.map((e: string) => `  âŒ ${e}`).join('\n')}` : ''}`
+                : `âš ï¸ ${result.message}`;
             await ctx.reply(responseMsg, { parse_mode: 'Markdown' });
         } catch (err: any) {
-            await ctx.reply(`❌ Approval failed: ${err.message}`);
+            await ctx.reply(`âŒ Approval failed: ${err.message}`);
         }
     });
 
     bot.hears(/^\/reject_(.+)$/, async (ctx) => {
         const approvalId = ctx.match[1];
-        console.log(`🔒 Rejection text command: ${approvalId}`);
+        console.log(`ðŸ”’ Rejection text command: ${approvalId}`);
         const message = await rejectPendingReconciliation(approvalId);
         await ctx.reply(message, { parse_mode: 'Markdown' });
     });
 
-    // DROPSHIP INVOICE INLINE BUTTONS (LEGACY — feature retired)
-    // ──────────────────────────────────────────────────
+    // DROPSHIP INVOICE INLINE BUTTONS (LEGACY â€” feature retired)
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // These handlers remain as stubs to gracefully handle taps on old messages.
 
     bot.action(/^dropship_fwd_(.+)$/, async (ctx) => {
@@ -2086,7 +1239,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
         await ctx.editMessageText(
-            original + '\n\n⚠️ Dropship forwarding has been retired. All invoices now go through standard PO matching.\nForward manually to buildasoilap@bill.com if needed.'
+            original + '\n\nâš ï¸ Dropship forwarding has been retired. All invoices now go through standard PO matching.\nForward manually to buildasoilap@bill.com if needed.'
         );
     });
 
@@ -2105,20 +1258,20 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         await ctx.answerCbQuery('Skipped');
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
-        await ctx.editMessageText(original + '\n\n⏭️ Skipped — invoice left unmatched.');
+        await ctx.editMessageText(original + '\n\nâ­ï¸ Skipped â€” invoice left unmatched.');
     });
 
     // PO COMMIT & SEND INLINE BUTTONS
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Three-step flow:
-    //   po_review_<orderId>      → fetch PO details, look up vendor email, show confirm screen
-    //   po_confirm_send_<sendId> → commit in Finale + send email
-    //   po_cancel_send_<sendId>  → dismiss, PO stays as draft
-    //   po_skip_<orderId>        → silent dismiss (no review needed)
+    //   po_review_<orderId>      â†’ fetch PO details, look up vendor email, show confirm screen
+    //   po_confirm_send_<sendId> â†’ commit in Finale + send email
+    //   po_cancel_send_<sendId>  â†’ dismiss, PO stays as draft
+    //   po_skip_<orderId>        â†’ silent dismiss (no review needed)
 
     bot.action(/^po_review_(.+)$/, async (ctx) => {
         const orderId = ctx.match[1];
-        await ctx.answerCbQuery('Fetching PO details…');
+        await ctx.answerCbQuery('Fetching PO detailsâ€¦');
         try {
             // Reuse module-level finale singleton instead of creating a new instance
             const reviewClient = finale;
@@ -2127,7 +1280,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             if (!review.canCommit) {
                 await ctx.editMessageText(
                     (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
-                    `\n\n⚠️ PO #${orderId} is no longer in draft status — cannot commit.`
+                    `\n\nâš ï¸ PO #${orderId} is no longer in draft status â€” cannot commit.`
                 );
                 return;
             }
@@ -2135,20 +1288,20 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
 
             const itemLines = review.items.map(i =>
-                `  • ${i.productId}  ${i.productName.slice(0, 28).padEnd(28)}  ×${i.quantity}  $${i.unitPrice.toFixed(2)} = $${i.lineTotal.toFixed(2)}`
+                `  â€¢ ${i.productId}  ${i.productName.slice(0, 28).padEnd(28)}  Ã—${i.quantity}  $${i.unitPrice.toFixed(2)} = $${i.lineTotal.toFixed(2)}`
             ).join('\n');
 
             const reviewText = [
-                `📋 *PO #${review.orderId} — ${review.vendorName}*`,
+                `ðŸ“‹ *PO #${review.orderId} â€” ${review.vendorName}*`,
                 ``,
                 itemLines,
                 ``,
                 `*Total: $${review.total.toFixed(2)}*`,
-                `To: ${email ? `${email} _(${source})_` : '⚠️ No vendor email on file'}`,
+                `To: ${email ? `${email} _(${source})_` : 'âš ï¸ No vendor email on file'}`,
                 ``,
                 email
-                    ? `⚠️ _This will commit in Finale AND email the vendor._`
-                    : `_Cannot send — no email address found for ${review.vendorName}._\n_Add it to vendor\\_profiles or the vendors table._`,
+                    ? `âš ï¸ _This will commit in Finale AND email the vendor._`
+                    : `_Cannot send â€” no email address found for ${review.vendorName}._\n_Add it to vendor\\_profiles or the vendors table._`,
             ].join('\n');
 
             if (!email) {
@@ -2156,7 +1309,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                     parse_mode: 'Markdown',
                     reply_markup: {
                         inline_keyboard: [[
-                            { text: '❌ Cancel', callback_data: `po_cancel_send_noop_${orderId}` },
+                            { text: 'âŒ Cancel', callback_data: `po_cancel_send_noop_${orderId}` },
                         ]],
                     },
                 });
@@ -2168,24 +1321,24 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 parse_mode: 'Markdown',
                 reply_markup: {
                     inline_keyboard: [[
-                        { text: '✅ Confirm Send', callback_data: `po_confirm_send_${sendId}` },
-                        { text: '❌ Cancel', callback_data: `po_cancel_send_${sendId}` },
+                        { text: 'âœ… Confirm Send', callback_data: `po_confirm_send_${sendId}` },
+                        { text: 'âŒ Cancel', callback_data: `po_cancel_send_${sendId}` },
                     ]],
                 },
             });
         } catch (err: any) {
-            await ctx.reply(`❌ Failed to fetch PO #${orderId}: ${err.message}`);
+            await ctx.reply(`âŒ Failed to fetch PO #${orderId}: ${err.message}`);
         }
     });
 
     bot.action(/^po_confirm_send_(.+)$/, async (ctx) => {
         const sendId = ctx.match[1];
-        await ctx.answerCbQuery('Committing and sending…');
+        await ctx.answerCbQuery('Committing and sendingâ€¦');
         const pending = getPendingPOSend(sendId);
         if (!pending) {
             await ctx.editMessageText(
                 (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
-                '\n\n⚠️ Send data expired (bot restarted). Please tap "Review & Send" again to re-initiate.'
+                '\n\nâš ï¸ Send data expired (bot restarted). Please tap "Review & Send" again to re-initiate.'
             );
             return;
         }
@@ -2193,7 +1346,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             const result = await commitAndSendPO(sendId, 'telegram');
             await ctx.editMessageText(
                 (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
-                `\n\n✅ PO #${result.orderId} committed in Finale and emailed to ${result.sentTo}`
+                `\n\nâœ… PO #${result.orderId} committed in Finale and emailed to ${result.sentTo}`
             );
 
             // DECISION(2026-03-19): Generate a copy-paste Slack response for Will.
@@ -2209,12 +1362,12 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             });
 
             const slackResponse = [
-                `📋 *Copy-paste for Slack:*`,
+                `ðŸ“‹ *Copy-paste for Slack:*`,
                 ``,
                 `\`\`\``,
-                `✅ Ordered — PO #${result.orderId}`,
-                `🔗 ${pending.review.finaleUrl}`,
-                `📅 Expected arrival: ~${expectedDateStr}`,
+                `âœ… Ordered â€” PO #${result.orderId}`,
+                `ðŸ”— ${pending.review.finaleUrl}`,
+                `ðŸ“… Expected arrival: ~${expectedDateStr}`,
                 `\`\`\``,
             ].join('\n');
 
@@ -2233,7 +1386,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                 } catch { }
             });
         } catch (err: any) {
-            await ctx.reply(`❌ Failed to commit/send PO: ${err.message}`);
+            await ctx.reply(`âŒ Failed to commit/send PO: ${err.message}`);
         }
     });
 
@@ -2243,21 +1396,21 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         expirePendingPOSend(sendId);
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
-        await ctx.editMessageText(original + '\n\n_Cancelled — PO remains as draft in Finale._', { parse_mode: 'Markdown' });
+        await ctx.editMessageText(original + '\n\n_Cancelled â€” PO remains as draft in Finale._', { parse_mode: 'Markdown' });
     });
 
     bot.action(/^po_skip_(.+)$/, async (ctx) => {
         await ctx.answerCbQuery('Skipped');
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
-        await ctx.editMessageText(original + '\n\n_Skipped — PO stays as draft in Finale._', { parse_mode: 'Markdown' });
+        await ctx.editMessageText(original + '\n\n_Skipped â€” PO stays as draft in Finale._', { parse_mode: 'Markdown' });
     });
 
     // Fire-and-forget the launch, then start OpsManager right away.
     bot.launch({ dropPendingUpdates: true })
-        .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        .catch((err: any) => console.error('âŒ Bot launch error:', err.message));
 
-    console.log('✅ ARIA IS LIVE AND LISTENING');
+    console.log('âœ… ARIA IS LIVE AND LISTENING');
 
     // Seed memory with vendor patterns and known processes on every boot
     // (seedMemories uses upsert so this is idempotent)
@@ -2265,9 +1418,9 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         const { seedMemories } = await import('../lib/intelligence/memory');
         const { seedKnownVendorPatterns } = await import('../lib/intelligence/vendor-memory');
         await Promise.all([seedMemories(), seedKnownVendorPatterns()]);
-        console.log('🧠 Memory: ✅ Vendor patterns seeded');
+        console.log('ðŸ§  Memory: âœ… Vendor patterns seeded');
     } catch (err: any) {
-        console.warn('⚠️ Memory seed failed (non-fatal):', err.message);
+        console.warn('âš ï¸ Memory seed failed (non-fatal):', err.message);
     }
 
     // Start aria-review folder watcher
@@ -2286,7 +1439,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
         console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
     }
 
-    // ── Restore pending approvals from Supabase (survive pm2 restart) ────────────
+    // â”€â”€ Restore pending approvals from Supabase (survive pm2 restart) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try {
         const pending = await loadPendingApprovalsFromSupabase();
 
@@ -2305,7 +1458,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
 
                 const chatId = Number(telegramChatId) || Number(process.env.TELEGRAM_CHAT_ID);
                 if (!chatId) {
-                    console.warn(`[boot] No chat ID for approval ${approvalId} — skipping`);
+                    console.warn(`[boot] No chat ID for approval ${approvalId} â€” skipping`);
                     continue;
                 }
 
@@ -2316,8 +1469,8 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
                         parse_mode: 'Markdown',
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '✅ Approve & Apply', callback_data: `approve_${approvalId}` },
-                                { text: '❌ Reject', callback_data: `reject_${approvalId}` },
+                                { text: 'âœ… Approve & Apply', callback_data: `approve_${approvalId}` },
+                                { text: 'âŒ Reject', callback_data: `reject_${approvalId}` },
                             ]],
                         },
                     });
@@ -2334,33 +1487,50 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     const ops = new OpsManager(bot);
     ops.start();
 
+    // â”€â”€ REGISTER MODULAR COMMANDS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // DECISION(2026-03-20): Commands extracted to src/cli/commands/ modules.
+    // Must be registered AFTER OpsManager is created so deps.opsManager is available.
+    // Previously, /crons referenced undeclared `opsManager` variable â€” now fixed.
+    const botDeps = {
+        bot,
+        finale,
+        opsManager: ops,
+        watchdog: globalWatchdog,
+        chatHistory,
+        chatLastActive,
+        perplexityKey: perplexityKey || null,
+        elevenLabsKey: elevenLabsKey || null,
+        botStartTime: BOT_START_TIME,
+    };
+    registerAllCommands(bot, botDeps);
+
     // Start Slack Watchdog in-process (so /requests can access pending data)
     if (process.env.SLACK_ACCESS_TOKEN) {
         try {
             const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
             globalWatchdog = new SlackWatchdog(pollInterval);
             await globalWatchdog.start();
-            console.log('🦊 Slack Watchdog: ✅ Running in-process');
+            console.log('ðŸ¦Š Slack Watchdog: âœ… Running in-process');
         } catch (err: any) {
-            console.warn('⚠️ Slack Watchdog failed to start:', err.message);
+            console.warn('âš ï¸ Slack Watchdog failed to start:', err.message);
         }
     } else {
-        console.log('🦊 Slack Watchdog: ❌ SLACK_ACCESS_TOKEN not set');
+        console.log('ðŸ¦Š Slack Watchdog: âŒ SLACK_ACCESS_TOKEN not set');
     }
 
-    console.log('📅 Cron schedules registered:');
+    console.log('ðŸ“… Cron schedules registered:');
 
-    console.log('   🏭 Build Risk Report:  7:30 AM MT (Weekdays)');
-    console.log('   📊 Daily PO Summary:  8:00 AM MT (Weekdays)');
-    console.log('   🗓️  Weekly Review:     8:01 AM MT (Fridays)');
-    console.log('   📦 PO Sync:           Every 30 min');
-    console.log('   🧹 Ad Cleanup:        Every hour');
+    console.log('   ðŸ­ Build Risk Report:  7:30 AM MT (Weekdays)');
+    console.log('   ðŸ“Š Daily PO Summary:  8:00 AM MT (Weekdays)');
+    console.log('   ðŸ—“ï¸  Weekly Review:     8:01 AM MT (Fridays)');
+    console.log('   ðŸ“¦ PO Sync:           Every 30 min');
+    console.log('   ðŸ§¹ Ad Cleanup:        Every hour');
 
     // Immediate healthcheck ping on boot
     const hcUrl = process.env.HEALTHCHECK_PING_URL;
     if (hcUrl) fetch(hcUrl).catch(() => {});
 
-    // ── MEMORY MONITORING (OOM prevention) ──
+    // â”€â”€ MEMORY MONITORING (OOM prevention) â”€â”€
     // DECISION(2026-03-09): Log memory usage hourly for PM2 log analysis.
     // Also provides /memory command for on-demand diagnostics.
     // DECISION(2026-03-16): Added Healthchecks.io dead-man's switch ping.
@@ -2374,7 +1544,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             ` | External: ${mb(mem.external)}MB | Chats: ${Object.keys(chatHistory).length}`
         );
 
-        // Healthchecks.io dead-man's switch — fire-and-forget
+        // Healthchecks.io dead-man's switch â€” fire-and-forget
         const hcUrl = process.env.HEALTHCHECK_PING_URL;
         if (hcUrl) fetch(hcUrl).catch(() => {});
     }, 15 * 60 * 1000); // every 15 minutes
@@ -2390,7 +1560,7 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
             if (chatId) {
                 await bot.telegram.sendMessage(
                     chatId,
-                    `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
+                    `âš ï¸ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) â€” consider restarting if this persists.`
                 ).catch(() => { });
                 lastMemAlertSent = Date.now();
             }
