@@ -11,9 +11,11 @@
  *                                                → AP Forwarder → Bill.com
  *
  * @author  Antigravity / Aria
- * @updated 2026-03-19 — Fixed pipeline gap: items now queue as PENDING_FORWARD
- *          instead of PENDING_EXTRACTION (which had no consumer). Added cross-inbox
- *          dedup and tightened invoice classification heuristics.
+ * @updated 2026-03-20 — Added 3-layer safety net: sender blocklist, subject
+ *          skip patterns, and PDF content scanning ("Do Not Pay", $0.00 balance,
+ *          proforma, etc.) to prevent bad forwards to Bill.com.
+ *          Previous: Fixed pipeline gap (PENDING_FORWARD vs PENDING_EXTRACTION),
+ *          added cross-inbox dedup, tightened classification heuristics.
  */
 
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -47,6 +49,10 @@ const SENDER_BLOCKLIST: Array<{ type: 'domain' | 'contains' | 'exact'; value: st
 
 // ── SUBJECT BLOCKLIST ──────────────────────────────────────────────
 // Subjects matching these patterns are auto-archived, never forwarded.
+// DECISION(2026-03-20): Keep this list TIGHT. Only skip emails that are
+// 100% system-generated junk. Vendor communications about payment status
+// (remittance advice, late notices, etc.) must NOT be skipped — they need
+// human review to cross-check Bill.com.
 const SUBJECT_SKIP_PATTERNS: RegExp[] = [
     /undeliverable/i,
     /delivery.*failed/i,
@@ -58,6 +64,16 @@ const SUBJECT_SKIP_PATTERNS: RegExp[] = [
 // ── PDF CONTENT BLOCKLIST ─────────────────────────────────────────
 // If the first ~2KB of extracted PDF text matches any of these, the
 // invoice is blocked from Bill.com forwarding.
+//
+// DECISION(2026-03-20): Keep this list EXTREMELY conservative.
+// Only patterns that are 100% guaranteed non-payable. When in doubt,
+// let it through for human review.
+//
+// NOT blocked (intentionally — need human review):
+//   - Proforma invoices (can be payable)
+//   - Quotations (vendor may update to invoice)
+//   - Remittance advice (need to verify against Bill.com)
+//   - "Your invoice is late" (need to check Bill.com)
 const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
     { pattern: /do\s*not\s*pay/i, reason: 'PDF contains "Do Not Pay"' },
     { pattern: /this\s+is\s+not\s+a\s+bill/i, reason: 'PDF states "This is not a bill"' },
