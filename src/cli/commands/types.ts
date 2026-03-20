@@ -10,6 +10,7 @@
  */
 
 import type { Context, Telegraf } from 'telegraf';
+import type { Update } from 'telegraf/types';
 import type { FinaleClient } from '../../lib/finale/client';
 import type { OpsManager } from '../../lib/intelligence/ops-manager';
 import type { SlackWatchdog } from '../../lib/slack/watchdog';
@@ -23,8 +24,12 @@ export interface BotCommand {
     name: string | string[];
     /** Human-readable description shown in /help and setMyCommands list */
     description: string;
-    /** The handler invoked when the command is triggered */
-    handler: (ctx: Context, deps: BotDeps) => Promise<void>;
+    /**
+     * The handler invoked when the command is triggered.
+     * Uses generic Context to stay compatible with Telegraf's bot.command() wrapper.
+     * Access ctx.message.text via optional chaining since Context is not narrowed.
+     */
+    handler: (ctx: Context, deps: BotDeps) => Promise<any>;
 }
 
 /**
@@ -41,4 +46,13 @@ export interface BotDeps {
     perplexityKey: string | null;
     elevenLabsKey: string | null;
     botStartTime: Date;
+}
+
+/**
+ * Safely extracts the raw text from a command context.
+ * Telegraf's `bot.command()` narrows ctx at runtime but our generic
+ * `Context` type doesn't know about it. This helper avoids TS2339.
+ */
+export function getCmdText(ctx: Context): string {
+    return (ctx.message as any)?.text ?? '';
 }

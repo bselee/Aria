@@ -11,6 +11,7 @@
  */
 
 import type { BotCommand, BotDeps } from './types';
+import { getCmdText } from './types';
 
 /**
  * /remember <text> — Store something in Aria's Pinecone memory.
@@ -19,7 +20,7 @@ const rememberCommand: BotCommand = {
     name: 'remember',
     description: 'Store a fact in Aria\'s memory',
     handler: async (ctx, _deps) => {
-        const text = ctx.message!.text!.replace(/^\/remember\s*/, '').trim();
+        const text = getCmdText(ctx).replace(/^\/remember\s*/, '').trim();
         if (!text) {
             return ctx.reply('Usage: `/remember AAACooper sends multi-page invoices as statements`', { parse_mode: 'Markdown' });
         }
@@ -46,7 +47,7 @@ const recallCommand: BotCommand = {
     name: 'recall',
     description: 'Search Aria\'s memory',
     handler: async (ctx, _deps) => {
-        const query = ctx.message!.text!.replace(/^\/recall\s*/, '').trim();
+        const query = getCmdText(ctx).replace(/^\/recall\s*/, '').trim();
         if (!query) {
             return ctx.reply('Usage: `/recall AAACooper invoices`', { parse_mode: 'Markdown' });
         }

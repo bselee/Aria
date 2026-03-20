@@ -10,6 +10,7 @@
  */
 
 import type { BotCommand, BotDeps } from './types';
+import { getCmdText } from './types';
 
 /**
  * /product <SKU> — Look up a product in Finale Inventory.
@@ -19,7 +20,7 @@ const productCommand: BotCommand = {
     name: 'product',
     description: 'Look up a product in Finale',
     handler: async (ctx, deps) => {
-        const sku = ctx.message!.text!.replace('/product', '').trim();
+        const sku = getCmdText(ctx).replace('/product', '').trim();
 
         if (!sku) {
             return ctx.reply(
@@ -105,7 +106,7 @@ const consumptionCommand: BotCommand = {
     name: 'consumption',
     description: 'Show BOM consumption for a SKU',
     handler: async (ctx, deps) => {
-        const args = ctx.message!.text!.replace(/^\/consumption\s*/, '').trim().split(/\s+/);
+        const args = getCmdText(ctx).replace(/^\/consumption\s*/, '').trim().split(/\s+/);
         const sku = args[0];
         const days = parseInt(args[1]) || 90;
 
@@ -134,7 +135,7 @@ const simulateCommand: BotCommand = {
     name: ['simulate', 'build'],
     description: 'Simulate a production build explosion',
     handler: async (ctx, deps) => {
-        const rawArgs = ctx.message!.text!.split(' ');
+        const rawArgs = getCmdText(ctx).split(' ');
         rawArgs.shift(); // Remove the command part
 
         const argsStr = rawArgs.join(' ').replace(/=|x|X/g, ' ').trim();
@@ -171,7 +172,7 @@ const buildsCommand: BotCommand = {
     handler: async (ctx, _deps) => {
         ctx.sendChatAction('typing');
 
-        const args = ctx.message!.text!.replace(/^\/builds\s*/, '').trim();
+        const args = getCmdText(ctx).replace(/^\/builds\s*/, '').trim();
         const days = Math.min(Math.max(parseInt(args) || 1, 1), 30);
 
         try {
@@ -212,7 +213,7 @@ const buildsCommand: BotCommand = {
             reply += `${data.length} build${data.length > 1 ? 's' : ''}  |  ${totalUnits.toLocaleString()} total units\n`;
             reply += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
-            for (const [dateStr, rows] of byDate) {
+            for (const [dateStr, rows] of Array.from(byDate)) {
                 reply += `\n📅 *${dateStr}*\n`;
                 for (const row of rows) {
                     const time = new Date(row.completed_at).toLocaleTimeString('en-US', {

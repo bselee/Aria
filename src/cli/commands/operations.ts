@@ -11,6 +11,7 @@
  */
 
 import type { BotCommand, BotDeps } from './types';
+import { getCmdText } from './types';
 
 /**
  * /buildrisk — 30-day build risk analysis (Calendar → BOM → Stock + POs).
@@ -236,7 +237,7 @@ const notifyCommand: BotCommand = {
     handler: async (ctx, _deps) => {
         ctx.sendChatAction('typing');
 
-        const requestId = ctx.message!.text!.split(' ').slice(1).join(' ').trim();
+        const requestId = getCmdText(ctx).split(' ').slice(1).join(' ').trim();
         if (!requestId) {
             await ctx.reply('Usage: /notify <request_id>\n\nCopy the ID from an Amazon order notification.');
             return;

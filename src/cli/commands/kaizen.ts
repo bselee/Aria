@@ -11,6 +11,7 @@
  */
 
 import type { BotCommand, BotDeps } from './types';
+import { getCmdText } from './types';
 
 // DECISION(2026-02-20): ElevenLabs voice config kept centralized here.
 // If voice features expand, this should move to a config module.
@@ -34,7 +35,7 @@ const kaizenCommand: BotCommand = {
 
         try {
             const { generateSelfReview } = await import('../../lib/intelligence/feedback-loop');
-            const args = ctx.message!.text!.replace(/^\/kaizen\s*/, '').trim();
+            const args = getCmdText(ctx).replace(/^\/kaizen\s*/, '').trim();
             const days = Math.min(Math.max(parseInt(args) || 7, 1), 90);
             const report = await generateSelfReview(days);
             await ctx.reply(report, { parse_mode: 'HTML' });
@@ -53,7 +54,7 @@ const vendorCommand: BotCommand = {
     name: 'vendor',
     description: 'Show vendor reliability scorecard',
     handler: async (ctx, _deps) => {
-        const vendorName = ctx.message!.text!.replace(/^\/vendor\s*/, '').trim();
+        const vendorName = getCmdText(ctx).replace(/^\/vendor\s*/, '').trim();
         if (!vendorName) {
             return ctx.reply(
                 '📊 *Vendor Reliability Scorecard*\n\n' +
