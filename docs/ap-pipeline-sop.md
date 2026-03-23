@@ -477,6 +477,47 @@ Should an anomaly occur (i.e. FedEx applies a freight invoice to the *other* ove
 
 ---
 
+## Multi-Invoice Statement Splitting (AAA Cooper)
+
+**File:** `src/lib/intelligence/workers/ap-identifier.ts` → `handleMultiInvoiceStatement()`
+
+Some vendors send bundled "statements" that actually contain multiple individual invoices mixed with BOLs and cover letters. The AP pipeline detects these vendors and automatically splits the PDF.
+
+### How It Works
+
+1. Email classified as `STATEMENT` by LLM
+2. Sender/filename checked against `MULTI_INVOICE_STATEMENT_VENDORS` array
+3. If match found:
+   - Download PDF attachment from Gmail
+   - Extract text per-page using pdf-lib + pdf-parse
+   - LLM classifies each page as INVOICE / BOL / COVER / OTHER
+   - Each INVOICE page → individual PDF named by PRO/invoice number
+   - Each uploaded to Supabase Storage → queued as `PENDING_FORWARD`
+   - AP Forwarder sends to Bill.com on next cycle
+4. If no match → standard STATEMENT handling (label + archive)
+
+### Supported Vendors
+
+| Vendor | Sender Pattern | Filename Pattern | Invoice ID |
+|--------|---------------|-----------------|------------|
+| AAA Cooper | `/aaa\s*cooper/i` | `/ACT_STMD/i` | PRO number |
+
+### Adding a New Multi-Invoice Vendor
+
+1. Open `src/lib/intelligence/workers/ap-identifier.ts`
+2. Add entry to `MULTI_INVOICE_STATEMENT_VENDORS`:
+   ```typescript
+   {
+       senderMatch: /vendor-name/i,
+       filenameMatch: /PATTERN/i,  // optional
+       label: 'Vendor Display Name',
+   },
+   ```
+3. Update vendor memory seed in `vendor-memory.ts`
+4. `pm2 restart aria-bot`
+
+---
+
 ## 🔮 Future Brilliance (The AP Roadmap)
 
 To make this system truly untouchable, the following concepts are queued for future phases:

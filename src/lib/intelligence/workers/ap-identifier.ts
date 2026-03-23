@@ -22,7 +22,7 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
 import { z } from "zod";
-import { unifiedObjectGeneration } from "../llm";
+import { unifiedObjectGeneration, unifiedTextGeneration } from "../llm";
 import { recall } from "../memory";
 import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
 import { FinaleClient } from "../../finale/client";
@@ -81,6 +81,29 @@ const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
     { pattern: /already\s+paid/i, reason: 'PDF says "Already Paid"' },
     { pattern: /balance\s*:?\s*\$?\s*0\.00/i, reason: 'PDF shows $0.00 balance' },
     { pattern: /paid\s+in\s+full/i, reason: 'PDF says "Paid in Full"' },
+    // DECISION(2026-03-23): Added after Dash invoice (DASH-032026-16581) was forwarded
+    // to Bill.com despite prominently displaying "PAID" as a status marker. Paid invoices
+    // with zero balance should never reach Bill.com — they are payment confirmations.
+    { pattern: /payment\s+terms.*\bPAID\b/is, reason: 'PDF shows "PAID" near payment terms' },
+    { pattern: /(?:^|\n)\s*PAID\s*(?:\n|$)/m, reason: 'PDF has standalone "PAID" status marker' },
+    { pattern: /\bamount\s+paid\b.{0,10}\$[\d,]+\.\d{2}.*\b(?:balance|due)\b.{0,10}\$?\s*0\.00/is, reason: 'PDF shows amount paid with $0.00 balance' },
+];
+
+// ── MULTI-INVOICE STATEMENT VENDORS ──────────────────────────────
+// DECISION(2026-03-23): Some vendors send "statements" that are actually
+// bundles of 3-6 individual invoices mixed with BOLs and cover letters.
+// When these are classified as STATEMENT, we must split them into
+// individual invoice PDFs and queue each for Bill.com forwarding.
+const MULTI_INVOICE_STATEMENT_VENDORS: Array<{
+    senderMatch: RegExp;
+    filenameMatch?: RegExp;
+    label: string;
+}> = [
+    {
+        senderMatch: /aaa\s*cooper/i,
+        filenameMatch: /ACT_STMD/i,
+        label: 'AAA Cooper',
+    },
 ];
 
 export class APIdentifierAgent {
@@ -356,6 +379,46 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 }
 
                 if (intent === "STATEMENT") {
+                    // ── CHECK: Is this a multi-invoice "statement"? ──────────
+                    // DECISION(2026-03-23): Some vendors (AAA Cooper) send bundled
+                    // invoices labeled as "statements." Before dead-ending, check
+                    // if the sender matches a known multi-invoice vendor pattern.
+                    // If so, split the PDF and queue individual invoices.
+                    const pdfNames: string[] = m.pdf_filenames || [];
+                    const multiInvVendor = MULTI_INVOICE_STATEMENT_VENDORS.find(v =>
+                        v.senderMatch.test(from) ||
+                        (v.filenameMatch && pdfNames.some((f: string) => v.filenameMatch!.test(f)))
+                    );
+
+                    if (multiInvVendor && m.gmail_message_id) {
+                        try {
+                            const handled = await this.handleMultiInvoiceStatement(
+                                m, gmail, supabase, multiInvVendor.label,
+                            );
+                            if (handled) {
+                                // Successfully split — label as processed and archive
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me",
+                                        id: m.gmail_message_id,
+                                        requestBody: {
+                                            addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
+                                            removeLabelIds: ["INBOX", "UNREAD"]
+                                        }
+                                    });
+                                } catch (e) { /* ignore */ }
+                                continue;
+                            }
+                            // Fall through to normal STATEMENT handling if split failed
+                        } catch (err: any) {
+                            console.error(`     ❌ Multi-invoice statement split failed:`, err.message);
+                            await this.logActivity(supabase, from, subject, "STATEMENT",
+                                `Multi-invoice split failed: ${err.message} — falling back to label`);
+                            // Fall through to normal STATEMENT handling
+                        }
+                    }
+
+                    // Default STATEMENT handling: label and archive
                     try {
                         await gmail.users.messages.modify({
                             userId: "me",
@@ -688,8 +751,53 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         }
 
         // Step 4: If no PO match, create a draft PO for Will to review
+        // DEDUP GUARD: Check if we already created a draft PO for this vendor/invoice
         let draftInfo: { orderId: string; finaleUrl: string } | null = null;
+        let skipDraftCreation = false;
+
         if (!matchedPO) {
+            // Check paid_invoices table for existing record with same vendor + invoice
+            try {
+                const { data: existingPaid } = await supabase
+                    .from('paid_invoices')
+                    .select('id, po_number, po_matched')
+                    .eq('vendor_name', extracted.vendorName)
+                    .eq('invoice_number', extracted.invoiceNumber)
+                    .maybeSingle();
+
+                if (existingPaid?.po_number) {
+                    console.log(`     ⚠️ DEDUP: Draft PO already exists for ${extracted.vendorName} inv#${extracted.invoiceNumber} → PO #${existingPaid.po_number}. Skipping.`);
+                    matchedPO = { orderId: existingPaid.po_number, total: extracted.amountPaid, status: 'Draft' };
+                    skipDraftCreation = true;
+                } else if (existingPaid) {
+                    console.log(`     ⚠️ DEDUP: Already processed ${extracted.vendorName} inv#${extracted.invoiceNumber} (no PO matched). Skipping.`);
+                    skipDraftCreation = true;
+                }
+            } catch { /* table may not exist — proceed normally */ }
+
+            // Also check if we created a draft PO for this vendor in the last 24h
+            if (!skipDraftCreation) {
+                try {
+                    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+                    const { data: recentDraft } = await supabase
+                        .from('paid_invoices')
+                        .select('id, po_number')
+                        .eq('vendor_name', extracted.vendorName)
+                        .gte('created_at', twentyFourHoursAgo)
+                        .not('po_number', 'is', null)
+                        .limit(1)
+                        .maybeSingle();
+
+                    if (recentDraft?.po_number) {
+                        console.log(`     ⚠️ DEDUP: Recent draft PO #${recentDraft.po_number} exists for ${extracted.vendorName} (last 24h). Skipping.`);
+                        matchedPO = { orderId: recentDraft.po_number, total: extracted.amountPaid, status: 'Draft' };
+                        skipDraftCreation = true;
+                    }
+                } catch { /* proceed normally */ }
+            }
+        }
+
+        if (!matchedPO && !skipDraftCreation) {
             try {
                 const vendorPartyId = await finale.findVendorPartyByName(extracted.vendorName);
 
@@ -804,6 +912,259 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             draftPO: draftInfo?.orderId || null,
             confidence: extracted.confidence,
         });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // MULTI-INVOICE STATEMENT HANDLER (AAA Cooper-style)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Splits a multi-invoice "statement" PDF into individual invoice PDFs.
+     *
+     * AAA Cooper (and similar vendors) bundle 3-6 invoices into one PDF along
+     * with BOLs, delivery receipts, and cover letters. Each invoice has its
+     * own PRO number and needs to be sent individually to Bill.com.
+     *
+     * Process:
+     * 1. Download the PDF attachment from Gmail
+     * 2. Extract text per-page using pdf-lib + pdf-parse
+     * 3. LLM classifies each page as INVOICE / BOL / COVER / OTHER
+     * 4. For each INVOICE page: extract into its own PDF, name by PRO/invoice #
+     * 5. Upload each to Supabase Storage
+     * 6. Queue each as PENDING_FORWARD in ap_inbox_queue
+     * 7. Existing AP Forwarder picks them up and sends to Bill.com
+     *
+     * @returns true if statement was successfully split and queued, false if
+     *          it should fall through to default STATEMENT handling.
+     */
+    private async handleMultiInvoiceStatement(
+        emailRow: any,
+        gmail: any,
+        supabase: any,
+        vendorLabel: string,
+    ): Promise<boolean> {
+        const subject = emailRow.subject || 'No Subject';
+        const from = emailRow.from_email || 'Unknown';
+        const msgId = emailRow.gmail_message_id;
+
+        console.log(`     ✂️ Multi-invoice statement detected (${vendorLabel}): "${subject}"`);
+
+        // Step 1: Fetch full message and find PDF attachments
+        let msg: any;
+        try {
+            msg = await gmail.users.messages.get({ userId: 'me', id: msgId });
+        } catch (err: any) {
+            console.error(`     ❌ Failed to fetch message for statement split:`, err.message);
+            return false;
+        }
+
+        const pdfParts: any[] = [];
+        const walkParts = (parts: any[]): void => {
+            for (const part of parts) {
+                if (part.filename && part.filename.toLowerCase().endsWith('.pdf')) {
+                    pdfParts.push(part);
+                }
+                if (part.parts?.length) walkParts(part.parts);
+            }
+        };
+        walkParts(msg.data.payload?.parts || []);
+
+        if (pdfParts.length === 0) {
+            console.log(`     ⚠️ No PDF attachment found on statement email — falling through`);
+            return false;
+        }
+
+        // Process the first PDF attachment (statements are typically single-PDF)
+        const pdfPart = pdfParts[0];
+        if (!pdfPart.body?.attachmentId) return false;
+
+        let buffer: Buffer;
+        try {
+            const response = await gmail.users.messages.attachments.get({
+                userId: 'me',
+                messageId: msgId,
+                id: pdfPart.body.attachmentId,
+            });
+            const attachmentData = response.data.data;
+            if (!attachmentData) return false;
+            buffer = Buffer.from(attachmentData, 'base64url');
+        } catch (err: any) {
+            console.error(`     ❌ Failed to download PDF attachment:`, err.message);
+            return false;
+        }
+
+        console.log(`     📄 Downloaded ${pdfPart.filename} (${(buffer.length / 1024).toFixed(0)} KB)`);
+
+        // Step 2: Per-page text extraction
+        const { extractPerPage } = await import('../../pdf/extractor');
+        const { PDFDocument } = await import('pdf-lib');
+        const pages = await extractPerPage(buffer);
+
+        if (pages.length < 2) {
+            console.log(`     ⚠️ Only ${pages.length} page(s) — not a multi-invoice statement`);
+            return false;
+        }
+
+        console.log(`     🔬 Analyzing ${pages.length} pages for invoice identification...`);
+
+        // Step 3: LLM per-page classification
+        const pageAnalysis = await unifiedTextGeneration({
+            system: `You analyze freight carrier statement documents page by page. These "statements" contain a mix of individual invoices, bills of lading (BOL), delivery receipts, and cover letters.
+
+For each page, determine:
+- INVOICE: An individual freight invoice with charges, a PRO number, shipper/consignee, and a total amount
+- BOL: Bill of lading or delivery receipt
+- COVER: Cover letter, summary page, or remittance advice
+- OTHER: Any other page type
+
+Return ONLY a JSON array with one object per page:
+[{"page":1,"type":"COVER"},{"page":2,"type":"BOL"},{"page":3,"type":"INVOICE","invoiceNumber":"64471573","amount":470.51}]
+
+For INVOICE pages, extract:
+- invoiceNumber: The PRO number or invoice number (critical for filename)
+- amount: The total charge amount
+
+If no invoice number is found, use null.`,
+            prompt: `${pages.length} pages from a ${vendorLabel} statement:\n\n${pages.map(p =>
+                `=== PAGE ${p.pageNumber} ===\n${p.text.slice(0, 1000)}\n`
+            ).join('\n')}`,
+        });
+
+        // Parse the LLM response
+        let pageResults: Array<{
+            page: number;
+            type: string;
+            invoiceNumber?: string | null;
+            amount?: number | null;
+        }> = [];
+        try {
+            const jsonMatch = pageAnalysis.match(/\[[\s\S]*?\]/);
+            if (jsonMatch) pageResults = JSON.parse(jsonMatch[0]);
+        } catch {
+            console.error(`     ❌ Failed to parse page analysis JSON — aborting split`);
+            return false;
+        }
+
+        const invoicePages = pageResults.filter(p => p.type === 'INVOICE');
+
+        if (invoicePages.length === 0) {
+            console.log(`     ⚠️ No invoice pages identified in statement — falling through`);
+            return false;
+        }
+
+        console.log(`     📋 Found ${invoicePages.length} invoice(s): ${invoicePages.map(p => p.invoiceNumber || `page${p.page}`).join(', ')}`);
+
+        // Step 4: Split PDF and queue each invoice
+        const sourcePdf = await PDFDocument.load(buffer);
+        let queuedCount = 0;
+
+        for (const invPage of invoicePages) {
+            const pageIdx = invPage.page - 1;
+            if (pageIdx < 0 || pageIdx >= sourcePdf.getPageCount()) continue;
+
+            const invNum = invPage.invoiceNumber || `page${invPage.page}`;
+            const safeInvNum = invNum.replace(/[^a-zA-Z0-9-]/g, '_');
+            const invFilename = `${safeInvNum}.pdf`;
+
+            // Create single-page PDF
+            const singlePdf = await PDFDocument.create();
+            const [copiedPage] = await singlePdf.copyPages(sourcePdf, [pageIdx]);
+            singlePdf.addPage(copiedPage);
+            const pageBuffer = Buffer.from(await singlePdf.save());
+
+            // Dedup check: same PRO number from same sender within 7 days
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+            const { data: existingInv } = await supabase
+                .from('ap_inbox_queue')
+                .select('id')
+                .eq('email_from', from)
+                .eq('pdf_filename', invFilename)
+                .gte('created_at', sevenDaysAgo)
+                .maybeSingle();
+
+            if (existingInv) {
+                console.log(`     ⚠️ DEDUP: ${invFilename} already queued from ${from} — skipping`);
+                continue;
+            }
+
+            // Upload to Supabase Storage
+            const storagePath = `${msgId}/split_${Date.now()}_${invFilename}`;
+            const { error: uploadError } = await supabase.storage
+                .from('ap_invoices')
+                .upload(storagePath, pageBuffer, {
+                    contentType: 'application/pdf',
+                    upsert: true,
+                });
+
+            if (uploadError) {
+                console.error(`     ❌ Storage upload failed for ${invFilename}:`, uploadError.message);
+                continue;
+            }
+
+            // Queue as PENDING_FORWARD
+            const uniqueMsgId = `${msgId}_split_${safeInvNum}`;
+            const { error: insertError } = await supabase.from('ap_inbox_queue').insert({
+                message_id: uniqueMsgId,
+                email_from: from,
+                email_subject: `${vendorLabel} Invoice ${invNum}`,
+                intent: 'INVOICE',
+                pdf_path: storagePath,
+                pdf_filename: invFilename,
+                status: 'PENDING_FORWARD',
+                source_inbox: emailRow.source_inbox || 'ap',
+            });
+
+            if (insertError) {
+                console.error(`     ❌ Queue insert failed for ${invFilename}:`, insertError.message);
+                continue;
+            }
+
+            const amountStr = invPage.amount ? ` ($${invPage.amount.toFixed(2)})` : '';
+            console.log(`     ✅ Queued ${invFilename}${amountStr} → PENDING_FORWARD`);
+            queuedCount++;
+        }
+
+        if (queuedCount > 0) {
+            await this.logActivity(
+                supabase, from, subject, 'MULTI_INVOICE_STATEMENT',
+                `Split ${vendorLabel} statement: ${queuedCount} invoice(s) queued for Bill.com`,
+                {
+                    vendor: vendorLabel,
+                    invoicesFound: invoicePages.length,
+                    invoicesQueued: queuedCount,
+                    invoiceNumbers: invoicePages.map(p => p.invoiceNumber).filter(Boolean),
+                    sourceFilename: pdfPart.filename,
+                }
+            );
+
+            // Telegram notification
+            const chatId = process.env.TELEGRAM_CHAT_ID;
+            if (chatId && this.bot) {
+                const invoiceList = invoicePages
+                    .map(p => {
+                        const num = p.invoiceNumber || `page${p.page}`;
+                        const amt = p.amount ? ` — $${p.amount.toFixed(2)}` : '';
+                        return `  • ${num}${amt}`;
+                    })
+                    .join('\n');
+                const total = invoicePages.reduce((sum, p) => sum + (p.amount || 0), 0);
+                const totalStr = total > 0 ? `\n<b>Statement Total:</b> $${total.toFixed(2)}` : '';
+
+                try {
+                    await this.bot.telegram.sendMessage(chatId, [
+                        `✂️ <b>${vendorLabel} Statement Split</b>`,
+                        ``,
+                        `Split <b>${queuedCount}</b> invoice(s) from statement:`,
+                        invoiceList,
+                        totalStr,
+                        ``,
+                        `📤 Queued for Bill.com forwarding`,
+                    ].filter(Boolean).join('\n'), { parse_mode: 'HTML' });
+                } catch { /* non-critical */ }
+            }
+        }
+
+        return queuedCount > 0;
     }
 
     /** Escape HTML special characters for Telegram messages. */
