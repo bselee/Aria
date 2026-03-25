@@ -306,25 +306,28 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         console.log(`     🗑️ Promoted/Spam archived.`);
                     } catch (e) { /* ignore */ }
                 } else if (intent === "INLINE_INVOICE") {
-                    // Delegate to InlineInvoiceHandler for PDF generation + Bill.com forward
+                    // DECISION(2026-03-25): All paid (credit-card) invoices from the default
+                    // inbox are enqueued to nightshift for overnight PO reconciliation.
+                    // Previously these went to InlineInvoiceHandler (synchronous, inline).
+                    //
+                    // Why nightshift?
+                    //   - These invoices are already paid — no urgency for immediate processing
+                    //   - Extraction requires Haiku (qwen3 unreliable for structured data)
+                    //   - The nightshift loop handles dedup, guardrails, Finale updates, and
+                    //     morning handoff reporting in one consistent pipeline
+                    //   - Guard 1 failures (no PO#) still fire Telegram alerts immediately
+                    //     from within the worker, so nothing time-sensitive is lost
+                    //
+                    // These emails should NEVER go to Bill.com — they are already paid.
+                    // Bill.com forwarding is exclusively the AP inbox's job.
                     try {
-                        const { InlineInvoiceHandler } = await import('./inline-invoice-handler');
-                        const { Telegraf } = await import('telegraf');
-                        const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
-                        const handler = new InlineInvoiceHandler(bot);
-                        // DECISION(2026-03-13): Use full body_text instead of snippet.
-                        // PO #124462 showed the snippet (~200 chars) truncated Ed's cost
-                        // breakdown, making the LLM parser unable to extract accurate data.
+                        const { enqueueDefaultInboxInvoice } = await import('./nightshift-agent');
                         const bodyText = m.body_text || m.body_snippet || '';
-                        const result = await handler.process(bodyText, subject, senderEmail, rfcMessageId || gmailMessageId, threadId, hasPdf);
-                        if (result.processed) {
-                            console.log(`     📧 Inline invoice processed: ${result.logs.join(' | ')}`);
-                            processedCount++;
-                        } else {
-                            console.log(`     ⚠️ Inline invoice detection passed but handler declined: ${result.logs.join(' | ')}`);
-                        }
+                        await enqueueDefaultInboxInvoice(gmailMessageId, senderEmail, subject, bodyText);
+                        console.log(`     📥 Paid invoice queued for overnight reconciliation: "${subject}"`);
+                        processedCount++;
                     } catch (err: any) {
-                        console.error(`     ❌ Inline invoice handler failed:`, err.message);
+                        console.error(`     ❌ Failed to enqueue paid invoice:`, err.message);
                     }
                 } else {
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);

@@ -45,10 +45,10 @@ import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPa
 // ── Column width defaults (px) ──────────────────────────────────────
 // DECISION(2026-03-25): Consolidated from 5 to 4 columns because the
 // farRight + right columns were pushed off-screen on typical viewport widths.
-// Build Schedule now lives with Purchasing in midRight.
-const DEFAULT_LEFT_W = 360;
-const DEFAULT_MIDLEFT_W = 300;
-const DEFAULT_MIDRIGHT_W = 380;
+// Total fixed widths ~880px leaves ~400px+ for the flex right column at 1280px.
+const DEFAULT_LEFT_W = 300;
+const DEFAULT_MIDLEFT_W = 280;
+const DEFAULT_MIDRIGHT_W = 300;
 
 function ColHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
     return (

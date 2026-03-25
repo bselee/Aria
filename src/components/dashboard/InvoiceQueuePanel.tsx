@@ -215,8 +215,13 @@ export default function InvoiceQueuePanel() {
                 auto: <span className="text-emerald-400">{stats.autoApproved}</span>
               </span>
               <span className="text-[10px] font-mono text-zinc-500">
-                pending: <span className="text-amber-300">{stats.needsApproval}</span>
+                pending: <span className="text-amber-300">{freshPending.length}</span>
               </span>
+              {stalePending.length > 0 && (
+                <span className="text-[10px] font-mono text-zinc-600">
+                  stale: <span className="text-zinc-500">{stalePending.length}</span>
+                </span>
+              )}
               <span className="text-[10px] font-mono text-zinc-500">
                 unmatched: <span className="text-rose-400">{stats.unmatched}</span>
               </span>

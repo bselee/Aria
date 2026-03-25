@@ -180,6 +180,36 @@ async function checkLlamaHealth(): Promise<boolean> {
 // ── Public: enqueue ───────────────────────────────────────────────────────────
 
 /**
+ * Enqueue a paid invoice from bill.selee@buildasoil.com for overnight PO reconciliation.
+ * These are always already-paid (credit card) invoices — never Bill.com.
+ * Includes full body_text so Haiku can extract line items overnight.
+ * Never throws.
+ */
+export async function enqueueDefaultInboxInvoice(
+    gmailMessageId: string,
+    fromEmail: string,
+    subject: string,
+    bodyText: string,
+): Promise<void> {
+    try {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        await supabase.from("nightshift_queue").upsert(
+            {
+                gmail_message_id: gmailMessageId,
+                task_type: "default_inbox_invoice",
+                payload: { from_email: fromEmail, subject, body_text: bodyText, source_inbox: "default" },
+                status: "pending",
+            },
+            { onConflict: "gmail_message_id,task_type", ignoreDuplicates: true },
+        );
+    } catch (err: any) {
+        console.error("[nightshift] enqueue default-inbox error:", err?.message ?? err);
+    }
+}
+
+/**
  * Insert a gmail message into the nightshift queue for overnight classification.
  * Uses ON CONFLICT DO NOTHING — safe to call multiple times for the same message.
  * Never throws.
@@ -291,10 +321,10 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
         console.warn("[nightshift] stale-reset error (non-fatal):", e?.message);
     }
 
-    // 4. Fetch pending batch
+    // 4. Fetch pending batch (all task types)
     const { data: tasks, error: fetchErr } = await supabase
         .from("nightshift_queue")
-        .select("id, gmail_message_id, payload")
+        .select("id, gmail_message_id, task_type, payload")
         .eq("status", "pending")
         .gt("expires_at", new Date().toISOString())
         .order("created_at", { ascending: true })
@@ -315,9 +345,12 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
     let haikuCount = 0;
     let failedCount = 0;
 
+    let defaultInboxCount = 0;
+    let defaultInboxFailed = 0;
+
     for (const task of tasks) {
-        const { id, gmail_message_id: msgId, payload } = task as any;
-        const { from_email: from = "", subject = "", body_snippet: snippet = "" } = payload ?? {};
+        const { id, gmail_message_id: msgId, task_type, payload } = task as any;
+        const { from_email: from = "", subject = "", body_snippet: snippet = "", body_text: bodyText = "" } = payload ?? {};
 
         // 6a. Optimistic lock — returns the row only if it was still 'pending'
         const { data: locked } = await supabase
@@ -332,7 +365,61 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
             continue;
         }
 
-        // 6b. Recall vendor context
+        // ── Route: default_inbox_invoice ─────────────────────────────────────
+        // DECISION(2026-03-25): Paid invoices from bill.selee@buildasoil.com use
+        // a dedicated worker. qwen3 is skipped entirely — Haiku handles extraction.
+        // Immediate Telegram alerts fire inside the worker for Guard 1/4 failures.
+        if (task_type === "default_inbox_invoice") {
+            if (dryRun) {
+                console.log(`[nightshift] (dry-run) would process default_inbox_invoice for ${msgId}`);
+                await supabase
+                    .from("nightshift_queue")
+                    .update({ status: "pending", updated_at: new Date().toISOString() })
+                    .eq("id", id);
+                continue;
+            }
+
+            try {
+                const { processDefaultInboxInvoice } = await import("./workers/default-inbox-invoice");
+                const result = await processDefaultInboxInvoice(msgId, from, subject, bodyText || snippet);
+
+                console.log(`[nightshift] default_inbox gmail_id=${msgId} | outcome=${result.outcome} | ${result.summary}`);
+
+                const succeeded = result.outcome !== "unknown_error" && result.outcome !== "extraction_failed";
+                await supabase
+                    .from("nightshift_queue")
+                    .update({
+                        status:       succeeded ? "completed" : "failed",
+                        result:       result,
+                        handler:      "haiku",
+                        error:        result.error || null,
+                        updated_at:   new Date().toISOString(),
+                        processed_at: new Date().toISOString(),
+                    })
+                    .eq("id", id);
+
+                if (succeeded) {
+                    defaultInboxCount++;
+                } else {
+                    defaultInboxFailed++;
+                }
+            } catch (workerErr: any) {
+                console.error(`[nightshift] default_inbox worker error for ${msgId}:`, workerErr?.message);
+                await supabase
+                    .from("nightshift_queue")
+                    .update({
+                        status:       "failed",
+                        error:        workerErr?.message ?? "worker_exception",
+                        updated_at:   new Date().toISOString(),
+                        processed_at: new Date().toISOString(),
+                    })
+                    .eq("id", id);
+                defaultInboxFailed++;
+            }
+            continue; // Don't fall into email_classification logic below
+        }
+
+        // 6b. Recall vendor context (email_classification path)
         let memoryContext = "";
         try {
             const memories = await recall(`AP email from ${from}: ${subject}`, { topK: 3 });
@@ -432,7 +519,14 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
     } catch { /* non-fatal */ }
 
     const durationMs = Date.now() - cycleStart;
-    console.log(`[nightshift] Batch done: ${tasks.length} tasks (${localCount} local, ${haikuCount} haiku, ${failedCount} failed) in ${Math.round(durationMs / 1000)}s`);
+    console.log(
+        `[nightshift] Batch done: ${tasks.length} tasks ` +
+        `(${localCount} local, ${haikuCount} haiku, ${failedCount} failed` +
+        (defaultInboxCount + defaultInboxFailed > 0
+            ? `, ${defaultInboxCount} invoices reconciled, ${defaultInboxFailed} invoice failures`
+            : "") +
+        `) in ${Math.round(durationMs / 1000)}s`
+    );
 
     opts.onBatchComplete?.({ local: localCount, haiku: haikuCount, failed: failedCount, durationMs });
 }
@@ -454,6 +548,18 @@ export interface NightshiftHandoff {
     lowConfidence: Array<{ gmailMessageId: string; from: string; subject: string; classification: string; confidence: number }>;
     /** Overnight reconciliation results (from cron_runs) */
     reconciliations: Array<{ vendor: string; status: string; durationSec: number; error?: string }>;
+    /**
+     * Default inbox paid invoice reconciliation results.
+     * These are always-paid (credit-card) invoices from bill.selee@buildasoil.com.
+     */
+    defaultInboxInvoices: Array<{
+        vendorName: string;
+        poNumber: string | null;
+        outcome: string;
+        total: number;
+        priceUpdates: number;
+        summary: string;
+    }>;
     /** Formatted Telegram message */
     telegramMessage: string;
 }
@@ -480,15 +586,19 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
             .select("gmail_message_id, status, handler, result, error, payload")
             .gte("created_at", twelveHoursAgo);
 
-        const tasks = allTasks || [];
+        const allTasksList = allTasks || [];
 
-        const completed = tasks.filter(t => t.status === "completed");
-        const failed = tasks.filter(t => t.status === "failed");
-        const pending = tasks.filter(t => t.status === "pending");
+        // Split by task type — default inbox invoices are a separate pipeline
+        const emailTasks   = allTasksList.filter((t: any) => (t.task_type ?? "email_classification") === "email_classification");
+        const invoiceTasks = allTasksList.filter((t: any) => t.task_type === "default_inbox_invoice");
+
+        const completed = emailTasks.filter((t: any) => t.status === "completed");
+        const failed    = emailTasks.filter((t: any) => t.status === "failed");
+        const pending   = emailTasks.filter((t: any) => t.status === "pending");
 
         // Count by handler
-        const localCount = completed.filter(t => t.handler === "local").length;
-        const haikuCount = completed.filter(t => t.handler === "claude-haiku").length;
+        const localCount = completed.filter((t: any) => t.handler === "local").length;
+        const haikuCount = completed.filter((t: any) => t.handler === "claude-haiku").length;
 
         // Count by classification
         const byClassification: Record<string, number> = {};
@@ -500,11 +610,11 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
         // Low-confidence results (completed but below 0.85 — flagged for daytime re-verify)
         const LOW_CONF_THRESHOLD = 0.85;
         const lowConfidence = completed
-            .filter(t => {
+            .filter((t: any) => {
                 const conf = (t.result as any)?.confidence;
                 return typeof conf === "number" && conf < LOW_CONF_THRESHOLD;
             })
-            .map(t => ({
+            .map((t: any) => ({
                 gmailMessageId: t.gmail_message_id,
                 from: (t.payload as any)?.from_email || "",
                 subject: (t.payload as any)?.subject || "",
@@ -512,21 +622,31 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
                 confidence: (t.result as any)?.confidence || 0,
             }));
 
-        // Failed tasks → to-do items for daytime LLM
+        // Failed email classification tasks → to-do items for daytime LLM
         const pendingTasks = [
-            ...failed.map(t => ({
+            ...failed.map((t: any) => ({
                 gmailMessageId: t.gmail_message_id,
                 from: (t.payload as any)?.from_email || "",
                 subject: (t.payload as any)?.subject || "",
                 error: t.error || "unknown",
             })),
-            ...pending.map(t => ({
+            ...pending.map((t: any) => ({
                 gmailMessageId: t.gmail_message_id,
                 from: (t.payload as any)?.from_email || "",
                 subject: (t.payload as any)?.subject || "",
                 error: "still_pending_at_handoff",
             })),
         ];
+
+        // Default inbox invoice reconciliation results
+        const defaultInboxInvoices: NightshiftHandoff["defaultInboxInvoices"] = invoiceTasks.map((t: any) => ({
+            vendorName:   (t.result as any)?.vendorName   || (t.payload as any)?.from_email || "Unknown",
+            poNumber:     (t.result as any)?.poNumber     || null,
+            outcome:      (t.result as any)?.outcome      || t.status,
+            total:        (t.result as any)?.total        || 0,
+            priceUpdates: (t.result as any)?.priceUpdates || 0,
+            summary:      (t.result as any)?.summary      || t.error || "",
+        }));
 
         // 2. Fetch overnight reconciliation results from cron_runs
         const reconciliations: NightshiftHandoff["reconciliations"] = [];
@@ -565,9 +685,24 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
             lines.push("📧 No emails in nightshift queue overnight");
         }
 
-        // Reconciliation summary
+        // Default inbox paid invoice summary
+        if (defaultInboxInvoices.length > 0) {
+            const okOutcomes = new Set(["reconciled", "reconciled_partial", "already_processed"]);
+            const invoiceOk   = defaultInboxInvoices.filter(i => okOutcomes.has(i.outcome));
+            const invoiceBad  = defaultInboxInvoices.filter(i => !okOutcomes.has(i.outcome));
+            lines.push(`\n💳 <b>Paid Invoice Reconciliation (${defaultInboxInvoices.length}):</b>`);
+            for (const inv of invoiceOk) {
+                const icon = inv.outcome === "reconciled" ? "✅" : inv.outcome === "reconciled_partial" ? "⚠️" : "♻️";
+                lines.push(`   ${icon} ${inv.vendorName}${inv.poNumber ? ` PO #${inv.poNumber}` : ""} — $${inv.total.toFixed(2)}, ${inv.priceUpdates} updates`);
+            }
+            for (const inv of invoiceBad) {
+                lines.push(`   ❌ ${inv.vendorName}: ${inv.outcome}`);
+            }
+        }
+
+        // Cron-run reconciliation summary (Axiom, FedEx, TeraGanix, ULINE CLI)
         if (reconciliations.length > 0) {
-            lines.push("\n🧾 <b>Reconciliations:</b>");
+            lines.push("\n🧾 <b>CLI Reconciliations:</b>");
             for (const r of reconciliations) {
                 const icon = r.status === "success" ? "✅" : "❌";
                 lines.push(`   ${icon} ${r.vendor} (${r.durationSec}s)${r.error ? ` — ${r.error.slice(0, 60)}` : ""}`);
@@ -596,7 +731,17 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
 
         const failedRecons = reconciliations.filter(r => r.status !== "success");
         if (failedRecons.length > 0) {
-            todoItems.push(`🧾 ${failedRecons.length} reconciliation(s) failed — need manual review`);
+            todoItems.push(`🧾 ${failedRecons.length} CLI reconciliation(s) failed — need manual review`);
+        }
+
+        // Invoice reconciliation failures that need morning attention
+        const needsMorningReview = ["extraction_failed", "reconciled_partial", "no_vendor_party", "unknown_error"];
+        const invoiceNeedsReview = defaultInboxInvoices.filter(i => needsMorningReview.includes(i.outcome));
+        if (invoiceNeedsReview.length > 0) {
+            todoItems.push(`💳 ${invoiceNeedsReview.length} paid invoice(s) need morning review:`);
+            for (const inv of invoiceNeedsReview.slice(0, 5)) {
+                todoItems.push(`   • ${inv.summary}`);
+            }
         }
 
         if (todoItems.length > 0) {
@@ -623,6 +768,7 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
                         pendingTasks: pendingTasks.length,
                         lowConfidence: lowConfidence.length,
                         reconciliations,
+                        defaultInboxInvoices: defaultInboxInvoices.length,
                     },
                     status: "completed",
                     result: { todoItems, telegramMessage },
@@ -642,6 +788,7 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
             pendingTasks,
             lowConfidence,
             reconciliations,
+            defaultInboxInvoices,
             telegramMessage,
         };
     } catch (err: any) {
