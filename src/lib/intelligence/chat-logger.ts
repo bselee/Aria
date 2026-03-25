@@ -1,19 +1,23 @@
 import { createClient } from '../supabase';
 
 export async function logChatMessage(params: {
-  source: 'telegram' | 'slack';
-  role: 'user' | 'assistant';
-  content: string;
+  source:    'telegram' | 'slack';
+  role:      'user' | 'assistant';
+  content:   string;
+  threadId?: string;           // chatId (telegram) or channelId (slack) — for context window
   metadata?: Record<string, any>;
 }): Promise<void> {
   try {
     const db = createClient();
     if (!db) return;
     await db.from('sys_chat_logs').insert({
-      source: params.source,
-      role: params.role,
-      content: params.content,
-      metadata: params.metadata || null,
+      source:   params.source,
+      role:     params.role,
+      content:  params.content,
+      metadata: {
+        ...(params.metadata ?? {}),
+        ...(params.threadId ? { thread_id: params.threadId } : {}),
+      } || null,
     });
   } catch {
     // Never block message handling due to logging failure
