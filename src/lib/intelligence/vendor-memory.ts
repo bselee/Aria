@@ -184,6 +184,58 @@ export async function findRelevantPatterns(documentText: string, topK: number = 
  */
 export async function seedKnownVendorPatterns(): Promise<void> {
     const knownPatterns: VendorPattern[] = [
+        // ── Default inbox (bill.selee@buildasoil.com) — credit card vendors ──────
+        // These are already-paid invoices. Never forward to Bill.com.
+        // handlingRule describes how the DefaultInboxInvoiceWorker should reconcile.
+        {
+            vendorName: 'ULINE',
+            documentType: 'INVOICE',
+            pattern: 'Sends order confirmation and invoice emails to bill.selee@buildasoil.com. ' +
+                     'Subject always includes our PO# ("PO# 124541") and their order number ("# 47211652"). ' +
+                     'Uses their own catalog numbers (e.g. S-1665, H-1234B) which differ from Finale SKUs. ' +
+                     'Known SKU cross-references: S-15837B→FJG101, S-13505B→FJG102, S-13506B→FJG103, ' +
+                     'S-10748B→FJG104, S-12229→10113, S-4551→ULS455, H-1621→Ho-1621. ' +
+                     'All other ULINE catalog numbers can be used as Finale SKUs directly. ' +
+                     'CRITICAL: ULINE sells by case or box but Finale tracks individual units. ' +
+                     'Example: ULINE invoices 1 box at $103, Finale has 500 units — per-unit price = $103 ÷ 500 = $0.206. ' +
+                     'Always compare invoiced qty vs the Finale PO qty to detect UOM differences.',
+            handlingRule: 'priceStrategy=per_item. For each line item: apply SKU cross-reference if the catalog ' +
+                          'number is in the known list, otherwise use catalog number as-is for finaleSku. ' +
+                          'Compute finalePricePerUnit = invoicedUnitPrice / (finaleQty / invoicedQty) when quantities differ. ' +
+                          'Add freight. Credit card paid — never Bill.com.',
+            invoiceBehavior: 'single_page',
+            forwardTo: '',
+            learnedFrom: 'manual',
+            confidence: 0.95,
+        },
+        {
+            vendorName: 'Colorful Packaging',
+            documentType: 'INVOICE',
+            pattern: 'Sends invoice emails to bill.selee@buildasoil.com with a lump-sum product total and separate freight. ' +
+                     'PO# appears in subject (e.g. "Packaging Bags #124481" or "PO-124481"). ' +
+                     'Does not break out individual SKU prices — one total for all items in the order.',
+            handlingRule: 'priceStrategy=lump_sum. Divide (total minus freight minus tax) evenly across all ' +
+                          'Finale PO line items weighted by quantity: perUnit = productTotal / totalPOQty. ' +
+                          'Update each line item to that per-unit price. Add freight. Credit card paid — never Bill.com.',
+            invoiceBehavior: 'single_page',
+            forwardTo: '',
+            learnedFrom: 'manual',
+            confidence: 0.92,
+        },
+        {
+            vendorName: 'Axiom Print',
+            documentType: 'INVOICE',
+            pattern: 'Sends invoice emails to bill.selee@buildasoil.com for print jobs. ' +
+                     'Line items typically map directly to Finale product IDs. ' +
+                     'PO# referenced in subject or body.',
+            handlingRule: 'priceStrategy=per_item. Finale SKUs match vendor line item identifiers directly. ' +
+                          'No UOM conversion needed. Add freight if present. Credit card paid — never Bill.com.',
+            invoiceBehavior: 'single_page',
+            forwardTo: '',
+            learnedFrom: 'manual',
+            confidence: 0.88,
+        },
+        // ── AP inbox (ap@buildasoil.com) — unpaid invoices ────────────────────────
         {
             vendorName: 'AAACooper',
             documentType: 'STATEMENT',
