@@ -44,13 +44,28 @@ Expected: FAIL because the file/types do not exist yet.
   - `copilot_action_sessions`
 - Add shared types in `src/lib/copilot/types.ts`
 
-**Step 4: Run test to verify it passes**
+**Step 4: Apply and validate the migration**
+
+Run:
+
+```bash
+npx supabase db push
+npx tsx -e "import { createClient } from './src/lib/supabase'; const db = createClient(); const run = async () => { for (const table of ['copilot_artifacts', 'copilot_action_sessions']) { const { error } = await db.from(table).select('*').limit(1); console.log(table, error?.message ?? 'ok'); } }; run();"
+```
+
+Expected:
+
+- migration applies cleanly to the linked dev database
+- both tables are queryable with the service-role client
+- no unexpected RLS or missing-table errors
+
+**Step 5: Run test to verify it passes**
 
 Run: `npx vitest run src/lib/copilot/types.test.ts`
 
 Expected: PASS
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add supabase/migrations/20260325_create_copilot_artifacts_and_sessions.sql src/lib/copilot/types.ts src/lib/copilot/types.test.ts
@@ -122,6 +137,7 @@ git commit -m "feat: add shared copilot context assembly"
 
 **Files:**
 - Create: `src/lib/copilot/tools.ts`
+- Create: `src/lib/copilot/tools.test.ts`
 - Create: `src/lib/copilot/actions.ts`
 - Create: `src/lib/copilot/actions.test.ts`
 - Modify: `src/cli/aria-tools.ts`
@@ -136,6 +152,12 @@ Create `src/lib/copilot/actions.test.ts` for:
 - explicit verb with one binding => allowed
 - partial success bubbles correctly
 
+Create `src/lib/copilot/tools.test.ts` for:
+
+- wrong read tool result triggers one fallback attempt
+- repeated `no_result` stops after one retry
+- read-tool failure never escalates into write behavior
+
 ```ts
 it("returns needs_confirmation when write target is ambiguous", async () => {
   const result = await validateWriteIntent({
@@ -147,11 +169,27 @@ it("returns needs_confirmation when write target is ambiguous", async () => {
 });
 ```
 
+```ts
+it("retries once when the first read tool returns no_result", async () => {
+  const result = await resolveReadToolRoute({
+    text: "show recent open POs",
+    attempts: ["wrong_tool", "query_purchase_orders"],
+  });
+
+  expect(result.attemptCount).toBe(2);
+});
+```
+
 **Step 2: Run test to verify it fails**
 
-Run: `npx vitest run src/lib/copilot/actions.test.ts`
+Run:
 
-Expected: FAIL because `validateWriteIntent` does not exist.
+```bash
+npx vitest run src/lib/copilot/actions.test.ts
+npx vitest run src/lib/copilot/tools.test.ts
+```
+
+Expected: FAIL because `validateWriteIntent` / `resolveReadToolRoute` do not exist.
 
 **Step 3: Write minimal implementation**
 
@@ -162,17 +200,23 @@ Expected: FAIL because `validateWriteIntent` does not exist.
   - `failed`
   - `partial_success`
 - Add explicit write gating rules in `src/lib/copilot/actions.ts`
+- Add one-retry read fallback handling in `src/lib/copilot/tools.ts`
 
 **Step 4: Run test to verify it passes**
 
-Run: `npx vitest run src/lib/copilot/actions.test.ts`
+Run:
+
+```bash
+npx vitest run src/lib/copilot/actions.test.ts
+npx vitest run src/lib/copilot/tools.test.ts
+```
 
 Expected: PASS
 
 **Step 5: Commit**
 
 ```bash
-git add src/lib/copilot/tools.ts src/lib/copilot/actions.ts src/lib/copilot/actions.test.ts src/cli/aria-tools.ts src/app/api/dashboard/send/route.ts
+git add src/lib/copilot/tools.ts src/lib/copilot/tools.test.ts src/lib/copilot/actions.ts src/lib/copilot/actions.test.ts src/cli/aria-tools.ts src/app/api/dashboard/send/route.ts
 git commit -m "feat: add shared copilot tools and action contracts"
 ```
 
@@ -270,12 +314,21 @@ Expected: FAIL because `handleTelegramText` does not exist.
 - Move normal Telegram text handling into the adapter.
 - Preserve callback/button flows unchanged for now.
 - Delete duplicated normal-Q&A prompt assembly from `start-bot.ts` once parity is verified.
+- Do not change Slack watchdog boot or wiring in this task.
 
 **Step 4: Run test to verify it passes**
 
-Run: `npx vitest run src/lib/copilot/channels/telegram.test.ts`
+Run:
 
-Expected: PASS
+```bash
+npx vitest run src/lib/copilot/channels/telegram.test.ts
+git diff --exit-code src/lib/slack/watchdog.ts
+```
+
+Expected:
+
+- Telegram adapter test PASS
+- no Slack watchdog wiring changes in this task
 
 **Step 5: Commit**
 
@@ -314,6 +367,7 @@ Expected: FAIL because `handleDashboardSend` does not exist.
 
 - Replace the dashboard route’s local provider/tool logic with the shared core.
 - Keep the HTTP route shape unchanged for the UI.
+- Verify Slack watchdog startup path is unaffected by this adapter refactor.
 
 **Step 4: Run test to verify it passes**
 
@@ -683,4 +737,3 @@ Expected: PASS, excluding known pre-existing issues documented in project docs.
 git add docs/STATUS.md
 git commit -m "docs: record shared copilot rollout status"
 ```
-
