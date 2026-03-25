@@ -44,6 +44,7 @@ import {
     type TrackingCategory,
 } from '../carriers/tracking-service';
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
+import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import {
     recordCronRun,
@@ -279,8 +280,8 @@ export class OpsManager {
         }, { timezone: "America/Denver" });
 
         // DECISION(2026-03-19): Active Purchases Ledger cron REMOVED.
-        // Now included as a section in the unified morning OOS Digest post.
-        // See OOSReportGenerator cron below — appends Active Purchases to slackBody.
+        // DECISION(2026-03-20): Also removed from unified OOS Digest post per Will.
+        // Active Purchases remain available via Dashboard only.
 
         // Friday Summary @ 8:01 AM
         cron.schedule("1 8 * * 5", () => {
@@ -458,33 +459,13 @@ export class OpsManager {
                     }
 
                     // DECISION(2026-03-19): Single unified morning Slack post.
-                    // Combines OOS Digest + Active Purchases into one message.
-                    // Replaced separate Active Purchases Ledger, Daily Summary,
-                    // and Weekly Summary Slack posts.
+                    // Originally combined OOS Digest + Active Purchases into one message.
+                    // DECISION(2026-03-20): Removed Active Purchases from Slack feed per Will.
+                    // OOS Digest only — Active Purchases remain available via Dashboard.
                     if (result.slackBody) {
                         try {
-                            let combinedMsg = result.slackBody;
-
-                            // Append Active Purchases section
-                            const activePOs = await this.getActivePurchasesList(14);
-                            if (activePOs.length > 0) {
-                                combinedMsg += `\n\n*Active Purchases*  _14-day window_`;
-                                for (const p of activePOs) {
-                                    const icon = p.isReceived ? '✅' : (p.trackingNumbers?.length ? '🟢' : '🟡');
-                                    const poLink = `<${p.finaleUrl}|${p.orderId}>`;
-                                    if (p.isReceived && p.receiveDate) {
-                                        combinedMsg += `\n${icon} ${poLink} — ${p.vendorName} · Received ${this.fmtDate(p.receiveDate)}`;
-                                    } else {
-                                        const trackPart = p.trackingNumbers?.length
-                                            ? p.trackingNumbers.map((t: string) => `<${carrierUrl(t)}|${t.includes(':::') ? t.split(':::')[1].slice(-8) : t.slice(-8)}>`).join(' ')
-                                            : '_awaiting tracking_';
-                                        combinedMsg += `\n${icon} ${poLink} — ${p.vendorName} · ${this.fmtDate(p.orderDate)} → ${this.fmtDate(p.expectedDate)} · ${trackPart}`;
-                                    }
-                                }
-                            }
-
-                            await this.postToSlack(combinedMsg, "Morning Purchasing Digest");
-                            console.log(`📋 [OOS] Slack morning digest posted (${combinedMsg.length} chars)`);
+                            await this.postToSlack(result.slackBody, "Morning Purchasing Digest");
+                            console.log(`📋 [OOS] Slack morning digest posted (${result.slackBody.length} chars)`);
                         } catch (slackErr: any) {
                             console.error('❌ Slack morning digest failed:', slackErr.message);
                         }
@@ -553,6 +534,36 @@ export class OpsManager {
             }
         }), { timezone: "America/Denver" });
 
+        // Nightshift Pre-classification enqueue @ 6:00 PM Mon-Fri
+        // DECISION(2026-03-24): Batch-enqueues unprocessed AP emails for local LLM overnight.
+        // llama-server starts at 6:05 PM (Task Scheduler), processes the queue, shuts down at 7 AM.
+        // The 8 AM AP identifier poll skips paid Sonnet calls for messages with confidence >= 0.7.
+        cron.schedule("0 18 * * 1-5", () => {
+            this.safeRun("NightshiftEnqueue", () => this.enqueueNightshiftEmails());
+        }, { timezone: "America/Denver" });
+
+        // Nightshift Morning Handoff @ 6:55 AM Mon-Fri
+        // DECISION(2026-03-25): This is the loop closure. At 6:55 AM (5 min before
+        // stop-nightshift.ps1 kills the runner at 7 AM), this generates a structured
+        // shift-change report. Failed/low-confidence items become to-do items for the
+        // daytime cloud LLM (Gemini/Claude). Posted to Telegram + stored in Supabase.
+        cron.schedule("55 6 * * 1-5", () => {
+            this.safeRun("NightshiftHandoff", async () => {
+                const handoff = await generateMorningHandoff();
+                if (handoff) {
+                    const chatId = process.env.TELEGRAM_CHAT_ID;
+                    if (chatId) {
+                        await this.bot.telegram.sendMessage(
+                            chatId,
+                            handoff.telegramMessage,
+                            { parse_mode: "HTML" }
+                        );
+                    }
+                    console.log(`[nightshift] Morning handoff: ${handoff.totalClassified} classified, ${handoff.failedCount} failed, ${handoff.pendingTasks.length} to-do items`);
+                }
+            });
+        }, { timezone: "America/Denver" });
+
         // Daily Dedup Set Reset — midnight Denver (OOM prevention)
         // DECISION(2026-03-09): These Sets grow by ~50-100 entries/day and are
         // never pruned during runtime. Over weeks, thousands of entries accumulate.
@@ -611,6 +622,48 @@ export class OpsManager {
                 { parse_mode: "HTML" }
             ).catch(() => { });
         }
+    }
+
+    /**
+     * Enqueue unprocessed AP emails into nightshift_queue for local LLM classification.
+     * Called at 6 PM weekdays so the llama-server (starting at 6:05 PM) has tasks ready.
+     * source_inbox='ap' filter is critical — default inbox emails never need AP classification.
+     */
+    private async enqueueNightshiftEmails(): Promise<void> {
+        const supabase = createClient();
+        const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+
+        const { data: emails, error } = await supabase
+            .from("email_inbox_queue")
+            .select("gmail_message_id, from_email, subject, body_snippet")
+            .eq("processed_by_ap", false)
+            .eq("source_inbox", "ap")
+            .gt("created_at", cutoff)
+            .limit(100);
+
+        if (error) {
+            console.error("[nightshift] enqueueNightshiftEmails error:", error.message);
+            return;
+        }
+
+        if (!emails || emails.length === 0) {
+            console.log("[nightshift] No pending AP emails to enqueue for nightshift");
+            return;
+        }
+
+        let enqueued = 0;
+        for (const email of emails) {
+            await enqueueEmailClassification(
+                email.gmail_message_id,
+                email.from_email ?? "",
+                email.subject ?? "",
+                email.body_snippet ?? "",
+                "ap",
+            );
+            enqueued++;
+        }
+
+        console.log(`[nightshift] Enqueued ${enqueued}/${emails.length} AP emails for overnight classification`);
     }
 
     /**
@@ -1592,8 +1645,7 @@ export class OpsManager {
                 { parse_mode: "Markdown" }
             );
 
-            // 2. Cross-post Slack version to #purchasing
-            await this.postToSlack(report.slackMessage, "Build Risk Report");
+            // 2. (Slack cross-post removed — OOS digest and dashboard/calendar cover this)
 
             // 3. If critical items exist, send a follow-up with action items
             if (report.criticalCount > 0) {
@@ -1863,14 +1915,34 @@ export class OpsManager {
             // Grab Finale received and committed PO data — use full week range for both reports
             let finaleReceivedPOs: any[] = [];
             let finaleCommittedPOs: any[] = [];
+            // DECISION(2026-03-23): Also fetch last week's committed POs so the morning
+            // summary includes prior-week spend for comparison. Uses the previous
+            // Monday→Sunday window. Only fetched for daily reports (weekly already covers it).
+            let lastWeekCommittedPOs: any[] = [];
             try {
                 const finale = finaleClient;
-                const [receivedPOs, committedPOs] = await Promise.all([
+
+                // Previous week range: Mon→Sun before current week
+                const prevMonday = new Date(monday);
+                prevMonday.setDate(prevMonday.getDate() - 7);
+                const prevSunday = new Date(monday); // Current Monday = end of previous week
+                const prevMondayStr = prevMonday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+                const prevSundayStr = prevSunday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+                const fetchPromises: Promise<any>[] = [
                     finale.getTodaysReceivedPOs(finaleStartDate, finaleEndDate),
-                    finale.getTodaysCommittedPOs(finaleStartDate, finaleEndDate)
-                ]);
-                finaleReceivedPOs = receivedPOs;
-                finaleCommittedPOs = committedPOs;
+                    finale.getTodaysCommittedPOs(finaleStartDate, finaleEndDate),
+                ];
+
+                // Only add last-week fetch for daily reports
+                if (timeframe === "yesterday") {
+                    fetchPromises.push(finale.getTodaysCommittedPOs(prevMondayStr, prevSundayStr));
+                }
+
+                const results = await Promise.all(fetchPromises);
+                finaleReceivedPOs = results[0];
+                finaleCommittedPOs = results[1];
+                if (results[2]) lastWeekCommittedPOs = results[2];
             } catch (err) {
                 console.warn("Could not fetch Finale PO activity for summary", err);
             }
@@ -1901,17 +1973,22 @@ export class OpsManager {
                 }
             }
 
+            // Compute last week's total spend for the summary
+            const lastWeekTotalSpend = lastWeekCommittedPOs.reduce((sum: number, po: any) => sum + (po.total || 0), 0);
+
             return {
                 timeframe,
                 purchase_orders_db: pos.data || [],
                 finale_receivings: finaleReceivedPOs,
                 finale_committed: finaleCommittedPOs,
+                last_week_committed: lastWeekCommittedPOs,
+                last_week_total_spend: lastWeekTotalSpend,
                 invoices: invoices.data || [],
                 documents: documents.data || [],
                 unread_emails: { count: unreadCount, subjects: unreadSubjects }
             };
         } catch (err) {
-            return { timeframe, purchase_orders_db: [], finale_receivings: [], finale_committed: [], invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
+            return { timeframe, purchase_orders_db: [], finale_receivings: [], finale_committed: [], last_week_committed: [], last_week_total_spend: 0, invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
         }
     }
 
@@ -1940,6 +2017,7 @@ Focus on:
 - Total spend/amount due (Week-to-date and Yesterday specific).
 - Finale receivings (Show week-to-date total POs/units/spend, AND clearly list yesterday's specific POs received).
 - Committed POs (Show week-to-date total, AND specifically list yesterday's POs placed).
+- **Last Week's PO Spend** — The data includes "last_week_committed" (list of committed POs from the previous Mon–Sun) and "last_week_total_spend" (their sum). Show this as a one-liner: "Last Week Committed: X POs · $Y total". This gives Will a quick comparison.
 - Unread actionable email count (current snapshot).
 
 DO NOT include a vendors-contacted/invoiced section.

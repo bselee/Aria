@@ -1,19 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye } from "lucide-react";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type PurchasingItem = {
     productId: string; productName: string; supplierName: string; supplierPartyId: string;
     unitPrice: number; stockOnHand: number; stockOnOrder: number;
-    purchaseVelocity: number; salesVelocity: number; dailyRate: number;
+    purchaseVelocity: number; salesVelocity: number; demandVelocity: number; dailyRate: number;
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: "critical" | "warning" | "watch" | "ok";
     explanation: string; suggestedQty: number;
     orderIncrementQty: number | null; isBulkDelivery: boolean;
     finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
+    finaleDemandQty: number | null;
 };
 type PurchasingGroup = {
     vendorName: string; vendorPartyId: string;
@@ -34,6 +35,7 @@ type CommitReview = {
 };
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
+type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; errors?: string[] };
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
@@ -83,6 +85,10 @@ export default function PurchasingPanel() {
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
+
+    // ULINE direct ordering
+    const [ulineOrdering, setUlineOrdering] = useState(false);
+    const [ulineResult, setUlineResult] = useState<UlineOrderResult | null>(null);
 
     // collapse + resize
     const [isCollapsed, setIsCollapsed] = useState(false);
@@ -339,6 +345,39 @@ export default function PurchasingPanel() {
         setCommitModal(null);
     }
 
+    // ── ULINE direct ordering ──────────────────────────────────────────────
+    function isUlineVendor(vendorName: string): boolean {
+        return vendorName.toLowerCase().includes('uline');
+    }
+
+    async function handleOrderOnUline(group: PurchasingGroup) {
+        const pid = group.vendorPartyId;
+        const items = group.items
+            .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId])
+            .map(i => ({
+                productId: i.productId,
+                quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty,
+            }));
+
+        if (items.length === 0) return;
+
+        setUlineOrdering(true);
+        setUlineResult(null);
+        try {
+            const res = await fetch('/api/dashboard/purchasing/uline-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items }),
+            });
+            const result: UlineOrderResult = await res.json();
+            setUlineResult(result);
+        } catch (e: any) {
+            setUlineResult({ success: false, itemsAdded: 0, message: e.message });
+        } finally {
+            setUlineOrdering(false);
+        }
+    }
+
     // ── derived state ──────────────────────────────────────────────────────
     const allGroups = data?.groups ?? [];
     const sortedGroups = [...allGroups].sort((a, b) => URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]);
@@ -435,7 +474,7 @@ export default function PurchasingPanel() {
             {/* ── Header ── */}
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Purchasing</span>
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
                 <div className="flex-1" />
@@ -643,17 +682,33 @@ export default function PurchasingPanel() {
                                                                 )}
                                                             </div>
                                                         ) : (
-                                                            <button
-                                                                onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
-                                                                disabled={anyCreating}
-                                                                className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
-                                                                    ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
-                                                                    : "bg-transparent text-zinc-600 border-zinc-800"
-                                                                    }`}
-                                                            >
-                                                                {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
-                                                                {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
-                                                            </button>
+                                                            <>
+                                                                <button
+                                                                    onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
+                                                                    disabled={anyCreating}
+                                                                    className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
+                                                                        ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
+                                                                        : "bg-transparent text-zinc-600 border-zinc-800"
+                                                                        }`}
+                                                                >
+                                                                    {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
+                                                                    {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
+                                                                </button>
+                                                                {/* ULINE: Order Now button — fires items directly to ULINE cart */}
+                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && (
+                                                                    <button
+                                                                        onClick={() => handleOrderOnUline(group)}
+                                                                        disabled={ulineOrdering}
+                                                                        className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-700/80 hover:bg-amber-600 text-amber-100 border-amber-600 transition-colors disabled:opacity-40 shrink-0"
+                                                                        title="Add selected items to ULINE cart via Quick Order"
+                                                                    >
+                                                                        {ulineOrdering
+                                                                            ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
+                                                                            : <ShoppingCart className="w-2.5 h-2.5" />}
+                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                    </button>
+                                                                )}
+                                                            </>
                                                         )}
                                                         {/* Vendor-level snooze menu */}
                                                         <div className="relative shrink-0">
@@ -703,10 +758,24 @@ export default function PurchasingPanel() {
                                                                 )}
                                                             </div>
                                                         ) : selectedCount > 0 ? (
-                                                            <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
-                                                                className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
-                                                                {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
-                                                            </button>
+                                                            <div className="flex items-center gap-1.5">
+                                                                <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
+                                                                    className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
+                                                                    {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
+                                                                </button>
+                                                                {isUlineVendor(group.vendorName) && (
+                                                                    <button
+                                                                        onClick={() => handleOrderOnUline(group)}
+                                                                        disabled={ulineOrdering}
+                                                                        className="flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-amber-700/80 hover:bg-amber-600 text-amber-100 border border-amber-600 transition-colors disabled:opacity-40"
+                                                                    >
+                                                                        {ulineOrdering
+                                                                            ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
+                                                                            : <ShoppingCart className="w-2.5 h-2.5" />}
+                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                    </button>
+                                                                )}
+                                                            </div>
                                                         ) : null}
                                                     </div>
 
@@ -855,6 +924,22 @@ export default function PurchasingPanel() {
                                     );
                                 })}
                             </div>
+
+                            {/* ULINE order result banner */}
+                            {ulineResult && (
+                                <div className={`px-4 py-2 text-[11px] font-mono flex items-center gap-2 border-t ${
+                                    ulineResult.success
+                                        ? 'bg-emerald-900/20 border-emerald-800/40 text-emerald-400'
+                                        : 'bg-rose-900/20 border-rose-800/40 text-rose-400'
+                                }`}>
+                                    <span>{ulineResult.success ? '✅' : '⚠️'}</span>
+                                    <span className="flex-1">{ulineResult.message}</span>
+                                    <button
+                                        onClick={() => setUlineResult(null)}
+                                        className="text-zinc-500 hover:text-zinc-300 transition-colors"
+                                    >✕</button>
+                                </div>
+                            )}
 
                             <div onMouseDown={startResize}
                                 className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"

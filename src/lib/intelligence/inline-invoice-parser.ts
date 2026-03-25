@@ -33,7 +33,16 @@ import { z } from 'zod';
  * @returns true if the email likely contains inline invoice data
  */
 export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean, emailSubject?: string): boolean {
-    if (hasPdfAttachment) return false;
+    // DECISION(2026-03-23): Allow PDF-bearing emails from credit-card vendors
+    // (Colorful Packaging, Axiom Print) through. Their vendor-specific handlers
+    // in InlineInvoiceHandler extract data from vendor APIs or LLM, not PDFs.
+    const isCreditCardVendor = /colorfulpackaging\.com/i.test(emailBody) ||
+                                /axiomprint\.com/i.test(emailBody) ||
+                                /uline\.com/i.test(emailBody) ||
+                                /colorful\s*packaging/i.test(emailBody) ||
+                                /axiom\s*print/i.test(emailBody) ||
+                                /uline/i.test(emailBody);
+    if (hasPdfAttachment && !isCreditCardVendor) return false;
 
     const dollarPattern = /\$[\d,]+\.\d{2}/;
     // Also match raw amounts like "1140.77" near money-context words

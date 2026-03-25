@@ -29,6 +29,29 @@ export class AcknowledgementAgent {
         this.tokenIdentifier = tokenIdentifier;
     }
 
+    // DECISION(2026-03-24): System sender addresses that ARIA should never auto-reply to.
+    // These are internal pipeline senders (Stockie alerts, etc.) that feed ARIA data
+    // but should not receive "Thanks!" or follow-up responses.
+    private static SYSTEM_SENDERS = [
+        'dev@plutonian.io',   // Stockie Low Stock Alert — triggers OOS report pipeline
+    ];
+
+    // DECISION(2026-03-24): Subject patterns for ARIA's own outbound reports.
+    // These should never get auto-replies, follow-ups, or any processing.
+    private static SYSTEM_SUBJECT_PATTERNS = [
+        /^OOS Report\b/i,             // ARIA's OOS report emails
+        /^Out Of Stock\b/i,           // Stockie alert subject
+    ];
+
+    private isSystemSender(from: string): boolean {
+        const lowerFrom = from.toLowerCase();
+        return AcknowledgementAgent.SYSTEM_SENDERS.some(s => lowerFrom.includes(s));
+    }
+
+    private isSystemSubject(subject: string): boolean {
+        return AcknowledgementAgent.SYSTEM_SUBJECT_PATTERNS.some(p => p.test(subject));
+    }
+
     private isNoReply(from: string): boolean {
         const lowerFrom = from.toLowerCase();
         return lowerFrom.includes("noreply") ||
@@ -170,6 +193,20 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     continue;
                 }
 
+                // Guardrail 1b: Do not process system pipeline senders (e.g. Stockie alerts)
+                // These emails feed ARIA's internal systems and should never get auto-replies.
+                if (this.isSystemSender(senderEmail)) {
+                    console.log(`     -> Skipping system sender (${senderEmail}): ${subject}`);
+                    continue;
+                }
+
+                // Guardrail 1c: Do not process ARIA's own outbound reports
+                // (e.g. OOS Report emails sent to ourselves)
+                if (this.isSystemSubject(subject)) {
+                    console.log(`     -> Skipping system report email: ${subject}`);
+                    continue;
+                }
+
                 console.log(`   Evaluating: "${subject}" from ${senderEmail}`);
 
                 // Guardrail 2: Classify intent
@@ -189,6 +226,27 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         console.log(`     -> Upgrading ROUTINE_INFO → INLINE_INVOICE (cost data detected in body)`);
                         intent = "INLINE_INVOICE";
                     }
+                }
+
+                // DECISION(2026-03-23): Vendor-specific intent override.
+                // Credit-card-paid vendors (Colorful Packaging, Axiom Print) should
+                // NEVER go to Bill.com or the AP Agent. Force INLINE_INVOICE so the
+                // InlineInvoiceHandler processes them with vendor-specific logic.
+                // This applies regardless of PDF attachment status.
+                const creditCardVendorPatterns = [
+                    /colorfulpackaging\.com/i,
+                    /colorful\s*packaging/i,
+                    /axiomprint\.com/i,
+                    /axiom\s*print/i,
+                    /uline\.com/i,
+                    /uline/i,
+                ];
+                const senderAndBody = senderEmail + ' ' + subject + ' ' + (m.body_text || snippet);
+                const isCreditCardVendor = creditCardVendorPatterns.some(p => p.test(senderAndBody));
+
+                if (isCreditCardVendor && intent !== "INLINE_INVOICE") {
+                    console.log(`     -> Overriding ${intent} → INLINE_INVOICE (credit-card vendor, never Bill.com)`);
+                    intent = "INLINE_INVOICE";
                 }
 
                 if (intent === "ROUTINE_INFO") {

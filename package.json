@@ -37,6 +37,7 @@
     "@types/pdfkit": "^0.17.5",
     "aftership": "^8.1.0",
     "ai": "^6.0.104",
+    "ai-sdk-ollama": "^3.8.2",
     "axios": "^1.13.5",
     "chokidar": "^5.0.0",
     "dotenv": "^17.3.1",

@@ -1,8 +1,15 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { Receipt, ChevronDown, Check, X } from "lucide-react";
+import { Receipt, ChevronDown, Check, X, AlertCircle } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
+
+/** Threshold in days: pending items older than this are considered stale */
+const STALE_THRESHOLD_DAYS = 7;
+
+function daysOld(iso: string): number {
+  return Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -71,6 +78,7 @@ export default function InvoiceQueuePanel() {
   const [stats, setStats] = useState<InvoiceQueueStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [actingOn, setActingOn] = useState<string | null>(null);
+  const [bulkDismissing, setBulkDismissing] = useState(false);
 
   // Handle approve/dismiss actions
   const handleAction = useCallback(async (id: string, action: "approve" | "dismiss") => {
@@ -91,6 +99,23 @@ export default function InvoiceQueuePanel() {
       setActingOn(null);
       fetchData(true); // bust cache and refresh
     }
+  }, []);
+
+  // Bulk-dismiss all stale pending items
+  const handleDismissAllStale = useCallback(async (staleItems: InvoiceQueueItem[]) => {
+    setBulkDismissing(true);
+    const ids = staleItems.map(i => i.activityLogId).filter(Boolean) as string[];
+    for (const id of ids) {
+      try {
+        await fetch("/api/dashboard/reconciliation-action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ activityLogId: id, action: "dismiss" }),
+        });
+      } catch { /* continue with rest */ }
+    }
+    setBulkDismissing(false);
+    fetchData(true);
   }, []);
 
   // Collapse state — persisted to localStorage
@@ -130,6 +155,10 @@ export default function InvoiceQueuePanel() {
   const pending = invoices.filter(i => i.status === "needs_approval");
   const rest = invoices.filter(i => i.status !== "needs_approval");
 
+  // Identify stale pending items (older than threshold)
+  const stalePending = pending.filter(i => daysOld(i.processedAt) > STALE_THRESHOLD_DAYS);
+  const freshPending = pending.filter(i => daysOld(i.processedAt) <= STALE_THRESHOLD_DAYS);
+
   return (
     <div className="border-b border-zinc-800 shrink-0">
       {/* Header */}
@@ -150,10 +179,15 @@ export default function InvoiceQueuePanel() {
           </button>
         )}
 
-        {/* Pending badge */}
-        {pending.length > 0 && (
+        {/* Pending badge — only count fresh pending */}
+        {freshPending.length > 0 && (
           <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-300 border-amber-500/40">
-            {pending.length} PENDING
+            {freshPending.length} PENDING
+          </span>
+        )}
+        {stalePending.length > 0 && (
+          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-zinc-600/30 text-zinc-500 border-zinc-600/40">
+            {stalePending.length} STALE
           </span>
         )}
         {!loading && pending.length === 0 && (
@@ -213,8 +247,29 @@ export default function InvoiceQueuePanel() {
             </div>
           )}
 
-          {/* Pending invoices — highlighted row */}
-          {pending.map(inv => {
+          {/* Stale pending — collapsed with bulk dismiss */}
+          {stalePending.length > 0 && (
+            <div className="border-b border-zinc-700/30 bg-zinc-800/20">
+              <div className="flex items-center gap-2 px-4 py-1.5">
+                <AlertCircle className="w-3 h-3 text-zinc-500 shrink-0" />
+                <span className="text-[10px] font-mono text-zinc-500">
+                  {stalePending.length} stale item{stalePending.length !== 1 ? "s" : ""} ({stalePending.map(i => `${i.vendorName}`).join(", ")}) — {stalePending[0] && daysOld(stalePending[0].processedAt)}+ days old
+                </span>
+                <div className="flex-1" />
+                <button
+                  onClick={() => handleDismissAllStale(stalePending)}
+                  disabled={bulkDismissing}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                >
+                  <X className="w-3 h-3" />
+                  {bulkDismissing ? "Dismissing..." : "Dismiss All Stale"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Fresh pending invoices — highlighted row */}
+          {freshPending.map(inv => {
             const cfg = statusCfg(inv.status);
             return (
               <div

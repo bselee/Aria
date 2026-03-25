@@ -1679,17 +1679,5 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             console.error("❌ Telegram recap failed:", err.message);
         }
 
-        // Send to Slack
-        if (this.slack) {
-            try {
-                await this.slack.chat.postMessage({
-                    channel: this.slackChannel,
-                    text: msg.replace(/\*/g, "*"),
-                    mrkdwn: true
-                });
-            } catch (err: any) {
-                console.error("❌ Slack recap failed:", err.message);
-            }
-        }
     }
 }

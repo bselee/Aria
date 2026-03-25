@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    start-bot.ts
  * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
  *          Gemini (primary chat) with automatic OpenRouter fallback, and
@@ -1487,6 +1487,22 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     const ops = new OpsManager(bot);
     ops.start();
 
+    // Start Slack Watchdog in-process BEFORE botDeps construction
+    // so deps.watchdog captures the live instance, not null.
+    // DECISION(2026-03-20): /requests needs deps.watchdog to be the running instance.
+    if (process.env.SLACK_ACCESS_TOKEN) {
+        try {
+            const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
+            globalWatchdog = new SlackWatchdog(pollInterval);
+            await globalWatchdog.start();
+            console.log('ðŸ¦Š Slack Watchdog: âœ… Running in-process');
+        } catch (err: any) {
+            console.warn('âš ï¸ Slack Watchdog failed to start:', err.message);
+        }
+    } else {
+        console.log('ðŸ¦Š Slack Watchdog: âŒ SLACK_ACCESS_TOKEN not set');
+    }
+
     // â”€â”€ REGISTER MODULAR COMMANDS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // DECISION(2026-03-20): Commands extracted to src/cli/commands/ modules.
     // Must be registered AFTER OpsManager is created so deps.opsManager is available.
@@ -1504,19 +1520,6 @@ Rule: if the answer could be stale (anything numeric, status-based, or date-base
     };
     registerAllCommands(bot, botDeps);
 
-    // Start Slack Watchdog in-process (so /requests can access pending data)
-    if (process.env.SLACK_ACCESS_TOKEN) {
-        try {
-            const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
-            globalWatchdog = new SlackWatchdog(pollInterval);
-            await globalWatchdog.start();
-            console.log('ðŸ¦Š Slack Watchdog: âœ… Running in-process');
-        } catch (err: any) {
-            console.warn('âš ï¸ Slack Watchdog failed to start:', err.message);
-        }
-    } else {
-        console.log('ðŸ¦Š Slack Watchdog: âŒ SLACK_ACCESS_TOKEN not set');
-    }
 
     console.log('ðŸ“… Cron schedules registered:');
 

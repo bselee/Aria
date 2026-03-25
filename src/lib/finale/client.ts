@@ -98,9 +98,10 @@ export interface PurchasingItem {
     unitPrice: number;
     stockOnHand: number;
     stockOnOrder: number;
-    purchaseVelocity: number;      // units/day from 90d purchase receipts
-    salesVelocity: number;         // units/day from 90d outbound shipments
-    dailyRate: number;             // max(purchaseVelocity, salesVelocity)
+    purchaseVelocity: number;      // units/day from purchase receipts (bulk-inflated for packaging)
+    salesVelocity: number;         // units/day from outbound shipments
+    demandVelocity: number;        // units/day from Finale 90-day demand (sales + BOM consumption)
+    dailyRate: number;             // best signal: demandVelocity → salesVelocity → purchaseVelocity
     runwayDays: number;            // stockOnHand / dailyRate
     adjustedRunwayDays: number;    // (stockOnHand + stockOnOrder) / dailyRate
     leadTimeDays: number;
@@ -114,6 +115,7 @@ export interface PurchasingItem {
     finaleReorderQty: number | null;
     finaleStockoutDays: number | null;
     finaleConsumptionQty: number | null;
+    finaleDemandQty: number | null;    // 90-day demand quantity from Finale productView
 }
 
 export interface PurchasingGroup {
@@ -1289,9 +1291,54 @@ export class FinaleClient {
 
             return product;
         } catch (err: any) {
-            if (err.message.includes("404")) return null;
+            if (err.message.includes("404")) {
+                // DECISION(2026-03-23): Finale REST /api/product/<sku> returns 404
+                // for some valid products. Fall back to product list scan.
+                const exists = await this.validateProductExists(sku.trim());
+                if (exists) {
+                    console.warn(`[finale] lookupProduct: ${sku} 404 on direct fetch but found in product list — Finale API quirk`);
+                }
+                return null;
+            }
             console.error(`❌ Finale lookup failed for ${sku}:`, err.message);
             return null;
+        }
+    }
+
+    /**
+     * Validate that a product SKU exists in Finale.
+     * Tries direct REST endpoint first (fast), falls back to scanning the
+     * full product list if the direct endpoint returns 404.
+     *
+     * DECISION(2026-03-23): Finale's REST GET /api/product/<sku> returns 404
+     * for some valid products that DO appear in the product list and the UI.
+     * This is a known Finale API quirk. The product list scan is the reliable
+     * fallback. We cache the product list for the lifetime of the client instance.
+     */
+    private productListCache: string[] | null = null;
+
+    async validateProductExists(sku: string): Promise<boolean> {
+        const trimmed = sku.trim();
+
+        // Fast path: direct endpoint
+        try {
+            await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(trimmed)}`);
+            return true;
+        } catch {
+            // Direct endpoint 404s for some valid products — try list scan
+        }
+
+        // Fallback: scan product list (cached per client instance)
+        try {
+            if (!this.productListCache) {
+                const data = await this.get(`/${this.accountPath}/api/product`);
+                this.productListCache = data.productId || [];
+                console.log(`[finale] Product list cached: ${this.productListCache.length} products`);
+            }
+            return this.productListCache.includes(trimmed);
+        } catch (err: any) {
+            console.error(`[finale] validateProductExists failed for ${sku}:`, err.message);
+            return false;
         }
     }
 
@@ -1311,7 +1358,7 @@ export class FinaleClient {
                 query: `
                     query {
                         orderViewConnection(
-                            first: 20
+                            first: 100
                             type: ["PURCHASE_ORDER"]
                             product: ["${productUrl}"]
                             sort: [{ field: "orderDate", mode: "desc" }]
@@ -1352,9 +1399,10 @@ export class FinaleClient {
             const result = await res.json();
             if (result.errors) return [];
 
+            const relevantStatuses = new Set(["Committed", "Locked"]);
             const edges = result.data?.orderViewConnection?.edges || [];
             return edges
-                .filter((edge: any) => edge.node.status === "Committed")
+                .filter((edge: any) => relevantStatuses.has(edge.node.status))
                 .map((edge: any) => {
                     const po = edge.node;
                     const items = po.itemList?.edges || [];
@@ -3510,6 +3558,20 @@ export class FinaleClient {
             console.warn('[finale] Price check failed (non-blocking):', e.message);
         }
 
+        // ── Step 0.5: Pre-validate all product SKUs exist in Finale ──────────
+        // DECISION(2026-03-23): Finale silently accepts POs with invalid productUrls,
+        // creating line items with no product linked. Pre-validate to fail fast.
+        for (const item of items) {
+            const exists = await this.validateProductExists(item.productId);
+            if (!exists) {
+                throw new Error(
+                    `Product "${item.productId}" not found in Finale. ` +
+                    `Cannot create PO with unlinked products. ` +
+                    `Verify the SKU exists in Finale before retrying.`
+                );
+            }
+        }
+
         // ── Step 1: Snap quantities to order increments ──────────────────────
         const adjustedItems = items.map(item => {
             const rawQty = item.quantity;
@@ -3569,7 +3631,10 @@ export class FinaleClient {
             payload.destinationFacilityUrl = facilityUrl;
         }
 
-        if (memo) payload.privateNotes = memo;
+        // DECISION(2026-03-23): Do not set privateNotes on POs.
+        // Internal memos create noise in Finale's PO records.
+        // The memo parameter is retained in the method signature for
+        // structured logging but is no longer written to the PO.
 
         const res = await fetch(`${this.apiBase}/${this.accountPath}/api/order`, {
             method: 'POST',
@@ -3589,6 +3654,33 @@ export class FinaleClient {
         const data = await res.json();
         const orderId = data.orderId;
         if (!orderId) throw new Error('Finale returned no orderId');
+
+        // ── Post-creation verification: ensure all products are linked ──────
+        // DECISION(2026-03-23): Finale silently drops product linkage when the
+        // productUrl doesn't resolve internally (even if pre-validation passed).
+        // Verify and auto-cancel if any line items are missing products.
+        const createdItems = data.orderItemList || [];
+        const unlinkedItems = createdItems.filter((i: any) => !i.productUrl);
+        if (unlinkedItems.length > 0) {
+            console.error(`[finale] ⚠️ PO #${orderId}: ${unlinkedItems.length}/${createdItems.length} items have no product linked — cancelling PO`);
+            try {
+                await fetch(`${this.apiBase}/${this.accountPath}/api/order/${orderId}`, {
+                    method: 'PUT',
+                    headers: {
+                        Authorization: this.authHeader,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ statusId: 'ORDER_CANCELLED' }),
+                });
+                console.log(`[finale] Auto-cancelled broken PO #${orderId}`);
+            } catch (cancelErr: any) {
+                console.error(`[finale] Failed to auto-cancel PO #${orderId}:`, cancelErr.message);
+            }
+            throw new Error(
+                `PO #${orderId} created but ${unlinkedItems.length} products failed to link. ` +
+                `PO auto-cancelled. Check that all SKUs exist in Finale.`
+            );
+        }
 
         // Build the human-readable Finale URL (same base64 pattern used throughout client.ts)
         const rawOrderUrl = data.orderUrl || `/${this.accountPath}/api/order/${orderId}`;
@@ -3751,8 +3843,11 @@ export class FinaleClient {
                 const n = parseFloat(val.replace(/,/g, ''));
                 return isNaN(n) ? null : n;
             };
+            // DECISION(2026-03-23): Prefer unitsInStock over stockOnHand.
+            // stockOnHand returns 0 for many products; unitsInStock returns the
+            // real physical count (verified against Finale UI for ULINE items).
             const stockOnHand = stockNode
-                ? (parseStockVal(stockNode.stockOnHand) ?? parseStockVal(stockNode.unitsInStock))
+                ? (parseStockVal(stockNode.unitsInStock) ?? parseStockVal(stockNode.stockOnHand))
                 : null;
             const stockAvailable = stockNode ? parseStockVal(stockNode.stockAvailable) : null;
 
@@ -3784,7 +3879,7 @@ export class FinaleClient {
         //   - consumptionQuantity > 0     : BOM consumption (covers purchased components)
         // NOTE: consumptionQuantity alone misses purchased-for-resale items (boxes, packaging, etc.)
         // which have consumptionQuantity=0 but reorderQuantityToOrder>0 and demandQuantity>0.
-        const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null }> = [];
+        const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
         let cursor: string | null = null;
 
         while (true) {
@@ -3793,7 +3888,7 @@ export class FinaleClient {
                 query: `{
                     productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
                         pageInfo { hasNextPage endCursor }
-                        edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays } }
+                        edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay } }
                     }
                 }`
             };
@@ -3813,11 +3908,15 @@ export class FinaleClient {
                 const consumption = this.parseFinaleNum(p.consumptionQuantity);
                 const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
                 const stockoutDays = this.parseFinaleNum(p.stockoutDays);
+                const demandQty = this.parseFinaleNum(p.demandQuantity);
+                const demandPerDay = this.parseFinaleNum(p.demandPerDay);
                 candidates.push({
                     productId: p.productId,
                     finaleReorderQty: reorderQty,
                     finaleStockoutDays: stockoutDays,
-                    finaleConsumptionQty: consumption
+                    finaleConsumptionQty: consumption,
+                    finaleDemandQty: demandQty,
+                    finaleDemandPerDay: demandPerDay,
                 });
             }
 
@@ -3911,10 +4010,32 @@ export class FinaleClient {
                     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
 
                     // Step 4: velocity + runway
+                    // DECISION(2026-03-23): Use max(demandVelocity, purchaseVelocity).
+                    // Verified against 2yr ULINE order history CSV (730 days, 530 line items):
+                    //   - Boxes (S-4128): purchase vel 17.8/d ≈ ULINE cadence 15.4/d ✅
+                    //     Finale demand = 0 because boxes consumed via stock changes, not sales/BOMs.
+                    //   - Jugs (FJG102): purchase vel 2.5/d, demand 0.11/d, ULINE cadence 1.8/d
+                    //     max() = 2.5/d — slightly aggressive but ensures no stockout ✅
+                    //   - Direct-sell items: demand captures BOM+sales, purchase ≈ demand ✅
+                    // Using max() is simplest and safest: highest known signal = "never run out".
+                    // Previous cascade (demand→sales→purchase) made boxes invisible (demand=0).
                     const purchaseVelocity = activity.purchasedQty / daysBack;
                     const salesVelocity = activity.soldQty / daysBack;
-                    const dailyRate = Math.max(purchaseVelocity, salesVelocity);
+
+                    // Demand velocity: prefer demandPerDay (direct field) → demandQuantity / 90
+                    const demandVelocity = candidate.finaleDemandPerDay != null && candidate.finaleDemandPerDay > 0
+                        ? candidate.finaleDemandPerDay
+                        : candidate.finaleDemandQty != null && candidate.finaleDemandQty > 0
+                            ? candidate.finaleDemandQty / 90
+                            : 0;
+
+                    // Best velocity = highest known consumption signal
+                    const dailyRate = Math.max(demandVelocity, purchaseVelocity);
                     if (dailyRate === 0) continue; // no actual movement
+
+                    // Identify which signal is driving the rate (for explanation)
+                    const rateSource = dailyRate === demandVelocity ? '90d demand'
+                        : `${daysBack}d receipts`;
 
                     const runwayDays = stockOnHand / dailyRate;
                     const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
@@ -3928,11 +4049,8 @@ export class FinaleClient {
                             : adjustedRunwayDays < leadTimeDays + 30 ? 'warning'
                                 : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
                                     : 'ok';
-
-                    // Step 7: natural language explanation
-                    const rateSource = purchaseVelocity >= salesVelocity ? 'receipts' : 'shipments';
                     const parts: string[] = [
-                        `Avg ${dailyRate.toFixed(1)}/day (${daysBack}d ${rateSource})`,
+                        `Avg ${dailyRate.toFixed(1)}/day (${rateSource})`,
                         `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays)}d`,
                         `Lead ${leadTimeDays}d`,
                     ];
@@ -3966,6 +4084,7 @@ export class FinaleClient {
                         stockOnOrder,
                         purchaseVelocity,
                         salesVelocity,
+                        demandVelocity,
                         dailyRate,
                         runwayDays,
                         adjustedRunwayDays,
@@ -3984,6 +4103,7 @@ export class FinaleClient {
                         finaleReorderQty: candidate.finaleReorderQty,
                         finaleStockoutDays: candidate.finaleStockoutDays,
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
+                        finaleDemandQty: candidate.finaleDemandQty,
                     });
                 } catch {
                     // Skip products that error — non-fatal

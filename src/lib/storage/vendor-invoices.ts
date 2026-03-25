@@ -29,6 +29,7 @@ export type InvoiceSource =
     | "csv_import"
     | "sandbox_drop"
     | "payment_confirm"
+    | "axiom_api"
     | "manual";
 
 export type InvoiceStatus =

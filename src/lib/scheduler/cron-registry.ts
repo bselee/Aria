@@ -219,15 +219,8 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'reporting',
         weekdaysOnly: true,
     },
-    {
-        name: 'SlackPurchasesReport',
-        description: 'Posts active purchases ledger to Slack #purchasing',
-        schedule: '10 8 * * 1-5',
-        scheduleHuman: '8:10 AM weekdays',
-        timezone: 'America/Denver',
-        category: 'reporting',
-        weekdaysOnly: true,
-    },
+    // DECISION(2026-03-20): SlackPurchasesReport REMOVED per Will.
+    // Active Purchases no longer posted to Slack — available via Dashboard only.
     {
         name: 'APDailyRecap',
         description: 'End-of-day AP agent recap of all invoice processing decisions',
@@ -351,6 +344,24 @@ export const CRON_JOBS: CronJobDefinition[] = [
         timezone: 'America/Denver',
         category: 'maintenance',
         weekdaysOnly: false,
+    },
+    {
+        name: 'NightshiftEnqueue',
+        description: 'Batch-enqueues unprocessed AP emails for overnight local LLM classification',
+        schedule: '0 18 * * 1-5',
+        scheduleHuman: '6:00 PM weekdays',
+        timezone: 'America/Denver',
+        category: 'kaizen',
+        weekdaysOnly: true,
+    },
+    {
+        name: 'NightshiftHandoff',
+        description: 'Morning shift-change report: classification results, reconciliation outcomes, to-do list',
+        schedule: '55 6 * * 1-5',
+        scheduleHuman: '6:55 AM weekdays',
+        timezone: 'America/Denver',
+        category: 'kaizen',
+        weekdaysOnly: true,
     },
 ];
 

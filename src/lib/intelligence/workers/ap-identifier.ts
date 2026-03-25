@@ -25,6 +25,7 @@ import { z } from "zod";
 import { unifiedObjectGeneration, unifiedTextGeneration } from "../llm";
 import { recall } from "../memory";
 import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
+import { getPreClassification } from "../nightshift-agent";
 import { FinaleClient } from "../../finale/client";
 import { Telegraf } from "telegraf";
 
@@ -279,6 +280,20 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     continue;
                 }
 
+                // ── TAX DOCUMENT GUARD ─────────────────────────────────────
+                // DECISION(2026-03-24): Tax documents must never be marked as read
+                // or archived automatically. They require manual human handling.
+                const isTaxRelated = /\btax(es)?\b|w-?9|1099|1040|sales tax|tax return|tax exemption/i.test(subject) ||
+                                     /\btax(es)?\b|w-?9|1099|1040/i.test(snippet) ||
+                                     (m.pdf_filenames || []).some((f: string) => /\btax(es)?\b|w-?9|1099|1040/i.test(f));
+                
+                if (isTaxRelated) {
+                    console.log(`   ⚠️ TAX DOCUMENT: "${subject}". Leaving unread for human review.`);
+                    await this.logActivity(supabase, from, subject, "TAX_DOCUMENT", 
+                        "Tax document detected — leaving unread in inbox");
+                    continue; // Skip all further processing; remains UNREAD and in INBOX
+                }
+
                 // ── SUBJECT SKIP CHECK ─────────────────────────────────────
                 const subjectBlocked = SUBJECT_SKIP_PATTERNS.find(p => p.test(subject));
                 if (subjectBlocked) {
@@ -362,8 +377,17 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     intent = "PAID_INVOICE";
                     console.log(`     -> Forced PAID_INVOICE (regex heuristic match)`);
                 } else {
-                    intent = await this.classifyEmailIntent(subject, from, snippet);
-                    console.log(`     -> Classified as: ${intent}`);
+                    // DECISION(2026-03-24): Check nightshift pre-classification before paid LLM call.
+                    // If the local model classified this overnight with confidence >= 0.7, use it.
+                    // Falls through to paid LLM on null return — zero risk to daytime AP flow.
+                    const preClass = await getPreClassification(m.gmail_message_id).catch(() => null);
+                    if (preClass) {
+                        intent = preClass.classification;
+                        console.log(`     -> Pre-classified (${preClass.handler}, conf=${preClass.confidence.toFixed(2)}): ${intent}`);
+                    } else {
+                        intent = await this.classifyEmailIntent(subject, from, snippet);
+                        console.log(`     -> Classified as: ${intent}`);
+                    }
                 }
 
                 if (intent === "ADVERTISEMENT") {

@@ -179,12 +179,9 @@ export async function enrichOOSItems(
     const oosSkuSet = new Set(items.map(i => i.sku.toLowerCase()));
 
     // Find all POs that contain OOS SKUs
-    // DECISION(2026-03-11): Include both Committed AND Completed POs.
-    // Finale auto-completes POs when reception qty matches, but:
-    //   - Item may still be OOS (stock consumed faster than received)
-    //   - Tracking/shipping info is still relevant context
-    //   - Invoice matching is still pending on Completed POs
-    const relevantStatuses = new Set(['Committed', 'Completed']);
+    // DECISION(2026-03-24): Include Locked POs as well. These are the same
+    // as Committed POs in the Finale UI, but often have status "Locked" in GraphQL.
+    const relevantStatuses = new Set(['Committed', 'Locked', 'Completed']);
     const relevantPOs = recentPOs.filter(po =>
         relevantStatuses.has(po.status) &&
         po.items.some(item => oosSkuSet.has((item.productId || '').toLowerCase()))

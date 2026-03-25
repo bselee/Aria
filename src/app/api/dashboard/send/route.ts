@@ -42,6 +42,7 @@ You MUST use your tools to answer questions. NEVER ask clarifying questions when
 - Sales history / units sold / volume for a product → use get_sales_history
 - Vendor info → use query_vendors
 - PO status → use query_purchase_orders
+- PO spend / "how much did we spend" / "last week spend" / "committed spend" → use get_po_spend
 - Invoice status → use query_invoices
 
 ### LIVE DATA RULE:
@@ -236,6 +237,47 @@ const dashboardTools = {
             if (!res.ok) return `Perplexity error: ${res.status} ${res.statusText}`;
             const data = await res.json();
             return data.choices?.[0]?.message?.content || 'No results.';
+        },
+    }),
+
+    get_po_spend: tool({
+        description: "Get total committed PO spend for a date range. Use for 'last week PO spend', 'this month spend', 'how much did we commit'. Returns total $, PO count, and per-vendor breakdown.",
+        inputSchema: z.object({
+            start_date: z.string().describe('Start date in YYYY-MM-DD format (inclusive)'),
+            end_date: z.string().describe('End date in YYYY-MM-DD format (exclusive). For "last week" ending Sunday, use the following Monday.'),
+        }),
+        execute: async ({ start_date, end_date }) => {
+            const { finaleClient } = await import('@/lib/finale/client');
+            const committed = await finaleClient.getTodaysCommittedPOs(start_date, end_date);
+
+            if (committed.length === 0) {
+                return `No committed POs found between ${start_date} and ${end_date}.`;
+            }
+
+            const totalSpend = committed.reduce((sum, po) => sum + (po.total || 0), 0);
+
+            // Per-vendor breakdown
+            const byVendor: Record<string, { count: number; spend: number }> = {};
+            for (const po of committed) {
+                const vendor = po.supplier || 'Unknown';
+                if (!byVendor[vendor]) byVendor[vendor] = { count: 0, spend: 0 };
+                byVendor[vendor].count++;
+                byVendor[vendor].spend += po.total || 0;
+            }
+
+            const vendorLines = Object.entries(byVendor)
+                .sort((a, b) => b[1].spend - a[1].spend)
+                .map(([v, d]) => `  ${v}: ${d.count} PO(s) · $${d.spend.toLocaleString(undefined, { minimumFractionDigits: 2 })}`)
+                .join('\n');
+
+            const poList = committed
+                .map(po => `  PO #${po.orderId} — ${po.supplier} — $${(po.total || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })} (${po.orderDate})`)
+                .join('\n');
+
+            return `Committed PO Spend (${start_date} to ${end_date}):\n` +
+                `Total: $${totalSpend.toLocaleString(undefined, { minimumFractionDigits: 2 })} across ${committed.length} PO(s)\n\n` +
+                `By Vendor:\n${vendorLines}\n\n` +
+                `POs:\n${poList}`;
         },
     }),
 

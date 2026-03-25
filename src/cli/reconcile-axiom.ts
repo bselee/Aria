@@ -1296,7 +1296,32 @@ async function main() {
                 console.log(`      - ${inv.invoiceNumber} ($${inv.subtotal.toFixed(2)}) from ${inv.orderDate.substring(0, 10)}`);
             }
         } else {
+            // DECISION(2026-03-25): Import supabase for dedup checks before draft creation.
+            // Without this, every nightly run creates NEW draft POs for all historical
+            // invoices that don't match an existing committed PO by date/SKU proximity.
+            const { createClient: createSb } = await import('../lib/supabase');
+            const sbClient = createSb();
+
             for (const inv of unmatchedInvoices) {
+                // ── DEDUP GUARD ──────────────────────────────────────────────
+                // DECISION(2026-03-25): Check vendor_invoices table BEFORE creating
+                // a draft PO. If a previous run already created a PO for this
+                // invoice number, skip it. This prevents the nightly cron from
+                // producing duplicate draft POs every single run.
+                try {
+                    const { data: existingVI } = await sbClient
+                        .from('vendor_invoices')
+                        .select('id, po_number')
+                        .eq('vendor_name', 'Axiom Print')
+                        .eq('invoice_number', inv.invoiceNumber)
+                        .maybeSingle();
+
+                    if (existingVI?.po_number) {
+                        console.log(`      ⏭️  ${inv.invoiceNumber}: Already has PO #${existingVI.po_number} — skipping draft creation`);
+                        continue;
+                    }
+                } catch { /* table may not exist — proceed with creation */ }
+
                 // Build line items from invoice estimates using SKU mapping
                 const items: Array<{ productId: string; quantity: number; unitPrice: number }> = [];
                 for (const est of inv.estimates) {

@@ -1,9 +1,9 @@
 /**
  * @file    page.tsx
- * @purpose ARIA Operations Dashboard — 5-column draggable layout with floating chat
+ * @purpose ARIA Operations Dashboard — 4-column draggable layout with floating chat
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-03-09
+ * @updated 2026-03-25
  * @deps    @dnd-kit/core, @dnd-kit/sortable, dashboard panel components
  */
 "use client";
@@ -37,17 +37,18 @@ import ChatMirror from "@/components/dashboard/ChatMirror";
 import InvoiceQueuePanel from "@/components/dashboard/InvoiceQueuePanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
-import ReorderPanel from "@/components/dashboard/ReorderPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
-import AxiomReviewQueuePanel from "@/components/dashboard/AxiomReviewQueuePanel";
+import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPanel";
 
 
 // ── Column width defaults (px) ──────────────────────────────────────
+// DECISION(2026-03-25): Consolidated from 5 to 4 columns because the
+// farRight + right columns were pushed off-screen on typical viewport widths.
+// Build Schedule now lives with Purchasing in midRight.
 const DEFAULT_LEFT_W = 360;
 const DEFAULT_MIDLEFT_W = 300;
-const DEFAULT_MIDRIGHT_W = 320;
-const DEFAULT_FARRIGHT_W = 300;
+const DEFAULT_MIDRIGHT_W = 380;
 
 function ColHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
     return (
@@ -68,29 +69,30 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
         </div>
     ),
     "invoice-queue": <InvoiceQueuePanel />,
-    "reorder": <ReorderPanel />,
     "purchasing": <PurchasingPanel />,
     "build-schedule": <BuildSchedulePanel />,
     "active-purchases": <ActivePurchasesPanel />,
-    "axiom-queue": <AxiomReviewQueuePanel />,
+    "purchasing-calendar": <PurchasingCalendarPanel />,
 };
 
 // ── Layout types ────────────────────────────────────────────────────
-// DECISION(2026-03-09): Moved to 5 columns to reduce crowding.
-// ChatMirror extracted to a floating widget so it no longer consumes a column.
-type ColumnId = "left" | "midLeft" | "midRight" | "farRight" | "right";
+// DECISION(2026-03-25): Consolidated to 4 columns. 5-column layout pushed
+// farRight + right off-screen on typical viewports. Build Schedule merged
+// with Purchasing into midRight. ChatMirror stays as floating widget.
+type ColumnId = "left" | "midLeft" | "midRight" | "right";
 type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings"],
-    midLeft: ["axiom-queue", "invoice-queue", "active-purchases"],
-    midRight: ["reorder", "purchasing"],
-    farRight: ["build-schedule"],
-    right: ["activity"]
+    // DECISION(2026-03-25): Removed axiom-queue from dashboard — Axiom ordering
+    // is now fully autonomous (like ULINE). No manual review needed.
+    midLeft: ["invoice-queue", "active-purchases"],
+    midRight: ["purchasing", "purchasing-calendar"],
+    right: ["activity", "build-schedule"]
 };
 
 // All ColumnIds for iteration during layout merge / restore
-const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "farRight", "right"];
+const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "right"];
 
 function Column({ id, items, children, style, className }: { id: string, items: string[], children: React.ReactNode, style?: React.CSSProperties, className?: string }) {
     const { setNodeRef } = useDroppable({ id });
@@ -107,7 +109,6 @@ export default function DashboardPage() {
     const [leftW, setLeftW] = useState(DEFAULT_LEFT_W);
     const [midLeftW, setMidLeftW] = useState(DEFAULT_MIDLEFT_W);
     const [midRightW, setMidRightW] = useState(DEFAULT_MIDRIGHT_W);
-    const [farRightW, setFarRightW] = useState(DEFAULT_FARRIGHT_W);
     const [layout, setLayout] = useState<LayoutState>(DEFAULT_LAYOUT);
     const [activeId, setActiveId] = useState<string | null>(null);
     const [chatOpen, setChatOpen] = useState(false);
@@ -119,21 +120,18 @@ export default function DashboardPage() {
         const lw = localStorage.getItem("aria-dash-left-w");
         const mlw = localStorage.getItem("aria-dash-midleft-w");
         const mrw = localStorage.getItem("aria-dash-midright-w");
-        const frw = localStorage.getItem("aria-dash-farright-w");
         const ly = localStorage.getItem("aria-dash-layout");
         const co = localStorage.getItem("aria-dash-chat-open");
 
         if (lw) setLeftW(Math.max(200, Math.min(600, parseInt(lw))));
         if (mlw) setMidLeftW(Math.max(200, Math.min(600, parseInt(mlw))));
         if (mrw) setMidRightW(Math.max(200, Math.min(600, parseInt(mrw))));
-        if (frw) setFarRightW(Math.max(200, Math.min(600, parseInt(frw))));
         if (co === "true") setChatOpen(true);
         if (ly) {
             try {
                 const restored = JSON.parse(ly);
 
-                // DECISION(2026-03-09): Migrate old layouts to 5-column format.
-                // Also strip the removed "chat-mirror" panel from any column.
+                // DECISION(2026-03-09): Migrate old 3-col "mid" layouts.
                 if (restored.mid && !restored.midLeft) {
                     const oldMid: string[] = restored.mid;
                     restored.midLeft = oldMid.filter((id: string) =>
@@ -147,14 +145,23 @@ export default function DashboardPage() {
                     restored.right = [...(restored.right || []), ...overflow];
                     delete restored.mid;
                 }
-                // Ensure farRight column exists (migration from 4-col layout)
-                if (!restored.farRight) {
-                    restored.farRight = DEFAULT_LAYOUT.farRight;
+                // DECISION(2026-03-25): Migrate old 5-col layout → 4-col.
+                // Move any panels from the retired farRight column into midRight.
+                if (restored.farRight) {
+                    const farRightPanels: string[] = restored.farRight;
+                    if (!restored.midRight) restored.midRight = [];
+                    for (const id of farRightPanels) {
+                        if (!restored.midRight.includes(id)) {
+                            restored.midRight.push(id);
+                        }
+                    }
+                    delete restored.farRight;
                 }
-                // Strip chat-mirror from all columns (now a floating widget)
+                // Strip retired panels from all columns
+                const RETIRED_PANELS = new Set(["chat-mirror", "reorder", "axiom-queue"]);
                 for (const col of ALL_COLUMNS) {
                     if (restored[col]) {
-                        restored[col] = (restored[col] as string[]).filter((id: string) => id !== "chat-mirror");
+                        restored[col] = (restored[col] as string[]).filter((id: string) => !RETIRED_PANELS.has(id));
                     }
                 }
                 // Deduplicate: if a panel appears in multiple columns, keep
@@ -170,8 +177,8 @@ export default function DashboardPage() {
                     }
                 }
 
-                // Validate all five columns exist before restoring
-                if (restored.left && restored.midLeft && restored.midRight && restored.farRight && restored.right) {
+                // Validate all four columns exist before restoring
+                if (restored.left && restored.midLeft && restored.midRight && restored.right) {
                     // Merge any panels that exist in DEFAULT_LAYOUT but are missing from
                     // the saved layout (prevents new panels from being silently dropped
                     // by stale localStorage saves).
@@ -197,7 +204,6 @@ export default function DashboardPage() {
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-left-w", String(leftW)); }, [leftW, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midleft-w", String(midLeftW)); }, [midLeftW, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midright-w", String(midRightW)); }, [midRightW, mounted]);
-    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-farright-w", String(farRightW)); }, [farRightW, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-chat-open", String(chatOpen)); }, [chatOpen, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-layout", JSON.stringify(layout)); }, [layout, mounted]);
 
@@ -241,18 +247,7 @@ export default function DashboardPage() {
         window.addEventListener("mouseup", onUp);
     }, [midRightW]);
 
-    const startFarRightResize = useCallback((e: React.MouseEvent) => {
-        e.preventDefault();
-        const startX = e.clientX, startW = farRightW;
-        const onMove = (ev: MouseEvent) =>
-            setFarRightW(Math.max(200, Math.min(600, startW + ev.clientX - startX)));
-        const onUp = () => {
-            window.removeEventListener("mousemove", onMove);
-            window.removeEventListener("mouseup", onUp);
-        };
-        window.addEventListener("mousemove", onMove);
-        window.addEventListener("mouseup", onUp);
-    }, [farRightW]);
+    // DECISION(2026-03-25): Removed farRight column + resize handler (4-col layout).
 
     // ── DnD ─────────────────────────────────────────────────────────
     const sensors = useSensors(
@@ -404,17 +399,6 @@ export default function DashboardPage() {
                     </Column>
 
                     <ColHandle onMouseDown={startMidRightResize} />
-
-                    {/* ── Column 4: Builds ───────────────────────────── */}
-                    <Column id="farRight" items={layout.farRight} style={{ width: farRightW }} className={colClasses}>
-                        {layout.farRight.map(id => (
-                            <SortablePanel key={id} id={id} className={flexPanelIds.has(id) ? "flex-1" : undefined}>
-                                {PANEL_MAP[id]}
-                            </SortablePanel>
-                        ))}
-                    </Column>
-
-                    <ColHandle onMouseDown={startFarRightResize} />
 
                     {/* ── Column 5: Activity ─────────────────────────── */}
                     <Column id="right" items={layout.right} className="flex-1 min-w-[240px] flex flex-col gap-4 p-4 overflow-y-auto overflow-x-hidden h-full pb-20">

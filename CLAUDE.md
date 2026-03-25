@@ -60,6 +60,15 @@ node --import tsx src/cli/test-ap-routing.ts
 node --import tsx src/cli/verify-tools.ts
 node --import tsx src/cli/run-ap-pipeline.ts       # Manually trigger AP pipeline against real Gmail invoice
 node --import tsx src/test/test-ap-agent-live.ts   # Live AP agent test
+
+# Nightshift (local LLM overnight pre-classification)
+node --import tsx src/cli/nightshift-runner.ts [--dry-run]   # Start overnight loop manually
+node --import tsx src/cli/test-ollama.ts [model] [think]     # Ollama classification smoke test
+node --import tsx src/cli/test-ollama-pdf.ts [model]         # Ollama PDF extraction capability test
+# Task Scheduler scripts (run as Admin once to register):
+#   scripts/setup-task-scheduler.ps1  → registers NightshiftStart (6:05 PM) + NightshiftStop (7 AM)
+#   scripts/start-nightshift.ps1      → starts runner (Ollama must be running)
+#   scripts/stop-nightshift.ps1       → kills runner by PID
 ```
 
 All scripts load `.env.local` via `dotenv.config({ path: '.env.local' })` at startup. PM2 does NOT use env_file — `.env.local` is loaded inside each script.
@@ -131,6 +140,7 @@ Calendar auth is a **separate OAuth flow** from Gmail — it uses `GOOGLE_CLIENT
 | `src/lib/intelligence/pinecone.ts` | Pinecone vector store for operational context + deduplication state (index: `gravity-memory`, 1024d, namespace: `aria-memory`) |
 | `src/lib/intelligence/vendor-memory.ts` | Vendor document handling patterns in Pinecone (namespace: `vendor-memory`). Stores how each vendor sends docs. `seedKnownVendorPatterns()` called on boot. |
 | `src/lib/intelligence/dropship-store.ts` | In-memory store (48h TTL) for unmatched invoices pending dropship forwarding. Bot's `dropship_fwd_*` callbacks retrieve from here. Lost on restart. |
+| `src/lib/intelligence/nightshift-agent.ts` | Overnight local LLM email pre-classifier. `enqueueEmailClassification()` → `nightshift_queue` table. `runNightshiftLoop()` uses Ollama qwen2.5:1.5b, escalates to Claude Haiku on low confidence. `getPreClassification()` called by ap-identifier before paid Sonnet classify. |
 | `src/lib/intelligence/sandbox-watcher.ts` | Watches `~/OneDrive/Desktop/Sandbox/` for dropped files. PDFs → AP pipeline, TXT → LLM Q&A, CSV/XLSX → summarize, images → Supabase Storage. Processed files move to `processed/`, responses to `responses/`. |
 | `src/lib/intelligence/po-correlator.ts` | Cross-inbox correlation: reads outgoing PO emails from `bill.selee@buildasoil.com` (label:PO), correlates with incoming invoices, builds vendor communication profiles (saved to `vendor_profiles` table) |
 | `src/lib/github/client.ts` | GitHub integration via Octokit: creates issues for document discrepancies, syncs issue state to Supabase, processes PR PDF uploads. Env: `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO` |
@@ -243,7 +253,7 @@ Finale fee types map to `productpromo` IDs: FREIGHT=10007, TAX=10008, TARIFF=100
 node _run_migration.js supabase/migrations/<filename>.sql
 ```
 
-`_run_migration.js` connects via the Supabase connection pooler (`aws-0-us-west-2.pooler.6543`) — direct `db.*.supabase.co` DNS does not resolve in this environment. It falls through connection strategies automatically. If it doesn't exist, paste the SQL into the [Supabase SQL Editor](https://supabase.com/dashboard/project/_/sql). The `pg` package must be installed (`npm install pg` if missing). Uses `SUPABASE_DB_PASSWORD` env var, falls back to `SUPABASE_SERVICE_ROLE_KEY`.
+`_run_migration.js` connects via `DATABASE_URL` in `.env.local` (full Supabase pooler connection string — this is the correct credential). `SUPABASE_SERVICE_ROLE_KEY` is a REST API JWT, NOT the database password — do not use it for pg connections. Direct `db.*.supabase.co` DNS does not resolve in this environment. The `pg` package must be installed (`npm install pg` if missing).
 
 **Migration rules:**
 - Non-destructive migrations (new tables, new columns, new indexes) → **apply automatically, do not ask**
@@ -275,6 +285,26 @@ Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `
 - `Every 15 min` — AP inbox invoice check
 - `Hourly` — Advertisement cleanup
 - `Every 30 min` — PO conversation sync
+- `6:00 PM Mon-Fri` — Nightshift enqueue: batches unprocessed AP emails into `nightshift_queue` for overnight local LLM classification
+
+### Nightshift System
+Overnight email pre-classification using **Ollama** (local, always-on) to skip paid LLM calls at the 8 AM AP poll.
+
+**Model:** `qwen2.5:1.5b` (default) — suitable for email intent classification only.
+
+**Capability assessment (benchmarked 2026-03-24):**
+- ✅ Email classification (INVOICE/ADVERTISEMENT/STATEMENT/HUMAN_INTERACTION): reliable, 2-7s/email
+- ✅ Handles messy OCR text (l/I/0/O confusion) well
+- ❌ PDF invoice data extraction (gleaning): NOT suitable — fails on complex fee structures (freight/fuel/tariff), returns null on statements. Full extraction stays on Claude Haiku / Sonnet.
+
+**Flow:**
+1. 6 PM: ops-manager reads `email_inbox_queue` (unprocessed AP, last 3 days) → enqueues to `nightshift_queue`
+2. Overnight: nightshift-runner → qwen2.5:1.5b classifies → if confidence < 0.7, escalates to Claude Haiku (cap: 20/night)
+3. 8 AM: ap-identifier calls `getPreClassification()` — ADVERTISEMENT → archived + skipped (zero paid cost); others fall through to normal paid pipeline
+
+**Scripts:** `scripts/start-nightshift.ps1` (Ollama-aware, no llama-server needed), `scripts/stop-nightshift.ps1`, `scripts/setup-task-scheduler.ps1` (run once as Admin). Task Scheduler: NightshiftStart @ 6:05 PM, NightshiftStop @ 7:00 AM Mon-Fri.
+
+**Key files:** `src/lib/intelligence/nightshift-agent.ts`, `src/cli/nightshift-runner.ts`, `supabase/migrations/20260324_create_nightshift_queue.sql` (applied).
 
 ## Agents & Skills
 
