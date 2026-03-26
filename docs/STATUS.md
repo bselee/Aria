@@ -36,6 +36,8 @@
 
 | Date | What Changed | Key Files | Conv ID |
 |---|---|---|---|
+| 2026-03-26 | **Shared Copilot Layer** — `src/lib/copilot/` unified core for Telegram + dashboard Q&A; 52 tests; all passing | `copilot/core.ts`, `channels/`, `artifacts.ts`, `smoke.ts` | `a5ddaa9` |
+| 2026-03-26 | **ULINE Invoice Parser** — zero-LLM line item extraction for ULINE compact PDF format | `pdf/invoice-parser.ts` | `eb5556d` |
 | 2026-03-16 | **ULINE Reconciliation CLI** — single-command pipeline: scrape + map SKUs + update prices + freight | `src/cli/reconcile-uline.ts` | `7101fa3b` |
 | 2026-03-16 | **UOM Conversion Fix** — Finale tracks smallest unit; vendors sell by case/box. Must divide price by factor. | reconcile-uline.ts, workflows | `7101fa3b` |
 | 2026-03-16 | **Ad Sweep investigation** — diagnosed why sweep didn't run | ops-manager.ts | `5ecf18a7` |
@@ -48,9 +50,10 @@
 
 ## Active Priorities
 
-1. Gemini API paid tier — upgrade to resolve quota-0 blocking
-2. Gmail MCP investigation — determine why external MCP server fails (EOF)
-3. Pinecone MCP connectivity — intermittent EOF errors on upsert calls
+1. Wire `handleTelegramText` into `start-bot.ts` text handler (replace bespoke prompt assembly)
+2. Wire `handleDashboardSend` into `src/app/api/dashboard/send/route.ts`
+3. Gemini API paid tier — upgrade to resolve quota-0 blocking
+4. Gmail MCP investigation — determine why external MCP server fails (EOF)
 
 ## Updating This File
 
