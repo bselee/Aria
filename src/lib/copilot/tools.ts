@@ -86,3 +86,48 @@ export const READ_TOOLS: CopilotTool[] = [
 export function getTool(name: string): CopilotTool | undefined {
     return READ_TOOLS.find(t => t.name === name);
 }
+
+// ── Read tool routing with one-retry fallback ─────────────────────────────────
+
+export interface ReadToolRouteInput {
+    text:     string;
+    /** Ordered list of tool names to attempt (first = preferred, rest = fallbacks) */
+    attempts: string[];
+}
+
+export interface ReadToolRouteResult {
+    resolvedTool?:   string;
+    attemptCount:    number;
+    failed:          boolean;
+    /** Never set — read failures must not produce write action refs */
+    writeActionRef?: never;
+}
+
+/**
+ * Resolve the best read tool from an ordered attempt list.
+ *
+ * Rules (per design doc):
+ *   - First attempt returns a known tool → success (attemptCount = 1)
+ *   - First attempt unknown/no_result → try second (attemptCount = 2)
+ *   - Second attempt also fails → stop, return failed (no third attempt)
+ *   - Failures never produce writeActionRef (type-enforced as `never`)
+ */
+export async function resolveReadToolRoute(input: ReadToolRouteInput): Promise<ReadToolRouteResult> {
+    const { attempts } = input;
+    const MAX_ATTEMPTS = 2;
+
+    for (let i = 0; i < Math.min(attempts.length, MAX_ATTEMPTS); i++) {
+        const toolName = attempts[i];
+        const known    = getTool(toolName);
+
+        if (known) {
+            return { resolvedTool: toolName, attemptCount: i + 1, failed: false };
+        }
+    }
+
+    return {
+        resolvedTool: undefined,
+        attemptCount: Math.min(attempts.length, MAX_ATTEMPTS),
+        failed:       true,
+    };
+}
