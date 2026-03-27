@@ -18,6 +18,7 @@
  *          added cross-inbox dedup, tightened classification heuristics.
  */
 
+import { createHash } from "crypto";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
@@ -574,6 +575,29 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             if (!attachmentData) continue;
                             const buffer = Buffer.from(attachmentData, "base64url");
 
+                            // ── Dedup Check 3: PDF content hash ───────────────────
+                            // Some vendors (e.g. Abel's ACE) send identical PDFs in
+                            // separate emails with different subjects. Hash the actual
+                            // bytes so truly identical invoices are never forwarded twice,
+                            // regardless of filename or subject line.
+                            const pdfHash = createHash("sha256").update(buffer).digest("hex");
+                            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+                            const { data: hashDup } = await supabase
+                                .from("ap_inbox_queue")
+                                .select("id, email_subject")
+                                .eq("email_from", from)
+                                .eq("pdf_content_hash", pdfHash)
+                                .gte("created_at", sevenDaysAgo)
+                                .maybeSingle();
+                            if (hashDup) {
+                                console.log(`     ⚠️ PDF content duplicate: ${capturedFilename} (hash match with "${hashDup.email_subject}") — skipping`);
+                                await this.logActivity(supabase, from, subject, "DUPLICATE_PDF_CONTENT",
+                                    `PDF content hash duplicate: ${capturedFilename} matches prior entry "${hashDup.email_subject}" — not forwarded`);
+                                attachmentIndex++;
+                                processedAnyPDF = true;
+                                continue;
+                            }
+
                             // ── PDF CONTENT SAFETY CHECK ──────────────────────────
                             // DECISION(2026-03-20): Before forwarding to Bill.com,
                             // scan the first ~2KB of PDF text for block patterns
@@ -638,7 +662,8 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 pdf_path: storagePath,
                                 pdf_filename: capturedFilename,
                                 status: queueStatus,
-                                source_inbox: sourceInbox
+                                source_inbox: sourceInbox,
+                                pdf_content_hash: pdfHash,
                             });
 
                             if (insertError) {

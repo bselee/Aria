@@ -879,43 +879,50 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         }
                     }
                 }
-                if (candidates.length > 1) {
-                    // Pass 1: collect all valid candidates
-                    const validCandidates: string[] = [];
-                    for (const candidate of candidates) {
-                        try {
-                            await probeClient.getOrderDetails(candidate);
-                            validCandidates.push(candidate);
-                        } catch {
-                            // not found — try next
-                        }
-                    }
 
-                    if (validCandidates.length === 1) {
-                        console.log(`     → Resolved PO "${finalePONumber}" to: ${validCandidates[0]}`);
-                        finalePONumber = validCandidates[0];
-                    } else if (validCandidates.length > 1) {
-                        // Multiple valid POs — disambiguate by vendor name similarity
-                        console.log(`     → Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
-                        let bestCandidate = validCandidates[0];
-                        let bestScore = -1;
-                        const invoiceVendorWords = (invoiceData.vendorName || "")
-                            .toLowerCase().split(/\s+/).filter(w => w.length > 2);
-                        for (const candidate of validCandidates) {
-                            try {
-                                const summary = await probeClient.getOrderSummary(candidate);
-                                if (!summary) continue;
-                                const supplierLower = summary.supplier.toLowerCase();
-                                const score = invoiceVendorWords.filter(w => supplierLower.includes(w)).length;
-                                console.log(`     ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
-                                if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
-                            } catch {
-                                /* leave current best */
-                            }
-                        }
-                        console.log(`     → Best vendor match: PO ${bestCandidate}`);
-                        finalePONumber = bestCandidate;
+                // Always validate candidates in Finale — even single-candidate cases.
+                // If the printed PO# is the vendor's own order number (e.g. ULINE "S-144261"),
+                // none will resolve and we must clear finalePONumber so the vendor+date
+                // fallback below can run. Without this clear, the fallback is silently skipped.
+                const validCandidates: string[] = [];
+                for (const candidate of candidates) {
+                    try {
+                        await probeClient.getOrderDetails(candidate);
+                        validCandidates.push(candidate);
+                    } catch {
+                        // not found — try next
                     }
+                }
+
+                if (validCandidates.length === 0) {
+                    // No candidate exists in Finale — vendor printed their own reference number.
+                    // Clear so vendor+date fallback can run.
+                    console.log(`     → PO "${finalePONumber}" not found in Finale — clearing for fallback lookup`);
+                    finalePONumber = null;
+                } else if (validCandidates.length === 1) {
+                    console.log(`     → Resolved PO "${finalePONumber}" to: ${validCandidates[0]}`);
+                    finalePONumber = validCandidates[0];
+                } else {
+                    // Multiple valid POs — disambiguate by vendor name similarity
+                    console.log(`     → Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
+                    let bestCandidate = validCandidates[0];
+                    let bestScore = -1;
+                    const invoiceVendorWords = (invoiceData.vendorName || "")
+                        .toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                    for (const candidate of validCandidates) {
+                        try {
+                            const summary = await probeClient.getOrderSummary(candidate);
+                            if (!summary) continue;
+                            const supplierLower = summary.supplier.toLowerCase();
+                            const score = invoiceVendorWords.filter(w => supplierLower.includes(w)).length;
+                            console.log(`     ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
+                            if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+                        } catch {
+                            /* leave current best */
+                        }
+                    }
+                    console.log(`     → Best vendor match: PO ${bestCandidate}`);
+                    finalePONumber = bestCandidate;
                 }
             }
 
@@ -926,11 +933,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         invoiceData.invoiceDate,
                         30 // ±30-day window
                     );
-                    // Filter to open/committed POs within 10% of invoice total
+                    // Filter to open/committed/draft POs within 10% of invoice total.
+                    // Draft POs (ORDER_CREATED) may have $0 total — skip variance check for those.
                     const plausible = candidates.filter(c =>
-                        (c.status === "Committed" || c.status === "Open") &&
+                        (c.status === "Committed" || c.status === "Open" || c.status === "ORDER_CREATED") &&
                         invoiceData.total > 0 &&
-                        Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10
+                        (c.total === 0 || Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10)
                     );
                     if (plausible.length > 0) {
                         plausible.sort((a, b) =>
@@ -1151,17 +1159,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
         }
 
-        if (this.slack) {
-            try {
-                await this.slack.chat.postMessage({
-                    channel: this.slackChannel,
-                    text: msg.replace(/\*/g, "*"),
-                    mrkdwn: true
-                });
-            } catch (err: any) {
-                console.error("Slack post failed for AP Agent:", err.message);
-            }
-        }
     }
 
     /**

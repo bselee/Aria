@@ -797,6 +797,7 @@ export interface ReconciliationResult {
     vendorNote?: string;        // Set when vendor correlation used non-name signal to confirm
     notes?: string;             // Non-blocking informational notes (e.g., balance validation warning)
     report?: ReconciliationReport;  // Structured audit report — populated at end of reconcileInvoiceToPO()
+    populateItems?: Array<{ productId: string; quantity: number; unitPrice: number; description: string }>;  // Set when PO is empty draft — items to add on approval
 }
 
 // ──────────────────────────────────────────────────
@@ -960,21 +961,78 @@ export async function reconcileInvoiceToPO(
         };
     }
 
-    // ── Guard 0.5: Empty PO line items ─────────────────────────────────────────
-    // Fix 6: A PO with 0 line items is a template, data issue, or wrong PO.
-    // Silently returning no_change would mark the invoice as processed with nothing done.
-    // Surface it as needs_approval so Will sees it and can investigate.
+    // ── Guard 0.5: Empty PO — try to populate from invoice items ──────────────
+    // Draft POs often have no items yet. Instead of surfacing a useless needs_approval
+    // (where approving does nothing), try to resolve invoice SKUs in Finale and offer
+    // to populate the PO on approval.
     if (!poSummary.items || poSummary.items.length === 0) {
-        const emptyPoWarnings = ["PO has 0 line items in Finale — possible data issue or template PO. Manual review required."];
+        const populateItems: Array<{ productId: string; quantity: number; unitPrice: number; description: string }> = [];
+
+        if (invoice.lineItems && invoice.lineItems.length > 0) {
+            for (const li of invoice.lineItems) {
+                const sku = li.sku?.trim();
+                if (!sku || (li.quantity ?? 0) <= 0 || (li.unitPrice ?? 0) <= 0) continue;
+                try {
+                    const product = await client.lookupProduct(sku);
+                    if (product) {
+                        populateItems.push({
+                            productId: sku,
+                            quantity: li.quantity,
+                            unitPrice: li.unitPrice,
+                            description: li.description || sku,
+                        });
+                    }
+                } catch { /* unresolved SKU — skip */ }
+            }
+        }
+
+        const feeChanges = reconcileFees(invoice, poSummary, vendorFeeLabelMap);
+        const feeTotal = feeChanges.reduce((s, f) => s + f.amount, 0);
+
+        if (populateItems.length > 0) {
+            const lineTotal = populateItems.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
+            const resolvedNote = `${populateItems.length}/${invoice.lineItems?.length ?? 0} invoice SKUs resolved in Finale`;
+            const itemLines = populateItems.map(i => `  • ${i.productId} × ${i.quantity} @ $${i.unitPrice.toFixed(2)} = $${(i.quantity * i.unitPrice).toFixed(2)}`).join('\n');
+            const feeLines = feeChanges.length > 0
+                ? `\nFees: ` + feeChanges.map(f => `${f.description} $${f.amount.toFixed(2)}`).join(', ')
+                : '';
+            const populateSummary =
+                `📋 Draft PO ${orderId} has no items — approve to populate from invoice?\n` +
+                `${resolvedNote}\n${itemLines}${feeLines}\n` +
+                `Total: $${(lineTotal + feeTotal).toFixed(2)}`;
+
+            return {
+                orderId,
+                invoiceNumber: invoice.invoiceNumber,
+                vendorName: invoice.vendorName,
+                invoiceTotal: invoice.total,
+                priceChanges: [],
+                feeChanges,
+                trackingUpdate: null,
+                overallVerdict: "needs_approval",
+                summary: populateSummary,
+                totalDollarImpact: lineTotal + feeTotal,
+                autoApplicable: false,
+                warnings: [resolvedNote],
+                populateItems,
+                report: buildReconciliationReport(invoice, poSummary, [], feeChanges, balanceCheck, "needs_approval", [resolvedNote]),
+            };
+        }
+
+        // No SKUs resolved in Finale — can't auto-populate, flag for manual review
+        const emptyPoWarnings = [
+            `PO ${orderId} has 0 line items — ${invoice.lineItems?.length ?? 0} invoice SKUs could not be resolved in Finale. Manual review required.`
+        ];
         return {
             orderId,
             invoiceNumber: invoice.invoiceNumber,
             vendorName: invoice.vendorName,
+            invoiceTotal: invoice.total,
             priceChanges: [],
             feeChanges: [],
             trackingUpdate: null,
             overallVerdict: "needs_approval",
-            summary: `⚠️ PO ${orderId} has no line items in Finale — possible data issue or template PO. Invoice not reconciled.`,
+            summary: `⚠️ PO ${orderId} has no line items and no invoice SKUs could be resolved in Finale. Manual review required.`,
             totalDollarImpact: 0,
             autoApplicable: false,
             warnings: emptyPoWarnings,
@@ -1774,6 +1832,16 @@ export async function applyReconciliation(
     const applied: string[] = [];
     const skipped: string[] = [];
     const errors: string[] = [];
+
+    // 0. Populate empty draft PO from invoice items if this was a Guard 0.5 case
+    if (result.populateItems && result.populateItems.length > 0) {
+        try {
+            await client.addItemsToPO(result.orderId, result.populateItems);
+            applied.push(`Populated PO with ${result.populateItems.length} items from invoice`);
+        } catch (err: any) {
+            errors.push(`PO populate failed: ${err.message}`);
+        }
+    }
 
     // 1. Apply price changes
     for (const pc of result.priceChanges) {

@@ -2610,6 +2610,31 @@ export class FinaleClient {
 
         return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated, supplierPartyUrl };
     }
+
+    /**
+     * Add new line items to an existing PO.
+     * Used when a draft PO has no items and needs to be populated from an invoice.
+     * Uses GET → Modify → POST pattern, same as updateOrderItemPrice.
+     */
+    async addItemsToPO(
+        orderId: string,
+        items: Array<{ productId: string; quantity: number; unitPrice: number }>
+    ): Promise<void> {
+        const encodedId = encodeURIComponent(orderId);
+        const currentPO = await this.getOrderDetails(orderId);
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
+
+        const newItems = items.map(item => ({
+            productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+        }));
+
+        currentPO.orderItemList = [...(currentPO.orderItemList || []), ...newItems];
+        await this.post(`/${this.accountPath}/api/order/${encodedId}`, currentPO);
+        await this.restoreOrderStatus(orderId, originalStatus);
+    }
+
     /**
      * Updates the base supplier pricing for a SKU in Finale.
      * This ensures the NEXT PO automatically gets the most current pricing.

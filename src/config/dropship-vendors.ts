@@ -8,5 +8,7 @@ export const KNOWN_DROPSHIP_KEYWORDS = [
     "loganlab",
     "evergreen growers",
     "evergreengrow",
+    "abel",
+    "abelsace",
     // add more: "vendor name fragment" or "emaildomain.com"
 ];

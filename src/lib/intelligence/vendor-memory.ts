@@ -190,19 +190,23 @@ export async function seedKnownVendorPatterns(): Promise<void> {
         {
             vendorName: 'ULINE',
             documentType: 'INVOICE',
-            pattern: 'Sends order confirmation and invoice emails to bill.selee@buildasoil.com. ' +
-                     'Subject always includes our PO# ("PO# 124541") and their order number ("# 47211652"). ' +
-                     'Uses their own catalog numbers (e.g. S-1665, H-1234B) which differ from Finale SKUs. ' +
+            pattern: 'Sends PDF invoices to ap@buildasoil.com (Net-30 accounts payable) and order confirmations to ' +
+                     'bill.selee@buildasoil.com (credit card orders). Subject includes PO# (e.g. "PO# 124541") and ' +
+                     'ULINE order number (e.g. "# 47211652"). ' +
+                     'PDF LINE ITEM FORMAT — COMPACT, NO SPACES: {qty}{2-letter-UOM}{ULINE-SKU}{description}{unitPrice}{extPrice}. ' +
+                     'Example raw text: "48RLS-15625INDUSTRIAL SECURITY TAPE9.50456.00" = qty:48, UOM:RL, SKU:S-15625, unit:$9.50, ext:$456.00. ' +
+                     'CRITICAL: descriptions often START WITH DIGITS (box dimensions: "9 X 5 X 5"). The digit at the start of the ' +
+                     'description is NOT part of the SKU. Correct parse: "500EAS-40929 X 5 X 5" = qty:500, SKU:S-4092, desc:"9 X 5 X 5" BOXES". ' +
+                     'Prices are concatenated with no separator; unit price always ends with exactly 2 decimal digits before ext price begins. ' +
                      'Known SKU cross-references: S-15837B→FJG101, S-13505B→FJG102, S-13506B→FJG103, ' +
                      'S-10748B→FJG104, S-12229→10113, S-4551→ULS455, H-1621→Ho-1621. ' +
                      'All other ULINE catalog numbers can be used as Finale SKUs directly. ' +
-                     'CRITICAL: ULINE sells by case or box but Finale tracks individual units. ' +
-                     'Example: ULINE invoices 1 box at $103, Finale has 500 units — per-unit price = $103 ÷ 500 = $0.206. ' +
-                     'Always compare invoiced qty vs the Finale PO qty to detect UOM differences.',
-            handlingRule: 'priceStrategy=per_item. For each line item: apply SKU cross-reference if the catalog ' +
-                          'number is in the known list, otherwise use catalog number as-is for finaleSku. ' +
-                          'Compute finalePricePerUnit = invoicedUnitPrice / (finaleQty / invoicedQty) when quantities differ. ' +
-                          'Add freight. Credit card paid — never Bill.com.',
+                     'UOM codes: RL=roll, CT=carton, EA=each, BX=box, PK=pack, CS=case.',
+            handlingRule: 'priceStrategy=per_item. For each line item: apply SKU cross-reference if catalog number is in known list; ' +
+                          'for digit-bloated SKUs (description digit absorbed), use the base SKU (trim trailing digits that form a dimension). ' +
+                          'invoicedQty is as printed; finalePricePerUnit = invoicedUnitPrice (no UOM conversion — Finale tracks same unit as invoiced). ' +
+                          'Add freight (labeled "SHIPPING/HANDLING"). Add tax (labeled "SALES TAX"). ' +
+                          'AP invoices forward to Bill.com; credit card invoices do NOT forward to Bill.com.',
             invoiceBehavior: 'single_page',
             forwardTo: '',
             learnedFrom: 'manual',
