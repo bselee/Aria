@@ -10,14 +10,16 @@ export async function logChatMessage(params: {
   try {
     const db = createClient();
     if (!db) return;
+    const metadata = {
+      ...(params.metadata ?? {}),
+      ...(params.threadId ? { thread_id: params.threadId } : {}),
+    };
+
     await db.from('sys_chat_logs').insert({
       source:   params.source,
       role:     params.role,
       content:  params.content,
-      metadata: {
-        ...(params.metadata ?? {}),
-        ...(params.threadId ? { thread_id: params.threadId } : {}),
-      } || null,
+      metadata: Object.keys(metadata).length > 0 ? metadata : null,
     });
   } catch {
     // Never block message handling due to logging failure

@@ -40,7 +40,19 @@ export type LLMOptions = {
     prompt?: string;
     messages?: ModelMessage[];
     temperature?: number;
+    maxTokens?: number;
 };
+
+export type LLMToolOptions = LLMOptions & {
+    tools: Record<string, any>;
+    maxSteps?: number;
+};
+
+export interface LLMToolResult {
+    text: string;
+    providerUsed: string;
+    toolCalls: string[];
+}
 
 // DECISION(2026-02-27): Build provider chain dynamically based on available API keys.
 // This prevents wasted time trying providers that will definitely fail.
@@ -200,6 +212,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
                 model: provider.model(),
                 system: options.system,
                 temperature: options.temperature,
+                maxTokens: options.maxTokens,
                 maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
             } as any);
@@ -208,6 +221,72 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
             lastError = err;
 
             // If quota out, mark dead
+            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("429"))) {
+                markProviderDead(provider.name, err.message);
+            }
+
+            const next = providers[i + 1];
+            if (next) {
+                console.warn(`⚠️ ${provider.name} failed: ${err.message}. Falling back to ${next.name}...`);
+            } else {
+                console.error(`❌ All LLM providers failed. Last error (${provider.name}): ${err.message}`);
+            }
+        }
+    }
+
+    throw lastError || new Error('All LLM providers failed.');
+}
+
+export async function unifiedToolTextGeneration(options: LLMToolOptions): Promise<LLMToolResult> {
+    const providers = getProviderChain();
+
+    if (providers.length === 0) {
+        throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
+    }
+
+    let lastError: Error | null = null;
+
+    for (let i = 0; i < providers.length; i++) {
+        const provider = providers[i];
+
+        if (isProviderDead(provider.name)) {
+            continue;
+        }
+
+        try {
+            if (provider.name.toLowerCase().includes('gemini')) {
+                await geminiLimiter.acquire();
+            }
+
+            const result = await generateText({
+                model: provider.model(),
+                system: options.system,
+                temperature: options.temperature,
+                maxTokens: options.maxTokens,
+                maxSteps: options.maxSteps ?? 5,
+                maxRetries: 0,
+                tools: options.tools,
+                ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
+            } as any);
+
+            const stepCalls = Array.isArray((result as any).steps)
+                ? (result as any).steps.flatMap((step: any) => step.toolCalls ?? [])
+                : [];
+            const rawToolCalls = (result as any).toolCalls ?? stepCalls;
+            const toolCalls = Array.isArray(rawToolCalls)
+                ? rawToolCalls
+                    .map((call: any) => call.toolName ?? call.tool?.name ?? call.name)
+                    .filter(Boolean)
+                : [];
+
+            return {
+                text: result.text,
+                providerUsed: provider.name,
+                toolCalls,
+            };
+        } catch (err: any) {
+            lastError = err;
+
             if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("429"))) {
                 markProviderDead(provider.name, err.message);
             }

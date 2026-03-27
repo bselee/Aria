@@ -4,8 +4,8 @@ import {
     storePendingPOSend,
     getPendingPOSend,
     lookupVendorOrderEmail,
-    commitAndSendPO,
 } from '@/lib/purchasing/po-sender';
+import { executePOSendAction } from '@/lib/copilot/actions';
 
 /**
  * POST /api/dashboard/purchasing/commit
@@ -35,7 +35,9 @@ export async function POST(req: NextRequest) {
             }
 
             const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
-            const sendId = storePendingPOSend(orderId, review, email, source);
+            const sendId = await storePendingPOSend(orderId, review, email, source, {
+                channel: 'dashboard',
+            });
 
             return NextResponse.json({ review, email, emailSource: source, sendId });
 
@@ -43,7 +45,7 @@ export async function POST(req: NextRequest) {
             const { sendId } = body;
             if (!sendId) return NextResponse.json({ error: 'sendId required' }, { status: 400 });
 
-            const pending = getPendingPOSend(sendId);
+            const pending = await getPendingPOSend(sendId);
             if (!pending) {
                 return NextResponse.json(
                     { error: 'Send session expired or not found — start a new review' },
@@ -51,14 +53,18 @@ export async function POST(req: NextRequest) {
                 );
             }
 
-            const result = await commitAndSendPO(sendId, 'dashboard', body.skipEmail || false);
-            return NextResponse.json(result);
+            const result = await executePOSendAction({
+                sendId,
+                triggeredBy: 'dashboard',
+                skipEmail: body.skipEmail || false,
+            });
+            return NextResponse.json(result, { status: result.status === 'failed' ? 404 : 200 });
 
         } else if (action === 'cancel') {
             const { sendId } = body;
             if (sendId) {
                 const { expirePendingPOSend } = await import('@/lib/purchasing/po-sender');
-                expirePendingPOSend(sendId);
+                await expirePendingPOSend(sendId);
             }
             return NextResponse.json({ cancelled: true });
 

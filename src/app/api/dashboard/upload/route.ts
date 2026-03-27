@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import OpenAI from 'openai';
+import { describeImageArtifact, saveArtifact } from '@/lib/copilot/artifacts';
 
 const SUPPORTED_MIME = new Set([
     'application/pdf',
@@ -31,10 +32,8 @@ export async function POST(req: Request) {
 
         // ── Image files → GPT-4o Vision ──────────────────────────────
         if (mimeType.startsWith('image/')) {
-            const openai = process.env.OPENAI_API_KEY
-                ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-                : null;
-            if (!openai) return NextResponse.json({ error: 'OpenAI not configured' }, { status: 500 });
+            const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+            if (!process.env.OPENAI_API_KEY) return NextResponse.json({ error: 'OpenAI not configured' }, { status: 500 });
 
             const res = await openai.chat.completions.create({
                 model: 'gpt-4o',
@@ -54,6 +53,17 @@ export async function POST(req: Request) {
                 max_tokens: 500
             });
             reply = res.choices[0].message.content || 'Could not analyze image.';
+
+            await saveArtifact({
+                threadId: 'dashboard',
+                channel: 'dashboard',
+                sourceType: 'dashboard_upload',
+                filename,
+                mimeType,
+                rawText: base64,
+                summary: reply,
+                tags: ['dashboard', 'upload'],
+            });
 
             // Log both sides to sys_chat_logs so they appear in the chat feed
             try {
@@ -84,12 +94,13 @@ export async function POST(req: Request) {
             const extracted = await extractPDF(buffer);
 
             let actionMetadata: any = null;
+            let classification: { type: string; confidence: string; reasoning?: string } | null = null;
 
             if (!extracted?.rawText?.trim()) {
                 reply = `Uploaded ${filename} — but couldn't extract text. The PDF may be scanned or protected.`;
             } else {
                 const { classifyDocument } = await import('@/lib/pdf/classifier');
-                const classification = await classifyDocument(extracted);
+                classification = await classifyDocument(extracted);
 
                 if (classification.type === 'INVOICE') {
                     const { parseInvoice } = await import('@/lib/pdf/invoice-parser');
@@ -170,6 +181,20 @@ export async function POST(req: Request) {
                 }
             }
 
+            await saveArtifact({
+                threadId: 'dashboard',
+                channel: 'dashboard',
+                sourceType: 'dashboard_upload',
+                filename,
+                mimeType,
+                rawText: extracted.rawText,
+                summary: reply,
+                structuredData: classification ?? undefined,
+                tags: classification
+                    ? ['dashboard', 'upload', classification.type.toLowerCase()]
+                    : ['dashboard', 'upload', 'pdf'],
+            });
+
             // Log both sides to sys_chat_logs so they appear in the chat feed
             try {
                 const { createClient } = await import('@/lib/supabase');
@@ -225,6 +250,17 @@ export async function POST(req: Request) {
                 max_tokens: 600
             });
             reply = `📊 **${filename}**\n\n${res.choices[0].message.content || ''}`;
+
+            await saveArtifact({
+                threadId: 'dashboard',
+                channel: 'dashboard',
+                sourceType: 'dashboard_upload',
+                filename,
+                mimeType,
+                rawText: textContent,
+                summary: reply,
+                tags: ['dashboard', 'upload', 'spreadsheet'],
+            });
 
             // Log both sides to sys_chat_logs so they appear in the chat feed
             try {

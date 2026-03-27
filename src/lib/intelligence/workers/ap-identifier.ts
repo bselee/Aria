@@ -28,6 +28,9 @@ import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
 import { getPreClassification } from "../nightshift-agent";
 import { FinaleClient } from "../../finale/client";
 import { Telegraf } from "telegraf";
+import { applyMessageLabelPolicy } from "../gmail-policy";
+import { getInvoiceInboxPolicy } from "./ap-identifier-policy";
+import { filterStatementInvoicePages } from "./ap-identifier-statement-filter";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -85,9 +88,9 @@ const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
     // DECISION(2026-03-23): Added after Dash invoice (DASH-032026-16581) was forwarded
     // to Bill.com despite prominently displaying "PAID" as a status marker. Paid invoices
     // with zero balance should never reach Bill.com — they are payment confirmations.
-    { pattern: /payment\s+terms.*\bPAID\b/is, reason: 'PDF shows "PAID" near payment terms' },
+    { pattern: /payment\s+terms[\s\S]*\bPAID\b/i, reason: 'PDF shows "PAID" near payment terms' },
     { pattern: /(?:^|\n)\s*PAID\s*(?:\n|$)/m, reason: 'PDF has standalone "PAID" status marker' },
-    { pattern: /\bamount\s+paid\b.{0,10}\$[\d,]+\.\d{2}.*\b(?:balance|due)\b.{0,10}\$?\s*0\.00/is, reason: 'PDF shows amount paid with $0.00 balance' },
+    { pattern: /\bamount\s+paid\b[\s\S]{0,120}\$[\d,]+\.\d{2}[\s\S]*\b(?:balance|due)\b[\s\S]{0,120}\$?\s*0\.00/i, reason: 'PDF shows amount paid with $0.00 balance' },
 ];
 
 // ── MULTI-INVOICE STATEMENT VENDORS ──────────────────────────────
@@ -487,21 +490,20 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 // should forward invoices to Bill.com. The default inbox
                 // (bill.selee@buildasoil.com) receives PO threads, quotes,
                 // and vendor correspondence that may have PDFs attached but
-                // are NOT invoices. Label and archive, but do NOT queue.
+                // are NOT to be forwarded. Keep them visible for review.
                 if (sourceInbox !== 'ap') {
                     console.log(`     ⚠️ Invoice detected on '${sourceInbox}' inbox — labeling only, not queuing for Bill.com`);
+                    const policy = getInvoiceInboxPolicy(sourceInbox);
                     try {
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: m.gmail_message_id,
-                            requestBody: {
-                                addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
-                                removeLabelIds: ["INBOX", "UNREAD"]
-                            }
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId: m.gmail_message_id,
+                            addLabels: policy.addLabels,
+                            removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
                     await this.logActivity(supabase, from, subject, intent,
-                        `Invoice detected on ${sourceInbox} inbox — labeled only, not forwarded`);
+                        policy.activityNote);
                     continue;
                 }
 
@@ -1069,14 +1071,20 @@ If no invoice number is found, use null.`,
             return false;
         }
 
-        const invoicePages = pageResults.filter(p => p.type === 'INVOICE');
+        const { invoicePages, discardedCount } = filterStatementInvoicePages(
+            vendorLabel,
+            pageResults.map((result) => ({
+                ...result,
+                text: pages.find((page) => page.pageNumber === result.page)?.text || "",
+            })),
+        );
 
         if (invoicePages.length === 0) {
             console.log(`     ⚠️ No invoice pages identified in statement — falling through`);
             return false;
         }
 
-        console.log(`     📋 Found ${invoicePages.length} invoice(s): ${invoicePages.map(p => p.invoiceNumber || `page${p.page}`).join(', ')}`);
+        console.log(`     📋 Found ${invoicePages.length} invoice(s); discarded ${discardedCount} paperwork page(s): ${invoicePages.map(p => p.invoiceNumber || `page${p.page}`).join(', ')}`);
 
         // Step 4: Split PDF and queue each invoice
         const sourcePdf = await PDFDocument.load(buffer);
@@ -1156,6 +1164,7 @@ If no invoice number is found, use null.`,
                     vendor: vendorLabel,
                     invoicesFound: invoicePages.length,
                     invoicesQueued: queuedCount,
+                    discardedPages: discardedCount,
                     invoiceNumbers: invoicePages.map(p => p.invoiceNumber).filter(Boolean),
                     sourceFilename: pdfPart.filename,
                 }
@@ -1178,7 +1187,7 @@ If no invoice number is found, use null.`,
                     await this.bot.telegram.sendMessage(chatId, [
                         `✂️ <b>${vendorLabel} Statement Split</b>`,
                         ``,
-                        `Split <b>${queuedCount}</b> invoice(s) from statement:`,
+                        `Split <b>${queuedCount}</b> invoice(s); discarded <b>${discardedCount}</b> non-invoice page(s):`,
                         invoiceList,
                         totalStr,
                         ``,

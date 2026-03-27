@@ -4,6 +4,8 @@ import { unifiedObjectGeneration } from "./llm";
 import { createClient } from "../supabase";
 import { z } from "zod";
 import { recall } from "./memory";
+import { applyMessageLabelPolicy } from "./gmail-policy";
+import { recordHumanFollowUpRequired, recordSimpleAutoReply } from "./email-feedback";
 
 /**
  * @file acknowledgement-agent.ts
@@ -14,6 +16,7 @@ import { recall } from "./memory";
  */
 export class AcknowledgementAgent {
     private tokenIdentifier: string;
+    private labelCache = new Map<string, string>();
 
     // Random variations for a natural feel
     private responses = [
@@ -62,6 +65,31 @@ export class AcknowledgementAgent {
             lowerFrom.includes("mailer-daemon") ||
             lowerFrom.includes("bounce") ||
             lowerFrom.includes("@send.");
+    }
+
+    private async addMessageLabels(gmail: any, gmailMessageId: string, labelNames: string[]): Promise<void> {
+        await applyMessageLabelPolicy({
+            gmail,
+            gmailMessageId,
+            addLabels: labelNames,
+            labelCache: this.labelCache,
+        });
+    }
+
+    private looksLikeConversationThread(subject: string, bodyText: string): boolean {
+        if (/^re:/i.test(subject) && /\n\s*(on .+ wrote:|from:|sent:|subject:)/i.test(bodyText)) {
+            return true;
+        }
+
+        if (/\n>\s*\S+/.test(bodyText)) {
+            return true;
+        }
+
+        if (/\?/.test(bodyText) && /\n/.test(bodyText)) {
+            return true;
+        }
+
+        return false;
     }
 
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
@@ -182,6 +210,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 const subject = m.subject || "No Subject";
                 const senderEmail = m.from_email || "Unknown Sender";
                 const snippet = m.body_snippet || "";
+                const bodyText = m.body_text || snippet;
                 const rfcMessageId = m.rfc_message_id;
                 const threadId = m.thread_id || m.gmail_message_id;
                 const gmailMessageId = m.gmail_message_id;
@@ -211,6 +240,13 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
 
                 // Guardrail 2: Classify intent
                 let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
+                let humanReviewReason = "llm_requires_human";
+
+                if (intent === "ROUTINE_INFO" && this.looksLikeConversationThread(subject, bodyText)) {
+                    console.log(`     -> Upgrading ROUTINE_INFO → REQUIRES_HUMAN (conversation thread detected)`);
+                    intent = "REQUIRES_HUMAN";
+                    humanReviewReason = "conversation_thread";
+                }
 
                 // DECISION(2026-03-13): Post-classification cost-data guard.
                 // PO #124462 showed that the LLM classified Ed's cost breakdown
@@ -252,6 +288,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 if (intent === "ROUTINE_INFO") {
                     // It's routine! Let's handle it.
                     const isNoRep = this.isNoReply(senderEmail);
+                    let replied = false;
                     if (!isNoRep && rfcMessageId && myEmail) {
                         try {
                             // Send reply
@@ -266,29 +303,29 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                                 }
                             });
                             console.log(`     ✅ Sent reply: "${replyBody}"`);
+                            replied = true;
+                            await recordSimpleAutoReply({
+                                gmailMessageId,
+                                threadId,
+                                fromEmail: senderEmail,
+                                subject,
+                                replyBody,
+                            });
                         } catch (replyErr: any) {
                             console.error(`     ❌ Failed to send reply:`, replyErr.message);
                         }
                     } else if (isNoRep) {
-                        console.log(`     -> Sender is no-reply, skipping response but will archive.`);
+                        console.log(`     -> Sender is no-reply, skipping response and leaving visible.`);
                     }
 
-                    // Archiving logic
                     try {
-                        if (hasPdf) {
-                            // If has PDF, it might be an invoice for the AP Agent.
-                            // Leave it unread in the inbox so AP Identifier can process it.
-                            console.log(`     📄 Has PDF — left UNREAD in INBOX for AP-Agent.`);
+                        if (replied) {
+                            await this.addMessageLabels(gmail, gmailMessageId, ["Replied"]);
+                            console.log(`     🏷️ Added Replied label and kept email visible.`);
+                        } else if (hasPdf) {
+                            console.log(`     📄 Has PDF — left visible for invoice handling.`);
                         } else {
-                            // Normal behavior: archive and mark as read
-                            await gmail.users.messages.modify({
-                                userId: "me",
-                                id: gmailMessageId,
-                                requestBody: {
-                                    removeLabelIds: ["INBOX", "UNREAD"]
-                                }
-                            });
-                            console.log(`     📦 Archived and marked as read.`);
+                            console.log(`     👀 Routine update left visible for review.`);
                         }
                         processedCount++;
                     } catch (modErr: any) {
@@ -322,7 +359,6 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     // Bill.com forwarding is exclusively the AP inbox's job.
                     try {
                         const { enqueueDefaultInboxInvoice } = await import('./nightshift-agent');
-                        const bodyText = m.body_text || m.body_snippet || '';
                         await enqueueDefaultInboxInvoice(gmailMessageId, senderEmail, subject, bodyText);
                         console.log(`     📥 Paid invoice queued for overnight reconciliation: "${subject}"`);
                         processedCount++;
@@ -330,6 +366,19 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         console.error(`     ❌ Failed to enqueue paid invoice:`, err.message);
                     }
                 } else {
+                    try {
+                        await this.addMessageLabels(gmail, gmailMessageId, ["Follow Up"]);
+                        console.log(`     🏷️ Added Follow Up label.`);
+                        await recordHumanFollowUpRequired({
+                            gmailMessageId,
+                            threadId,
+                            fromEmail: senderEmail,
+                            subject,
+                            reason: humanReviewReason,
+                        });
+                    } catch (labelErr: any) {
+                        console.error(`     ❌ Failed to add Follow Up label:`, labelErr.message);
+                    }
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
                 }
             }

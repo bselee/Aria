@@ -34,6 +34,10 @@ import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
 import { createClient } from "../../supabase";
 import { findRelevantPatterns, storeVendorPattern } from "../vendor-memory";
+import { getAuthenticatedClient } from "../../gmail/auth";
+import { gmail as GmailApi } from "@googleapis/gmail";
+import { applyMessageLabelPolicy } from "../gmail-policy";
+import { recordDefaultInboxInvoiceOutcome } from "../email-feedback";
 import { z } from "zod";
 
 // ── Result types ───────────────────────────────────────────────────────────────
@@ -218,6 +222,38 @@ Rules:
     }
 }
 
+async function closeHandledInvoiceEmail(gmailMessageId: string): Promise<void> {
+    const auth = await getAuthenticatedClient("default");
+    const gmail = GmailApi({ version: "v1", auth });
+
+    await applyMessageLabelPolicy({
+        gmail,
+        gmailMessageId,
+        addLabels: ["Invoices"],
+        removeLabels: ["INBOX", "UNREAD"],
+    });
+}
+
+async function recordInvoiceOutcomeSafe(
+    gmailMessageId: string,
+    fromEmail: string,
+    subject: string,
+    result: DefaultInboxInvoiceResult,
+): Promise<void> {
+    try {
+        await recordDefaultInboxInvoiceOutcome({
+            gmailMessageId,
+            fromEmail,
+            subject,
+            outcome: result.outcome,
+            vendorName: result.vendorName,
+            poNumber: result.poNumber,
+            total: result.total,
+            priceUpdates: result.priceUpdates,
+        });
+    } catch { /* non-fatal */ }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function hasMagnitudeViolation(oldPrice: number, newPrice: number): boolean {
@@ -264,6 +300,7 @@ export async function processDefaultInboxInvoice(
                 `<b>Subject:</b> ${subject}\n\n` +
                 `Cannot reconcile — manual PO lookup required.`
             );
+            await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
         }
 
@@ -289,13 +326,15 @@ export async function processDefaultInboxInvoice(
         const extracted = await extractWithHaiku(fromEmail, subject, bodyText, vendorContext);
 
         if (!extracted || extracted.confidence === "low" || extracted.total === 0) {
-            return {
+            const result: DefaultInboxInvoiceResult = {
                 ...base,
                 poNumber,
                 outcome:             "extraction_failed",
                 needsImmediateAlert: false,
                 summary: `${fromEmail} PO #${poNumber}: extraction failed (conf=${extracted?.confidence ?? "null"}, total=${extracted?.total ?? 0})`,
             };
+            await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
+            return result;
         }
 
         const { vendorName, total, freight, tax, subtotal, invoiceNumber, invoiceDate,
@@ -315,7 +354,11 @@ export async function processDefaultInboxInvoice(
                     .limit(1);
 
                 if (existing && existing.length > 0) {
-                    return {
+                    try {
+                        await closeHandledInvoiceEmail(gmailMessageId);
+                    } catch { /* non-fatal */ }
+
+                    const result: DefaultInboxInvoiceResult = {
                         ...base,
                         poNumber,
                         total,
@@ -323,6 +366,8 @@ export async function processDefaultInboxInvoice(
                         outcome: "already_processed",
                         summary: `Dedup: ${vendorName} ${invoiceNumber} already archived → PO #${existing[0].po_number}`,
                     };
+                    await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
+                    return result;
                 }
             } catch { /* non-fatal */ }
         }
@@ -354,6 +399,7 @@ export async function processDefaultInboxInvoice(
                 `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
                 `PO does not exist in Finale.`
             );
+            await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
         }
 
@@ -389,6 +435,7 @@ export async function processDefaultInboxInvoice(
                     `<b>Current:</b> $${poItem.unitPrice} → <b>Invoice:</b> $${price.toFixed(4)}\n\n` +
                     `Likely OCR or decimal error. No changes written.`
                 );
+                await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
                 return result;
             }
         }
@@ -465,7 +512,7 @@ export async function processDefaultInboxInvoice(
                     tax,
                     total,
                     status:         "reconciled",
-                    source:         "email_inline",
+                    source:         "payment_confirm",
                     source_ref:     `default-inbox-${gmailMessageId}`,
                     line_items:     lineItems.map(li => ({
                         sku:         li.finaleSku || li.description || "UNKNOWN",
@@ -482,7 +529,7 @@ export async function processDefaultInboxInvoice(
         // ── Write-back to Pinecone ────────────────────────────────────────────
         // Store what was learned about this vendor so future invoices get richer context.
         // Only write when Haiku produced a confident result with useful observations.
-        if (vendorLearning && vendorName !== "Unknown Vendor" && extracted.confidence !== "low") {
+        if (vendorLearning && vendorName !== "Unknown Vendor") {
             try {
                 await storeVendorPattern({
                     vendorName,
@@ -507,7 +554,13 @@ export async function processDefaultInboxInvoice(
             ? `${vendorName} PO #${poSummary.orderId}: ${subtotalMismatch ? `subtotal mismatch ($${finaleLineTotal.toFixed(2)} vs $${extractedSubtotal.toFixed(2)})` : "freight_only"} — freight $${freight.toFixed(2)} added`
             : `${vendorName} PO #${poSummary.orderId}: ${priceUpdatesCount} price updates, freight $${freight.toFixed(2)}, total $${total.toFixed(2)}`;
 
-        return {
+        if (outcome === "reconciled") {
+            try {
+                await closeHandledInvoiceEmail(gmailMessageId);
+            } catch { /* non-fatal */ }
+        }
+
+        const result: DefaultInboxInvoiceResult = {
             ...base,
             vendorName,
             poNumber:     poSummary.orderId,
@@ -517,13 +570,17 @@ export async function processDefaultInboxInvoice(
             outcome,
             summary,
         };
+        await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
+        return result;
 
     } catch (err: any) {
-        return {
+        const result: DefaultInboxInvoiceResult = {
             ...base,
             outcome: "unknown_error",
             error:   err?.message ?? String(err),
             summary: `Unhandled error — ${fromEmail}: ${err?.message ?? "unknown"}`,
         };
+        await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
+        return result;
     }
 }

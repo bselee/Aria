@@ -37,6 +37,25 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
+import {
+    convertFinaleItemToUlineOrder,
+    toUlineModel,
+} from '../lib/purchasing/uline-ordering';
+import {
+    scrapeObservedUlineCartRows,
+    syncVerifiedUlineCartPricesToDraftPO,
+} from '../lib/purchasing/uline-cart-live';
+import {
+    launchUlineSession,
+    openUlinePasteItemsPage,
+} from '../lib/purchasing/uline-session';
+import {
+    formatCartVerificationMessage,
+    planDraftPOPriceUpdates,
+    verifyUlineCart,
+    type CartVerificationResult,
+    type ObservedUlineCartRow,
+} from './order-uline-cart';
 import path from 'path';
 import os from 'os';
 
@@ -45,47 +64,20 @@ import os from 'os';
 const QUICK_ORDER_URL = 'https://www.uline.com/Ordering/QuickOrder';
 const CHROME_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
 
-// ── SKU Mapping ───────────────────────────────────────────────────────────────
-
-// DECISION(2026-03-16): Bidirectional SKU mapping.
-// ULINE_TO_FINALE is the source of truth (from reconcile-uline.ts).
-// FINALE_TO_ULINE is the reverse for ordering. Items not in this map
-// use their Finale SKU directly (most match 1:1 with ULINE model numbers).
-const ULINE_TO_FINALE: Record<string, string> = {
-    'S-15837B': 'FJG101',
-    'S-13505B': 'FJG102',
-    'S-13506B': 'FJG103',
-    'S-10748B': 'FJG104',
-    'S-12229': '10113',
-    'S-4551': 'ULS455',
-    'H-1621': 'Ho-1621',
-};
-
-// Inverted mapping: Finale SKU → ULINE model number
-const FINALE_TO_ULINE: Record<string, string> = {};
-for (const [uline, finale] of Object.entries(ULINE_TO_FINALE)) {
-    FINALE_TO_ULINE[finale] = uline;
-}
-
-/**
- * Convert a Finale product ID to a ULINE model number.
- * Uses the cross-reference table for known mappings, passes through otherwise.
- *
- * @param finaleId - Finale product/SKU ID
- * @returns ULINE model number
- */
-function toUlineModel(finaleId: string): string {
-    return FINALE_TO_ULINE[finaleId] || finaleId;
-}
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface OrderLineItem {
     finaleSku: string;
     ulineModel: string;
-    quantity: number;
-    unitPrice: number;
+    quantity: number;              // ULINE cart quantity
+    unitPrice: number;             // ULINE unit price
     description: string;
+    finaleEachQuantity: number;
+    finaleUnitPrice: number;
+    effectiveEachQuantity: number;
+    orderUnitEaches: number;
+    quantityStep: number;
+    guardrailWarnings: string[];
 }
 
 interface OrderManifest {
@@ -93,6 +85,13 @@ interface OrderManifest {
     sourcePO: string | null;
     items: OrderLineItem[];
     totalEstimate: number;
+}
+
+interface UlineCartFillResult {
+    message: string;
+    verification: CartVerificationResult;
+    observedRows: ObservedUlineCartRow[];
+    errorText?: string;
 }
 
 // ── Parse CLI Args ────────────────────────────────────────────────────────────
@@ -128,13 +127,13 @@ async function gatherFromPO(finale: FinaleClient, orderId: string): Promise<Orde
         const finaleId = item.productUrl?.split('/').pop() || item.productId || '';
         if (!finaleId || (item.quantity ?? 0) <= 0) continue;
 
-        items.push({
+        items.push(convertFinaleItemToUlineOrder({
             finaleSku: finaleId,
             ulineModel: toUlineModel(finaleId),
-            quantity: item.quantity || 0,
-            unitPrice: item.unitPrice || 0,
+            finaleEachQuantity: item.quantity || 0,
+            finaleUnitPrice: item.unitPrice || 0,
             description: item.itemDescription || finaleId,
-        });
+        }));
     }
 
     const total = items.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
@@ -171,7 +170,7 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
             orderViewConnection(
                 first: 50
                 type: ["PURCHASE_ORDER"]
-                statusId: ["ORDER_CREATED", "ORDER_COMMITTED"]
+                status: ["Created", "Committed"]
                 sort: [{ field: "orderDate", mode: "desc" }]
             ) {
                 edges { node {
@@ -214,13 +213,13 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
             const finaleId = item.product?.productId || '';
             if (!finaleId || (item.quantity ?? 0) <= 0) continue;
 
-            items.push({
+            items.push(convertFinaleItemToUlineOrder({
                 finaleSku: finaleId,
                 ulineModel: toUlineModel(finaleId),
-                quantity: item.quantity || 0,
-                unitPrice: item.unitPrice || 0,
-                description: finaleId, // GraphQL doesn't return description easily
-            });
+                finaleEachQuantity: item.quantity || 0,
+                finaleUnitPrice: item.unitPrice || 0,
+                description: finaleId,
+            }));
         }
 
         if (items.length > 0) {
@@ -302,13 +301,13 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
             console.log(`   ${urgencyIcon} ${item.productId}: ${item.explanation}`);
             console.log(`      Suggested qty: ${item.suggestedQty} | Stock: ${Math.round(item.stockOnHand)} | On order: ${Math.round(item.stockOnOrder)} | Runway: ${item.adjustedRunwayDays.toFixed(1)}d`);
 
-            items.push({
+            items.push(convertFinaleItemToUlineOrder({
                 finaleSku: item.productId,
                 ulineModel: toUlineModel(item.productId),
-                quantity: item.suggestedQty,
-                unitPrice: item.unitPrice,
+                finaleEachQuantity: item.suggestedQty,
+                finaleUnitPrice: item.unitPrice,
                 description: item.productName,
-            });
+            }));
         }
     }
 
@@ -393,8 +392,8 @@ async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderManifest
 
     const finaleItems = manifest.items.map(item => ({
         productId: item.finaleSku,
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
+        quantity: item.finaleEachQuantity,
+        unitPrice: item.finaleUnitPrice,
     }));
 
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
@@ -443,16 +442,8 @@ async function scrapeOrderConfirmation(): Promise<{ orderNumber: string; orderDa
     console.log('\n   🔍 Scraping ULINE order confirmation...');
     console.log('   ⚠️  Chrome must be closed for this step\n');
 
-    const context = await chromium.launchPersistentContext(
-        path.join(CHROME_PROFILE, 'Default'),
-        {
-            headless: false,
-            channel: 'chrome',
-            acceptDownloads: true,
-            viewport: { width: 1280, height: 900 },
-            args: ['--disable-blink-features=AutomationControlled'],
-        }
-    );
+    const session = await launchUlineSession({ headless: false });
+    const { context } = session;
 
     const page = context.pages()[0] || await context.newPage();
 
@@ -496,6 +487,86 @@ async function scrapeOrderConfirmation(): Promise<{ orderNumber: string; orderDa
     }
 }
 
+function parseCurrency(value: string | null | undefined): number | null {
+    if (!value) return null;
+    const match = value.replace(/,/g, '').match(/\$?(-?\d+(?:\.\d{1,2})?)/);
+    if (!match) return null;
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractUlineModel(text: string): string | null {
+    const match = text.match(/\b[A-Z]{1,3}-\d{3,6}[A-Z]?\b/);
+    return match ? match[0] : null;
+}
+
+async function scrapeObservedCartRows(page: Page): Promise<ObservedUlineCartRow[]> {
+    const rows = await page.locator('tr, .cartRow, .itemRow, .orderRow').evaluateAll((elements) => {
+        return elements.map((element) => {
+            const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+            const inputs = Array.from(element.querySelectorAll('input')) as HTMLInputElement[];
+            const quantityInput = inputs.find(input =>
+                /qty|quantity/i.test(input.name || '')
+                || /qty|quantity/i.test(input.id || ''),
+            );
+            return {
+                text,
+                quantityValue: quantityInput?.value || '',
+            };
+        });
+    }).catch(() => []);
+
+    const parsed = rows.flatMap((row) => {
+        const ulineModel = extractUlineModel(row.text);
+        if (!ulineModel) return [];
+
+        const moneyMatches = Array.from(
+            row.text.matchAll(/\$-?\d[\d,]*(?:\.\d{2})?/g),
+            match => parseCurrency(match[0]),
+        ).filter((value): value is number => value !== null);
+
+        const quantityMatch = row.quantityValue
+            || row.text.match(/\bQty(?:\s*[:#-]?\s*|\s+)(\d[\d,]*)\b/i)?.[1]
+            || row.text.match(new RegExp(`${ulineModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(\\d[\\d,]*)`))?.[1];
+
+        const quantity = quantityMatch ? Number(String(quantityMatch).replace(/,/g, '')) : NaN;
+        if (!Number.isFinite(quantity) || quantity <= 0) return [];
+
+        return [{
+            ulineModel,
+            quantity,
+            unitPrice: moneyMatches[0] ?? null,
+            lineTotal: moneyMatches.length > 1 ? moneyMatches[moneyMatches.length - 1] : null,
+        }];
+    });
+
+    const unique = new Map<string, ObservedUlineCartRow>();
+    for (const row of parsed) {
+        unique.set(row.ulineModel, row);
+    }
+    return Array.from(unique.values());
+}
+
+async function syncVerifiedCartPricesToDraftPO(
+    finale: FinaleClient,
+    orderId: string | null,
+    expectedItems: OrderLineItem[],
+    observedRows: ObservedUlineCartRow[],
+    verification: CartVerificationResult,
+): Promise<number> {
+    if (!orderId) return 0;
+
+    const updates = planDraftPOPriceUpdates(expectedItems, observedRows, verification);
+    let applied = 0;
+
+    for (const update of updates) {
+        await finale.updateOrderItemPrice(orderId, update.finaleSku, update.newUnitPrice);
+        applied += 1;
+    }
+
+    return applied;
+}
+
 // ── Phase 2: Place Order on ULINE ─────────────────────────────────────────────
 
 /**
@@ -505,7 +576,11 @@ async function scrapeOrderConfirmation(): Promise<{ orderNumber: string; orderDa
  * @param items - Array of order line items with ULINE model numbers
  * @returns Summary of what was added to cart
  */
-async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomous?: boolean }): Promise<string> {
+async function placeViaQuickOrderPaste(
+    finale: FinaleClient,
+    items: OrderLineItem[],
+    opts?: { autonomous?: boolean; draftPO?: string | null },
+): Promise<UlineCartFillResult> {
     const autonomous = opts?.autonomous ?? false;
     console.log('\n   🌐 Launching browser (Paste Items method)...');
     if (!autonomous) console.log('   ⚠️  Chrome must be closed for this step\n');
@@ -525,7 +600,7 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
 
     try {
         // Navigate to Quick Order page
-        await page.goto(QUICK_ORDER_URL, { waitUntil: 'load', timeout: 30_000 });
+        await openUlinePasteItemsPage(page);
 
         // Handle login if needed
         const landed = await Promise.race([
@@ -604,6 +679,7 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
             } catch { /* not found */ }
         }
 
+        let errorText = '';
         if (addClicked) {
             console.log('   🛒 Clicked "Add to Cart" — items should be in your ULINE cart now!');
 
@@ -611,7 +687,7 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
             await page.waitForTimeout(3_000);
 
             // Check if there are any error messages
-            const errorText = await page.$eval('.error, .errorMessage, .alert-danger', el => el.textContent?.trim() || '').catch(() => '');
+            errorText = await page.$eval('.error, .errorMessage, .alert-danger', el => el.textContent?.trim() || '').catch(() => '');
             if (errorText) {
                 console.log(`   ⚠️  ULINE error: ${errorText}`);
             }
@@ -619,14 +695,33 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
             console.log('   ⚠️  Could not find "Add to Cart" button — items are in the textarea for manual submission');
         }
 
+        const observedRows = addClicked
+            ? await scrapeObservedUlineCartRows(page)
+            : [];
+        const verification = verifyUlineCart(items, observedRows);
+        const message = formatCartVerificationMessage(verification);
+        const priceUpdatesApplied = await syncVerifiedUlineCartPricesToDraftPO(
+            finale,
+            opts?.draftPO || null,
+            items,
+            observedRows,
+            verification,
+        );
+        if (priceUpdatesApplied > 0) {
+            console.log(`   💰 Synced ${priceUpdatesApplied} verified ULINE price update(s) back to Finale draft PO.`);
+        }
+
         // Autonomous mode: close browser after a short delay and return
         if (autonomous) {
             console.log('\n   🤖 Autonomous mode — closing browser after cart fill.');
             await page.waitForTimeout(2_000);
             await context.close();
-            return addClicked
-                ? `Added ${items.length} items to ULINE cart`
-                : `Pasted ${items.length} items (Add to Cart button not found — items in textarea)`;
+            return {
+                message: addClicked ? message : 'Cart fill attempted; manual verification needed.',
+                verification,
+                observedRows,
+                errorText,
+            };
         }
 
         // Interactive mode: keep browser open for user review
@@ -645,13 +740,29 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
 
         await context.close();
 
-        return `Added ${items.length} items to ULINE cart via Paste method`;
+        return {
+            message,
+            verification,
+            observedRows,
+            errorText,
+        };
 
     } catch (err) {
         if (autonomous) {
             // Autonomous mode: close and report the error — don't hang
             try { await context.close(); } catch { /* best effort */ }
-            return `⚠️ Cart fill failed: ${(err as Error).message}`;
+            return {
+                message: `⚠️ Cart fill failed: ${(err as Error).message}`,
+                verification: {
+                    status: 'unverified',
+                    matchedModels: [],
+                    missingModels: items.map(item => item.ulineModel),
+                    quantityMismatches: [],
+                    unexpectedModels: [],
+                },
+                observedRows: [],
+                errorText: (err as Error).message,
+            };
         }
 
         // Interactive mode: DON'T close browser on error
@@ -664,7 +775,18 @@ async function placeViaQuickOrderPaste(items: OrderLineItem[], opts?: { autonomo
         } catch { /* timeout ok */ }
 
         await context.close();
-        return `Pasted ${items.length} items (manual Add to Cart needed)`;
+        return {
+            message: 'Cart fill attempted; manual verification needed.',
+            verification: {
+                status: 'unverified',
+                matchedModels: [],
+                missingModels: items.map(item => item.ulineModel),
+                quantityMismatches: [],
+                unexpectedModels: [],
+            },
+            observedRows: [],
+            errorText: (err as Error).message,
+        };
     }
 }
 
@@ -791,6 +913,29 @@ function printManifest(manifest: OrderManifest) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+function getBlockingGuardrailWarnings(items: OrderLineItem[]): string[] {
+    return items.flatMap(item =>
+        item.guardrailWarnings.filter(warning => warning.includes('exceeds the')),
+    );
+}
+
+function printManifestSummary(manifest: OrderManifest) {
+    const source = manifest.sourcePO ? `PO #${manifest.sourcePO}` : 'Manual';
+    console.log(`\n   ULINE Order Summary - ${source} (${manifest.sourceType})`);
+    for (const item of manifest.items) {
+        const crossRef = item.finaleSku !== item.ulineModel ? ' *' : '';
+        console.log(
+            `   - ${item.finaleSku} -> ${item.ulineModel}${crossRef}: ` +
+            `${item.finaleEachQuantity} Finale eaches => ${item.quantity} ULINE qty @ $${item.unitPrice.toFixed(2)}`
+        );
+        for (const warning of item.guardrailWarnings) {
+            console.log(`     ! ${warning}`);
+        }
+    }
+    console.log(`   Est. Total: $${manifest.totalEstimate.toFixed(2)}`);
+    console.log('   (* = cross-referenced SKU, Finale != ULINE model #)\n');
+}
+
 async function main() {
     const args = parseArgs();
 
@@ -844,7 +989,7 @@ async function main() {
     // Merge all items into a single order (ULINE Quick Order is per-order, not per-PO)
     const allItems: OrderLineItem[] = [];
     for (const manifest of manifests) {
-        printManifest(manifest);
+        printManifestSummary(manifest);
         allItems.push(...manifest.items);
     }
 
@@ -854,6 +999,9 @@ async function main() {
         const existing = deduped.get(item.ulineModel);
         if (existing) {
             existing.quantity += item.quantity;
+            existing.finaleEachQuantity += item.finaleEachQuantity;
+            existing.effectiveEachQuantity += item.effectiveEachQuantity;
+            existing.guardrailWarnings.push(...item.guardrailWarnings);
         } else {
             deduped.set(item.ulineModel, { ...item });
         }
@@ -863,6 +1011,16 @@ async function main() {
     if (manifests.length > 1) {
         console.log(`\n   📊 Combined: ${finalItems.length} unique ULINE items from ${manifests.length} POs`);
         console.log(`   Total est: $${finalItems.reduce((s, i) => s + i.quantity * i.unitPrice, 0).toFixed(2)}\n`);
+    }
+
+    const blockingWarnings = getBlockingGuardrailWarnings(finalItems);
+    if (blockingWarnings.length > 0) {
+        console.log('\n   âŒ ULINE guardrail blocked this order:');
+        for (const warning of blockingWarnings) {
+            console.log(`      ${warning}`);
+        }
+        console.log('      Reduce quantities or adjust the PO before sending to ULINE.');
+        return;
     }
 
     console.log(`   Items to order: ${finalItems.length}`);
@@ -886,7 +1044,7 @@ async function main() {
     if (args.useGrid) {
         result = await placeViaQuickOrderGrid(finalItems);
     } else {
-        result = await placeViaQuickOrderPaste(finalItems, { autonomous: false });
+        result = (await placeViaQuickOrderPaste(finale, finalItems, { autonomous: false })).message;
     }
 
     console.log('╔══════════════════════════════════════════════════╗');
@@ -909,11 +1067,20 @@ async function main() {
 export interface UlineOrderResult {
     success: boolean;
     itemCount: number;
-    items: Array<{ sku: string; ulineModel: string; qty: number; unitPrice: number }>;
+    items: Array<{
+        sku: string;
+        ulineModel: string;
+        qty: number;
+        unitPrice: number;
+        finaleEachQty: number;
+        effectiveEachQty: number;
+    }>;
     estimatedTotal: number;
     finalePO: string | null;
     finaleUrl: string | null;
     cartResult: string;
+    cartVerificationStatus: CartVerificationResult['status'];
+    priceUpdatesApplied: number;
     skippedLowVelocity: number;
     error?: string;
 }
@@ -951,6 +1118,8 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
                 finalePO: null,
                 finaleUrl: null,
                 cartResult: 'No items need reordering',
+                cartVerificationStatus: 'verified',
+                priceUpdatesApplied: 0,
                 skippedLowVelocity: 0,
             };
         }
@@ -968,16 +1137,60 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
             console.error('[uline-friday] PO creation failed (proceeding with cart only):', poErr.message);
         }
 
-        // Phase 3: Fill ULINE cart via browser automation
-        let cartResult: string;
-        try {
-            cartResult = await placeViaQuickOrderPaste(updatedManifest.items, { autonomous: true });
-        } catch (cartErr: any) {
-            console.error('[uline-friday] Cart fill failed:', cartErr.message);
-            cartResult = `⚠️ Cart fill failed: ${cartErr.message}`;
+        const blockingWarnings = getBlockingGuardrailWarnings(updatedManifest.items);
+        if (blockingWarnings.length > 0) {
+            return {
+                success: false,
+                itemCount: updatedManifest.items.length,
+                items: updatedManifest.items.map(i => ({
+                    sku: i.finaleSku,
+                    ulineModel: i.ulineModel,
+                    qty: i.quantity,
+                    unitPrice: i.unitPrice,
+                    finaleEachQty: i.finaleEachQuantity,
+                    effectiveEachQty: i.effectiveEachQuantity,
+                })),
+                estimatedTotal: updatedManifest.totalEstimate,
+                finalePO: updatedManifest.sourcePO,
+                finaleUrl,
+                cartResult: '',
+                cartVerificationStatus: 'unverified',
+                priceUpdatesApplied: 0,
+                skippedLowVelocity: 0,
+                error: `ULINE guardrail blocked the order: ${blockingWarnings[0]}`,
+            };
         }
 
-        console.log(`[uline-friday] Complete: ${updatedManifest.items.length} items, PO ${updatedManifest.sourcePO || 'none'}, cart: ${cartResult}`);
+        // Phase 3: Fill ULINE cart via browser automation
+        let cartFill: UlineCartFillResult;
+        try {
+            cartFill = await placeViaQuickOrderPaste(finale, updatedManifest.items, {
+                autonomous: true,
+                draftPO: updatedManifest.sourcePO,
+            });
+        } catch (cartErr: any) {
+            console.error('[uline-friday] Cart fill failed:', cartErr.message);
+            cartFill = {
+                message: `⚠️ Cart fill failed: ${cartErr.message}`,
+                verification: {
+                    status: 'unverified',
+                    matchedModels: [],
+                    missingModels: updatedManifest.items.map(item => item.ulineModel),
+                    quantityMismatches: [],
+                    unexpectedModels: [],
+                },
+                observedRows: [],
+                errorText: cartErr.message,
+            };
+        }
+
+        const priceUpdatesApplied = planDraftPOPriceUpdates(
+            updatedManifest.items,
+            cartFill.observedRows,
+            cartFill.verification,
+        ).length;
+
+        console.log(`[uline-friday] Complete: ${updatedManifest.items.length} items, PO ${updatedManifest.sourcePO || 'none'}, cart: ${cartFill.message}`);
 
         return {
             success: true,
@@ -987,11 +1200,15 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
                 ulineModel: i.ulineModel,
                 qty: i.quantity,
                 unitPrice: i.unitPrice,
+                finaleEachQty: i.finaleEachQuantity,
+                effectiveEachQty: i.effectiveEachQuantity,
             })),
             estimatedTotal: updatedManifest.totalEstimate,
             finalePO: updatedManifest.sourcePO,
             finaleUrl,
-            cartResult,
+            cartResult: cartFill.message,
+            cartVerificationStatus: cartFill.verification.status,
+            priceUpdatesApplied,
             skippedLowVelocity: 0,
         };
 
@@ -1005,6 +1222,8 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
             finalePO: null,
             finaleUrl: null,
             cartResult: '',
+            cartVerificationStatus: 'unverified',
+            priceUpdatesApplied: 0,
             skippedLowVelocity: 0,
             error: err.message,
         };
