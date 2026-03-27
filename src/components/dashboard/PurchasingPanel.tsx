@@ -35,7 +35,7 @@ type CommitReview = {
 };
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
-type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; errors?: string[] };
+type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
@@ -352,11 +352,13 @@ export default function PurchasingPanel() {
 
     async function handleOrderOnUline(group: PurchasingGroup) {
         const pid = group.vendorPartyId;
+        const draftPO = createdPOs[pid]?.orderId;
         const items = group.items
             .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId])
             .map(i => ({
                 productId: i.productId,
                 quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty,
+                unitPrice: i.unitPrice,
             }));
 
         if (items.length === 0) return;
@@ -367,7 +369,7 @@ export default function PurchasingPanel() {
             const res = await fetch('/api/dashboard/purchasing/uline-order', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items }),
+                body: JSON.stringify({ items, draftPO }),
             });
             const result: UlineOrderResult = await res.json();
             setUlineResult(result);

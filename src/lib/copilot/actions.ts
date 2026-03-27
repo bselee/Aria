@@ -13,6 +13,7 @@
  */
 
 import type { ActionResult } from "./types";
+import { commitAndSendPO } from "../purchasing/po-sender";
 
 // ── Write verbs ───────────────────────────────────────────────────────────────
 
@@ -111,4 +112,55 @@ export function makeActionResult(
         actionRef:    opts.actionRef,
         details:      opts.details,
     };
+}
+
+export interface ExecutePOSendActionInput {
+    sendId: string;
+    triggeredBy: "telegram" | "dashboard";
+    skipEmail?: boolean;
+}
+
+export async function executePOSendAction(input: ExecutePOSendActionInput): Promise<ActionResult> {
+    try {
+        const result = await commitAndSendPO(
+            input.sendId,
+            input.triggeredBy,
+            input.skipEmail ?? false,
+        );
+
+        if (result.emailError) {
+            return makeActionResult(
+                "partial_success",
+                `PO #${result.orderId} committed in Finale, but vendor email failed: ${result.emailError}`,
+                {
+                    actionRef: input.sendId,
+                    retryAllowed: false,
+                    safeToRetry: false,
+                    details: result,
+                },
+            );
+        }
+
+        return makeActionResult(
+            "success",
+            `PO #${result.orderId} committed in Finale${result.sentTo ? ` and emailed to ${result.sentTo}` : ""}`,
+            {
+                actionRef: input.sendId,
+                retryAllowed: false,
+                safeToRetry: false,
+                details: result,
+            },
+        );
+    } catch (err: any) {
+        const userMessage = /expired|not found/i.test(err.message)
+            ? "Send session expired or not found — start a new review."
+            : `Failed to commit/send PO: ${err.message}`;
+
+        return makeActionResult("failed", userMessage, {
+            actionRef: input.sendId,
+            retryAllowed: /expired|not found/i.test(err.message),
+            safeToRetry: false,
+            details: { error: err.message },
+        });
+    }
 }

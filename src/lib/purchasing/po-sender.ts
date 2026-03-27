@@ -9,6 +9,7 @@ import { createClient } from '../supabase';
 import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
+import type { CopilotChannel } from '../copilot/types';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -16,40 +17,162 @@ import { FinaleClient, type DraftPOReview } from '../finale/client';
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 
-interface PendingPOSend {
+export interface PendingPOSend {
     id: string;
     orderId: string;
     review: DraftPOReview;
     vendorEmail: string | null;
     vendorEmailSource: string;  // 'vendor_profiles' | 'vendors_table' | 'unknown'
     createdAt: number;
+    expiresAt: number;
+    channel: CopilotChannel;
+    telegramMessageId?: number;
+    telegramChatId?: string;
 }
 
 const pendingPOSends = new Map<string, PendingPOSend>();
 
-export function storePendingPOSend(
+interface StorePendingPOSendOptions {
+    channel?: CopilotChannel;
+    telegramMessageId?: number;
+    telegramChatId?: string;
+    expiresAt?: string;
+}
+
+function serializePendingPOSend(entry: PendingPOSend) {
+    return {
+        session_id: entry.id,
+        channel: entry.channel,
+        action_type: 'po_send',
+        payload: {
+            orderId: entry.orderId,
+            review: entry.review,
+            vendorEmail: entry.vendorEmail,
+            vendorEmailSource: entry.vendorEmailSource,
+        },
+        status: 'pending',
+        telegram_message_id: entry.telegramMessageId ?? null,
+        telegram_chat_id: entry.telegramChatId ?? null,
+        created_at: new Date(entry.createdAt).toISOString(),
+        expires_at: new Date(entry.expiresAt).toISOString(),
+    };
+}
+
+function rowToPendingPOSend(row: any): PendingPOSend | undefined {
+    if (row?.status && row.status !== 'pending') {
+        return undefined;
+    }
+    if (!row?.payload?.review || !row?.payload?.orderId) {
+        return undefined;
+    }
+
+    return {
+        id: row.session_id,
+        orderId: row.payload.orderId,
+        review: row.payload.review,
+        vendorEmail: row.payload.vendorEmail ?? null,
+        vendorEmailSource: row.payload.vendorEmailSource ?? 'unknown',
+        createdAt: new Date(row.created_at ?? Date.now()).getTime(),
+        expiresAt: new Date(row.expires_at).getTime(),
+        channel: row.channel,
+        telegramMessageId: row.telegram_message_id ?? undefined,
+        telegramChatId: row.telegram_chat_id ?? undefined,
+    };
+}
+
+async function persistPendingPOSend(entry: PendingPOSend): Promise<void> {
+    const db = createClient();
+    if (!db) return;
+    await db.from('copilot_action_sessions').upsert(serializePendingPOSend(entry));
+}
+
+async function loadPendingPOSend(id: string): Promise<PendingPOSend | undefined> {
+    const db = createClient();
+    if (!db) return undefined;
+
+    const { data } = await db
+        .from('copilot_action_sessions')
+        .select('*')
+        .eq('session_id', id)
+        .maybeSingle();
+
+    return rowToPendingPOSend(data);
+}
+
+async function updatePendingPOSendStatus(
+    id: string,
+    status: 'confirmed' | 'cancelled' | 'expired',
+): Promise<void> {
+    const db = createClient();
+    if (!db) return;
+    await db
+        .from('copilot_action_sessions')
+        .update({ status })
+        .eq('session_id', id);
+}
+
+export function clearPendingPOSendCache(): void {
+    pendingPOSends.clear();
+}
+
+export async function storePendingPOSend(
     orderId: string,
     review: DraftPOReview,
     vendorEmail: string | null,
-    source: string
-): string {
+    source: string,
+    options: StorePendingPOSendOptions = {},
+): Promise<string> {
     const id = `posend_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    pendingPOSends.set(id, { id, orderId, review, vendorEmail, vendorEmailSource: source, createdAt: Date.now() });
+    const createdAt = Date.now();
+    const expiresAt = options.expiresAt
+        ? new Date(options.expiresAt).getTime()
+        : createdAt + TTL_MS;
+    const entry: PendingPOSend = {
+        id,
+        orderId,
+        review,
+        vendorEmail,
+        vendorEmailSource: source,
+        createdAt,
+        expiresAt,
+        channel: options.channel ?? 'dashboard',
+        telegramMessageId: options.telegramMessageId,
+        telegramChatId: options.telegramChatId,
+    };
+
+    pendingPOSends.set(id, entry);
+    await persistPendingPOSend(entry);
     return id;
 }
 
-export function getPendingPOSend(id: string): PendingPOSend | undefined {
-    const entry = pendingPOSends.get(id);
-    if (!entry) return undefined;
-    if (Date.now() - entry.createdAt > TTL_MS) {
-        pendingPOSends.delete(id);
+export async function getPendingPOSend(id: string): Promise<PendingPOSend | undefined> {
+    const cached = pendingPOSends.get(id);
+    if (cached) {
+        if (Date.now() > cached.expiresAt) {
+            pendingPOSends.delete(id);
+            await updatePendingPOSendStatus(id, 'expired');
+            return undefined;
+        }
+        return cached;
+    }
+
+    const persisted = await loadPendingPOSend(id);
+    if (!persisted) return undefined;
+    if (Date.now() > persisted.expiresAt) {
+        await updatePendingPOSendStatus(id, 'expired');
         return undefined;
     }
-    return entry;
+
+    pendingPOSends.set(id, persisted);
+    return persisted;
 }
 
-export function expirePendingPOSend(id: string): void {
+export async function expirePendingPOSend(
+    id: string,
+    status: 'cancelled' | 'expired' | 'confirmed' = 'cancelled',
+): Promise<void> {
     pendingPOSends.delete(id);
+    await updatePendingPOSendStatus(id, status);
 }
 
 // ──────────────────────────────────────────────────
@@ -151,8 +274,8 @@ export async function commitAndSendPO(
     id: string,
     triggeredBy: 'telegram' | 'dashboard',
     skipEmail: boolean = false
-): Promise<{ orderId: string; sentTo: string | null; gmailMessageId: string | null; emailSkipped: boolean }> {
-    const pending = getPendingPOSend(id);
+): Promise<{ orderId: string; sentTo: string | null; gmailMessageId: string | null; emailSkipped: boolean; emailError?: string }> {
+    const pending = await getPendingPOSend(id);
     if (!pending) throw new Error('Pending PO send not found or expired — initiate a new Review & Send');
 
     const { orderId, review, vendorEmail } = pending;
@@ -165,28 +288,33 @@ export async function commitAndSendPO(
     // 2. Send email via bill.selee@buildasoil.com (if not skipped and email exists)
     let gmailMessageId = null;
     let sentAt = null;
+    let emailError: string | undefined;
 
     if (!skipEmail && vendorEmail) {
-        const auth = await getAuthenticatedClient('default');
-        const gmail = GmailApi({ version: 'v1', auth });
+        try {
+            const auth = await getAuthenticatedClient('default');
+            const gmail = GmailApi({ version: 'v1', auth });
 
-        const { subject, body } = generatePOEmailBody(review);
-        const mimeMessage = [
-            `To: ${vendorEmail}`,
-            `From: bill.selee@buildasoil.com`,
-            `Subject: ${subject}`,
-            `Content-Type: text/plain; charset=utf-8`,
-            ``,
-            body,
-        ].join('\r\n');
+            const { subject, body } = generatePOEmailBody(review);
+            const mimeMessage = [
+                `To: ${vendorEmail}`,
+                `From: bill.selee@buildasoil.com`,
+                `Subject: ${subject}`,
+                `Content-Type: text/plain; charset=utf-8`,
+                ``,
+                body,
+            ].join('\r\n');
 
-        const sendResult = await gmail.users.messages.send({
-            userId: 'me',
-            requestBody: { raw: Buffer.from(mimeMessage).toString('base64url') },
-        });
+            const sendResult = await gmail.users.messages.send({
+                userId: 'me',
+                requestBody: { raw: Buffer.from(mimeMessage).toString('base64url') },
+            });
 
-        gmailMessageId = sendResult.data.id || '';
-        sentAt = new Date().toISOString();
+            gmailMessageId = sendResult.data.id || '';
+            sentAt = new Date().toISOString();
+        } catch (err: any) {
+            emailError = err.message;
+        }
     }
 
     const { subject } = generatePOEmailBody(review);
@@ -211,15 +339,31 @@ export async function commitAndSendPO(
                 email_from: 'bill.selee@buildasoil.com',
                 email_subject: subject,
                 intent: 'PO_SEND',
-                action_taken: skipEmail || !vendorEmail
+                action_taken: emailError
+                    ? `PO #${orderId} committed in Finale (Email failed: ${emailError})`
+                    : skipEmail || !vendorEmail
                     ? `PO #${orderId} committed in Finale (Email skipped/unavailable)`
                     : `PO #${orderId} committed in Finale and emailed to ${vendorEmail}`,
                 notified_slack: false,
-                metadata: { orderId, vendorEmail: skipEmail ? null : vendorEmail, triggeredBy, gmailMessageId, itemCount: review.items.length, emailSkipped: skipEmail || !vendorEmail },
+                metadata: {
+                    orderId,
+                    vendorEmail: skipEmail ? null : vendorEmail,
+                    triggeredBy,
+                    gmailMessageId,
+                    itemCount: review.items.length,
+                    emailSkipped: skipEmail || !vendorEmail,
+                    emailError,
+                },
             }),
         ]);
     }
 
-    expirePendingPOSend(id);
-    return { orderId, sentTo: skipEmail ? null : vendorEmail, gmailMessageId, emailSkipped: skipEmail || !vendorEmail };
+    await expirePendingPOSend(id, 'confirmed');
+    return {
+        orderId,
+        sentTo: skipEmail ? null : vendorEmail,
+        gmailMessageId,
+        emailSkipped: skipEmail || !vendorEmail,
+        emailError,
+    };
 }

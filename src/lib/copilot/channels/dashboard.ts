@@ -1,37 +1,35 @@
-/**
- * @file    src/lib/copilot/channels/dashboard.ts
- * @purpose Thin dashboard adapter over the shared copilot core.
- *
- *          Dashboard API routes delegate normal Q&A reasoning here.
- *          The HTTP route shape (request/response) stays in the Next.js
- *          route handler — this module only handles reasoning.
- */
-
-import { runCopilotTurn } from "../core";
+import { logChatMessage } from "../../intelligence/chat-logger";
+import { runCopilotTurn, type CopilotTurnResult } from "../core";
 
 export interface DashboardSendInput {
-    message:    string;
-    sessionId?: string;
+    message: string;
+    threadId?: string;
 }
 
-export interface DashboardSendResult {
-    reply:    string;
-    channel:  "dashboard";
-    providerUsed:     string;
-    toolCalls:        string[];
-    actionRefs:       string[];
-    boundArtifactId?: string;
-}
+export async function handleDashboardSend(input: DashboardSendInput): Promise<CopilotTurnResult> {
+    const threadId = input.threadId ?? "dashboard";
 
-export async function handleDashboardSend(input: DashboardSendInput): Promise<DashboardSendResult> {
-    const result = await runCopilotTurn({
-        channel:  "dashboard",
-        text:     input.message,
-        threadId: input.sessionId ?? "dashboard-default",
+    await logChatMessage({
+        source: "telegram",
+        role: "user",
+        content: input.message,
+        threadId,
+        metadata: { from: "dashboard" },
     });
 
-    return {
-        ...result,
+    const result = await runCopilotTurn({
         channel: "dashboard",
-    };
+        text: input.message,
+        threadId,
+    });
+
+    await logChatMessage({
+        source: "telegram",
+        role: "assistant",
+        content: result.reply,
+        threadId,
+        metadata: { from: "dashboard", provider: result.providerUsed },
+    });
+
+    return result;
 }

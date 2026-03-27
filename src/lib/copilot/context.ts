@@ -122,11 +122,10 @@ async function fetchTurnsFromDB(threadId: string): Promise<ConversationTurn[]> {
     try {
         const db = createClient();
         if (!db) return [];
-        // sys_chat_logs doesn't yet have thread_id — filter by source=telegram, most recent
         const { data } = await db
             .from("sys_chat_logs")
             .select("role, content, created_at, metadata")
-            .eq("source", "telegram")
+            .contains("metadata", { thread_id: threadId })
             .order("created_at", { ascending: false })
             .limit(MAX_TURNS * 2);  // fetch extra, trim below
 

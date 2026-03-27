@@ -3,6 +3,11 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // Mock the LLM layer so tests don't hit real APIs
 vi.mock("../intelligence/llm", () => ({
     unifiedTextGeneration: vi.fn().mockResolvedValue("Stock for KM106: 240 units on hand."),
+    unifiedToolTextGeneration: vi.fn().mockResolvedValue({
+        text:         "Here are the recent open purchase orders.",
+        providerUsed: "test-provider",
+        toolCalls:    ["query_purchase_orders"],
+    }),
 }));
 
 // Mock Supabase so context fetch doesn't require real DB
@@ -10,6 +15,7 @@ vi.mock("../supabase", () => ({
     createClient: vi.fn().mockReturnValue(null),
 }));
 
+import { unifiedToolTextGeneration } from "../intelligence/llm";
 import { runCopilotTurn } from "./core";
 
 describe("runCopilotTurn", () => {
@@ -34,7 +40,11 @@ describe("runCopilotTurn", () => {
             threadId: "session-456",
         });
 
-        expect(result.reply).toBeTruthy();
+        expect(result.reply).toBe("Here are the recent open purchase orders.");
+        expect(result.providerUsed).toBe("test-provider");
+        expect(result.toolCalls).toEqual(["query_purchase_orders"]);
+        expect(vi.mocked(unifiedToolTextGeneration)).toHaveBeenCalledOnce();
+        expect(vi.mocked(unifiedToolTextGeneration).mock.calls[0][0].tools).toHaveProperty("query_purchase_orders");
     });
 
     it("returns providerUsed field", async () => {
@@ -71,5 +81,17 @@ describe("runCopilotTurn", () => {
 
         expect(result.reply).toBeTruthy();
         expect(result.boundArtifactId).toBe("art1");
+    });
+
+    it("short-circuits ambiguous writes before the tool-capable LLM path", async () => {
+        const result = await runCopilotTurn({
+            channel:  "telegram",
+            text:     "send that PO",
+            threadId: "chat-123",
+        });
+
+        expect(result.reply).toContain("specific target");
+        expect(result.toolCalls).toEqual([]);
+        expect(vi.mocked(unifiedToolTextGeneration)).not.toHaveBeenCalled();
     });
 });

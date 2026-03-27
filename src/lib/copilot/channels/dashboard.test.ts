@@ -1,29 +1,33 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../intelligence/llm", () => ({
-    unifiedTextGeneration: vi.fn().mockResolvedValue("Here are the recent open POs."),
-}));
-vi.mock("../../supabase", () => ({
-    createClient: vi.fn().mockReturnValue(null),
+vi.mock("../../intelligence/chat-logger", () => ({
+    logChatMessage: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("../core", () => ({
+    runCopilotTurn: vi.fn().mockResolvedValue({
+        reply: "Recent open POs fetched.",
+        providerUsed: "test-provider",
+        toolCalls: [],
+        actionRefs: [],
+    }),
+}));
+
+import { runCopilotTurn } from "../core";
 import { handleDashboardSend } from "./dashboard";
 
 describe("handleDashboardSend", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
     it("routes dashboard chat through the shared copilot core", async () => {
         const result = await handleDashboardSend({ message: "recent open POs" });
-        expect(result.reply).toBeTruthy();
-    });
 
-    it("returns channel=dashboard in the result", async () => {
-        const result = await handleDashboardSend({ message: "build risk today" });
-        expect(result.channel).toBe("dashboard");
-    });
-
-    it("passes sessionId as threadId to the core", async () => {
-        const result = await handleDashboardSend({
-            message:   "what is stock for PU102",
-            sessionId: "session-abc",
+        expect(runCopilotTurn).toHaveBeenCalledWith({
+            channel: "dashboard",
+            text: "recent open POs",
+            threadId: "dashboard",
         });
         expect(result.reply).toBeTruthy();
     });

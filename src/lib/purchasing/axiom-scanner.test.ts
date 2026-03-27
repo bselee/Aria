@@ -1,29 +1,47 @@
-import { scanAxiomDemand } from './axiom-scanner';
-import { createClient } from '../supabase';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-jest.mock('../supabase', () => ({
-    createClient: jest.fn()
+const { createClientMock, fromMock, selectMock, eqMock, maybeSingleMock, updateMock, insertMock } = vi.hoisted(() => ({
+    createClientMock: vi.fn(),
+    fromMock: vi.fn(),
+    selectMock: vi.fn(),
+    eqMock: vi.fn(),
+    maybeSingleMock: vi.fn(),
+    updateMock: vi.fn(),
+    insertMock: vi.fn(),
 }));
 
-const mockSupabaseQuery = {
-    select: jest.fn().mockReturnThis(),
-    eq: jest.fn().mockReturnThis(),
-    maybeSingle: jest.fn().mockResolvedValue({ data: null }),
-    update: jest.fn().mockReturnThis(),
-    insert: jest.fn().mockResolvedValue({ error: null })
-};
+vi.mock('../supabase', () => ({
+    createClient: createClientMock,
+}));
+
+import { scanAxiomDemand } from './axiom-scanner';
 
 describe('scanAxiomDemand', () => {
     beforeEach(() => {
-        jest.clearAllMocks();
-        (createClient as jest.Mock).mockReturnValue({
-            from: jest.fn().mockReturnValue(mockSupabaseQuery)
+        vi.clearAllMocks();
+
+        selectMock.mockReturnThis();
+        eqMock.mockReturnThis();
+        maybeSingleMock.mockResolvedValue({ data: null });
+        updateMock.mockReturnThis();
+        insertMock.mockResolvedValue({ error: null });
+
+        fromMock.mockReturnValue({
+            select: selectMock,
+            eq: eqMock,
+            maybeSingle: maybeSingleMock,
+            update: updateMock,
+            insert: insertMock,
+        });
+
+        createClientMock.mockReturnValue({
+            from: fromMock,
         });
     });
 
-    it('should identify Axiom SKUs below threshold and queue them', async () => {
+    it('queues Axiom SKUs below threshold', async () => {
         const mockFinale = {
-            getPurchasingIntelligence: jest.fn().mockResolvedValue([
+            getPurchasingIntelligence: vi.fn().mockResolvedValue([
                 {
                     vendorName: 'Axiom Print',
                     items: [
@@ -34,18 +52,19 @@ describe('scanAxiomDemand', () => {
                             suggestedQty: 500,
                             dailyRate: 10,
                             adjustedRunwayDays: 5,
-                            runwayDays: 5
-                        }
-                    ]
-                }
-            ])
+                            runwayDays: 5,
+                        },
+                    ],
+                },
+            ]),
         };
 
         const result = await scanAxiomDemand(mockFinale as any);
+
         expect(result.queuedCount).toBe(1);
-        expect(mockSupabaseQuery.insert).toHaveBeenCalledWith(expect.objectContaining({
+        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({
             sku: 'LBL-AXIOM-01',
-            status: 'pending'
+            status: 'pending',
         }));
     });
 });

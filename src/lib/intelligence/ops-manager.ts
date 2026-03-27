@@ -40,12 +40,14 @@ import {
     carrierUrl,
     detectLTLCarrier,
     buildFollowUpEmail,
+    isFedExNumber,
     type TrackingStatus,
     type TrackingCategory,
 } from '../carriers/tracking-service';
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
+import { buildDailyFinaleSlices } from "./ops-summary-slices";
 import {
     recordCronRun,
     getAllCronRunStatuses,
@@ -1881,7 +1883,7 @@ export class OpsManager {
         const date = new Date();
         if (timeframe === "yesterday") date.setDate(date.getDate() - 1);
         else date.setDate(date.getDate() - 7);
-        const isoDate = date.toISOString().split("T")[0];
+        const isoDate = date.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
         // For weekly reports AND daily week-to-date data, calculate Monday of current week → tomorrow
         const now = new Date();
@@ -1976,11 +1978,23 @@ export class OpsManager {
             // Compute last week's total spend for the summary
             const lastWeekTotalSpend = lastWeekCommittedPOs.reduce((sum: number, po: any) => sum + (po.total || 0), 0);
 
+            const dailySlices = timeframe === "yesterday"
+                ? buildDailyFinaleSlices({
+                    finaleReceivingsWtd: finaleReceivedPOs,
+                    finaleCommittedWtd: finaleCommittedPOs,
+                    yesterdayIsoDate: isoDate,
+                })
+                : null;
+
             return {
                 timeframe,
                 purchase_orders_db: pos.data || [],
                 finale_receivings: finaleReceivedPOs,
                 finale_committed: finaleCommittedPOs,
+                finale_receivings_wtd: dailySlices?.finale_receivings_wtd || finaleReceivedPOs,
+                finale_receivings_yesterday: dailySlices?.finale_receivings_yesterday || finaleReceivedPOs,
+                finale_committed_wtd: dailySlices?.finale_committed_wtd || finaleCommittedPOs,
+                finale_committed_yesterday: dailySlices?.finale_committed_yesterday || finaleCommittedPOs,
                 last_week_committed: lastWeekCommittedPOs,
                 last_week_total_spend: lastWeekTotalSpend,
                 invoices: invoices.data || [],
@@ -1988,7 +2002,21 @@ export class OpsManager {
                 unread_emails: { count: unreadCount, subjects: unreadSubjects }
             };
         } catch (err) {
-            return { timeframe, purchase_orders_db: [], finale_receivings: [], finale_committed: [], last_week_committed: [], last_week_total_spend: 0, invoices: [], documents: [], unread_emails: { count: 0, subjects: [] } };
+            return {
+                timeframe,
+                purchase_orders_db: [],
+                finale_receivings: [],
+                finale_committed: [],
+                finale_receivings_wtd: [],
+                finale_receivings_yesterday: [],
+                finale_committed_wtd: [],
+                finale_committed_yesterday: [],
+                last_week_committed: [],
+                last_week_total_spend: 0,
+                invoices: [],
+                documents: [],
+                unread_emails: { count: 0, subjects: [] },
+            };
         }
     }
 
@@ -2010,13 +2038,13 @@ DO NOT include: vendors-contacted/invoiced section, unread emails, document proc
 Format with clean markdown bullets. Be specific with numbers — no vague summaries.
 Data: ${JSON.stringify(data)}`
             : `Summarize the following operations activity for the Daily Morning report.
-The data provided contains WEEK-TO-DATE records (from Monday through Yesterday).
-Your summary MUST include WEEKLY TOTALS for the week so far (Monday to yesterday), AND add in the previous day's (yesterday's) specific receptions and POs placed.
+The data provided contains explicit week-to-date and yesterday-only Finale slices.
+Your summary MUST include WEEKLY TOTALS for the week so far, AND only name yesterday's specific receivings and committed POs from the explicit *_yesterday arrays.
 
 Focus on: 
 - Total spend/amount due (Week-to-date and Yesterday specific).
-- Finale receivings (Show week-to-date total POs/units/spend, AND clearly list yesterday's specific POs received).
-- Committed POs (Show week-to-date total, AND specifically list yesterday's POs placed).
+- Finale receivings (Use finale_receivings_wtd for totals, AND finale_receivings_yesterday for yesterday's specific POs received).
+- Committed POs (Use finale_committed_wtd for totals, AND finale_committed_yesterday for yesterday's specific POs placed).
 - **Last Week's PO Spend** — The data includes "last_week_committed" (list of committed POs from the previous Mon–Sun) and "last_week_total_spend" (their sum). Show this as a one-liner: "Last Week Committed: X POs · $Y total". This gives Will a quick comparison.
 - Unread actionable email count (current snapshot).
 
@@ -2335,7 +2363,12 @@ Data: ${JSON.stringify(data)}`;
 
         // Case 3: Items ordered — build rich notification
         const itemLines = result.items
-            .map(i => `  <code>${i.ulineModel}</code> × ${i.qty}  ($${(i.qty * i.unitPrice).toFixed(2)})`)
+            .map(i => {
+                const qtyLabel = i.finaleEachQty === i.effectiveEachQty
+                    ? `${i.qty}`
+                    : `${i.qty} <i>(Finale ${i.finaleEachQty} ea → ${i.effectiveEachQty} ea)</i>`;
+                return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.qty * i.unitPrice).toFixed(2)})`;
+            })
             .join('\n');
 
         const poLine = result.finalePO && result.finaleUrl
@@ -2344,14 +2377,22 @@ Data: ${JSON.stringify(data)}`;
                 ? `📄 Finale PO #${result.finalePO}`
                 : '⚠️ PO creation skipped';
 
-        const cartIcon = result.cartResult.includes('⚠️') ? '⚠️' : '🛒';
+        const cartIcon = result.cartVerificationStatus === 'verified'
+            ? '🛒'
+            : result.cartVerificationStatus === 'partial'
+                ? '⚠️'
+                : '🟡';
 
         let msg = `🛒 <b>ULINE Friday Order — Ready for Checkout</b>\n\n`;
         msg += `${poLine}\n`;
         msg += `💰 Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n`;
         msg += `📦 ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n`;
         msg += `${itemLines}\n\n`;
-        msg += `${cartIcon} Cart: ${result.cartResult}\n\n`;
+        msg += `${cartIcon} Cart: ${result.cartResult}\n`;
+        if (result.priceUpdatesApplied > 0) {
+            msg += `💰 Draft PO price sync: ${result.priceUpdatesApplied} line item update(s) applied\n`;
+        }
+        msg += `\n`;
         msg += `<i>Review your ULINE cart and checkout when ready.</i>\n`;
         msg += `<i>🔗 <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a></i>`;
 

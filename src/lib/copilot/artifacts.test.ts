@@ -1,58 +1,58 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../supabase", () => ({
-    createClient: vi.fn().mockReturnValue(null),
+const { createMock } = vi.hoisted(() => ({
+    createMock: vi.fn(),
 }));
 
-import { normalizeArtifact } from "./artifacts";
+vi.mock("openai", () => ({
+    default: class OpenAI {
+        chat = {
+            completions: {
+                create: createMock,
+            },
+        };
+    },
+}));
+
+import { describeImageArtifact, normalizeArtifact } from "./artifacts";
 
 describe("normalizeArtifact", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        process.env.OPENAI_API_KEY = "test-key";
+    });
+
     it("normalizes Telegram photos into shared artifact records", async () => {
-        const artifact = await normalizeArtifact({
+        const artifact = normalizeArtifact({
+            threadId: "chat-1",
+            channel: "telegram",
             sourceType: "telegram_photo",
-            mimeType:   "image/jpeg",
-            filename:   "photo.jpg",
-            threadId:   "chat-123",
+            mimeType: "image/jpeg",
+            filename: "photo.jpg",
         });
 
         expect(artifact.sourceType).toBe("telegram_photo");
+        expect(artifact.channel).toBe("telegram");
+        expect(artifact.threadId).toBe("chat-1");
         expect(artifact.artifactId).toBeTruthy();
-        expect(artifact.status).toBe("pending");
     });
 
-    it("normalizes Telegram documents into shared artifact records", async () => {
-        const artifact = await normalizeArtifact({
-            sourceType: "telegram_document",
-            mimeType:   "application/pdf",
-            filename:   "invoice.pdf",
-            threadId:   "chat-456",
+    it("describes image artifacts for screenshot follow-ups", async () => {
+        createMock.mockResolvedValue({
+            choices: [
+                {
+                    message: {
+                        content: "ULINE cart screenshot with box and tape line items ready for PO drafting.",
+                    },
+                },
+            ],
         });
 
-        expect(artifact.sourceType).toBe("telegram_document");
-        expect(artifact.mimeType).toBe("application/pdf");
-    });
-
-    it("normalizes dashboard uploads into shared artifact records", async () => {
-        const artifact = await normalizeArtifact({
-            sourceType: "dashboard_upload",
-            mimeType:   "image/png",
-            filename:   "screenshot.png",
-            threadId:   "session-789",
+        const summary = await describeImageArtifact({
+            mimeType: "image/jpeg",
+            base64: Buffer.from("fake-image").toString("base64"),
         });
 
-        expect(artifact.sourceType).toBe("dashboard_upload");
-        expect(artifact.channel).toBe("dashboard");
-    });
-
-    it("sets summary when provided", async () => {
-        const artifact = await normalizeArtifact({
-            sourceType: "telegram_photo",
-            mimeType:   "image/jpeg",
-            filename:   "cart.jpg",
-            threadId:   "chat-1",
-            summary:    "ULINE shopping cart screenshot",
-        });
-
-        expect(artifact.summary).toBe("ULINE shopping cart screenshot");
+        expect(summary).toContain("ULINE cart screenshot");
     });
 });

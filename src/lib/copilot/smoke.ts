@@ -1,74 +1,43 @@
-/**
- * @file    src/lib/copilot/smoke.ts
- * @purpose Startup health reporting for the shared copilot layer.
- *
- *          Reports the explicit startup state of each component so that
- *          silent failures are never possible.  Consumed by start-bot.ts
- *          on boot and by monitoring/alerting paths.
- *
- *          States:
- *            running  — component is active and healthy
- *            disabled — component is intentionally off (env var missing, feature flag)
- *            error    — component attempted to start but failed
- */
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-export type ComponentState = "running" | "disabled" | "error";
-
 export interface StartupHealth {
-    bot:       ComponentState;
-    dashboard: ComponentState;
-    slack:     ComponentState;
-    timestamp: string;
+    bot: "running";
+    dashboard: "ready";
+    slack: "running" | "disabled";
+    notes: string[];
 }
 
-// ── getStartupHealth ──────────────────────────────────────────────────────────
+export interface StartupHealthInput {
+    hasSlackToken?: boolean;
+    startSlackWatchdog?: () => Promise<void>;
+}
 
-/**
- * Return the current startup state of each copilot component.
- *
- * This is intentionally lightweight — no network calls, no DB.
- * It reads env vars to determine intent (running vs disabled) and
- * reports `error` only when a required env var for a component is
- * missing but the component is expected to be running.
- *
- * Never throws.
- */
-export async function getStartupHealth(): Promise<StartupHealth> {
-    try {
-        const bot       = detectBotState();
-        const dashboard = detectDashboardState();
-        const slack     = detectSlackState();
+export async function getStartupHealth(input: StartupHealthInput = {}): Promise<StartupHealth> {
+    const notes: string[] = [];
+    const hasSlackToken = input.hasSlackToken ?? Boolean(process.env.SLACK_ACCESS_TOKEN);
 
-        return { bot, dashboard, slack, timestamp: new Date().toISOString() };
-    } catch {
+    if (!hasSlackToken) {
         return {
-            bot:       "error",
-            dashboard: "error",
-            slack:     "disabled",
-            timestamp: new Date().toISOString(),
+            bot: "running",
+            dashboard: "ready",
+            slack: "disabled",
+            notes,
         };
     }
-}
 
-// ── Component state detectors ─────────────────────────────────────────────────
-
-function detectBotState(): ComponentState {
-    if (!process.env.TELEGRAM_BOT_TOKEN) return "disabled";
-    return "running";
-}
-
-function detectDashboardState(): ComponentState {
-    // Dashboard runs as long as Next.js is up — no dedicated env gate
-    // GOOGLE_GENERATIVE_AI_API_KEY is needed for Gemini chat
-    if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY && !process.env.ANTHROPIC_API_KEY) {
-        return "disabled";
+    try {
+        await input.startSlackWatchdog?.();
+        return {
+            bot: "running",
+            dashboard: "ready",
+            slack: "running",
+            notes,
+        };
+    } catch (err: any) {
+        notes.push(`Slack watchdog failed to start: ${err.message}`);
+        return {
+            bot: "running",
+            dashboard: "ready",
+            slack: "disabled",
+            notes,
+        };
     }
-    return "running";
-}
-
-function detectSlackState(): ComponentState {
-    if (!process.env.SLACK_ACCESS_TOKEN) return "disabled";
-    return "running";
 }

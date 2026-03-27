@@ -1,30 +1,156 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DraftPOReview } from "../finale/client";
+
+const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.hoisted(() => {
+    const sessionRows = new Map<string, any>();
+    const commitDraftPOMock = vi.fn().mockResolvedValue(undefined);
+    const gmailSendMock = vi.fn().mockResolvedValue({ data: { id: "gmail-1" } });
+
+    const createClientMock = vi.fn(() => ({
+        from(table: string) {
+            if (table === "copilot_action_sessions") {
+                return {
+                    upsert: async (row: any) => {
+                        sessionRows.set(row.session_id, { ...row });
+                        return { data: row, error: null };
+                    },
+                    select: () => ({
+                        eq: (_field: string, value: string) => ({
+                            maybeSingle: async () => ({
+                                data: sessionRows.get(value) ?? null,
+                                error: null,
+                            }),
+                        }),
+                    }),
+                    update: (values: any) => ({
+                        eq: async (_field: string, value: string) => {
+                            const row = sessionRows.get(value);
+                            if (row) {
+                                sessionRows.set(value, { ...row, ...values });
+                            }
+                            return { data: row ? [{ ...row, ...values }] : [], error: null };
+                        },
+                    }),
+                };
+            }
+
+            if (table === "po_sends" || table === "ap_activity_log") {
+                return {
+                    insert: async (_row: any) => ({ data: null, error: null }),
+                };
+            }
+
+            return {
+                insert: async (_row: any) => ({ data: null, error: null }),
+            };
+        },
+    }));
+
+    return { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock };
+});
 
 vi.mock("../supabase", () => ({
-    createClient: vi.fn().mockReturnValue(null),
+    createClient: createClientMock,
 }));
 
-import { executePOSendAction } from "./actions.po-send";
+vi.mock("../gmail/auth", () => ({
+    getAuthenticatedClient: vi.fn().mockResolvedValue({}),
+}));
 
-describe("executePOSendAction", () => {
+vi.mock("@googleapis/gmail", () => ({
+    gmail: vi.fn(() => ({
+        users: {
+            messages: {
+                send: gmailSendMock,
+            },
+        },
+    })),
+}));
+
+vi.mock("../finale/client", () => ({
+    FinaleClient: class FinaleClient {
+        commitDraftPO = commitDraftPOMock;
+    },
+}));
+
+import { executePOSendAction } from "./actions";
+import {
+    clearPendingPOSendCache,
+    getPendingPOSend,
+    storePendingPOSend,
+} from "../purchasing/po-sender";
+
+function makeReview(orderId = "PO-1001"): DraftPOReview {
+    return {
+        orderId,
+        vendorName: "ULINE",
+        vendorPartyId: "vendor-1",
+        orderDate: "2026-03-26",
+        total: 199.5,
+        items: [
+            {
+                productId: "S-4551",
+                productName: "Corrugated Boxes",
+                quantity: 90,
+                unitPrice: 3.33,
+                lineTotal: 299.7,
+            },
+        ],
+        finaleUrl: "https://finale.example/po/PO-1001",
+        canCommit: true,
+    };
+}
+
+describe("PO send actions", () => {
+    beforeEach(() => {
+        sessionRows.clear();
+        vi.clearAllMocks();
+        commitDraftPOMock.mockResolvedValue(undefined);
+        gmailSendMock.mockResolvedValue({ data: { id: "gmail-1" } });
+        clearPendingPOSendCache();
+    });
+
+    it("restores a pending send session after cache clear", async () => {
+        const sendId = await storePendingPOSend("PO-1001", makeReview(), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
+
+        clearPendingPOSendCache();
+
+        const restored = await getPendingPOSend(sendId);
+        expect(restored?.orderId).toBe("PO-1001");
+    });
+
+    it("fails cleanly when the send session is expired", async () => {
+        const sendId = await storePendingPOSend("PO-1002", makeReview("PO-1002"), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+            expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        });
+
+        clearPendingPOSendCache();
+
+        const result = await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+        });
+
+        expect(result.status).toBe("failed");
+        expect(result.userMessage).toMatch(/expired|start a new review/i);
+    });
+
     it("returns partial_success when Finale commit succeeds but email send fails", async () => {
-        const result = await executePOSendAction({ sendId: "s1" });
-        expect(["success", "partial_success", "failed"]).toContain(result.status);
-    });
+        gmailSendMock.mockRejectedValueOnce(new Error("SMTP offline"));
+        const sendId = await storePendingPOSend("PO-1003", makeReview("PO-1003"), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
 
-    it("returns failed with clean message for stale session", async () => {
-        const result = await executePOSendAction({ sendId: "stale-session-nonexistent" });
-        expect(result.status).toBe("failed");
-        expect(result.userMessage).toBeTruthy();
-    });
+        const result = await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+        });
 
-    it("returns failed cleanly for expired session", async () => {
-        const result = await executePOSendAction({ sendId: "expired-session" });
-        expect(result.status).toBe("failed");
-        expect(result.retryAllowed).toBe(false);
-    });
-
-    it("never propagates uncaught exceptions to the caller", async () => {
-        await expect(executePOSendAction({ sendId: "" })).resolves.toBeDefined();
+        expect(result.status).toBe("partial_success");
+        expect(result.userMessage).toMatch(/committed/i);
+        expect(result.userMessage).toMatch(/email/i);
     });
 });
