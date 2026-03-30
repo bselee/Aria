@@ -45,6 +45,13 @@ import {
     type TrackingCategory,
 } from '../carriers/tracking-service';
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
+import {
+    RECEIVED_CALENDAR_RETENTION_DAYS,
+    RECEIVED_DASHBOARD_RETENTION_DAYS,
+    derivePurchasingLifecycle,
+    getPurchasingEventDate,
+    shouldKeepReceivedPurchase,
+} from "../purchasing/calendar-lifecycle";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -391,7 +398,7 @@ export class OpsManager {
         // Creates/updates calendar events for outgoing and received POs.
         cron.schedule("0 */4 * * *", () => {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar());
-        });
+        }, { timezone: "America/Denver" });
 
         // Morning Heartbeat @ 7:00 AM weekdays
         // DECISION(2026-03-16): After a 3-day outage with zero alerting, this
@@ -1156,9 +1163,6 @@ export class OpsManager {
         const pos = await finaleClient.getRecentPurchaseOrders(daysBack);
         await leadTimeService.warmCache();
 
-        const now = new Date();
-        now.setHours(0, 0, 0, 0);
-
         // Fetch tracking from Supabase
         const supabase = createClient();
         const poNumbers = pos.map(p => p.orderId).filter(Boolean);
@@ -1201,15 +1205,8 @@ export class OpsManager {
 
             const isReceived = status === "completed";
 
-            // If received, auto-remove after 5 days
-            if (isReceived && po.receiveDate) {
-                const recDate = new Date(po.receiveDate);
-                recDate.setHours(0, 0, 0, 0);
-                const diffTime = Math.abs(now.getTime() - recDate.getTime());
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-                if (diffDays > 5) {
-                    continue; // skip received > 5 days ago
-                }
+            if (isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)) {
+                continue;
             }
 
             // Calculate expected date like the calendar
@@ -1258,7 +1255,7 @@ export class OpsManager {
             const purchases = await this.getActivePurchasesList(14);
             if (purchases.length === 0) return; // Silent if no active purchases
 
-            let msg = `*Active Purchases*\n_Running list of incoming shipments from the last 14 days (auto-clears 5 days after receipt)_\n\n`;
+            let msg = `*Active Purchases*\n_Running list of incoming shipments from the last 14 days (auto-clears ${RECEIVED_DASHBOARD_RETENTION_DAYS} days after receipt)_\n\n`;
 
             for (const p of purchases) {
                 const rcvd = p.isReceived;
@@ -1415,6 +1412,9 @@ export class OpsManager {
                         const receivedDate = po.receiveDate
                             ? new Date(po.receiveDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
                             : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                        const receivedDateKey = po.receiveDate
+                            ? po.receiveDate.toString().split('T')[0]
+                            : new Date().toISOString().split('T')[0];
 
                         const title = `✅ PO #${po.orderId} — ${po.supplier}`;
                         const itemLines = po.items.slice(0, 5)
@@ -1429,7 +1429,14 @@ export class OpsManager {
                             `→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`;
 
                         const calendar = new CalendarClient();
-                        await calendar.updateEventTitleAndDescription(calRow.calendar_id, calRow.event_id, title, description);
+                        await calendar.updateEventTitleAndDescription(
+                            calRow.calendar_id,
+                            calRow.event_id,
+                            title,
+                            description,
+                            '2',
+                            receivedDateKey
+                        );
 
                         await supabase.from('purchasing_calendar_events')
                             .update({ status: 'received', updated_at: new Date().toISOString() })
@@ -2098,12 +2105,8 @@ Data: ${JSON.stringify(data)}`;
      * Build the calendar event title for a PO.
      * DECISION(2026-03-11): Unreceived POs get 🔴 prefix for visual urgency.
      */
-    private buildPOEventTitle(po: FullPO): string {
-        const s = (po.status || '').toLowerCase();
-        const isReceived = s === 'completed';
-        const isCancelled = s === 'cancelled';
-        const emoji = isReceived ? '✅' : isCancelled ? '❌' : '🔴';
-        return `${emoji} PO #${po.orderId} — ${po.vendorName}`;
+    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status)): string {
+        return `${lifecycle.titleEmoji} PO #${po.orderId} — ${po.vendorName}`;
     }
 
     /**
@@ -2114,10 +2117,11 @@ Data: ${JSON.stringify(data)}`;
         expectedDate: string,
         leadProvenance: string,
         trackingNumbers: string[],
-        prefetchedStatuses?: Map<string, TrackingStatus | null>
+        prefetchedStatuses?: Map<string, TrackingStatus | null>,
+        lifecycle = derivePurchasingLifecycle(po.status)
     ): Promise<string> {
-        const isReceived = (po.status || '').toLowerCase() === 'completed';
-        const isCancelled = (po.status || '').toLowerCase() === 'cancelled';
+        const isReceived = lifecycle.isReceived;
+        const isCancelled = lifecycle.isCancelled;
 
         const lines: string[] = [];
 
@@ -2155,11 +2159,11 @@ Data: ${JSON.stringify(data)}`;
 
         // DECISION(2026-03-11): Removed monetary Total from calendar events per user request.
 
-        const statusLabel = isReceived ? 'Received' : isCancelled ? 'Cancelled' : 'In Transit';
-        lines.push(`Status: ${statusLabel}`);
+        lines.push(`Status: ${lifecycle.statusLabel}`);
 
-        // Unreceived POs get a prominent NOT YET RECEIVED note
-        if (!isReceived && !isCancelled) {
+        if (lifecycle.isDeliveredAwaitingReceipt) {
+            lines.push(`🟡 <b>TRACKING SHOWS DELIVERED — VERIFY RECEIVING IN FINALE</b>`);
+        } else if (!isReceived && !isCancelled) {
             lines.push(`🔴 <b>NOT YET RECEIVED</b>`);
         }
 
@@ -2177,8 +2181,8 @@ Data: ${JSON.stringify(data)}`;
      * Runs every 4 hours via cron. Also called by the backfill script.
      * Never throws — all errors are logged and swallowed.
      */
-    async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number }> {
-        const counts = { created: 0, updated: 0, skipped: 0 };
+    async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number; cleared: number }> {
+        const counts = { created: 0, updated: 0, skipped: 0, cleared: 0 };
         try {
             const finale = finaleClient;
             const supabase = createClient();
@@ -2241,8 +2245,6 @@ Data: ${JSON.stringify(data)}`;
                     leadProvenance = '14d default';
                 }
 
-                const title = this.buildPOEventTitle(po);
-
                 // Get tracking array for this PO
                 const trackingNumbers = trackingMap.get(po.orderId) || [];
 
@@ -2259,15 +2261,26 @@ Data: ${JSON.stringify(data)}`;
                     return ts ? `${t}:${ts.category}` : t;
                 }).join(',');
 
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses);
-                const newStatus = (po.status || '').toLowerCase() === 'completed' ? 'received'
-                    : (po.status || '').toLowerCase() === 'cancelled' ? 'cancelled'
-                        : 'open';
+                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()));
+                const title = this.buildPOEventTitle(po, lifecycle);
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
+                const newStatus = lifecycle.calendarStatus;
+                const eventDate = getPurchasingEventDate(expectedDate, po.receiveDate, lifecycle);
 
                 const existingRow = existing.get(po.orderId);
+                if (lifecycle.isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
+                    if (existingRow) {
+                        await calendar.deleteEvent(existingRow.calendar_id, existingRow.event_id);
+                        await supabase.from('purchasing_calendar_events').delete().eq('po_number', po.orderId);
+                        counts.cleared++;
+                        console.log(`📅 [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
+                    } else {
+                        counts.skipped++;
+                    }
+                    continue;
+                }
 
-                // Google Calendar colorId: 11 = Tomato (red), 2 = Sage (green)
-                const colorId = newStatus === 'received' ? '2' : '11';
+                const colorId = lifecycle.colorId;
 
                 if (!existingRow) {
                     // New PO — create calendar event
@@ -2275,7 +2288,7 @@ Data: ${JSON.stringify(data)}`;
                         const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
                             title,
                             description,
-                            date: expectedDate,
+                            date: eventDate,
                             colorId,
                         });
                         await supabase.from('purchasing_calendar_events').insert({
@@ -2286,7 +2299,7 @@ Data: ${JSON.stringify(data)}`;
                             last_tracking: trackingHash
                         });
                         counts.created++;
-                        console.log(`📅 [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${expectedDate}`);
+                        console.log(`📅 [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${eventDate}`);
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
@@ -2297,7 +2310,8 @@ Data: ${JSON.stringify(data)}`;
                         existingRow.event_id,
                         title,
                         description,
-                        colorId
+                        colorId,
+                        eventDate
                     );
                     await supabase.from('purchasing_calendar_events')
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
@@ -2309,7 +2323,7 @@ Data: ${JSON.stringify(data)}`;
                 }
             }
 
-            console.log(`[cal-sync] Done — ${counts.created} created, ${counts.updated} updated, ${counts.skipped} skipped`);
+            console.log(`[cal-sync] Done — ${counts.created} created, ${counts.updated} updated, ${counts.cleared} cleared, ${counts.skipped} skipped`);
         } catch (err: any) {
             console.error('[cal-sync] syncPurchasingCalendar error:', err.message);
         }

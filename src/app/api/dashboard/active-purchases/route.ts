@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { FinaleClient } from "@/lib/finale/client";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
+import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "@/lib/purchasing/calendar-lifecycle";
 
 // Helps compute expected date same way as ops-manager
 function addDays(dateStr: string, days: number): string {
@@ -16,9 +17,6 @@ export async function GET(req: Request) {
         // Fetch last 60 days of POs to ensure we get active ones
         const pos = await finale.getRecentPurchaseOrders(60);
         await leadTimeService.warmCache();
-
-        const now = new Date();
-        now.setHours(0, 0, 0, 0);
 
         // Fetch tracking from Supabase
         const { createClient } = await import("@/lib/supabase");
@@ -57,16 +55,8 @@ export async function GET(req: Request) {
 
             const isReceived = status === "completed";
 
-            // If received, auto-remove after 5 days
-            if (isReceived && po.receiveDate) {
-                const recDate = new Date(po.receiveDate);
-                recDate.setHours(0, 0, 0, 0);
-                const diffTime = Math.abs(now.getTime() - recDate.getTime());
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-                if (diffDays > 5) {
-                    continue; // skip received > 5 days ago
-                }
+            if (isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)) {
+                continue;
             }
 
             // Calculate expected date like the calendar

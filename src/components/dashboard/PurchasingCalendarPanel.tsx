@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, ExternalLink, Package } from "lucide-react";
+import { RECEIVED_DASHBOARD_RETENTION_DAYS } from "@/lib/purchasing/calendar-lifecycle";
 
 // ── Types ────────────────────────────────────────────────────────
 type ActivePurchase = {
@@ -185,11 +186,11 @@ export default function PurchasingCalendarPanel() {
     const overdueCount = overdue.reduce((s, g) => s + g.purchases.length, 0);
     const todayCount = todayGroup?.purchases.length || 0;
 
-    // Recently received (last 3 days)
+    // Recently received (last few days, aligned with server retention)
     const recentlyReceived = purchases.filter(p => {
         if (!p.isReceived || !p.receiveDate) return false;
         const diff = daysDiff(p.receiveDate.split("T")[0], today);
-        return diff >= 0 && diff <= 3;
+        return diff >= 0 && diff <= RECEIVED_DASHBOARD_RETENTION_DAYS;
     });
 
     // ── Render ──

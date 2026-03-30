@@ -196,6 +196,7 @@ export const CRON_JOBS: CronJobDefinition[] = [
         description: 'Syncs open POs to Google Calendar events with tracking/ETA data',
         schedule: '0 */4 * * *',
         scheduleHuman: 'Every 4 hours',
+        timezone: 'America/Denver',
         category: 'purchasing',
         weekdaysOnly: false,
     },

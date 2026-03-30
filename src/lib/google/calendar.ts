@@ -195,12 +195,20 @@ export class CalendarClient {
         eventId: string,
         title: string,
         description: string,
-        colorId?: string
+        colorId?: string,
+        date?: string
     ): Promise<void> {
         await this.init();
         try {
             const requestBody: any = { summary: title, description };
             if (colorId) requestBody.colorId = colorId;
+            if (date) {
+                const startDate = new Date(date);
+                const endDate = new Date(startDate);
+                endDate.setUTCDate(endDate.getUTCDate() + 1);
+                requestBody.start = { date };
+                requestBody.end = { date: endDate.toISOString().split("T")[0] };
+            }
             await this.calendar!.events.patch({
                 calendarId,
                 eventId,
