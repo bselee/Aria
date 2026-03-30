@@ -49,6 +49,7 @@ import {
     launchUlineSession,
     openUlinePasteItemsPage,
 } from '../lib/purchasing/uline-session';
+import { buildVendorDraftPlans } from '../lib/purchasing/vendor-draft-plans';
 import {
     formatCartVerificationMessage,
     planDraftPOPriceUpdates,
@@ -250,20 +251,15 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
 async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManifest> {
     console.log('   🤖 Running purchasing intelligence scan for ULINE items...');
     console.log('   ⏳ This scans all active products — may take 1-2 minutes...\n');
-
     const groups = await finale.getPurchasingIntelligence();
+    const plans = buildVendorDraftPlans(groups, {}, 'uline');
 
-    // Filter for ULINE vendor (case-insensitive)
-    const ulineGroups = groups.filter(g =>
-        g.vendorName.toLowerCase().includes('uline')
-    );
-
-    if (ulineGroups.length === 0) {
+    if (plans.length === 0) {
         console.log('   ℹ️  No ULINE vendor group found in purchasing intelligence');
         return { sourceType: 'auto_reorder', sourcePO: null, items: [], totalEstimate: 0 };
     }
 
-    console.log(`   Found ${ulineGroups.length} ULINE group(s): ${ulineGroups.map(g => g.vendorName).join(', ')}\n`);
+    console.log(`   Found ${plans.length} ULINE group(s): ${plans.map(g => g.vendorName).join(', ')}\n`);
 
     const items: OrderLineItem[] = [];
     const skippedLowVelocity: Array<{ productId: string; dailyRate: number; explanation: string }> = [];
@@ -276,13 +272,18 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
     // but don't include them in the order manifest.
     const MIN_DAILY_VELOCITY = 0.1;
 
-    for (const group of ulineGroups) {
-        // Only include items that actually need ordering (critical or warning)
-        const needsOrdering = group.items.filter(i =>
-            i.urgency === 'critical' || i.urgency === 'warning'
-        );
+    for (const plan of plans) {
+        if (!plan.autoDraftEligible) {
+            console.log(`   ⏸️  Skipping ${plan.vendorName}: shared purchasing policy marked this vendor plan as manual review only.`);
+            continue;
+        }
 
-        for (const item of needsOrdering) {
+        for (const line of plan.assessedItems) {
+            const item = line.item;
+            if (!(line.assessment.decision === 'order' || line.assessment.decision === 'reduce')) {
+                continue;
+            }
+
             // Filter out one-off purchases with negligible velocity
             if (item.dailyRate < MIN_DAILY_VELOCITY) {
                 skippedLowVelocity.push({
@@ -298,13 +299,13 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
             }
 
             const urgencyIcon = item.urgency === 'critical' ? '🔴' : '🟡';
-            console.log(`   ${urgencyIcon} ${item.productId}: ${item.explanation}`);
-            console.log(`      Suggested qty: ${item.suggestedQty} | Stock: ${Math.round(item.stockOnHand)} | On order: ${Math.round(item.stockOnOrder)} | Runway: ${item.adjustedRunwayDays.toFixed(1)}d`);
+            console.log(`   ${urgencyIcon} ${item.productId}: ${line.assessment.explanation}`);
+            console.log(`      Suggested qty: ${line.assessment.recommendedQty} | Stock: ${Math.round(item.stockOnHand)} | On order: ${Math.round(item.stockOnOrder)} | Runway: ${item.adjustedRunwayDays.toFixed(1)}d`);
 
             items.push(convertFinaleItemToUlineOrder({
                 finaleSku: item.productId,
                 ulineModel: toUlineModel(item.productId),
-                finaleEachQuantity: item.suggestedQty,
+                finaleEachQuantity: line.assessment.recommendedQty,
                 finaleUnitPrice: item.unitPrice,
                 description: item.productName,
             }));

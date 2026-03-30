@@ -329,34 +329,41 @@ export function getAriaTools(opts: {
             }),
             execute: async ({ vendor_filter }) => {
                 try {
-                    const finaleClient = new FinaleClient();
-                    const groups = await finaleClient.getExternalReorderItems();
-                    const filtered = vendor_filter
-                        ? groups.filter((g: any) => g.vendorName.toLowerCase().includes(vendor_filter.toLowerCase()))
-                        : groups;
-                    if (filtered.length === 0) {
+                    const { buildVendorDraftPlans } = await import('../lib/purchasing/vendor-draft-plans');
+                    const groups = await finale.getPurchasingIntelligence();
+                    const plans = buildVendorDraftPlans(groups, {}, vendor_filter);
+                    if (plans.length === 0) {
                         return vendor_filter
                             ? `No reorder items found for vendor matching "${vendor_filter}".`
-                            : 'No external vendor reorder items found.';
+                            : 'No purchasing groups found.';
+                    }
+                    const actionablePlans = plans.filter(plan => plan.actionableItems.length > 0);
+                    if (actionablePlans.length === 0) {
+                        const blockedSummary = plans
+                            .flatMap(plan => plan.blockedLines.slice(0, 2).map(line => `${line.item.productId}: ${line.assessment.explanation}`))
+                            .slice(0, 4);
+                        return vendor_filter
+                            ? `No actionable draft lines found for vendor matching "${vendor_filter}".${blockedSummary.length ? ` Blocked: ${blockedSummary.join(' | ')}` : ''}`
+                            : `No actionable draft lines found.${blockedSummary.length ? ` Blocked: ${blockedSummary.join(' | ')}` : ''}`;
                     }
                     const created: string[] = [];
                     const tgChatId = String(chatId);
-                    for (const group of filtered) {
+                    for (const plan of actionablePlans) {
                         try {
-                            const items = group.items.map((i: any) => ({
-                                productId: i.productId,
-                                quantity: i.reorderQty ?? Math.max(1, Math.ceil((i.consumptionQty / 90) * 30)),
-                                unitPrice: i.unitPrice,
-                                orderIncrementQty: i.orderIncrementQty ?? null,
-                                isBulkDelivery: i.isBulkDelivery ?? false,
-                            }));
-                            const po = await finaleClient.createDraftPurchaseOrder(
-                                group.vendorPartyId, items,
+                            const po = await finale.createDraftPurchaseOrder(
+                                plan.vendorPartyId, plan.actionableItems,
                                 'Auto-generated draft — review and commit in Finale'
                             );
-                            let poLine = `✅ PO #${po.orderId} — ${group.vendorName} (${items.length} SKU${items.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
+                            let poLine = `✅ PO #${po.orderId} — ${plan.vendorName} (${plan.actionableItems.length} SKU${plan.actionableItems.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
                             if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
                             if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
+                            if (plan.blockedLines.length > 0) {
+                                const blocked = plan.blockedLines
+                                    .slice(0, 3)
+                                    .map(line => `${line.item.productId}: ${line.assessment.explanation}`)
+                                    .join(' | ');
+                                poLine += `\nBlocked: ${blocked}`;
+                            }
                             created.push(poLine);
                             // Send inline Review & Send keyboard for this PO
                             bot.telegram.sendMessage(tgChatId, poLine, {
@@ -368,7 +375,7 @@ export function getAriaTools(opts: {
                                 },
                             }).catch(() => { });
                         } catch (e: any) {
-                            created.push(`❌ ${group.vendorName}: ${e.message}`);
+                            created.push(`❌ ${plan.vendorName}: ${e.message}`);
                         }
                     }
                     return `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
