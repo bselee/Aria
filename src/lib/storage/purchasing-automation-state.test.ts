@@ -28,6 +28,29 @@ describe("buildPurchasingAutomationStatePayload", () => {
                     note: "Will consistently sizes this one up for freight cadence.",
                 },
             },
+            feedbackMemory: {
+                poHistory: {
+                    "124554": {
+                        poNumber: "124554",
+                        status: "validated",
+                        score: 4,
+                        reasons: ["invoice_matched"],
+                        lastActivityAt: "2026-03-30T12:00:00.000Z",
+                        lines: [{ sku: "S-3902", qty: 1 }],
+                    },
+                },
+                skuFeedback: {
+                    "S-3902": {
+                        validatedCount: 1,
+                        reviewNeededCount: 0,
+                        cumulativeScore: 4,
+                        lastStatus: "validated",
+                        lastPoNumber: "124554",
+                        lastFeedbackAt: "2026-03-30T12:00:00.000Z",
+                        lastOrderedQty: 1,
+                    },
+                },
+            },
         });
 
         expect(payload).toMatchObject({
@@ -43,6 +66,29 @@ describe("buildPurchasingAutomationStatePayload", () => {
                 "S-3902": {
                     quantityBias: 500,
                     note: "Will consistently sizes this one up for freight cadence.",
+                },
+            },
+            feedback_memory: {
+                poHistory: {
+                    "124554": {
+                        poNumber: "124554",
+                        status: "validated",
+                        score: 4,
+                        reasons: ["invoice_matched"],
+                        lastActivityAt: "2026-03-30T12:00:00.000Z",
+                        lines: [{ sku: "S-3902", qty: 1 }],
+                    },
+                },
+                skuFeedback: {
+                    "S-3902": {
+                        validatedCount: 1,
+                        reviewNeededCount: 0,
+                        cumulativeScore: 4,
+                        lastStatus: "validated",
+                        lastPoNumber: "124554",
+                        lastFeedbackAt: "2026-03-30T12:00:00.000Z",
+                        lastOrderedQty: 1,
+                    },
                 },
             },
         });

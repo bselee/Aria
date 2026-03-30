@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { buildSustainableVillageCartPlan, type SustainableVillageProductMapping } from "@/lib/purchasing/sustainable-village-ordering";
+import {
+    populateSustainableVillageCart,
+    verifySustainableVillageCart,
+} from "@/lib/purchasing/sustainable-village-cart-live";
+import {
+    launchSustainableVillageSession,
+    openSustainableVillageStorefrontCart,
+} from "@/lib/purchasing/sustainable-village-session";
 
 export async function POST(req: NextRequest) {
     try {
@@ -25,11 +33,36 @@ export async function POST(req: NextRequest) {
             }, { status: 400 });
         }
 
-        return NextResponse.json({
-            success: true,
-            message: "Sustainable Village cart plan is ready for browser automation.",
-            lines: plan.lines,
-        });
+        const session = await launchSustainableVillageSession({ headless: true });
+        const page = session.context.pages()[0] || await session.context.newPage();
+
+        try {
+            await openSustainableVillageStorefrontCart(page);
+            const observedLines = await populateSustainableVillageCart(page, plan.lines);
+            const verification = verifySustainableVillageCart(plan.lines, observedLines);
+
+            if (verification.status !== "verified") {
+                return NextResponse.json({
+                    success: false,
+                    itemsAdded: 0,
+                    message: "Sustainable Village cart fill could not be fully verified; manual review needed.",
+                    verification,
+                    observedLines,
+                });
+            }
+
+            return NextResponse.json({
+                success: true,
+                itemsAdded: plan.lines.length,
+                message: "Sustainable Village cart verified and ready for checkout review.",
+                lines: plan.lines,
+                observedLines,
+                verification,
+            });
+        } finally {
+            await session.close().catch(() => undefined);
+        }
+
     } catch (err: any) {
         return NextResponse.json(
             { success: false, message: `Sustainable Village order planning failed: ${err.message}` },

@@ -55,6 +55,7 @@ import {
 import { loadActivePurchases } from "../purchasing/active-purchases";
 import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader";
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
+import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -2166,6 +2167,25 @@ Data: ${JSON.stringify(data)}`;
 
             const calendar = new CalendarClient();
             const completionSignals = await loadPOCompletionSignalIndex(supabase, pos.map(p => p.orderId).filter(Boolean));
+            const feedbackSync = await syncRecommendationFeedbackForPurchaseOrders(
+                pos
+                    .filter(po => Boolean(po.orderId))
+                    .map(po => ({
+                        vendorName: po.vendorName,
+                        poNumber: po.orderId,
+                        lines: (po.items || []).map(item => ({
+                            sku: item.productId,
+                            qty: item.quantity,
+                        })),
+                        completionSignal: completionSignals.get(po.orderId) ?? null,
+                    })),
+            );
+
+            if (feedbackSync.updatedVendors > 0) {
+                console.log(
+                    `[cal-sync] Updated purchasing feedback memory for ${feedbackSync.updatedVendors} vendor(s); skipped ${feedbackSync.skippedRecords} incomplete record(s)`,
+                );
+            }
 
             for (const po of pos) {
                 if (!po.orderId) continue;
