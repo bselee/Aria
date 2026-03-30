@@ -1,5 +1,7 @@
 import { createClient } from '../supabase';
 import { FinaleClient } from '../finale/client';
+import { assessPurchasingGroups } from './assessment-service';
+import { buildDraftPOItemsFromAssessment } from './draft-po-policy';
 
 export async function scanAxiomDemand(finaleClient: FinaleClient) {
     const supabase = createClient();
@@ -20,15 +22,19 @@ export async function scanAxiomDemand(finaleClient: FinaleClient) {
         return { queuedCount: 0 };
     }
 
-    // 3. Filter items that need ordering
-    const itemsToQueue = axiomGroup.items.filter(item => 
-        item.urgency === 'critical' || item.urgency === 'warning' || item.urgency === 'reorder_flagged'
-    );
+    // 3. Run the shared purchasing policy and only queue actionable lines
+    const assessment = assessPurchasingGroups([axiomGroup]);
+    const assessedGroup = assessment.groups[0];
+    const draftItems = buildDraftPOItemsFromAssessment(assessedGroup?.items ?? []);
+    const itemsToQueue = (assessedGroup?.items ?? [])
+        .filter(line => draftItems.items.some(item => item.productId === line.item.productId));
 
     let queuedCount = 0;
 
-    for (const item of itemsToQueue) {
-        if (!item.suggestedQty || item.suggestedQty <= 0) continue;
+    for (const line of itemsToQueue) {
+        const item = line.item;
+        const draftItem = draftItems.items.find(entry => entry.productId === item.productId);
+        if (!draftItem || draftItem.quantity <= 0) continue;
 
         // Check if there is already a 'pending' row for this sku
         const { data: existing } = await supabase
@@ -43,7 +49,7 @@ export async function scanAxiomDemand(finaleClient: FinaleClient) {
             await supabase
                 .from('axiom_demand_queue')
                 .update({ 
-                    suggested_qty: item.suggestedQty,
+                    suggested_qty: draftItem.quantity,
                     velocity_30d: item.dailyRate * 30,
                     runway_days: item.adjustedRunwayDays ?? item.runwayDays,
                     updated_at: new Date().toISOString()
@@ -56,7 +62,7 @@ export async function scanAxiomDemand(finaleClient: FinaleClient) {
                 .insert({
                     sku: item.productId,
                     product_name: item.productName,
-                    suggested_qty: item.suggestedQty,
+                    suggested_qty: draftItem.quantity,
                     velocity_30d: item.dailyRate * 30,
                     runway_days: item.adjustedRunwayDays ?? item.runwayDays,
                     status: 'pending'
