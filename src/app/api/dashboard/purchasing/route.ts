@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
+import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
 
 // Module-level cache — full scan takes several minutes and makes hundreds of API calls.
 let cache: PurchasingGroup[] | null = null;
@@ -24,8 +25,24 @@ export async function GET(req: NextRequest) {
         }
     }
 
+    const assessment = assessPurchasingGroups(cache);
+    const groups = assessment.groups.map(group => ({
+        vendorName: group.vendorName,
+        vendorPartyId: group.vendorPartyId,
+        urgency: group.urgency,
+        items: group.items.map(line => ({
+            ...line.item,
+            candidate: line.candidate,
+            assessment: line.assessment,
+        })),
+    }));
+
     return NextResponse.json(
-        { groups: cache, cachedAt: new Date(cacheAt).toISOString() },
+        {
+            groups,
+            cachedAt: new Date(cacheAt).toISOString(),
+            vendorSummaries: assessment.vendorSummaries,
+        },
         { headers: { 'Cache-Control': 'no-store' } }
     );
 }

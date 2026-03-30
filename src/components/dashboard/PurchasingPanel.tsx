@@ -15,13 +15,31 @@ type PurchasingItem = {
     orderIncrementQty: number | null; isBulkDelivery: boolean;
     finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;
+    candidate?: { directDemand: number; bomDemand: number; finishedGoodsCoverageDays?: number | null };
+    assessment?: {
+        decision: "order" | "reduce" | "hold" | "manual_review";
+        recommendedQty: number;
+        confidence: "high" | "medium" | "low";
+        reasonCodes: string[];
+        explanation: string;
+    };
 };
 type PurchasingGroup = {
     vendorName: string; vendorPartyId: string;
     urgency: "critical" | "warning" | "watch" | "ok";
     items: PurchasingItem[];
 };
-type AssessmentData = { groups: PurchasingGroup[]; cachedAt: string };
+type AssessmentData = {
+    groups: PurchasingGroup[];
+    cachedAt: string;
+    vendorSummaries?: Array<{
+        vendorName: string;
+        vendorPartyId: string;
+        actionableCount: number;
+        blockedCount: number;
+        highestConfidence: "high" | "medium" | "low" | null;
+    }>;
+};
 type POResult = { orderId: string; finaleUrl: string };
 type CommitReview = {
     sendId: string;
@@ -214,8 +232,11 @@ export default function PurchasingPanel() {
                 ic[g.vendorPartyId] = {};
                 iq[g.vendorPartyId] = {};
                 for (const item of g.items) {
-                    ic[g.vendorPartyId][item.productId] = item.urgency === "critical" || item.urgency === "warning";
-                    iq[g.vendorPartyId][item.productId] = item.suggestedQty;
+                    const decision = item.assessment?.decision;
+                    ic[g.vendorPartyId][item.productId] = decision
+                        ? (decision === "order" || decision === "reduce")
+                        : (item.urgency === "critical" || item.urgency === "warning");
+                    iq[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
                 }
             }
             setChecked(ic);
@@ -912,7 +933,7 @@ export default function PurchasingPanel() {
                                                                             {/* Row 4: Explanation */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="mt-1.5 text-[10px] font-mono text-zinc-600 italic">
-                                                                                    {item.explanation}
+                                                                                    {item.assessment?.explanation ?? item.explanation}
                                                                                 </div>
                                                                             )}
                                                                         </div>
