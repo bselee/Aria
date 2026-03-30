@@ -98,6 +98,27 @@ export async function extractPDF(buffer: Buffer): Promise<PDFExtractionResult> {
     };
 }
 
+/**
+ * Force LLM-based OCR extraction regardless of text density.
+ * Used as a retry path when the fast pdf-parse extraction produces a suspicious
+ * result (no PO, unbalanced totals, garbled text). Always escalates to the
+ * strongest available vision model.
+ */
+export async function extractPDFWithLLM(buffer: Buffer): Promise<PDFExtractionResult> {
+    const startTime = Date.now();
+    let parsed: any;
+    try {
+        parsed = await pdfParse(buffer, { max: 0 });
+    } catch {
+        parsed = { text: "", numpages: 1 };
+    }
+    const rawText = parsed.text || "";
+    const tables = extractTablesFromText(rawText);
+    const pageCount = parsed.numpages || 1;
+    console.log(`[extractor] Forced LLM OCR retry — bypassing text density check`);
+    return await extractScannedPDF(buffer, { rawText, tables, pageCount }, startTime);
+}
+
 const SCANNED_PDF_PROMPT = "Extract all text from this invoice PDF. Include every line item, price, quantity, vendor name, invoice number, PO number, dates, addresses, and totals. Return the complete raw text content — do not summarize.";
 const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. Extract ALL text from this PDF exactly as it appears. Preserve every number, date, vendor name, invoice number, PO number, line item, quantity, unit price, and total.";
 

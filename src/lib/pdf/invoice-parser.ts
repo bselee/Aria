@@ -229,10 +229,190 @@ function parseUlineLineItems(rawText: string): Array<{ sku: string; quantity: nu
     return items.length ? items : null;
 }
 
+// ── Vendor-specific parser registry ────────────────────────────────────────
+//
+// Known vendors get deterministic field extraction BEFORE the LLM call.
+// Each parser returns partial InvoiceData fields it can extract with certainty.
+// The LLM still fills in everything else — vendor parsers just override the
+// fields they know how to extract reliably.
+//
+// To add a new vendor:
+//   1. Add a detect function (returns true if text matches the vendor)
+//   2. Add an extract function (returns partial InvoiceData overrides)
+//   3. Register in VENDOR_PARSERS array below
+
+// ── Deterministic PO# regex extractor ──────────────────────────────────────
+//
+// LLMs sometimes miss the PO number on invoices — especially when it's in a
+// table cell, uses unusual labeling, or the OCR text is noisy. This regex
+// sweep catches the most common PO label formats seen in vendor invoices
+// (Coats, Riceland, general freight/packaging vendors).
+//
+// Runs AFTER the LLM parse and backfills poNumber only when the LLM left it
+// blank. The LLM's extraction is trusted when present — regex is the safety net.
+
+// Note: \s includes \n, so these patterns handle both same-line and next-line values.
+// E.g. "P.O. Number\n124547" and "P.O. Number 124547" both match.
+const PO_LABEL_PATTERNS: RegExp[] = [
+    // "P.O. Number 124547" / "P.O. Number: 124547" / "P.O. No. 124547"
+    // Also handles next-line: "P.O. Number\n124547"
+    /P\.?\s*O\.?\s*(?:Number|No\.?|Num\.?|#)\s*[:.]?\s*(\d{4,})/i,
+    // "PO# 124547" / "PO #124547" / "PO#: 124547"
+    /PO\s*#\s*:?\s*(\d{4,})/i,
+    // "Purchase Order 124547" / "Purchase Order: 124547" / "Purchase Order Number 124547"
+    /Purchase\s+Order\s*(?:Number|No\.?|Num\.?|#)?\s*[:.]?\s*(\d{4,})/i,
+    // "Your Order # 124547" / "Your Order No. 124547"
+    /Your\s+Order\s*(?:Number|No\.?|#)?\s*[:.]?\s*(\d{4,})/i,
+    // "Customer PO 124547" / "Cust PO: 124547"
+    /Cust(?:omer)?\s+PO\s*[:.]?\s*(\d{4,})/i,
+    // "Reference: 124547" / "Ref # 124547" (common on freight invoices)
+    /Ref(?:erence)?\s*#?\s*[:.]?\s*(\d{5,})/i,
+    // "Order No 124547" / "Order Number: 124547"
+    /Order\s+(?:Number|No\.?|#)\s*[:.]?\s*(\d{4,})/i,
+];
+
+/**
+ * Extract PO number from raw text using deterministic regex patterns.
+ * Returns the first match found, or null if no PO pattern is detected.
+ * Also searches table data if provided (PO# often lives in a table cell).
+ */
+export function extractPOByRegex(rawText: string, tables?: string[][]): string | null {
+    // Search raw text first — same-line patterns
+    for (const pattern of PO_LABEL_PATTERNS) {
+        const match = rawText.match(pattern);
+        if (match?.[1]) return match[1];
+    }
+
+    // Header-row pattern: PO label on one line (possibly with other headers),
+    // value on the NEXT line in the same column position.
+    // Example:  "P.O. Number     Terms       Ship Date"
+    //           "124547          Net 30      03/24/2026"
+    const PO_HEADER_LINE_RE = /^(.*P\.?\s*O\.?\s*(?:Number|No\.?|Num\.?|#?).*)/im;
+    const headerMatch = rawText.match(PO_HEADER_LINE_RE);
+    if (headerMatch) {
+        const headerLine = headerMatch[1];
+        const headerIdx = rawText.indexOf(headerLine);
+        const afterHeader = rawText.slice(headerIdx + headerLine.length);
+        // Next non-empty line should contain the PO value as first token
+        const nextLine = afterHeader.split("\n").find(l => l.trim().length > 0);
+        if (nextLine) {
+            const firstToken = nextLine.trim().match(/^(\d{4,})/);
+            if (firstToken?.[1]) return firstToken[1];
+        }
+    }
+
+    if (tables?.length) {
+        // Strategy A: Join all rows, strip pipes, search as contiguous text.
+        // Catches "P.O. Number | 124547" on a single row.
+        const tableText = tables.map(row => row.join(" ").replace(/\|/g, " ")).join("\n");
+        for (const pattern of PO_LABEL_PATTERNS) {
+            const match = tableText.match(pattern);
+            if (match?.[1]) return match[1];
+        }
+
+        // Strategy B: Header-value pattern — label in one row, value in the next.
+        // Coats-style tables: row[0] = "P.O. Number | Terms | Ship"
+        //                     row[1] = "124547 | Net 30 | 3/26/2026"
+        // The PO label is in the header but the number is in the data row below.
+        const PO_HEADER_RE = /P\.?\s*O\.?\s*(?:Number|No\.?|Num\.?|#)?|Purchase\s+Order|Customer\s+PO|Your\s+Order/i;
+        for (const table of tables) {
+            for (let r = 0; r < table.length - 1; r++) {
+                const cells = table[r].split(/\s*\|\s*/);
+                const colIdx = cells.findIndex(c => PO_HEADER_RE.test(c.trim()));
+                if (colIdx === -1) continue;
+                // Found a PO-labeled column — grab the value from the next row
+                const valueCells = table[r + 1].split(/\s*\|\s*/);
+                const valueCell = valueCells[colIdx]?.trim();
+                const numMatch = valueCell?.match(/^(\d{4,})/);
+                if (numMatch?.[1]) return numMatch[1];
+            }
+        }
+    }
+
+    return null;
+}
+
+// ── Shipping/freight line item extraction ───────────────────────────────────
+//
+// Many vendors (Coats, smaller suppliers) include shipping/handling/freight as
+// a regular line item instead of a separate charge. The reconciler maps
+// invoice.freight → Finale FREIGHT fee type, so these line items need to be
+// pulled out and folded into the freight field. Without this, shipping costs
+// are invisible to reconciliation and never land on the PO.
+
+const SHIPPING_LINE_RE = /^(?:shipping|freight|frt|delivery|s\s*&\s*h|handling|ship(?:ping)?\s+(?:and|&)\s+handl)/i;
+
+function extractShippingToFreight(invoice: InvoiceData): void {
+    if (!invoice.lineItems?.length) return;
+
+    let extractedFreight = 0;
+    const productLines: typeof invoice.lineItems = [];
+
+    for (const li of invoice.lineItems) {
+        const desc = (li.description || "").trim();
+        if (SHIPPING_LINE_RE.test(desc)) {
+            // Use extended price (total) if available, otherwise qty * unitPrice
+            const amount = (li.total && li.total > 0)
+                ? li.total
+                : (li.qty ?? 0) * (li.unitPrice ?? 0);
+            if (amount > 0) {
+                extractedFreight += amount;
+                continue; // Don't include in product lines
+            }
+        }
+        productLines.push(li);
+    }
+
+    if (extractedFreight > 0) {
+        // If freight was already set (e.g., by a vendor parser or LLM) and matches
+        // the line-item amount, don't double-count — just remove the line items.
+        // If freight was NOT set, populate it from the line items.
+        const existingFreight = invoice.freight ?? 0;
+        if (existingFreight > 0 && Math.abs(existingFreight - extractedFreight) < 1.00) {
+            // Already accounted for — just strip the shipping line items
+            invoice.lineItems = productLines;
+            console.log(`[invoice-parser] Removed shipping line items (freight $${existingFreight.toFixed(2)} already set)`);
+        } else if (existingFreight === 0) {
+            invoice.freight = extractedFreight;
+            invoice.lineItems = productLines;
+            console.log(`[invoice-parser] Extracted $${extractedFreight.toFixed(2)} shipping from line items → freight`);
+        } else {
+            // Existing freight differs materially from line items — add the delta
+            invoice.freight = existingFreight + extractedFreight;
+            invoice.lineItems = productLines;
+            console.log(`[invoice-parser] Added $${extractedFreight.toFixed(2)} shipping line items to existing $${existingFreight.toFixed(2)} freight`);
+        }
+    }
+}
+
+function extractVendorNameByLayout(rawText: string): string | null {
+    const lines = rawText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    for (const line of lines) {
+        if (/^(invoice|bill to|ship to|invoice number|invoice date|date|po(?:\.|\s|#))/i.test(line)) {
+            break;
+        }
+        if (line.length < 3) continue;
+        if (/\d/.test(line) && !/[A-Za-z]/.test(line)) continue;
+        return line;
+    }
+
+    return null;
+}
+
 export async function parseInvoice(rawText: string, tables?: string[][]): Promise<InvoiceData> {
     // Pre-extract ULINE line items with regex before the LLM call (zero extra cost).
     // The LLM call below still handles all header fields.
     const ulineItems = parseUlineLineItems(rawText);
+
+    // Pre-extract PO# via regex — used as fallback if LLM misses it
+    const regexPO = extractPOByRegex(rawText, tables);
+
+    // Run vendor-specific parsers — deterministic overrides for known invoice layouts
+    const layoutVendorName = extractVendorNameByLayout(rawText);
 
     // Provide both raw text and any extracted tables for best accuracy
     const tableContext = tables?.length
@@ -247,9 +427,11 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
             schemaName: "Invoice"
         });
 
+        const invoice = data as InvoiceData;
+
         // Override LLM line items with regex-parsed ones when available (more accurate)
         if (ulineItems) {
-            (data as InvoiceData).lineItems = ulineItems.map(i => ({
+            invoice.lineItems = ulineItems.map(i => ({
                 sku: i.sku,
                 description: i.description,
                 qty: i.quantity,
@@ -258,13 +440,45 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
             }));
         }
 
-        return data as InvoiceData;
+        // Apply vendor-specific overrides — these are deterministic and trusted
+        // over LLM output for the specific fields they extract.
+        if ((invoice.vendorName === "UNKNOWN" || !invoice.vendorName?.trim()) && layoutVendorName) {
+            console.log(`[invoice-parser] Header vendor backfill: "${layoutVendorName}"`);
+            invoice.vendorName = layoutVendorName;
+        }
+
+        // Backfill PO# from regex when LLM and vendor parser both missed it
+        if (!invoice.poNumber && regexPO) {
+            console.log(`[invoice-parser] Regex PO backfill: "${regexPO}" (LLM returned no poNumber)`);
+            invoice.poNumber = regexPO;
+        }
+
+        // Override garbled LLM PO with clean regex match.
+        // OCR commonly swaps 1↔I, 0↔O, 5↔S. If the LLM returned a PO with
+        // non-digit chars and regex found a clean numeric match, prefer regex.
+        if (invoice.poNumber && regexPO && invoice.poNumber !== regexPO) {
+            const llmHasNonDigits = /[^0-9]/.test(invoice.poNumber);
+            const regexIsClean = /^\d+$/.test(regexPO);
+            if (llmHasNonDigits && regexIsClean) {
+                console.log(`[invoice-parser] Regex PO override: "${invoice.poNumber}" → "${regexPO}" (LLM PO contains non-digits)`);
+                invoice.poNumber = regexPO;
+            }
+        }
+
+        // Extract shipping/freight/handling line items into the freight field.
+        // Vendors like Coats include "Shipping and Handling" as a line item rather
+        // than a separate freight charge. The reconciler needs this in invoice.freight
+        // to map it to the Finale FREIGHT fee type on the PO.
+        extractShippingToFreight(invoice);
+
+        return invoice;
     } catch (err: any) {
         console.error("❌ parseInvoice failed even with fallback:", err.message);
-        // Fallback to empty structure if everything fails
+        // Fallback to empty structure if everything fails — still use regex PO if available
         return {
             documentType: "invoice",
             invoiceNumber: "error",
+            poNumber: regexPO || undefined,
             vendorName: "error",
             invoiceDate: new Date().toISOString().split('T')[0],
             lineItems: [],

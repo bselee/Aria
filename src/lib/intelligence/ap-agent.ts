@@ -5,7 +5,7 @@ import { Telegraf, Markup } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { z } from "zod";
 import { unifiedObjectGeneration } from "./llm";
-import { extractPDF } from "../pdf/extractor";
+import { extractPDF, extractPDFWithLLM } from "../pdf/extractor";
 import { recall } from "./memory";
 import { parseInvoice, InvoiceData } from "../pdf/invoice-parser";
 // matchInvoiceToPO kept for manual re-match flow in start-bot.ts invoice_has_po_ handler
@@ -24,6 +24,7 @@ import {
 } from "../finale/reconciler";
 import { recordFeedback } from "./feedback-loop";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
+import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
 
 /**
  * @file    ap-agent.ts
@@ -83,6 +84,70 @@ const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // ── Internal ignores ────────────────────────────────────────────────
     { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
 ];
+
+function countMeaningfulLineItems(invoice: InvoiceData): number {
+    return (invoice.lineItems || []).filter((li) => {
+        const description = (li.description || "").trim();
+        const amount = (li.total && li.total > 0)
+            ? li.total
+            : (li.qty ?? 0) * (li.unitPrice ?? 0);
+        return description.length > 0 && amount >= 0;
+    }).length;
+}
+
+function getInvoiceLineSubtotal(invoice: InvoiceData): number {
+    return (invoice.lineItems || []).reduce((sum, li) => {
+        if (li.total && li.total > 0) return sum + li.total;
+        return sum + ((li.qty ?? 0) * (li.unitPrice ?? 0));
+    }, 0);
+}
+
+function hasCoreReconciliationSignals(invoice: InvoiceData): boolean {
+    return Boolean(
+        invoice.poNumber?.trim() &&
+        invoice.vendorName !== "UNKNOWN" &&
+        invoice.total > 0 &&
+        countMeaningfulLineItems(invoice) > 0
+    );
+}
+
+function getInvoiceParseScore(invoice: InvoiceData): number {
+    let score = 0;
+    if (invoice.poNumber?.trim()) score += 3;
+    if (invoice.vendorName !== "UNKNOWN") score += 2;
+    if (invoice.total > 0) score += 2;
+    if (countMeaningfulLineItems(invoice) > 0) score += 2;
+    if (invoice.confidence !== "low") score += 1;
+    return score;
+}
+
+function getOCRRetryReasons(invoice: InvoiceData): string[] {
+    const retryReasons: string[] = [];
+    const lineItemCount = countMeaningfulLineItems(invoice);
+    const hasCoreSignals = hasCoreReconciliationSignals(invoice);
+
+    if (!invoice.poNumber) retryReasons.push("po_missing");
+    if (lineItemCount === 0) retryReasons.push("zero_line_items");
+    if (invoice.vendorName === "UNKNOWN") retryReasons.push("vendor_unknown");
+    if (invoice.total === 0) retryReasons.push("total_zero");
+    if (invoice.confidence === "low" && !hasCoreSignals) retryReasons.push("low_confidence");
+
+    if (!invoice.poNumber && lineItemCount > 0 && invoice.total > 0) {
+        const lineSubtotal = getInvoiceLineSubtotal(invoice);
+        const knownCharges =
+            (invoice.freight ?? 0) +
+            (invoice.tax ?? 0) +
+            (invoice.tariff ?? 0) +
+            (invoice.labor ?? 0) -
+            (invoice.discount ?? 0);
+        const gap = Math.abs(invoice.total - lineSubtotal - knownCharges);
+        if (gap > invoice.total * 0.25 && gap > 25) {
+            retryReasons.push(`balance_gap_$${gap.toFixed(2)}`);
+        }
+    }
+
+    return retryReasons;
+}
 export class APAgent {
     private bot: Telegraf;
     private slack: WebClient | null;
@@ -744,8 +809,78 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string, pdfStoragePath: string | null = null) {
         try {
             // 1. Extract + parse
-            const extracted = await extractPDF(buffer);
-            const invoiceData: InvoiceData = await parseInvoice(extracted.rawText);
+            let extracted = await extractPDF(buffer);
+            let invoiceData: InvoiceData = await parseInvoice(
+                extracted.rawText,
+                extracted.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))])
+            );
+            const firstPassSnapshot = {
+                strategy: extracted.ocrStrategy || null,
+                confidence: invoiceData.confidence || null,
+                poNumber: invoiceData.poNumber || null,
+                vendorName: invoiceData.vendorName || null,
+                lineItemCount: countMeaningfulLineItems(invoiceData),
+                total: invoiceData.total,
+            };
+            let retrySnapshot: typeof firstPassSnapshot | null = null;
+
+            // 1.retry: Automatic OCR escalation — if the fast pdf-parse path produced
+            // a suspicious result, re-extract with forced LLM vision OCR before proceeding.
+            // Catches PDFs where text layer exists but is garbled, incomplete, or misaligned.
+            //
+            // Any ONE of these triggers is enough to retry — they're independent signals:
+            const retryReasons = getOCRRetryReasons(invoiceData);
+
+            if (retryReasons.length > 0 && extracted.ocrStrategy === "pdf-parse") {
+                console.log(`     🔄 Suspicious first-pass result [${retryReasons.join(", ")}] — retrying with LLM OCR`);
+                let retryOutcome = "no_improvement";
+                try {
+                    const retryExtracted = await extractPDFWithLLM(buffer);
+                    const retryInvoice = await parseInvoice(
+                        retryExtracted.rawText,
+                        retryExtracted.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))])
+                    );
+                    retrySnapshot = {
+                        strategy: retryExtracted.ocrStrategy || null,
+                        confidence: retryInvoice.confidence || null,
+                        poNumber: retryInvoice.poNumber || null,
+                        vendorName: retryInvoice.vendorName || null,
+                        lineItemCount: countMeaningfulLineItems(retryInvoice),
+                        total: retryInvoice.total,
+                    };
+                    // Accept retry if it produced a materially better result
+                    const retryBetter = getInvoiceParseScore(retryInvoice) > getInvoiceParseScore(invoiceData);
+                    if (retryBetter) {
+                        console.log(`     ✅ LLM OCR retry improved — PO: ${retryInvoice.poNumber || "none"}, lines: ${retryInvoice.lineItems?.length || 0}, total: $${retryInvoice.total}`);
+                        extracted = retryExtracted;
+                        invoiceData = retryInvoice;
+                        retryOutcome = "improved";
+                    } else {
+                        console.log(`     ℹ️ LLM OCR retry did not improve — keeping original parse`);
+                    }
+                } catch (retryErr: any) {
+                    console.warn(`     ⚠️ LLM OCR retry failed: ${retryErr.message} — continuing with original`);
+                    retryOutcome = `error: ${retryErr.message}`;
+                }
+                // Persist retry decision to ap_activity_log for telemetry
+                try {
+                    await supabase?.from("ap_activity_log").insert({
+                        email_from: from,
+                        email_subject: subject,
+                        intent: "OCR_RETRY",
+                        action_taken: `OCR retry fired [${retryReasons.join(", ")}] → ${retryOutcome}`,
+                        metadata: {
+                            filename,
+                            retryReasons,
+                            retryOutcome,
+                            firstPassStrategy: firstPassSnapshot.strategy,
+                            firstPassPO: firstPassSnapshot.poNumber,
+                            firstPassLineItems: firstPassSnapshot.lineItemCount,
+                            firstPassTotal: firstPassSnapshot.total,
+                        },
+                    });
+                } catch { /* best-effort telemetry */ }
+            }
 
             // 1a. Vendor Alias Resolution (Tier 2 update)
             invoiceData.vendorName = await this.resolveVendorAlias(supabase, invoiceData.vendorName);
@@ -773,7 +908,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             });
 
             // 1c. Low-confidence guard — garbled PDF, skip reconciliation entirely
-            if (invoiceData.confidence === "low") {
+            if (invoiceData.confidence === "low" && !hasCoreReconciliationSignals(invoiceData)) {
                 console.warn(`     ⚠️ Low-confidence parse for ${filename} — alerting Will.`);
                 // C2 FIX: Persist the document even on OCR failure so it's never silently lost.
                 // Without this, the email sits unread with zero audit trail in `documents`.
@@ -800,6 +935,10 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 );
                 await this.logActivity(supabase, from, subject, "INVOICE", `Low-confidence parse — reconciliation skipped for ${filename}`);
                 return;
+            }
+
+            if (invoiceData.confidence === "low") {
+                console.warn(`     ⚠️ Low-confidence parse for ${filename}, but core reconciliation signals are present — continuing.`);
             }
 
             // 1c. Zero-line-item guard — possible OCR failure on scanned/corrupted PDF
@@ -992,7 +1131,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             // 3a. Archive into unified vendor_invoices table (non-blocking)
             try {
-                await upsertVendorInvoice({
+                const vendorInvoiceId = await upsertVendorInvoice({
                     vendor_name: invoiceData.vendorName,
                     invoice_number: invoiceData.invoiceNumber,
                     invoice_date: invoiceData.invoiceDate,
@@ -1015,6 +1154,22 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     })),
                     raw_data: invoiceData as unknown as Record<string, unknown>,
                 });
+                const shouldSeedReviewCorpus =
+                    retryReasons.length > 0 ||
+                    invoiceData.confidence === "low" ||
+                    !matched;
+                if (vendorInvoiceId && shouldSeedReviewCorpus) {
+                    await upsertInvoiceReviewSample({
+                        vendorInvoiceId,
+                        pdfStoragePath,
+                        gmailMessageId: messageId || null,
+                        sourceRef: messageId || `email-${from}`,
+                        reviewStatus: "pending_review",
+                        reviewedFields: {},
+                        firstPass: firstPassSnapshot,
+                        retryPass: retrySnapshot,
+                    });
+                }
             } catch { /* dedup collision or non-critical failure */ }
 
             // 3b. Log Bill.com forward event with full invoice detail
