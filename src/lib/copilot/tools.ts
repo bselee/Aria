@@ -210,6 +210,13 @@ export function getReadToolNames(): ReadToolName[] {
     return [...READ_TOOL_NAMES];
 }
 
+export function getTool(name: string) {
+    if ((READ_TOOL_NAMES as readonly string[]).includes(name)) {
+        return getSharedReadTools()[name as ReadToolName];
+    }
+    return undefined;
+}
+
 // ── Read tool routing with one-retry fallback ─────────────────────────────────
 
 export interface ReadToolRouteInput {

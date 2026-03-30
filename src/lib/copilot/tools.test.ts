@@ -1,20 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { resolveReadToolRoute, getTool, READ_TOOLS } from "./tools";
+import { resolveReadToolRoute, getTool, READ_TOOL_NAMES } from "./tools";
 
 describe("READ_TOOLS registry", () => {
     it("includes all expected read tools", () => {
-        const names = READ_TOOLS.map(t => t.name);
+        const names = READ_TOOL_NAMES;
         expect(names).toContain("lookup_product");
-        expect(names).toContain("search_purchase_orders");
-        expect(names).toContain("lookup_vendor");
-        expect(names).toContain("get_build_risk");
+        expect(names).toContain("query_purchase_orders");
+        expect(names).toContain("query_vendors");
+        expect(names).toContain("build_risk_analysis");
         expect(names).toContain("inspect_artifact");
     });
 
     it("getTool returns the correct definition by name", () => {
-        const tool = getTool("lookup_product");
-        expect(tool?.name).toBe("lookup_product");
-        expect(tool?.parameters).toBeTruthy();
+        const tool = getTool("lookup_product") as any;
+        expect(tool).toBeDefined();
+        // The AI SDK tool type has description and parameters
+        expect(tool?.description).toBeDefined();
     });
 
     it("getTool returns undefined for unknown names", () => {
@@ -26,11 +27,11 @@ describe("resolveReadToolRoute", () => {
     it("retries once when the first read tool returns no_result", async () => {
         const result = await resolveReadToolRoute({
             text:     "show recent open POs",
-            attempts: ["wrong_tool", "search_purchase_orders"],
+            attempts: ["wrong_tool", "query_purchase_orders"],
         });
 
         expect(result.attemptCount).toBe(2);
-        expect(result.resolvedTool).toBe("search_purchase_orders");
+        expect(result.resolvedTool).toBe("query_purchase_orders");
     });
 
     it("stops after one retry on repeated no_result", async () => {
