@@ -120,6 +120,14 @@ Example reason codes:
 - `mapping_missing`
 - `recent_draft_exists`
 
+### Essential intelligence extensions
+
+The first implementation should also include three high-value extensions because they are operationally essential, not optional polish:
+
+- `receiving/AP feedback loop`
+- `vendor/order constraints`
+- `override memory`
+
 ---
 
 ## Demand Model
@@ -176,6 +184,69 @@ Trusted means the vendor is repeatable enough operationally that automated draft
 ### Why this split
 
 This keeps purchasing intelligence available everywhere without spamming the system with premature or low-confidence drafts for every vendor in the catalog.
+
+---
+
+## Vendor and Order Constraints
+
+The shared engine should understand ordering realities beyond raw unit demand.
+
+Examples:
+
+- minimum order values
+- case-pack or carton constraints
+- order increments
+- freight breakpoints
+- “do not place tiny orders” economics
+- vendor-specific minimum practical order thresholds
+
+These constraints should not live inside vendor cart adapters. They should be part of the common purchasing policy so draft PO quality stays consistent everywhere.
+
+If a recommendation is theoretically correct on demand but operationally bad because it creates a tiny or uneconomic order, the engine should return `reduce`, `hold`, or `manual_review` with clear reason codes.
+
+---
+
+## Feedback and Learning Loop
+
+Purchasing intelligence should improve based on what actually happened after ordering.
+
+The engine should ingest downstream truth signals from:
+
+- receiving in Finale
+- AP invoice matching and reconciliation
+- observed vendor cart pricing
+- whether a draft PO was committed, edited, or ignored
+
+This feedback should influence future confidence and recommendations.
+
+Examples:
+
+- repeated overbuy on a SKU lowers reorder aggressiveness
+- repeated underbuy or stockout pressure increases urgency
+- invoices that consistently add meaningful freight can influence order economics
+- recommendations that are repeatedly overridden should be treated as low-confidence until the engine learns the pattern
+
+This is not the same as substitute intelligence or seasonality modeling. It is a practical closed-loop quality system for the first version.
+
+---
+
+## Override Memory
+
+When a human repeatedly changes the same recommendation, the system should remember that as operational knowledge.
+
+Examples:
+
+- Will consistently trims a suggested quantity for a SKU
+- Will consistently suppresses certain component-driven recommendations when finished goods are already healthy
+- Will consistently increases order size for a fast mover to hit a practical freight or reorder cadence
+
+The engine should store these patterns and expose them as:
+
+- confidence adjustments
+- recommended quantity bias
+- explanation text showing that the system is following established operating behavior
+
+Override memory should be vendor/SKU-scoped and recency-bounded. It should not become an unbounded pile of old habits.
 
 ---
 
@@ -304,6 +375,9 @@ Use Supabase to persist:
 - per-vendor watermarks
 - recent purchasing assessments
 - draft PO cooldown and duplication checks
+- vendor/order constraints
+- downstream recommendation outcomes
+- override memory
 
 Historical vendor information should be ingested once, summarized, and reused from storage instead of re-scraped repeatedly.
 
@@ -321,6 +395,10 @@ Testing should focus on the policy layer first, not browser automation first.
 - on-order inventory suppresses duplicate reorder pressure
 - large pack-size forced overbuy returns `reduce` or `manual_review`
 - recent duplicate draft prevents another auto-created draft
+- tiny uneconomic order triggers `hold` or `manual_review`
+- known override memory biases a recommendation in the expected direction
+- downstream overbuy feedback reduces confidence or quantity
+- receiving/AP truth can mark a recommendation as successful or poor
 
 ### Integration tests
 
@@ -345,8 +423,9 @@ Testing should focus on the policy layer first, not browser automation first.
 2. Feed dashboard and bot draft PO creation through it.
 3. Add vendor trust boundaries and auto-draft gating.
 4. Add recency/watermark persistence.
-5. Refactor `ULINE` and `Axiom` flows to consume the shared policy.
-6. Add Sustainable Village Playwright carting on top of the same policy output.
+5. Add vendor constraints, feedback logging, and override memory persistence.
+6. Refactor `ULINE` and `Axiom` flows to consume the shared policy.
+7. Add Sustainable Village Playwright carting on top of the same policy output.
 
 ---
 

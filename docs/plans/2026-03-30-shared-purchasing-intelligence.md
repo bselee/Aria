@@ -4,7 +4,7 @@
 
 **Goal:** Build one shared purchasing intelligence engine that powers dashboard and bot draft-PO creation for all vendors, while limiting scheduled auto-drafts and vendor cart automation to trusted repeatable vendors like ULINE, Axiom, and Sustainable Village.
 
-**Architecture:** Add a pure purchasing-policy layer under `src/lib/purchasing/` that converts Finale demand inputs into explainable `order` / `reduce` / `hold` / `manual_review` assessments. Then route existing purchasing entrypoints and vendor adapters through that layer, add Supabase-backed watermark/trust persistence, and finally scaffold Sustainable Village cart automation on top of the same assessed draft-PO manifest.
+**Architecture:** Add a pure purchasing-policy layer under `src/lib/purchasing/` that converts Finale demand inputs into explainable `order` / `reduce` / `hold` / `manual_review` assessments. Then route existing purchasing entrypoints and vendor adapters through that layer, add Supabase-backed watermark/trust persistence, fold in vendor constraints plus receiving/AP feedback and override memory, and finally scaffold Sustainable Village cart automation on top of the same assessed draft-PO manifest.
 
 **Tech Stack:** TypeScript, Vitest, Next.js App Router, Finale API client, Supabase, Playwright
 
@@ -81,6 +81,7 @@ Create `src/lib/purchasing/policy-engine.test.ts` covering:
 - mixed-demand item still returns `order` when direct demand justifies it
 - open PO/on-order coverage reduces or suppresses reorder
 - large pack increment forcing material overbuy returns `reduce` or `manual_review`
+- tiny uneconomic order triggers `hold` or `manual_review`
 
 Prefer pure input/output tests with no mocks beyond simple literals.
 
@@ -100,11 +101,13 @@ Create `src/lib/purchasing/policy-engine.ts` with:
 - a normalized input shape derived from Finale purchasing data
 - `assessPurchasingCandidate(input): PurchasingAssessment`
 - helper functions for:
+  - vendor/order constraint evaluation
   - healthy finished-goods coverage
   - BOM suppression
   - direct-demand support
   - on-order coverage suppression
   - pack-size overbuy detection
+  - small-order economics guardrails
 
 Keep the first implementation deterministic and explicit. No vendor-specific logic here.
 
@@ -408,7 +411,7 @@ git commit -m "feat(purchasing): add trusted vendor automation policy"
 
 ---
 
-### Task 8: Persist vendor watermarks and recent learned mappings
+### Task 8: Persist vendor watermarks, constraints, and override memory
 
 **Files:**
 - Create: `src/lib/storage/purchasing-automation-state.ts`
@@ -422,6 +425,8 @@ Create tests that verify persistence helpers can:
 - read/write last processed order watermark per vendor
 - store last successful mapping sync
 - store cooldown state for recent draft creation
+- store vendor/order constraints
+- store override memory for vendor/SKU patterns
 - return bounded recent state without scanning all history
 
 **Step 2: Run test to verify it fails**
@@ -441,6 +446,8 @@ Add:
 - storage helper module with CRUD methods for:
   - watermarks
   - cooldown timestamps
+  - vendor/order constraints
+  - override memory
   - optional last verified cart/order identifiers
 
 Keep schema focused and incremental.
@@ -464,7 +471,62 @@ git commit -m "feat(purchasing): persist vendor automation state"
 
 ---
 
-### Task 9: Refactor ULINE and Axiom flows to consume assessed manifests
+### Task 9: Add recommendation outcome logging and feedback scoring
+
+**Files:**
+- Create: `src/lib/purchasing/recommendation-feedback.ts`
+- Create: `src/lib/purchasing/recommendation-feedback.test.ts`
+- Modify: `src/lib/purchasing/draft-po-policy.ts`
+- Modify: `src/lib/intelligence/ap-agent.ts`
+- Modify: `src/lib/purchasing/po-completion-loader.ts`
+
+**Step 1: Write the failing test**
+
+Create tests that verify:
+- a purchasing recommendation outcome can be recorded after draft creation
+- AP/receiving outcomes can be summarized into recommendation feedback
+- repeated overbuy or unresolved follow-up lowers confidence
+- successful recommendations can be marked as validated
+
+**Step 2: Run test to verify it fails**
+
+Run:
+
+```bash
+npx vitest run src/lib/purchasing/recommendation-feedback.test.ts
+```
+
+Expected: FAIL because the feedback module does not exist yet.
+
+**Step 3: Write minimal implementation**
+
+Create `src/lib/purchasing/recommendation-feedback.ts` with:
+- recommendation outcome shapes
+- scoring helpers
+- adapters that summarize downstream signals from AP/reconciliation and receiving-aware completion state
+
+Update draft-creation and downstream hooks only enough to persist/consume the feedback cleanly.
+
+**Step 4: Run test to verify it passes**
+
+Run:
+
+```bash
+npx vitest run src/lib/purchasing/recommendation-feedback.test.ts
+```
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add src/lib/purchasing/recommendation-feedback.ts src/lib/purchasing/recommendation-feedback.test.ts src/lib/purchasing/draft-po-policy.ts src/lib/intelligence/ap-agent.ts src/lib/purchasing/po-completion-loader.ts
+git commit -m "feat(purchasing): add recommendation feedback loop"
+```
+
+---
+
+### Task 10: Refactor ULINE and Axiom flows to consume assessed manifests
 
 **Files:**
 - Modify: `src/cli/order-uline.ts`
@@ -519,7 +581,7 @@ git commit -m "refactor(purchasing): make vendor flows consume assessed manifest
 
 ---
 
-### Task 10: Scaffold Sustainable Village login-first cart automation
+### Task 11: Scaffold Sustainable Village login-first cart automation
 
 **Files:**
 - Create: `src/lib/purchasing/sustainable-village-session.ts`
@@ -578,7 +640,7 @@ git commit -m "feat(purchasing): add sustainable village cart automation scaffol
 
 ---
 
-### Task 11: Add recency-bounded vendor history ingestion helpers
+### Task 12: Add recency-bounded vendor history ingestion helpers
 
 **Files:**
 - Create: `src/lib/purchasing/vendor-history-window.ts`
@@ -632,7 +694,7 @@ git commit -m "perf(purchasing): bound vendor history scans by watermark"
 
 ---
 
-### Task 12: Run focused verification and document operational behavior
+### Task 13: Run focused verification and document operational behavior
 
 **Files:**
 - Modify: `docs/SYSTEM.md`
@@ -665,6 +727,9 @@ Update docs to explain:
 - trusted vendor auto-draft boundary
 - manual draft creation availability for all vendors
 - recency/watermark behavior
+- vendor/order constraints
+- receiving/AP feedback loop
+- override memory
 - Sustainable Village cart-review scope
 
 **Step 4: Commit**
