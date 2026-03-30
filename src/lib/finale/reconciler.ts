@@ -13,7 +13,7 @@
  *   1. ≤3% variance → auto-approve, apply, Telegram notify
  *   2. >3% but <10x → flag for Telegram bot approval before applying
  *   3. >10x magnitude shift → REJECT outright (likely decimal error)
- *   4. Total PO impact >$500 delta → require manual approval regardless
+ *   4. Non-freight aggregate PO impact >$500 delta → require manual approval regardless
  * 
  * These thresholds prevent catastrophic pricing errors like $2.60 → $26,000
  * which can happen from OCR misreads, decimal slips, or unit-of-measure confusion.
@@ -603,7 +603,10 @@ async function checkDuplicateReconciliation(
  * a catastrophic price change to Finale.
  */
 const RECONCILIATION_CONFIG = {
-    /** ≤3% price change → auto-approve without human review */
+    /**
+     * ≤3% price change → auto-approve without human review.
+     * Keep this conservative because OCR risk is highest on line pricing.
+     */
     AUTO_APPROVE_PERCENT: 0.03,
 
     /**
@@ -615,10 +618,10 @@ const RECONCILIATION_CONFIG = {
     MAGNITUDE_CEILING: 10,
 
     /**
-     * If total PO dollar impact exceeds this, require manual approval
-     * regardless of per-line percentage.
-     * Example: 100 units × $0.50 price increase = $50 (auto-OK)
-     *          100 units × $10.00 price increase = $1000 (needs approval)
+     * If non-freight aggregate PO impact exceeds this, require manual approval
+     * regardless of per-line percentage. Freight uses its own fee-specific cap
+     * because truckload freight can be legitimate while OCR-sensitive line
+     * pricing still needs conservative aggregate gating.
      */
     TOTAL_IMPACT_CAP_DOLLARS: 500,
 
@@ -631,12 +634,13 @@ const RECONCILIATION_CONFIG = {
 
     /**
      * DECISION(2026-03-18): Per-fee-type auto-approve caps.
-     * Freight is normal cost of business ($200–$1,500 for most LTL).
-     * Product pricing is where real discrepancies occur — keep those tight.
+     * Freight is normal cost of business and can legitimately reach truckload
+     * territory. Product pricing is where real discrepancies occur — keep
+     * those tight.
      * The delta (invoice fee − existing PO fee) is what's measured.
      */
     FEE_AUTO_APPROVE_BY_TYPE: {
-        FREIGHT:      2000,   // LTL/parcel is routine. Flag only full-truckload territory.
+        FREIGHT:      4000,   // Allow legitimate truckload freight before manual approval.
         SHIPPING:     500,    // Fuel surcharge — proportional to freight, smaller.
         TAX:          1000,   // Sales tax is formulaic. Either correct or wildly off.
         TARIFF:       250,    // Duties/tariffs are unpredictable — keep tight.
@@ -1088,22 +1092,28 @@ export async function reconcileInvoiceToPO(
     const totalDollarImpact =
         priceChanges.reduce((sum, pc) => sum + Math.abs(pc.dollarImpact), 0) +
         feeChanges.reduce((sum, fc) => sum + Math.abs(fc.amount - fc.existingAmount), 0);
+    const gatedDollarImpact =
+        priceChanges.reduce((sum, pc) => sum + Math.abs(pc.dollarImpact), 0) +
+        feeChanges
+            .filter((fc) => fc.feeType !== "FREIGHT")
+            .reduce((sum, fc) => sum + Math.abs(fc.amount - fc.existingAmount), 0);
 
     // 5. Apply total-impact safety check
-    //    Even if individual lines are ≤3%, if aggregate PO impact > $500, escalate
-    if (totalDollarImpact > RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS) {
+    //    Even if individual lines are ≤3%, if non-freight aggregate PO impact
+    //    exceeds the cap, escalate. Freight uses its own fee-specific cap.
+    if (gatedDollarImpact > RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS) {
         for (const pc of priceChanges) {
             if (pc.verdict === "auto_approve") {
                 pc.verdict = "needs_approval";
-                pc.reason += ` | Total PO impact $${totalDollarImpact.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} cap`;
+                pc.reason += ` | Non-freight PO impact $${gatedDollarImpact.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} cap`;
             }
         }
-        // Fix 1: Also escalate fee changes — freight/tariff/tax must not auto-apply
-        // when the total PO impact is high, even if each fee delta is individually small.
+        // Keep freight on its own fee-specific cap so legitimate truckload
+        // charges do not force approval by aggregate impact alone.
         for (const fc of feeChanges) {
-            if (fc.verdict === "auto_approve") {
+            if (fc.verdict === "auto_approve" && fc.feeType !== "FREIGHT") {
                 fc.verdict = "needs_approval";
-                fc.reason += " | Total PO impact exceeds $500 threshold — manual approval required";
+                fc.reason += ` | Non-freight PO impact exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} threshold — manual approval required`;
             }
         }
     }

@@ -180,7 +180,10 @@ async function main() {
         const extracted = await extractPDF(pdfBuffer);
         console.log(`   📄 Extracted ${extracted.rawText.length} chars of text`);
 
-        invoiceData = await parseInvoice(extracted.rawText);
+        invoiceData = await parseInvoice(
+            extracted.rawText,
+            extracted.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))])
+        );
 
         // Subject-line PO is stored as a last-resort fallback.
         // Vendor invoice references (e.g., Riceland's "B123402") are often THEIR internal PO

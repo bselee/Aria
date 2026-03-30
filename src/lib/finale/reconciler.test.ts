@@ -9,13 +9,19 @@
  * @deps    vitest
  */
 
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
     validateInvoiceBalance,
     normalizeLineTotal,
     reconcileFees,
+    reconcileInvoiceToPO,
 } from "./reconciler";
 import type { InvoiceData } from "../pdf/invoice-parser";
+
+vi.mock("../intelligence/vendor-memory", () => ({
+    getVendorPattern: vi.fn().mockResolvedValue(null),
+    storeVendorPattern: vi.fn().mockResolvedValue(undefined),
+}));
 
 // ──────────────────────────────────────────────────
 // TEST HELPERS
@@ -279,8 +285,8 @@ describe("reconcileFees", () => {
     });
 
     it("should flag large fee deltas as needs_approval", () => {
-        // Freight of $2500 exceeds $2000 auto-approve cap
-        const invoice = makeInvoice({ freight: 2500 });
+        // Freight above the truckload-safe cap should still require approval
+        const invoice = makeInvoice({ freight: 4500 });
         const po = makePO([]);
         const changes = reconcileFees(invoice, po);
         const freightChange = changes.find(c => c.feeType === "FREIGHT");
@@ -313,5 +319,78 @@ describe("reconcileFees", () => {
         const freightWith = changesWith.find(c => c.feeType === "FREIGHT");
         // Should find the existing PO adjustment via vendor-learned label
         expect(freightWith?.isNew).toBe(false);
+    });
+});
+
+describe("reconcileInvoiceToPO guardrails", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it("auto-approves freight-only truckload charges when product pricing is unchanged", async () => {
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            lineItems: [
+                { sku: "SKU-1", description: "Organic Compost", qty: 10, unitPrice: 50, total: 500 },
+            ],
+            subtotal: 500,
+            freight: 3500,
+            total: 4000,
+            amountDue: 4000,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [
+                    { productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Organic Compost" },
+                ],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+
+        expect(result.overallVerdict).toBe("auto_approve");
+        expect(result.feeChanges.find((fc) => fc.feeType === "FREIGHT")?.verdict).toBe("auto_approve");
+    });
+
+    it("still requires approval for non-trivial product price changes", async () => {
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            lineItems: [
+                { sku: "SKU-1", description: "Organic Compost", qty: 10, unitPrice: 54, total: 540 },
+            ],
+            subtotal: 540,
+            total: 540,
+            amountDue: 540,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [
+                    { productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Organic Compost" },
+                ],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+
+        expect(result.overallVerdict).toBe("needs_approval");
+        expect(result.priceChanges[0]?.verdict).toBe("needs_approval");
     });
 });

@@ -104,7 +104,10 @@ export async function POST(req: Request) {
 
                 if (classification.type === 'INVOICE') {
                     const { parseInvoice } = await import('@/lib/pdf/invoice-parser');
-                    const invoice = await parseInvoice(extracted.rawText);
+                    const invoice = await parseInvoice(
+                        extracted.rawText,
+                        extracted.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))])
+                    );
                     const lines = invoice.lineItems?.length
                         ? invoice.lineItems.slice(0, 8).map(li =>
                             `  • ${li.sku || li.description} — qty ${li.qty} @ $${li.unitPrice} = $${li.total}`

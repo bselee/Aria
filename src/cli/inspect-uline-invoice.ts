@@ -13,7 +13,7 @@ const ULINE_TO_FINALE: Record<string, string> = {
 
 async function main() {
     const ext = await extractPDF(buf);
-    const inv = await parseInvoice(ext.rawText);
+    const inv = await parseInvoice(ext.rawText, ext.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))]));
     console.log(`Vendor: ${inv.vendorName} | Total: $${inv.total} | PO: ${inv.poNumber}`);
     console.log(`\nLine items (${inv.lineItems.length}):`);
     const client = new FinaleClient();

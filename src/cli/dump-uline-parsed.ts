@@ -7,7 +7,7 @@ import { parseInvoice } from "../lib/pdf/invoice-parser";
 async function main() {
     const buf = fs.readFileSync("C:/Users/BuildASoil/OneDrive/Desktop/Sandbox/ULINE/Uline_Invoice_205814897_119441639_1.pdf");
     const ext = await extractPDF(buf);
-    const inv = await parseInvoice(ext.rawText);
+    const inv = await parseInvoice(ext.rawText, ext.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))]));
     for (const li of inv.lineItems) {
         const derivedQty = (li.extendedPrice && li.unitPrice && li.unitPrice > 0)
             ? Math.round(li.extendedPrice / li.unitPrice) : null;
