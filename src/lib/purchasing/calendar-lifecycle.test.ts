@@ -38,4 +38,17 @@ describe("calendar lifecycle", () => {
         const now = new Date("2026-03-30T23:00:00Z");
         expect(daysSinceDate("2026-03-29T01:00:00Z", now)).toBe(1);
     });
+
+    it("shows received but incomplete POs as a green received state with AP follow-up messaging", () => {
+        const lifecycle = derivePurchasingLifecycle("completed", [], "received_pending_invoice");
+        expect(lifecycle.isReceived).toBe(true);
+        expect(lifecycle.titleEmoji).toBe("🟢");
+        expect(lifecycle.statusLabel).toBe("Received - Awaiting Invoice");
+    });
+
+    it("shows fully resolved POs as complete", () => {
+        const lifecycle = derivePurchasingLifecycle("completed", [], "complete");
+        expect(lifecycle.titleEmoji).toBe("✅");
+        expect(lifecycle.statusLabel).toBe("Complete");
+    });
 });

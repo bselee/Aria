@@ -52,6 +52,9 @@ import {
     getPurchasingEventDate,
     shouldKeepReceivedPurchase,
 } from "../purchasing/calendar-lifecycle";
+import { loadActivePurchases } from "../purchasing/active-purchases";
+import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader";
+import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -111,14 +114,14 @@ export class OpsManager {
         this.bot = bot;
 
         // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
-        // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
+        // Slack posting is best-effort â€” if SLACK_BOT_TOKEN is missing, we
         // gracefully skip Slack without blocking the Telegram message.
         const slackToken = process.env.SLACK_BOT_TOKEN;
         this.slack = slackToken ? new WebClient(slackToken) : null;
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
 
         if (!this.slack) {
-            console.warn("⚠️ OpsManager: SLACK_BOT_TOKEN not set — Slack cross-posting disabled.");
+            console.warn("âš ï¸ OpsManager: SLACK_BOT_TOKEN not set â€” Slack cross-posting disabled.");
         }
 
         // Initialize dedicated AP agents
@@ -146,7 +149,7 @@ export class OpsManager {
         const startTime = performance.now();
         let cronRunId: number | null = null;
 
-        // Record start in cron_runs (fire-and-forget — don't block the task)
+        // Record start in cron_runs (fire-and-forget â€” don't block the task)
         try {
             const supabase = createClient();
             const { data } = await supabase.from('cron_runs').insert({
@@ -177,7 +180,7 @@ export class OpsManager {
             const durationMs = Math.round(performance.now() - startTime);
             recordCronRun(taskName, durationMs, 'error', error.message);
 
-            console.error(`🚨 [${taskName}] Crashed after ${durationMs}ms. Handing to Supervisor...`, error.message);
+            console.error(`ðŸš¨ [${taskName}] Crashed after ${durationMs}ms. Handing to Supervisor...`, error.message);
 
             // Update cron_runs with error
             if (cronRunId) {
@@ -201,14 +204,14 @@ export class OpsManager {
                     error_stack: error.stack || ""
                 });
             } catch (queueErr) {
-                console.error(`     ❌ Failed to write crash exception for ${taskName} to DB:`, queueErr);
+                console.error(`     âŒ Failed to write crash exception for ${taskName} to DB:`, queueErr);
 
                 // Absolute fallback in case the DB is down
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId && this.bot) {
                     await this.bot.telegram.sendMessage(
                         chatId,
-                        `🚨 <b>DB Unavailable - Crash Escalation</b> 🚨\n\n<b>Agent:</b> ${taskName}\n<b>Error:</b> ${error.message}`,
+                        `ðŸš¨ <b>DB Unavailable - Crash Escalation</b> ðŸš¨\n\n<b>Agent:</b> ${taskName}\n<b>Error:</b> ${error.message}`,
                         { parse_mode: 'HTML' }
                     ).catch(() => { });
                 }
@@ -238,7 +241,7 @@ export class OpsManager {
      * Start all scheduled tasks
      */
     start() {
-        console.log("🚀 Starting Ops Manager Scheduler...");
+        console.log("ðŸš€ Starting Ops Manager Scheduler...");
 
         // Hydrate dedup Sets from Supabase/Finale so a restart doesn't re-alert on
         // builds completed or POs received in the last 2 hours.
@@ -256,7 +259,7 @@ export class OpsManager {
             this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
         });
 
-        // AP Email Ingestion — twice daily at 8 AM and 2 PM weekdays
+        // AP Email Ingestion â€” twice daily at 8 AM and 2 PM weekdays
         // DECISION(2026-03-18): Limited to 2x/day to avoid overwhelming the Google
         // API. The AP inbox receives far less volume than the default inbox, so
         // twice-daily polling is sufficient. Token guard prevents silent failures
@@ -297,19 +300,19 @@ export class OpsManager {
             this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
         }, { timezone: "America/Denver" });
 
-        // ── AXIOM LABEL SCANNER ─────────────────────────────
+        // â”€â”€ AXIOM LABEL SCANNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // DECISION(2026-03-17): Runs purely autonomously to identify label demand
         // and add them to the queue for review on the dashboard.
         cron.schedule("15 8 * * 1-5", () => {
             this.safeRun("AxiomDemandScan", () => this.runAxiomDemandScan());
         }, { timezone: "America/Denver" });
 
-        // ── ULINE FRIDAY AUTO-ORDER ──────────────────────────
+        // â”€â”€ ULINE FRIDAY AUTO-ORDER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // DECISION(2026-03-16): Fully autonomous ULINE ordering pipeline.
         // Runs every Friday at 8:30 AM Denver time. Flow:
         //   1. Scan Finale purchasing intelligence for ULINE items below reorder threshold
         //   2. Create a draft PO in Finale with those items
-        //   3. Open Chrome → fill ULINE Quick Order cart via Paste Items
+        //   3. Open Chrome â†’ fill ULINE Quick Order cart via Paste Items
         //   4. Send Telegram notification with full manifest
         // Will just needs to review the cart and click checkout.
         // If zero items need reordering, sends a brief "all stocked" message.
@@ -346,7 +349,7 @@ export class OpsManager {
             this.safeRun("POSweep", () => runPOSweep(60, false));
         });
 
-        // ── VENDOR RECONCILIATIONS ──────────────────────────
+        // â”€â”€ VENDOR RECONCILIATIONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // DECISION(2026-03-18): Scheduling automated vendor reconciliations for Axiom,
         // FedEx, TeraGanix, and ULINE. Scheduled sequentially in the early AM hours
         // on weekdays to avoid interfering with Will's active Chrome sessions,
@@ -413,10 +416,10 @@ export class OpsManager {
                 const uptimeHrs = Math.round(process.uptime() / 3600 * 10) / 10;
                 await this.bot.telegram.sendMessage(
                     chatId,
-                    `☀️ <b>Aria Morning Check-In</b>\n\n` +
-                    `✅ Bot is online and healthy\n` +
-                    `⏱ Uptime: ${uptimeHrs}h | Memory: ${heapMB}MB\n` +
-                    `📋 Next: Build Risk (7:30), Daily Summary (8:00)`,
+                    `â˜€ï¸ <b>Aria Morning Check-In</b>\n\n` +
+                    `âœ… Bot is online and healthy\n` +
+                    `â± Uptime: ${uptimeHrs}h | Memory: ${heapMB}MB\n` +
+                    `ðŸ“‹ Next: Build Risk (7:30), Daily Summary (8:00)`,
                     { parse_mode: "HTML" }
                 );
             });
@@ -435,7 +438,7 @@ export class OpsManager {
             this.safeRun("StaleDraftPOAlert", () => this.alertStaleDraftPOs());
         }, { timezone: "America/Denver" });
 
-        // OOS Report Generator — polls every 5 min between 7:45–9:05 AM weekdays
+        // OOS Report Generator â€” polls every 5 min between 7:45â€“9:05 AM weekdays
         // DECISION(2026-03-11): Changed from fixed 8:30 cron to reactive polling.
         // Stockie email typically arrives ~8 AM. This polls every 5 min starting 7:45
         // so the report fires within minutes of arrival. The OOS-Processed label
@@ -456,13 +459,13 @@ export class OpsManager {
                     if (chatId) {
                         await this.bot.telegram.sendMessage(
                             chatId,
-                            `📋 <b>OOS Report Generated</b>\n\n` +
-                            `📊 ${result.totalItems} out-of-stock items analyzed\n` +
-                            `🚨 ${result.needsOrder.length} need ordering\n` +
-                            `✅ ${result.onOrder.length} on order\n` +
-                            `⚠️ ${result.agingPOs.length} aging POs\n` +
-                            `🔧 ${result.internalBuild.length} internal builds\n\n` +
-                            `📁 Saved to: <code>${result.outputPath}</code>`,
+                            `ðŸ“‹ <b>OOS Report Generated</b>\n\n` +
+                            `ðŸ“Š ${result.totalItems} out-of-stock items analyzed\n` +
+                            `ðŸš¨ ${result.needsOrder.length} need ordering\n` +
+                            `âœ… ${result.onOrder.length} on order\n` +
+                            `âš ï¸ ${result.agingPOs.length} aging POs\n` +
+                            `ðŸ”§ ${result.internalBuild.length} internal builds\n\n` +
+                            `ðŸ“ Saved to: <code>${result.outputPath}</code>`,
                             { parse_mode: "HTML" }
                         );
                     }
@@ -470,13 +473,13 @@ export class OpsManager {
                     // DECISION(2026-03-19): Single unified morning Slack post.
                     // Originally combined OOS Digest + Active Purchases into one message.
                     // DECISION(2026-03-20): Removed Active Purchases from Slack feed per Will.
-                    // OOS Digest only — Active Purchases remain available via Dashboard.
+                    // OOS Digest only â€” Active Purchases remain available via Dashboard.
                     if (result.slackBody) {
                         try {
                             await this.postToSlack(result.slackBody, "Morning Purchasing Digest");
-                            console.log(`📋 [OOS] Slack morning digest posted (${result.slackBody.length} chars)`);
+                            console.log(`ðŸ“‹ [OOS] Slack morning digest posted (${result.slackBody.length} chars)`);
                         } catch (slackErr: any) {
-                            console.error('❌ Slack morning digest failed:', slackErr.message);
+                            console.error('âŒ Slack morning digest failed:', slackErr.message);
                         }
                     }
                 }
@@ -491,9 +494,9 @@ export class OpsManager {
             this.safeRun("APDailyRecap", () => this.apAgent.sendDailyRecap());
         }, { timezone: "America/Denver" });
 
-        // ── KAIZEN FEEDBACK LOOP CRONS ─────────────────────
+        // â”€â”€ KAIZEN FEEDBACK LOOP CRONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        // Weekly Kaizen Self-Review — Fridays 8:20 AM Denver
+        // Weekly Kaizen Self-Review â€” Fridays 8:20 AM Denver
         // DECISION(2026-03-18): Staggered from 8:15 to 8:20 to avoid collision
         // with AxiomDemandScan (8:15) and SlackPurchasesReport (8:10).
         cron.schedule("20 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
@@ -504,15 +507,15 @@ export class OpsManager {
             }
         }), { timezone: "America/Denver" });
 
-        // Daily Memory Sync — every night at 10:00 PM Denver
+        // Daily Memory Sync â€” every night at 10:00 PM Denver
         cron.schedule("0 22 * * *", () => this.safeRun("KaizenMemorySync", async () => {
             const synced = await syncLearningsToMemory();
             if (synced > 0) {
-                console.log(`🧠 [Kaizen] Nightly sync: ${synced} learnings pushed to Pinecone`);
+                console.log(`ðŸ§  [Kaizen] Nightly sync: ${synced} learnings pushed to Pinecone`);
             }
         }), { timezone: "America/Denver" });
 
-        // Nightly Housekeeping — 11:00 PM Denver (prune stale data everywhere)
+        // Nightly Housekeeping â€” 11:00 PM Denver (prune stale data everywhere)
         cron.schedule("0 23 * * *", () => this.safeRun("NightlyHousekeeping", async () => {
             const report = await runHousekeeping();
 
@@ -536,7 +539,7 @@ export class OpsManager {
                 if (chatId) {
                     await this.bot.telegram.sendMessage(
                         chatId,
-                        `🧹 <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
+                        `ðŸ§¹ <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
                         { parse_mode: "HTML" }
                     );
                 }
@@ -573,7 +576,7 @@ export class OpsManager {
             });
         }, { timezone: "America/Denver" });
 
-        // Daily Dedup Set Reset — midnight Denver (OOM prevention)
+        // Daily Dedup Set Reset â€” midnight Denver (OOM prevention)
         // DECISION(2026-03-09): These Sets grow by ~50-100 entries/day and are
         // never pruned during runtime. Over weeks, thousands of entries accumulate.
         // Safe to clear nightly because Sets are re-hydrated from Supabase/Finale
@@ -598,7 +601,7 @@ export class OpsManager {
      *
      * DECISION(2026-03-18): Centralized from 4 inline execAsync blocks to a single method.
      * Adds timeout (5 min), maxBuffer (10 MB), and Telegram notification with results.
-     * Previously, reconciliation results were only logged to console — Will had no
+     * Previously, reconciliation results were only logged to console â€” Will had no
      * visibility into whether overnight reconciliations succeeded or failed.
      *
      * @param vendorName  - Human-readable name ("Axiom", "FedEx", etc.)
@@ -625,8 +628,8 @@ export class OpsManager {
         if (chatId) {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `✅ <b>${vendorName} Reconciliation Complete</b>\n\n` +
-                `⏱ Duration: ${durationSec}s\n` +
+                `âœ… <b>${vendorName} Reconciliation Complete</b>\n\n` +
+                `â± Duration: ${durationSec}s\n` +
                 `<pre>${summary.slice(0, 500)}</pre>`,
                 { parse_mode: "HTML" }
             ).catch(() => { });
@@ -636,7 +639,7 @@ export class OpsManager {
     /**
      * Enqueue unprocessed AP emails into nightshift_queue for local LLM classification.
      * Called at 6 PM weekdays so the llama-server (starting at 6:05 PM) has tasks ready.
-     * source_inbox='ap' filter is critical — default inbox emails never need AP classification.
+     * source_inbox='ap' filter is critical â€” default inbox emails never need AP classification.
      */
     private async enqueueNightshiftEmails(): Promise<void> {
         const supabase = createClient();
@@ -679,7 +682,7 @@ export class OpsManager {
      * Move advertisements to label
      */
     async processAdvertisements() {
-        console.log("🧹 Running Advertisement Cleanup...");
+        console.log("ðŸ§¹ Running Advertisement Cleanup...");
         try {
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
@@ -703,7 +706,7 @@ export class OpsManager {
                 }
             });
 
-            console.log(`✅ Moved ${ids.length} advertisements.`);
+            console.log(`âœ… Moved ${ids.length} advertisements.`);
         } catch (err: any) {
             console.error("Cleanup error:", err.message);
         }
@@ -713,13 +716,13 @@ export class OpsManager {
      * Sync PO conversations and tracking response times
      */
     async syncPOConversations() {
-        console.log("📦 Syncing PO Conversations...");
+        console.log("ðŸ“¦ Syncing PO Conversations...");
         try {
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
-            // Only scan POs from the last 14 days — tracking arrives well within that window
+            // Only scan POs from the last 14 days â€” tracking arrives well within that window
             const since = new Date();
             since.setDate(since.getDate() - 14);
             const sinceStr = since.toISOString().slice(0, 10).replace(/-/g, '/');
@@ -768,7 +771,7 @@ export class OpsManager {
 
                 const responseTimeMins = responseAt ? Math.round((responseAt - sentAt) / 60000) : null;
 
-                // 🔍 Extract Tracking Numbers from full message body (snippet is too short — truncates numbers)
+                // ðŸ” Extract Tracking Numbers from full message body (snippet is too short â€” truncates numbers)
                 const _decodeGmailBody = (data: string): string =>
                     Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
                 const _walkMsgParts = (parts: any[], out: string[]) => {
@@ -795,7 +798,7 @@ export class OpsManager {
                         while ((match = gRegex.exec(bodyText)) !== null) {
                             // pro/bol/generic: group[1] is the number; others: full match[0]
                             const trackingNum = ['generic', 'pro', 'bol'].includes(carrier) ? (match[1] || match[0]) : match[0];
-                            // Must contain ≥2 digits — filters pure-word false positives
+                            // Must contain â‰¥2 digits â€” filters pure-word false positives
                             const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
                             if (!trackingNum || !hasDigits) continue;
                             // For PRO/BOL: encode with carrier name if detected in same message
@@ -815,7 +818,7 @@ export class OpsManager {
                 const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
                 const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
 
-                // Always read existing tracking so we can merge — never overwrite inbox-sourced tracking
+                // Always read existing tracking so we can merge â€” never overwrite inbox-sourced tracking
                 const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers, line_items").eq("po_number", poNumber).maybeSingle();
                 const oldTracking = existingPO?.tracking_numbers || [];
                 // Merge: inbox-backfilled numbers stay even if PO thread doesn't mention them
@@ -826,7 +829,7 @@ export class OpsManager {
                     const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
 
                     if (newTracking.length > 0) {
-                        // Persist tracking numbers FIRST — prevents duplicate alerts if two
+                        // Persist tracking numbers FIRST â€” prevents duplicate alerts if two
                         // processes run concurrently (e.g. PM2 restart during a sync cycle).
                         await supabase.from("purchase_orders").upsert({
                             po_number: poNumber,
@@ -851,7 +854,7 @@ export class OpsManager {
                             : `PO: #${poNumber}`;
 
                         const itemsLine = poDetails?.lineItems.length
-                            ? `Items: ${poDetails.lineItems.map(i => `<code>${i.sku}</code> ×${i.qty}`).join(', ')}`
+                            ? `Items: ${poDetails.lineItems.map(i => `<code>${i.sku}</code> Ã—${i.qty}`).join(', ')}`
                             : "";
 
                         // Fetch delivery status + build message lines per tracking number
@@ -876,7 +879,7 @@ export class OpsManager {
                     }
                 }
 
-                // Index to Pinecone for RAG — sanitize nulls (Pinecone rejects null metadata values)
+                // Index to Pinecone for RAG â€” sanitize nulls (Pinecone rejects null metadata values)
                 const pineconeMetadata: Record<string, string | number | boolean | string[]> = {
                     po_number: poNumber,
                     subject,
@@ -891,7 +894,7 @@ export class OpsManager {
                     pineconeMetadata
                 );
 
-                // Update DB (full record sync — use merged tracking to preserve inbox-sourced numbers)
+                // Update DB (full record sync â€” use merged tracking to preserve inbox-sourced numbers)
                 await supabase.from("purchase_orders").upsert({
                     po_number: poNumber,
                     vendor_name: vendorName,
@@ -916,11 +919,11 @@ export class OpsManager {
                             }, { onConflict: "po_number" });
                         }
                     } catch {
-                        // Non-fatal — catalog will populate on next sync cycle
+                        // Non-fatal â€” catalog will populate on next sync cycle
                     }
                 }
 
-                // Update vendor intelligence profile — accumulate known email addresses
+                // Update vendor intelligence profile â€” accumulate known email addresses
                 // and track whether this vendor replies to PO threads.
                 // Re-extract vendor name here since it's scoped inside the newTracking block above.
                 const vendorNameForProfile = (subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i) || [])[1]?.trim() || null;
@@ -952,8 +955,8 @@ export class OpsManager {
                     }, { onConflict: "vendor_name" });
                 }
 
-                // ── Vendor follow-up + outside-thread search (non-responders only) ──
-                // DECISION(2026-03-13): Reordered logic — search for outside-thread
+                // â”€â”€ Vendor follow-up + outside-thread search (non-responders only) â”€â”€
+                // DECISION(2026-03-13): Reordered logic â€” search for outside-thread
                 // emails FIRST. If the vendor already communicated (even outside the PO
                 // thread), skip the follow-up entirely. This prevents nagging vendors
                 // like Stockie who responded in a separate thread.
@@ -1021,7 +1024,7 @@ export class OpsManager {
                                     const outsideSubject = msgData.payload?.headers?.find((h: any) => h.name === 'Subject')?.value || '(no subject)';
                                     this.bot.telegram.sendMessage(
                                         process.env.TELEGRAM_CHAT_ID || "",
-                                        `📧 Found <b>${vendorName}</b> email outside PO thread\nPO #${poNumber} | Subject: ${outsideSubject}\n"${snippet.slice(0, 250)}"`,
+                                        `ðŸ“§ Found <b>${vendorName}</b> email outside PO thread\nPO #${poNumber} | Subject: ${outsideSubject}\n"${snippet.slice(0, 250)}"`,
                                         { parse_mode: "HTML" }
                                     );
                                     if (outsideTracking.length > 0) {
@@ -1040,7 +1043,7 @@ export class OpsManager {
                     }
 
                     // 2. Follow-up email in original thread (once per PO, only if vendor
-                    //    has NOT communicated at all — including outside-thread emails)
+                    //    has NOT communicated at all â€” including outside-thread emails)
                     if (!vendorCommunicatedOutsideThread) {
                         try {
                             const { data: poRow } = await supabase
@@ -1070,10 +1073,10 @@ export class OpsManager {
                                     follow_up_sent_at: new Date().toISOString(),
                                     updated_at: new Date().toISOString(),
                                 }, { onConflict: "po_number" });
-                                console.log(`📧 [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
+                                console.log(`ðŸ“§ [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
                                 this.bot.telegram.sendMessage(
                                     process.env.TELEGRAM_CHAT_ID || "",
-                                    `📧 Sent ETA follow-up to <b>${vendorName}</b> for PO #${poNumber} (${sentDateStr}, no response in 3+ days)`,
+                                    `ðŸ“§ Sent ETA follow-up to <b>${vendorName}</b> for PO #${poNumber} (${sentDateStr}, no response in 3+ days)`,
                                     { parse_mode: "HTML" }
                                 );
                             }
@@ -1081,7 +1084,7 @@ export class OpsManager {
                             console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
                         }
                     } else {
-                        console.log(`📧 [po-sync] Skipping follow-up for PO #${poNumber} — vendor ${vendorName} already communicated outside PO thread`);
+                        console.log(`ðŸ“§ [po-sync] Skipping follow-up for PO #${poNumber} â€” vendor ${vendorName} already communicated outside PO thread`);
                     }
                 }
             }
@@ -1106,10 +1109,10 @@ export class OpsManager {
                 text,
                 mrkdwn: true,
             });
-            console.log(`✅ ${label} posted to Slack ${this.slackChannel}`);
+            console.log(`âœ… ${label} posted to Slack ${this.slackChannel}`);
         } catch (err: any) {
             // Non-fatal: Telegram message was already sent
-            console.error(`❌ Slack post failed (${label}):`, err.data?.error || err.message);
+            console.error(`âŒ Slack post failed (${label}):`, err.data?.error || err.message);
         }
     }
 
@@ -1117,11 +1120,11 @@ export class OpsManager {
      * Generate and send the daily summary to Telegram + Slack.
      */
     async sendDailySummary() {
-        console.log("📊 Preparing Daily PO Summary...");
+        console.log("ðŸ“Š Preparing Daily PO Summary...");
         const opsData = await this.getOperationsStatsForTimeframe("yesterday");
 
         const summary = await this.generateLLMSummary("Daily", opsData);
-        const telegramMsg = `📊 **Morning Operations Summary**\n\n${summary}`;
+        const telegramMsg = `ðŸ“Š **Morning Operations Summary**\n\n${summary}`;
 
         // 1. Always send to Telegram first (primary channel)
         this.bot.telegram.sendMessage(
@@ -1138,11 +1141,11 @@ export class OpsManager {
      * Generate and send the weekly summary (Friday) to Telegram + Slack.
      */
     async sendWeeklySummary() {
-        console.log("📅 Preparing Weekly PO Summary...");
+        console.log("ðŸ“… Preparing Weekly PO Summary...");
         const opsData = await this.getOperationsStatsForTimeframe("week");
 
         const summary = await this.generateLLMSummary("Weekly", opsData);
-        const telegramMsg = `🗓️ **Friday Weekly Operations Review**\n\n${summary}`;
+        const telegramMsg = `ðŸ—“ï¸ **Friday Weekly Operations Review**\n\n${summary}`;
 
         // 1. Always send to Telegram first (primary channel)
         this.bot.telegram.sendMessage(
@@ -1159,92 +1162,14 @@ export class OpsManager {
      * Gets the active purchases list (used by Dashboard API and Slack).
      */
     async getActivePurchasesList(daysBack: number = 60) {
-        // Fetch last N days of POs to ensure we get active ones
-        const pos = await finaleClient.getRecentPurchaseOrders(daysBack);
-        await leadTimeService.warmCache();
-
-        // Fetch tracking from Supabase
-        const supabase = createClient();
-        const poNumbers = pos.map(p => p.orderId).filter(Boolean);
-        const trackingMap = new Map<string, string[]>();
-
-        if (supabase && poNumbers.length > 0) {
-            try {
-                for (let i = 0; i < poNumbers.length; i += 100) {
-                    const chunk = poNumbers.slice(i, i + 100);
-                    const { data: dbPOs } = await supabase
-                        .from("purchase_orders")
-                        .select("po_number, tracking_numbers")
-                        .in("po_number", chunk);
-
-                    for (const dp of dbPOs || []) {
-                        trackingMap.set(dp.po_number, dp.tracking_numbers || []);
-                    }
-                }
-            } catch (e: any) {
-                console.warn("[ops-manager] active purchases tracking fetch failed:", e.message);
-            }
-        }
-
-        const activePos = [];
-
-        function addDaysLoc(dateStr: string, days: number): string {
-            const d = new Date(dateStr);
-            d.setUTCDate(d.getUTCDate() + days);
-            return d.toISOString().split("T")[0];
-        }
-
-        for (const po of pos) {
-            if (!po.orderId) continue;
-            // Skip dropship POs
-            if (po.orderId.toLowerCase().includes("dropship")) continue;
-
-            const status = (po.status || "").toLowerCase();
-            // Only show committed or completed — skip drafts and cancelled
-            if (!["committed", "completed"].includes(status)) continue;
-
-            const isReceived = status === "completed";
-
-            if (isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)) {
-                continue;
-            }
-
-            // Calculate expected date like the calendar
-            let expectedDate: string;
-            let leadProvenance: string;
-
-            if (po.orderDate) {
-                const lt = await leadTimeService.getForVendor(po.vendorName);
-                expectedDate = addDaysLoc(po.orderDate, lt.days);
-                leadProvenance = lt.label;
-            } else {
-                expectedDate = new Date().toISOString().split("T")[0];
-                leadProvenance = "14d default";
-            }
-
-            activePos.push({
-                ...po,
-                expectedDate,
-                leadProvenance,
-                isReceived,
-                trackingNumbers: trackingMap.get(po.orderId) || []
-            });
-        }
-
-        activePos.sort((a, b) => {
-            const da = new Date(a.orderDate || 0).getTime();
-            const db = new Date(b.orderDate || 0).getTime();
-            return db - da; // newest first
-        });
-
-        return activePos;
+        return loadActivePurchases(finaleClient, daysBack);
     }
 
     /**
      * Build and post the Active Purchases Ledger to Slack.
      */
     async postActivePurchasesToSlack() {
-        console.log("🛒 Preparing Active Purchases Slack Ledger...");
+        console.log("ðŸ›’ Preparing Active Purchases Slack Ledger...");
         if (!this.slack) {
             console.log("Skipping Slack ledger: Slack not configured");
             return;
@@ -1261,7 +1186,7 @@ export class OpsManager {
                 const rcvd = p.isReceived;
                 const icon = this.poStatusEmoji(p.status);
 
-                let block = `${icon} *<${p.finaleUrl}|PO# ${p.orderId}>* — ${p.vendorName}\n`;
+                let block = `${icon} *<${p.finaleUrl}|PO# ${p.orderId}>* â€” ${p.vendorName}\n`;
 
                 // Keep the layout identical to the Purchasing Calendar
                 if (rcvd && p.receiveDate) {
@@ -1282,7 +1207,7 @@ export class OpsManager {
                 }
 
                 // Truncate item list identically
-                const itemLines = p.items.slice(0, 5).map((i: any) => `${i.productId} × ${i.quantity.toLocaleString()}`);
+                const itemLines = p.items.slice(0, 5).map((i: any) => `${i.productId} Ã— ${i.quantity.toLocaleString()}`);
                 if (p.items.length > 5) itemLines.push(`+ ${p.items.length - 5} more`);
                 block += `> Items: ${itemLines.join(', ')}\n`;
 
@@ -1293,14 +1218,14 @@ export class OpsManager {
 
             await this.postToSlack(msg, "Active Purchases");
         } catch (e: any) {
-            console.error(`❌ Active Purchases posting failed:`, e.message);
+            console.error(`âŒ Active Purchases posting failed:`, e.message);
         }
     }
 
 
     /**
      * Run the Calendar BOM build risk analysis and post results.
-     * Fetches production calendars → parses events → explodes BOMs → checks stock.
+     * Fetches production calendars â†’ parses events â†’ explodes BOMs â†’ checks stock.
      * Posts to both Telegram and Slack #purchasing.
      *
      * DECISION(2026-02-25): This runs at 7:30 AM weekdays, 30 min before
@@ -1315,13 +1240,13 @@ export class OpsManager {
      * POs:    query Finale for today's received POs (low volume, safe to re-query).
      */
     private async hydrateSeenSets(): Promise<void> {
-        // Hydrate build completions: load today's completions from Supabase (midnight MT → now)
+        // Hydrate build completions: load today's completions from Supabase (midnight MT â†’ now)
         // Using today rather than 2h prevents re-alerting after a mid-day restart.
         try {
             const db = createClient();
             if (db) {
                 const todayMidnight = new Date();
-                todayMidnight.setHours(0, 0, 0, 0);  // local midnight — conservative, always earlier than MT midnight
+                todayMidnight.setHours(0, 0, 0, 0);  // local midnight â€” conservative, always earlier than MT midnight
                 const since = todayMidnight.toISOString();
                 const { data } = await db
                     .from('build_completions')
@@ -1386,7 +1311,7 @@ export class OpsManager {
                 const moreItems = po.items.length > 5 ? ` +${po.items.length - 5} more` : '';
 
                 const msg =
-                    `📦 *PO Received*\n` +
+                    `ðŸ“¦ *PO Received*\n` +
                     `PO: \`${po.orderId}\`  |  Supplier: ${po.supplier}\n` +
                     `Units: ${itemCount.toLocaleString()}  |  Value: $${po.total.toLocaleString()}\n` +
                     `SKUs: ${skuList}${moreItems}`;
@@ -1409,24 +1334,42 @@ export class OpsManager {
                             .single();
                         if (!calRow) return;
 
-                        const receivedDate = po.receiveDate
-                            ? new Date(po.receiveDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-                            : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                        const completionSignals = await loadPOCompletionSignalIndex(supabase, [po.orderId]);
+                        const completionSignal = completionSignals.get(po.orderId);
+                        const completionState = derivePOCompletionState({
+                            finaleReceived: true,
+                            trackingDelivered: false,
+                            hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
+                            reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
+                            freightResolved: completionSignal?.freightResolved || false,
+                            unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
+                        });
+                        const lifecycle = derivePurchasingLifecycle('completed', [], completionState);
                         const receivedDateKey = po.receiveDate
                             ? po.receiveDate.toString().split('T')[0]
                             : new Date().toISOString().split('T')[0];
-
-                        const title = `✅ PO #${po.orderId} — ${po.supplier}`;
-                        const itemLines = po.items.slice(0, 5)
-                            .map(i => `${i.productId} × ${i.quantity.toLocaleString()}`)
-                            .join('\n');
-                        const moreStr = po.items.length > 5 ? `\n+ ${po.items.length - 5} more` : '';
-                        const description =
-                            `Ordered: ${po.orderDate ? new Date(po.orderDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'Unknown'} | Received: ${receivedDate}\n` +
-                            `Items:\n${itemLines}${moreStr}\n` +
-                            `Total: $${po.total.toLocaleString()}\n` +
-                            `Status: Received\n` +
-                            `→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`;
+                        const title = this.buildPOEventTitle({
+                            orderId: po.orderId,
+                            vendorName: po.supplier,
+                            status: 'completed',
+                        } as FullPO, lifecycle);
+                        const description = await this.buildPOEventDescription(
+                            {
+                                orderId: po.orderId,
+                                vendorName: po.supplier,
+                                status: 'completed',
+                                orderDate: po.orderDate || '',
+                                receiveDate: po.receiveDate || new Date().toISOString(),
+                                total: po.total || 0,
+                                items: po.items || [],
+                                finaleUrl: po.finaleUrl,
+                            } as FullPO,
+                            po.orderDate || receivedDateKey,
+                            'receipt update',
+                            [],
+                            undefined,
+                            lifecycle
+                        );
 
                         const calendar = new CalendarClient();
                         await calendar.updateEventTitleAndDescription(
@@ -1434,23 +1377,23 @@ export class OpsManager {
                             calRow.event_id,
                             title,
                             description,
-                            '2',
+                            lifecycle.colorId,
                             receivedDateKey
                         );
 
                         await supabase.from('purchasing_calendar_events')
-                            .update({ status: 'received', updated_at: new Date().toISOString() })
+                            .update({ status: lifecycle.calendarStatus, updated_at: new Date().toISOString() })
                             .eq('po_number', po.orderId);
 
-                        console.log(`📅 [po-watcher] Calendar event updated for PO ${po.orderId}`);
+                        console.log(`ðŸ“… [po-watcher] Calendar event updated for PO ${po.orderId}`);
                     } catch (e: any) {
                         console.warn('[po-watcher] Calendar update failed:', e.message);
                     }
                 });
 
-                console.log(`📦 [po-watcher] PO received: ${po.orderId} from ${po.supplier} (${itemCount} units)`);
+                console.log(`ðŸ“¦ [po-watcher] PO received: ${po.orderId} from ${po.supplier} (${itemCount} units)`);
 
-                // ── Receiving Discrepancy Detection ──────────────────────────
+                // â”€â”€ Receiving Discrepancy Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // DECISION(2026-03-04): Compare received qty vs ordered qty per item.
                 // Flag shorts and overs via Telegram so they don't go unnoticed.
                 const discrepancies: string[] = [];
@@ -1460,13 +1403,13 @@ export class OpsManager {
                     if (ordered > 0 && received !== ordered) {
                         const diff = received - ordered;
                         const pct = Math.round((diff / ordered) * 100);
-                        const icon = diff < 0 ? '🔴' : '🟡';
-                        discrepancies.push(`${icon} \`${item.productId}\`: ordered ${ordered.toLocaleString()} → received ${received.toLocaleString()} (${diff > 0 ? '+' : ''}${diff.toLocaleString()}, ${pct > 0 ? '+' : ''}${pct}%)`);
+                        const icon = diff < 0 ? 'ðŸ”´' : 'ðŸŸ¡';
+                        discrepancies.push(`${icon} \`${item.productId}\`: ordered ${ordered.toLocaleString()} â†’ received ${received.toLocaleString()} (${diff > 0 ? '+' : ''}${diff.toLocaleString()}, ${pct > 0 ? '+' : ''}${pct}%)`);
                     }
                 }
                 if (discrepancies.length > 0) {
                     const discMsg =
-                        `⚠️ *Receiving Discrepancy — PO #${po.orderId}*\n` +
+                        `âš ï¸ *Receiving Discrepancy â€” PO #${po.orderId}*\n` +
                         `Supplier: ${po.supplier}\n\n` +
                         discrepancies.join('\n');
                     this.bot.telegram.sendMessage(
@@ -1502,12 +1445,12 @@ export class OpsManager {
                 const dateStr = po.orderDate
                     ? new Date(po.orderDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
                     : '?';
-                return `• PO #${po.orderId} — ${po.supplier} (${po.ageDays}d old, ${po.itemCount} items, $${po.total.toLocaleString()}) [${dateStr}]`;
+                return `â€¢ PO #${po.orderId} â€” ${po.supplier} (${po.ageDays}d old, ${po.itemCount} items, $${po.total.toLocaleString()}) [${dateStr}]`;
             });
 
             const msg =
-                `📋 *${stale.length} Stale Draft PO${stale.length > 1 ? 's' : ''}*\n` +
-                `_Uncommitted for 3+ days — commit or delete:_\n\n` +
+                `ðŸ“‹ *${stale.length} Stale Draft PO${stale.length > 1 ? 's' : ''}*\n` +
+                `_Uncommitted for 3+ days â€” commit or delete:_\n\n` +
                 lines.join('\n');
 
             this.bot.telegram.sendMessage(
@@ -1516,7 +1459,7 @@ export class OpsManager {
                 { parse_mode: 'Markdown' }
             ).catch((e: any) => console.warn('[ops-manager] Stale draft alert failed:', e.message));
 
-            console.log(`📋 [ops-manager] Sent stale draft alert for ${stale.length} PO(s).`);
+            console.log(`ðŸ“‹ [ops-manager] Sent stale draft alert for ${stale.length} PO(s).`);
         } catch (err: any) {
             console.error('[ops-manager] alertStaleDraftPOs error:', err.message);
         }
@@ -1527,9 +1470,9 @@ export class OpsManager {
      *
      * On completion detected:
      *   1. Sends a Telegram notification to Will
-     *   2. Appends "✅ Completed: [timestamp]" to the matching Google Calendar event description
+     *   2. Appends "âœ… Completed: [timestamp]" to the matching Google Calendar event description
      *
-     * Calendar writes are best-effort — description-only PATCH, no color/title changes.
+     * Calendar writes are best-effort â€” description-only PATCH, no color/title changes.
      * Finale endpoint discovery is required; see src/cli/test-finale-builds.ts.
      */
     async pollBuildCompletions() {
@@ -1543,7 +1486,7 @@ export class OpsManager {
             // Fetch calendar builds once so we can match by SKU + date
             const calendar = new CalendarClient();
             const parser = new BuildParser();
-            const events = await calendar.getAllUpcomingBuilds(60); // wider window — build may be today
+            const events = await calendar.getAllUpcomingBuilds(60); // wider window â€” build may be today
             const parsedBuilds = await parser.extractBuildPlan(events);
 
             for (const build of completed) {
@@ -1557,7 +1500,7 @@ export class OpsManager {
                     timeZone: 'America/Denver',
                 });
 
-                // Match to a calendar event (same SKU, within ±1 day of build date)
+                // Match to a calendar event (same SKU, within Â±1 day of build date)
                 const buildDate = completedAt.toISOString().split('T')[0];
                 const matched = parsedBuilds.find(p =>
                     p.sku === build.sku &&
@@ -1577,12 +1520,12 @@ export class OpsManager {
                         const existingEvent = await calendar.getEventRaw(matched.calendarId, matched.eventId);
                         const existingDesc = existingEvent?.description || '';
                         const existingTitle = existingEvent?.summary || '';
-                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('✅') || existingTitle.startsWith('🟡')) {
-                            console.log(`⏭️ [build-watcher] ${build.sku} already annotated, skipping`);
+                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('âœ…') || existingTitle.startsWith('ðŸŸ¡')) {
+                            console.log(`â­ï¸ [build-watcher] ${build.sku} already annotated, skipping`);
                         } else {
                             const scheduledQty = matched.quantity;
-                            // Determine icon: 🟡 partial if under scheduled, ✅ if met or exceeded
-                            const icon = (scheduledQty && build.quantity < scheduledQty) ? '🟡' : '✅';
+                            // Determine icon: ðŸŸ¡ partial if under scheduled, âœ… if met or exceeded
+                            const icon = (scheduledQty && build.quantity < scheduledQty) ? 'ðŸŸ¡' : 'âœ…';
 
                             // 1. Prepend icon to title so it's visible on calendar grid
                             const newTitle = `${icon} ${existingTitle}`;
@@ -1591,11 +1534,11 @@ export class OpsManager {
                             let completionNote: string;
                             if (scheduledQty && scheduledQty !== build.quantity) {
                                 const pct = Math.round((build.quantity / scheduledQty) * 100);
-                                completionNote = `${icon} Completed: ${timeStr} — ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
+                                completionNote = `${icon} Completed: ${timeStr} â€” ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
                             } else {
                                 completionNote = `${icon} Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
                             }
-                            completionNote += `\n→ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
+                            completionNote += `\nâ†’ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
 
                             const newDesc = existingDesc
                                 ? `${existingDesc}\n${completionNote}`
@@ -1631,7 +1574,7 @@ export class OpsManager {
                 // Build completions are now annotated directly onto the existing build plan
                 // event (above) to avoid duplicate entries on the same calendar day.
 
-                console.log(`✅ [build-watcher] Build complete: ${build.sku} × ${build.quantity} @ ${timeStr}`);
+                console.log(`âœ… [build-watcher] Build complete: ${build.sku} Ã— ${build.quantity} @ ${timeStr}`);
             }
         } catch (err: any) {
             console.error('[build-watcher] pollBuildCompletions error:', err.message);
@@ -1639,7 +1582,7 @@ export class OpsManager {
     }
 
     async sendBuildRiskReport() {
-        console.log("🏭 Running daily Calendar BOM Build Risk Analysis...");
+        console.log("ðŸ­ Running daily Calendar BOM Build Risk Analysis...");
 
         try {
             const report = await runBuildRiskAnalysis(30, (msg) => {
@@ -1654,11 +1597,11 @@ export class OpsManager {
                 { parse_mode: "Markdown" }
             );
 
-            // 2. (Slack cross-post removed — OOS digest and dashboard/calendar cover this)
+            // 2. (Slack cross-post removed â€” OOS digest and dashboard/calendar cover this)
 
             // 3. If critical items exist, send a follow-up with action items
             if (report.criticalCount > 0) {
-                const urgentMsg = `🚨 *${report.criticalCount} CRITICAL stockout risk(s) detected!*\n` +
+                const urgentMsg = `ðŸš¨ *${report.criticalCount} CRITICAL stockout risk(s) detected!*\n` +
                     `_These components will stock out within 14 days and have no incoming POs._\n` +
                     `_Check the build risk report above for details, or run \`/buildrisk\` for the full analysis._`;
 
@@ -1670,7 +1613,7 @@ export class OpsManager {
             }
 
             // Restock detection: compare today's risk vs yesterday's snapshot.
-            // Any component that was CRITICAL/WARNING and is now OK → send Telegram
+            // Any component that was CRITICAL/WARNING and is now OK â†’ send Telegram
             // alert and append a note to the affected calendar events.
             setImmediate(async () => {
                 const { getLastSnapshot, saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
@@ -1687,8 +1630,8 @@ export class OpsManager {
 
                     if (restocked.length > 0) {
                         // Telegram alert
-                        const restockMsg = `✅ *Component Restock Alert*\n` +
-                            restocked.map(sku => `• \`${sku}\` — back in stock, was ${lastSnapshot[sku].riskLevel}`).join('\n') +
+                        const restockMsg = `âœ… *Component Restock Alert*\n` +
+                            restocked.map(sku => `â€¢ \`${sku}\` â€” back in stock, was ${lastSnapshot[sku].riskLevel}`).join('\n') +
                             `\n_Affected builds are no longer blocked by these components._`;
                         this.bot.telegram.sendMessage(
                             process.env.TELEGRAM_CHAT_ID || '',
@@ -1715,7 +1658,7 @@ export class OpsManager {
                                     await calClient.appendToEventDescription(
                                         build.calendarId,
                                         build.eventId,
-                                        `✅ ${sku} replenished — Build now Green (${today})`
+                                        `âœ… ${sku} replenished â€” Build now Green (${today})`
                                     );
                                 }
                             }
@@ -1723,7 +1666,7 @@ export class OpsManager {
                     }
                 }
 
-                // ── Blocked-build calendar annotations ──
+                // â”€â”€ Blocked-build calendar annotations â”€â”€
                 // DECISION(2026-03-04): For each CRITICAL/WARNING component, annotate
                 // the affected calendar build events with a concise warning showing the
                 // blocking component, any PO on order + ETA, and whether it arrives in
@@ -1759,13 +1702,13 @@ export class OpsManager {
                             const build = builds.find(p => p.sku === fgSku && p.eventId !== null);
                             if (!build?.eventId || !build.calendarId) continue;
 
-                            // ── Build the annotation ──
-                            const icon = demand.riskLevel === 'CRITICAL' ? '🔴' : '🟡';
+                            // â”€â”€ Build the annotation â”€â”€
+                            const icon = demand.riskLevel === 'CRITICAL' ? 'ðŸ”´' : 'ðŸŸ¡';
                             const daysLabel = demand.stockoutDays !== null
                                 ? `${demand.stockoutDays}d to stockout`
                                 : 'low stock';
 
-                            let note = `${icon} ${compSku} — ${daysLabel}`;
+                            let note = `${icon} ${compSku} â€” ${daysLabel}`;
 
                             if (demand.incomingPOs.length > 0) {
                                 const po = demand.incomingPOs[0]; // most relevant PO
@@ -1785,22 +1728,22 @@ export class OpsManager {
 
                                 const poLabel = `PO#${po.orderId} from ${po.supplier} (${po.quantity.toLocaleString()} units)`;
                                 if (etaStr) {
-                                    note += `\n   ${arrivesBefore ? '✅' : '⚠️'} ${poLabel} ETA ~${etaStr}`;
+                                    note += `\n   ${arrivesBefore ? 'âœ…' : 'âš ï¸'} ${poLabel} ETA ~${etaStr}`;
                                     if (!arrivesBefore) {
                                         const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
                                         const etaMs = new Date(po.orderDate).getTime() + (demand.leadTimeDays ?? 0) * 86400000;
                                         const daysLate = Math.ceil((etaMs - buildMs) / 86400000);
-                                        note += ` — arrives ~${daysLate}d after build`;
+                                        note += ` â€” arrives ~${daysLate}d after build`;
                                     }
                                 } else {
-                                    note += `\n   📦 ${poLabel} on order`;
+                                    note += `\n   ðŸ“¦ ${poLabel} on order`;
                                 }
 
                                 if (demand.incomingPOs.length > 1) {
                                     note += ` (+${demand.incomingPOs.length - 1} more PO${demand.incomingPOs.length > 2 ? 's' : ''})`;
                                 }
                             } else {
-                                note += '\n   ⛔ No PO on order';
+                                note += '\n   â›” No PO on order';
                             }
 
                             note += ` (${todayLabel})`;
@@ -1822,7 +1765,7 @@ export class OpsManager {
                     }
 
                     if (annotated > 0) {
-                        console.log(`📅 [build-risk] Annotated ${annotated} calendar event(s) with component shortage warnings.`);
+                        console.log(`ðŸ“… [build-risk] Annotated ${annotated} calendar event(s) with component shortage warnings.`);
                     }
                 } catch (err: any) {
                     console.warn('[build-risk] Calendar block annotation failed (non-fatal):', err.message);
@@ -1830,7 +1773,7 @@ export class OpsManager {
 
                 await saveBuildRiskSnapshot(report);
 
-                // Smart reorder prescriptions — fires as a follow-up Telegram message.
+                // Smart reorder prescriptions â€” fires as a follow-up Telegram message.
                 // Deduped: only sends if (sku, 'reorder') hasn't been alerted in the last 20 hours.
                 try {
                     const { generateReorderPrescriptions, formatPrescriptionsTelegram } = await import('../builds/reorder-engine');
@@ -1864,7 +1807,7 @@ export class OpsManager {
                                     { onConflict: 'sku,alert_type' }
                                 );
                             }
-                            console.log(`🧠 [reorder] Sent ${fresh.length} prescription${fresh.length > 1 ? 's' : ''}.`);
+                            console.log(`ðŸ§  [reorder] Sent ${fresh.length} prescription${fresh.length > 1 ? 's' : ''}.`);
                         }
                     }
                 } catch (err: any) {
@@ -1872,14 +1815,14 @@ export class OpsManager {
                 }
             });
 
-            console.log(`✅ Build risk report sent: 🔴 ${report.criticalCount} · 🟡 ${report.warningCount} · 👀 ${report.watchCount} · ✅ ${report.okCount}`);
+            console.log(`âœ… Build risk report sent: ðŸ”´ ${report.criticalCount} Â· ðŸŸ¡ ${report.warningCount} Â· ðŸ‘€ ${report.watchCount} Â· âœ… ${report.okCount}`);
         } catch (err: any) {
-            console.error("❌ Build risk analysis failed:", err.message);
+            console.error("âŒ Build risk analysis failed:", err.message);
 
             // Report the failure to Telegram so Will knows
             this.bot.telegram.sendMessage(
                 process.env.TELEGRAM_CHAT_ID || "",
-                `⚠️ _Daily build risk analysis failed: ${err.message}_\n_Run \`/buildrisk\` manually to troubleshoot._`,
+                `âš ï¸ _Daily build risk analysis failed: ${err.message}_\n_Run \`/buildrisk\` manually to troubleshoot._`,
                 { parse_mode: "Markdown" }
             );
         }
@@ -1892,7 +1835,7 @@ export class OpsManager {
         else date.setDate(date.getDate() - 7);
         const isoDate = date.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 
-        // For weekly reports AND daily week-to-date data, calculate Monday of current week → tomorrow
+        // For weekly reports AND daily week-to-date data, calculate Monday of current week â†’ tomorrow
         const now = new Date();
         const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 5=Fri
         const monday = new Date(now);
@@ -1921,17 +1864,17 @@ export class OpsManager {
                 supabase.from("documents").select("type, status, email_from, email_subject, action_required, created_at").gte("created_at", queryStartDate).limit(20)
             ]);
 
-            // Grab Finale received and committed PO data — use full week range for both reports
+            // Grab Finale received and committed PO data â€” use full week range for both reports
             let finaleReceivedPOs: any[] = [];
             let finaleCommittedPOs: any[] = [];
             // DECISION(2026-03-23): Also fetch last week's committed POs so the morning
             // summary includes prior-week spend for comparison. Uses the previous
-            // Monday→Sunday window. Only fetched for daily reports (weekly already covers it).
+            // Mondayâ†’Sunday window. Only fetched for daily reports (weekly already covers it).
             let lastWeekCommittedPOs: any[] = [];
             try {
                 const finale = finaleClient;
 
-                // Previous week range: Mon→Sun before current week
+                // Previous week range: Monâ†’Sun before current week
                 const prevMonday = new Date(monday);
                 prevMonday.setDate(prevMonday.getDate() - 7);
                 const prevSunday = new Date(monday); // Current Monday = end of previous week
@@ -1956,7 +1899,7 @@ export class OpsManager {
                 console.warn("Could not fetch Finale PO activity for summary", err);
             }
 
-            // Unread emails: daily only — not relevant for weekly review
+            // Unread emails: daily only â€” not relevant for weekly review
             let unreadCount = 0;
             let unreadSubjects: string[] = [];
             if (timeframe === "yesterday") {
@@ -2037,12 +1980,12 @@ export class OpsManager {
             ? `Generate a concise Friday Weekly Operations Review for BuildASoil from the data below.
 
 INCLUDE (in this order):
-1. **Weekly Receivings** — List EVERY PO received this week. For each: vendor name, PO number, total units received, dollar amount, and key SKUs. End with a total (# POs, total units, total $).
-2. **POs Committed This Week** — List each new PO placed: vendor, PO number, dollar amount. End with total spend.
-3. **Notable items** — Any anomalies, large orders, or action items worth flagging.
+1. **Weekly Receivings** â€” List EVERY PO received this week. For each: vendor name, PO number, total units received, dollar amount, and key SKUs. End with a total (# POs, total units, total $).
+2. **POs Committed This Week** â€” List each new PO placed: vendor, PO number, dollar amount. End with total spend.
+3. **Notable items** â€” Any anomalies, large orders, or action items worth flagging.
 
 DO NOT include: vendors-contacted/invoiced section, unread emails, document processing stats.
-Format with clean markdown bullets. Be specific with numbers — no vague summaries.
+Format with clean markdown bullets. Be specific with numbers â€” no vague summaries.
 Data: ${JSON.stringify(data)}`
             : `Summarize the following operations activity for the Daily Morning report.
 The data provided contains explicit week-to-date and yesterday-only Finale slices.
@@ -2052,7 +1995,7 @@ Focus on:
 - Total spend/amount due (Week-to-date and Yesterday specific).
 - Finale receivings (Use finale_receivings_wtd for totals, AND finale_receivings_yesterday for yesterday's specific POs received).
 - Committed POs (Use finale_committed_wtd for totals, AND finale_committed_yesterday for yesterday's specific POs placed).
-- **Last Week's PO Spend** — The data includes "last_week_committed" (list of committed POs from the previous Mon–Sun) and "last_week_total_spend" (their sum). Show this as a one-liner: "Last Week Committed: X POs · $Y total". This gives Will a quick comparison.
+- **Last Week's PO Spend** â€” The data includes "last_week_committed" (list of committed POs from the previous Monâ€“Sun) and "last_week_total_spend" (their sum). Show this as a one-liner: "Last Week Committed: X POs Â· $Y total". This gives Will a quick comparison.
 - Unread actionable email count (current snapshot).
 
 DO NOT include a vendors-contacted/invoiced section.
@@ -2069,18 +2012,18 @@ Data: ${JSON.stringify(data)}`;
         }
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // PURCHASING CALENDAR SYNC
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Build the status emoji prefix for a PO based on its Finale status string.
      */
     private poStatusEmoji(status: string): string {
         const s = (status || '').toLowerCase();
-        if (s === 'completed') return '✅';
-        if (s === 'cancelled') return '❌';
-        return '🔜';
+        if (s === 'completed') return 'âœ…';
+        if (s === 'cancelled') return 'âŒ';
+        return 'ðŸ”œ';
     }
 
     /**
@@ -2103,10 +2046,10 @@ Data: ${JSON.stringify(data)}`;
 
     /**
      * Build the calendar event title for a PO.
-     * DECISION(2026-03-11): Unreceived POs get 🔴 prefix for visual urgency.
+     * DECISION(2026-03-11): Unreceived POs get ðŸ”´ prefix for visual urgency.
      */
     private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status)): string {
-        return `${lifecycle.titleEmoji} PO #${po.orderId} — ${po.vendorName}`;
+        return `${lifecycle.titleEmoji} PO #${po.orderId} â€” ${po.vendorName}`;
     }
 
     /**
@@ -2152,8 +2095,8 @@ Data: ${JSON.stringify(data)}`;
             lines.push(`Tracking: Awaiting Tracking`);
         }
 
-        // Line items — max 5 + overflow count
-        const itemLines = po.items.slice(0, 5).map(i => `${i.productId} × ${i.quantity.toLocaleString()}`);
+        // Line items â€” max 5 + overflow count
+        const itemLines = po.items.slice(0, 5).map(i => `${i.productId} Ã— ${i.quantity.toLocaleString()}`);
         if (po.items.length > 5) itemLines.push(`+ ${po.items.length - 5} more`);
         lines.push(`Items: ${itemLines.join(', ')}`);
 
@@ -2162,12 +2105,12 @@ Data: ${JSON.stringify(data)}`;
         lines.push(`Status: ${lifecycle.statusLabel}`);
 
         if (lifecycle.isDeliveredAwaitingReceipt) {
-            lines.push(`🟡 <b>TRACKING SHOWS DELIVERED — VERIFY RECEIVING IN FINALE</b>`);
+            lines.push(`ðŸŸ¡ <b>TRACKING SHOWS DELIVERED â€” VERIFY RECEIVING IN FINALE</b>`);
         } else if (!isReceived && !isCancelled) {
-            lines.push(`🔴 <b>NOT YET RECEIVED</b>`);
+            lines.push(`ðŸ”´ <b>NOT YET RECEIVED</b>`);
         }
 
-        lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
+        lines.push(`â†’ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
 
         return lines.join('\n');
     }
@@ -2176,10 +2119,10 @@ Data: ${JSON.stringify(data)}`;
      * Sync all recent purchase orders to the purchasing Google Calendar.
      * - Creates a new all-day event (on the expected arrival date) for each new PO
      * - Updates the event title/description in place when status changes
-     * - Expected arrival date: Finale's deliverDate → vendor median lead time → 14d default
+     * - Expected arrival date: Finale's deliverDate â†’ vendor median lead time â†’ 14d default
      *
      * Runs every 4 hours via cron. Also called by the backfill script.
-     * Never throws — all errors are logged and swallowed.
+     * Never throws â€” all errors are logged and swallowed.
      */
     async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number; cleared: number }> {
         const counts = { created: 0, updated: 0, skipped: 0, cleared: 0 };
@@ -2187,7 +2130,7 @@ Data: ${JSON.stringify(data)}`;
             const finale = finaleClient;
             const supabase = createClient();
             if (!supabase) {
-                console.warn('[cal-sync] Supabase unavailable — skipping purchasing calendar sync');
+                console.warn('[cal-sync] Supabase unavailable â€” skipping purchasing calendar sync');
                 return counts;
             }
 
@@ -2222,17 +2165,18 @@ Data: ${JSON.stringify(data)}`;
             }
 
             const calendar = new CalendarClient();
+            const completionSignals = await loadPOCompletionSignalIndex(supabase, pos.map(p => p.orderId).filter(Boolean));
 
             for (const po of pos) {
                 if (!po.orderId) continue;
-                // Skip dropship POs — they're pass-through orders, not BuildASoil inventory
+                // Skip dropship POs â€” they're pass-through orders, not BuildASoil inventory
                 if (po.orderId.toLowerCase().includes('dropship')) continue;
-                // Only show committed or received — skip drafts and cancelled
+                // Only show committed or received â€” skip drafts and cancelled
                 if (!['committed', 'completed'].includes((po.status || '').toLowerCase())) continue;
 
                 // Determine expected arrival date.
-                // NOTE: Finale's dueDate is payment terms (Net 30 etc), NOT delivery estimate — ignored.
-                // Priority: vendor history median (≥3 completed POs) → 14d global default.
+                // NOTE: Finale's dueDate is payment terms (Net 30 etc), NOT delivery estimate â€” ignored.
+                // Priority: vendor history median (â‰¥3 completed POs) â†’ 14d global default.
                 let expectedDate: string;
                 let leadProvenance: string;
 
@@ -2255,25 +2199,35 @@ Data: ${JSON.stringify(data)}`;
                     trackingStatuses.set(t, await getTrackingStatus(t));
                 }));
 
-                // Hash = sorted "num:status" pairs — changes when EasyPost status changes
+                // Hash = sorted "num:status" pairs â€” changes when EasyPost status changes
                 const trackingHash = trackingNumbers.slice().sort().map(t => {
                     const ts = trackingStatuses.get(t);
                     return ts ? `${t}:${ts.category}` : t;
                 }).join(',');
 
-                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()));
+                const completionSignal = completionSignals.get(po.orderId);
+                const completionState = derivePOCompletionState({
+                    finaleReceived: (po.status || '').toLowerCase() === 'completed',
+                    trackingDelivered: Array.from(trackingStatuses.values()).length > 0 &&
+                        Array.from(trackingStatuses.values()).every(ts => ts?.category === 'delivered'),
+                    hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
+                    reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
+                    freightResolved: completionSignal?.freightResolved || false,
+                    unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
+                });
+                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState);
                 const title = this.buildPOEventTitle(po, lifecycle);
                 const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
                 const newStatus = lifecycle.calendarStatus;
                 const eventDate = getPurchasingEventDate(expectedDate, po.receiveDate, lifecycle);
 
                 const existingRow = existing.get(po.orderId);
-                if (lifecycle.isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
+                if (completionState === 'complete' && lifecycle.isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
                     if (existingRow) {
                         await calendar.deleteEvent(existingRow.calendar_id, existingRow.event_id);
                         await supabase.from('purchasing_calendar_events').delete().eq('po_number', po.orderId);
                         counts.cleared++;
-                        console.log(`📅 [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
+                        console.log(`ðŸ“… [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
                     } else {
                         counts.skipped++;
                     }
@@ -2283,7 +2237,7 @@ Data: ${JSON.stringify(data)}`;
                 const colorId = lifecycle.colorId;
 
                 if (!existingRow) {
-                    // New PO — create calendar event
+                    // New PO â€” create calendar event
                     try {
                         const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
                             title,
@@ -2299,12 +2253,12 @@ Data: ${JSON.stringify(data)}`;
                             last_tracking: trackingHash
                         });
                         counts.created++;
-                        console.log(`📅 [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${eventDate}`);
+                        console.log(`ðŸ“… [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${eventDate}`);
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
                 } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
-                    // Status changed or tracking changed — update in place
+                    // Status changed or tracking changed â€” update in place
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
                         existingRow.event_id,
@@ -2317,13 +2271,13 @@ Data: ${JSON.stringify(data)}`;
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
                         .eq('po_number', po.orderId);
                     counts.updated++;
-                    console.log(`📅 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus}, tracking changed=${existingRow.last_tracking !== trackingHash}`);
+                    console.log(`ðŸ“… [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus}, tracking changed=${existingRow.last_tracking !== trackingHash}`);
                 } else {
                     counts.skipped++;
                 }
             }
 
-            console.log(`[cal-sync] Done — ${counts.created} created, ${counts.updated} updated, ${counts.cleared} cleared, ${counts.skipped} skipped`);
+            console.log(`[cal-sync] Done â€” ${counts.created} created, ${counts.updated} updated, ${counts.cleared} cleared, ${counts.skipped} skipped`);
         } catch (err: any) {
             console.error('[cal-sync] syncPurchasingCalendar error:', err.message);
         }
@@ -2339,14 +2293,14 @@ Data: ${JSON.stringify(data)}`;
      *   3. Fill ULINE Quick Order cart via Chrome automation
      *   4. Send Telegram notification with manifest, PO link, and cart status
      *
-     * Runs via cron at 8:30 AM Denver every Friday. Never throws — errors are
+     * Runs via cron at 8:30 AM Denver every Friday. Never throws â€” errors are
      * caught and reported via Telegram. Will just reviews cart and checks out.
      */
     async runFridayUlineOrder() {
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!chatId) return;
 
-        console.log('[uline-friday] 🛒 Starting Friday ULINE auto-order...');
+        console.log('[uline-friday] ðŸ›’ Starting Friday ULINE auto-order...');
 
         const { runAutonomousUlineOrder } = await import('../../cli/order-uline');
         const result = await runAutonomousUlineOrder();
@@ -2355,7 +2309,7 @@ Data: ${JSON.stringify(data)}`;
         if (!result.success) {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `🚨 <b>ULINE Friday Order — Failed</b>\n\n` +
+                `ðŸš¨ <b>ULINE Friday Order â€” Failed</b>\n\n` +
                 `<b>Error:</b> <code>${result.error || 'Unknown error'}</code>\n\n` +
                 `Run manually: <code>node --import tsx src/cli/order-uline.ts --auto-reorder --create-po</code>`,
                 { parse_mode: 'HTML' }
@@ -2367,48 +2321,48 @@ Data: ${JSON.stringify(data)}`;
         if (result.itemCount === 0) {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `✅ <b>ULINE Friday Order — All Stocked</b>\n\n` +
+                `âœ… <b>ULINE Friday Order â€” All Stocked</b>\n\n` +
                 `Purchasing intelligence scanned all ULINE items.\n` +
-                `Everything is above reorder threshold — no order needed this week. 🎉`,
+                `Everything is above reorder threshold â€” no order needed this week. ðŸŽ‰`,
                 { parse_mode: 'HTML' }
             );
             return;
         }
 
-        // Case 3: Items ordered — build rich notification
+        // Case 3: Items ordered â€” build rich notification
         const itemLines = result.items
             .map(i => {
                 const qtyLabel = i.finaleEachQty === i.effectiveEachQty
                     ? `${i.qty}`
-                    : `${i.qty} <i>(Finale ${i.finaleEachQty} ea → ${i.effectiveEachQty} ea)</i>`;
-                return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.qty * i.unitPrice).toFixed(2)})`;
+                    : `${i.qty} <i>(Finale ${i.finaleEachQty} ea â†’ ${i.effectiveEachQty} ea)</i>`;
+                return `  <code>${i.ulineModel}</code> Ã— ${qtyLabel}  ($${(i.qty * i.unitPrice).toFixed(2)})`;
             })
             .join('\n');
 
         const poLine = result.finalePO && result.finaleUrl
-            ? `📄 <a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
+            ? `ðŸ“„ <a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
             : result.finalePO
-                ? `📄 Finale PO #${result.finalePO}`
-                : '⚠️ PO creation skipped';
+                ? `ðŸ“„ Finale PO #${result.finalePO}`
+                : 'âš ï¸ PO creation skipped';
 
         const cartIcon = result.cartVerificationStatus === 'verified'
-            ? '🛒'
+            ? 'ðŸ›’'
             : result.cartVerificationStatus === 'partial'
-                ? '⚠️'
-                : '🟡';
+                ? 'âš ï¸'
+                : 'ðŸŸ¡';
 
-        let msg = `🛒 <b>ULINE Friday Order — Ready for Checkout</b>\n\n`;
+        let msg = `ðŸ›’ <b>ULINE Friday Order â€” Ready for Checkout</b>\n\n`;
         msg += `${poLine}\n`;
-        msg += `💰 Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n`;
-        msg += `📦 ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n`;
+        msg += `ðŸ’° Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n`;
+        msg += `ðŸ“¦ ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n`;
         msg += `${itemLines}\n\n`;
         msg += `${cartIcon} Cart: ${result.cartResult}\n`;
         if (result.priceUpdatesApplied > 0) {
-            msg += `💰 Draft PO price sync: ${result.priceUpdatesApplied} line item update(s) applied\n`;
+            msg += `ðŸ’° Draft PO price sync: ${result.priceUpdatesApplied} line item update(s) applied\n`;
         }
         msg += `\n`;
         msg += `<i>Review your ULINE cart and checkout when ready.</i>\n`;
-        msg += `<i>🔗 <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a></i>`;
+        msg += `<i>ðŸ”— <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a></i>`;
 
         await this.bot.telegram.sendMessage(chatId, msg, {
             parse_mode: 'HTML',
@@ -2416,11 +2370,11 @@ Data: ${JSON.stringify(data)}`;
             disable_web_page_preview: true,
         });
 
-        console.log(`[uline-friday] ✅ Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
+        console.log(`[uline-friday] âœ… Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
     }
 
     /**
-     * ── AXIOM DEMAND SCANNER ─────────────────────────────────
+     * â”€â”€ AXIOM DEMAND SCANNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
      * Periodically scans Finale for suggested reorder quantities for Axiom labels,
      * and queues them up in Supabase for user review on the dashboard.
      */
@@ -2435,7 +2389,7 @@ Data: ${JSON.stringify(data)}`;
                 if (chatId) {
                     await this.bot.telegram.sendMessage(
                         chatId,
-                        `🏷️ <b>Axiom Labels Demand Scan</b>\n\nQueued/Updated ${result.queuedCount} items for reorder.\n<a href="https://buildasoil.dash.app/">Review on Dashboard</a>`,
+                        `ðŸ·ï¸ <b>Axiom Labels Demand Scan</b>\n\nQueued/Updated ${result.queuedCount} items for reorder.\n<a href="https://buildasoil.dash.app/">Review on Dashboard</a>`,
                         { parse_mode: 'HTML' } // Use standard dash link since Aria dashboard doesn't exist yet/used murp.app
                     ).catch((e: any) => console.warn('[ops-manager] Axiom scan alert failed:', e.message));
                 }
@@ -2446,7 +2400,7 @@ Data: ${JSON.stringify(data)}`;
     }
 
     /**
-     * ── SLACK ETA SYNC ─────────────────────────────────────────
+     * â”€â”€ SLACK ETA SYNC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
      * Periodically queries sys_chat_logs for POs requested in Slack threads,
      * checks live tracking ETAs for those POs, and pushes ETA updates
      * to the exact original Slack thread if the ETA display string changed.
@@ -2455,7 +2409,7 @@ Data: ${JSON.stringify(data)}`;
         const supabase = createClient();
         if (!supabase) return;
 
-        console.log("🚚 [Slack ETA Sync] Checking for live ETA updates...");
+        console.log("ðŸšš [Slack ETA Sync] Checking for live ETA updates...");
 
         const thirtyDaysAgo = new Date();
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
@@ -2518,7 +2472,7 @@ Data: ${JSON.stringify(data)}`;
                     const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
                     const link = ts.public_url ? `<${ts.public_url}|${displayNum}>` : displayNum;
                     
-                    messagesToSend.push(`🚚 *PO#${poNumber} Update*: ${carrier} tracking ${link} is now *${currentStatus}*`);
+                    messagesToSend.push(`ðŸšš *PO#${poNumber} Update*: ${carrier} tracking ${link} is now *${currentStatus}*`);
                 }
             }
 
@@ -2535,10 +2489,10 @@ Data: ${JSON.stringify(data)}`;
                                 thread_ts,
                                 text: combinedMessage
                             });
-                            console.log(`  💬 [Slack Watchdog] Pushed ETA update to thread for PO#${poNumber}`);
+                            console.log(`  ðŸ’¬ [Slack Watchdog] Pushed ETA update to thread for PO#${poNumber}`);
                             sentUpdatesCount++;
                         } catch (err: any) {
-                            console.error(`  ❌ Failed to post ETA to Slack thread: ${err.message}`);
+                            console.error(`  âŒ Failed to post ETA to Slack thread: ${err.message}`);
                         }
                     }
                 }
@@ -2549,13 +2503,13 @@ Data: ${JSON.stringify(data)}`;
                     .eq('po_number', poNumber);
                     
                 if (updateRes.error) {
-                    console.error(`  ❌ Failed to save last_eta_update for PO#${poNumber}:`, updateRes.error.message);
+                    console.error(`  âŒ Failed to save last_eta_update for PO#${poNumber}:`, updateRes.error.message);
                 }
             }
         }
 
         if (sentUpdatesCount > 0) {
-            console.log(`🚚 [Slack ETA Sync] Sent ${sentUpdatesCount} thread updates.`);
+            console.log(`ðŸšš [Slack ETA Sync] Sent ${sentUpdatesCount} thread updates.`);
         }
     }
 }

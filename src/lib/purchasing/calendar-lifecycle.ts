@@ -1,12 +1,22 @@
 import type { TrackingStatus } from "../carriers/tracking-service";
+import type { POCompletionState } from "./po-completion-state";
 
 export const RECEIVED_CALENDAR_RETENTION_DAYS = 14;
 export const RECEIVED_DASHBOARD_RETENTION_DAYS = 3;
 
-export type PurchasingCalendarStatus = "open" | "delivered" | "received" | "cancelled";
+export type PurchasingCalendarStatus =
+    | "open"
+    | "delivered"
+    | "received"
+    | "received_pending_invoice"
+    | "received_pending_reconciliation"
+    | "complete"
+    | "exception"
+    | "cancelled";
 
 export interface PurchasingLifecycleState {
     calendarStatus: PurchasingCalendarStatus;
+    completionState: POCompletionState | null;
     colorId: string;
     titleEmoji: string;
     statusLabel: string;
@@ -44,7 +54,8 @@ export function shouldKeepReceivedPurchase(
 
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
-    trackingStatuses: Array<TrackingStatus | null> = []
+    trackingStatuses: Array<TrackingStatus | null> = [],
+    completionState: POCompletionState | null = null
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
     const isReceived = normalized === "completed";
@@ -58,20 +69,69 @@ export function derivePurchasingLifecycle(
         knownStatuses.every(item => item.category === "delivered");
 
     if (isReceived) {
-        return {
-            calendarStatus: "received",
-            colorId: "2",
-            titleEmoji: "✅",
-            statusLabel: "Received",
-            isReceived: true,
-            isCancelled: false,
-            isDeliveredAwaitingReceipt: false,
-        };
+        switch (completionState) {
+            case "complete":
+                return {
+                    calendarStatus: "complete",
+                    completionState,
+                    colorId: "2",
+                    titleEmoji: "✅",
+                    statusLabel: "Complete",
+                    isReceived: true,
+                    isCancelled: false,
+                    isDeliveredAwaitingReceipt: false,
+                };
+            case "received_pending_invoice":
+                return {
+                    calendarStatus: "received_pending_invoice",
+                    completionState,
+                    colorId: "2",
+                    titleEmoji: "🟢",
+                    statusLabel: "Received - Awaiting Invoice",
+                    isReceived: true,
+                    isCancelled: false,
+                    isDeliveredAwaitingReceipt: false,
+                };
+            case "received_pending_reconciliation":
+                return {
+                    calendarStatus: "received_pending_reconciliation",
+                    completionState,
+                    colorId: "2",
+                    titleEmoji: "🟢",
+                    statusLabel: "Received - AP Follow-Up Needed",
+                    isReceived: true,
+                    isCancelled: false,
+                    isDeliveredAwaitingReceipt: false,
+                };
+            case "exception":
+                return {
+                    calendarStatus: "exception",
+                    completionState,
+                    colorId: "6",
+                    titleEmoji: "🟠",
+                    statusLabel: "Received - Exception Needs Review",
+                    isReceived: true,
+                    isCancelled: false,
+                    isDeliveredAwaitingReceipt: false,
+                };
+            default:
+                return {
+                    calendarStatus: "received",
+                    completionState,
+                    colorId: "2",
+                    titleEmoji: "✅",
+                    statusLabel: "Received",
+                    isReceived: true,
+                    isCancelled: false,
+                    isDeliveredAwaitingReceipt: false,
+                };
+        }
     }
 
     if (isCancelled) {
         return {
             calendarStatus: "cancelled",
+            completionState,
             colorId: "11",
             titleEmoji: "❌",
             statusLabel: "Cancelled",
@@ -84,6 +144,7 @@ export function derivePurchasingLifecycle(
     if (hasDeliveredProof) {
         return {
             calendarStatus: "delivered",
+            completionState,
             colorId: "5",
             titleEmoji: "🟡",
             statusLabel: "Delivered - Awaiting Receipt",
@@ -95,6 +156,7 @@ export function derivePurchasingLifecycle(
 
     return {
         calendarStatus: "open",
+        completionState,
         colorId: "11",
         titleEmoji: "🔴",
         statusLabel: "In Transit",

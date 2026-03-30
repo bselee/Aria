@@ -12,8 +12,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, ExternalLink, Package } from "lucide-react";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS } from "@/lib/purchasing/calendar-lifecycle";
+import type { POCompletionState } from "@/lib/purchasing/po-completion-state";
 
-// ── Types ────────────────────────────────────────────────────────
+// â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 type ActivePurchase = {
     orderId: string;
     vendorName: string;
@@ -27,6 +28,7 @@ type ActivePurchase = {
     leadProvenance: string;
     trackingNumbers?: string[];
     isReceived: boolean;
+    completionState: POCompletionState;
 };
 
 type DayGroup = {
@@ -37,7 +39,7 @@ type DayGroup = {
     purchases: ActivePurchase[];
 };
 
-// ── Helpers ──────────────────────────────────────────────────────
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /** Returns "Today", "Tomorrow", "Yesterday", or "Wed Mar 26" */
 function friendlyDate(dateKey: string, todayKey: string): string {
@@ -65,6 +67,13 @@ function daysDiff(from: string, to: string): number {
     return Math.round((b - a) / 86_400_000);
 }
 
+function followUpLabel(state: POCompletionState): string {
+    if (state === "received_pending_invoice") return "Received - invoice still needed";
+    if (state === "received_pending_reconciliation") return "Received - AP follow-up still open";
+    if (state === "exception") return "Received - exception needs review";
+    return "Received";
+}
+
 function todayKey(): string {
     return new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
 }
@@ -90,7 +99,7 @@ function carrierUrl(trackingNumber: string): string {
     return `https://parcelsapp.com/en/tracking/${raw}`;
 }
 
-// ── Component ────────────────────────────────────────────────────
+// â”€â”€ Component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export default function PurchasingCalendarPanel() {
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
     const [loading, setLoading] = useState(true);
@@ -100,7 +109,7 @@ export default function PurchasingCalendarPanel() {
     const [bodyHeight, setBodyHeight] = useState(400);
     const dragRef = useRef<{ startY: number; startH: number } | null>(null);
 
-    // ── Persistence ──
+    // â”€â”€ Persistence â”€â”€
     useEffect(() => {
         const s = localStorage.getItem("aria-dash-pcal-collapsed");
         if (s === "true") setIsCollapsed(true);
@@ -110,7 +119,7 @@ export default function PurchasingCalendarPanel() {
     useEffect(() => { localStorage.setItem("aria-dash-pcal-collapsed", String(isCollapsed)); }, [isCollapsed]);
     useEffect(() => { localStorage.setItem("aria-dash-pcal-h", String(bodyHeight)); }, [bodyHeight]);
 
-    // ── Resize handle ──
+    // â”€â”€ Resize handle â”€â”€
     const startResize = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
         dragRef.current = { startY: e.clientY, startH: bodyHeight };
@@ -128,7 +137,7 @@ export default function PurchasingCalendarPanel() {
         window.addEventListener("mouseup", onUp);
     }, [bodyHeight]);
 
-    // ── Fetch data ──
+    // â”€â”€ Fetch data â”€â”€
     const fetchData = useCallback(async (isRefresh = false) => {
         if (isRefresh) setRefreshing(true); else setLoading(true);
         setError(null);
@@ -152,16 +161,15 @@ export default function PurchasingCalendarPanel() {
         return () => clearInterval(id);
     }, [fetchData]);
 
-    // ── Build day groups ──
+    // â”€â”€ Build day groups â”€â”€
     const today = todayKey();
 
-    // Only unreceived committed POs
-    const pending = purchases.filter(p => !p.isReceived);
+    const pending = purchases.filter(p => p.completionState !== "complete");
 
     // Group by expected date
     const grouped = new Map<string, ActivePurchase[]>();
     for (const po of pending) {
-        const key = po.expectedDate || today;
+        const key = po.isReceived ? today : (po.expectedDate || today);
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key)!.push(po);
     }
@@ -188,12 +196,13 @@ export default function PurchasingCalendarPanel() {
 
     // Recently received (last few days, aligned with server retention)
     const recentlyReceived = purchases.filter(p => {
+        if (p.completionState !== "complete") return false;
         if (!p.isReceived || !p.receiveDate) return false;
         const diff = daysDiff(p.receiveDate.split("T")[0], today);
         return diff >= 0 && diff <= RECEIVED_DASHBOARD_RETENTION_DAYS;
     });
 
-    // ── Render ──
+    // â”€â”€ Render â”€â”€
     return (
         <div className="flex flex-col border border-zinc-800 rounded bg-[#0c0c0e] overflow-hidden">
             {/* Header */}
@@ -249,52 +258,52 @@ export default function PurchasingCalendarPanel() {
                         ) : pending.length === 0 ? (
                             <div className="flex flex-col items-center py-6 text-zinc-500 text-xs">
                                 <CheckCircle2 className="h-6 w-6 mb-2 text-emerald-500/60" />
-                                <span>All POs received — nothing pending.</span>
+                                <span>All POs received â€” nothing pending.</span>
                             </div>
                         ) : (
                             <>
-                                {/* ── OVERDUE ── */}
+                                {/* â”€â”€ OVERDUE â”€â”€ */}
                                 {overdue.length > 0 && (
                                     <DaySection
-                                        title={`⚠️ OVERDUE — ${overdueCount} PO${overdueCount !== 1 ? "s" : ""}`}
+                                        title={`âš ï¸ OVERDUE â€” ${overdueCount} PO${overdueCount !== 1 ? "s" : ""}`}
                                         groups={overdue}
                                         variant="overdue"
                                         today={today}
                                     />
                                 )}
 
-                                {/* ── TODAY ── */}
+                                {/* â”€â”€ TODAY â”€â”€ */}
                                 {todayGroup && (
                                     <DaySection
-                                        title={`📦 TODAY — ${todayCount} expected`}
+                                        title={`ðŸ“¦ TODAY â€” ${todayCount} expected`}
                                         groups={[todayGroup]}
                                         variant="today"
                                         today={today}
                                     />
                                 )}
 
-                                {/* ── UPCOMING ── */}
+                                {/* â”€â”€ UPCOMING â”€â”€ */}
                                 {upcoming.length > 0 && (
                                     <DaySection
-                                        title="📅 UPCOMING"
+                                        title="ðŸ“… UPCOMING"
                                         groups={upcoming}
                                         variant="upcoming"
                                         today={today}
                                     />
                                 )}
 
-                                {/* ── RECENTLY RECEIVED ── */}
+                                {/* â”€â”€ RECENTLY RECEIVED â”€â”€ */}
                                 {recentlyReceived.length > 0 && (
                                     <div className="border-t border-zinc-800/50 pt-2 mt-3">
                                         <h3 className="text-[10px] font-mono uppercase tracking-wider text-emerald-500/70 mb-1.5">
-                                            ✅ Recently Received ({recentlyReceived.length})
+                                            âœ… Recently Received ({recentlyReceived.length})
                                         </h3>
                                         <div className="space-y-1">
                                             {recentlyReceived.map(po => (
                                                 <div key={po.orderId} className="flex items-center gap-2 text-[10px] text-zinc-600 font-mono">
                                                     <CheckCircle2 className="h-2.5 w-2.5 text-emerald-600/50 shrink-0" />
                                                     <span className="truncate">
-                                                        #{po.orderId} {po.vendorName} — rcvd {shortDate(po.receiveDate)}
+                                                        #{po.orderId} {po.vendorName} â€” rcvd {shortDate(po.receiveDate)}
                                                     </span>
                                                 </div>
                                             ))}
@@ -317,7 +326,7 @@ export default function PurchasingCalendarPanel() {
     );
 }
 
-// ── Day Section ──────────────────────────────────────────────────
+// â”€â”€ Day Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function DaySection({
     title,
     groups,
@@ -387,7 +396,7 @@ function DaySection({
     );
 }
 
-// ── Single PO Row ────────────────────────────────────────────────
+// â”€â”€ Single PO Row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function PORow({
     po,
     variant,
@@ -401,6 +410,7 @@ function PORow({
     const topSkus = po.items.slice(0, 3).map(i => i.productId).join(", ");
     const more = po.items.length > 3 ? ` +${po.items.length - 3}` : "";
     const hasTracking = (po.trackingNumbers?.length || 0) > 0;
+    const needsAPFollowUp = po.isReceived && po.completionState !== "complete";
     const daysOverdue = variant === "overdue" ? Math.abs(daysDiff(po.expectedDate, today)) : 0;
 
     // Estimate revised ETA for overdue items: expected + 50% of overdue days as buffer
@@ -457,18 +467,24 @@ function PORow({
 
                     {/* Items summary */}
                     <div className="text-[10px] text-zinc-500 font-mono mt-0.5 truncate">
-                        {topSkus}{more} · {itemCount.toLocaleString()} units
+                        {topSkus}{more} Â· {itemCount.toLocaleString()} units
                     </div>
+
+                    {needsAPFollowUp && (
+                        <div className="mt-1 text-[10px] font-mono text-emerald-300/80">
+                            {followUpLabel(po.completionState)}
+                        </div>
+                    )}
 
                     {/* Overdue info */}
                     {variant === "overdue" && (
                         <div className="flex items-center gap-2 mt-1">
                             <span className="text-[10px] font-mono text-red-400/80">
-                                Expected {shortDate(po.expectedDate)} · {daysOverdue}d overdue
+                                Expected {shortDate(po.expectedDate)} Â· {daysOverdue}d overdue
                             </span>
                             {!hasTracking && (
                                 <span className="text-[10px] font-mono text-amber-400/70 px-1 py-0.5 bg-amber-500/10 rounded border border-amber-500/20">
-                                    ⚠ NO TRACKING — INVESTIGATE
+                                    âš  NO TRACKING â€” INVESTIGATE
                                 </span>
                             )}
                             {hasTracking && revisedEtaDate && (
@@ -484,7 +500,7 @@ function PORow({
                         <div className="flex flex-wrap gap-1 mt-1">
                             {po.trackingNumbers!.slice(0, 3).map((t, idx) => {
                                 const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
-                                const short = displayNum.length > 14 ? `…${displayNum.slice(-10)}` : displayNum;
+                                const short = displayNum.length > 14 ? `â€¦${displayNum.slice(-10)}` : displayNum;
                                 return (
                                     <a
                                         key={idx}
@@ -493,7 +509,7 @@ function PORow({
                                         rel="noopener noreferrer"
                                         className="text-[9px] font-mono text-cyan-400/70 hover:text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 rounded px-1 py-0.5 hover:bg-cyan-500/20 transition-colors"
                                     >
-                                        📦 {short}
+                                        ðŸ“¦ {short}
                                     </a>
                                 );
                             })}
@@ -510,7 +526,7 @@ function PORow({
                         <div className="text-[9px] text-zinc-600 font-mono mt-0.5">
                             ETA: {shortDate(po.expectedDate)} ({po.leadProvenance})
                             {!hasTracking && (
-                                <span className="ml-1 text-amber-500/50">· no tracking yet</span>
+                                <span className="ml-1 text-amber-500/50">Â· no tracking yet</span>
                             )}
                         </div>
                     )}
