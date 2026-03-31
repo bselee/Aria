@@ -5,19 +5,19 @@ import {
   snapshotVendorButtons,
   extractVendorChipNames,
   clickVendorChip,
+  waitForVendorChips,
+  waitForVendorPanelReady,
 } from "@/lib/purchasing/purchases-scraper-nav";
 
 const PURCHASES_URL = "https://basauto.vercel.app/purchases";
 const CDP_ENDPOINT = "http://127.0.0.1:9222";
-const PAGE_SETTLE_MS = 750;
 
 async function ensurePurchasesPage(page: any) {
   if (!page.url().includes("/purchases")) {
     await page.goto(PURCHASES_URL, { waitUntil: "networkidle", timeout: 60000 });
   }
 
-  await page.waitForSelector("button", { timeout: 30000 });
-  await page.waitForTimeout(PAGE_SETTLE_MS);
+  await waitForVendorChips(page);
 }
 
 async function scrapePurchases() {
@@ -42,8 +42,14 @@ async function scrapePurchases() {
 
   for (const vendorName of vendorNames) {
     console.log(`\n=== ${vendorName} ===`);
+    const headingText = await page
+      .locator("h1, h2, h3, h4, h5")
+      .first()
+      .textContent()
+      .then((text) => (text ? text.trim() : ""));
+
     await clickVendorChip(page, vendorName);
-    await page.waitForTimeout(PAGE_SETTLE_MS);
+    await waitForVendorPanelReady(page, headingText || null);
 
     const items = await page.evaluate(`
       (function() {
