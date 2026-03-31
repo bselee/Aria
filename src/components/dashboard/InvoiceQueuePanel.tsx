@@ -162,6 +162,9 @@ export default function InvoiceQueuePanel() {
   const stalePending = pending.filter(i => daysOld(i.processedAt) > STALE_THRESHOLD_DAYS);
   const freshPending = pending.filter(i => daysOld(i.processedAt) <= STALE_THRESHOLD_DAYS);
   const needsEyesTotal = needsEyes.missingPdf + needsEyes.humanInteraction;
+  const needsEyesParts = [];
+  if (needsEyes.missingPdf > 0) needsEyesParts.push(`${needsEyes.missingPdf} PDF`);
+  if (needsEyes.humanInteraction > 0) needsEyesParts.push(`${needsEyes.humanInteraction} HUMAN`);
 
   return (
     <div className="border-b border-zinc-800 shrink-0">
@@ -196,7 +199,7 @@ export default function InvoiceQueuePanel() {
         )}
         {needsEyesTotal > 0 && (
           <span className="text-xs font-mono font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-200 border-amber-500/30">
-            Needs Eyes {needsEyes.missingPdf} PDF {needsEyes.humanInteraction} HUMAN
+            Needs Eyes {needsEyesParts.join(" ")}
           </span>
         )}
         {!loading && pending.length === 0 && (

@@ -63,4 +63,19 @@ describe("InvoiceQueuePanel Needs Eyes badge", () => {
     expect(screen.getByText(/2 PDF/)).toBeTruthy();
     expect(screen.getByText(/1 HUMAN/)).toBeTruthy();
   });
+
+  it("omits zero-valued subcounts in the badge text", async () => {
+    stubLocalStorage();
+    stubFetch({
+      ...baseResponse,
+      needsEyes: { missingPdf: 0, humanInteraction: 1 },
+    });
+
+    render(<InvoiceQueuePanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(screen.getByText(/Needs Eyes/i)).toBeTruthy();
+    expect(screen.queryByText(/0 PDF/)).toBeNull();
+    expect(screen.getByText(/1 HUMAN/)).toBeTruthy();
+  });
 });
