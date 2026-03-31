@@ -8,6 +8,10 @@ import {
   waitForVendorChips,
   waitForVendorPanelReady,
 } from "@/lib/purchasing/purchases-scraper-nav";
+import {
+  parsePurchasesGuidanceItem,
+  type PurchasesGuidanceRawItem,
+} from "@/lib/purchasing/purchases-guidance-parser";
 
 const PURCHASES_URL = "https://basauto.vercel.app/purchases";
 const CDP_ENDPOINT = "http://127.0.0.1:9222";
@@ -51,7 +55,7 @@ async function scrapePurchases() {
     await clickVendorChip(page, vendorName);
     await waitForVendorPanelReady(page, headingText || null);
 
-    const items = await page.evaluate(`
+    const rawItems = await page.evaluate(`
       (function() {
         var results = [];
         var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
@@ -87,21 +91,22 @@ async function scrapePurchases() {
             }
           }
 
-          var metrics = {};
-          var leaves = card.querySelectorAll('*');
-          var prevLabel = '';
-          for (var m = 0; m < leaves.length; m++) {
-            var leaf = leaves[m];
-            if (leaf.children.length > 0) continue;
-            var txt = (leaf.textContent || '').trim();
-            if (!txt) continue;
+          var metricGroups = [];
+          var candidates = card.querySelectorAll('div, section, article, li');
+          for (var m = 0; m < candidates.length; m++) {
+            var candidate = candidates[m];
+            if (!candidate.children || candidate.children.length < 2) continue;
 
-            var isLabel = (txt === txt.toUpperCase()) && txt.length > 3 && txt.length < 50 && !/^[\\d$]/.test(txt);
-            if (isLabel) {
-              prevLabel = txt;
-            } else if (prevLabel && txt.length < 60) {
-              metrics[prevLabel] = txt;
-              prevLabel = '';
+            var texts = [];
+            for (var n = 0; n < candidate.children.length; n++) {
+              var childText = (candidate.children[n].textContent || '').trim().replace(/\\s+/g, ' ');
+              if (!childText || texts.indexOf(childText) !== -1) continue;
+              if (childText.length > 120) continue;
+              texts.push(childText);
+            }
+
+            if (texts.length >= 2) {
+              metricGroups.push(texts);
             }
           }
 
@@ -109,28 +114,13 @@ async function scrapePurchases() {
             sku: sku,
             description: description,
             urgency: urgency,
-            purchaseAgainBy: metrics['PURCHASE AGAIN BY'] || '',
-            recommendedReorderQty: metrics['RECOMMENDED REORDER QUANTITY'] || '',
-            supplierLeadTime: metrics['SUPPLIER LEAD TIME'] || '',
-            remaining: metrics['REMAINING'] || '',
-            last30DaysSold: metrics['LAST 30 DAYS SOLD'] || '',
-            last90DaysSold: metrics['LAST 90 DAYS SOLD'] || '',
-            dailyVelocity: metrics['DAILY VELOCITY'] || '',
-            ninetyDayConsumed: metrics['90 DAY CONSUMED'] || '',
-            avgBuildConsumption: metrics['AVG BUILD CONSUMPTION'] || '',
-            daysBuildsLeft: metrics['DAYS/BUILDS LEFT'] || '',
-            lastReceived: metrics['LAST RECEIVED'] || '',
-            ytdQtyBought: metrics['YTD QTY BOUGHT'] || '',
-            ytdPurchaseCost: metrics['YTD PURCHASE COST'] || '',
-            cogsExclShip: metrics['COGS EXCLUDING SHIP'] || '',
-            ytdQtySold: metrics['YTD QTY SOLD'] || '',
-            ytdRevenue: metrics['YTD REVENUE'] || '',
-            itemMargin: metrics['ITEM MARGIN BEFORE SHIPPING'] || '',
+            metricGroups: metricGroups,
           });
         }
         return results;
       })()
     `);
+    const items = (rawItems as PurchasesGuidanceRawItem[]).map((rawItem) => parsePurchasesGuidanceItem(rawItem));
 
     allVendorData[vendorName] = items as any[];
 
