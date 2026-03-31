@@ -38,9 +38,13 @@ export type InvoiceQueueStats = {
 };
 
 export type InvoiceQueueResponse = {
-    invoices: InvoiceQueueItem[];
-    stats: InvoiceQueueStats;
-    cachedAt: string;
+  invoices: InvoiceQueueItem[];
+  stats: InvoiceQueueStats;
+  needsEyes: {
+    missingPdf: number;
+    humanInteraction: number;
+  };
+  cachedAt: string;
 };
 
 // ── Module-level cache ────────────────────────────────────────────────────────
@@ -210,16 +214,28 @@ export async function GET(req: NextRequest) {
             };
         });
 
+        const needsEyes = {
+          missingPdf: 0,
+          humanInteraction: 0,
+        };
+
+        for (const log of logRaw ?? []) {
+          const reasonCode = log.metadata?.reasonCode;
+          if (reasonCode === "missing_pdf_manual_review") needsEyes.missingPdf++;
+          if (reasonCode === "human_interaction_manual_review") needsEyes.humanInteraction++;
+        }
+
         const result: InvoiceQueueResponse = {
-            invoices,
-            stats: {
-                totalToday,
-                autoApproved,
-                needsApproval,
-                unmatched,
-                totalDollarImpact,
-            },
-            cachedAt: new Date().toISOString(),
+          invoices,
+          stats: {
+            totalToday,
+            autoApproved,
+            needsApproval,
+            unmatched,
+            totalDollarImpact,
+          },
+          needsEyes,
+          cachedAt: new Date().toISOString(),
         };
 
         cache = result;

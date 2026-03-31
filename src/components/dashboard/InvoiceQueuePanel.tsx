@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useEffect, useState, useCallback } from "react";
 import { Receipt, ChevronDown, Check, X, AlertCircle } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
@@ -76,6 +77,7 @@ function pendingGuidance(inv: InvoiceQueueItem): { text: string; suggestion: "ap
 export default function InvoiceQueuePanel() {
   const [invoices, setInvoices] = useState<InvoiceQueueItem[]>([]);
   const [stats, setStats] = useState<InvoiceQueueStats | null>(null);
+  const [needsEyes, setNeedsEyes] = useState({ missingPdf: 0, humanInteraction: 0 });
   const [loading, setLoading] = useState(true);
   const [actingOn, setActingOn] = useState<string | null>(null);
   const [bulkDismissing, setBulkDismissing] = useState(false);
@@ -139,6 +141,7 @@ export default function InvoiceQueuePanel() {
         if (data) {
           setInvoices(data.invoices);
           setStats(data.stats);
+          setNeedsEyes(data.needsEyes ?? { missingPdf: 0, humanInteraction: 0 });
         }
         setLoading(false);
       })
@@ -158,6 +161,7 @@ export default function InvoiceQueuePanel() {
   // Identify stale pending items (older than threshold)
   const stalePending = pending.filter(i => daysOld(i.processedAt) > STALE_THRESHOLD_DAYS);
   const freshPending = pending.filter(i => daysOld(i.processedAt) <= STALE_THRESHOLD_DAYS);
+  const needsEyesTotal = needsEyes.missingPdf + needsEyes.humanInteraction;
 
   return (
     <div className="border-b border-zinc-800 shrink-0">
@@ -188,6 +192,11 @@ export default function InvoiceQueuePanel() {
         {stalePending.length > 0 && (
           <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-zinc-600/30 text-zinc-500 border-zinc-600/40">
             {stalePending.length} STALE
+          </span>
+        )}
+        {needsEyesTotal > 0 && (
+          <span className="text-xs font-mono font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-200 border-amber-500/30">
+            Needs Eyes {needsEyes.missingPdf} PDF {needsEyes.humanInteraction} HUMAN
           </span>
         )}
         {!loading && pending.length === 0 && (
