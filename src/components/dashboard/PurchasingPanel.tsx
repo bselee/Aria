@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart, AlertTriangle } from "lucide-react";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type PurchasingItem = {
@@ -13,6 +13,7 @@ type PurchasingItem = {
     urgency: "critical" | "warning" | "watch" | "ok";
     explanation: string; suggestedQty: number;
     orderIncrementQty: number | null; isBulkDelivery: boolean;
+    finaleDemandAnomalous: boolean;
     finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;
     candidate?: { directDemand: number; bomDemand: number; finishedGoodsCoverageDays?: number | null };
@@ -958,10 +959,21 @@ export default function PurchasingPanel() {
                                                                                         </div>
                                                                                         {(item.finaleReorderQty ?? 0) > 0 && (
                                                                                             <div className="flex items-center gap-1.5 mt-0.5">
-                                                                                                <Zap className="w-3 h-3 text-cyan-500" />
-                                                                                                <span className="text-[10px] font-mono text-cyan-500/80 italic">
-                                                                                                    Finale Reorder: {item.finaleReorderQty}
-                                                                                                </span>
+                                                                                                {item.finaleDemandAnomalous ? (
+                                                                                                    <>
+                                                                                                        <AlertTriangle className="w-3 h-3 text-amber-500" />
+                                                                                                        <span className="text-[10px] font-mono text-amber-400/90 italic">
+                                                                                                            Finale reorder suspect: {item.finaleReorderQty}
+                                                                                                        </span>
+                                                                                                    </>
+                                                                                                ) : (
+                                                                                                    <>
+                                                                                                        <Zap className="w-3 h-3 text-cyan-500" />
+                                                                                                        <span className="text-[10px] font-mono text-cyan-500/80 italic">
+                                                                                                            Finale Reorder: {item.finaleReorderQty}
+                                                                                                        </span>
+                                                                                                    </>
+                                                                                                )}
                                                                                             </div>
                                                                                         )}
                                                                                     </div>

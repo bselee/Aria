@@ -112,6 +112,7 @@ export interface PurchasingItem {
     suggestedQty: number;
     orderIncrementQty: number | null;  // "Std reorder in qty of" — snap order quantities to this multiple
     isBulkDelivery: boolean;           // true → route to Soil facility
+    finaleDemandAnomalous: boolean;    // true → Finale demand fields disagreed with trusted movement anchors
     finaleReorderQty: number | null;
     finaleStockoutDays: number | null;
     finaleConsumptionQty: number | null;
@@ -133,6 +134,143 @@ type PurchasingIntelligenceCandidate = {
     finaleDemandQty: number | null;
     finaleDemandPerDay: number | null;
 };
+
+export interface PurchasingDailyRateInput {
+    purchaseVelocity: number;
+    salesVelocity: number;
+    demandVelocity: number;
+    consumptionQuantity90d: number | null;
+    stockOnHand: number;
+    stockoutDays: number | null;
+}
+
+export interface PurchasingDailyRateDecision {
+    dailyRate: number;
+    rateSource: string;
+    demandAnomalous: boolean;
+}
+
+export interface PurchasingDemandAnomaly {
+    vendorName: string;
+    productId: string;
+    productName: string;
+    rawDemandVelocity: number;
+    trustedDailyRate: number;
+    salesVelocity: number;
+    purchaseVelocity: number;
+    finaleConsumptionQty: number | null;
+    finaleDemandQty: number | null;
+    finaleReorderQty: number | null;
+    suggestedQty: number;
+    stockOnHand: number;
+    stockOnOrder: number;
+    anomalyRatio: number;
+}
+
+const FINALE_DEMAND_ANOMALY_MULTIPLIER = 5;
+const REORDER_COVERAGE_BUFFER_DAYS = 60;
+
+export function resolvePurchasingDailyRate(input: PurchasingDailyRateInput): PurchasingDailyRateDecision {
+    const purchaseVelocity = Math.max(input.purchaseVelocity, 0);
+    const salesVelocity = Math.max(input.salesVelocity, 0);
+    const demandVelocity = Math.max(input.demandVelocity, 0);
+    const consumptionVelocity = input.consumptionQuantity90d && input.consumptionQuantity90d > 0
+        ? input.consumptionQuantity90d / 90
+        : 0;
+    const stockoutVelocity = input.stockOnHand > 0 && input.stockoutDays && input.stockoutDays > 0
+        ? input.stockOnHand / input.stockoutDays
+        : 0;
+
+    const fallbackSignals = [
+        { rate: consumptionVelocity, source: "90d consumption" },
+        { rate: salesVelocity, source: "sales history" },
+        { rate: stockoutVelocity, source: "stockout implied" },
+        { rate: purchaseVelocity, source: "90d receipts" },
+    ].filter(signal => signal.rate > 0);
+
+    const strongestFallback = fallbackSignals.reduce(
+        (best, signal) => signal.rate > best.rate ? signal : best,
+        { rate: 0, source: "none" },
+    );
+
+    const preferredFallback =
+        consumptionVelocity > 0 &&
+            stockoutVelocity > 0 &&
+            Math.abs(stockoutVelocity - consumptionVelocity) / consumptionVelocity <= 0.2
+            ? { rate: consumptionVelocity, source: "90d consumption" }
+            : strongestFallback;
+
+    if (
+        demandVelocity > 0 &&
+        preferredFallback.rate > 0 &&
+        demandVelocity > preferredFallback.rate * FINALE_DEMAND_ANOMALY_MULTIPLIER
+    ) {
+        return {
+            dailyRate: preferredFallback.rate,
+            rateSource: preferredFallback.source,
+            demandAnomalous: true,
+        };
+    }
+
+    if (demandVelocity > 0 && demandVelocity >= purchaseVelocity) {
+        return {
+            dailyRate: demandVelocity,
+            rateSource: "90d demand",
+            demandAnomalous: false,
+        };
+    }
+
+    if (purchaseVelocity > 0) {
+        return {
+            dailyRate: purchaseVelocity,
+            rateSource: "90d receipts",
+            demandAnomalous: false,
+        };
+    }
+
+    return {
+        dailyRate: preferredFallback.rate,
+        rateSource: preferredFallback.source,
+        demandAnomalous: false,
+    };
+}
+
+export function calculateSuggestedReorderQty(input: {
+    dailyRate: number;
+    leadTimeDays: number;
+    stockOnHand: number;
+    stockOnOrder: number;
+    orderIncrementQty: number | null;
+}): number {
+    const coverageTargetQty = Math.max(0, input.dailyRate * (input.leadTimeDays + REORDER_COVERAGE_BUFFER_DAYS));
+    const netNeededQty = Math.max(0, coverageTargetQty - input.stockOnHand - input.stockOnOrder);
+    if (netNeededQty <= 0) return 0;
+    return Math.ceil(FinaleClient.snapToIncrement(netNeededQty, input.orderIncrementQty));
+}
+
+export function summarizePurchasingDemandAnomalies(groups: PurchasingGroup[]): PurchasingDemandAnomaly[] {
+    return groups
+        .flatMap(group => group.items.map(item => ({
+            vendorName: group.vendorName,
+            productId: item.productId,
+            productName: item.productName,
+            rawDemandVelocity: item.demandVelocity,
+            trustedDailyRate: item.dailyRate,
+            salesVelocity: item.salesVelocity,
+            purchaseVelocity: item.purchaseVelocity,
+            finaleConsumptionQty: item.finaleConsumptionQty,
+            finaleDemandQty: item.finaleDemandQty,
+            finaleReorderQty: item.finaleReorderQty,
+            suggestedQty: item.suggestedQty,
+            stockOnHand: item.stockOnHand,
+            stockOnOrder: item.stockOnOrder,
+            anomalyRatio: item.dailyRate > 0 ? item.demandVelocity / item.dailyRate : Number.POSITIVE_INFINITY,
+            finaleDemandAnomalous: item.finaleDemandAnomalous,
+        })))
+        .filter(item => item.finaleDemandAnomalous)
+        .map(({ finaleDemandAnomalous: _ignored, ...item }) => item)
+        .sort((a, b) => b.anomalyRatio - a.anomalyRatio);
+}
 
 export interface FullPO {
     orderId: string;
@@ -4120,19 +4258,25 @@ export class FinaleClient {
                     const salesVelocity = activity.soldQty / daysBack;
 
                     // Demand velocity: prefer demandPerDay (direct field) → demandQuantity / 90
-                    const demandVelocity = candidate.finaleDemandPerDay != null && candidate.finaleDemandPerDay > 0
+                    const rawDemandVelocity = candidate.finaleDemandPerDay != null && candidate.finaleDemandPerDay > 0
                         ? candidate.finaleDemandPerDay
                         : candidate.finaleDemandQty != null && candidate.finaleDemandQty > 0
                             ? candidate.finaleDemandQty / 90
                             : 0;
 
-                    // Best velocity = highest known consumption signal
-                    const dailyRate = Math.max(demandVelocity, purchaseVelocity);
+                    const rateDecision = resolvePurchasingDailyRate({
+                        purchaseVelocity,
+                        salesVelocity,
+                        demandVelocity: rawDemandVelocity,
+                        consumptionQuantity90d: activity.consumptionQuantity,
+                        stockOnHand,
+                        stockoutDays: candidate.finaleStockoutDays,
+                    });
+                    const demandVelocity = rawDemandVelocity;
+                    const dailyRate = rateDecision.dailyRate;
                     if (dailyRate === 0) continue; // no actual movement
 
-                    // Identify which signal is driving the rate (for explanation)
-                    const rateSource = dailyRate === demandVelocity ? '90d demand'
-                        : `${daysBack}d receipts`;
+                    const rateSource = rateDecision.rateSource;
 
                     const runwayDays = stockOnHand / dailyRate;
                     const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
@@ -4154,6 +4298,9 @@ export class FinaleClient {
                     if (stockOnOrder > 0) {
                         parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
                     }
+                    if (rateDecision.demandAnomalous) {
+                        parts.push(`ignored anomalous Finale demand (${rawDemandVelocity.toFixed(1)}/day)`);
+                    }
                     const urgencyNote = urgency === 'critical' ? 'order now, already short'
                         : urgency === 'warning' ? 'order soon'
                             : urgency === 'watch' ? 'monitor'
@@ -4165,8 +4312,13 @@ export class FinaleClient {
                     // the product's "Std reorder in qty of" field from Finale.
                     // If no increment configured, raw quantity passes through unchanged.
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
-                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
-                    const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+                    const suggestedQty = calculateSuggestedReorderQty({
+                        dailyRate,
+                        leadTimeDays,
+                        stockOnHand,
+                        stockOnOrder,
+                        orderIncrementQty,
+                    });
 
                     // Bulk delivery detection for facility routing
                     const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
@@ -4197,6 +4349,7 @@ export class FinaleClient {
                         suggestedQty,
                         orderIncrementQty,
                         isBulkDelivery,
+                        finaleDemandAnomalous: rateDecision.demandAnomalous,
                         finaleReorderQty: candidate.finaleReorderQty,
                         finaleStockoutDays: candidate.finaleStockoutDays,
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
@@ -4323,17 +4476,24 @@ export class FinaleClient {
 
                     const purchaseVelocity = activity.purchasedQty / daysBack;
                     const salesVelocity = activity.soldQty / daysBack;
-                    const demandVelocity = activity.demandPerDay != null && activity.demandPerDay > 0
+                    const rawDemandVelocity = activity.demandPerDay != null && activity.demandPerDay > 0
                         ? activity.demandPerDay
                         : activity.demandQuantity != null && activity.demandQuantity > 0
                             ? activity.demandQuantity / 90
                             : 0;
-
-                    const dailyRate = Math.max(demandVelocity, purchaseVelocity);
+                    const rateDecision = resolvePurchasingDailyRate({
+                        purchaseVelocity,
+                        salesVelocity,
+                        demandVelocity: rawDemandVelocity,
+                        consumptionQuantity90d: activity.consumptionQuantity,
+                        stockOnHand,
+                        stockoutDays: activity.stockoutDays,
+                    });
+                    const demandVelocity = rawDemandVelocity;
+                    const dailyRate = rateDecision.dailyRate;
                     if (dailyRate === 0) continue;
 
-                    const rateSource = dailyRate === demandVelocity ? '90d demand'
-                        : `${daysBack}d receipts`;
+                    const rateSource = rateDecision.rateSource;
                     const runwayDays = stockOnHand / dailyRate;
                     const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
                     const urgency: PurchasingItem['urgency'] =
@@ -4349,6 +4509,9 @@ export class FinaleClient {
                     if (stockOnOrder > 0) {
                         parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
                     }
+                    if (rateDecision.demandAnomalous) {
+                        parts.push(`ignored anomalous Finale demand (${rawDemandVelocity.toFixed(1)}/day)`);
+                    }
                     const urgencyNote = urgency === 'critical' ? 'order now, already short'
                         : urgency === 'warning' ? 'order soon'
                             : urgency === 'watch' ? 'monitor'
@@ -4356,8 +4519,13 @@ export class FinaleClient {
                     const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
 
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
-                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
-                    const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+                    const suggestedQty = calculateSuggestedReorderQty({
+                        dailyRate,
+                        leadTimeDays,
+                        stockOnHand,
+                        stockOnOrder,
+                        orderIncrementQty,
+                    });
                     const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
 
                     items.push({
@@ -4386,6 +4554,7 @@ export class FinaleClient {
                         suggestedQty,
                         orderIncrementQty,
                         isBulkDelivery,
+                        finaleDemandAnomalous: rateDecision.demandAnomalous,
                         finaleReorderQty: candidate.finaleReorderQty,
                         finaleStockoutDays: candidate.finaleStockoutDays,
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
