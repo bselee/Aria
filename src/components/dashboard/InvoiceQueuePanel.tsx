@@ -162,7 +162,7 @@ export default function InvoiceQueuePanel() {
   const stalePending = pending.filter(i => daysOld(i.processedAt) > STALE_THRESHOLD_DAYS);
   const freshPending = pending.filter(i => daysOld(i.processedAt) <= STALE_THRESHOLD_DAYS);
   const needsEyesTotal = needsEyes.missingPdf + needsEyes.humanInteraction;
-  const needsEyesParts = [];
+  const needsEyesParts: string[] = [];
   if (needsEyes.missingPdf > 0) needsEyesParts.push(`${needsEyes.missingPdf} PDF`);
   if (needsEyes.humanInteraction > 0) needsEyesParts.push(`${needsEyes.humanInteraction} HUMAN`);
 

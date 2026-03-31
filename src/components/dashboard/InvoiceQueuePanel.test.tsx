@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import React from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +14,10 @@ const baseResponse = {
     needsApproval: 0,
     unmatched: 0,
     totalDollarImpact: 0,
+  },
+  needsEyes: {
+    missingPdf: 0,
+    humanInteraction: 0,
   },
   cachedAt: new Date().toISOString(),
 };
@@ -38,10 +44,7 @@ describe("InvoiceQueuePanel Needs Eyes badge", () => {
 
   it("does not render the badge when counts are zero", async () => {
     stubLocalStorage();
-    stubFetch({
-      ...baseResponse,
-      needsEyes: { missingPdf: 0, humanInteraction: 0 },
-    });
+    stubFetch(baseResponse);
 
     render(<InvoiceQueuePanel />);
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoicesData = [
   {
@@ -34,7 +34,7 @@ const logData = [
     id: 11,
     created_at: new Date().toISOString(),
     email_subject: "Missing PDF",
-    action_taken: "No PDF attachment found — left unread for manual review",
+    action_taken: "No PDF attachment found - left unread for manual review",
     metadata: {
       reasonCode: "missing_pdf_manual_review",
     },
@@ -44,29 +44,47 @@ const logData = [
     id: 12,
     created_at: new Date().toISOString(),
     email_subject: "Need response",
-    action_taken: "Human interaction detected on ap inbox — left visible for manual AP review",
+    action_taken: "Human interaction detected on ap inbox - left visible for manual AP review",
     metadata: {
       reasonCode: "human_interaction_manual_review",
     },
-    intent: "INVOICE",
+    intent: "HUMAN_INTERACTION",
   },
 ];
 
-const makeQuery = (rows: any[]) => {
+const queryState = {
+  intentFilter: null as string[] | null,
+  apLogInCalls: [] as string[][],
+};
+
+const makeQuery = (rows: any[], table: string) => {
   const query: any = {
     select: vi.fn().mockReturnThis(),
     order: vi.fn().mockReturnThis(),
-    limit: vi.fn().mockResolvedValue({ data: rows, error: null }),
-    in: vi.fn().mockReturnThis(),
+    limit: vi.fn().mockImplementation(() => {
+      if (table !== "ap_activity_log" || !queryState.intentFilter) {
+        return Promise.resolve({ data: rows, error: null });
+      }
+
+      return Promise.resolve({
+        data: rows.filter((row) => queryState.intentFilter!.includes(row.intent)),
+        error: null,
+      });
+    }),
+    in: vi.fn().mockImplementation((_column: string, values: string[]) => {
+      queryState.intentFilter = values;
+      queryState.apLogInCalls.push(values);
+      return query;
+    }),
   };
   return query;
 };
 
 const supabase = {
   from: vi.fn((table: string) => {
-    if (table === "invoices") return makeQuery(invoicesData);
-    if (table === "ap_activity_log") return makeQuery(logData);
-    return makeQuery([]);
+    if (table === "invoices") return makeQuery(invoicesData, table);
+    if (table === "ap_activity_log") return makeQuery(logData, table);
+    return makeQuery([], table);
   }),
 };
 
@@ -76,22 +94,30 @@ vi.mock("@/lib/supabase", () => ({
 
 import { GET } from "./route";
 
-describe("Invoice queue API", () => {
+describe("invoice queue route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    queryState.intentFilter = null;
+    queryState.apLogInCalls = [];
   });
 
-  it("returns needsEyes counts based on ap_activity_log reason codes", async () => {
+  it("returns needsEyes counts using AP manual-review reason codes", async () => {
     const response = await GET({
-      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue"),
+      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue?bust=1"),
     } as any);
 
     expect(response.status).toBe(200);
+
     const body = await response.json();
     expect(body.needsEyes).toEqual({
       missingPdf: 1,
       humanInteraction: 1,
     });
     expect(body.invoices).toHaveLength(1);
+    expect(queryState.apLogInCalls).toContainEqual([
+      "INVOICE",
+      "RECONCILIATION",
+      "HUMAN_INTERACTION",
+    ]);
   });
 });
