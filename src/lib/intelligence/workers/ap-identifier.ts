@@ -30,7 +30,11 @@ import { getPreClassification } from "../nightshift-agent";
 import { FinaleClient } from "../../finale/client";
 import { Telegraf } from "telegraf";
 import { applyMessageLabelPolicy } from "../gmail-policy";
-import { getInvoiceInboxPolicy } from "./ap-identifier-policy";
+import {
+    getAPHumanInteractionPolicy,
+    getAPMissingPdfPolicy,
+    getInvoiceInboxPolicy,
+} from "./ap-identifier-policy";
 import { filterStatementInvoicePages } from "./ap-identifier-statement-filter";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
@@ -462,13 +466,20 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 }
 
                 if (intent === "HUMAN_INTERACTION") {
+                    const policy = getAPHumanInteractionPolicy(sourceInbox);
                     try {
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: m.gmail_message_id,
-                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId: m.gmail_message_id,
+                            addLabels: policy.addLabels,
+                            removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
+                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                        reasonCode: policy.reasonCode,
+                        sourceInbox,
+                        gmailMessageId: m.gmail_message_id,
+                    });
                     continue;
                 }
 
@@ -503,8 +514,11 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
-                    await this.logActivity(supabase, from, subject, intent,
-                        policy.activityNote);
+                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                        reasonCode: policy.reasonCode,
+                        sourceInbox,
+                        gmailMessageId: m.gmail_message_id,
+                    });
                     continue;
                 }
 
@@ -594,7 +608,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             if (hashDup) {
                                 console.log(`     ⚠️ PDF content duplicate: ${capturedFilename} (hash match with "${hashDup.email_subject}") — skipping`);
                                 await this.logActivity(supabase, from, subject, "DUPLICATE_PDF_CONTENT",
-                                    `PDF content hash duplicate: ${capturedFilename} matches prior entry "${hashDup.email_subject}" — not forwarded`);
+                                    `PDF content hash duplicate: ${capturedFilename} matches prior entry "${hashDup.email_subject}" — not forwarded`, {
+                                        reasonCode: "duplicate_pdf_content",
+                                        sourceInbox,
+                                        gmailMessageId: m.gmail_message_id,
+                                        pdfFilename: capturedFilename,
+                                        duplicateSubject: hashDup.email_subject,
+                                    });
                                 attachmentIndex++;
                                 processedAnyPDF = true;
                                 continue;
@@ -621,7 +641,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 if (blockedContent) {
                                     console.log(`     🚫 PDF BLOCKED: ${capturedFilename} — ${blockedContent.reason}`);
                                     await this.logActivity(supabase, from, subject, "BLOCKED_PDF_CONTENT",
-                                        `PDF blocked from Bill.com: ${blockedContent.reason} (${capturedFilename})`);
+                                        `PDF blocked from Bill.com: ${blockedContent.reason} (${capturedFilename})`, {
+                                            reasonCode: "blocked_pdf_content",
+                                            sourceInbox,
+                                            gmailMessageId: m.gmail_message_id,
+                                            pdfFilename: capturedFilename,
+                                            blockedReason: blockedContent.reason,
+                                        });
                                     // Mark email as read and archive — do not forward
                                     try {
                                         await gmail.users.messages.modify({
@@ -678,7 +704,11 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                         } catch (err: any) {
                             console.error(`     ❌ Failed to queue attachment:`, err.message);
-                            await this.logActivity(supabase, from, subject, "PROCESSING_ERROR", `Queue failed: ${err.message}`);
+                            await this.logActivity(supabase, from, subject, "PROCESSING_ERROR", `Queue failed: ${err.message}`, {
+                                reasonCode: "queue_insert_failed",
+                                sourceInbox,
+                                gmailMessageId: m.gmail_message_id,
+                            });
                         }
                     }
                 }
@@ -696,15 +726,27 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     } catch (e) { /* ignore */ }
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
                     const logNote = `Queued for Bill.com forward (${pdfNames})`;
-                    await this.logActivity(supabase, from, subject, intent, logNote, { attachments: pdfNames });
+                    await this.logActivity(supabase, from, subject, intent, logNote, {
+                        reasonCode: "queued_for_billcom",
+                        sourceInbox,
+                        gmailMessageId: m.gmail_message_id,
+                        attachments: pdfNames,
+                        queueStatus: "PENDING_FORWARD",
+                    });
                 } else {
                     console.log(`     ⚠️ No PDF found on ${intent}. Leaving unread for human check.`);
-                    await this.logActivity(supabase, from, subject, intent, "No PDF attachment found — left unread for manual review");
+                    const policy = getAPMissingPdfPolicy(sourceInbox, intent);
+                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                        reasonCode: policy.reasonCode,
+                        sourceInbox,
+                        gmailMessageId: m.gmail_message_id,
+                    });
                     try {
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: m.gmail_message_id,
-                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId: m.gmail_message_id,
+                            addLabels: policy.addLabels,
+                            removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
                 }

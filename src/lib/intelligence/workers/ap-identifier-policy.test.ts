@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { getInvoiceInboxPolicy } from "./ap-identifier-policy";
+import {
+    getAPHumanInteractionPolicy,
+    getAPMissingPdfPolicy,
+    getInvoiceInboxPolicy,
+} from "./ap-identifier-policy";
 
 describe("getInvoiceInboxPolicy", () => {
     it("queues AP inbox invoices for Bill.com processing", () => {
@@ -8,6 +12,7 @@ describe("getInvoiceInboxPolicy", () => {
             addLabels: [],
             removeLabels: ["INBOX", "UNREAD"],
             activityNote: "Queued for Bill.com forward",
+            reasonCode: "queued_for_billcom",
         });
     });
 
@@ -16,7 +21,32 @@ describe("getInvoiceInboxPolicy", () => {
             queueForBillCom: false,
             addLabels: ["Follow Up"],
             removeLabels: [],
-            activityNote: "Invoice detected on default inbox — not forwarded to Bill.com; left visible for review",
+            activityNote: "Invoice detected on default inbox - not forwarded to Bill.com; left visible for review",
+            reasonCode: "invoice_non_ap_inbox",
+        });
+    });
+});
+
+describe("getAPHumanInteractionPolicy", () => {
+    it("keeps AP inbox human interactions visible for manual follow-up", () => {
+        expect(getAPHumanInteractionPolicy("ap")).toEqual({
+            queueForBillCom: false,
+            addLabels: ["Follow Up"],
+            removeLabels: [],
+            activityNote: "Human interaction detected on ap inbox - left visible for manual AP review",
+            reasonCode: "human_interaction_manual_review",
+        });
+    });
+});
+
+describe("getAPMissingPdfPolicy", () => {
+    it("keeps AP invoice intents visible when the PDF is missing", () => {
+        expect(getAPMissingPdfPolicy("ap", "INVOICE")).toEqual({
+            queueForBillCom: false,
+            addLabels: ["Follow Up"],
+            removeLabels: [],
+            activityNote: "No PDF attachment found on INVOICE in ap inbox - left visible for manual review",
+            reasonCode: "missing_pdf_manual_review",
         });
     });
 });
