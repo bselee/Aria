@@ -125,6 +125,15 @@ export interface PurchasingGroup {
     items: PurchasingItem[];
 }
 
+type PurchasingIntelligenceCandidate = {
+    productId: string;
+    finaleReorderQty: number | null;
+    finaleStockoutDays: number | null;
+    finaleConsumptionQty: number | null;
+    finaleDemandQty: number | null;
+    finaleDemandPerDay: number | null;
+};
+
 export interface FullPO {
     orderId: string;
     vendorName: string;
@@ -3737,6 +3746,11 @@ export class FinaleClient {
         openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }>;
         stockOnHand: number | null;
         stockAvailable: number | null;
+        reorderQuantityToOrder: number | null;
+        stockoutDays: number | null;
+        demandQuantity: number | null;
+        demandPerDay: number | null;
+        consumptionQuantity: number | null;
     }> {
         const end = new Date();
         const begin = new Date();
@@ -3793,6 +3807,11 @@ export class FinaleClient {
                         stockOnHand
                         stockAvailable
                         unitsInStock
+                        reorderQuantityToOrder
+                        stockoutDays
+                        demandQuantity
+                        demandPerDay
+                        consumptionQuantity
                     }}
                 }
             }`
@@ -3814,9 +3833,35 @@ export class FinaleClient {
                     body: JSON.stringify(query),
                 });
             }
-            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            if (!res.ok) {
+                return {
+                    purchasedQty: 0,
+                    soldQty: 0,
+                    openPOs: [],
+                    stockOnHand: null,
+                    stockAvailable: null,
+                    reorderQuantityToOrder: null,
+                    stockoutDays: null,
+                    demandQuantity: null,
+                    demandPerDay: null,
+                    consumptionQuantity: null,
+                };
+            }
             const result = await res.json();
-            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            if (result.errors) {
+                return {
+                    purchasedQty: 0,
+                    soldQty: 0,
+                    openPOs: [],
+                    stockOnHand: null,
+                    stockAvailable: null,
+                    reorderQuantityToOrder: null,
+                    stockoutDays: null,
+                    demandQuantity: null,
+                    demandPerDay: null,
+                    consumptionQuantity: null,
+                };
+            }
 
             let purchasedQty = 0;
             for (const edge of result.data?.purchasedIn?.edges || []) {
@@ -3875,10 +3920,37 @@ export class FinaleClient {
                 ? (parseStockVal(stockNode.unitsInStock) ?? parseStockVal(stockNode.stockOnHand))
                 : null;
             const stockAvailable = stockNode ? parseStockVal(stockNode.stockAvailable) : null;
+            const reorderQuantityToOrder = stockNode ? parseStockVal(stockNode.reorderQuantityToOrder) : null;
+            const stockoutDays = stockNode ? parseStockVal(stockNode.stockoutDays) : null;
+            const demandQuantity = stockNode ? parseStockVal(stockNode.demandQuantity) : null;
+            const demandPerDay = stockNode ? parseStockVal(stockNode.demandPerDay) : null;
+            const consumptionQuantity = stockNode ? parseStockVal(stockNode.consumptionQuantity) : null;
 
-            return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable };
+            return {
+                purchasedQty,
+                soldQty,
+                openPOs,
+                stockOnHand,
+                stockAvailable,
+                reorderQuantityToOrder,
+                stockoutDays,
+                demandQuantity,
+                demandPerDay,
+                consumptionQuantity,
+            };
         } catch {
-            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            return {
+                purchasedQty: 0,
+                soldQty: 0,
+                openPOs: [],
+                stockOnHand: null,
+                stockAvailable: null,
+                reorderQuantityToOrder: null,
+                stockoutDays: null,
+                demandQuantity: null,
+                demandPerDay: null,
+                consumptionQuantity: null,
+            };
         }
     }
 
@@ -4164,6 +4236,193 @@ export class FinaleClient {
 
         groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
         console.log(`[finale] getPurchasingIntelligence: ${items.length} items across ${groups.length} vendors`);
+        return groups;
+    }
+
+    async getPurchasingIntelligenceForSkus(skus: string[], daysBack = 90): Promise<PurchasingGroup[]> {
+        const candidates: PurchasingIntelligenceCandidate[] = [];
+        const preloadedActivity = new Map<string, Awaited<ReturnType<FinaleClient["getProductActivity"]>>>();
+        const normalizedSkus = [...new Set(
+            skus
+                .map((sku) => sku.trim().toUpperCase())
+                .filter(Boolean),
+        )];
+
+        for (const sku of normalizedSkus) {
+            const activity = await this.getProductActivity(sku, daysBack);
+            preloadedActivity.set(sku, activity);
+            candidates.push({
+                productId: sku,
+                finaleReorderQty: activity.reorderQuantityToOrder,
+                finaleStockoutDays: activity.stockoutDays,
+                finaleConsumptionQty: activity.consumptionQuantity,
+                finaleDemandQty: activity.demandQuantity,
+                finaleDemandPerDay: activity.demandPerDay,
+            });
+        }
+
+        console.log(`[finale] getPurchasingIntelligenceForSkus: ${candidates.length} requested`);
+        if (candidates.length === 0) return [];
+
+        const resolveParty = async (partyUrl: string): Promise<{ groupName: string; isManufactured: boolean; isDropship: boolean }> => {
+            const partyId = partyUrl.split('/').pop() || '';
+            const cached = _partyCacheShared.get(partyId);
+            if (cached && Date.now() - cached.ts < PARTY_CACHE_TTL) {
+                return { groupName: cached.groupName, isManufactured: cached.isManufactured, isDropship: cached.isDropship };
+            }
+            try {
+                const r = await fetch(`${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`, {
+                    headers: { Authorization: this.authHeader, Accept: 'application/json' },
+                });
+                const data = await r.json();
+                const groupName: string = data.groupName || data.name || 'Unknown';
+                const isManufactured = /buildasoil|manufacturing|soil dept|bas soil/i.test(groupName);
+                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
+                const result = { groupName, isManufactured, isDropship };
+                if (_partyCacheShared.size >= PARTY_CACHE_MAX) {
+                    const oldestKey = _partyCacheShared.keys().next().value;
+                    if (oldestKey !== undefined) _partyCacheShared.delete(oldestKey);
+                }
+                _partyCacheShared.set(partyId, { ...result, ts: Date.now() });
+                return result;
+            } catch {
+                return { groupName: 'Unknown', isManufactured: false, isDropship: false };
+            }
+        };
+
+        const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 };
+        const items: PurchasingItem[] = [];
+        const queue = [...candidates];
+
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (queue.length > 0) {
+                const candidate = queue.shift()!;
+                const sku = candidate.productId;
+                try {
+                    const prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                    const suppliers: any[] = prodData.supplierList || [];
+                    const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
+                    if (!mainSupplier?.supplierPartyUrl) continue;
+
+                    const party = await resolveParty(mainSupplier.supplierPartyUrl);
+                    if (party.isManufactured || party.isDropship) continue;
+                    if (FinaleClient.isDoNotReorder(prodData)) continue;
+
+                    const activity = preloadedActivity.get(sku) ?? await this.getProductActivity(sku, daysBack);
+
+                    const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
+                    const productName: string = prodData.internalName || prodData.productId || sku;
+                    const unitPrice: number = mainSupplier.price ?? 0;
+                    const rawLeadTime = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
+                    const leadTimeDays = !isNaN(rawLeadTime) && rawLeadTime > 0 ? rawLeadTime : 14;
+                    const leadTimeProvenance = !isNaN(rawLeadTime) && rawLeadTime > 0
+                        ? `${rawLeadTime}d (Finale)`
+                        : '14d default';
+                    const stockOnHand = activity.stockOnHand ?? parseFinaleNumber(prodData.quantityOnHand ?? prodData.stockLevel ?? 0);
+                    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
+
+                    const purchaseVelocity = activity.purchasedQty / daysBack;
+                    const salesVelocity = activity.soldQty / daysBack;
+                    const demandVelocity = activity.demandPerDay != null && activity.demandPerDay > 0
+                        ? activity.demandPerDay
+                        : activity.demandQuantity != null && activity.demandQuantity > 0
+                            ? activity.demandQuantity / 90
+                            : 0;
+
+                    const dailyRate = Math.max(demandVelocity, purchaseVelocity);
+                    if (dailyRate === 0) continue;
+
+                    const rateSource = dailyRate === demandVelocity ? '90d demand'
+                        : `${daysBack}d receipts`;
+                    const runwayDays = stockOnHand / dailyRate;
+                    const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
+                    const urgency: PurchasingItem['urgency'] =
+                        adjustedRunwayDays < leadTimeDays ? 'critical'
+                            : adjustedRunwayDays < leadTimeDays + 30 ? 'warning'
+                                : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
+                                    : 'ok';
+                    const parts: string[] = [
+                        `Avg ${dailyRate.toFixed(1)}/day (${rateSource})`,
+                        `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays)}d`,
+                        `Lead ${leadTimeDays}d`,
+                    ];
+                    if (stockOnOrder > 0) {
+                        parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
+                    }
+                    const urgencyNote = urgency === 'critical' ? 'order now, already short'
+                        : urgency === 'warning' ? 'order soon'
+                            : urgency === 'watch' ? 'monitor'
+                                : 'covered';
+                    const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
+
+                    const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
+                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
+                    const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+                    const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
+
+                    items.push({
+                        productId: sku,
+                        productName,
+                        supplierName: party.groupName,
+                        supplierPartyId: partyId,
+                        unitPrice,
+                        stockOnHand,
+                        stockOnOrder,
+                        purchaseVelocity,
+                        salesVelocity,
+                        demandVelocity,
+                        dailyRate,
+                        runwayDays,
+                        adjustedRunwayDays,
+                        leadTimeDays,
+                        leadTimeProvenance,
+                        openPOs: activity.openPOs.map(po => ({
+                            orderId: po.orderId,
+                            quantity: po.quantityOnOrder,
+                            orderDate: po.orderDate,
+                        })),
+                        urgency,
+                        explanation,
+                        suggestedQty,
+                        orderIncrementQty,
+                        isBulkDelivery,
+                        finaleReorderQty: candidate.finaleReorderQty,
+                        finaleStockoutDays: candidate.finaleStockoutDays,
+                        finaleConsumptionQty: candidate.finaleConsumptionQty,
+                        finaleDemandQty: candidate.finaleDemandQty,
+                    });
+                } catch {
+                    // Skip products that error — non-fatal
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        const byVendor = new Map<string, PurchasingItem[]>();
+        for (const item of items) {
+            if (!byVendor.has(item.supplierPartyId)) byVendor.set(item.supplierPartyId, []);
+            byVendor.get(item.supplierPartyId)!.push(item);
+        }
+
+        const groups: PurchasingGroup[] = [];
+        for (const groupItems of byVendor.values()) {
+            groupItems.sort((a, b) =>
+                urgencyRank[a.urgency] - urgencyRank[b.urgency] || a.runwayDays - b.runwayDays,
+            );
+            const worstUrgency = groupItems.reduce<PurchasingItem['urgency']>(
+                (worst, item) => urgencyRank[item.urgency] < urgencyRank[worst] ? item.urgency : worst,
+                'ok',
+            );
+            groups.push({
+                vendorName: groupItems[0].supplierName,
+                vendorPartyId: groupItems[0].supplierPartyId,
+                urgency: worstUrgency,
+                items: groupItems,
+            });
+        }
+
+        groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
+        console.log(`[finale] getPurchasingIntelligenceForSkus: ${items.length} items across ${groups.length} vendors`);
         return groups;
     }
 

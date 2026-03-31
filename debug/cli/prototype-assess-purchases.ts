@@ -121,9 +121,15 @@ async function comparePurchasesGuidance() {
   const { asJson, vendorFilter, inputPath, daysBack } = parseArgs(process.argv.slice(2));
   const resolvedInputPath = resolveInputPath(inputPath);
   const guidanceDataset = loadGuidanceDataset(resolvedInputPath);
+  const targetedSkus = [...new Set(
+    Object.values(guidanceDataset)
+      .flat()
+      .map((item) => item.sku.trim().toUpperCase())
+      .filter(Boolean),
+  )];
 
   const finale = new FinaleClient();
-  const groups = await finale.getPurchasingIntelligence(daysBack);
+  const groups = await finale.getPurchasingIntelligenceForSkus(targetedSkus, daysBack);
   const assessment = assessPurchasingGroups(groups);
   const assessmentIndex = buildAssessmentIndex(assessment.groups.flatMap((group) => group.items));
   const finaleProductCache = new Map<string, FinaleProductDetail | null>();

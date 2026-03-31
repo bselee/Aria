@@ -32,6 +32,21 @@ type PurchasingGroup = {
 type AssessmentData = {
     groups: PurchasingGroup[];
     cachedAt: string;
+    guidanceSummary?: {
+        status: "success" | "failed";
+        refreshedAt: string;
+        lastSuccessAt?: string | null;
+        summary: {
+            totalItems: number;
+            agreesWithPolicy: number;
+            overstatesNeed: number;
+            understatesNeed: number;
+            alreadyOnOrder: number;
+            missingInFinale: number;
+            needsManualReview: number;
+        };
+        error?: string | null;
+    } | null;
     vendorSummaries?: Array<{
         vendorName: string;
         vendorPartyId: string;
@@ -84,6 +99,7 @@ export default function PurchasingPanel() {
     const [data, setData] = useState<AssessmentData | null>(null);
     const [loading, setLoading] = useState(true);
     const [scanning, setScanning] = useState(false);
+    const [guidanceRefreshing, setGuidanceRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const [vendorTab, setVendorTab] = useState<string>("all");
@@ -249,6 +265,21 @@ export default function PurchasingPanel() {
         }
     }
     useEffect(() => { load(); }, []);
+
+    async function handleRefreshGuidance() {
+        setGuidanceRefreshing(true);
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/purchasing/guidance", { method: "POST" });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || json.message || json.error || "Guidance refresh failed");
+            await load();
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setGuidanceRefreshing(false);
+        }
+    }
 
     function toggleExpand(id: string) {
         setExpanded(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -422,6 +453,7 @@ export default function PurchasingPanel() {
     );
     const isLoading = loading || scanning;
     const anyCreating = creatingPO.size > 0;
+    const guidanceSummary = data?.guidanceSummary;
 
     // ── render ─────────────────────────────────────────────────────────────
     return (
@@ -501,6 +533,28 @@ export default function PurchasingPanel() {
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
                 <div className="flex-1" />
+
+                {guidanceSummary && (
+                    <button
+                        onClick={handleRefreshGuidance}
+                        disabled={guidanceRefreshing}
+                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${guidanceSummary.status === "failed"
+                            ? "border-rose-500/40 text-rose-300 bg-rose-500/10"
+                            : "border-zinc-700 text-zinc-300 bg-zinc-800/60 hover:border-zinc-600"
+                            } disabled:opacity-60`}
+                        title={guidanceSummary.status === "failed"
+                            ? (guidanceSummary.error || "Guidance refresh failed")
+                            : `Last refreshed ${timeAgo(guidanceSummary.refreshedAt)}`}
+                    >
+                        <RefreshCw className={`w-2.5 h-2.5 ${guidanceRefreshing ? "animate-spin" : ""}`} />
+                        <span>
+                            Guide {guidanceSummary.summary.totalItems}
+                            {guidanceSummary.summary.overstatesNeed > 0 ? ` · ${guidanceSummary.summary.overstatesNeed} over` : ""}
+                            {guidanceSummary.summary.understatesNeed > 0 ? ` · ${guidanceSummary.summary.understatesNeed} under` : ""}
+                            {guidanceSummary.summary.needsManualReview > 0 ? ` · ${guidanceSummary.summary.needsManualReview} review` : ""}
+                        </span>
+                    </button>
+                )}
 
                 {critCount > 0 && (
                     <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-red-500/20 text-red-300 border-red-500/40">

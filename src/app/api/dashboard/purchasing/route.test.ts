@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
     finaleCtorMock,
     assessGroupsMock,
+    getGuidanceStateMock,
 } = vi.hoisted(() => ({
     finaleCtorMock: vi.fn(),
     assessGroupsMock: vi.fn(),
+    getGuidanceStateMock: vi.fn(),
 }));
 
 vi.mock("@/lib/finale/client", () => ({
@@ -14,6 +16,10 @@ vi.mock("@/lib/finale/client", () => ({
 
 vi.mock("@/lib/purchasing/assessment-service", () => ({
     assessPurchasingGroups: assessGroupsMock,
+}));
+
+vi.mock("@/lib/storage/purchases-guidance-state", () => ({
+    getPurchasesGuidanceState: getGuidanceStateMock,
 }));
 
 import { GET } from "./route";
@@ -123,6 +129,22 @@ describe("dashboard purchasing route", () => {
                 },
             ],
         });
+
+        getGuidanceStateMock.mockResolvedValue({
+            sourceKey: "basauto-purchases",
+            status: "success",
+            refreshedAt: "2026-03-31T12:00:00.000Z",
+            lastSuccessAt: "2026-03-31T12:00:00.000Z",
+            summary: {
+                totalItems: 5,
+                agreesWithPolicy: 3,
+                overstatesNeed: 1,
+                understatesNeed: 1,
+                alreadyOnOrder: 0,
+                missingInFinale: 0,
+                needsManualReview: 0,
+            },
+        });
     });
 
     it("returns assessed purchasing groups while preserving the item fields the dashboard already uses", async () => {
@@ -156,5 +178,14 @@ describe("dashboard purchasing route", () => {
                 actionableCount: 1,
             }),
         ]);
+        expect(body.guidanceSummary).toEqual(expect.objectContaining({
+            status: "success",
+            refreshedAt: "2026-03-31T12:00:00.000Z",
+            summary: expect.objectContaining({
+                totalItems: 5,
+                overstatesNeed: 1,
+                understatesNeed: 1,
+            }),
+        }));
     });
 });

@@ -28,6 +28,8 @@ export type PurchasesGuidanceRawItem = PurchasesGuidanceBaseItem & {
   metricGroups: string[][];
 };
 
+export type PurchasesGuidanceParsedItem = PurchasesGuidanceBaseItem & PurchasesGuidanceMetrics;
+
 const METRIC_LABELS: Record<string, keyof PurchasesGuidanceMetrics> = {
   "PURCHASE AGAIN BY": "purchaseAgainBy",
   "RECOMMENDED REORDER QUANTITY": "recommendedReorderQty",
@@ -102,7 +104,7 @@ export function parsePurchasesGuidanceMetricGroups(metricGroups: string[][]): Pu
   return metrics;
 }
 
-export function parsePurchasesGuidanceItem(rawItem: PurchasesGuidanceRawItem): PurchasesGuidanceBaseItem & PurchasesGuidanceMetrics {
+export function parsePurchasesGuidanceItem(rawItem: PurchasesGuidanceRawItem): PurchasesGuidanceParsedItem {
   return {
     sku: rawItem.sku,
     description: rawItem.description,

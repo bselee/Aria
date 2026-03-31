@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
+import { getPurchasesGuidanceState } from '@/lib/storage/purchases-guidance-state';
 
 // Module-level cache — full scan takes several minutes and makes hundreds of API calls.
 let cache: PurchasingGroup[] | null = null;
@@ -26,6 +27,7 @@ export async function GET(req: NextRequest) {
     }
 
     const assessment = assessPurchasingGroups(cache);
+    const guidanceSummary = await getPurchasesGuidanceState();
     const groups = assessment.groups.map(group => ({
         vendorName: group.vendorName,
         vendorPartyId: group.vendorPartyId,
@@ -42,6 +44,7 @@ export async function GET(req: NextRequest) {
             groups,
             cachedAt: new Date(cacheAt).toISOString(),
             vendorSummaries: assessment.vendorSummaries,
+            guidanceSummary,
         },
         { headers: { 'Cache-Control': 'no-store' } }
     );
