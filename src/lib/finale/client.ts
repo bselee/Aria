@@ -4035,15 +4035,6 @@ export class FinaleClient {
                     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
 
                     // Step 4: velocity + runway
-                    // DECISION(2026-03-23): Use max(demandVelocity, purchaseVelocity).
-                    // Verified against 2yr ULINE order history CSV (730 days, 530 line items):
-                    //   - Boxes (S-4128): purchase vel 17.8/d ≈ ULINE cadence 15.4/d ✅
-                    //     Finale demand = 0 because boxes consumed via stock changes, not sales/BOMs.
-                    //   - Jugs (FJG102): purchase vel 2.5/d, demand 0.11/d, ULINE cadence 1.8/d
-                    //     max() = 2.5/d — slightly aggressive but ensures no stockout ✅
-                    //   - Direct-sell items: demand captures BOM+sales, purchase ≈ demand ✅
-                    // Using max() is simplest and safest: highest known signal = "never run out".
-                    // Previous cascade (demand→sales→purchase) made boxes invisible (demand=0).
                     const purchaseVelocity = activity.purchasedQty / daysBack;
                     const salesVelocity = activity.soldQty / daysBack;
 
@@ -4054,8 +4045,12 @@ export class FinaleClient {
                             ? candidate.finaleDemandQty / 90
                             : 0;
 
-                    // Best velocity = highest known consumption signal
-                    const dailyRate = Math.max(demandVelocity, purchaseVelocity);
+                    // DECISION(2026-03-31): Reverting to prefer demandVelocity (Finale's 90-day calculation)
+                    // over purchaseVelocity. Using `max(demand, purchase)` caused items with historic bulk
+                    // purchases to artificially inflate the daily rate, causing ARIA to warn of stockouts
+                    // when Finale correctly showed 90+ days of runway based on current velocity.
+                    // We only fall back to purchaseVelocity if demand is strictly 0 (e.g., untracked boxes).
+                    const dailyRate = demandVelocity > 0 ? demandVelocity : purchaseVelocity;
                     if (dailyRate === 0) continue; // no actual movement
 
                     // Identify which signal is driving the rate (for explanation)
