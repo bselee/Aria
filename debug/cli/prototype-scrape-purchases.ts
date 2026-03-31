@@ -1,42 +1,15 @@
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
+import {
+  snapshotVendorButtons,
+  extractVendorChipNames,
+  clickVendorChip,
+} from "@/lib/purchasing/purchases-scraper-nav";
 
 const PURCHASES_URL = "https://basauto.vercel.app/purchases";
 const CDP_ENDPOINT = "http://127.0.0.1:9222";
-const SKIP_BUTTON_LABELS = ["Purchases", "Overdue", "Purchase Request", "Tutorial"];
 const PAGE_SETTLE_MS = 750;
-
-type VendorButtonSnapshot = {
-  text: string;
-  isVisible: boolean;
-};
-
-export function normalizeVendorChipLabel(rawLabel: string): string | null {
-  const text = rawLabel.trim().replace(/\s+/g, " ");
-  if (!text) return null;
-  if (SKIP_BUTTON_LABELS.some((label) => text.includes(label))) {
-    return null;
-  }
-
-  const match = text.match(/^(.*?)(?:\s+)?(\d+)$/);
-  if (!match) return null;
-
-  const name = match[1].trim();
-  return name.length > 0 ? name : null;
-}
-
-export function extractVendorChipNames(buttons: VendorButtonSnapshot[]): string[] {
-  const names = new Set<string>();
-
-  for (const button of buttons) {
-    if (!button.isVisible) continue;
-    const name = normalizeVendorChipLabel(button.text);
-    if (name) names.add(name);
-  }
-
-  return [...names];
-}
 
 async function ensurePurchasesPage(page: any) {
   if (!page.url().includes("/purchases")) {
@@ -44,32 +17,6 @@ async function ensurePurchasesPage(page: any) {
   }
 
   await page.waitForSelector("button", { timeout: 30000 });
-  await page.waitForTimeout(PAGE_SETTLE_MS);
-}
-
-async function snapshotVendorButtons(page: any): Promise<VendorButtonSnapshot[]> {
-  const allButtons = await page.locator("button").all();
-  const snapshots: VendorButtonSnapshot[] = [];
-
-  for (const button of allButtons) {
-    const text = (await button.textContent())?.trim() || "";
-    const isVisible = await button.isVisible().catch(() => false);
-    snapshots.push({ text, isVisible });
-  }
-
-  return snapshots;
-}
-
-async function clickVendorChip(page: any, vendorName: string) {
-  const escapedVendorName = vendorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const chipPattern = new RegExp(`^${escapedVendorName}\\s*\\d+$`, "i");
-  const chip = page
-    .locator("button")
-    .filter({ hasText: chipPattern })
-    .first();
-
-  await chip.waitFor({ state: "visible", timeout: 15000 });
-  await chip.click();
   await page.waitForTimeout(PAGE_SETTLE_MS);
 }
 
@@ -96,6 +43,7 @@ async function scrapePurchases() {
   for (const vendorName of vendorNames) {
     console.log(`\n=== ${vendorName} ===`);
     await clickVendorChip(page, vendorName);
+    await page.waitForTimeout(PAGE_SETTLE_MS);
 
     const items = await page.evaluate(`
       (function() {
