@@ -1,53 +1,102 @@
-import { chromium, type Page } from 'playwright';
-import fs from 'fs';
-import path from 'path';
+import { chromium } from "playwright";
+import fs from "fs";
+import path from "path";
+
+const PURCHASES_URL = "https://basauto.vercel.app/purchases";
+const CDP_ENDPOINT = "http://127.0.0.1:9222";
+const SKIP_BUTTON_LABELS = ["Purchases", "Overdue", "Purchase Request", "Tutorial"];
+const PAGE_SETTLE_MS = 750;
+
+type VendorButtonSnapshot = {
+  text: string;
+  isVisible: boolean;
+};
+
+export function normalizeVendorChipLabel(rawLabel: string): string | null {
+  const text = rawLabel.trim().replace(/\s+/g, " ");
+  if (!text) return null;
+  if (SKIP_BUTTON_LABELS.some((label) => text.includes(label))) {
+    return null;
+  }
+
+  const match = text.match(/^(.*?)(?:\s+)?(\d+)$/);
+  if (!match) return null;
+
+  const name = match[1].trim();
+  return name.length > 0 ? name : null;
+}
+
+export function extractVendorChipNames(buttons: VendorButtonSnapshot[]): string[] {
+  const names = new Set<string>();
+
+  for (const button of buttons) {
+    if (!button.isVisible) continue;
+    const name = normalizeVendorChipLabel(button.text);
+    if (name) names.add(name);
+  }
+
+  return [...names];
+}
+
+async function ensurePurchasesPage(page: any) {
+  if (!page.url().includes("/purchases")) {
+    await page.goto(PURCHASES_URL, { waitUntil: "networkidle", timeout: 60000 });
+  }
+
+  await page.waitForSelector("button", { timeout: 30000 });
+  await page.waitForTimeout(PAGE_SETTLE_MS);
+}
+
+async function snapshotVendorButtons(page: any): Promise<VendorButtonSnapshot[]> {
+  const allButtons = await page.locator("button").all();
+  const snapshots: VendorButtonSnapshot[] = [];
+
+  for (const button of allButtons) {
+    const text = (await button.textContent())?.trim() || "";
+    const isVisible = await button.isVisible().catch(() => false);
+    snapshots.push({ text, isVisible });
+  }
+
+  return snapshots;
+}
+
+async function clickVendorChip(page: any, vendorName: string) {
+  const escapedVendorName = vendorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const chipPattern = new RegExp(`^${escapedVendorName}\\s*\\d+$`, "i");
+  const chip = page
+    .locator("button")
+    .filter({ hasText: chipPattern })
+    .first();
+
+  await chip.waitFor({ state: "visible", timeout: 15000 });
+  await chip.click();
+  await page.waitForTimeout(PAGE_SETTLE_MS);
+}
 
 async function scrapePurchases() {
-  console.log('Connecting to Chrome via CDP on 127.0.0.1:9222...');
-  const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
-  console.log('Connected!\n');
+  console.log(`Connecting to Chrome via CDP on ${CDP_ENDPOINT}...`);
+  const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+  console.log("Connected!\n");
 
   const context = browser.contexts()[0];
-  let page = context.pages().find(p => p.url().includes('basauto'));
+  let page = context.pages().find((p) => p.url().includes("basauto"));
   if (!page) {
     page = await context.newPage();
   }
 
-  if (!page.url().includes('/purchases')) {
-    await page.goto('https://basauto.vercel.app/purchases', { waitUntil: 'networkidle', timeout: 60000 });
-  }
-  await page.waitForTimeout(2000);
-  console.log('URL:', page.url(), '\n');
+  await ensurePurchasesPage(page);
+  console.log("URL:", page.url(), "\n");
 
-  // Find vendor chip buttons
-  const allButtons = await page.locator('button').all();
-  const vendorChips: Array<{ el: any; name: string }> = [];
-
-  for (let i = 0; i < allButtons.length; i++) {
-    const btn = allButtons[i];
-    const text = (await btn.textContent())?.trim() || '';
-    const isVisible = await btn.isVisible().catch(() => false);
-    if (!isVisible) continue;
-    // Vendor chips: "AC Infinity Inc.1", "Amazon4", "ULINE7", etc.
-    if (text.match(/^[A-Z][\w\s.,&'()-]+\d+$/i) &&
-        !['Purchases', 'Overdue', 'Purchase Request', 'Tutorial'].some(s => text.includes(s))) {
-      vendorChips.push({ el: btn, name: text });
-    }
-  }
-
-  console.log(`Found ${vendorChips.length} vendor chips:`);
-  vendorChips.forEach(vc => console.log(`  - ${vc.name}`));
+  const vendorNames = extractVendorChipNames(await snapshotVendorButtons(page));
+  console.log(`Found ${vendorNames.length} vendor chips:`);
+  vendorNames.forEach((name) => console.log(`  - ${name}`));
 
   const allVendorData: Record<string, any[]> = {};
 
-  for (let v = 0; v < vendorChips.length; v++) {
-    const { el, name } = vendorChips[v];
-    console.log(`\n=== ${name} ===`);
+  for (const vendorName of vendorNames) {
+    console.log(`\n=== ${vendorName} ===`);
+    await clickVendorChip(page, vendorName);
 
-    await el.click();
-    await page.waitForTimeout(2500);
-
-    // Use page.evaluate with a plain JS string to avoid tsx transform issues
     const items = await page.evaluate(`
       (function() {
         var results = [];
@@ -58,7 +107,6 @@ async function scrapePurchases() {
           var sku = (h.textContent || '').trim();
           if (!sku.match(/^[A-Z0-9][\\w-]{2,15}$/i)) continue;
 
-          // Walk up to find card container
           var card = h.parentElement;
           for (var j = 0; j < 5; j++) {
             if (!card || !card.parentElement) break;
@@ -69,14 +117,12 @@ async function scrapePurchases() {
           }
           if (!card) continue;
 
-          // Get description (element right after heading)
           var description = '';
           var nextEl = h.nextElementSibling;
           if (nextEl && (nextEl.textContent || '').length < 200) {
             description = (nextEl.textContent || '').trim();
           }
 
-          // Find urgency badge text
           var urgency = '';
           var allSpans = card.querySelectorAll('span, div, p, a');
           for (var k = 0; k < allSpans.length; k++) {
@@ -87,7 +133,6 @@ async function scrapePurchases() {
             }
           }
 
-          // Extract label→value pairs from leaf nodes
           var metrics = {};
           var leaves = card.querySelectorAll('*');
           var prevLabel = '';
@@ -133,53 +178,29 @@ async function scrapePurchases() {
       })()
     `);
 
-    allVendorData[name] = items as any[];
+    allVendorData[vendorName] = items as any[];
 
     for (const item of items as any[]) {
-      console.log(`  [${item.urgency || '?'}] ${item.sku} — ${item.description}`);
-      console.log(`    Purchase By: ${item.purchaseAgainBy} | Reorder Qty: ${item.recommendedReorderQty} | Lead: ${item.supplierLeadTime}`);
-      console.log(`    Remaining: ${item.remaining} | Days Left: ${item.daysBuildsLeft} | Velocity: ${item.dailyVelocity}`);
+      console.log(`  [${item.urgency || "?"}] ${item.sku} - ${item.description}`);
+      console.log(
+        `    Purchase By: ${item.purchaseAgainBy} | Reorder Qty: ${item.recommendedReorderQty} | Lead: ${item.supplierLeadTime}`,
+      );
+      console.log(
+        `    Remaining: ${item.remaining} | Days Left: ${item.daysBuildsLeft} | Velocity: ${item.dailyVelocity}`,
+      );
     }
   }
 
-  // Save JSON
-  const outputPath = path.join(process.cwd(), 'purchases-data.json');
+  const outputPath = path.join(process.cwd(), "purchases-data.json");
   fs.writeFileSync(outputPath, JSON.stringify(allVendorData, null, 2));
-
-  // Summary
-  console.log('\n============================');
-  console.log('   PURCHASING SUMMARY');
-  console.log('============================\n');
-
-  let totalItems = 0;
-  const byUrgency: Record<string, any[]> = { OVERDUE: [], URGENT: [], PURCHASE: [], OTHER: [] };
-
-  for (const [vendor, items] of Object.entries(allVendorData)) {
-    totalItems += items.length;
-    for (const item of items) {
-      const vendorClean = vendor.replace(/\d+$/, '').trim();
-      const entry = { vendor: vendorClean, ...item };
-      const u = (item.urgency || '').toUpperCase();
-      if (byUrgency[u]) byUrgency[u].push(entry);
-      else byUrgency.OTHER.push(entry);
-    }
-  }
-
-  console.log(`Vendors: ${Object.keys(allVendorData).length} | Items: ${totalItems}`);
-  console.log(`OVERDUE: ${byUrgency.OVERDUE.length} | URGENT: ${byUrgency.URGENT.length} | PURCHASE: ${byUrgency.PURCHASE.length}\n`);
-
-  for (const level of ['OVERDUE', 'URGENT', 'PURCHASE']) {
-    if (byUrgency[level].length === 0) continue;
-    console.log(`--- ${level} ---`);
-    for (const item of byUrgency[level]) {
-      console.log(`  ${item.vendor} | ${item.sku} — ${item.description}`);
-      console.log(`    Buy by: ${item.purchaseAgainBy} | Qty: ${item.recommendedReorderQty} | Remaining: ${item.remaining} | Days left: ${item.daysBuildsLeft}`);
-    }
-    console.log('');
-  }
-
   console.log(`Saved to ${outputPath}`);
-  browser.close();
+
+  await browser.close();
 }
 
-scrapePurchases().catch(console.error);
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
+  scrapePurchases().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
