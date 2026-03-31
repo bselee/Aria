@@ -50,6 +50,8 @@ export interface POEmailRecord {
     itemCount?: number;
     /** Whether the vendor replied to the PO email thread */
     vendorReplied: boolean;
+    /** Whether BuildASoil sent a reply after the vendor had already responded */
+    buyerAcknowledgedVendorReply?: boolean;
     /** Number of messages in the thread (1 = no vendor reply) */
     threadMessageCount: number;
     /** Tracking numbers if vendor included them in a reply */
@@ -63,11 +65,21 @@ export interface VendorProfile {
     vendorEmails: string[];
     totalPOs: number;
     respondedCount: number;
+    vendorReplyCount: number;
+    buyerAcknowledgedVendorReplyCount: number;
     averageResponseHours: number | null;
     /** How the vendor typically communicates (thread reply, separate email, etc.) */
     communicationPattern: "thread_reply" | "separate_email" | "no_response" | "mixed";
+    buyerAcknowledgementPattern: "usually_acknowledges" | "usually_silent" | "mixed" | "unknown";
     recentPOs: POEmailRecord[];
     lastPODate: string | null;
+}
+
+export interface ThreadCommunicationSummary {
+    vendorReplyCount: number;
+    buildasoilReplyCount: number;
+    buildasoilRepliedAfterVendor: boolean;
+    lastActor: "vendor" | "buildasoil" | "unknown";
 }
 
 export interface CorrelationResult {
@@ -142,6 +154,45 @@ export async function scanPOEmails(
     }
 }
 
+export function summarizeThreadCommunication(
+    threadMessages: any[],
+    buildasoilDomain: string = "buildasoil.com",
+): ThreadCommunicationSummary {
+    let vendorReplyCount = 0;
+    let buildasoilReplyCount = 0;
+    let buildasoilRepliedAfterVendor = false;
+    let vendorSeen = false;
+    let lastActor: ThreadCommunicationSummary["lastActor"] = "unknown";
+
+    for (const message of threadMessages || []) {
+        const fromHeader = message?.payload?.headers?.find((h: any) => h.name?.toLowerCase() === "from")?.value || "";
+        const lowerFrom = String(fromHeader).toLowerCase();
+        const isBuildASoil = lowerFrom.includes(buildasoilDomain);
+
+        if (isBuildASoil) {
+            buildasoilReplyCount++;
+            lastActor = "buildasoil";
+            if (vendorSeen) {
+                buildasoilRepliedAfterVendor = true;
+            }
+            continue;
+        }
+
+        if (lowerFrom.includes("@")) {
+            vendorReplyCount++;
+            vendorSeen = true;
+            lastActor = "vendor";
+        }
+    }
+
+    return {
+        vendorReplyCount,
+        buildasoilReplyCount,
+        buildasoilRepliedAfterVendor,
+        lastActor,
+    };
+}
+
 /**
  * Extract PO details from a single email message.
  */
@@ -180,12 +231,8 @@ async function extractPOFromEmail(
 
     const threadMessages = threadRes.data.messages || [];
     const threadMessageCount = threadMessages.length;
-
-    // A vendor replied if there's a message NOT from buildasoil.com
-    const vendorReplied = threadMessages.some((m: any) => {
-        const msgFrom = m.payload?.headers?.find((h: any) => h.name.toLowerCase() === "from")?.value || "";
-        return !msgFrom.toLowerCase().includes("buildasoil.com");
-    });
+    const threadSummary = summarizeThreadCommunication(threadMessages);
+    const vendorReplied = threadSummary.vendorReplyCount > 0;
 
     // Extract tracking numbers from thread replies
     const trackingNumbers = extractTrackingFromThread(threadMessages);
@@ -231,6 +278,7 @@ async function extractPOFromEmail(
         totalAmount,
         itemCount,
         vendorReplied,
+        buyerAcknowledgedVendorReply: threadSummary.buildasoilRepliedAfterVendor,
         threadMessageCount,
         trackingNumbers,
         snippet,
@@ -386,6 +434,8 @@ export function buildVendorProfiles(poRecords: POEmailRecord[]): VendorProfile[]
         const vendorEmails = [...new Set(poList.map(p => p.vendorEmail).filter(Boolean))];
         const totalPOs = poList.length;
         const respondedCount = poList.filter(p => p.vendorReplied).length;
+        const vendorReplyCount = respondedCount;
+        const buyerAcknowledgedVendorReplyCount = poList.filter(p => p.buyerAcknowledgedVendorReply).length;
 
         // Determine communication pattern
         const responseRate = respondedCount / totalPOs;
@@ -400,6 +450,18 @@ export function buildVendorProfiles(poRecords: POEmailRecord[]): VendorProfile[]
             communicationPattern = "no_response";
         }
 
+        let buyerAcknowledgementPattern: VendorProfile["buyerAcknowledgementPattern"] = "unknown";
+        if (vendorReplyCount > 0) {
+            const acknowledgementRate = buyerAcknowledgedVendorReplyCount / vendorReplyCount;
+            if (acknowledgementRate >= 0.8) {
+                buyerAcknowledgementPattern = "usually_acknowledges";
+            } else if (acknowledgementRate <= 0.2) {
+                buyerAcknowledgementPattern = "usually_silent";
+            } else {
+                buyerAcknowledgementPattern = "mixed";
+            }
+        }
+
         // Sort by date descending
         const sorted = poList.sort((a, b) =>
             new Date(b.sentDate).getTime() - new Date(a.sentDate).getTime()
@@ -410,8 +472,11 @@ export function buildVendorProfiles(poRecords: POEmailRecord[]): VendorProfile[]
             vendorEmails,
             totalPOs,
             respondedCount,
+            vendorReplyCount,
+            buyerAcknowledgedVendorReplyCount,
             averageResponseHours: null, // TODO(will)[2026-03-15]: Calculate from thread timestamps
             communicationPattern,
+            buyerAcknowledgementPattern,
             recentPOs: sorted.slice(0, 5),
             lastPODate: sorted[0]?.sentDate || null,
         });

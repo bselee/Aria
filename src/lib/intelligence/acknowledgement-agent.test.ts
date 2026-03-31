@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
     gmailSendMock,
     gmailModifyMock,
+    gmailThreadsGetMock,
     gmailLabelsListMock,
     gmailLabelsCreateMock,
     getProfileMock,
@@ -15,6 +16,7 @@ const {
 } = vi.hoisted(() => ({
     gmailSendMock: vi.fn(),
     gmailModifyMock: vi.fn(),
+    gmailThreadsGetMock: vi.fn(),
     gmailLabelsListMock: vi.fn(),
     gmailLabelsCreateMock: vi.fn(),
     getProfileMock: vi.fn(),
@@ -40,6 +42,9 @@ vi.mock("@googleapis/gmail", () => ({
             messages: {
                 send: gmailSendMock,
                 modify: gmailModifyMock,
+            },
+            threads: {
+                get: gmailThreadsGetMock,
             },
             labels: {
                 list: gmailLabelsListMock,
@@ -103,6 +108,7 @@ describe("AcknowledgementAgent", () => {
         getProfileMock.mockResolvedValue({ data: { emailAddress: "bill.selee@buildasoil.com" } });
         gmailSendMock.mockResolvedValue({ data: { id: "reply-1" } });
         gmailModifyMock.mockResolvedValue({ data: {} });
+        gmailThreadsGetMock.mockResolvedValue({ data: { messages: [] } });
         gmailLabelsListMock.mockResolvedValue({ data: { labels: [] } });
         gmailLabelsCreateMock.mockImplementation(async ({ requestBody }: { requestBody: { name: string } }) => ({
             data: { id: `${requestBody.name.toLowerCase().replace(/\s+/g, "-")}-label` },
@@ -151,6 +157,77 @@ describe("AcknowledgementAgent", () => {
             subject: "Tracking update",
             replyBody: expect.any(String),
         });
+    });
+
+    it("does not auto-reply to marketplace shipping notices", async () => {
+        queueState.messages = [
+            {
+                id: 11,
+                gmail_message_id: "gmail-11",
+                thread_id: "thread-11",
+                rfc_message_id: "<msg-11>",
+                from_email: "credit@notice.alibaba.com",
+                subject: "Your order is on its way (296225130501024781)",
+                body_snippet: "The supplier has shipped your products",
+                body_text: "The supplier has shipped your products. Track package.",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        expect(recordHumanFollowUpRequiredMock).not.toHaveBeenCalled();
+    });
+
+    it("does not send a second thank-you on vendor PO threads that already have a buildasoil reply", async () => {
+        queueState.messages = [
+            {
+                id: 12,
+                gmail_message_id: "gmail-12",
+                thread_id: "thread-12",
+                rfc_message_id: "<msg-12>",
+                from_email: "barends@jabbspe.com",
+                subject: "Re: BuildASoil PO # 124564 - JABB of the Carolinas, Inc. - 3/30/2026",
+                body_snippet: "This will ship today. ETA is next Monday, April 6.",
+                body_text: "Thanks Bill! This will ship today. ETA is next Monday, April 6.",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+        gmailThreadsGetMock.mockResolvedValue({
+            data: {
+                messages: [
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Bill Selee <bill.selee@buildasoil.com>" }],
+                        },
+                    },
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Ben Arends <barends@jabbspe.com>" }],
+                        },
+                    },
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Bill Selee <bill.selee@buildasoil.com>" }],
+                        },
+                    },
+                ],
+            },
+        });
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        expect(recordHumanFollowUpRequiredMock).not.toHaveBeenCalled();
     });
 
     it("forces multi-turn conversation threads into Follow Up instead of auto-replying", async () => {

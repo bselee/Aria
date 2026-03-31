@@ -6,6 +6,7 @@ import { z } from "zod";
 import { recall } from "./memory";
 import { applyMessageLabelPolicy } from "./gmail-policy";
 import { recordHumanFollowUpRequired, recordSimpleAutoReply } from "./email-feedback";
+import { summarizeThreadCommunication } from "./po-correlator";
 
 /**
  * @file acknowledgement-agent.ts
@@ -65,6 +66,45 @@ export class AcknowledgementAgent {
             lowerFrom.includes("mailer-daemon") ||
             lowerFrom.includes("bounce") ||
             lowerFrom.includes("@send.");
+    }
+
+    private isMarketplaceOrStatusSender(from: string, subject: string): boolean {
+        const haystack = `${from} ${subject}`.toLowerCase();
+        return [
+            "amazon.com",
+            "order-update@amazon.com",
+            "alibaba.com",
+            "notice.alibaba.com",
+            "track package",
+            "your order is on its way",
+            "delivered:",
+            "shipped",
+            "delivery update",
+            "view order",
+        ].some(pattern => haystack.includes(pattern));
+    }
+
+    private looksLikePurchaseThread(subject: string, bodyText: string): boolean {
+        const text = `${subject}\n${bodyText}`.toLowerCase();
+        return /buildasoil\s+po\s*#?\s*\d+/.test(text)
+            || /purchase\s+order/.test(text)
+            || /\bpo\s*#?\s*\d{4,}\b/.test(text)
+            || /\beta\b/.test(text)
+            || /\btracking\b/.test(text);
+    }
+
+    private async getThreadCommunicationSummary(gmail: any, threadId: string) {
+        try {
+            const threadRes = await gmail.users.threads.get({
+                userId: "me",
+                id: threadId,
+                format: "metadata",
+                metadataHeaders: ["From"],
+            });
+            return summarizeThreadCommunication(threadRes.data.messages || []);
+        } catch {
+            return null;
+        }
     }
 
     private async addMessageLabels(gmail: any, gmailMessageId: string, labelNames: string[]): Promise<void> {
@@ -288,8 +328,17 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 if (intent === "ROUTINE_INFO") {
                     // It's routine! Let's handle it.
                     const isNoRep = this.isNoReply(senderEmail);
+                    const isMarketplaceStatus = this.isMarketplaceOrStatusSender(senderEmail, subject);
+                    const isPurchaseThread = this.looksLikePurchaseThread(subject, bodyText);
+                    const threadSummary = isPurchaseThread
+                        ? await this.getThreadCommunicationSummary(gmail, threadId)
+                        : null;
                     let replied = false;
-                    if (!isNoRep && rfcMessageId && myEmail) {
+                    const suppressAutoReply = isMarketplaceStatus
+                        || (isPurchaseThread && (threadSummary?.vendorReplyCount || 0) > 0)
+                        || (isPurchaseThread && !!threadSummary?.buildasoilRepliedAfterVendor);
+
+                    if (!suppressAutoReply && !isNoRep && rfcMessageId && myEmail) {
                         try {
                             // Send reply
                             const replyBody = this.getRandomResponse();
@@ -314,6 +363,8 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         } catch (replyErr: any) {
                             console.error(`     ❌ Failed to send reply:`, replyErr.message);
                         }
+                    } else if (suppressAutoReply) {
+                        console.log(`     -> Suppressing auto-reply for marketplace/purchase thread.`);
                     } else if (isNoRep) {
                         console.log(`     -> Sender is no-reply, skipping response and leaving visible.`);
                     }
