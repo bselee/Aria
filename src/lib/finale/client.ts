@@ -113,6 +113,7 @@ export interface PurchasingItem {
     salesVelocity: number;         // units/day from outbound shipments
     demandVelocity: number;        // units/day from Finale 90-day demand (sales + BOM consumption)
     dailyRate: number;             // best signal: demandVelocity → salesVelocity → purchaseVelocity
+    dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number;            // stockOnHand / dailyRate
     adjustedRunwayDays: number;    // (stockOnHand + stockOnOrder) / dailyRate
     leadTimeDays: number;
@@ -222,6 +223,34 @@ export function normalizeFinaleReorderMethod(productData: any): FinaleReorderMet
         return "manual";
     }
     return "default";
+}
+
+export function chooseVelocitySignal(input: {
+    reorderMethod?: FinaleReorderMethod;
+    demandVelocity: number;
+    salesVelocity: number;
+    consumptionQty?: number | null;
+}): { dailyRate: number; signal: "demand" | "sales" | "none" } {
+    const reorderMethod = input.reorderMethod ?? "default";
+    const demandVelocity = input.demandVelocity > 0 ? input.demandVelocity : 0;
+    const salesVelocity = input.salesVelocity > 0 ? input.salesVelocity : 0;
+    const hasConsumption = (input.consumptionQty ?? 0) > 0;
+
+    const preferredSignals: Array<"demand" | "sales"> =
+        reorderMethod === "sales_velocity"
+            ? ["sales", "demand"]
+            : reorderMethod === "demand_velocity" || reorderMethod === "on_site_order"
+                ? ["demand", "sales"]
+                : reorderMethod === "default"
+                    ? (hasConsumption ? ["demand", "sales"] : ["sales", "demand"])
+                    : ["sales", "demand"];
+
+    for (const signal of preferredSignals) {
+        const rate = signal === "demand" ? demandVelocity : salesVelocity;
+        if (rate > 0) return { dailyRate: rate, signal };
+    }
+
+    return { dailyRate: 0, signal: "none" };
 }
 
 /**
@@ -4122,10 +4151,14 @@ export class FinaleClient {
                     // purchases to artificially inflate the daily rate, causing ARIA to warn of stockouts
                     // when Finale correctly showed 90+ days of runway based on current velocity.
                     // We only fall back to purchaseVelocity if demand is strictly 0 (e.g., untracked boxes).
-                    let dailyRate = reorderMethod === "sales_velocity" ? salesVelocity : demandVelocity;
-                    if ((reorderMethod === "manual" || reorderMethod === "default") && candidate.finaleConsumptionQty && candidate.finaleConsumptionQty > 0) {
-                        dailyRate = demandVelocity;
-                    }
+                    const chosenVelocity = chooseVelocitySignal({
+                        reorderMethod,
+                        demandVelocity,
+                        salesVelocity,
+                        consumptionQty: candidate.finaleConsumptionQty,
+                    });
+                    let dailyRate = chosenVelocity.dailyRate;
+                    let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
                     if (dailyRate === 0 && purchaseVelocity > 0) {
                         let daysSinceLastPurchase = 999;
                         if (activity.lastPurchaseDate) {
@@ -4136,6 +4169,7 @@ export class FinaleClient {
                         // We enforce a 180-day activity window (or an active open PO) to stay on the radar.
                         if (daysSinceLastPurchase <= 180 || activity.openPOs.length > 0) {
                             dailyRate = purchaseVelocity;
+                            rateSource = "receipts";
                         }
                     }
 
@@ -4143,8 +4177,11 @@ export class FinaleClient {
 
 
                     // Identify which signal is driving the rate (for explanation)
-                    const rateSource = dailyRate === demandVelocity ? '90d demand'
-                        : `${daysBack}d receipts`;
+                    const rateSourceLabel = rateSource === "demand"
+                        ? "90d demand"
+                        : rateSource === "sales"
+                            ? `${daysBack}d sales`
+                            : `${daysBack}d receipts`;
 
                     const runwayDays = stockOnHand / dailyRate;
                     const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
@@ -4159,7 +4196,7 @@ export class FinaleClient {
                                 : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
                                     : 'ok';
                     const parts: string[] = [
-                        `Avg ${dailyRate.toFixed(1)}/day (${rateSource})`,
+                        `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
                         `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays)}d`,
                         `Lead ${leadTimeDays}d`,
                     ];
@@ -4214,6 +4251,7 @@ export class FinaleClient {
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
                         finaleDemandQty: candidate.finaleDemandQty,
                         reorderMethod,
+                        dailyRateSource: rateSource === "none" ? undefined : rateSource,
                     });
                 } catch {
                     // Skip products that error — non-fatal

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
 import {
+    canIncludeInDraftPO,
     canUseDirectOrdering,
     getOrderingFocusBucket,
     shouldAutoSelectItem,
@@ -14,6 +15,7 @@ type PurchasingItem = {
     productId: string; productName: string; supplierName: string; supplierPartyId: string;
     unitPrice: number; stockOnHand: number; stockOnOrder: number;
     purchaseVelocity: number; salesVelocity: number; demandVelocity: number; dailyRate: number;
+    dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: "critical" | "warning" | "watch" | "ok";
@@ -295,6 +297,8 @@ export default function PurchasingPanel() {
         setExpanded(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
     }
     function toggleItem(pid: string, itemId: string) {
+        const item = data?.groups.find(group => group.vendorPartyId === pid)?.items.find(candidate => candidate.productId === itemId);
+        if (item && !canIncludeInDraftPO(item.reorderMethod)) return;
         setChecked(p => ({ ...p, [pid]: { ...p[pid], [itemId]: !p[pid]?.[itemId] } }));
     }
     function setQty(pid: string, itemId: string, v: number) {
@@ -303,8 +307,10 @@ export default function PurchasingPanel() {
     function selectAll(group: PurchasingGroup, val: boolean) {
         setChecked(p => {
             const n = { ...p[group.vendorPartyId] };
-            // only select/deselect non-snoozed items
-            group.items.filter(i => !isSnoozed(i.productId)).forEach(i => { n[i.productId] = val; });
+            // only select/deselect draft-eligible, non-snoozed items
+            group.items
+                .filter(i => !isSnoozed(i.productId) && canIncludeInDraftPO(i.reorderMethod))
+                .forEach(i => { n[i.productId] = val; });
             return { ...p, [group.vendorPartyId]: n };
         });
     }
@@ -312,7 +318,7 @@ export default function PurchasingPanel() {
     async function createVendorPO(group: PurchasingGroup): Promise<POResult | null> {
         const pid = group.vendorPartyId;
         const items = group.items
-            .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId])
+            .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod))
             .map(i => ({ productId: i.productId, quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
@@ -896,7 +902,8 @@ export default function PurchasingPanel() {
                                                         .filter(item => showSnoozed || !isSnoozed(item.productId))
                                                         .map(item => {
                                                             const itemSnoozed = isSnoozed(item.productId);
-                                                            const isChecked = !itemSnoozed && (groupChecked[item.productId] ?? false);
+                                                            const draftBlocked = !canIncludeInDraftPO(item.reorderMethod);
+                                                            const isChecked = !itemSnoozed && !draftBlocked && (groupChecked[item.productId] ?? false);
                                                             const qty = groupQtys[item.productId] ?? item.suggestedQty;
                                                             const rc = runwayColor(item.runwayDays);
                                                             const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
@@ -911,10 +918,11 @@ export default function PurchasingPanel() {
                                                                         {!itemSnoozed && (
                                                                             <input type="checkbox" checked={isChecked}
                                                                                 onChange={() => toggleItem(pid, iKey)}
+                                                                                disabled={draftBlocked}
                                                                                 className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
                                                                                     : item.urgency === "warning" ? "accent-yellow-400"
                                                                                         : "accent-zinc-400"
-                                                                                    }`} />
+                                                                                    } disabled:opacity-40`} />
                                                                         )}
                                                                         {itemSnoozed && <div className="mt-1 w-3.5 h-3.5" />}
 
@@ -972,7 +980,7 @@ export default function PurchasingPanel() {
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center gap-2 mt-1">
                                                                                     <span className="text-[11px] font-mono text-[var(--dash-l2)] flex-1 truncate">{item.productName}</span>
-                                                                                    {item.reorderMethod === "default" && (
+                                                                                    {item.reorderMethod === "default" && item.dailyRateSource === "demand" && (
                                                                                         <span className="text-[10px] font-mono text-zinc-500 shrink-0">
                                                                                             demand fallback
                                                                                         </span>

@@ -193,4 +193,47 @@ describe("assessPurchasingGroups", () => {
         expect(result.groups[0].items).toHaveLength(0);
         expect(result.actionableLines).toHaveLength(0);
     });
+
+    it("hard-excludes do-not-reorder items from assessed output", () => {
+        const result = assessPurchasingGroups([
+            {
+                vendorName: "ULINE",
+                vendorPartyId: "party-1",
+                urgency: "critical",
+                items: [
+                    {
+                        productId: "DNR-SKU",
+                        productName: "Retired SKU",
+                        supplierName: "ULINE",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1,
+                        stockOnHand: 0,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 2,
+                        salesVelocity: 2,
+                        demandVelocity: 2,
+                        dailyRate: 2,
+                        adjustedRunwayDays: 0,
+                        runwayDays: 0,
+                        leadTimeDays: 14,
+                        leadTimeProvenance: "14d (Finale)",
+                        openPOs: [],
+                        urgency: "critical",
+                        explanation: "Should be excluded.",
+                        suggestedQty: 50,
+                        orderIncrementQty: null,
+                        isBulkDelivery: false,
+                        finaleReorderQty: 50,
+                        finaleStockoutDays: 2,
+                        finaleConsumptionQty: 20,
+                        finaleDemandQty: 20,
+                        reorderMethod: "do_not_reorder",
+                    },
+                ],
+            },
+        ]);
+
+        expect(result.groups[0].items).toHaveLength(0);
+        expect(result.actionableLines).toHaveLength(0);
+    });
 });

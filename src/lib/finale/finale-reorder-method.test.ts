@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeFinaleReorderMethod } from "./client";
+import { chooseVelocitySignal, normalizeFinaleReorderMethod } from "./client";
 
 describe("normalizeFinaleReorderMethod", () => {
   it("detects do-not-reorder from guideline ids", () => {
@@ -29,5 +29,23 @@ describe("normalizeFinaleReorderMethod", () => {
 
   it("falls back to default when no explicit method is found", () => {
     expect(normalizeFinaleReorderMethod({})).toBe("default");
+  });
+
+  it("treats default with consumption as demand-driven", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 4,
+      salesVelocity: 1,
+      consumptionQty: 20,
+    })).toEqual({ dailyRate: 4, signal: "demand" });
+  });
+
+  it("treats manual as sales-first when no explicit demand-driven method is chosen", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "manual",
+      demandVelocity: 4,
+      salesVelocity: 1,
+      consumptionQty: 20,
+    })).toEqual({ dailyRate: 1, signal: "sales" });
   });
 });

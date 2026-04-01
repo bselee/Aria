@@ -36,7 +36,7 @@ export function shouldAutoSelectItem(
   item: FocusItem,
   policy: OrderingMethodPolicy = {},
 ): boolean {
-  if (item.reorderMethod === "do_not_reorder") {
+  if (!canIncludeInDraftPO(item.reorderMethod)) {
     return false;
   }
   if (policy.manualOnly || policy.neverAutoSelect) {
@@ -49,6 +49,12 @@ export function shouldAutoSelectItem(
   }
 
   return item.urgency === "critical" || item.urgency === "warning";
+}
+
+export function canIncludeInDraftPO(
+  reorderMethod?: FinaleReorderMethod,
+): boolean {
+  return reorderMethod !== "do_not_reorder";
 }
 
 export function canUseDirectOrdering(

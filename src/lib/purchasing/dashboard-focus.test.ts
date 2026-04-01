@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canIncludeInDraftPO,
   canUseDirectOrdering,
   getOrderingFocusBucket,
   shouldAutoSelectItem,
@@ -59,6 +60,11 @@ describe("dashboard focus helpers", () => {
       ...baseItem,
       reorderMethod: "manual",
     })).toBe(true);
+  });
+
+  it("never includes do-not-reorder items in draft POs", () => {
+    expect(canIncludeInDraftPO("do_not_reorder")).toBe(false);
+    expect(canIncludeInDraftPO("manual")).toBe(true);
   });
 
   it("blocks direct ordering when direct ordering is disabled", () => {
