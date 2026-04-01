@@ -36,6 +36,7 @@ describe("assessPurchasingGroups", () => {
                         finaleStockoutDays: 3,
                         finaleConsumptionQty: 0,
                         finaleDemandQty: 270,
+                        reorderMethod: "demand_velocity",
                     },
                 ],
             },
@@ -80,6 +81,7 @@ describe("assessPurchasingGroups", () => {
                         finaleStockoutDays: 40,
                         finaleConsumptionQty: 150,
                         finaleDemandQty: 180,
+                        reorderMethod: "default",
                     },
                     {
                         productId: "LABEL-42",
@@ -107,6 +109,7 @@ describe("assessPurchasingGroups", () => {
                         finaleStockoutDays: 20,
                         finaleConsumptionQty: 0,
                         finaleDemandQty: 120,
+                        reorderMethod: "manual",
                     },
                 ],
             },
@@ -146,5 +149,48 @@ describe("assessPurchasingGroups", () => {
 
         expect(result.groups.map(group => group.vendorName)).toEqual(["ULINE", "Axiom"]);
         expect(result.vendorSummaries).toHaveLength(2);
+    });
+
+    it("filters non-moving default items out of actionable assessment output", () => {
+        const result = assessPurchasingGroups([
+            {
+                vendorName: "ULINE",
+                vendorPartyId: "party-1",
+                urgency: "watch",
+                items: [
+                    {
+                        productId: "DUSTY-SKU",
+                        productName: "Dusty SKU",
+                        supplierName: "ULINE",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1,
+                        stockOnHand: 100,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 0,
+                        salesVelocity: 0,
+                        demandVelocity: 0,
+                        dailyRate: 0,
+                        runwayDays: 999,
+                        adjustedRunwayDays: 999,
+                        leadTimeDays: 14,
+                        leadTimeProvenance: "14d (Finale)",
+                        openPOs: [],
+                        urgency: "watch",
+                        explanation: "No recent movement.",
+                        suggestedQty: 10,
+                        orderIncrementQty: null,
+                        isBulkDelivery: false,
+                        finaleReorderQty: null,
+                        finaleStockoutDays: null,
+                        finaleConsumptionQty: 0,
+                        finaleDemandQty: 0,
+                        reorderMethod: "default",
+                    },
+                ],
+            },
+        ]);
+
+        expect(result.groups[0].items).toHaveLength(0);
+        expect(result.actionableLines).toHaveLength(0);
     });
 });

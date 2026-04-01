@@ -30,6 +30,7 @@ describe("buildPurchasingCandidate", () => {
             finaleStockoutDays: 3,
             finaleConsumptionQty: 0,
             finaleDemandQty: 270,
+            reorderMethod: "demand_velocity",
         });
 
         expect(candidate).toMatchObject({
@@ -41,6 +42,7 @@ describe("buildPurchasingCandidate", () => {
             leadTimeDays: 14,
             suggestedQty: 300,
             orderIncrementQty: 25,
+            reorderMethod: "demand_velocity",
             sourceUrgency: "critical",
         });
     });
@@ -72,6 +74,7 @@ describe("buildPurchasingCandidate", () => {
             finaleStockoutDays: 40,
             finaleConsumptionQty: 150,
             finaleDemandQty: 180,
+            reorderMethod: "default",
         }, {
             directDemand: 30,
             bomDemand: 150,

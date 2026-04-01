@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createBrowserClient } from "@/lib/supabase";
@@ -8,6 +9,8 @@ type ReceivedPO = {
     orderId: string;
     orderDate: string;
     receiveDate: string;
+    receiveDateTime?: string;
+    receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
     items: Array<{ productId: string; quantity: number }>;
@@ -45,6 +48,16 @@ function fmtDateTime(s: string): string {
 function fmtDollars(n: number): string {
     if (!n || n <= 1) return '';   // skip $0 and $1 placeholder totals
     return '$' + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function receiptBadge(po: ReceivedPO): { label: string; cls: string } | null {
+    if (po.receiptStatus === "full") {
+        return { label: "FULL", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" };
+    }
+    if (po.receiptStatus === "partial") {
+        return { label: "PARTIAL", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" };
+    }
+    return null;
 }
 
 export default function ReceivedItemsPanel() {
@@ -198,8 +211,13 @@ export default function ReceivedItemsPanel() {
                                     <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
-                                            <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDate)}</span>
+                                            <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
                                             <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
+                                            {receiptBadge(po) && (
+                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${receiptBadge(po)!.cls}`}>
+                                                    {receiptBadge(po)!.label}
+                                                </span>
+                                            )}
                                             {apStatus && (
                                                 <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
                                                     {apStatus.label}
@@ -213,6 +231,12 @@ export default function ReceivedItemsPanel() {
                                                 className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
                                                 {po.orderId}
                                             </a>
+                                            {po.receiptStatus === "partial" && (
+                                                <>
+                                                    <span className="text-zinc-700 text-xs">·</span>
+                                                    <span className="text-[10px] font-mono text-amber-300/80">partial receipt recorded</span>
+                                                </>
+                                            )}
                                             <span className="text-zinc-700 text-xs">·</span>
                                             {po.items.map(item => (
                                                 <span key={item.productId} className="text-sm font-mono text-zinc-200">

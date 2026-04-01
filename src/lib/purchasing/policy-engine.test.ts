@@ -102,4 +102,26 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.decision).toBe("hold");
         expect(assessment.reasonCodes).toContain("order_economics_unclear");
     });
+
+    it("keeps manual items actionable when movement still supports reorder", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            reorderMethod: "manual",
+            directDemand: 6,
+            suggestedQty: 150,
+        }) as any);
+
+        expect(assessment.decision).toBe("order");
+    });
+
+    it("treats default with current consumption like demand-driven movement", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            reorderMethod: "default",
+            directDemand: 0,
+            bomDemand: 20,
+            finishedGoodsCoverageDays: 12,
+            suggestedQty: 200,
+        }) as any);
+
+        expect(assessment.decision).toBe("order");
+    });
 });

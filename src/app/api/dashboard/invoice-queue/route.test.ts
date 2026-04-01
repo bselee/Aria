@@ -24,6 +24,7 @@ const logData = [
     created_at: new Date().toISOString(),
     email_subject: "INV-100",
     action_taken: "queued for Bill.com forward",
+    reviewed_action: null,
     metadata: {
       invoiceNumber: "INV-100",
       reasonCode: "queued_for_billcom",
@@ -35,6 +36,7 @@ const logData = [
     created_at: new Date().toISOString(),
     email_subject: "Missing PDF",
     action_taken: "No PDF attachment found - left unread for manual review",
+    reviewed_action: null,
     metadata: {
       reasonCode: "missing_pdf_manual_review",
     },
@@ -45,6 +47,7 @@ const logData = [
     created_at: new Date().toISOString(),
     email_subject: "Need response",
     action_taken: "Human interaction detected on ap inbox - left visible for manual AP review",
+    reviewed_action: null,
     metadata: {
       reasonCode: "human_interaction_manual_review",
     },
@@ -119,5 +122,22 @@ describe("invoice queue route", () => {
       "RECONCILIATION",
       "HUMAN_INTERACTION",
     ]);
+  });
+
+  it("filters invoices out of the queue when the latest linked review is dismissed", async () => {
+    logData[0] = {
+      ...logData[0],
+      action_taken: "queued for review",
+      reviewed_action: "dismissed",
+    };
+
+    const response = await GET({
+      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue?bust=1"),
+    } as any);
+
+    expect(response.status).toBe(200);
+
+    const body = await response.json();
+    expect(body.invoices).toHaveLength(0);
   });
 });

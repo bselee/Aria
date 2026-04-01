@@ -68,12 +68,33 @@ function summarizeVendor(group: AssessedPurchasingGroup): VendorAssessmentSummar
     };
 }
 
+function shouldSuppressAsNonMoving(item: PurchasingItem): boolean {
+    const method = item.reorderMethod ?? "default";
+    if (method === "do_not_reorder") return true;
+
+    const hasMovement = (item.salesVelocity ?? 0) > 0
+        || (item.demandVelocity ?? 0) > 0
+        || (item.purchaseVelocity ?? 0) > 0
+        || (item.finaleConsumptionQty ?? 0) > 0
+        || (item.finaleDemandQty ?? 0) > 0;
+    const hasCoveragePressure = (item.finaleReorderQty ?? 0) > 0
+        || (item.openPOs?.length ?? 0) > 0
+        || item.urgency === "critical"
+        || item.urgency === "warning";
+
+    if (hasMovement || hasCoveragePressure) return false;
+
+    return method === "default" || method === "manual";
+}
+
 export function assessPurchasingGroups(
     groups: PurchasingGroup[],
     options: AssessPurchasingGroupsOptions = {},
 ): PurchasingAssessmentResult {
     const assessedGroups = groups.map((group): AssessedPurchasingGroup => {
-        const items = group.items.map((item) => {
+        const items = group.items
+        .filter(item => !shouldSuppressAsNonMoving(item))
+        .map((item) => {
             const candidate = buildPurchasingCandidate(
                 item,
                 options.itemContexts?.[item.productId],

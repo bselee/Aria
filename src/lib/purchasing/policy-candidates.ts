@@ -11,6 +11,7 @@ export interface PurchasingCandidate extends PurchasingCandidateInput {
     finaleDemandQty: number | null;
     finaleConsumptionQty: number | null;
     isBulkDelivery: boolean;
+    reorderMethod?: PurchasingItem["reorderMethod"];
 }
 
 export interface PurchasingCandidateContext {
@@ -53,5 +54,6 @@ export function buildPurchasingCandidate(
         finaleDemandQty: item.finaleDemandQty,
         finaleConsumptionQty: item.finaleConsumptionQty,
         isBulkDelivery: item.isBulkDelivery,
+        reorderMethod: item.reorderMethod ?? "default",
     };
 }

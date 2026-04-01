@@ -2,6 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
+import {
+    canUseDirectOrdering,
+    getOrderingFocusBucket,
+    shouldAutoSelectItem,
+} from "@/lib/purchasing/dashboard-focus";
+import type { FinaleReorderMethod } from "@/lib/finale/client";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type PurchasingItem = {
@@ -15,6 +21,7 @@ type PurchasingItem = {
     orderIncrementQty: number | null; isBulkDelivery: boolean;
     finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;
+    reorderMethod?: FinaleReorderMethod;
     candidate?: { directDemand: number; bomDemand: number; finishedGoodsCoverageDays?: number | null };
     assessment?: {
         decision: "order" | "reduce" | "hold" | "manual_review";
@@ -54,9 +61,11 @@ type CommitReview = {
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
+type FocusFilter = "today" | "week" | "all";
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
+const FOCUS_FILTER_LS = "aria-dash-purchasing-focus";
 const URGENCY_RANK = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
 // DECISION(2026-03-10): Badge hierarchy reform — only CRIT gets a filled pill.
 // WARN = amber text only (no pill).  WATCH/OK = invisible badge.
@@ -103,6 +112,7 @@ export default function PurchasingPanel() {
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
+    const [focusFilter, setFocusFilter] = useState<FocusFilter>("today");
 
     // ULINE direct ordering
     const [ulineOrdering, setUlineOrdering] = useState(false);
@@ -120,6 +130,13 @@ export default function PurchasingPanel() {
         if (s) setBodyHeight(Math.max(120, Math.min(700, parseInt(s))));
     }, []);
     useEffect(() => { localStorage.setItem("aria-dash-purchasing-h", String(bodyHeight)); }, [bodyHeight]);
+    useEffect(() => {
+        const savedFocus = localStorage.getItem(FOCUS_FILTER_LS) as FocusFilter | null;
+        if (savedFocus === "today" || savedFocus === "week" || savedFocus === "all") {
+            setFocusFilter(savedFocus);
+        }
+    }, []);
+    useEffect(() => { localStorage.setItem(FOCUS_FILTER_LS, focusFilter); }, [focusFilter]);
 
     // Load snooze state from localStorage; purge expired entries on mount
     useEffect(() => {
@@ -180,6 +197,33 @@ export default function PurchasingPanel() {
         const days = Math.ceil(((e.until as number) - Date.now()) / 86400000);
         return `snoozed ${days}d`;
     }
+    function reorderMethodBadge(method?: FinaleReorderMethod): string | null {
+        if (!method) return null;
+        if (method === "do_not_reorder") return "DNR";
+        if (method === "manual") return "MANUAL";
+        if (method === "sales_velocity") return "SALES";
+        if (method === "demand_velocity") return "DEMAND";
+        if (method === "on_site_order") return "ON SITE";
+        return "DEFAULT";
+    }
+    function reorderMethodTone(method?: FinaleReorderMethod): string {
+        if (method === "do_not_reorder") return "text-rose-300/80 border-rose-500/20";
+        if (method === "manual" || method === "on_site_order") return "text-amber-300/80 border-amber-500/20";
+        if (method === "sales_velocity" || method === "demand_velocity") return "text-cyan-300/80 border-cyan-500/20";
+        return "text-zinc-400 border-zinc-700/60";
+    }
+    function directOrderBlockReason(items: PurchasingItem[]): string {
+        if (items.some(item => item.reorderMethod === "manual")) return "Finale manual items selected";
+        if (items.some(item => item.reorderMethod === "on_site_order")) return "On-site order items selected";
+        if (items.some(item => item.reorderMethod === "do_not_reorder")) return "Do not reorder items selected";
+        return "Selected items need PO handling";
+    }
+    function itemMatchesFocus(item: PurchasingItem): boolean {
+        if (focusFilter === "all") return true;
+        const bucket = getOrderingFocusBucket(item);
+        if (focusFilter === "today") return bucket === "today";
+        return bucket === "today" || bucket === "week";
+    }
     // Vendor is effectively hidden if vendor-level snoozed OR every item is individually snoozed
     function vendorSnoozed(g: PurchasingGroup): boolean {
         return isSnoozed(`v:${g.vendorPartyId}`) || g.items.every(i => isSnoozed(i.productId));
@@ -188,7 +232,7 @@ export default function PurchasingPanel() {
     function renderSnoozeMenu(k: string) {
         const snoozed = isSnoozed(k);
         return (
-            <div className="absolute right-0 top-full mt-0.5 z-50 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[110px]">
+            <div className="absolute right-0 top-full mt-0.5 z-50 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[150px]">
                 {snoozed ? (
                     <button onClick={() => doUnsnooze(k)}
                         className="w-full text-left px-3 py-1.5 text-[10px] font-mono text-emerald-400 hover:bg-zinc-800">
@@ -232,10 +276,7 @@ export default function PurchasingPanel() {
                 ic[g.vendorPartyId] = {};
                 iq[g.vendorPartyId] = {};
                 for (const item of g.items) {
-                    const decision = item.assessment?.decision;
-                    ic[g.vendorPartyId][item.productId] = decision
-                        ? (decision === "order" || decision === "reduce")
-                        : (item.urgency === "critical" || item.urgency === "warning");
+                    ic[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
                     iq[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
                 }
             }
@@ -290,6 +331,7 @@ export default function PurchasingPanel() {
         try {
             const result = await createVendorPO(group);
             if (result) setCreatedPOs(p => ({ ...p, [pid]: result }));
+            await load(true);
         } catch (e: any) {
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
@@ -315,6 +357,7 @@ export default function PurchasingPanel() {
         if (Object.keys(updates).length) setCreatedPOs(p => ({ ...p, ...updates }));
         if (errs.length) setError(errs.join(" | "));
         setCreatingPO(new Set());
+        if (Object.keys(updates).length > 0) await load(true);
     }
 
     async function handleReviewAndSend(orderId: string) {
@@ -348,6 +391,7 @@ export default function PurchasingPanel() {
             if (!res.ok) { setError(json.error || 'Send failed'); return; }
             setSentPOs(p => new Set(p).add(commitModal.review.orderId));
             setCommitModal(null);
+            await load(true);
         } catch (e: any) {
             setError(`Send failed: ${e.message}`);
         } finally {
@@ -368,14 +412,14 @@ export default function PurchasingPanel() {
 
     // ── ULINE direct ordering ──────────────────────────────────────────────
     function isUlineVendor(vendorName: string): boolean {
-        return vendorName.toLowerCase().includes('uline');
+        return vendorName.toLowerCase().includes("uline");
     }
 
     async function handleOrderOnUline(group: PurchasingGroup) {
         const pid = group.vendorPartyId;
         const draftPO = createdPOs[pid]?.orderId;
         const items = group.items
-            .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId])
+            .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canUseDirectOrdering(group.vendorName, i.reorderMethod))
             .map(i => ({
                 productId: i.productId,
                 quantity: qtys[pid]?.[i.productId] ?? i.suggestedQty,
@@ -394,6 +438,7 @@ export default function PurchasingPanel() {
             });
             const result: UlineOrderResult = await res.json();
             setUlineResult(result);
+            if (result.success) await load(true);
         } catch (e: any) {
             setUlineResult({ success: false, itemsAdded: 0, message: e.message });
         } finally {
@@ -406,7 +451,13 @@ export default function PurchasingPanel() {
     const sortedGroups = [...allGroups].sort((a, b) => URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]);
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g));
     const displayGroups = showSnoozed ? sortedGroups : activeGroups;
-    const visibleGroups = vendorTab === "all" ? displayGroups : displayGroups.filter(g => g.vendorPartyId === vendorTab);
+    const focusGroups = displayGroups
+        .map(group => ({
+            ...group,
+            items: group.items.filter(item => itemMatchesFocus(item)),
+        }))
+        .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
+    const visibleGroups = vendorTab === "all" ? focusGroups : focusGroups.filter(g => g.vendorPartyId === vendorTab);
 
     // Total hidden items across all snoozed vendors + individually snoozed items
     const hiddenItemCount = sortedGroups.reduce((n, g) => {
@@ -414,14 +465,20 @@ export default function PurchasingPanel() {
         return n + g.items.filter(i => isSnoozed(i.productId)).length;
     }, 0);
 
-    const critCount = activeGroups.filter(g => g.urgency === "critical").length;
-    const warnCount = activeGroups.filter(g => g.urgency === "warning").length;
-    const actionableVendors = activeGroups.filter(g =>
+    const todayCount = activeGroups.flatMap(g => g.items).filter(item => getOrderingFocusBucket(item) === "today").length;
+    const weekCount = activeGroups.flatMap(g => g.items).filter(item => getOrderingFocusBucket(item) === "week").length;
+    const actionableVendors = focusGroups.filter(g =>
         !createdPOs[g.vendorPartyId] &&
         g.items.some(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId])
     );
     const isLoading = loading || scanning;
     const anyCreating = creatingPO.size > 0;
+
+    useEffect(() => {
+        if (vendorTab !== "all" && !focusGroups.some(g => g.vendorPartyId === vendorTab)) {
+            setVendorTab("all");
+        }
+    }, [focusGroups, vendorTab]);
 
     // ── render ─────────────────────────────────────────────────────────────
     return (
@@ -502,16 +559,33 @@ export default function PurchasingPanel() {
                 {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
                 <div className="flex-1" />
 
-                {critCount > 0 && (
-                    <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded border bg-red-500/20 text-red-300 border-red-500/40">
-                        {critCount} CRIT
-                    </span>
-                )}
-                {warnCount > 0 && (
-                    <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
-                        {warnCount} WARN
-                    </span>
-                )}
+                <button
+                    onClick={() => setFocusFilter("today")}
+                    className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "today"
+                        ? "bg-red-500/20 text-red-300 border-red-500/40"
+                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
+                        }`}
+                >
+                    {todayCount} TODAY
+                </button>
+                <button
+                    onClick={() => setFocusFilter("week")}
+                    className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "week"
+                        ? "bg-yellow-500/20 text-yellow-300 border-yellow-500/40"
+                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
+                        }`}
+                >
+                    {weekCount} WEEK
+                </button>
+                <button
+                    onClick={() => setFocusFilter("all")}
+                    className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "all"
+                        ? "bg-zinc-700 text-zinc-200 border-zinc-600"
+                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
+                        }`}
+                >
+                    ALL {activeGroups.length}
+                </button>
 
                 {/* Snoozed badge — toggles reveal */}
                 {hiddenItemCount > 0 && (
@@ -561,7 +635,7 @@ export default function PurchasingPanel() {
             {!isCollapsed && (
                 <>
                     {/* ── Vendor tabs ── active vendors + snoozed (greyed) when showSnoozed */}
-                    {displayGroups.length > 0 && (
+                    {focusGroups.length > 0 && (
                         <div className="flex items-center border-b border-zinc-800/60 bg-zinc-950/30 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                             <button
                                 onClick={() => setVendorTab("all")}
@@ -570,10 +644,10 @@ export default function PurchasingPanel() {
                                     : "border-transparent text-zinc-600 hover:text-zinc-400"
                                     }`}
                             >
-                                All <span className="opacity-60">{activeGroups.length}</span>
+                                {focusFilter === "today" ? "Today" : focusFilter === "week" ? "This Week" : "All"} <span className="opacity-60">{focusGroups.length}</span>
                             </button>
 
-                            {displayGroups.map(g => {
+                            {focusGroups.map(g => {
                                 const vSnoozed = vendorSnoozed(g);
                                 const cfg = URGENCY[g.urgency];
                                 const isActive = vendorTab === g.vendorPartyId;
@@ -637,6 +711,8 @@ export default function PurchasingPanel() {
                                     const groupChecked = checked[pid] ?? {};
                                     const groupQtys = qtys[pid] ?? {};
                                     const activeItems = group.items.filter(i => !isSnoozed(i.productId));
+                                    const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
+                                    const directOrderBlocked = selectedItems.some(i => !canUseDirectOrdering(group.vendorName, i.reorderMethod));
                                     const selectedCount = activeItems.filter(i => groupChecked[i.productId]).length;
                                     const allCheckedFlag = activeItems.length > 0 && activeItems.every(i => groupChecked[i.productId]);
                                     const hasActionable = activeItems.some(i => i.urgency === "critical" || i.urgency === "warning");
@@ -668,7 +744,6 @@ export default function PurchasingPanel() {
                                                         {cfg.label}
                                                     </span>
                                                 )}
-
                                                 {vSnoozed ? (
                                                     /* Restore entire snoozed vendor */
                                                     <button
@@ -718,7 +793,7 @@ export default function PurchasingPanel() {
                                                                     {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
                                                                 </button>
                                                                 {/* ULINE: Order Now button — fires items directly to ULINE cart */}
-                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && (
+                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && !directOrderBlocked && (
                                                                     <button
                                                                         onClick={() => handleOrderOnUline(group)}
                                                                         disabled={ulineOrdering}
@@ -730,6 +805,11 @@ export default function PurchasingPanel() {
                                                                             : <ShoppingCart className="w-2.5 h-2.5" />}
                                                                         {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
                                                                     </button>
+                                                                )}
+                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && directOrderBlocked && (
+                                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/20 text-amber-300/80 shrink-0">
+                                                                        {directOrderBlockReason(selectedItems)}
+                                                                    </span>
                                                                 )}
                                                             </>
                                                         )}
@@ -786,7 +866,7 @@ export default function PurchasingPanel() {
                                                                     className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
                                                                     {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
                                                                 </button>
-                                                                {isUlineVendor(group.vendorName) && (
+                                                                {isUlineVendor(group.vendorName) && !directOrderBlocked && (
                                                                     <button
                                                                         onClick={() => handleOrderOnUline(group)}
                                                                         disabled={ulineOrdering}
@@ -797,6 +877,11 @@ export default function PurchasingPanel() {
                                                                             : <ShoppingCart className="w-2.5 h-2.5" />}
                                                                         {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
                                                                     </button>
+                                                                )}
+                                                                {isUlineVendor(group.vendorName) && directOrderBlocked && (
+                                                                    <span className="text-[10px] font-mono px-2 py-0.5 rounded border border-amber-500/20 text-amber-300/80">
+                                                                        {directOrderBlockReason(selectedItems)}
+                                                                    </span>
                                                                 )}
                                                             </div>
                                                         ) : null}
@@ -816,6 +901,7 @@ export default function PurchasingPanel() {
                                                             const rc = runwayColor(item.runwayDays);
                                                             const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
                                                             const iKey = item.productId;
+                                                            const methodBadge = reorderMethodBadge(item.reorderMethod);
 
                                                             return (
                                                                 <div key={iKey}
@@ -850,6 +936,11 @@ export default function PurchasingPanel() {
                                                                                         bundle?
                                                                                     </span>
                                                                                 )}
+                                                                                {methodBadge && !itemSnoozed && (
+                                                                                    <span className={`text-[9px] font-mono border rounded px-1 shrink-0 ${reorderMethodTone(item.reorderMethod)}`}>
+                                                                                        {methodBadge}
+                                                                                    </span>
+                                                                                )}
 
                                                                                 <div className="flex-1" />
 
@@ -881,6 +972,11 @@ export default function PurchasingPanel() {
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center gap-2 mt-1">
                                                                                     <span className="text-[11px] font-mono text-[var(--dash-l2)] flex-1 truncate">{item.productName}</span>
+                                                                                    {item.reorderMethod === "default" && (
+                                                                                        <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                                                                            demand fallback
+                                                                                        </span>
+                                                                                    )}
                                                                                     {item.unitPrice > 0 ? (
                                                                                         <span className="text-[11px] font-mono text-emerald-400 font-semibold shrink-0">
                                                                                             ${item.unitPrice.toFixed(2)}/ea

@@ -50,6 +50,7 @@ export interface FinaleProductDetail {
     isManufactured: boolean;
     hasBOM: boolean;
     doNotReorder: boolean;         // Finale ROM = "Do not reorder" or category = "Deprecating"
+    reorderMethod?: FinaleReorderMethod;
     finaleUrl: string;
     openPOs: POInfo[];             // Committed POs containing this product
 }
@@ -64,11 +65,21 @@ export interface ReceivedPO {
     orderId: string;
     orderDate: string;
     receiveDate: string;
+    receiveDateTime?: string;
+    receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
     items: Array<{ productId: string; quantity: number; orderedQuantity?: number }>;
     finaleUrl: string;
 }
+
+export type FinaleReorderMethod =
+    | "do_not_reorder"
+    | "manual"
+    | "sales_velocity"
+    | "demand_velocity"
+    | "on_site_order"
+    | "default";
 
 export interface ExternalReorderItem {
     productId: string;
@@ -116,6 +127,7 @@ export interface PurchasingItem {
     finaleStockoutDays: number | null;
     finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;    // 90-day demand quantity from Finale productView
+    reorderMethod?: FinaleReorderMethod;
 }
 
 export interface PurchasingGroup {
@@ -175,6 +187,41 @@ function parseFinaleNumber(val: string | number | null | undefined): number {
     const cleaned = String(val).replace(/,/g, '');
     const num = parseFloat(cleaned);
     return isNaN(num) ? 0 : num;
+}
+
+function extractFinaleMethodTokens(productData: any): string[] {
+    const tokens: string[] = [];
+    tokens.push(String(productData?.reorderPointPolicy ?? ""));
+    tokens.push(String(productData?.reorderCalculationMethodId ?? ""));
+    for (const guideline of productData?.reorderGuidelineList || []) {
+        tokens.push(String(guideline?.reorderCalculationMethodId ?? ""));
+        tokens.push(String(guideline?.reorderPointPolicy ?? ""));
+    }
+    for (const field of productData?.userFieldDataList || []) {
+        tokens.push(String(field?.value ?? field?.userFieldValue ?? field?.attrValue ?? ""));
+        tokens.push(String(field?.name ?? field?.userFieldName ?? field?.label ?? ""));
+    }
+    return tokens.map(token => token.trim().toLowerCase()).filter(Boolean);
+}
+
+export function normalizeFinaleReorderMethod(productData: any): FinaleReorderMethod {
+    if (FinaleClient.isDoNotReorder(productData)) return "do_not_reorder";
+
+    const tokens = extractFinaleMethodTokens(productData);
+
+    if (tokens.some(token => token.includes("on site") || token.includes("onsite"))) {
+        return "on_site_order";
+    }
+    if (tokens.some(token => token.includes("demand velocity") || token.includes("demandvelocity"))) {
+        return "demand_velocity";
+    }
+    if (tokens.some(token => token.includes("sales velocity") || token.includes("salesvelocity"))) {
+        return "sales_velocity";
+    }
+    if (tokens.some(token => token === "manual" || token.includes("manual reorder"))) {
+        return "manual";
+    }
+    return "default";
 }
 
 /**
@@ -771,6 +818,11 @@ export class FinaleClient {
                                     status
                                     orderDate
                                     receiveDate
+                                    shipmentList {
+                                        shipmentId
+                                        status
+                                        receiveDate
+                                    }
                                     total
                                     supplier { name }
                                     itemList(first: 50) {
@@ -806,17 +858,30 @@ export class FinaleClient {
 
             const edges = result.data?.orderViewConnection?.edges || [];
             return edges
-                .map((edge: any) => {
-                    const po = edge.node;
-                    const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
-                    return {
-                        orderId: po.orderId,
-                        orderDate: po.orderDate || "",
-                        receiveDate: po.receiveDate || "",
-                        supplier: po.supplier?.name || "Unknown",
-                        total: parseFinaleNumber(po.total),
-                        items: (po.itemList?.edges || []).map((ie: any) => ({
-                            productId: ie.node.product?.productId || "?",
+                  .map((edge: any) => {
+                      const po = edge.node;
+                      const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
+                      const shipmentDates = (po.shipmentList || [])
+                          .map((shipment: any) => shipment.receiveDate)
+                          .filter(Boolean)
+                          .sort()
+                          .reverse();
+                      const receiveDateTime = shipmentDates[0] || po.receiveDate || "";
+                      const status = String(po.status || "").toLowerCase();
+                      const receiptStatus =
+                          status.includes("complete") ? "full" :
+                          status ? "partial" :
+                          "received";
+                      return {
+                          orderId: po.orderId,
+                          orderDate: po.orderDate || "",
+                          receiveDate: po.receiveDate || "",
+                          receiveDateTime,
+                          receiptStatus,
+                          supplier: po.supplier?.name || "Unknown",
+                          total: parseFinaleNumber(po.total),
+                          items: (po.itemList?.edges || []).map((ie: any) => ({
+                              productId: ie.node.product?.productId || "?",
                             quantity: parseFinaleNumber(ie.node.quantity),
                         })),
                         finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
@@ -3035,6 +3100,7 @@ export class FinaleClient {
             isManufactured,
             hasBOM,
             doNotReorder: FinaleClient.isDoNotReorder(data),
+            reorderMethod: normalizeFinaleReorderMethod(data),
             finaleUrl: data.productUrl || "",
             openPOs: [],  // Populated later by lookupProduct()
         };
@@ -4022,6 +4088,7 @@ export class FinaleClient {
                     const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
                     const productName: string = prodData.internalName || prodData.productId || sku;
                     const unitPrice: number = mainSupplier.price ?? 0;
+                    const reorderMethod = normalizeFinaleReorderMethod(prodData);
 
                     // Lead time: REST product field → 14d default
                     const rawLeadTime = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
@@ -4055,7 +4122,10 @@ export class FinaleClient {
                     // purchases to artificially inflate the daily rate, causing ARIA to warn of stockouts
                     // when Finale correctly showed 90+ days of runway based on current velocity.
                     // We only fall back to purchaseVelocity if demand is strictly 0 (e.g., untracked boxes).
-                    let dailyRate = demandVelocity;
+                    let dailyRate = reorderMethod === "sales_velocity" ? salesVelocity : demandVelocity;
+                    if ((reorderMethod === "manual" || reorderMethod === "default") && candidate.finaleConsumptionQty && candidate.finaleConsumptionQty > 0) {
+                        dailyRate = demandVelocity;
+                    }
                     if (dailyRate === 0 && purchaseVelocity > 0) {
                         let daysSinceLastPurchase = 999;
                         if (activity.lastPurchaseDate) {
@@ -4143,6 +4213,7 @@ export class FinaleClient {
                         finaleStockoutDays: candidate.finaleStockoutDays,
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
                         finaleDemandQty: candidate.finaleDemandQty,
+                        reorderMethod,
                     });
                 } catch {
                     // Skip products that error — non-fatal

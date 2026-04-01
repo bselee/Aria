@@ -55,6 +55,7 @@ describe("dashboard purchasing route", () => {
                             finaleStockoutDays: 3,
                             finaleConsumptionQty: 0,
                             finaleDemandQty: 270,
+                            reorderMethod: "demand_velocity",
                         },
                     ],
                 },
@@ -95,6 +96,7 @@ describe("dashboard purchasing route", () => {
                                 finaleStockoutDays: 3,
                                 finaleConsumptionQty: 0,
                                 finaleDemandQty: 270,
+                                reorderMethod: "demand_velocity",
                             },
                             candidate: {
                                 directDemand: 9,
@@ -141,6 +143,7 @@ describe("dashboard purchasing route", () => {
             productId: "BOX-101",
             productName: "Shipping Box",
             suggestedQty: 300,
+            reorderMethod: "demand_velocity",
             assessment: {
                 decision: "order",
                 recommendedQty: 300,

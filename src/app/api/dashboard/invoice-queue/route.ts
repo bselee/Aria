@@ -180,9 +180,14 @@ export async function GET(req: NextRequest) {
         let unmatched = 0;
         let totalDollarImpact = 0;
 
-        const invoices: InvoiceQueueItem[] = rows.map(row => {
+        const invoices: InvoiceQueueItem[] = rows.flatMap(row => {
             const invNum: string = row.invoice_number ?? '';
             const matchedLog = logByInvoiceNum.get(invNum) ?? null;
+            const reviewedAction = (matchedLog?.reviewed_action ?? "").toLowerCase();
+
+            if (reviewedAction === "dismissed" || reviewedAction === "approved" || reviewedAction === "rejected") {
+                return [];
+            }
 
             const status = resolveStatus(row.status, matchedLog?.action_taken ?? null);
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
@@ -195,7 +200,7 @@ export async function GET(req: NextRequest) {
             if (status === 'unmatched') unmatched++;
             if (dollarImpact !== null) totalDollarImpact += dollarImpact;
 
-            return {
+            return [{
                 id: String(row.id),
                 activityLogId: matchedLog?.id ? String(matchedLog.id) : null,
                 invoiceNumber: invNum,
@@ -211,7 +216,7 @@ export async function GET(req: NextRequest) {
                 processedAt,
                 dollarImpact,
                 balanceWarning,
-            };
+            }];
         });
 
         const needsEyes = {

@@ -9,6 +9,7 @@ const PACK_OVERBUY_MANUAL_REVIEW_RATIO = 3;
 export interface PurchasingCandidateInput {
     vendorName: string;
     productId: string;
+    reorderMethod?: "do_not_reorder" | "manual" | "sales_velocity" | "demand_velocity" | "on_site_order" | "default";
     directDemand: number;
     bomDemand: number;
     stockOnHand: number;
