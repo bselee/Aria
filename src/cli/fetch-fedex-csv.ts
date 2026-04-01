@@ -1,144 +1,199 @@
 /**
  * @file    fetch-fedex-csv.ts
  * @purpose Automates downloading the latest invoice CSV from FedEx Billing Online.
- *          Launches Chrome wrapped by Playwright but with all your extensions 
- *          (like 1Password) intact, navigates to FBO, and saves the resulting CSV
- *          to the Sandbox directory.
- * @author  Will / Antigravity
- * @created 2026-03-16
- * @updated 2026-03-16
- * @deps    playwright, dotenv
- *
- * Usage:
- *   node --import tsx src/cli/fetch-fedex-csv.ts
+ *          Uses a persistent Chrome profile so the existing FedEx session can be reused.
+ *          Saves results into a stable Aria-owned FedEx folder and writes a status file
+ *          for dashboard/manual visibility.
  */
 
-import * as dotenv from 'dotenv';
-dotenv.config({ path: '.env.local' });
+import * as dotenv from "dotenv";
+dotenv.config({ path: ".env.local" });
 
-import { chromium } from 'playwright';
-import path from 'path';
-import os from 'os';
-import fs from 'fs';
+import { chromium } from "playwright";
+import path from "path";
+import os from "os";
+import { execSync } from "child_process";
+import { pathToFileURL } from "url";
+import {
+    ensureFedexStatementDir,
+    writeFedexAcquisitionStatus,
+} from "@/lib/statements/fedex-acquisition";
 
-const FBO_URL = 'https://www.fedex.com/en-us/billing-online.html';
-const CHROME_PROFILE_DIR = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
-const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
+const FBO_URL = "https://www.fedex.com/en-us/billing-online.html";
+const CHROME_PROFILE_DIR = path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data");
+const FEDEX_STATEMENT_DIR = ensureFedexStatementDir();
 
-async function main() {
-    console.log(`\n╔═══════════════════════════════════════════════╗`);
-    console.log(`║      FedEx Billing Online CSV Downloader      ║`);
-    console.log(`╚═══════════════════════════════════════════════╝\n`);
+export interface FedexDownloadResult {
+    success: boolean;
+    mode: "probe" | "playwright_download" | "failed";
+    startedAt: string;
+    finishedAt: string;
+    detectedState?: "logged_in" | "login_required" | "unknown";
+    sourcePath?: string | null;
+    savedPath?: string | null;
+    message: string;
+    error?: string | null;
+}
 
-    if (!fs.existsSync(SANDBOX_DIR)) {
-        fs.mkdirSync(SANDBOX_DIR, { recursive: true });
-    }
+export async function runFedexCsvDownload(options?: { probeOnly?: boolean }): Promise<FedexDownloadResult> {
+    const startedAt = new Date().toISOString();
+    const probeOnly = options?.probeOnly ?? false;
+    let detectedState: FedexDownloadResult["detectedState"] = "unknown";
 
-    console.log('🚀 Phase 1: Launching Chrome with your persistent profile AND extensions...');
-    console.log('   ⚠️  Please ensure no other Chrome windows are open before we start.\n');
+    console.log("\n===============================================");
+    console.log(" FedEx Billing Online CSV Downloader");
+    console.log("===============================================\n");
+    console.log(`FedEx statement folder: ${FEDEX_STATEMENT_DIR}`);
+    console.log("Phase 1: Launching Chrome with the persistent profile.");
+    console.log("Please ensure no other Chrome windows are open before we start.\n");
 
     try {
-        // Kill any invisible chrome.exe background processes hanging around
-        require('child_process').execSync('taskkill /F /IM chrome.exe /T', { stdio: 'ignore' });
-        // Give the OS a moment to release the profile and DB locks
-        await new Promise(r => setTimeout(r, 2000));
+        execSync("taskkill /F /IM chrome.exe /T", { stdio: "ignore" });
+        await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch {
         // ignore
     }
 
-    // By default, Playwright disables all extensions. To use 1Password, we MUST
-    // use a persistent context, point to your user data dir, and ignore the disable args.
-    const context = await chromium.launchPersistentContext(
-        CHROME_PROFILE_DIR, 
-        {
-            headless: false,
-            channel: 'chrome',
-            acceptDownloads: true,
-            viewport: null, // Let the window maximize naturally
-            ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
-            args: ['--disable-blink-features=AutomationControlled', '--start-maximized']
-        }
-    );
+    const context = await chromium.launchPersistentContext(CHROME_PROFILE_DIR, {
+        headless: false,
+        channel: "chrome",
+        acceptDownloads: true,
+        viewport: null,
+        ignoreDefaultArgs: ["--disable-extensions", "--enable-automation"],
+        args: ["--disable-blink-features=AutomationControlled", "--start-maximized"],
+    });
 
     const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
     try {
-        // --- Step 1: Navigate & Authenticate ---
-        console.log('🌐 Bringing FedEx Billing Online into view...');
-        await page.goto(FBO_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        console.log("Opening FedEx Billing Online...");
+        await page.goto(FBO_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-        // Wait to see if we are logged in or if we need to click "Log In"
         const loggedIn = await Promise.race([
             page.waitForSelector('text="Account Summary"', { timeout: 7000 }).then(() => true),
             page.waitForSelector('text="Search/Download"', { timeout: 7000 }).then(() => true),
             page.waitForSelector('a:has-text("Log in")', { timeout: 7000 }).then(async (el) => {
-                console.log('🔐 Found Login button, navigating to login screen...');
                 await el?.click();
                 return false;
-            }).catch(() => false)
+            }).catch(() => false),
         ]);
 
         if (!loggedIn) {
-            console.log('\n======================================================');
-            console.log('👤 ACTION REQUIRED: Not logged into FedEx yet.');
-            console.log('👉 Since we enabled extensions, your 1Password is available!');
-            console.log('👉 Please use it to log in as normal.');
-            console.log('👉 DO NOT click anywhere else after logging in, just wait.');
-            console.log('======================================================\n');
-            
-            // Wait for FBO dashboard elements indicating successful login
+            detectedState = "login_required";
+            console.log("FedEx needs login. Use the existing browser session or 1Password to complete it.");
             await page.waitForSelector('text="Search/Download"', { timeout: 120_000 });
-            console.log('🔓 Login successful, proceeding to Billing dashboard!');
+            console.log("Login succeeded and FedEx search/download is visible.");
         } else {
-            console.log('🔓 Auto-login confirmed!');
+            detectedState = "logged_in";
+            console.log("FedEx dashboard/search view is already available.");
         }
 
-        // --- Step 2: Navigate to Download Section ---
-        console.log('\n📄 Phase 2: Finding invoices...');
+        if (probeOnly) {
+            const result: FedexDownloadResult = {
+                success: true,
+                mode: "probe",
+                startedAt,
+                finishedAt: new Date().toISOString(),
+                detectedState,
+                message: detectedState === "logged_in"
+                    ? "FedEx probe succeeded and dashboard/search elements were visible."
+                    : "FedEx probe reached login flow and then found dashboard/search after login.",
+            };
+            writeFedexAcquisitionStatus(result);
+            return result;
+        }
+
+        console.log("Phase 2: Navigating to FedEx Search/Download...");
         await page.waitForTimeout(3000);
 
         try {
             const searchTab = await page.$('a:has-text("Search/Download")');
             if (searchTab) {
-                console.log('👉 Clicking "Search/Download" tab...');
                 await searchTab.click();
                 await page.waitForTimeout(3000);
             }
-        } catch (e: any) {
-            console.log('⚠️ Could not click Search/Download automatically:', e.message);
+        } catch (error: any) {
+            console.log(`Could not click Search/Download automatically: ${error.message}`);
         }
 
-        // --- Step 3: Wait for Download ---
-        console.log('\n======================================================');
-        console.log('📥 Phase 3: Waiting for CSV Download.');
-        console.log('👉 Please manually select your desired invoice on screen.');
-        console.log('👉 Click "Download -> CSV".');
-        console.log('👉 Sit back, the bot is listening and will pull and rename it instantly.');
-        console.log('======================================================\n');
+        console.log("Phase 3: Waiting for the CSV download.");
+        console.log("Manually choose the desired invoice and click Download -> CSV.");
 
-        const downloadPromise = page.waitForEvent('download', { timeout: 300_000 }); // 5 min
-        const download = await downloadPromise;
-        
+        const download = await page.waitForEvent("download", { timeout: 300_000 });
         const suggestedName = download.suggestedFilename();
-        console.log(`\n📦 Intercepted download: ${suggestedName}`);
-        
-        const safeName = suggestedName.endsWith('.csv') ? suggestedName : `FEDEX_${suggestedName}.csv`;
-        const finalPath = path.join(SANDBOX_DIR, safeName);
-        
-        await download.saveAs(finalPath);
-        
-        console.log(`\n✅ SAVED: ${finalPath}`);
-        console.log(`\n🎉 You can now run: node --import tsx src/cli/reconcile-fedex.ts`);
+        const safeName = suggestedName.endsWith(".csv") ? suggestedName : `FEDEX_${suggestedName}.csv`;
+        const finalPath = path.join(FEDEX_STATEMENT_DIR, safeName);
 
-    } catch (err: any) {
-        console.error('\n❌ Script encountered an error:', err.message);
+        await download.saveAs(finalPath);
+
+        const result: FedexDownloadResult = {
+            success: true,
+            mode: "playwright_download",
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            detectedState,
+            savedPath: finalPath,
+            message: "FedEx CSV downloaded successfully via Playwright.",
+        };
+        writeFedexAcquisitionStatus(result);
+        console.log(`Saved: ${finalPath}`);
+        return result;
+    } catch (error: any) {
+        const profileLocked = String(error.message || "").includes("ProcessSingleton")
+            || String(error.message || "").includes("profile directory");
+        const result: FedexDownloadResult = {
+            success: false,
+            mode: "failed",
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            detectedState,
+            message: profileLocked
+                ? "FedEx acquisition failed because the Chrome profile is still locked by another Chrome process."
+                : "FedEx CSV acquisition failed.",
+            error: error.message,
+        };
+        writeFedexAcquisitionStatus(result);
+        console.error(`FedEx downloader error: ${error.message}`);
+        return result;
     } finally {
         await context.close();
-        console.log('🏁 Bot disconnected. Chrome closed.');
+        console.log("Chrome closed.");
     }
 }
 
-main().catch(err => {
-    console.error('Fatal:', err);
-    process.exit(1);
-});
+async function main() {
+    const args = process.argv.slice(2);
+    const probeOnly = args.includes("--probe-only");
+    const json = args.includes("--json");
+    const result = await runFedexCsvDownload({ probeOnly });
+    if (json) {
+        console.log(JSON.stringify(result));
+    }
+    if (!result.success) {
+        process.exit(1);
+    }
+}
+
+const isEntrypoint = process.argv[1]
+    ? pathToFileURL(process.argv[1]).href === import.meta.url
+    : false;
+
+if (isEntrypoint) {
+    main().catch((error) => {
+        const result: FedexDownloadResult = {
+            success: false,
+            mode: "failed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            detectedState: "unknown",
+            message: "FedEx CSV acquisition crashed before completion.",
+            error: error.message,
+        };
+        writeFedexAcquisitionStatus(result);
+        if (process.argv.slice(2).includes("--json")) {
+            console.log(JSON.stringify(result));
+        }
+        console.error(error);
+        process.exit(1);
+    });
+}

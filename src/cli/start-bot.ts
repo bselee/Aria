@@ -1198,6 +1198,51 @@ bot.on('text', async (ctx) => {
             }
         }
     }, 30 * 60 * 1000); // every 30 minutes
+
+    // ── CRON HEALTH WATCHDOG (setInterval, NOT cron — immune to node-cron bugs) ──
+    // DECISION(2026-04-01): node-cron 4.x heartbeat chains can silently die at
+    // midnight date rollover. This watchdog checks cron_runs for staleness every
+    // 30 min. If a critical agent hasn't run in 2× its expected interval, sends
+    // a Telegram alert so Will can investigate or restart.
+    const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000; // 30 min
+    const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
+        { name: 'Supervisor', maxStaleMin: 15 },
+        { name: 'EmailIngestionDefault', maxStaleMin: 15 },
+        { name: 'APIdentifierAgent', maxStaleMin: 35 },
+        { name: 'APForwarderAgent', maxStaleMin: 35 },
+    ];
+    let lastCronWatchdogAlert = 0;
+    setInterval(async () => {
+        try {
+            const { createClient } = await import('../lib/supabase');
+            const supabase = createClient();
+            const cutoff = new Date(Date.now() - 35 * 60 * 1000).toISOString(); // 35 min ago
+            const { data } = await supabase.from('cron_runs')
+                .select('task_name, started_at')
+                .in('task_name', CRITICAL_CRONS.map(c => c.name))
+                .gte('started_at', cutoff)
+                .order('started_at', { ascending: false });
+
+            const recentTasks = new Set((data || []).map(r => r.task_name));
+            const stale = CRITICAL_CRONS.filter(c => !recentTasks.has(c.name));
+
+            if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId) {
+                    const names = stale.map(s => s.name).join(', ');
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `🚨 <b>Cron Watchdog Alert</b>\n\n` +
+                        `These agents haven't run in 35+ min:\n<code>${names}</code>\n\n` +
+                        `Possible node-cron heartbeat death. Consider <code>pm2 restart aria-bot</code>.`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                    lastCronWatchdogAlert = Date.now();
+                    console.warn(`[cron-watchdog] ⚠️ Stale crons detected: ${names}`);
+                }
+            }
+        } catch { /* non-critical */ }
+    }, CRON_WATCHDOG_INTERVAL);
 })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

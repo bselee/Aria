@@ -105,6 +105,14 @@ export const CRON_JOBS: CronJobDefinition[] = [
         weekdaysOnly: false,
     },
     {
+        name: 'StatementReconciliationAgent',
+        description: 'Processes dashboard-launched vendor statement reconciliation runs',
+        schedule: '*/5 * * * *',
+        scheduleHuman: 'Every 5 minutes',
+        category: 'reconciliation',
+        weekdaysOnly: false,
+    },
+    {
         name: 'AcknowledgementAgent',
         description: 'Auto-replies to vendor emails with professional acknowledgement',
         schedule: '*/12 * * * *',

@@ -28,6 +28,7 @@ import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
+import { processQueuedStatementRun } from "../statements/service";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -250,15 +251,20 @@ export class OpsManager {
             console.warn('[ops-manager] hydrateSeenSets failed (non-fatal):', err.message)
         );
 
+        // DECISION(2026-04-01): ALL cron.schedule calls MUST include { timezone: "America/Denver" }.
+        // node-cron 4.x has a bug where non-timezone heartbeat chains silently die at midnight
+        // date rollover. Timezone-aware tasks use a different code path that survives.
+        const TZ = { timezone: "America/Denver" } as const;
+
         // Supervisor checking errors
         cron.schedule("*/5 * * * *", () => {
             this.safeRun("Supervisor", () => this.supervisor.supervise());
-        });
+        }, TZ);
 
         // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
         cron.schedule("*/5 * * * *", () => {
             this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
-        });
+        }, TZ);
 
         // AP Email Ingestion â€” twice daily at 8 AM and 2 PM weekdays
         // DECISION(2026-03-18): Limited to 2x/day to avoid overwhelming the Google
@@ -275,17 +281,28 @@ export class OpsManager {
         // AP Identifier scans for unread PDFs every 15 minutes and queues them
         cron.schedule("*/15 * * * *", () => {
             this.safeRun("APIdentifierAgent", () => this.apIdentifier.identifyAndQueue());
-        });
+        }, TZ);
 
         // AP Forwarder ships queued invoices to Bill.com every 15 minutes
         cron.schedule("2-59/15 * * * *", () => {
             this.safeRun("APForwarderAgent", () => this.apForwarder.processPendingForwards());
-        });
+        }, TZ);
+
+        // Statement reconciliation worker polls dashboard-launched runs
+        cron.schedule("*/5 * * * *", () => {
+            this.safeRun("StatementReconciliationAgent", async () => {
+                await processQueuedStatementRun(async (message) => {
+                    const chatId = process.env.TELEGRAM_CHAT_ID;
+                    if (!chatId) return;
+                    await this.bot.telegram.sendMessage(chatId, message);
+                });
+            });
+        }, TZ);
 
         // Acknowledgement Agent runs every 12 minutes to routinely thank vendors
         cron.schedule("*/12 * * * *", () => {
             this.safeRun("AcknowledgementAgent", () => this.ackAgent.processUnreadEmails(20));
-        });
+        }, TZ);
 
         // Daily Summary @ 8:00 AM weekdays only
         cron.schedule("0 8 * * 1-5", () => {
@@ -324,31 +341,31 @@ export class OpsManager {
         // Email Maintenance (Advertisements) every hour
         cron.schedule("0 * * * *", () => {
             this.safeRun("AdMaintenance", () => this.processAdvertisements());
-        });
+        }, TZ);
 
         // Tracking Agent polls processing queue every 60 minutes
         cron.schedule("0 * * * *", () => {
             this.safeRun("TrackingAgent", () => this.trackingAgent.processUnreadEmails());
-        });
+        }, TZ);
 
         // Slack Tracking ETA Sync every 2 hours
         // DECISION(2026-03-18): Pushes live freight tracking ETAs directly into the
         // corresponding Slack Watchdog threads where Will or coworkers originally asked.
         cron.schedule("0 */2 * * *", () => {
             this.safeRun("SlackETASync", () => this.pollSlackETAUpdates());
-        });
+        }, TZ);
 
         // PO Sync every 30 minutes
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("POSync", () => this.syncPOConversations());
-        });
+        }, TZ);
 
         // PO-First AP Sweep (invoice reconciliation backfill) every 4 hours
         // DECISION(2026-03-18): Provides a fallback net for invoices that couldn't be
         // matched at ingestion time due to missing PO data or delay in Finale commitment.
         cron.schedule("30 */4 * * *", () => {
             this.safeRun("POSweep", () => runPOSweep(60, false));
-        });
+        }, TZ);
 
         // â”€â”€ VENDOR RECONCILIATIONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // DECISION(2026-03-18): Scheduling automated vendor reconciliations for Axiom,
@@ -390,13 +407,13 @@ export class OpsManager {
         // and appends a completion timestamp to the matching calendar event description.
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("BuildCompletionWatcher", () => this.pollBuildCompletions());
-        });
+        }, TZ);
 
         // PO Receiving Watcher every 30 minutes
         // Polls Finale for today's newly-received purchase orders and sends Telegram alerts.
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("POReceivingWatcher", () => this.pollPOReceivings());
-        });
+        }, TZ);
 
         // Purchasing Calendar Sync every 4 hours
         // Creates/updates calendar events for outgoing and received POs.

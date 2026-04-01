@@ -36,6 +36,10 @@ import {
     getInvoiceInboxPolicy,
 } from "./ap-identifier-policy";
 import { filterStatementInvoicePages } from "./ap-identifier-statement-filter";
+import {
+    queueStatementEmailIntake,
+    queueStatementMetadataOnly,
+} from "@/lib/statements/email-intake";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -192,6 +196,93 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         } catch (e: any) {
             console.error("   ❌ Failed to log activity:", e.message);
         }
+    }
+
+    private inferStatementVendorName(from: string, subject: string): string {
+        const displayMatch = from.match(/^([^<]+)/);
+        const display = displayMatch?.[1]?.trim();
+        if (display && !display.includes("@")) return display;
+
+        const emailMatch = from.match(/<([^>]+)>/);
+        const email = emailMatch?.[1] ?? from;
+        const domain = email.split("@")[1] ?? "";
+        const host = domain.split(".")[0] ?? "";
+        if (host) {
+            return host
+                .split(/[-_]/g)
+                .filter(Boolean)
+                .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+                .join(" ");
+        }
+
+        return subject.split("-")[0]?.trim() || "Unknown Vendor";
+    }
+
+    private async queueStatementCandidates(
+        emailRow: any,
+        gmail: any,
+        sourceInbox: string,
+        vendorName: string,
+    ): Promise<string[]> {
+        const queuedIds: string[] = [];
+        const msgId = emailRow.gmail_message_id;
+        if (!msgId) return queuedIds;
+
+        const fullMsg = await gmail.users.messages.get({
+            userId: "me",
+            id: msgId,
+            format: "full",
+        });
+
+        const pdfParts: any[] = [];
+        const walkParts = (parts: any[] = []) => {
+            for (const part of parts) {
+                if (
+                    part.filename?.toLowerCase().endsWith(".pdf")
+                    && part.body?.attachmentId
+                ) {
+                    pdfParts.push(part);
+                }
+                if (part.parts?.length) walkParts(part.parts);
+            }
+        };
+        walkParts(fullMsg.data.payload?.parts || []);
+
+        for (const part of pdfParts) {
+            const response = await gmail.users.messages.attachments.get({
+                userId: "me",
+                messageId: msgId,
+                id: part.body.attachmentId,
+            });
+            const attachmentData = response.data.data;
+            if (!attachmentData) continue;
+
+            const intakeId = await queueStatementEmailIntake({
+                gmailMessageId: msgId,
+                sourceInbox,
+                vendorName,
+                emailFrom: emailRow.from_email || "Unknown",
+                emailSubject: emailRow.subject || "No Subject",
+                filename: part.filename || "statement.pdf",
+                contentType: "application/pdf",
+                buffer: Buffer.from(attachmentData, "base64url"),
+            });
+
+            if (intakeId) queuedIds.push(intakeId);
+        }
+
+        if (queuedIds.length === 0) {
+            const intakeId = await queueStatementMetadataOnly({
+                gmailMessageId: msgId,
+                sourceInbox,
+                vendorName,
+                emailFrom: emailRow.from_email || "Unknown",
+                emailSubject: emailRow.subject || "No Subject",
+            });
+            if (intakeId) queuedIds.push(intakeId);
+        }
+
+        return queuedIds;
     }
 
     /**
@@ -450,8 +541,10 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         }
                     }
 
-                    // Default STATEMENT handling: label and archive
+                    // Default STATEMENT handling: queue for statement reconciliation, then label/archive
                     try {
+                        const vendorName = this.inferStatementVendorName(from, subject);
+                        const intakeIds = await this.queueStatementCandidates(m, gmail, sourceInbox, vendorName);
                         await gmail.users.messages.modify({
                             userId: "me",
                             id: m.gmail_message_id,
@@ -460,7 +553,20 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 removeLabelIds: ["INBOX", "UNREAD"]
                             }
                         });
-                        await this.logActivity(supabase, from, subject, "STATEMENT", "Labeled as Statement, marked read");
+                        await this.logActivity(
+                            supabase,
+                            from,
+                            subject,
+                            "STATEMENT",
+                            "Queued for statement reconciliation, labeled as Statement, marked read",
+                            {
+                                reasonCode: "statement_intake_queued",
+                                sourceInbox,
+                                gmailMessageId: m.gmail_message_id,
+                                vendorName,
+                                intakeIds,
+                            },
+                        );
                     } catch (e) { /* ignore */ }
                     continue;
                 }

@@ -40,6 +40,7 @@ import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import { SortablePanel } from "@/components/dashboard/SortablePanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPanel";
+import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
 
 
 // ── Column width defaults (px) ──────────────────────────────────────
@@ -69,6 +70,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
         </div>
     ),
     "invoice-queue": <InvoiceQueuePanel />,
+    "statement-reconciliation": <StatementReconciliationPanel />,
     "purchasing": <PurchasingPanel />,
     "build-schedule": <BuildSchedulePanel />,
     "active-purchases": <ActivePurchasesPanel />,
@@ -86,7 +88,7 @@ const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings"],
     // DECISION(2026-03-25): Removed axiom-queue from dashboard — Axiom ordering
     // is now fully autonomous (like ULINE). No manual review needed.
-    midLeft: ["invoice-queue", "active-purchases"],
+    midLeft: ["invoice-queue", "statement-reconciliation", "active-purchases"],
     midRight: ["purchasing", "purchasing-calendar"],
     right: ["activity", "build-schedule"]
 };

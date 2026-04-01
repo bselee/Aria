@@ -3756,6 +3756,7 @@ export class FinaleClient {
                 ) {
                     edges { node {
                         status
+                        orderDate
                         itemList(first: 20) {
                             edges { node { product { productId } quantity } }
                         }
@@ -3814,14 +3815,18 @@ export class FinaleClient {
                     body: JSON.stringify(query),
                 });
             }
-            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
             const result = await res.json();
-            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
 
             let purchasedQty = 0;
+            let lastPurchaseDate: string | null = null;
             for (const edge of result.data?.purchasedIn?.edges || []) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
+                if (!lastPurchaseDate && po.orderDate) {
+                    lastPurchaseDate = po.orderDate;
+                }
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
                         purchasedQty += parseFinaleNumber(ie.node.quantity);
@@ -3876,9 +3881,9 @@ export class FinaleClient {
                 : null;
             const stockAvailable = stockNode ? parseStockVal(stockNode.stockAvailable) : null;
 
-            return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable };
+            return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable, lastPurchaseDate };
         } catch {
-            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null };
+            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
         }
     }
 
@@ -4050,8 +4055,22 @@ export class FinaleClient {
                     // purchases to artificially inflate the daily rate, causing ARIA to warn of stockouts
                     // when Finale correctly showed 90+ days of runway based on current velocity.
                     // We only fall back to purchaseVelocity if demand is strictly 0 (e.g., untracked boxes).
-                    const dailyRate = demandVelocity > 0 ? demandVelocity : purchaseVelocity;
-                    if (dailyRate === 0) continue; // no actual movement
+                    let dailyRate = demandVelocity;
+                    if (dailyRate === 0 && purchaseVelocity > 0) {
+                        let daysSinceLastPurchase = 999;
+                        if (activity.lastPurchaseDate) {
+                            const lp = new Date(activity.lastPurchaseDate);
+                            daysSinceLastPurchase = (Date.now() - lp.getTime()) / (1000 * 60 * 60 * 24);
+                        }
+
+                        // We enforce a 180-day activity window (or an active open PO) to stay on the radar.
+                        if (daysSinceLastPurchase <= 180 || activity.openPOs.length > 0) {
+                            dailyRate = purchaseVelocity;
+                        }
+                    }
+
+                    if (dailyRate === 0) continue; // no actual movement within windows
+
 
                     // Identify which signal is driving the rate (for explanation)
                     const rateSource = dailyRate === demandVelocity ? '90d demand'
