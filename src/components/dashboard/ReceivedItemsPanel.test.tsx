@@ -90,5 +90,49 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(screen.getAllByText(/PARTIAL/i)[0]).toBeTruthy();
     expect(screen.getByText(/Today 10:15 AM|Today 10:15/i)).toBeTruthy();
+    expect(screen.getByText(/short on BPM01/i)).toBeTruthy();
+  });
+
+  it("sorts receivings newest first and summarizes multiple short SKUs", async () => {
+    stubLocalStorage();
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-OLD",
+          orderDate: "2026-04-01",
+          receiveDate: "2026-04-01T08:00:00-06:00",
+          receiveDateTime: "2026-04-01T08:00:00-06:00",
+          receiptStatus: "full",
+          supplier: "Older Vendor",
+          total: 500,
+          items: [{ productId: "OLD-1", quantity: 3 }],
+          finaleUrl: "https://example.com/old",
+        },
+        {
+          orderId: "PO-NEW",
+          orderDate: "2026-04-01",
+          receiveDate: "2026-04-01T11:30:00-06:00",
+          receiveDateTime: "2026-04-01T11:30:00-06:00",
+          receiptStatus: "partial",
+          supplier: "Newest Vendor",
+          total: 900,
+          items: [
+            { productId: "SKU-A", quantity: 2 },
+            { productId: "SKU-B", quantity: 5 },
+            { productId: "SKU-C", quantity: 1 },
+          ],
+          finaleUrl: "https://example.com/new",
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const supplierRows = screen.getAllByText(/Vendor/).map(node => node.textContent);
+    expect(supplierRows[0]).toMatch(/Newest Vendor/);
+    expect(screen.getByText(/short on SKU-A, SKU-B \+1 more/i)).toBeTruthy();
   });
 });

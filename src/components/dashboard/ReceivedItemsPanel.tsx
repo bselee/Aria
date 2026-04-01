@@ -60,6 +60,19 @@ function receiptBadge(po: ReceivedPO): { label: string; cls: string } | null {
     return null;
 }
 
+function receiveSortValue(po: ReceivedPO): number {
+    const parsed = parseDenverDate(po.receiveDateTime || po.receiveDate);
+    return parsed?.getTime() ?? 0;
+}
+
+function partialDiscrepancy(po: ReceivedPO): string | null {
+    if (po.receiptStatus !== "partial" || po.items.length === 0) return null;
+    const skuList = po.items.map(item => item.productId).filter(Boolean);
+    if (skuList.length === 0) return "partial receipt";
+    if (skuList.length <= 2) return `short on ${skuList.join(", ")}`;
+    return `short on ${skuList.slice(0, 2).join(", ")} +${skuList.length - 2} more`;
+}
+
 export default function ReceivedItemsPanel() {
     const [pos, setPos] = useState<ReceivedPO[]>([]);
     const [apMap, setApMap] = useState<ApStatusMap>({});
@@ -150,7 +163,8 @@ export default function ReceivedItemsPanel() {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             if (data.error) throw new Error(data.error);
-            setPos(data.received || []);
+            const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+            setPos(sorted);
         } catch (e: any) {
             setError(e.message);
         } finally {
@@ -207,6 +221,7 @@ export default function ReceivedItemsPanel() {
                             {pos.map(po => {
                                 const apStatus = apMap[po.orderId];
                                 const dollars = fmtDollars(po.total);
+                                const discrepancy = partialDiscrepancy(po);
                                 return (
                                     <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
                                         {/* Line 1: date · vendor · AP status · total */}
@@ -231,10 +246,10 @@ export default function ReceivedItemsPanel() {
                                                 className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
                                                 {po.orderId}
                                             </a>
-                                            {po.receiptStatus === "partial" && (
+                                            {discrepancy && (
                                                 <>
                                                     <span className="text-zinc-700 text-xs">·</span>
-                                                    <span className="text-[10px] font-mono text-amber-300/80">partial receipt recorded</span>
+                                                    <span className="text-[10px] font-mono text-amber-300/80">{discrepancy}</span>
                                                 </>
                                             )}
                                             <span className="text-zinc-700 text-xs">·</span>
