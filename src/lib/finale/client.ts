@@ -190,6 +190,119 @@ function parseFinaleNumber(val: string | number | null | undefined): number {
     return isNaN(num) ? 0 : num;
 }
 
+function parseISODateOnly(value: string): string | null {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (isNaN(parsed.getTime())) return null;
+    return parsed.toISOString().slice(0, 10);
+}
+
+function toISOStringOrNull(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (isNaN(parsed.getTime())) return null;
+    return parsed.toISOString();
+}
+
+function getShipmentsInReceiptWindow(po: any, windowStart: string, windowEnd: string): any[] {
+    return (po?.shipmentList || []).filter((shipment: any) => {
+        const isoDate = parseISODateOnly(shipment.receiveDate);
+        return isoDate && isoDate >= windowStart && isoDate < windowEnd;
+    });
+}
+
+export function getReceiptQueryStartDate(windowStart: string, lookbackDays: number = 180): string {
+    const parsed = new Date(`${windowStart}T00:00:00Z`);
+    if (isNaN(parsed.getTime())) return windowStart;
+    parsed.setUTCDate(parsed.getUTCDate() - lookbackDays);
+    return parsed.toISOString().slice(0, 10);
+}
+
+export function getReceiptStatusFromPoStatus(status: string | null | undefined): "full" | "partial" {
+    const normalized = String(status || "").toLowerCase();
+    const fullStatuses = ["complete", "completed", "closed", "received"];
+    return fullStatuses.some(token => normalized.includes(token)) ? "full" : "partial";
+}
+
+export function getShipmentReceiptDateTime(shipment: any): string | null {
+    const receiptEvent = (shipment?.statusIdHistoryList || [])
+        .filter((entry: any) =>
+            typeof entry?.txStamp === "number" &&
+            String(entry?.statusId || "").toUpperCase().includes("DELIVERED"),
+        )
+        .sort((a: any, b: any) => b.txStamp - a.txStamp)[0];
+
+    if (receiptEvent?.txStamp) {
+        return new Date(receiptEvent.txStamp * 1000).toISOString();
+    }
+
+    return (
+        toISOStringOrNull(shipment?.lastUpdatedDate) ||
+        toISOStringOrNull(shipment?.receiveDate) ||
+        toISOStringOrNull(shipment?.createdDate)
+    );
+}
+
+export function deriveReceivedPurchaseOrders(
+    edges: any[],
+    windowStart: string,
+    windowEnd: string,
+    accountPath: string,
+): ReceivedPO[] {
+    return edges
+        .map((edge: any) => {
+            const po = edge.node;
+            const receivedShipments = getShipmentsInReceiptWindow(po, windowStart, windowEnd);
+
+            if (receivedShipments.length === 0) return null;
+
+            const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
+            const shipmentDates = receivedShipments
+                .map((shipment: any) => shipment.receiveDate)
+                .filter(Boolean)
+                .sort()
+                .reverse();
+
+            return {
+                orderId: po.orderId,
+                orderDate: po.orderDate || "",
+                receiveDate: shipmentDates[0] || "",
+                receiveDateTime: shipmentDates[0] || "",
+                receiptStatus: getReceiptStatusFromPoStatus(po.status),
+                supplier: po.supplier?.name || "Unknown",
+                total: parseFinaleNumber(po.total),
+                items: (po.itemList?.edges || []).map((ie: any) => ({
+                    productId: ie.node.product?.productId || "?",
+                    quantity: parseFinaleNumber(ie.node.quantity),
+                })),
+                finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
+            } satisfies ReceivedPO;
+        })
+        .filter(Boolean) as ReceivedPO[];
+}
+
+export function enrichReceivedPurchaseOrdersWithShipmentDetails(
+    orders: ReceivedPO[],
+    shipmentDetailsByOrderId: Record<string, any[]>,
+): ReceivedPO[] {
+    return orders.map((order) => {
+        const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
+        const exactReceiptTimes = shipmentDetails
+            .map((shipment) => getShipmentReceiptDateTime(shipment))
+            .filter(Boolean)
+            .sort()
+            .reverse();
+
+        if (exactReceiptTimes.length === 0) return order;
+
+        return {
+            ...order,
+            receiveDateTime: exactReceiptTimes[0] || order.receiveDateTime,
+            receiveDate: parseISODateOnly(exactReceiptTimes[0] || "") || order.receiveDate,
+        };
+    });
+}
+
 function extractFinaleMethodTokens(productData: any): string[] {
     const tokens: string[] = [];
     tokens.push(String(productData?.reorderPointPolicy ?? ""));
@@ -815,21 +928,20 @@ export class FinaleClient {
     }
 
     /**
-     * Fetch POs received today via GraphQL.
-     * Uses `receiveDate: { begin, end }` filter.
-     * DECISION(2026-03-12): Receivings = POs with a receiveDate, regardless of
-     * status. A PO can have received items while still Committed (partial receive),
-     * Created (draft, operator still adjusting), or Completed. The receiveDate
-     * filter in the GraphQL query is the sole gate — no client-side status filter.
+     * Fetch POs with actual receipts via GraphQL.
+     * We query a broad order-date window to get recent PO candidates, then
+     * filter by shipmentList.receiveDate inside the requested receipt window.
+     * DECISION(2026-04-02): PO-level receiveDate is not reliable enough to act
+     * as the receipt gate. shipmentList.receiveDate is the actual receipt truth.
      */
     async getTodaysReceivedPOs(startDate?: string, endDate?: string): Promise<ReceivedPO[]> {
         try {
-            // Get today's date in YYYY-MM-DD format (Mountain Time)
             const now = new Date();
             const today = startDate || now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const tomorrow = new Date(now);
             tomorrow.setDate(tomorrow.getDate() + 1);
             const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const queryStart = getReceiptQueryStartDate(today);
 
             const query = {
                 query: `
@@ -837,8 +949,8 @@ export class FinaleClient {
                         orderViewConnection(
                             first: 500
                             type: ["PURCHASE_ORDER"]
-                            receiveDate: { begin: "${today}", end: "${tomorrowStr}" }
-                            sort: [{ field: "receiveDate", mode: "desc" }]
+                            orderDate: { begin: "${queryStart}", end: "${tomorrowStr}" }
+                            sort: [{ field: "orderDate", mode: "desc" }]
                         ) {
                             edges {
                                 node {
@@ -886,36 +998,58 @@ export class FinaleClient {
             }
 
             const edges = result.data?.orderViewConnection?.edges || [];
-            return edges
-                  .map((edge: any) => {
-                      const po = edge.node;
-                      const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
-                      const shipmentDates = (po.shipmentList || [])
-                          .map((shipment: any) => shipment.receiveDate)
-                          .filter(Boolean)
-                          .sort()
-                          .reverse();
-                      const receiveDateTime = shipmentDates[0] || po.receiveDate || "";
-                      const status = String(po.status || "").toLowerCase();
-                      const receiptStatus =
-                          status.includes("complete") ? "full" :
-                          status ? "partial" :
-                          "received";
-                      return {
-                          orderId: po.orderId,
-                          orderDate: po.orderDate || "",
-                          receiveDate: po.receiveDate || "",
-                          receiveDateTime,
-                          receiptStatus,
-                          supplier: po.supplier?.name || "Unknown",
-                          total: parseFinaleNumber(po.total),
-                          items: (po.itemList?.edges || []).map((ie: any) => ({
-                              productId: ie.node.product?.productId || "?",
-                            quantity: parseFinaleNumber(ie.node.quantity),
-                        })),
-                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
-                    };
-                });
+            const received = deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
+            if (received.length === 0) return received;
+
+            const orderUrlByOrderId = new Map(
+                edges
+                    .map((edge: any) => [edge?.node?.orderId, edge?.node?.orderUrl] as const)
+                    .filter(([orderId, orderUrl]) => Boolean(orderId && orderUrl)),
+            );
+
+            const shipmentDetailsByOrderId = Object.fromEntries(
+                await Promise.all(
+                    received.map(async (order) => {
+                        if (!order?.orderId) {
+                            return ["", []];
+                        }
+
+                        try {
+                            const orderUrl = orderUrlByOrderId.get(order.orderId);
+                            const poDetails = orderUrl
+                                ? await this.get(orderUrl)
+                                : await this.getOrderDetails(order.orderId);
+                            const shipmentUrls: string[] = poDetails?.shipmentUrlList || [];
+                            if (shipmentUrls.length === 0) {
+                                return [order.orderId, []];
+                            }
+
+                            const details = (
+                                await Promise.all(
+                                    shipmentUrls.map(async (shipmentUrl) => {
+                                        try {
+                                            return await this.getShipmentDetails(shipmentUrl);
+                                        } catch (err: any) {
+                                            console.warn(`[finale] getTodaysReceivedPOs shipment detail fallback for ${shipmentUrl}: ${err.message}`);
+                                            return null;
+                                        }
+                                    }),
+                                )
+                            ).filter((shipment) => {
+                                const isoDate = parseISODateOnly(shipment?.receiveDate || "");
+                                return isoDate && isoDate >= today && isoDate < tomorrowStr;
+                            });
+
+                            return [order.orderId, details];
+                        } catch (err: any) {
+                            console.warn(`[finale] getTodaysReceivedPOs order detail fallback for ${order.orderId}: ${err.message}`);
+                            return [order.orderId, []];
+                        }
+                    }),
+                ),
+            );
+
+            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId);
         } catch (err: any) {
             console.error("Failed to fetch receivings:", err.message);
             return [];

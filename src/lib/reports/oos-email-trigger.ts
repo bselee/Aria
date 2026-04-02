@@ -122,8 +122,7 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
     // Find the CSV attachment
     const csvAttachment = findCSVAttachment(msg);
     if (!csvAttachment) {
-        console.error('📋 [OOS-Trigger] No CSV attachment found in Stockie email.');
-        return null;
+        throw new Error('Stockie email found but no CSV attachment was recognized.');
     }
 
     // Download the attachment
@@ -141,8 +140,7 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
     console.log(`📋 [OOS-Trigger] Parsed ${oosItems.length} OOS SKUs from CSV`);
 
     if (oosItems.length === 0) {
-        console.warn('📋 [OOS-Trigger] No OOS items parsed from CSV. Skipping report.');
-        return null;
+        throw new Error('Stockie CSV was downloaded but parsed 0 OOS SKUs. Check header mapping or attachment format.');
     }
 
     // Enrich with Finale data

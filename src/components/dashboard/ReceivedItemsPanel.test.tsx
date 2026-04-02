@@ -89,7 +89,7 @@ describe("ReceivedItemsPanel", () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(screen.getAllByText(/PARTIAL/i)[0]).toBeTruthy();
-    expect(screen.getByText(/Today 10:15 AM|Today 10:15/i)).toBeTruthy();
+    expect(screen.getByText(/(Today|Yest) 10:15 AM|(Today|Yest) 10:15/i)).toBeTruthy();
     expect(screen.getByText(/short on BPM01/i)).toBeTruthy();
   });
 

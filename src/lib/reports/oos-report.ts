@@ -106,25 +106,38 @@ function addBusinessDays(start: Date, bdays: number): Date {
 export function parseStockieCSV(csvContent: string): OOSItem[] {
     const lines = csvContent.split('\n').filter(l => l.trim().length > 0);
     if (lines.length < 2) return [];
+    const headers = parseCSVLine(lines[0]).map(header => header.trim().toUpperCase());
+
+    const fieldIndex = (name: string): number => headers.indexOf(name.toUpperCase());
+    const skuIdx = fieldIndex("SKU");
+    const productIdx = fieldIndex("PRODUCT");
+    const variantIdx = fieldIndex("VARIANT");
+    const vendorIdx = fieldIndex("VENDOR");
+    const committedIdx = fieldIndex("COMMITTED");
+    const availableIdx = fieldIndex("AVAILABLE");
+    const onHandIdx = fieldIndex("ON HAND");
+    const incomingIdx = fieldIndex("INCOMING");
+    const productUrlIdx = fieldIndex("PRODUCT URL");
+
+    if ([skuIdx, productIdx, variantIdx, vendorIdx, committedIdx, availableIdx, onHandIdx, incomingIdx, productUrlIdx].some(idx => idx === -1)) {
+        return [];
+    }
 
     const items: OOSItem[] = [];
 
     for (let i = 1; i < lines.length; i++) {
         const fields = parseCSVLine(lines[i]);
-        if (fields.length < 15) continue;
-
-        const available = parseInt(fields[10]) || 0;
-        // Only include items that are at or below threshold
+        const available = parseInt(fields[availableIdx] ?? "") || 0;
         items.push({
-            sku: fields[4]?.trim() || '',
-            productName: fields[1]?.trim() || '',
-            variant: fields[3]?.trim() || '',
-            shopifyVendor: fields[6]?.trim() || '',
-            shopifyCommitted: parseInt(fields[9]) || 0,
+            sku: fields[skuIdx]?.trim() || '',
+            productName: fields[productIdx]?.trim() || '',
+            variant: fields[variantIdx]?.trim() || '',
+            shopifyVendor: fields[vendorIdx]?.trim() || '',
+            shopifyCommitted: parseInt(fields[committedIdx] ?? "") || 0,
             shopifyAvailable: available,
-            shopifyOnHand: parseInt(fields[11]) || 0,
-            shopifyIncoming: parseInt(fields[12]) || 0,
-            shopifyProductUrl: fields[2]?.trim() || '',
+            shopifyOnHand: parseInt(fields[onHandIdx] ?? "") || 0,
+            shopifyIncoming: parseInt(fields[incomingIdx] ?? "") || 0,
+            shopifyProductUrl: fields[productUrlIdx]?.trim() || '',
         });
     }
 
@@ -142,7 +155,12 @@ function parseCSVLine(line: string): string[] {
     for (let i = 0; i < line.length; i++) {
         const ch = line[i];
         if (ch === '"') {
-            inQuotes = !inQuotes;
+            if (inQuotes && line[i + 1] === '"') {
+                current += '"';
+                i++;
+            } else {
+                inQuotes = !inQuotes;
+            }
         } else if (ch === ',' && !inQuotes) {
             fields.push(current.trim());
             current = '';
