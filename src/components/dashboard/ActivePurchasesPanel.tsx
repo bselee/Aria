@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X } from "lucide-react";
 
 type ActivePurchase = {
@@ -15,6 +15,12 @@ type ActivePurchase = {
     finaleUrl: string;
     leadProvenance: string;
     trackingNumbers?: string[];
+    shipments?: Array<{
+        tracking_number: string;
+        public_tracking_url: string | null;
+        status_display: string | null;
+        estimated_delivery_at: string | null;
+    }>;
 };
 
 type ApiResponse = {
@@ -52,6 +58,14 @@ function fmtDate(dateStr: string | null | undefined): string {
     if (!dateStr) return "Unknown";
     const d = new Date(dateStr);
     return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function fmtDateTime(dateStr: string | null | undefined): string {
+    if (!dateStr) return "";
+    const d = new Date(dateStr);
+    return isNaN(d.getTime())
+        ? dateStr
+        : d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 function timeAgo(iso: string) {
@@ -225,6 +239,12 @@ export default function ActivePurchasesPanel() {
                                 } else if (isCancelled) {
                                     statusLabel = "Cancelled";
                                     statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
+                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
+                                    statusLabel = "Out Today";
+                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
+                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
+                                    statusLabel = "Delivered";
+                                    statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
                                 }
 
                                 return (
@@ -265,18 +285,37 @@ export default function ActivePurchasesPanel() {
                                                 <span>Exp: <span className="text-zinc-300">{fmtDate(po.expectedDate)}</span> <span className="opacity-50">({po.leadProvenance})</span></span>
                                             )}
 
-                                            {po.trackingNumbers && po.trackingNumbers.length > 0 && (
+                                            {((po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0) && (
                                                 <>
                                                     <span className="text-zinc-700">·</span>
-                                                    <span className="text-zinc-400 shrink-0">Trk:</span>
-                                                    {po.trackingNumbers.map((t, i) => {
+                                                    <span className="text-zinc-400 shrink-0">Ship:</span>
+                                                    {(po.shipments?.length
+                                                        ? po.shipments.map((shipment) => ({
+                                                            tracking: shipment.tracking_number,
+                                                            url: shipment.public_tracking_url || carrierUrl(shipment.tracking_number),
+                                                            status: shipment.status_display,
+                                                            eta: shipment.estimated_delivery_at,
+                                                        }))
+                                                        : (po.trackingNumbers || []).map((tracking) => ({
+                                                            tracking,
+                                                            url: carrierUrl(tracking),
+                                                            status: null,
+                                                            eta: null,
+                                                        }))).map((entry, i) => {
+                                                        const t = entry.tracking;
                                                         const display = t.includes(":::") ? t.replace(":::", " ") : t;
-                                                        const url = carrierUrl(t);
                                                         return (
-                                                            <a key={i} href={url} target="_blank" rel="noopener noreferrer"
-                                                                className="text-cyan-400 hover:text-cyan-300 hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5">
-                                                                {display}<ExternalLink className="w-2 h-2 opacity-60" />
-                                                            </a>
+                                                            <span key={i} className="inline-flex items-center gap-1 shrink-0">
+                                                                <a href={entry.url} target="_blank" rel="noopener noreferrer"
+                                                                    className="text-cyan-400 hover:text-cyan-300 hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5">
+                                                                    {display}<ExternalLink className="w-2 h-2 opacity-60" />
+                                                                </a>
+                                                                {(entry.status || entry.eta) && (
+                                                                    <span className="text-zinc-500">
+                                                                        {entry.status || "In transit"}{entry.eta ? ` • ${fmtDateTime(entry.eta)}` : ""}
+                                                                    </span>
+                                                                )}
+                                                            </span>
                                                         );
                                                     })}
                                                 </>

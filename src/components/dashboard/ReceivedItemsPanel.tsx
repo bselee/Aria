@@ -17,6 +17,11 @@ type ReceivedPO = {
     finaleUrl: string;
 };
 
+type TrackingTodaySummary = {
+    headline: string;
+    lines: string[];
+} | null;
+
 // Real AP status keyed by Finale orderId
 type ApStatusMap = Record<string, { label: string; cls: string }>;
 
@@ -75,6 +80,7 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
 
 export default function ReceivedItemsPanel() {
     const [pos, setPos] = useState<ReceivedPO[]>([]);
+    const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
     const [apMap, setApMap] = useState<ApStatusMap>({});
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -159,12 +165,23 @@ export default function ReceivedItemsPanel() {
         silent ? setRefreshing(true) : setLoading(true);
         setError(null);
         try {
-            const res = await fetch('/api/dashboard/receivings?days=14');
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
+            const [receivingsRes, trackingRes] = await Promise.all([
+                fetch('/api/dashboard/receivings?days=14'),
+                fetch('/api/dashboard/tracking'),
+            ]);
+
+            if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
+            const data = await receivingsRes.json();
             if (data.error) throw new Error(data.error);
             const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
             setPos(sorted);
+
+            if (trackingRes.ok) {
+                const trackingData = await trackingRes.json();
+                setTodaySummary(trackingData.todaySummary || null);
+            } else {
+                setTodaySummary(null);
+            }
         } catch (e: any) {
             setError(e.message);
         } finally {
@@ -218,6 +235,24 @@ export default function ReceivedItemsPanel() {
                         <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in the last 14 days</span></div>
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
+                            {todaySummary && (
+                                <div className="px-4 py-3 border-b border-cyan-500/20 bg-cyan-500/5">
+                                    <div className="text-[11px] font-mono uppercase tracking-[0.18em] text-cyan-300/80">
+                                        Shipping Today
+                                    </div>
+                                    <div className="mt-1 text-sm font-semibold text-cyan-100">
+                                        {todaySummary.headline}
+                                    </div>
+                                    <div className="mt-2 space-y-1">
+                                        {todaySummary.lines.map((line) => (
+                                            <div key={line} className="text-[11px] font-mono text-cyan-200/85">
+                                                {line}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
                             {pos.map(po => {
                                 const apStatus = apMap[po.orderId];
                                 const dollars = fmtDollars(po.total);

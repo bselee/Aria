@@ -1,0 +1,101 @@
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+ ⨯ Module not found: Error: C:\Users\BuildASoil\Documents\Projects\aria\package.json (directory description file): Error: C:\Users\BuildASoil\Documents\Projects\aria\package.json (directory description file): Error: C:\Users\BuildASoil\Documents\Projects\aria\package.json (directory description file): Error: No file content
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[purchasing] active purchases tracking fetch failed: Shipment load failed: Could not find the table 'public.shipments' in the schema cache
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[finale] getRecentPurchaseOrders error: fetch failed
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[finale] getRecentPurchaseOrders error: fetch failed
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+Failed to fetch receivings: fetch failed
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |
+[invoice-queue] GET error: Error: TypeError: fetch failed
+    at GET (src\app\api\dashboard\invoice-queue\route.ts:145:27)
+  143 |             .limit(100);
+  144 |
+> 145 |         if (invErr) throw new Error(invErr.message);
+      |                           ^
+  146 |
+  147 |         const rows: any[] = invoicesRaw ?? [];
+  148 |

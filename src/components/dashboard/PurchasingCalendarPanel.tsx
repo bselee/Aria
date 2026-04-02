@@ -9,7 +9,7 @@
  */
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, ExternalLink, Package } from "lucide-react";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS } from "@/lib/purchasing/calendar-lifecycle";
 import type { POCompletionState } from "@/lib/purchasing/po-completion-state";
@@ -27,6 +27,12 @@ type ActivePurchase = {
     finaleUrl: string;
     leadProvenance: string;
     trackingNumbers?: string[];
+    shipments?: Array<{
+        tracking_number: string;
+        public_tracking_url: string | null;
+        status_display: string | null;
+        estimated_delivery_at: string | null;
+    }>;
     isReceived: boolean;
     completionState: POCompletionState;
 };
@@ -409,9 +415,22 @@ function PORow({
     const itemCount = po.items.reduce((s, i) => s + i.quantity, 0);
     const topSkus = po.items.slice(0, 3).map(i => i.productId).join(", ");
     const more = po.items.length > 3 ? ` +${po.items.length - 3}` : "";
-    const hasTracking = (po.trackingNumbers?.length || 0) > 0;
+    const hasTracking = (po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0;
     const needsAPFollowUp = po.isReceived && po.completionState !== "complete";
     const daysOverdue = variant === "overdue" ? Math.abs(daysDiff(po.expectedDate, today)) : 0;
+    const displayShipments = (po.shipments?.length
+        ? po.shipments.map((shipment) => ({
+            tracking: shipment.tracking_number,
+            status: shipment.status_display,
+            eta: shipment.estimated_delivery_at,
+            url: shipment.public_tracking_url || carrierUrl(shipment.tracking_number),
+        }))
+        : (po.trackingNumbers || []).map((tracking) => ({
+            tracking,
+            status: null,
+            eta: null,
+            url: carrierUrl(tracking),
+        })));
 
     // Estimate revised ETA for overdue items: expected + 50% of overdue days as buffer
     const revisedEtaDays = variant === "overdue" ? Math.ceil(daysOverdue * 0.5) + 1 : 0;
@@ -498,24 +517,26 @@ function PORow({
                     {/* Tracking links */}
                     {hasTracking && (
                         <div className="flex flex-wrap gap-1 mt-1">
-                            {po.trackingNumbers!.slice(0, 3).map((t, idx) => {
+                            {displayShipments.slice(0, 3).map((entry, idx) => {
+                                const t = entry.tracking;
                                 const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
                                 const short = displayNum.length > 14 ? `â€¦${displayNum.slice(-10)}` : displayNum;
                                 return (
                                     <a
                                         key={idx}
-                                        href={carrierUrl(t)}
+                                        href={entry.url}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         className="text-[9px] font-mono text-cyan-400/70 hover:text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 rounded px-1 py-0.5 hover:bg-cyan-500/20 transition-colors"
+                                        title={entry.status || undefined}
                                     >
                                         ðŸ“¦ {short}
                                     </a>
                                 );
                             })}
-                            {po.trackingNumbers!.length > 3 && (
+                            {displayShipments.length > 3 && (
                                 <span className="text-[9px] font-mono text-zinc-500">
-                                    +{po.trackingNumbers!.length - 3} more
+                                    +{displayShipments.length - 3} more
                                 </span>
                             )}
                         </div>
@@ -525,6 +546,9 @@ function PORow({
                     {variant !== "overdue" && (
                         <div className="text-[9px] text-zinc-600 font-mono mt-0.5">
                             ETA: {shortDate(po.expectedDate)} ({po.leadProvenance})
+                            {po.shipments?.[0]?.status_display && (
+                                <span className="ml-1 text-cyan-400/60">· {po.shipments[0].status_display}</span>
+                            )}
                             {!hasTracking && (
                                 <span className="ml-1 text-amber-500/50">Â· no tracking yet</span>
                             )}

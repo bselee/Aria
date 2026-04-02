@@ -19,6 +19,41 @@ import {
     TRACKING_PATTERNS,
 } from './tracking-service';
 
+const REAL_VENDOR_EMAILS = {
+    thirstyEarthUpsShipstation: `
+Dear Jeremy Silva,
+
+Thank you for your order from Thirsty Earth! We wanted to let you know that your order (#19457) was shipped via UPS, UPS Ground Saver on 3/30/2026.
+
+Track Your Shipment: 1ZJ74F69YW54289607
+`,
+    thirstyEarthFedexShipstation: `
+Dear Jeremy Silva,
+
+Thank you for your order from Thirsty Earth! We wanted to let you know that your order (#19457) was shipped via FedEx, FedEx Ground on 4/1/2026.
+
+Track Your Shipment: 8051904063
+`,
+    organiShieldUspsShipstation: `
+Dear Bill Selee,
+
+Thank you for your order from OrganiShield! We wanted to let you know that your order (#18580) was shipped via USPS, USPS Ground Advantage on 3/31/2026.
+
+Track Your Shipment: 9434650106151053145623
+`,
+    autopotQuickbooksInvoice: `
+Your invoice is ready!
+
+23371057
+
+Here's your invoice! Thank you for your prompt payment.
+
+23371057 UPS - 1Z22YV580360436423
+
+This charge may appear as Organic Rescue LLC on your bank or CC statement.
+`,
+};
+
 // ──────────────────────────────────────────────────
 // detectCarrier
 // ──────────────────────────────────────────────────
@@ -283,6 +318,50 @@ describe('extractTrackingNumbers', () => {
 
     it('should return empty array for text with no tracking numbers', () => {
         expect(extractTrackingNumbers('no tracking here')).toEqual([]);
+    });
+
+    it('extracts the real UPS tracking number from a Thirsty Earth ShipStation email', () => {
+        const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthUpsShipstation);
+        expect(results).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    carrier: 'ups',
+                    trackingNumber: '1ZJ74F69YW54289607',
+                }),
+            ]),
+        );
+    });
+
+    it('extracts the real USPS tracking number from an OrganiShield ShipStation email', () => {
+        const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.organiShieldUspsShipstation);
+        expect(results).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    carrier: 'usps',
+                    trackingNumber: '9434650106151053145623',
+                }),
+            ]),
+        );
+    });
+
+    it('extracts the real UPS tracking number embedded inside an AutoPot QuickBooks invoice email', () => {
+        const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.autopotQuickbooksInvoice);
+        expect(results).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    carrier: 'ups',
+                    trackingNumber: '1Z22YV580360436423',
+                }),
+            ]),
+        );
+    });
+
+    it('captures both real Thirsty Earth shipment variants from separate fulfillment emails', () => {
+        const upsResults = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthUpsShipstation);
+        const fedexResults = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthFedexShipstation);
+
+        expect(upsResults.some((result) => result.trackingNumber === '1ZJ74F69YW54289607')).toBe(true);
+        expect(fedexResults.some((result) => result.trackingNumber === '8051904063')).toBe(true);
     });
 });
 

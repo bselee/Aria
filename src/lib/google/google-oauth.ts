@@ -29,7 +29,7 @@ import * as path from 'path';
  * Only the OAuth2 constructor is needed.
  */
 interface GoogleAuthModule {
-    OAuth2: new (clientId: string, clientSecret: string, redirectUri: string) => GoogleOAuth2Client;
+    OAuth2: new (...args: any[]) => GoogleOAuth2Client;
 }
 
 /**
@@ -37,15 +37,15 @@ interface GoogleAuthModule {
  * Covers only the methods this helper actually calls.
  */
 interface GoogleOAuth2Client {
-    setCredentials(credentials: Record<string, unknown>): void;
-    refreshAccessToken(): Promise<{ credentials: Record<string, unknown> }>;
+    setCredentials(credentials: any): void;
+    refreshAccessToken(): Promise<{ credentials: any }>;
     generateAuthUrl(options: {
         access_type: string;
         scope: string[];
         prompt: string;
         state?: string;
     }): string;
-    getToken(code: string): Promise<{ tokens: Record<string, unknown> }>;
+    getToken(code: string): Promise<{ tokens: any }>;
 }
 
 /**

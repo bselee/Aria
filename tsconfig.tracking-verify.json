@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "next-env.d.ts",
+    "src/lib/intelligence/tracking-agent.ts",
+    "src/lib/intelligence/tracking-agent.test.ts",
+    "src/lib/tracking/shipment-intelligence.ts",
+    "src/app/api/dashboard/tracking/route.ts",
+    "src/components/dashboard/ReceivedItemsPanel.tsx",
+    "src/components/dashboard/TrackingBoardPanel.tsx"
+  ]
+}

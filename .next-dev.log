@@ -1,0 +1,246 @@
+
+> aria-document-intelligence@1.0.0 dev
+> next dev
+
+   ▲ Next.js 15.5.12
+   - Local:        http://localhost:3000
+   - Network:      http://169.254.83.107:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 4.7s
+ ○ Compiling /api/dashboard/receivings ...
+ ✓ Compiled /api/dashboard/invoice-queue in 7s (768 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 7102ms
+ GET /api/dashboard/invoice-queue 200 in 7277ms
+ GET /api/dashboard/receivings?days=14 200 in 22622ms
+ ○ Compiling /api/dashboard/active-purchases ...
+ ✓ Compiled /api/dashboard/active-purchases in 1322ms (775 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 1364ms
+ GET /api/dashboard/invoice-queue 200 in 1559ms
+[LeadTimeService] Cache warmed — 9 vendor(s) with history
+ GET /api/dashboard/active-purchases 200 in 7341ms
+ GET /api/dashboard/active-purchases 200 in 4881ms
+ GET /api/dashboard/statement-reconciliation 200 in 232ms
+ GET /api/dashboard/invoice-queue 200 in 367ms
+ GET /api/dashboard/invoice-queue 200 in 23ms
+ GET /api/dashboard/statement-reconciliation 200 in 164ms
+ GET /api/dashboard/statement-reconciliation 200 in 202ms
+ GET /api/dashboard/invoice-queue 200 in 323ms
+ GET /api/dashboard/invoice-queue 200 in 33ms
+ GET /api/dashboard/statement-reconciliation 200 in 154ms
+ GET /api/dashboard/statement-reconciliation 200 in 148ms
+ GET /api/dashboard/invoice-queue 200 in 318ms
+ GET /api/dashboard/active-purchases 200 in 5923ms
+ GET /api/dashboard/receivings?days=14 200 in 10650ms
+ GET /api/dashboard/invoice-queue 200 in 47ms
+ GET /api/dashboard/statement-reconciliation 200 in 157ms
+ GET /api/dashboard/statement-reconciliation 200 in 208ms
+ GET /api/dashboard/invoice-queue 200 in 322ms
+ GET /api/dashboard/invoice-queue 200 in 33ms
+ GET /api/dashboard/statement-reconciliation 200 in 150ms
+ GET /api/dashboard/statement-reconciliation 200 in 192ms
+ GET /api/dashboard/invoice-queue 200 in 288ms
+ GET /api/dashboard/invoice-queue 200 in 81ms
+ GET /api/dashboard/statement-reconciliation 200 in 228ms
+ GET /api/dashboard/active-purchases 200 in 4902ms
+ GET /api/dashboard/statement-reconciliation 200 in 228ms
+ GET /api/dashboard/invoice-queue 200 in 422ms
+ GET /api/dashboard/invoice-queue 200 in 25ms
+ GET /api/dashboard/statement-reconciliation 200 in 155ms
+ GET /api/dashboard/statement-reconciliation 200 in 159ms
+ GET /api/dashboard/invoice-queue 200 in 328ms
+ GET /api/dashboard/invoice-queue 200 in 84ms
+ GET /api/dashboard/statement-reconciliation 200 in 185ms
+ GET /api/dashboard/active-purchases 200 in 5253ms
+ GET /api/dashboard/statement-reconciliation 200 in 138ms
+ GET /api/dashboard/invoice-queue 200 in 332ms
+ GET /api/dashboard/active-purchases 200 in 5515ms
+ GET /api/dashboard/receivings?days=14 200 in 9411ms
+ GET /api/dashboard/invoice-queue 200 in 30ms
+ GET /api/dashboard/statement-reconciliation 200 in 150ms
+ GET /api/dashboard/statement-reconciliation 200 in 216ms
+ GET /api/dashboard/invoice-queue 200 in 382ms
+ GET /api/dashboard/invoice-queue 200 in 36ms
+ GET /api/dashboard/statement-reconciliation 200 in 167ms
+ GET /api/dashboard/statement-reconciliation 200 in 145ms
+ GET /api/dashboard/invoice-queue 200 in 317ms
+ GET /api/dashboard/invoice-queue 200 in 45ms
+ GET /api/dashboard/statement-reconciliation 200 in 238ms
+ GET /api/dashboard/active-purchases 200 in 7746ms
+ GET /api/dashboard/statement-reconciliation 200 in 155ms
+ GET /api/dashboard/invoice-queue 200 in 327ms
+ GET /api/dashboard/invoice-queue 200 in 50ms
+ GET /api/dashboard/statement-reconciliation 200 in 166ms
+ GET /api/dashboard/statement-reconciliation 200 in 174ms
+ GET /api/dashboard/invoice-queue 200 in 344ms
+ GET /api/dashboard/invoice-queue 200 in 41ms
+ GET /api/dashboard/statement-reconciliation 200 in 143ms
+ GET /api/dashboard/statement-reconciliation 200 in 207ms
+ GET /api/dashboard/invoice-queue 200 in 427ms
+ GET /api/dashboard/active-purchases 200 in 6233ms
+ GET /api/dashboard/receivings?days=14 200 in 10924ms
+ GET /api/dashboard/invoice-queue 200 in 40ms
+ GET /api/dashboard/statement-reconciliation 200 in 171ms
+ GET /api/dashboard/statement-reconciliation 200 in 174ms
+ GET /api/dashboard/invoice-queue 200 in 342ms
+ GET /api/dashboard/invoice-queue 200 in 36ms
+ GET /api/dashboard/statement-reconciliation 200 in 145ms
+ GET /api/dashboard/statement-reconciliation 200 in 147ms
+ GET /api/dashboard/invoice-queue 200 in 340ms
+ GET /api/dashboard/invoice-queue 200 in 58ms
+ GET /api/dashboard/statement-reconciliation 200 in 179ms
+ GET /api/dashboard/active-purchases 200 in 6704ms
+ GET /api/dashboard/active-purchases 200 in 4789ms
+ GET /api/dashboard/statement-reconciliation 200 in 145ms
+ GET /api/dashboard/invoice-queue 200 in 314ms
+ GET /api/dashboard/invoice-queue 200 in 39ms
+ GET /api/dashboard/statement-reconciliation 200 in 155ms
+ GET /api/dashboard/statement-reconciliation 200 in 185ms
+ GET /api/dashboard/invoice-queue 200 in 383ms
+ GET /api/dashboard/statement-reconciliation 200 in 160ms
+ GET /api/dashboard/invoice-queue 200 in 27ms
+ GET /api/dashboard/statement-reconciliation 200 in 160ms
+ GET /api/dashboard/invoice-queue 200 in 338ms
+ GET /api/dashboard/active-purchases 200 in 6390ms
+ GET /api/dashboard/receivings?days=14 200 in 8786ms
+ GET /api/dashboard/invoice-queue 200 in 37ms
+ GET /api/dashboard/statement-reconciliation 200 in 185ms
+ GET /api/dashboard/statement-reconciliation 200 in 159ms
+ GET /api/dashboard/invoice-queue 200 in 320ms
+ GET /api/dashboard/statement-reconciliation 200 in 152ms
+ GET /api/dashboard/invoice-queue 200 in 319ms
+ GET /api/dashboard/invoice-queue 200 in 36ms
+ GET /api/dashboard/statement-reconciliation 200 in 149ms
+ GET /api/dashboard/statement-reconciliation 200 in 203ms
+ GET /api/dashboard/invoice-queue 200 in 354ms
+ GET /api/dashboard/active-purchases 200 in 10195ms
+ GET /api/dashboard/statement-reconciliation 200 in 223ms
+ GET /api/dashboard/invoice-queue 200 in 417ms
+ GET /api/dashboard/invoice-queue 200 in 64ms
+ GET /api/dashboard/statement-reconciliation 200 in 165ms
+ GET /api/dashboard/statement-reconciliation 200 in 164ms
+ GET /api/dashboard/invoice-queue 200 in 338ms
+ GET /api/dashboard/invoice-queue 200 in 77ms
+ GET /api/dashboard/statement-reconciliation 200 in 215ms
+ GET /api/dashboard/statement-reconciliation 200 in 307ms
+ GET /api/dashboard/invoice-queue 200 in 507ms
+ GET /api/dashboard/active-purchases 200 in 6127ms
+ GET /api/dashboard/receivings?days=14 200 in 9408ms
+ GET /api/dashboard/active-purchases 200 in 5566ms
+ GET /api/dashboard/invoice-queue 200 in 18ms
+ GET /api/dashboard/statement-reconciliation 200 in 151ms
+ GET /api/dashboard/statement-reconciliation 200 in 192ms
+ GET /api/dashboard/invoice-queue 200 in 366ms
+ GET /api/dashboard/invoice-queue 200 in 16ms
+ GET /api/dashboard/statement-reconciliation 200 in 148ms
+ GET /api/dashboard/statement-reconciliation 200 in 176ms
+ GET /api/dashboard/invoice-queue 200 in 336ms
+ GET /api/dashboard/invoice-queue 200 in 57ms
+ GET /api/dashboard/statement-reconciliation 200 in 209ms
+ GET /api/dashboard/active-purchases 200 in 6271ms
+ GET /api/dashboard/statement-reconciliation 200 in 138ms
+ GET /api/dashboard/invoice-queue 200 in 369ms
+ ✓ Compiled in 1077ms (765 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 1106ms
+ GET /api/dashboard/invoice-queue 200 in 1312ms
+ GET /api/dashboard/invoice-queue 200 in 45ms
+ GET /api/dashboard/statement-reconciliation 200 in 225ms
+ GET /api/dashboard/statement-reconciliation 200 in 172ms
+ GET /api/dashboard/invoice-queue 200 in 327ms
+ GET /api/dashboard/statement-reconciliation 200 in 412ms
+ ○ Compiling /api/dashboard/active-purchases ...
+ ✓ Compiled /api/dashboard/active-purchases in 1974ms (575 modules)
+ ✓ Compiled (723 modules)
+ GET /api/dashboard/invoice-queue 200 in 8739ms
+[LeadTimeService] Cache warmed — 10 vendor(s) with history
+ GET /api/dashboard/active-purchases 200 in 14164ms
+ GET /api/dashboard/receivings?days=14 200 in 16103ms
+ GET /api/dashboard/statement-reconciliation 200 in 523ms
+ GET /api/dashboard/invoice-queue 200 in 431ms
+ GET /api/dashboard/invoice-queue 200 in 51ms
+ GET /api/dashboard/statement-reconciliation 200 in 241ms
+ GET /api/dashboard/statement-reconciliation 200 in 136ms
+ GET /api/dashboard/invoice-queue 200 in 262ms
+ GET /api/dashboard/invoice-queue 200 in 59ms
+ GET /api/dashboard/statement-reconciliation 200 in 192ms
+ ✓ Compiled in 280ms (193 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 160ms
+ GET /api/dashboard/invoice-queue 200 in 333ms
+ GET /api/dashboard/active-purchases 200 in 5795ms
+ GET /api/dashboard/active-purchases 200 in 5372ms
+ GET /api/dashboard/statement-reconciliation 200 in 261ms
+ GET /api/dashboard/invoice-queue 200 in 22ms
+ GET /api/dashboard/statement-reconciliation 200 in 176ms
+ GET /api/dashboard/invoice-queue 200 in 341ms
+ GET /api/dashboard/invoice-queue 200 in 54ms
+ GET /api/dashboard/statement-reconciliation 200 in 175ms
+ GET /api/dashboard/statement-reconciliation 200 in 146ms
+ GET /api/dashboard/invoice-queue 200 in 283ms
+ GET /api/dashboard/statement-reconciliation 200 in 176ms
+ GET /api/dashboard/invoice-queue 200 in 286ms
+ GET /api/dashboard/active-purchases 200 in 6116ms
+ GET /api/dashboard/receivings?days=14 200 in 6981ms
+ GET /api/dashboard/statement-reconciliation 200 in 149ms
+ GET /api/dashboard/invoice-queue 200 in 310ms
+ GET /api/dashboard/statement-reconciliation 200 in 141ms
+ GET /api/dashboard/invoice-queue 200 in 342ms
+ GET /api/dashboard/statement-reconciliation 200 in 159ms
+ GET /api/dashboard/invoice-queue 200 in 331ms
+ GET /api/dashboard/statement-reconciliation 200 in 176ms
+ GET /api/dashboard/invoice-queue 200 in 312ms
+ ✓ Compiled in 871ms (572 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 938ms
+ ○ Compiling /api/dashboard/active-purchases ...
+ ✓ Compiled /api/dashboard/active-purchases in 918ms (721 modules)
+ GET /api/dashboard/invoice-queue 200 in 4197ms
+[LeadTimeService] Cache warmed — 10 vendor(s) with history
+ GET /api/dashboard/active-purchases 200 in 9581ms
+ GET /api/dashboard/invoice-queue 200 in 485ms
+ GET /api/dashboard/statement-reconciliation 200 in 655ms
+ ✓ Compiled in 892ms (572 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 797ms
+ GET /api/dashboard/invoice-queue 200 in 309ms
+ GET /api/dashboard/invoice-queue 200 in 48ms
+ GET /api/dashboard/statement-reconciliation 200 in 170ms
+ GET /api/dashboard/statement-reconciliation 200 in 187ms
+ GET /api/dashboard/invoice-queue 200 in 369ms
+ ✓ Compiled in 471ms (193 modules)
+ GET /api/dashboard/statement-reconciliation 200 in 232ms
+ ○ Compiling /api/dashboard/receivings ...
+ ✓ Compiled /api/dashboard/receivings in 933ms (721 modules)
+ ✓ Compiled (723 modules)
+ GET /api/dashboard/invoice-queue 200 in 2461ms
+[LeadTimeService] Cache warmed — 10 vendor(s) with history
+ GET /api/dashboard/active-purchases 200 in 8569ms
+ GET /api/dashboard/receivings?days=14 200 in 11243ms
+ GET /api/dashboard/active-purchases 200 in 9269ms
+ GET /api/dashboard/invoice-queue 200 in 24ms
+ GET /api/dashboard/statement-reconciliation 200 in 504ms
+ GET /api/dashboard/statement-reconciliation 200 in 362ms
+ GET /api/dashboard/invoice-queue 200 in 527ms
+ GET /api/dashboard/invoice-queue 200 in 58ms
+ GET /api/dashboard/statement-reconciliation 200 in 180ms
+ GET /api/dashboard/invoice-queue 500 in 10987ms
+ GET /api/dashboard/statement-reconciliation 200 in 10992ms
+ GET /api/dashboard/statement-reconciliation 200 in 2059ms
+ GET /api/dashboard/invoice-queue 500 in 2174ms
+ GET /api/dashboard/active-purchases 200 in 2405ms
+ GET /api/dashboard/statement-reconciliation 200 in 6988ms
+ GET /api/dashboard/invoice-queue 500 in 10913ms
+ GET /api/dashboard/invoice-queue 500 in 11016ms
+ GET /api/dashboard/statement-reconciliation 200 in 11022ms
+ GET /api/dashboard/invoice-queue 500 in 10988ms
+ GET /api/dashboard/statement-reconciliation 200 in 11027ms
+ GET /api/dashboard/statement-reconciliation 200 in 7955ms
+ GET /api/dashboard/invoice-queue 500 in 8033ms
+ GET /api/dashboard/active-purchases 200 in 10823ms
+ GET /api/dashboard/invoice-queue 500 in 10945ms
+ GET /api/dashboard/receivings?days=14 200 in 10949ms
+ GET /api/dashboard/statement-reconciliation 200 in 10960ms
+ GET /api/dashboard/invoice-queue 500 in 10941ms
+ GET /api/dashboard/statement-reconciliation 200 in 10953ms
+ GET /api/dashboard/invoice-queue 500 in 10845ms
+ GET /api/dashboard/statement-reconciliation 200 in 10853ms
+ GET /api/dashboard/invoice-queue 500 in 11273ms
+ GET /api/dashboard/statement-reconciliation 200 in 11284ms

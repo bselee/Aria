@@ -28,10 +28,30 @@ function stubLocalStorage(initialHeight = "280") {
   });
 }
 
-function stubFetch(payload: any) {
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-    ok: true,
-    json: () => Promise.resolve(payload),
+function stubFetch(payload: any, trackingPayload?: any) {
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    const body = url.includes("/api/dashboard/tracking")
+      ? (trackingPayload ?? {
+          board: {
+            arrivingToday: [],
+            outForDelivery: [],
+            deliveredAwaitingReceipt: [],
+            exceptions: [],
+            stale: [],
+            recentlyDelivered: [],
+          },
+          shipments: [],
+          asOf: "2026-04-01T12:00:00.000Z",
+          todaySummary: null,
+          answer: null,
+        })
+      : payload;
+
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve(body),
+    });
   }));
 }
 
@@ -134,5 +154,49 @@ describe("ReceivedItemsPanel", () => {
     const supplierRows = screen.getAllByText(/Vendor/).map(node => node.textContent);
     expect(supplierRows[0]).toMatch(/Newest Vendor/);
     expect(screen.getByText(/short on SKU-A, SKU-B \+1 more/i)).toBeTruthy();
+  });
+
+  it("shows a today shipment summary above receivings when tracking data is available", async () => {
+    stubLocalStorage();
+    stubFetch(
+      {
+        received: [
+          {
+            orderId: "PO-100",
+            orderDate: "2026-04-01",
+            receiveDate: "2026-04-01",
+            supplier: "Berger",
+            total: 100,
+            items: [{ productId: "SKU-1", quantity: 1 }],
+            finaleUrl: "https://example.com/po",
+          },
+        ],
+        days: 14,
+        asOf: "2026-04-01",
+      },
+      {
+        board: {
+          arrivingToday: [],
+          outForDelivery: [],
+          deliveredAwaitingReceipt: [],
+          exceptions: [],
+          stale: [],
+          recentlyDelivered: [],
+        },
+        shipments: [],
+        asOf: "2026-04-01T12:00:00.000Z",
+        todaySummary: {
+          headline: "1 out for delivery, 1 arriving today",
+          lines: ["PO-200 - ULINE - Out for delivery", "PO-300 - Berger - ETA Apr 1, 1:00 PM"],
+        },
+        answer: null,
+      },
+    );
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(screen.getByText(/1 out for delivery, 1 arriving today/i)).toBeTruthy();
+    expect(screen.getByText(/PO-200 - ULINE - Out for delivery/i)).toBeTruthy();
   });
 });

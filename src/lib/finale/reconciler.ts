@@ -27,6 +27,7 @@
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../supabase";
+import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
 
@@ -1949,22 +1950,18 @@ export async function applyReconciliation(
                     // Save tracking numbers to invoices table for future dedup
                     await saveTrackingNumbers(newTrackingNumbers, result.invoiceNumber);
 
-                    // Also persist to purchase_orders.tracking_numbers so calendar sync + dashboard show it
+                    // Persist to the shared shipments layer; it backfills purchase_orders for compatibility.
                     if (newTrackingNumbers.length > 0) {
                         try {
-                            const supabase = createClient();
-                            if (supabase) {
-                                const { data: existingPO } = await supabase
-                                    .from("purchase_orders")
-                                    .select("tracking_numbers")
-                                    .eq("po_number", result.orderId)
-                                    .maybeSingle();
-                                const merged = [...new Set([...(existingPO?.tracking_numbers ?? []), ...newTrackingNumbers])];
-                                await supabase.from("purchase_orders").upsert({
-                                    po_number: result.orderId,
-                                    tracking_numbers: merged,
-                                    updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" });
+                            for (const trackingNumber of newTrackingNumbers) {
+                                await upsertShipmentEvidence({
+                                    trackingNumber,
+                                    poNumber: result.orderId,
+                                    source: "invoice_reconciliation",
+                                    sourceRef: result.invoiceNumber,
+                                    confidence: 0.85,
+                                    estimatedDeliveryAt: result.trackingUpdate?.shipDate || null,
+                                });
                             }
                         } catch (e: any) {
                             console.warn(`⚠️ [reconciler] Failed to persist tracking to purchase_orders: ${e.message}`);

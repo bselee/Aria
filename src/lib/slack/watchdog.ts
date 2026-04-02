@@ -918,8 +918,9 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                     // Check for shipment tracking
                     const { data: shipment } = await supabase
                         .from("shipments")
-                        .select("status, estimated_delivery, tracking_number")
+                        .select("status_display, estimated_delivery_at, tracking_number")
                         .contains("po_numbers", [po.po_number])
+                        .eq("active", true)
                         .single();
 
                     const eta = shipment

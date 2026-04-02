@@ -4,11 +4,13 @@ import { createClient } from "../supabase";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "./calendar-lifecycle";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
+import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
     leadProvenance: string;
     trackingNumbers: string[];
+    shipments: ShipmentRecord[];
     isReceived: boolean;
     completionState: POCompletionState;
 }
@@ -29,6 +31,7 @@ export async function loadActivePurchases(
     const supabase = createClient();
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
     const trackingMap = new Map<string, string[]>();
+    const shipmentMap = new Map<string, ShipmentRecord[]>();
 
     if (supabase && poNumbers.length > 0) {
         try {
@@ -41,6 +44,14 @@ export async function loadActivePurchases(
 
                 for (const dp of dbPOs || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
+                }
+            }
+
+            const shipments = await listShipmentsForPurchaseOrders(poNumbers);
+            for (const shipment of shipments) {
+                for (const poNumber of shipment.po_numbers || []) {
+                    if (!shipmentMap.has(poNumber)) shipmentMap.set(poNumber, []);
+                    shipmentMap.get(poNumber)!.push(shipment);
                 }
             }
         } catch (e: any) {
@@ -59,10 +70,11 @@ export async function loadActivePurchases(
         if (!["committed", "completed"].includes(status)) continue;
 
         const isReceived = status === "completed";
+        const shipments = shipmentMap.get(po.orderId) || [];
         const completionSignal = completionSignals.get(po.orderId);
         const completionState = derivePOCompletionState({
             finaleReceived: isReceived,
-            trackingDelivered: false,
+            trackingDelivered: shipments.length > 0 && shipments.every((shipment) => shipment.status_category === "delivered"),
             hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
             reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
             freightResolved: completionSignal?.freightResolved || false,
@@ -96,6 +108,7 @@ export async function loadActivePurchases(
             isReceived,
             completionState,
             trackingNumbers: trackingMap.get(po.orderId) || [],
+            shipments,
         });
     }
 

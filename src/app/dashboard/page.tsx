@@ -8,7 +8,7 @@
  */
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
     DndContext,
     DragOverlay,
@@ -41,6 +41,7 @@ import { SortablePanel } from "@/components/dashboard/SortablePanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPanel";
 import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
+import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 
 
 // ── Column width defaults (px) ──────────────────────────────────────
@@ -74,6 +75,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
     "purchasing": <PurchasingPanel />,
     "build-schedule": <BuildSchedulePanel />,
     "active-purchases": <ActivePurchasesPanel />,
+    "tracking-board": <TrackingBoardPanel />,
     "purchasing-calendar": <PurchasingCalendarPanel />,
 };
 
@@ -88,7 +90,7 @@ const DEFAULT_LAYOUT: LayoutState = {
     left: ["build-risk", "receivings"],
     // DECISION(2026-03-25): Removed axiom-queue from dashboard — Axiom ordering
     // is now fully autonomous (like ULINE). No manual review needed.
-    midLeft: ["invoice-queue", "statement-reconciliation", "active-purchases"],
+    midLeft: ["invoice-queue", "statement-reconciliation", "active-purchases", "tracking-board"],
     midRight: ["purchasing", "purchasing-calendar"],
     right: ["activity", "build-schedule"]
 };

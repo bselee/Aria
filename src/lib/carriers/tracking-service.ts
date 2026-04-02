@@ -25,6 +25,8 @@ export interface TrackingStatus {
     category: TrackingCategory;
     display: string;
     public_url?: string;
+    estimated_delivery_at?: string;
+    delivered_at?: string;
 }
 
 // ──────────────────────────────────────────────────
@@ -40,11 +42,11 @@ export const TRACKING_PATTERNS = {
     ups: /\b1Z[0-9A-Z]{16}\b/i,
     // FedEx: 12-digit express, 15-digit ground, or 96XXXXXXXXXXXXXXXXXX (20-digit SmartPost)
     fedex: /\b(96\d{18}|\d{15}|\d{12})\b/,
-    usps: /\b(94|92|93|95)\d{20}\b/,
+    usps: /\b(?:94|92|93|95)\d{20}\b/,
     dhl: /\bJD\d{18}\b/i,
     // generic: require '#' or ':' separator — prevents "tracking information" false matches
     // keyword is non-capturing (?:...) so match[1] is always the tracking number
-    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i,
+    generic: /\b(?:tracking|track(?:\s+your)?\s+shipment|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i,
     // LTL freight identifiers — whitespace required after keyword
     pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
     bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
@@ -193,7 +195,14 @@ export function parseTrackingContent(content: string): TrackingStatus | null {
     const deliveredDate = content.match(
         /delivered\s+(?:on\s+)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i
     );
-    if (deliveredDate) return { category: 'delivered', display: `Delivered ${deliveredDate[1]}` };
+    if (deliveredDate) {
+        const deliveredAt = new Date(`${deliveredDate[1]} 17:00:00 UTC`);
+        return {
+            category: 'delivered',
+            display: `Delivered ${deliveredDate[1]}`,
+            delivered_at: Number.isNaN(deliveredAt.getTime()) ? undefined : deliveredAt.toISOString(),
+        };
+    }
     if (/\bdelivered\b/i.test(content)) return { category: 'delivered', display: 'Delivered' };
 
     // Out for delivery
@@ -208,11 +217,25 @@ export function parseTrackingContent(content: string): TrackingStatus | null {
     const eta = content.match(
         /(?:estimated|scheduled|expected)\s+delivery[:\s]+(?:[A-Z][a-z]+,\s+)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i
     );
-    if (eta) return { category: 'in_transit', display: `Expected ${eta[1]}` };
+    if (eta) {
+        const estimated = new Date(`${eta[1]} 17:00:00 UTC`);
+        return {
+            category: 'in_transit',
+            display: `Expected ${eta[1]}`,
+            estimated_delivery_at: Number.isNaN(estimated.getTime()) ? undefined : estimated.toISOString(),
+        };
+    }
 
     // "by end of day <date>"
     const eod = content.match(/by\s+end\s+of\s+(?:business\s+)?day[,\s]+([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})/i);
-    if (eod) return { category: 'in_transit', display: `Expected by ${eod[1]}` };
+    if (eod) {
+        const estimated = new Date(`${eod[1]} 17:00:00 UTC`);
+        return {
+            category: 'in_transit',
+            display: `Expected by ${eod[1]}`,
+            estimated_delivery_at: Number.isNaN(estimated.getTime()) ? undefined : estimated.toISOString(),
+        };
+    }
 
     // Generic in-transit signals
     if (/in\s+transit|on\s+the\s+way|picked\s+up|departed/i.test(content))
@@ -295,7 +318,12 @@ async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingS
                     const d = new Date(deliveredEntry.dateTime);
                     display = `Delivered ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
                 }
-                return { category: 'delivered', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+                return {
+                    category: 'delivered',
+                    display,
+                    public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}`,
+                    delivered_at: deliveredEntry?.dateTime ? new Date(deliveredEntry.dateTime).toISOString() : undefined,
+                };
             }
             case 'OD':
                 return { category: 'out_for_delivery', display: 'Out for delivery', public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
@@ -307,7 +335,12 @@ async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingS
                     const e = new Date(estEntry);
                     display = `Expected ${e.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
                 }
-                return { category: 'in_transit', display, public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}` };
+                return {
+                    category: 'in_transit',
+                    display,
+                    public_url: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${trackingNumber}`,
+                    estimated_delivery_at: estEntry ? new Date(estEntry).toISOString() : undefined,
+                };
             }
         }
     } catch (err: any) {
@@ -395,7 +428,12 @@ export async function getTrackingStatus(trackingNumber: string): Promise<Trackin
                     const d = new Date(tracker.updated_at);
                     dDisplay = `Delivered ${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
                 }
-                return { category: 'delivered', display: dDisplay, public_url: tracker.public_url };
+                return {
+                    category: 'delivered',
+                    display: dDisplay,
+                    public_url: tracker.public_url,
+                    delivered_at: tracker.updated_at ? new Date(tracker.updated_at).toISOString() : undefined,
+                };
             }
             case "out_for_delivery":
                 return { category: 'out_for_delivery', display: 'Out for delivery', public_url: tracker.public_url };
@@ -412,7 +450,12 @@ export async function getTrackingStatus(trackingNumber: string): Promise<Trackin
                     const e = new Date(tracker.est_delivery_date);
                     dDisplay = `Expected ${e.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
                 }
-                return { category: 'in_transit', display: dDisplay, public_url: tracker.public_url };
+                return {
+                    category: 'in_transit',
+                    display: dDisplay,
+                    public_url: tracker.public_url,
+                    estimated_delivery_at: tracker.est_delivery_date ? new Date(tracker.est_delivery_date).toISOString() : undefined,
+                };
             }
         }
     } catch (err: any) {

@@ -219,6 +219,21 @@ export async function enrichOOSItems(
                 poTrackingMap.set(record.po_number, record.tracking_numbers);
             }
         }
+
+        const { data: shipmentRecords } = await supabase
+            .from("shipments")
+            .select("po_numbers, tracking_number")
+            .overlaps("po_numbers", poNumbers)
+            .eq("active", true);
+
+        for (const shipment of shipmentRecords || []) {
+            for (const poNumber of shipment.po_numbers || []) {
+                const merged = [...new Set([...(poTrackingMap.get(poNumber) || []), shipment.tracking_number])];
+                if (merged.length > 0) {
+                    poTrackingMap.set(poNumber, merged);
+                }
+            }
+        }
     }
 
     // Also try to get shipment tracking from Finale for POs without Supabase tracking

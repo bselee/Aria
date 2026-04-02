@@ -11,6 +11,7 @@ import { createClient } from "../supabase";
 import { extractPDF } from "../pdf/extractor";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
+import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 
 const TRACKING_PATTERNS = {
     ups: /\b1Z[A-Z0-9]{16}\b/gi,
@@ -18,7 +19,7 @@ const TRACKING_PATTERNS = {
     usps: /\b(94|92|93|95)\d{20}\b/g,
     dhl: /\bJD\d{18}\b/gi,
     // generic: require '#' or ':' separator so "tracking information" doesn't match
-    generic: /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi,
+    generic: /\b(?:tracking|track(?:\s+your)?\s+shipment|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi,
     // PRO/BOL: require whitespace after keyword — prevents "production"/"bolus" false matches
     pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi,
     bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/gi,
@@ -27,6 +28,107 @@ const TRACKING_PATTERNS = {
 // Tracking numbers must contain at least 2 digits — filters pure-word false positives
 function isValidTrackingNum(num: string): boolean {
     return (num.match(/\d/g)?.length ?? 0) >= 2;
+}
+
+type RecentPurchaseOrder = {
+    po_number: string;
+    vendor_name?: string | null;
+    created_at?: string | null;
+};
+
+const VENDOR_NAME_STOP_WORDS = new Set([
+    "inc",
+    "llc",
+    "ltd",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "usa",
+    "the",
+    "and",
+]);
+
+function normalizeComparisonText(value: string | null | undefined): string {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function vendorNameTokens(vendorName: string | null | undefined): string[] {
+    return normalizeComparisonText(vendorName)
+        .split(" ")
+        .filter((token) => token.length >= 3 && !VENDOR_NAME_STOP_WORDS.has(token));
+}
+
+function extractNumericHints(text: string): string[] {
+    return Array.from(new Set((text.match(/\b\d{6,}\b/g) || []).map((value) => value.trim())));
+}
+
+export function inferPONumberFromRecentPOs(
+    message: { subject?: string | null; bodySnippet?: string | null; fromEmail?: string | null },
+    recentPOs: RecentPurchaseOrder[],
+): string | null {
+    if (!recentPOs.length) return null;
+
+    const subject = String(message.subject || "");
+    const bodySnippet = String(message.bodySnippet || "");
+    const fromEmail = String(message.fromEmail || "");
+    const combinedText = `${subject}\n${bodySnippet}\n${fromEmail}`;
+    const normalizedCombined = normalizeComparisonText(combinedText);
+    const numericHints = extractNumericHints(combinedText);
+
+    const directOrderMatch = recentPOs.filter((po) =>
+        numericHints.some((hint) => String(po.po_number || "").toLowerCase().startsWith(hint.toLowerCase()))
+    );
+    if (directOrderMatch.length === 1) {
+        return directOrderMatch[0].po_number;
+    }
+
+    const scored = recentPOs
+        .map((po) => {
+            const tokens = vendorNameTokens(po.vendor_name);
+            if (!tokens.length) return { po, score: 0 };
+
+            const fullVendor = normalizeComparisonText(po.vendor_name);
+            const fullMatch = fullVendor.length >= 5 && normalizedCombined.includes(fullVendor);
+            const tokenMatches = tokens.filter((token) => normalizedCombined.includes(token)).length;
+            return { po, score: (fullMatch ? 10 : 0) + tokenMatches };
+        })
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score);
+
+    if (!scored.length) return null;
+
+    const topScore = scored[0].score;
+    const topMatches = scored.filter((entry) => entry.score === topScore).map((entry) => entry.po);
+    const nonDropship = topMatches.filter((po) => !/dropship/i.test(String(po.po_number || "")));
+
+    if (nonDropship.length === 1) {
+        return nonDropship[0].po_number;
+    }
+
+    if (topMatches.length === 1 && numericHints.length === 0) {
+        return topMatches[0].po_number;
+    }
+
+    return null;
+}
+
+function canonicalizePONumber(poNumber: string, recentPOs: RecentPurchaseOrder[]): string {
+    const normalized = String(poNumber || "").trim();
+    if (!normalized) return normalized;
+
+    const directMatch = recentPOs.find((po) => String(po.po_number || "").toLowerCase() === normalized.toLowerCase());
+    if (directMatch) return directMatch.po_number;
+
+    const prefixMatches = recentPOs.filter((po) =>
+        String(po.po_number || "").toLowerCase().startsWith(normalized.toLowerCase())
+    );
+
+    return prefixMatches.length === 1 ? prefixMatches[0].po_number : normalized;
 }
 
 export class TrackingAgent {
@@ -222,12 +324,38 @@ export class TrackingAgent {
                     } catch (_) { /* ignore, will skip below */ }
                 }
 
+                if (!poMatch) {
+                    const recentCutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
+                    const { data: recentPOs } = await supabase
+                        .from("purchase_orders")
+                        .select("po_number, vendor_name, created_at")
+                        .gte("created_at", recentCutoff)
+                        .limit(200);
+
+                    const inferredPO = inferPONumberFromRecentPOs({
+                        subject,
+                        bodySnippet: bodyMsg,
+                        fromEmail: m.from_email,
+                    }, (recentPOs || []) as RecentPurchaseOrder[]);
+
+                    if (inferredPO) {
+                        poMatch = [inferredPO, inferredPO.match(/(\d+)/)?.[1] || inferredPO];
+                    }
+                }
+
                 // Still no PO # — can't associate tracking, skip
                 if (!poMatch) {
                     continue;
                 }
 
-                const poNumber = poMatch[1];
+                const recentCutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
+                const { data: recentPOs } = await supabase
+                    .from("purchase_orders")
+                    .select("po_number, vendor_name, created_at")
+                    .gte("created_at", recentCutoff)
+                    .limit(200);
+
+                const poNumber = canonicalizePONumber(poMatch[1], (recentPOs || []) as RecentPurchaseOrder[]);
                 let extractedTracking: string[] = [];
 
                 // We only need to fetch full payload if there's a PDF or we need full text
@@ -248,24 +376,25 @@ export class TrackingAgent {
                 }
 
                 if (extractedTracking.length > 0) {
-                    const { data: existingPO } = await supabase
-                        .from("purchase_orders")
-                        .select("tracking_numbers")
-                        .eq("po_number", poNumber)
-                        .maybeSingle();
+                    const newTracking: string[] = [];
+                    for (const tracking of extractedTracking) {
+                        const record = await upsertShipmentEvidence({
+                            trackingNumber: tracking,
+                            poNumber,
+                            source: "email_tracking",
+                            sourceRef: m.gmail_message_id,
+                            confidence: 0.9,
+                        });
 
-                    const oldTracking = existingPO?.tracking_numbers || [];
-                    const newTracking = extractedTracking.filter(t => !oldTracking.includes(t));
+                        if (record) {
+                            newTracking.push(record.tracking_number);
+                        }
+                    }
 
                     if (newTracking.length > 0) {
-                        const mergedTracking = [...new Set([...oldTracking, ...newTracking])];
-                        await supabase.from("purchase_orders").upsert({
-                            po_number: poNumber,
-                            tracking_numbers: mergedTracking,
-                            updated_at: new Date().toISOString()
-                        }, { onConflict: "po_number" });
+                        const deduped = [...new Set(newTracking)];
 
-                        foundTracking.push({ poNumber, trackingNumbers: newTracking });
+                        foundTracking.push({ poNumber, trackingNumbers: deduped });
                         console.log(`✅ [TrackingAgent] Found new broad tracking for PO #${poNumber}: ${newTracking.join(', ')}`);
                     }
                 }

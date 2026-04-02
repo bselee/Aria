@@ -71,6 +71,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
+import { listShipmentsForPurchaseOrders, upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 
 const execAsync = promisify(exec);
 
@@ -847,6 +848,17 @@ export class OpsManager {
                     const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
 
                     if (newTracking.length > 0) {
+                        for (const trackingNumber of newTracking) {
+                            await upsertShipmentEvidence({
+                                trackingNumber,
+                                poNumber,
+                                vendorName,
+                                source: "po_thread_sync",
+                                sourceRef: threadId,
+                                confidence: 0.9,
+                            });
+                        }
+
                         // Persist tracking numbers FIRST â€” prevents duplicate alerts if two
                         // processes run concurrently (e.g. PM2 restart during a sync cycle).
                         await supabase.from("purchase_orders").upsert({
@@ -1047,6 +1059,16 @@ export class OpsManager {
                                     );
                                     if (outsideTracking.length > 0) {
                                         const merged = [...new Set([...trackingNumbers, ...outsideTracking])];
+                                        for (const trackingNumber of outsideTracking) {
+                                            await upsertShipmentEvidence({
+                                                trackingNumber,
+                                                poNumber,
+                                                vendorName,
+                                                source: "outside_thread_tracking",
+                                                sourceRef: msg.id,
+                                                confidence: 0.75,
+                                            });
+                                        }
                                         await supabase.from("purchase_orders").upsert({
                                             po_number: poNumber,
                                             tracking_numbers: merged,
@@ -2181,6 +2203,14 @@ Data: ${JSON.stringify(data)}`;
             for (const row of poRows ?? []) {
                 trackingMap.set(row.po_number, row.tracking_numbers || []);
             }
+            const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
+            const shipmentRecords = await listShipmentsForPurchaseOrders(pos.map(p => p.orderId).filter(Boolean));
+            for (const shipment of shipmentRecords) {
+                for (const poNumber of shipment.po_numbers || []) {
+                    if (!shipmentMap.has(poNumber)) shipmentMap.set(poNumber, []);
+                    shipmentMap.get(poNumber)!.push(shipment);
+                }
+            }
 
             const calendar = new CalendarClient();
             const completionSignals = await loadPOCompletionSignalIndex(supabase, pos.map(p => p.orderId).filter(Boolean));
@@ -2228,13 +2258,24 @@ Data: ${JSON.stringify(data)}`;
 
                 // Get tracking array for this PO
                 const trackingNumbers = trackingMap.get(po.orderId) || [];
+                const shipmentRollups = shipmentMap.get(po.orderId) || [];
 
-                // Pre-fetch EasyPost statuses so we can include them in change-detection hash
-                // (hash must reflect status so re-sync triggers when billing was fixed or status changes)
                 const trackingStatuses = new Map<string, TrackingStatus | null>();
-                await Promise.all(trackingNumbers.map(async t => {
-                    trackingStatuses.set(t, await getTrackingStatus(t));
-                }));
+                if (shipmentRollups.length > 0) {
+                    for (const shipment of shipmentRollups) {
+                        trackingStatuses.set(shipment.tracking_number, shipment.status_category && shipment.status_display ? {
+                            category: shipment.status_category as TrackingCategory,
+                            display: shipment.status_display,
+                            public_url: shipment.public_tracking_url || undefined,
+                            estimated_delivery_at: shipment.estimated_delivery_at || undefined,
+                            delivered_at: shipment.delivered_at || undefined,
+                        } : null);
+                    }
+                } else {
+                    await Promise.all(trackingNumbers.map(async t => {
+                        trackingStatuses.set(t, await getTrackingStatus(t));
+                    }));
+                }
 
                 // Hash = sorted "num:status" pairs â€” changes when EasyPost status changes
                 const trackingHash = trackingNumbers.slice().sort().map(t => {
