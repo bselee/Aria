@@ -60,6 +60,28 @@ describe("receivings helpers", () => {
         });
     });
 
+    it("excludes dropship purchase orders from warehouse receivings", () => {
+        const received = deriveReceivedPurchaseOrders([
+            {
+                node: {
+                    orderId: "23372817A-DropshipPO",
+                    orderUrl: "/buildasoil/api/order/23372817A-DropshipPO",
+                    status: "Completed",
+                    orderDate: "2026-03-31",
+                    receiveDate: "2026-04-01",
+                    shipmentList: [
+                        { shipmentId: "sh-1", status: "received", receiveDate: "2026-04-01T10:15:00-06:00" },
+                    ],
+                    total: "25",
+                    supplier: { name: "Printful" },
+                    itemList: { edges: [{ node: { product: { productId: "SKU-2" }, quantity: "2" } }] },
+                },
+            },
+        ], "2026-04-01", "2026-04-03", "buildasoil");
+
+        expect(received).toEqual([]);
+    });
+
     it("marks open received purchase orders as partial", () => {
         expect(getReceiptStatusFromPoStatus("Committed")).toBe("partial");
         expect(getReceiptStatusFromPoStatus("Locked")).toBe("partial");

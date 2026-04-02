@@ -224,6 +224,11 @@ export function getReceiptStatusFromPoStatus(status: string | null | undefined):
     return fullStatuses.some(token => normalized.includes(token)) ? "full" : "partial";
 }
 
+export function isWarehouseReceivingOrder(orderId: string | null | undefined): boolean {
+    const normalized = String(orderId || "").toLowerCase();
+    return !normalized.includes("dropship");
+}
+
 export function getShipmentReceiptDateTime(shipment: any): string | null {
     const receiptEvent = (shipment?.statusIdHistoryList || [])
         .filter((entry: any) =>
@@ -252,6 +257,7 @@ export function deriveReceivedPurchaseOrders(
     return edges
         .map((edge: any) => {
             const po = edge.node;
+            if (!isWarehouseReceivingOrder(po?.orderId)) return null;
             const receivedShipments = getShipmentsInReceiptWindow(po, windowStart, windowEnd);
 
             if (receivedShipments.length === 0) return null;
