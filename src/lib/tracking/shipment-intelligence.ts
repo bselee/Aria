@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase";
+import { FinaleClient } from "@/lib/finale/client";
 import {
     carrierUrl,
     detectCarrier,
@@ -473,9 +474,28 @@ function scoreFieldMatch(
     return score;
 }
 
+export function normalizePoString(po: string | null | undefined): string {
+    if (!po) return "";
+    let clean = po.trim().toUpperCase();
+    // Strip common prefixes: PO-, PO, ORDER, #
+    clean = clean.replace(/^(PO[-\s]?|ORDER[-\s]?|#)/i, "");
+    return clean.trim();
+}
+
 function scoreShipmentMatch(shipment: ShipmentRecord, query: string, queryTokens: string[]): number {
+    const rawPos = shipment.po_numbers || [];
+    const normalizedPos = rawPos.map(normalizePoString).filter(Boolean);
+    const combinedPos = Array.from(new Set([...rawPos, ...normalizedPos]));
+
+    const normalQuery = normalizePoString(query);
+    const normalTokens = queryTokens.map(normalizePoString).filter(Boolean);
+    const combinedTokens = Array.from(new Set([...queryTokens, ...normalTokens]));
+
     return (
-        scoreFieldMatch(shipment.po_numbers || [], query, queryTokens, 120, 45) +
+        Math.max(
+            scoreFieldMatch(combinedPos, query, combinedTokens, 120, 45),
+            normalQuery ? scoreFieldMatch(combinedPos, normalQuery, combinedTokens, 120, 45) : 0
+        ) +
         scoreFieldMatch(
             [shipment.tracking_number, shipment.normalized_tracking_number],
             query,
@@ -545,11 +565,14 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
 
     const { data: shipments } = await supabase
         .from("shipments")
-        .select("tracking_number")
+        .select("tracking_number, public_tracking_url")
         .contains("po_numbers", [poNumber])
         .eq("active", true);
 
-    const trackingNumbers = uniqueStrings((shipments || []).map((shipment: any) => shipment.tracking_number));
+    const trackingNumbers = uniqueStrings((shipments || []).map((s: any) => s.tracking_number));
+    const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));
+
+    // 1. Sync to local Supabase cache
     await supabase
         .from("purchase_orders")
         .upsert({
@@ -557,6 +580,25 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
             tracking_numbers: trackingNumbers,
             updated_at: new Date().toISOString(),
         }, { onConflict: "po_number" });
+
+    // 2. Sync bidirectional back to Finale custom fields
+    if (trackingNumbers.length > 0) {
+        try {
+            const finale = new FinaleClient();
+            await finale.updatePurchaseOrderTracking(
+                poNumber,
+                trackingNumbers.join(", "),
+                publicUrls.join(", ")
+            );
+        } catch (err: any) {
+            console.warn(`[tracking-sync] Failed bidirectional Finale sync for PO ${poNumber}: ${err.message}`);
+        }
+    }
+}
+
+function isReceivedPurchaseOrderStatus(status: string | null | undefined): boolean {
+    const normalized = String(status || "").toLowerCase();
+    return normalized === "received" || normalized === "completed";
 }
 
 export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promise<ShipmentRecord | null> {
@@ -676,23 +718,37 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
         throw new Error(`Shipment load failed: ${error.message}`);
     }
 
-    return (data || []) as ShipmentRecord[];
+    return refreshDueShipments((data || []) as ShipmentRecord[]);
 }
 
-async function getReceivedPoNumbers(): Promise<Set<string>> {
+async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
     const supabase = createClient();
-    if (!supabase) return new Set<string>();
+    if (!supabase || poNumbers.length === 0) return new Set<string>();
 
-    const { data } = await supabase
-        .from("purchase_orders")
-        .select("po_number, status")
-        .or("status.eq.received,status.eq.Received,status.eq.completed,status.eq.Completed")
-        .limit(200);
+    const received = new Set<string>();
 
-    return new Set((data || []).map((row: any) => row.po_number).filter(Boolean));
+    for (let i = 0; i < poNumbers.length; i += 100) {
+        const chunk = poNumbers.slice(i, i + 100);
+        const { data, error } = await supabase
+            .from("purchase_orders")
+            .select("po_number, status")
+            .in("po_number", chunk);
+
+        if (error) {
+            throw new Error(`Received PO load failed: ${error.message}`);
+        }
+
+        for (const row of data || []) {
+            if (row?.po_number && isReceivedPurchaseOrderStatus(row.status)) {
+                received.add(row.po_number);
+            }
+        }
+    }
+
+    return received;
 }
 
-async function listActiveShipments(): Promise<ShipmentRecord[]> {
+async function listActiveShipmentsRaw(): Promise<ShipmentRecord[]> {
     const supabase = createClient();
     if (!supabase) return [];
 
@@ -710,7 +766,16 @@ async function listActiveShipments(): Promise<ShipmentRecord[]> {
         throw new Error(`Shipment board load failed: ${error.message}`);
     }
 
-    return refreshDueShipments((data || []) as ShipmentRecord[]);
+    return (data || []) as ShipmentRecord[];
+}
+
+export async function refreshActiveShipmentsBackgroundJob(): Promise<void> {
+    try {
+        const shipments = await listActiveShipmentsRaw();
+        await refreshDueShipments(shipments);
+    } catch (err: any) {
+        console.error(`[shipment-refresh-job] Failed to refresh active shipments: ${err.message}`);
+    }
 }
 
 async function refreshDueShipments(shipments: ShipmentRecord[]): Promise<ShipmentRecord[]> {
@@ -735,10 +800,20 @@ async function refreshDueShipments(shipments: ShipmentRecord[]): Promise<Shipmen
         .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 }
 
+async function listActiveShipmentsForRead(): Promise<ShipmentRecord[]> {
+    const shipments = await listActiveShipmentsRaw();
+    return refreshDueShipments(shipments);
+}
+
 export async function getDashboardTrackingBoard(): Promise<DashboardTrackingBoardResult> {
-    const shipments = await listActiveShipments();
+    const shipments = await listActiveShipmentsForRead();
     const nowIso = new Date().toISOString();
-    const receivedPoNumbers = await getReceivedPoNumbers();
+    const deliveredPoNumbers = uniqueStrings(
+        shipments
+            .filter((shipment) => shipment.status_category === "delivered")
+            .flatMap((shipment) => shipment.po_numbers || []),
+    );
+    const receivedPoNumbers = await getReceivedPoNumbers(deliveredPoNumbers);
     const board = getShipmentBoardBuckets(shipments, { now: nowIso, receivedPoNumbers });
     return {
         board,
@@ -748,7 +823,7 @@ export async function getDashboardTrackingBoard(): Promise<DashboardTrackingBoar
 }
 
 export async function getBestTrackingAnswerForQuery(query: string): Promise<BestTrackingAnswer | null> {
-    const shipments = await listActiveShipments();
+    const shipments = await listActiveShipmentsForRead();
     return buildBestTrackingAnswer({
         query,
         shipments,

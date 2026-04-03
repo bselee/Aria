@@ -94,6 +94,7 @@ describe("ReceivedItemsPanel", () => {
           orderDate: "2026-04-01",
           receiveDate: "2026-04-01T10:15:00-06:00",
           receiveDateTime: "2026-04-01T10:15:00-06:00",
+          receivedBy: "Luis",
           receiptStatus: "partial",
           supplier: "Berger",
           total: 13378,
@@ -109,7 +110,8 @@ describe("ReceivedItemsPanel", () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(screen.getAllByText(/PARTIAL/i)[0]).toBeTruthy();
-    expect(screen.getByText(/(Today|Yest) 10:15 AM|(Today|Yest) 10:15/i)).toBeTruthy();
+    expect(screen.getByText(/Apr 1 10:15 AM/i)).toBeTruthy();
+    expect(screen.getByText(/rcvd by Luis/i)).toBeTruthy();
     expect(screen.getByText(/short on BPM01/i)).toBeTruthy();
   });
 

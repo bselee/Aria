@@ -66,6 +66,7 @@ export interface ReceivedPO {
     orderDate: string;
     receiveDate: string;
     receiveDateTime?: string;
+    receivedBy?: string | null;
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
@@ -211,7 +212,7 @@ function getShipmentsInReceiptWindow(po: any, windowStart: string, windowEnd: st
     });
 }
 
-export function getReceiptQueryStartDate(windowStart: string, lookbackDays: number = 180): string {
+export function getReceiptQueryStartDate(windowStart: string, lookbackDays: number = 365): string {
     const parsed = new Date(`${windowStart}T00:00:00Z`);
     if (isNaN(parsed.getTime())) return windowStart;
     parsed.setUTCDate(parsed.getUTCDate() - lookbackDays);
@@ -248,6 +249,39 @@ export function getShipmentReceiptDateTime(shipment: any): string | null {
     );
 }
 
+export function getShipmentReceiverName(shipment: any): string | null {
+    const directFields = [
+        shipment?.receivedByName,
+        shipment?.receivedBy,
+        shipment?.receiverName,
+        shipment?.receiver,
+        shipment?.lastUpdatedByName,
+        shipment?.lastUpdatedBy,
+    ];
+
+    for (const value of directFields) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+
+    const deliveredEvent = (shipment?.statusIdHistoryList || [])
+        .filter((entry: any) => String(entry?.statusId || "").toUpperCase().includes("DELIVERED"))
+        .sort((a: any, b: any) => Number(b?.txStamp || 0) - Number(a?.txStamp || 0))[0];
+
+    const eventFields = [
+        deliveredEvent?.userName,
+        deliveredEvent?.fullName,
+        deliveredEvent?.displayName,
+        deliveredEvent?.name,
+        deliveredEvent?.updatedBy,
+    ];
+
+    for (const value of eventFields) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+
+    return null;
+}
+
 export function deriveReceivedPurchaseOrders(
     edges: any[],
     windowStart: string,
@@ -274,6 +308,7 @@ export function deriveReceivedPurchaseOrders(
                 orderDate: po.orderDate || "",
                 receiveDate: shipmentDates[0] || "",
                 receiveDateTime: shipmentDates[0] || "",
+                receivedBy: null,
                 receiptStatus: getReceiptStatusFromPoStatus(po.status),
                 supplier: po.supplier?.name || "Unknown",
                 total: parseFinaleNumber(po.total),
@@ -293,18 +328,23 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
 ): ReceivedPO[] {
     return orders.map((order) => {
         const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
-        const exactReceiptTimes = shipmentDetails
-            .map((shipment) => getShipmentReceiptDateTime(shipment))
-            .filter(Boolean)
-            .sort()
-            .reverse();
+        const shipmentReceipts = shipmentDetails
+            .map((shipment) => ({
+                receiptDateTime: getShipmentReceiptDateTime(shipment),
+                receivedBy: getShipmentReceiverName(shipment),
+            }))
+            .filter((shipment) => Boolean(shipment.receiptDateTime))
+            .sort((a, b) => String(b.receiptDateTime).localeCompare(String(a.receiptDateTime)));
 
-        if (exactReceiptTimes.length === 0) return order;
+        if (shipmentReceipts.length === 0) return order;
+
+        const latestReceipt = shipmentReceipts[0];
 
         return {
             ...order,
-            receiveDateTime: exactReceiptTimes[0] || order.receiveDateTime,
-            receiveDate: parseISODateOnly(exactReceiptTimes[0] || "") || order.receiveDate,
+            receiveDateTime: latestReceipt.receiptDateTime || order.receiveDateTime,
+            receiveDate: parseISODateOnly(latestReceipt.receiptDateTime || "") || order.receiveDate,
+            receivedBy: latestReceipt.receivedBy || order.receivedBy || null,
         };
     });
 }
@@ -948,62 +988,78 @@ export class FinaleClient {
             tomorrow.setDate(tomorrow.getDate() + 1);
             const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
             const queryStart = getReceiptQueryStartDate(today);
+            const PAGE_SIZE = 500;
+            const MAX_PAGES = 12;
+            const edges: any[] = [];
+            let cursor: string | null = null;
 
-            const query = {
-                query: `
-                    query {
-                        orderViewConnection(
-                            first: 500
-                            type: ["PURCHASE_ORDER"]
-                            orderDate: { begin: "${queryStart}", end: "${tomorrowStr}" }
-                            sort: [{ field: "orderDate", mode: "desc" }]
-                        ) {
-                            edges {
-                                node {
-                                    orderId
-                                    orderUrl
-                                    status
-                                    orderDate
-                                    receiveDate
-                                    shipmentList {
-                                        shipmentId
+            for (let page = 0; page < MAX_PAGES; page += 1) {
+                const afterClause = cursor ? `, after: "${cursor}"` : "";
+                const query = {
+                    query: `
+                        query {
+                            orderViewConnection(
+                                first: ${PAGE_SIZE}
+                                type: ["PURCHASE_ORDER"]
+                                orderDate: { begin: "${queryStart}", end: "${tomorrowStr}" }
+                                sort: [{ field: "orderDate", mode: "desc" }]${afterClause}
+                            ) {
+                                pageInfo { hasNextPage endCursor }
+                                edges {
+                                    node {
+                                        orderId
+                                        orderUrl
                                         status
+                                        orderDate
                                         receiveDate
-                                    }
-                                    total
-                                    supplier { name }
-                                    itemList(first: 50) {
-                                        edges {
-                                            node {
-                                                product { productId }
-                                                quantity
+                                        shipmentList {
+                                            shipmentId
+                                            status
+                                            receiveDate
+                                        }
+                                        total
+                                        supplier { name }
+                                        itemList(first: 50) {
+                                            edges {
+                                                node {
+                                                    product { productId }
+                                                    quantity
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                `
-            };
+                    `
+                };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: {
-                    Authorization: this.authHeader,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(query),
-            });
+                const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                    method: "POST",
+                    headers: {
+                        Authorization: this.authHeader,
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(query),
+                });
 
-            if (!res.ok) return [];
-            const result = await res.json();
-            if (result.errors) {
-                console.error("Receivings GraphQL error:", result.errors[0].message);
-                return [];
+                if (!res.ok) return [];
+                const result = await res.json();
+                if (result.errors) {
+                    console.error("Receivings GraphQL error:", result.errors[0].message);
+                    return [];
+                }
+
+                const conn = result.data?.orderViewConnection;
+                if (!conn) break;
+
+                edges.push(...(conn.edges || []));
+
+                if (!conn.pageInfo?.hasNextPage) break;
+                cursor = conn.pageInfo?.endCursor || null;
+                if (!cursor) break;
             }
 
-            const edges = result.data?.orderViewConnection?.edges || [];
             const received = deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
             if (received.length === 0) return received;
 
@@ -2670,21 +2726,18 @@ export class FinaleClient {
      * @param originalStatus - The status before we unlocked for editing
      */
     private async restoreOrderStatus(orderId: string, originalStatus: string): Promise<void> {
-        if (originalStatus !== "ORDER_LOCKED" && originalStatus !== "ORDER_COMPLETED") {
-            return; // Was a draft — leave as-is
-        }
-
         const afterEdits = await this.getOrderDetails(orderId);
+        const targetStatus =
+            originalStatus === "ORDER_LOCKED" || originalStatus === "ORDER_COMPLETED"
+                ? "ORDER_LOCKED"
+                : "ORDER_CREATED";
 
-        if (afterEdits.statusId === "ORDER_CREATED") {
-            // Direct statusId override → ORDER_LOCKED (committed).
-            // Do NOT use actionUrlComplete — Finale auto-promotes to COMPLETED.
-            await this.post(
-                `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
-                { ...afterEdits, statusId: "ORDER_LOCKED" }
-            );
+        if (afterEdits.statusId !== targetStatus) {
+            await this.post(`/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`, {
+                ...afterEdits,
+                statusId: targetStatus,
+            });
         }
-        // If already ORDER_LOCKED, nothing to do.
     }
 
     /**
@@ -2955,6 +3008,93 @@ export class FinaleClient {
         }
 
         return this.post(shipmentUrl, current);
+    }
+
+    /**
+     * Update custom tracking fields directly on the Purchase Order.
+     * This pushes tracking sync back to Finale UI for warehouse receivers.
+     *
+     * DECISION(2026-04-03): Finale stores custom fields in userFieldDataList
+     * as { attrName, attrValue } entries. The customization service confirms:
+     *   - user_10001 = "Tracking Link"  (##text2)
+     *   - user_10002 = "Tracking Number" (##text2)
+     * Previous implementation incorrectly used fabricated top-level keys
+     * (customTrackingNumber/customTrackingLink) that Finale silently ignores.
+     *
+     * @param orderId        - Finale order ID (e.g., "124498")
+     * @param trackingNumber - The tracking number string
+     * @param trackingLink   - The public URL to view tracking status
+     */
+    async updatePurchaseOrderTracking(
+        orderId: string,
+        trackingNumber: string,
+        trackingLink: string
+    ): Promise<boolean> {
+        // Finale custom field internal names (from /api/customization → orderTypeList)
+        const ATTR_TRACKING_LINK = "user_10001";
+        const ATTR_TRACKING_NUMBER = "user_10002";
+        let shouldRestore = false;
+        let originalStatus = "ORDER_CREATED";
+        let writeError: Error | null = null;
+        let restoreError: Error | null = null;
+
+        try {
+            const currentPO = await this.getOrderDetails(orderId);
+
+            // Check existing userFieldDataList for current values
+            const existingFields: Array<{ attrName: string; attrValue: string }> =
+                currentPO.userFieldDataList || [];
+
+            const currentTrackingNumber = existingFields.find(
+                (f: { attrName: string }) => f.attrName === ATTR_TRACKING_NUMBER
+            )?.attrValue;
+            const currentTrackingLink = existingFields.find(
+                (f: { attrName: string }) => f.attrName === ATTR_TRACKING_LINK
+            )?.attrValue;
+
+            // Skip API call if already matched
+            if (currentTrackingNumber === trackingNumber && currentTrackingLink === trackingLink) {
+                return false;
+            }
+
+            shouldRestore = true;
+            originalStatus = await this.unlockForEditing(currentPO, orderId);
+
+            // Merge new tracking values into userFieldDataList, preserving other custom fields
+            const updatedFields = existingFields.filter(
+                (f: { attrName: string }) => f.attrName !== ATTR_TRACKING_NUMBER && f.attrName !== ATTR_TRACKING_LINK
+            );
+            updatedFields.push({ attrName: ATTR_TRACKING_NUMBER, attrValue: trackingNumber });
+            updatedFields.push({ attrName: ATTR_TRACKING_LINK, attrValue: trackingLink });
+
+            currentPO.userFieldDataList = updatedFields;
+
+            const encodedId = encodeURIComponent(orderId);
+            await this.post(`/${this.accountPath}/api/order/${encodedId}`, currentPO);
+        } catch (err: any) {
+            writeError = err instanceof Error ? err : new Error(String(err));
+        } finally {
+            if (shouldRestore) {
+                try {
+                    await this.restoreOrderStatus(orderId, originalStatus);
+                } catch (err: any) {
+                    restoreError = err instanceof Error ? err : new Error(String(err));
+                    console.error(`🚨 [FinaleClient] CRITICAL: Failed to restore PO ${orderId} to steady state: ${restoreError.message}`);
+                }
+            }
+        }
+
+        if (restoreError) {
+            console.warn(`⚠️ [FinaleClient] Tracking writeback for PO ${orderId} failed steady-state validation`);
+            return false;
+        }
+
+        if (writeError) {
+            console.warn(`⚠️ [FinaleClient] Failed to push tracking to PO ${orderId}: ${writeError.message}`);
+            return false;
+        }
+
+        return true;
     }
 
     /**

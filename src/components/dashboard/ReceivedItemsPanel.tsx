@@ -10,6 +10,7 @@ type ReceivedPO = {
     orderDate: string;
     receiveDate: string;
     receiveDateTime?: string;
+    receivedBy?: string | null;
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
@@ -36,15 +37,7 @@ function fmtDateTime(s: string): string {
     if (!d) return s || '—';
     const opts: Intl.DateTimeFormatOptions = { timeZone: 'America/Denver' };
     const isDateOnly = !s.includes(':');
-    const today = new Date(), yest = new Date(today);
-    yest.setDate(yest.getDate() - 1);
-    const dStr = d.toLocaleDateString('en-CA', { ...opts });
-    const todayStr = today.toLocaleDateString('en-CA', { ...opts });
-    const yesterdayStr = yest.toLocaleDateString('en-CA', { ...opts });
-    let datePart: string;
-    if (dStr === todayStr) datePart = 'Today';
-    else if (dStr === yesterdayStr) datePart = 'Yest';
-    else datePart = d.toLocaleDateString('en-US', { ...opts, month: 'short', day: 'numeric' });
+    const datePart = d.toLocaleDateString('en-US', { ...opts, month: 'short', day: 'numeric' });
     if (isDateOnly) return datePart;
     const timePart = d.toLocaleTimeString('en-US', { ...opts, hour: 'numeric', minute: '2-digit', hour12: true });
     return `${datePart} ${timePart}`;
@@ -161,12 +154,12 @@ export default function ReceivedItemsPanel() {
             });
     }, []);
 
-    const fetch14d = useCallback(async (silent = false) => {
+    const fetchReceivings = useCallback(async (silent = false) => {
         silent ? setRefreshing(true) : setLoading(true);
         setError(null);
         try {
             const [receivingsRes, trackingRes] = await Promise.all([
-                fetch('/api/dashboard/receivings?days=14'),
+                fetch('/api/dashboard/receivings'),
                 fetch('/api/dashboard/tracking'),
             ]);
 
@@ -191,22 +184,22 @@ export default function ReceivedItemsPanel() {
     }, []);
 
     useEffect(() => {
-        fetch14d();
-        const t = setInterval(() => fetch14d(true), 10 * 60 * 1000);
+        fetchReceivings();
+        const t = setInterval(() => fetchReceivings(true), 10 * 60 * 1000);
         return () => clearInterval(t);
-    }, [fetch14d]);
+    }, [fetchReceivings]);
 
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
-                <span className="text-[10px] text-[var(--dash-ts)] font-mono">14d</span>
+                <span className="text-[10px] text-[var(--dash-ts)] font-mono">WTD</span>
                 <div className="flex-1" />
                 {!loading && pos.length > 0 && (
                     <span className="text-xs font-mono text-zinc-500">{pos.length} POs</span>
                 )}
-                <button onClick={() => fetch14d(true)} disabled={refreshing}
+                <button onClick={() => fetchReceivings(true)} disabled={refreshing}
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
                     <RefreshCw className={`w-3 h-3 ${refreshing ? 'animate-spin' : ''}`} />
                 </button>
@@ -232,7 +225,7 @@ export default function ReceivedItemsPanel() {
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
                     ) : pos.length === 0 ? (
-                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in the last 14 days</span></div>
+                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings this week</span></div>
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
                             {todaySummary && (
@@ -281,6 +274,12 @@ export default function ReceivedItemsPanel() {
                                                 className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
                                                 {po.orderId}
                                             </a>
+                                            {po.receivedBy && (
+                                                <>
+                                                    <span className="text-zinc-700 text-xs">·</span>
+                                                    <span className="text-[10px] font-mono text-cyan-300/80">rcvd by {po.receivedBy}</span>
+                                                </>
+                                            )}
                                             {discrepancy && (
                                                 <>
                                                     <span className="text-zinc-700 text-xs">·</span>
@@ -288,8 +287,8 @@ export default function ReceivedItemsPanel() {
                                                 </>
                                             )}
                                             <span className="text-zinc-700 text-xs">·</span>
-                                            {po.items.map(item => (
-                                                <span key={item.productId} className="text-sm font-mono text-zinc-200">
+                                            {po.items.map((item, index) => (
+                                                <span key={`${item.productId}-${index}`} className="text-sm font-mono text-zinc-200">
                                                     {item.productId}
                                                     <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
                                                 </span>

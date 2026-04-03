@@ -4,13 +4,14 @@ import {
     deriveReceivedPurchaseOrders,
     enrichReceivedPurchaseOrdersWithShipmentDetails,
     getReceiptQueryStartDate,
+    getShipmentReceiverName,
     getShipmentReceiptDateTime,
     getReceiptStatusFromPoStatus,
 } from "./client";
 
 describe("receivings helpers", () => {
     it("widens the query window beyond the visible receipt window", () => {
-        expect(getReceiptQueryStartDate("2026-04-01")).toBe("2025-10-03");
+        expect(getReceiptQueryStartDate("2026-04-01")).toBe("2025-04-01");
     });
 
     it("excludes ghost receivings with only expected PO receive dates", () => {
@@ -102,6 +103,18 @@ describe("receivings helpers", () => {
         ).toBe("2026-04-01T15:06:46.000Z");
     });
 
+    it("extracts receiver identity from shipment detail when available", () => {
+        expect(getShipmentReceiverName({
+            receivedByName: "Luis",
+        })).toBe("Luis");
+
+        expect(getShipmentReceiverName({
+            statusIdHistoryList: [
+                { statusId: "SHIPMENT_DELIVERED", userName: "Emma" },
+            ],
+        })).toBe("Emma");
+    });
+
     it("enriches received purchase orders with exact shipment timestamps", () => {
         const enriched = enrichReceivedPurchaseOrdersWithShipmentDetails([
             {
@@ -109,6 +122,7 @@ describe("receivings helpers", () => {
                 orderDate: "2026-04-01",
                 receiveDate: "2026-04-01T18:00:00",
                 receiveDateTime: "2026-04-01T18:00:00",
+                receivedBy: null,
                 receiptStatus: "full",
                 supplier: "Printful",
                 total: 47,
@@ -121,6 +135,7 @@ describe("receivings helpers", () => {
                     shipmentId: "585408",
                     receiveDate: "2026-04-01T18:00:00",
                     lastUpdatedDate: "2026-04-01T15:06:46",
+                    receivedByName: "Warehouse A",
                     statusIdHistoryList: [
                         { statusId: null, txStamp: 1775056004 },
                         { statusId: "SHIPMENT_DELIVERED", txStamp: 1775056006 },
@@ -132,6 +147,7 @@ describe("receivings helpers", () => {
         expect(enriched[0]).toMatchObject({
             orderId: "23372817A-DropshipPO",
             receiveDateTime: "2026-04-01T15:06:46.000Z",
+            receivedBy: "Warehouse A",
         });
     });
 });
