@@ -11,6 +11,7 @@ import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import { SlackWatchdog } from '../lib/slack/watchdog';
+import { resolveSlackPollInterval } from '../lib/slack/watchdog-config';
 
 async function boot() {
     console.log("🌑 ARIA SLACK AGENT STARTING (Silent Monitor Mode)...");
@@ -21,8 +22,8 @@ async function boot() {
     }
 
     try {
-        // Poll every 60 seconds by default
-        const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || "60", 10);
+        // Poll every 180 seconds by default to reduce Finale/API churn.
+        const pollInterval = resolveSlackPollInterval(process.env.SLACK_POLL_INTERVAL);
         const watchdog = new SlackWatchdog(pollInterval);
         await watchdog.start();
     } catch (err: any) {

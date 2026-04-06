@@ -25,6 +25,7 @@ import {
     autoCompleteTrackedSlackRequests,
     upsertTrackedSlackRequest,
 } from "./request-tracker";
+import { isSlackAutoDraftPOEnabled } from "./watchdog-config";
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // SCHEMAS
@@ -693,7 +694,8 @@ export class SlackWatchdog {
         const noPOItems = finalDetails.filter(d =>
             d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl && d.needsReorder
         );
-        if (noPOItems.length > 0 && !boxReport) {
+        const autoDraftPOEnabled = isSlackAutoDraftPOEnabled(process.env.SLACK_WATCHDOG_AUTO_CREATE_DRAFT_PO);
+        if (noPOItems.length > 0 && !boxReport && autoDraftPOEnabled) {
             // Group by vendor
             const byVendor = new Map<string, SkuStockDetail[]>();
             for (const item of noPOItems) {
@@ -742,6 +744,10 @@ export class SlackWatchdog {
                         skuPOStatus.set(item.sku.toLowerCase(), `âŒ No PO (auto-create failed)`);
                     }
                 }
+            }
+        } else if (noPOItems.length > 0 && !boxReport && !autoDraftPOEnabled) {
+            for (const item of noPOItems) {
+                skuPOStatus.set(item.sku.toLowerCase(), "No PO (auto-create disabled)");
             }
         }
 

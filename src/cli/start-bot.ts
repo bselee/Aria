@@ -29,6 +29,7 @@ import { gmail as GmailApi } from '@googleapis/gmail';
 import { unifiedTextGeneration } from '../lib/intelligence/llm';
 import { FinaleClient } from '../lib/finale/client';
 import { SlackWatchdog } from '../lib/slack/watchdog';
+import { resolveSlackPollInterval } from '../lib/slack/watchdog-config';
 import { APAgent } from '../lib/intelligence/ap-agent';
 import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import { initSandboxWatcher } from '../lib/intelligence/sandbox-watcher';
@@ -1111,7 +1112,7 @@ bot.on('text', async (ctx) => {
     // Start Slack Watchdog in-process BEFORE botDeps construction
     // so deps.watchdog captures the live instance, not null.
     // DECISION(2026-03-20): /requests needs deps.watchdog to be the running instance.
-    const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
+    const pollInterval = resolveSlackPollInterval(process.env.SLACK_POLL_INTERVAL);
     let startedWatchdog: SlackWatchdog | null = null;
     const startupHealth = await getStartupHealth({
         hasSlackToken: Boolean(process.env.SLACK_ACCESS_TOKEN),
