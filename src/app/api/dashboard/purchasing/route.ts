@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
+import { resolvePurchasingCacheTtlMs } from './route-config';
 
 // Module-level cache — full scan takes several minutes and makes hundreds of API calls.
 let cache: PurchasingGroup[] | null = null;
 let cacheAt = 0;
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL = resolvePurchasingCacheTtlMs(process.env.PURCHASING_CACHE_TTL_HOURS);
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
