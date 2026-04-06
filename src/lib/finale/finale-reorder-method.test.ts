@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { chooseVelocitySignal, normalizeFinaleReorderMethod } from "./client";
+import {
+  chooseVelocitySignal,
+  normalizeFinaleReorderMethod,
+  sanitizeFinaleDemandSignals,
+  shouldSuppressPurchasingAnomaly,
+} from "./client";
 
 describe("normalizeFinaleReorderMethod", () => {
   it("detects do-not-reorder from guideline ids", () => {
@@ -47,5 +52,55 @@ describe("normalizeFinaleReorderMethod", () => {
       salesVelocity: 1,
       consumptionQty: 20,
     })).toEqual({ dailyRate: 1, signal: "sales" });
+  });
+
+  it("sanitizes packaged-item demand velocity when Finale demand units conflict with runway", () => {
+    expect(sanitizeFinaleDemandSignals({
+      stockOnHand: 56,
+      stockoutDays: 170,
+      demandPerDay: 55.92,
+      demandQuantity: 5033,
+      consumptionQuantity: 29,
+      reorderQuantityToOrder: 4256,
+      fallbackReorderQuantity: 4,
+    })).toEqual({
+      demandVelocity: 29 / 90,
+      demandQuantity: 29,
+      reorderQuantity: 4,
+      usedFallback: true,
+    });
+  });
+
+  it("preserves normal Finale demand signals when they agree with runway", () => {
+    expect(sanitizeFinaleDemandSignals({
+      stockOnHand: 120,
+      stockoutDays: 30,
+      demandPerDay: 4,
+      demandQuantity: 360,
+      consumptionQuantity: 350,
+      reorderQuantityToOrder: 300,
+      fallbackReorderQuantity: 12,
+    })).toEqual({
+      demandVelocity: 4,
+      demandQuantity: 360,
+      reorderQuantity: 300,
+      usedFallback: false,
+    });
+  });
+
+  it("suppresses dashboard items when the final displayed rate still contradicts Finale runway", () => {
+    expect(shouldSuppressPurchasingAnomaly({
+      stockOnHand: 56,
+      stockoutDays: 170,
+      dailyRate: 55.92,
+    })).toBe(true);
+  });
+
+  it("keeps dashboard items when the displayed rate is aligned with Finale runway", () => {
+    expect(shouldSuppressPurchasingAnomaly({
+      stockOnHand: 56,
+      stockoutDays: 170,
+      dailyRate: 29 / 90,
+    })).toBe(false);
   });
 });

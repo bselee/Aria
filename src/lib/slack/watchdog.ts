@@ -20,15 +20,20 @@ import axios from "axios";
 import Fuse from "fuse.js";
 import { FinaleClient } from "../finale/client";
 import { BoxAgent } from "../agents/box-agent";
+import {
+    addSlackReaction,
+    autoCompleteTrackedSlackRequests,
+    upsertTrackedSlackRequest,
+} from "./request-tracker";
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // SCHEMAS
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const RequestExtractionSchema = z.object({
-    isProductRequest: z.boolean().describe("True ONLY if someone is explicitly asking for a product to be ordered, restocked, or procured — NOT mere wishes, casual mentions, or hypothetical desires"),
-    hasExplicitAsk: z.boolean().describe("True only if the message contains an actual directive or ask (e.g. 'can we order', 'we need to get', 'please order', 'can you grab') — NOT just an expression of wanting or liking something"),
-    itemDescription: z.string().describe("The PRIMARY product, material, or supply being requested — use the most specific name or SKU possible"),
+    isProductRequest: z.boolean().describe("True ONLY if someone is explicitly asking for a product to be ordered, restocked, or procured â€” NOT mere wishes, casual mentions, or hypothetical desires"),
+    hasExplicitAsk: z.boolean().describe("True only if the message contains an actual directive or ask (e.g. 'can we order', 'we need to get', 'please order', 'can you grab') â€” NOT just an expression of wanting or liking something"),
+    itemDescription: z.string().describe("The PRIMARY product, material, or supply being requested â€” use the most specific name or SKU possible"),
     allItems: z.array(z.string()).describe("ALL distinct products, materials, or SKUs mentioned in the request. If multiple SKUs or products are listed (e.g. 'BLM207, BLM209, ALK101'), include each one separately. Always includes itemDescription as the first entry."),
     quantity: z.number().nullable().optional().describe("How many units requested, if mentioned"),
     urgency: z.enum(["low", "medium", "high"]).describe("low = general mention, medium = clearly needs it, high = urgent/ASAP language"),
@@ -60,8 +65,8 @@ interface DetectedRequest {
     eta: string | null;
     timestamp: string;
     finaleContext: string | null;  // Real-time stock/risk context from Finale
-    skuDescriptions: Map<string, string>;  // SKU (lowercase) → human-readable product name
-    skuPOStatus: Map<string, string>;      // SKU (lowercase) → "On order PO#123 (×50)" or "❌ No PO"
+    skuDescriptions: Map<string, string>;  // SKU (lowercase) â†’ human-readable product name
+    skuPOStatus: Map<string, string>;      // SKU (lowercase) â†’ "On order PO#123 (Ã—50)" or "âŒ No PO"
     messageTs: string;             // Original Slack ts for thread replies & reactions
     threadTs?: string;             // Thread parent ts, if applicable
     extractedUrls: string[];       // URLs found in the Slack message (for Amazon/one-off orders)
@@ -82,12 +87,12 @@ interface SkuStockDetail {
     vendorPartyUrl: string | null; // For PO matching
     unitCost: number | null;       // Last known supplier cost from Finale
     reorderQty: number | null;     // Finale-calculated reorder qty based on demand velocity
-    needsReorder: boolean;         // True if stockout ≤ 30d or out of stock
+    needsReorder: boolean;         // True if stockout â‰¤ 30d or out of stock
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // WATCHDOG
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // DECISION(2026-02-26): Only monitor channels where legitimate purchasing
 // requests come in. #inventory-management was too noisy with general chatter.
@@ -102,11 +107,11 @@ const MONITORED_CHANNEL_NAMES = new Set([
 
 export class SlackWatchdog {
     private client: WebClient;
-    private botClient: WebClient | null = null; // Bot token — used for users.info AND thread replies
+    private botClient: WebClient | null = null; // Bot token â€” used for users.info AND thread replies
     private lastChecked: Map<string, string> = new Map();
     private lastCheckedThreads: Map<string, string> = new Map(); // threadKey -> last reply ts
     private channelNames: Map<string, string> = new Map();       // Full-monitor channels (DMs + purchasing)
-    private mentionChannels: Map<string, string> = new Map();    // All other channels — only process @Bill mentions
+    private mentionChannels: Map<string, string> = new Map();    // All other channels â€” only process @Bill mentions
     private userNames: Map<string, string> = new Map();          // userId -> display name
     private productCatalog: KnownProduct[] = [];
     private fuse: Fuse<KnownProduct> | null = null;
@@ -114,7 +119,7 @@ export class SlackWatchdog {
     private pollIntervalMs: number;
     private finaleClient: FinaleClient;
     private processedRequests: Set<string> = new Set(); // In-memory dedup for request alerts
-    private ownerUserId: string | null = null; // Will's Slack ID — we skip his messages
+    private ownerUserId: string | null = null; // Will's Slack ID â€” we skip his messages
     private boxAgent: BoxAgent;
 
     constructor(pollIntervalSeconds: number = 60) {
@@ -122,7 +127,7 @@ export class SlackWatchdog {
         if (!token) throw new Error("SLACK_ACCESS_TOKEN is required");
 
         this.client = new WebClient(token);
-        // Bot token has users:read scope — used for resolving user display names
+        // Bot token has users:read scope â€” used for resolving user display names
         if (process.env.SLACK_BOT_TOKEN) {
             this.botClient = new WebClient(process.env.SLACK_BOT_TOKEN);
         }
@@ -130,27 +135,27 @@ export class SlackWatchdog {
 
         // DECISION(2026-02-25): Initialize Finale client to cross-reference
         // detected Slack requests with real-time stock data. If Finale keys
-        // are missing, we still work — just without stock context.
+        // are missing, we still work â€” just without stock context.
         this.finaleClient = new FinaleClient();
         this.boxAgent = new BoxAgent();
 
         // DECISION(2026-02-26): Dedup is now in-memory (Set) instead of Pinecone.
         // The old approach wrote 1024-dim dummy vectors to PINECONE_INDEX (email-embeddings),
-        // which is a different dimension → silent failures. In-memory dedup is fine because
+        // which is a different dimension â†’ silent failures. In-memory dedup is fine because
         // the watchdog re-establishes baselines on every restart anyway.
 
         // DECISION(2026-02-26): Will's own messages should never trigger alerts.
-        // He's the one who does the ordering — alerting himself is noise.
+        // He's the one who does the ordering â€” alerting himself is noise.
         this.ownerUserId = process.env.SLACK_OWNER_USER_ID || null;
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // LIFECYCLE
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async start() {
-        console.log("🦊 Aria Slack Watchdog v2: SILENT MONITOR mode");
-        console.log(`📡 Polling every ${this.pollIntervalMs / 1000}s`);
+        console.log("ðŸ¦Š Aria Slack Watchdog v2: SILENT MONITOR mode");
+        console.log(`ðŸ“¡ Polling every ${this.pollIntervalMs / 1000}s`);
 
         // 1. Build product catalog from PO history
         await this.buildProductCatalog();
@@ -158,20 +163,28 @@ export class SlackWatchdog {
         // 2. Discover channels
         await this.discoverChannels();
 
-        // 3. First poll — establish baseline (don't alert on old messages)
+        // 3. First poll â€” establish baseline (don't alert on old messages)
         await this.pollAllChannels();
 
         // 4. Start polling loop
         setInterval(async () => {
             try {
                 await this.pollAllChannels();
+                const completed = await autoCompleteTrackedSlackRequests({ lookbackHours: 48 });
+                for (const request of completed) {
+                    await addSlackReaction({
+                        channelId: request.channel_id,
+                        messageTs: request.message_ts,
+                        reaction: "white_check_mark",
+                    });
+                }
 
                 // Flush any pending requests to Telegram
                 if (this.pendingRequests.length > 0) {
                     await this.sendDigestToTelegram();
                 }
             } catch (err: any) {
-                console.error("❌ Poll cycle error:", err.message);
+                console.error("âŒ Poll cycle error:", err.message);
             }
         }, this.pollIntervalMs);
 
@@ -183,11 +196,11 @@ export class SlackWatchdog {
         // grow indefinitely without pruning. Cap them to prevent memory leaks.
         setInterval(() => {
             if (this.processedRequests.size > 1000) {
-                console.log(`[watchdog] processedRequests: ${this.processedRequests.size} → clearing`);
+                console.log(`[watchdog] processedRequests: ${this.processedRequests.size} â†’ clearing`);
                 this.processedRequests.clear();
             }
             if (this.lastCheckedThreads.size > 500) {
-                console.log(`[watchdog] lastCheckedThreads: ${this.lastCheckedThreads.size} → clearing`);
+                console.log(`[watchdog] lastCheckedThreads: ${this.lastCheckedThreads.size} â†’ clearing`);
                 this.lastCheckedThreads.clear();
             }
             // Flush stale pending requests (should be empty after digest, but safety net)
@@ -196,7 +209,7 @@ export class SlackWatchdog {
             }
         }, 30 * 60 * 1000);
 
-        console.log("🦊 Aria Slack Watchdog: LIVE and hunting for requests.");
+        console.log("ðŸ¦Š Aria Slack Watchdog: LIVE and hunting for requests.");
     }
 
     /**
@@ -206,9 +219,9 @@ export class SlackWatchdog {
         return [...this.pendingRequests];
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // PRODUCT CATALOG (Fuzzy Matching Source)
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Builds a searchable product catalog from PO line item history.
@@ -217,7 +230,7 @@ export class SlackWatchdog {
     private async buildProductCatalog() {
         const supabase = createClient();
         if (!supabase) {
-            console.warn("⚠️ No Supabase connection — using empty catalog");
+            console.warn("âš ï¸ No Supabase connection â€” using empty catalog");
             return;
         }
 
@@ -257,9 +270,9 @@ export class SlackWatchdog {
                 minMatchCharLength: 3,
             });
 
-            console.log(`📦 Product catalog loaded: ${products.length} unique items from PO history`);
+            console.log(`ðŸ“¦ Product catalog loaded: ${products.length} unique items from PO history`);
         } catch (err: any) {
-            console.warn("⚠️ Catalog build error:", err.message);
+            console.warn("âš ï¸ Catalog build error:", err.message);
         }
     }
 
@@ -279,9 +292,9 @@ export class SlackWatchdog {
         };
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // CHANNEL DISCOVERY
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private async discoverChannels() {
         const channelTypes = [
@@ -305,7 +318,7 @@ export class SlackWatchdog {
 
                     const isDM = ch.is_im === true;
 
-                    // DECISION(2026-03-19): DMs don't have a `name` property — Slack
+                    // DECISION(2026-03-19): DMs don't have a `name` property â€” Slack
                     // returns undefined, so it was falling through to the raw channel ID
                     // (e.g. "D04PQB36AS1"). For DMs, resolve the partner's real name
                     // so the digest reads "DM with Parker McMahon" instead of gibberish.
@@ -329,22 +342,22 @@ export class SlackWatchdog {
                         mentionCount++;
                     }
                 }
-                console.log(`  ✅ ${label}: ${fullCount} full-monitor, ${mentionCount} mention-watch`);
+                console.log(`  âœ… ${label}: ${fullCount} full-monitor, ${mentionCount} mention-watch`);
             } catch (err: any) {
-                console.warn(`  ⚠️ ${label}: skipped (${err.data?.error || err.message})`);
+                console.warn(`  âš ï¸ ${label}: skipped (${err.data?.error || err.message})`);
             }
         }
 
-        console.log(`📋 Full-monitor: ${this.channelNames.size} channels (DMs + ${[...MONITORED_CHANNEL_NAMES].join(', ')})`);
-        console.log(`📋 @Mention-watch: ${this.mentionChannels.size} additional channels`);
+        console.log(`ðŸ“‹ Full-monitor: ${this.channelNames.size} channels (DMs + ${[...MONITORED_CHANNEL_NAMES].join(', ')})`);
+        console.log(`ðŸ“‹ @Mention-watch: ${this.mentionChannels.size} additional channels`);
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // POLLING
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private async pollAllChannels() {
-        // Skip weekends — no point alerting Will on Saturday/Sunday
+        // Skip weekends â€” no point alerting Will on Saturday/Sunday
         const day = new Date().getDay();
         if (day === 0 || day === 6) return;
 
@@ -388,7 +401,7 @@ export class SlackWatchdog {
         const result = await this.client.conversations.history({
             channel: channelId,
             oldest: oldest || undefined,
-            limit: 10, // Lower limit for mention channels — less traffic expected
+            limit: 10, // Lower limit for mention channels â€” less traffic expected
         });
 
         const messages = result.messages || [];
@@ -444,7 +457,7 @@ export class SlackWatchdog {
         }
 
         // DECISION(2026-02-26): Also fetch replies from threads that had new activity.
-        // conversations.history only returns parent messages — thread replies are invisible
+        // conversations.history only returns parent messages â€” thread replies are invisible
         // without calling conversations.replies. This caused Krystal's Uline supply list
         // (a thread reply) to be completely missed.
         const threadedMessages = messages.filter(
@@ -481,33 +494,33 @@ export class SlackWatchdog {
                     }
                 }
             } catch (err: any) {
-                // Thread may have been deleted or we lack access — non-fatal
+                // Thread may have been deleted or we lack access â€” non-fatal
                 if (!err.message?.includes("thread_not_found")) {
-                    console.warn(`  ⚠️ Thread reply fetch failed: ${err.message}`);
+                    console.warn(`  âš ï¸ Thread reply fetch failed: ${err.message}`);
                 }
             }
         }
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // MESSAGE ANALYSIS
     // DECISION(2026-03-04): Aria now replies in Slack threads with stock context
     // for purchasing requests. This replaces the old "eyes-only" mode for product
-    // requests. Aria replies as a bot (SLACK_BOT_TOKEN) — clearly Aria, not Will.
+    // requests. Aria replies as a bot (SLACK_BOT_TOKEN) â€” clearly Aria, not Will.
     // Still sends Telegram digest for Will's visibility.
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private async processMessage(text: string, userId: string, channelId: string, channelName: string, messageTs: string, threadTs?: string) {
-        // Step 1: LLM intent analysis — is this a product request?
+        // Step 1: LLM intent analysis â€” is this a product request?
         const analysis = await this.analyzeIntent(text);
 
         // Only proceed if the LLM is confident this is a real, actionable product request
         // hasExplicitAsk filters out casual wishes like "I'd like X" or "it'd be nice to have X"
         if (!analysis.isProductRequest || !analysis.hasExplicitAsk || analysis.confidence < 0.75) return;
 
-        console.log(`📡 [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
+        console.log(`ðŸ“¡ [#${channelName}] Request detected (conf: ${analysis.confidence}): "${text.substring(0, 60)}..."`);
 
-        // Step 2: React with 👀 from Will's account (user token) to signal "looking into it"
+        // Step 2: React with ðŸ‘€ from Will's account (user token) to signal "looking into it"
         await this.addEyesReaction(channelId, messageTs);
 
         // Step 3: Fuzzy match against product catalog
@@ -537,7 +550,7 @@ export class SlackWatchdog {
             if (item && item.length >= 2) skuCandidates.add(item.trim());
         }
 
-        // Source 2: Regex fallback — expanded to catch digit-first SKUs
+        // Source 2: Regex fallback â€” expanded to catch digit-first SKUs
         // Handles: 3.0BAGCF, 3.0CF, S-4122, BLM207, ALK101, NC104, DOM101
         const skuPattern = /\b(\d+\.?\d*[A-Z]{2,}[A-Z0-9]*|[A-Z]{1,6}[._-]?[0-9]{2,5}(?:[._-][A-Z0-9]+)*)\b/g;
         for (const m of text.matchAll(skuPattern)) {
@@ -581,32 +594,32 @@ export class SlackWatchdog {
         );
 
         // Build the finaleContext string for Telegram
-        // DECISION(2026-03-16): Show "SKU — Product Name: stock data" so Will
+        // DECISION(2026-03-16): Show "SKU â€” Product Name: stock data" so Will
         // can immediately see what each SKU is without looking it up.
         if (finalDetails.length > 0) {
             finaleContext = finalDetails.map(d => {
                 const label = d.productName
-                    ? `*${d.sku}* — ${d.productName}`
+                    ? `*${d.sku}* â€” ${d.productName}`
                     : `*${d.sku}*`;
                 if (!d.found) return `  ${label}: not found in Finale`;
                 const parts: string[] = [];
                 if (d.onHand !== null) parts.push(`${d.onHand.toLocaleString()} on hand`);
                 if (d.onOrder !== null && d.onOrder > 0) parts.push(`${d.onOrder} on order`);
                 if (d.stockoutDays !== null) {
-                    if (d.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${d.stockoutDays}d!`);
+                    if (d.stockoutDays <= 14) parts.push(`âš ï¸ Stockout in ${d.stockoutDays}d!`);
                     else parts.push(`${d.stockoutDays}d runway`);
                 }
                 // DECISION(2026-03-16): Show actual PO numbers, not just a count.
-                // "On order PO#12345 (×50)" is infinitely more useful than "1 PO incoming".
+                // "On order PO#12345 (Ã—50)" is infinitely more useful than "1 PO incoming".
                 if (d.incomingPODetails.length > 0) {
                     const poList = d.incomingPODetails
-                        .map(po => `PO#${po.orderId} (×${po.quantity})`)
+                        .map(po => `PO#${po.orderId} (Ã—${po.quantity})`)
                         .join(', ');
-                    parts.push(`📋 ${poList}`);
+                    parts.push(`ðŸ“‹ ${poList}`);
                 } else {
-                    parts.push(`❌ No PO`);
+                    parts.push(`âŒ No PO`);
                 }
-                return `  ${label}: ${parts.join(' · ') || 'in Finale, no stock data'}`;
+                return `  ${label}: ${parts.join(' Â· ') || 'in Finale, no stock data'}`;
             }).join('\n');
         }
 
@@ -623,7 +636,7 @@ export class SlackWatchdog {
             : `req_${channelId}_${messageTs}`;
 
         if (this.processedRequests.has(dedupKey)) {
-            console.log(`  💤 Skipping repeated request (already handled): ${dedupKey}`);
+            console.log(`  ðŸ’¤ Skipping repeated request (already handled): ${dedupKey}`);
             return;
         }
 
@@ -632,8 +645,8 @@ export class SlackWatchdog {
         //   - Raw user IDs instead of names (U056HD83BK5)
         //   - False "not found in Finale" for valid SKUs (hyphen mismatch)
         //   - Non-sensical stock context that confused rather than helped
-        // The 👀 reaction stays (signals "seen"). Telegram digest stays (for Will).
-        // Slack channels are for humans only — Aria watches silently.
+        // The ðŸ‘€ reaction stays (signals "seen"). Telegram digest stays (for Will).
+        // Slack channels are for humans only â€” Aria watches silently.
 
         // Step 7b: For urgent reorder SKUs, check for existing draft POs from the vendor
         // DECISION(2026-03-04): Instead of just alerting Will, proactively check if there's
@@ -648,20 +661,20 @@ export class SlackWatchdog {
             });
         }
 
-        // Build SKU → description + PO status lookups for the Telegram digest
+        // Build SKU â†’ description + PO status lookups for the Telegram digest
         const skuDescriptions = new Map<string, string>();
         const skuPOStatus = new Map<string, string>();
         for (const d of finalDetails) {
             if (d.productName) skuDescriptions.set(d.sku.toLowerCase(), d.productName);
-            // Always show PO status: either "On order PO#XXXXX (×qty)" or "❌ No PO"
+            // Always show PO status: either "On order PO#XXXXX (Ã—qty)" or "âŒ No PO"
             if (d.found) {
                 if (d.incomingPODetails.length > 0) {
                     const poList = d.incomingPODetails
-                        .map(po => `PO#${po.orderId} (×${po.quantity})`)
+                        .map(po => `PO#${po.orderId} (Ã—${po.quantity})`)
                         .join(', ');
-                    skuPOStatus.set(d.sku.toLowerCase(), `📝 On order ${poList}`);
+                    skuPOStatus.set(d.sku.toLowerCase(), `ðŸ“ On order ${poList}`);
                 } else {
-                    skuPOStatus.set(d.sku.toLowerCase(), '❌ No PO');
+                    skuPOStatus.set(d.sku.toLowerCase(), 'âŒ No PO');
                 }
             }
         }
@@ -674,8 +687,8 @@ export class SlackWatchdog {
         // DECISION(2026-03-16): When someone requests products and they have no PO on order,
         // proactively create draft POs in Finale grouped by vendor. These are intended to remain as Draft POs for planning.
         // DECISION(2026-03-19): Only create draft POs for items that genuinely need
-        // reordering (stockout ≤30d OR out of stock). Previously any requested SKU
-        // with no PO got a draft — even with plenty of stock (e.g., 14kg of ACP101).
+        // reordering (stockout â‰¤30d OR out of stock). Previously any requested SKU
+        // with no PO got a draft â€” even with plenty of stock (e.g., 14kg of ACP101).
         // The needsReorder flag already captures the right threshold.
         const noPOItems = finalDetails.filter(d =>
             d.found && d.incomingPODetails.length === 0 && d.vendorPartyUrl && d.needsReorder
@@ -711,11 +724,11 @@ export class SlackWatchdog {
                         `Slack request from ${userName} in #${channelName}: ${items.map(d => d.sku).join(', ')}`,
                     );
 
-                    console.log(`  📝 Draft PO #${result.orderId} created for ${vendorName} (${items.length} items)`);
+                    console.log(`  ðŸ“ Draft PO #${result.orderId} created for ${vendorName} (${items.length} items)`);
 
                     // Update PO status for the digest
                     for (const item of items) {
-                        skuPOStatus.set(item.sku.toLowerCase(), `🆕 Draft PO Created #${result.orderId}`);
+                        skuPOStatus.set(item.sku.toLowerCase(), `ðŸ†• Draft PO Created #${result.orderId}`);
                     }
 
                     // Send immediate Telegram notification for draft PO creation
@@ -724,9 +737,9 @@ export class SlackWatchdog {
                         items, userName, channelName,
                     );
                 } catch (err: any) {
-                    console.error(`  ❌ Draft PO creation failed for ${vendorName}:`, err.message);
+                    console.error(`  âŒ Draft PO creation failed for ${vendorName}:`, err.message);
                     for (const item of items) {
-                        skuPOStatus.set(item.sku.toLowerCase(), `❌ No PO (auto-create failed)`);
+                        skuPOStatus.set(item.sku.toLowerCase(), `âŒ No PO (auto-create failed)`);
                     }
                 }
             }
@@ -765,7 +778,7 @@ export class SlackWatchdog {
         };
 
         this.pendingRequests.push(request);
-        console.log(`  → Queued for Telegram digest (${this.pendingRequests.length} pending)`);
+        console.log(`  â†’ Queued for Telegram digest (${this.pendingRequests.length} pending)`);
 
         // Mirror to dashboard (fire-and-forget)
         setImmediate(async () => {
@@ -788,41 +801,38 @@ export class SlackWatchdog {
             });
         });
 
-        // DECISION(2026-03-19): Persist Amazon/one-off requests to slack_requests
-        // table so we can match Amazon confirmation emails back to the requester
-        // and notify them in their original Slack thread when the order ships.
-        const hasFinaleMatch = match?.product || finalDetails.some(d => d.found);
-        if (!hasFinaleMatch) {
-            setImmediate(async () => {
-                try {
-                    const supabase = createClient();
-                    if (!supabase) return;
-                    await supabase.from('slack_requests').insert({
-                        channel_id: channelId,
-                        channel_name: channelName,
-                        message_ts: messageTs,
-                        thread_ts: threadTs || null,
-                        requester_user_id: userId,
-                        requester_name: userName,
-                        original_text: text,
-                        items_requested: rawItems,
-                        quantity: analysis.quantity || null,
-                        extracted_urls: extractedUrls.length > 0 ? extractedUrls : null,
-                        status: 'pending',
-                    });
-                    console.log(`  📋 Slack request stored for Amazon order matching`);
-                } catch (err: any) {
-                    console.warn(`  ⚠️ Failed to store slack_request:`, err.message);
-                }
-            });
-        }
+        // Persist every accepted request so we can track it to completion.
+        const matchedSkus = [...new Set([
+            match?.product?.sku,
+            ...finalDetails.filter(d => d.found).map(d => d.sku),
+        ].filter((sku): sku is string => !!sku && sku !== "N/A"))];
 
+        setImmediate(async () => {
+            try {
+                await upsertTrackedSlackRequest({
+                    channel_id: channelId,
+                    channel_name: channelName,
+                    message_ts: messageTs,
+                    thread_ts: threadTs || null,
+                    requester_user_id: userId,
+                    requester_name: userName,
+                    original_text: text,
+                    items_requested: rawItems,
+                    matched_skus: matchedSkus.length > 0 ? matchedSkus : null,
+                    quantity: analysis.quantity || null,
+                    extracted_urls: extractedUrls.length > 0 ? extractedUrls : null,
+                });
+                console.log(`  Slack request stored for durable tracking`);
+            } catch (err: any) {
+                console.warn(`  Failed to store slack_request:`, err.message);
+            }
+        });
         // Step 10: Mark as processed in dedup set
         this.processedRequests.add(dedupKey);
     }
 
     /**
-     * Reacts with 👀 on a Slack message using Will's user token.
+     * Reacts with ðŸ‘€ on a Slack message using Will's user token.
      * Signals to the requester that the message was seen.
      */
     private async addEyesReaction(channelId: string, messageTs: string) {
@@ -833,9 +843,9 @@ export class SlackWatchdog {
                 name: "eyes",
             });
         } catch (err: any) {
-            // "already_reacted" is fine — just means we already saw it
+            // "already_reacted" is fine â€” just means we already saw it
             if (!err.data?.error?.includes("already_reacted")) {
-                console.warn(`  ⚠️ Could not react: ${err.data?.error || err.message}`);
+                console.warn(`  âš ï¸ Could not react: ${err.data?.error || err.message}`);
             }
         }
     }
@@ -846,10 +856,10 @@ export class SlackWatchdog {
 
 Your ONLY job: determine if the message is an EXPLICIT REQUEST for a product to be ordered or procured.
 
-POSITIVE — isProductRequest=true AND hasExplicitAsk=true:
+POSITIVE â€” isProductRequest=true AND hasExplicitAsk=true:
 - "We need more X" / "We're out of X, can we order more?"
 - "Can we order Y?" / "Please order Z"
-- "Running low on Z — need to restock"
+- "Running low on Z â€” need to restock"
 - "I need [X] for [project] by [date]"
 - "Can you grab some X?"
 - "Here is a list of items we could possibly order soon: SKU1, SKU2..."
@@ -857,13 +867,13 @@ POSITIVE — isProductRequest=true AND hasExplicitAsk=true:
 - Messages with a clear directive directed at a buyer/manager
 - ANY message containing a list of raw SKUs (e.g. "BB106, FJG104, ALK101") tagged to buyers, even if the wording uses "possibly" or "maybe".
 
-PARTIAL — isProductRequest=true BUT hasExplicitAsk=false (do NOT alert):
-- "I'd like some X" / "It would be nice to have X" — desire, not a request
-- "X would be great" / "X would help" — wishful thinking
-- "I was thinking about getting X" — hypothetical, no ask
+PARTIAL â€” isProductRequest=true BUT hasExplicitAsk=false (do NOT alert):
+- "I'd like some X" / "It would be nice to have X" â€” desire, not a request
+- "X would be great" / "X would help" â€” wishful thinking
+- "I was thinking about getting X" â€” hypothetical, no ask
 - Casual mention of a product in passing conversation
 
-NEGATIVE — isProductRequest=false:
+NEGATIVE â€” isProductRequest=false:
 - General status updates or process questions
 - Social chat / greetings
 - Technical discussions not about ordering
@@ -881,9 +891,9 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         });
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // PO CROSS-REFERENCE
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private async checkActivePOs(product: KnownProduct): Promise<{ poNumber: string; eta: string | null } | null> {
         const supabase = createClient();
@@ -924,7 +934,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                         .single();
 
                     const eta = shipment
-                        ? `${shipment.status} — ETA: ${shipment.estimated_delivery || "TBD"}`
+                        ? `${shipment.status} â€” ETA: ${shipment.estimated_delivery || "TBD"}`
                         : "No tracking yet";
 
                     return { poNumber: po.po_number, eta };
@@ -937,9 +947,9 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         }
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // FINALE STOCK CONTEXT
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Query Finale for detailed stock info for a single SKU.
@@ -975,7 +985,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
             // DECISION(2026-03-04): We do the extra REST call because
             // knowing the vendor lets us find existing draft POs to add to.
             // DECISION(2026-03-16): Also capture product name so Telegram
-            // digest shows "SKU — Description" instead of raw codes.
+            // digest shows "SKU â€” Description" instead of raw codes.
             let vendorName: string | null = null;
             let vendorPartyUrl: string | null = null;
             let productName: string | null = null;
@@ -1002,21 +1012,21 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
             // Generate intelligent recommendation
             let recommendation: string;
             if (onHand !== null && onHand > 0 && stockoutDays !== null && stockoutDays > 60) {
-                recommendation = `We've got ${onHand.toLocaleString()} on hand — that's ${stockoutDays}d of runway. Should be good for a while.`;
+                recommendation = `We've got ${onHand.toLocaleString()} on hand â€” that's ${stockoutDays}d of runway. Should be good for a while.`;
             } else if (onHand !== null && onHand > 0 && stockoutDays !== null && stockoutDays > 30) {
                 recommendation = `${onHand.toLocaleString()} on hand, ${stockoutDays}d runway. Not urgent but worth keeping an eye on.`;
             } else if (stockoutDays !== null && stockoutDays <= 14) {
-                recommendation = `Thanks for the heads up! Only ${stockoutDays}d until stockout — getting on this.`;
+                recommendation = `Thanks for the heads up! Only ${stockoutDays}d until stockout â€” getting on this.`;
             } else if (stockoutDays !== null && stockoutDays <= 30) {
-                recommendation = `Good call — ${stockoutDays}d until stockout. Adding to the order list.`;
+                recommendation = `Good call â€” ${stockoutDays}d until stockout. Adding to the order list.`;
             } else if (incomingPOs > 0) {
-                recommendation = `Already on order — ${incomingPOs} PO${incomingPOs > 1 ? 's' : ''} incoming.`;
+                recommendation = `Already on order â€” ${incomingPOs} PO${incomingPOs > 1 ? 's' : ''} incoming.`;
             } else if (onHand !== null && onHand === 0) {
                 recommendation = `We're out! Getting this ordered ASAP.`;
             } else if (reorderQty !== null && reorderQty > 0) {
                 recommendation = `Finale suggests ordering ${reorderQty}. (Demand velocity: ${demandQuantity ?? 'untracked'})`;
             } else {
-                recommendation = `In Finale — checking on it.`;
+                recommendation = `In Finale â€” checking on it.`;
             }
 
             return {
@@ -1033,7 +1043,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
     // DECISION(2026-03-11): composeStockReply and replyInThread removed.
     // Aria no longer posts auto-replies in Slack channels. The bot was producing
     // confusing messages for coworkers (raw user IDs, false "not found" for valid
-    // SKUs). Slack channels are for humans — Aria watches silently with 👀 and
+    // SKUs). Slack channels are for humans â€” Aria watches silently with ðŸ‘€ and
     // reports to Will via Telegram digest only.
 
     /**
@@ -1051,7 +1061,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         if (detail.onOrder !== null && detail.onOrder > 0) parts.push(`${detail.onOrder} on order`);
         
         if (detail.stockoutDays !== null) {
-            if (detail.stockoutDays <= 14) parts.push(`⚠️ Stockout in ${detail.stockoutDays}d!`);
+            if (detail.stockoutDays <= 14) parts.push(`âš ï¸ Stockout in ${detail.stockoutDays}d!`);
             else if (detail.stockoutDays <= 30) parts.push(`Stockout in ${detail.stockoutDays}d`);
             else parts.push(`${detail.stockoutDays}d runway`);
         }
@@ -1065,13 +1075,13 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         }
 
         if (detail.incomingPOs > 0) parts.push(`${detail.incomingPOs} PO incoming`);
-        return parts.length > 0 ? parts.join(' · ') : `in Finale, no stock data`;
+        return parts.length > 0 ? parts.join(' Â· ') : `in Finale, no stock data`;
     }
 
     /**
      * Find open/draft POs from a specific vendor in Finale.
      * DECISION(2026-03-04): Looking for status "Open" (ORDER_CREATED) POs
-     * that haven't been committed yet — these are draft POs that we can add to.
+     * that haven't been committed yet â€” these are draft POs that we can add to.
      * Uses GraphQL to query by supplier name and filter for Open status.
      *
      * @param vendorName - The vendor/supplier name (e.g., "ULINE")
@@ -1148,14 +1158,14 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                     };
                 });
         } catch (err: any) {
-            console.warn(`  ⚠️ Draft PO lookup failed for ${vendorName}:`, err.message);
+            console.warn(`  âš ï¸ Draft PO lookup failed for ${vendorName}:`, err.message);
             return [];
         }
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // USER RESOLUTION
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private async resolveUserName(userId: string): Promise<string> {
         if (this.userNames.has(userId)) return this.userNames.get(userId)!;
@@ -1170,7 +1180,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         } catch {
             // DECISION(2026-03-19): Always show the real person's name in PO notes
             // and digests. If we can't resolve via Slack API, include the raw userId
-            // so Will can identify who asked. 'a team member' was too anonymous —
+            // so Will can identify who asked. 'a team member' was too anonymous â€”
             // PO memos need accountability tracing.
             const fallback = `Slack user ${userId}`;
             this.userNames.set(userId, fallback);
@@ -1178,9 +1188,9 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         }
     }
 
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // TELEGRAM REPORTING
-    // ──────────────────────────────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Sends a batched digest of all pending requests to Will on Telegram.
@@ -1198,29 +1208,29 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         const urgencyOrder = { high: 0, medium: 1, low: 2 };
         requests.sort((a, b) => urgencyOrder[a.analysis.urgency] - urgencyOrder[b.analysis.urgency]);
 
-        let message = `🦊 *Aria Slack Digest* — ${requests.length} request${requests.length > 1 ? "s" : ""} detected\n\n`;
+        let message = `ðŸ¦Š *Aria Slack Digest* â€” ${requests.length} request${requests.length > 1 ? "s" : ""} detected\n\n`;
 
         for (const req of requests) {
-            const urgencyEmoji = req.analysis.urgency === "high" ? "🔴" :
-                req.analysis.urgency === "medium" ? "🟡" : "🟢";
+            const urgencyEmoji = req.analysis.urgency === "high" ? "ðŸ”´" :
+                req.analysis.urgency === "medium" ? "ðŸŸ¡" : "ðŸŸ¢";
 
-            // DECISION(2026-03-19): Detect Amazon/one-off orders — items with no
+            // DECISION(2026-03-19): Detect Amazon/one-off orders â€” items with no
             // Finale catalog match AND no meaningful Finale stock data. These are
             // commodity/supply items that Will orders directly on Amazon.
             const hasFinaleData = req.matchedProduct || (req.finaleContext && !req.finaleContext.includes('not found in Finale'));
             const isAmazonOneOff = !hasFinaleData;
 
             const matchLine = req.matchedProduct
-                ? `✅ Catalog match: \`${req.matchedProduct.sku}\` — ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
+                ? `âœ… Catalog match: \`${req.matchedProduct.sku}\` â€” ${req.matchedProduct.name}${req.matchedProduct.vendor ? ` (${req.matchedProduct.vendor})` : ""}`
                 : isAmazonOneOff
-                    ? `🛒 Amazon/one-off order — not in Finale catalog`
-                    : `⚠️ No catalog match — see Finale data below`;
+                    ? `ðŸ›’ Amazon/one-off order â€” not in Finale catalog`
+                    : `âš ï¸ No catalog match â€” see Finale data below`;
 
             const poLine = isAmazonOneOff
-                ? ''  // Skip PO line for Amazon orders — irrelevant
+                ? ''  // Skip PO line for Amazon orders â€” irrelevant
                 : req.activePO
-                    ? `📋 Active PO: #${req.activePO} — ${req.eta}`
-                    : `📭 No active PO found`;
+                    ? `ðŸ“‹ Active PO: #${req.activePO} â€” ${req.eta}`
+                    : `ðŸ“­ No active PO found`;
 
             // DECISION(2026-03-16): Use pre-resolved SKU descriptions so Will can
             // instantly see what products people are asking for without manual lookup.
@@ -1230,37 +1240,37 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                 ? req.analysis.allItems
                 : [req.analysis.itemDescription];
 
-            // Format each item as "SKU — Description | PO status"
+            // Format each item as "SKU â€” Description | PO status"
             const itemsWithDescriptions = rawItems.map(item => {
                 const desc = req.skuDescriptions.get(item.toLowerCase());
                 const po = req.skuPOStatus.get(item.toLowerCase()) || '';
-                let line = desc ? `\`${item}\` — ${desc}` : `\`${item}\``;
+                let line = desc ? `\`${item}\` â€” ${desc}` : `\`${item}\``;
                 if (po && !isAmazonOneOff) line += `\n      ${po}`;
                 return line;
             });
 
-            // DECISION(2026-03-19): DM channels show as "DM with Name" — don't
+            // DECISION(2026-03-19): DM channels show as "DM with Name" â€” don't
             // redundantly say "Name in #DM with Name". For DMs, just show "Name (DM)".
             const isDMChannel = req.channel.startsWith('DM with ');
             const locationLabel = isDMChannel ? '(DM)' : `in #${req.channel}`;
 
             message +=
                 `${urgencyEmoji} *${req.userName}* ${locationLabel}\n` +
-                `💬 _"${req.originalText.substring(0, 120)}"_\n` +
-                `📦 Wants:\n${itemsWithDescriptions.map(i => `  • ${i}`).join('\n')}` +
-                `${req.analysis.quantity ? ` (×${req.analysis.quantity})` : ""}\n` +
+                `ðŸ’¬ _"${req.originalText.substring(0, 120)}"_\n` +
+                `ðŸ“¦ Wants:\n${itemsWithDescriptions.map(i => `  â€¢ ${i}`).join('\n')}` +
+                `${req.analysis.quantity ? ` (Ã—${req.analysis.quantity})` : ""}\n` +
                 `${matchLine}\n` +
                 `${poLine ? poLine + '\n' : ''}`;
 
             // Surface extracted URLs prominently for Amazon/one-off orders
             if (req.extractedUrls.length > 0) {
-                message += `🔗 Links:\n${req.extractedUrls.map(u => `  • ${u}`).join('\n')}\n`;
+                message += `ðŸ”— Links:\n${req.extractedUrls.map(u => `  â€¢ ${u}`).join('\n')}\n`;
             }
 
             // Add Finale stock context (per-SKU breakdown if multiple)
-            // Skip for Amazon/one-off orders — "not found in Finale" is already stated
+            // Skip for Amazon/one-off orders â€” "not found in Finale" is already stated
             if (req.finaleContext && !isAmazonOneOff) {
-                message += `📈 Finale:\n${req.finaleContext}\n`;
+                message += `ðŸ“ˆ Finale:\n${req.finaleContext}\n`;
             }
 
             message += `\n`;
@@ -1274,12 +1284,12 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                 text: message,
                 parse_mode: "Markdown",
             });
-            console.log(`🚀 Telegram digest sent: ${requests.length} requests`);
+            console.log(`ðŸš€ Telegram digest sent: ${requests.length} requests`);
 
             // Clear the buffer after sending
             this.pendingRequests = [];
         } catch (err: any) {
-            console.error("❌ Telegram digest failed:", err.message);
+            console.error("âŒ Telegram digest failed:", err.message);
         }
     }
 
@@ -1294,7 +1304,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
 
-        let message = `📦 *Reorder Needed: ${detail.sku}*\n\n`;
+        let message = `ðŸ“¦ *Reorder Needed: ${detail.sku}*\n\n`;
         message += `Requested by ${requesterName} in #${channelName}\n`;
         message += `Stock: ${detail.onHand?.toLocaleString() ?? 'Untracked'} on hand`;
         if (detail.stockoutDays !== null) message += ` \u00b7 ${detail.stockoutDays}d until stockout`;
@@ -1320,7 +1330,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                 const newest = draftPOs[0];
 
                 message += `\u2705 *Found draft PO from ${detail.vendorName}:*\n`;
-                message += `  PO #${newest.orderId} (${newest.orderDate}) — ${newest.itemCount} items\n`;
+                message += `  PO #${newest.orderId} (${newest.orderDate}) â€” ${newest.itemCount} items\n`;
                 message += `  [Open in Finale](${newest.finaleUrl})\n\n`;
                 message += `\u27a1\ufe0f Add *${detail.sku}* to this draft PO?\n`;
                 message += `  /addtopo ${newest.orderId} ${detail.sku}\n\n`;
@@ -1333,7 +1343,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
                 message += `Create new? /createpo ${detail.vendorName} ${detail.sku}\n`;
             }
         } else {
-            message += `\n\u26a0\ufe0f Vendor unknown — check Finale for supplier info.\n`;
+            message += `\n\u26a0\ufe0f Vendor unknown â€” check Finale for supplier info.\n`;
         }
 
         try {
@@ -1379,7 +1389,7 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
         });
 
         const itemLines = items.map(d => {
-            const name = d.productName ? `${d.sku} — ${d.productName}` : d.sku;
+            const name = d.productName ? `${d.sku} â€” ${d.productName}` : d.sku;
             const qty = Math.max(1, d.reorderQty ?? 1);
             
             const contextParts: string[] = [];
@@ -1388,18 +1398,18 @@ MULTI-ITEM RULE: If the message lists multiple products or SKUs (e.g. "OAG223, B
             if (d.demandQuantity !== null && d.demandQuantity > 0) contextParts.push(`Demand: ${d.demandQuantity}`);
             if (d.reorderQty !== null && d.reorderQty > 0) contextParts.push(`Sug. Reorder: ${d.reorderQty}`);
             
-            const context = contextParts.join(' · ');
-            return `  • ×${qty} ${name}\n      ${context}`;
+            const context = contextParts.join(' Â· ');
+            return `  â€¢ Ã—${qty} ${name}\n      ${context}`;
         }).join('\n');
 
         const message =
-            `🆕 *Draft PO Created* — PO #${orderId}\n\n` +
+            `ðŸ†• *Draft PO Created* â€” PO #${orderId}\n\n` +
             `Vendor: *${vendorName}*\n` +
             `Requested by: *${requesterName}* in #${channelName}\n` +
-            `📅 Expected arrival: ~${expectedDateStr} (14d from today)\n\n` +
+            `ðŸ“… Expected arrival: ~${expectedDateStr} (14d from today)\n\n` +
             `Items (qty based on Finale demand):\n${itemLines}\n\n` +
-            `🔗 [Open in Finale](${finaleUrl})\n` +
-            `📝 _Intended to remain as a Draft PO for planning/review_`;
+            `ðŸ”— [Open in Finale](${finaleUrl})\n` +
+            `ðŸ“ _Intended to remain as a Draft PO for planning/review_`;
 
         try {
             await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {

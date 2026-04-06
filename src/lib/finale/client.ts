@@ -412,6 +412,71 @@ export function chooseVelocitySignal(input: {
     return { dailyRate: 0, signal: "none" };
 }
 
+export function sanitizeFinaleDemandSignals(input: {
+    stockOnHand: number;
+    stockoutDays: number | null;
+    demandPerDay: number | null;
+    demandQuantity: number | null;
+    consumptionQuantity: number | null;
+    reorderQuantityToOrder: number | null;
+    fallbackReorderQuantity?: number | null;
+}): {
+    demandVelocity: number;
+    demandQuantity: number | null;
+    reorderQuantity: number | null;
+    usedFallback: boolean;
+} {
+    const rawDemandVelocity = input.demandPerDay && input.demandPerDay > 0 ? input.demandPerDay : 0;
+    const runwayVelocity = (
+        input.stockOnHand > 0 &&
+        input.stockoutDays !== null &&
+        input.stockoutDays > 0
+    ) ? input.stockOnHand / input.stockoutDays : 0;
+    const consumptionVelocity = input.consumptionQuantity && input.consumptionQuantity > 0
+        ? input.consumptionQuantity / 90
+        : 0;
+
+    const shouldFallback = (
+        rawDemandVelocity > 0 &&
+        runwayVelocity > 0 &&
+        rawDemandVelocity > runwayVelocity * 3 &&
+        consumptionVelocity > 0 &&
+        Math.abs(consumptionVelocity - runwayVelocity) <= Math.max(runwayVelocity * 0.5, 0.25)
+    );
+
+    if (shouldFallback) {
+        return {
+            demandVelocity: consumptionVelocity,
+            demandQuantity: input.consumptionQuantity ?? null,
+            reorderQuantity: input.fallbackReorderQuantity ?? input.reorderQuantityToOrder,
+            usedFallback: true,
+        };
+    }
+
+    return {
+        demandVelocity: rawDemandVelocity,
+        demandQuantity: input.demandQuantity ?? null,
+        reorderQuantity: input.reorderQuantityToOrder,
+        usedFallback: false,
+    };
+}
+
+export function shouldSuppressPurchasingAnomaly(input: {
+    stockOnHand: number;
+    stockoutDays: number | null;
+    dailyRate: number;
+}): boolean {
+    if (input.stockOnHand <= 0) return false;
+    if (input.stockoutDays === null || input.stockoutDays <= 0) return false;
+    if (input.dailyRate <= 0) return false;
+
+    const impliedRunwayDays = input.stockOnHand / input.dailyRate;
+    const ratio = impliedRunwayDays / input.stockoutDays;
+    const absoluteDelta = Math.abs(impliedRunwayDays - input.stockoutDays);
+
+    return (ratio < 1 / 3 || ratio > 3) && absoluteDelta > 30;
+}
+
 /**
  * DECISION(2026-03-04): Purchase Destination routing.
  * Finale POs use `originFacilityUrl` to set where received goods go.
@@ -4398,6 +4463,11 @@ export class FinaleClient {
                     const productName: string = prodData.internalName || prodData.productId || sku;
                     const unitPrice: number = mainSupplier.price ?? 0;
                     const reorderMethod = normalizeFinaleReorderMethod(prodData);
+                    const fallbackReorderQuantity = Array.isArray(prodData.reorderGuidelineList)
+                        ? prodData.reorderGuidelineList
+                            .map((rule: any) => this.parseFinaleNum(rule?.reorderQuantity))
+                            .find((qty: number | null) => qty !== null && qty > 0) ?? null
+                        : null;
 
                     // Lead time: REST product field → 14d default
                     const rawLeadTime = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
@@ -4419,11 +4489,20 @@ export class FinaleClient {
                     const purchaseVelocity = activity.purchasedQty / daysBack;
                     const salesVelocity = activity.soldQty / daysBack;
 
-                    // Demand velocity: prefer demandPerDay (direct field) → demandQuantity / 90
-                    const demandVelocity = candidate.finaleDemandPerDay != null && candidate.finaleDemandPerDay > 0
-                        ? candidate.finaleDemandPerDay
-                        : candidate.finaleDemandQty != null && candidate.finaleDemandQty > 0
-                            ? candidate.finaleDemandQty / 90
+                    const sanitizedDemand = sanitizeFinaleDemandSignals({
+                        stockOnHand,
+                        stockoutDays: candidate.finaleStockoutDays,
+                        demandPerDay: candidate.finaleDemandPerDay,
+                        demandQuantity: candidate.finaleDemandQty,
+                        consumptionQuantity: candidate.finaleConsumptionQty,
+                        reorderQuantityToOrder: candidate.finaleReorderQty,
+                        fallbackReorderQuantity,
+                    });
+
+                    const demandVelocity = sanitizedDemand.demandVelocity > 0
+                        ? sanitizedDemand.demandVelocity
+                        : sanitizedDemand.demandQuantity != null && sanitizedDemand.demandQuantity > 0
+                            ? sanitizedDemand.demandQuantity / 90
                             : 0;
 
                     // DECISION(2026-03-31): Reverting to prefer demandVelocity (Finale's 90-day calculation)
@@ -4454,6 +4533,14 @@ export class FinaleClient {
                     }
 
                     if (dailyRate === 0) continue; // no actual movement within windows
+                    if (shouldSuppressPurchasingAnomaly({
+                        stockOnHand,
+                        stockoutDays: candidate.finaleStockoutDays,
+                        dailyRate,
+                    })) {
+                        console.warn(`[finale] suppressing anomalous purchasing item ${sku}: stock=${stockOnHand}, stockoutDays=${candidate.finaleStockoutDays}, dailyRate=${dailyRate.toFixed(2)}`);
+                        continue;
+                    }
 
 
                     // Identify which signal is driving the rate (for explanation)
@@ -4526,10 +4613,10 @@ export class FinaleClient {
                         suggestedQty,
                         orderIncrementQty,
                         isBulkDelivery,
-                        finaleReorderQty: candidate.finaleReorderQty,
+                        finaleReorderQty: sanitizedDemand.reorderQuantity,
                         finaleStockoutDays: candidate.finaleStockoutDays,
                         finaleConsumptionQty: candidate.finaleConsumptionQty,
-                        finaleDemandQty: candidate.finaleDemandQty,
+                        finaleDemandQty: sanitizedDemand.demandQuantity,
                         reorderMethod,
                         dailyRateSource: rateSource === "none" ? undefined : rateSource,
                     });

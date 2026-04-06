@@ -54,6 +54,7 @@ describe('Bot Command Modularization', () => {
             // Operations commands
             expect(names).toContain('buildrisk');
             expect(names).toContain('requests');
+            expect(names).toContain('requestcomplete');
             expect(names).toContain('alerts');
             expect(names).toContain('correlate');
             expect(names).toContain('notify');
@@ -147,8 +148,8 @@ describe('Bot Command Modularization', () => {
             expect(inventoryCommands.length).toBe(5);
         });
 
-        it('operations module should export exactly 5 commands', () => {
-            expect(operationsCommands.length).toBe(5);
+        it('operations module should export exactly 6 commands', () => {
+            expect(operationsCommands.length).toBe(6);
         });
 
         it('memory module should export exactly 4 commands', () => {
