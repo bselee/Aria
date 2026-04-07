@@ -17,6 +17,9 @@
  * the product is manufactured (has a BOM), not purchased.
  */
 
+import { recordFinaleWriteAttempt } from "./write-access-log";
+import { assertFinaleWriteAllowed, type FinaleWriteContext } from "./write-access";
+
 // ──────────────────────────────────────────────────
 // TYPES
 // ──────────────────────────────────────────────────
@@ -3983,8 +3986,29 @@ export class FinaleClient {
             isBulkDelivery?: boolean;
         }>,
         memo?: string,
-        purchaseDestination?: string
+        purchaseDestination?: string,
+        writeContext?: FinaleWriteContext,
     ): Promise<{ orderId: string; finaleUrl: string; facilityName: string; duplicateWarnings: string[]; priceAlerts: string[] }> {
+        const draftWriteContext = writeContext ?? { source: "unknown", action: "create_draft_po" };
+        try {
+            assertFinaleWriteAllowed(draftWriteContext);
+            await recordFinaleWriteAttempt({
+                source: draftWriteContext.source,
+                action: draftWriteContext.action,
+                allowed: true,
+                target: { vendorPartyId, itemCount: items.length },
+            });
+        } catch (err: any) {
+            await recordFinaleWriteAttempt({
+                source: draftWriteContext.source,
+                action: draftWriteContext.action,
+                allowed: false,
+                denialReason: err?.message ?? String(err),
+                target: { vendorPartyId, itemCount: items.length },
+            });
+            throw err;
+        }
+
         const today = new Date().toISOString().split('T')[0] + 'T00:00:00';
 
         // ── Step 0: Duplicate PO detection ──────────────────────────────────
@@ -4710,7 +4734,30 @@ export class FinaleClient {
      * Throws if the PO is not in ORDER_CREATED status (guards against re-commit).
      * Strategy: POST to actionUrlComplete if present; fall back to posting statusId: ORDER_LOCKED.
      */
-    async commitDraftPO(orderId: string): Promise<{ orderId: string; committed: boolean; finalStatus: string }> {
+    async commitDraftPO(
+        orderId: string,
+        writeContext?: FinaleWriteContext,
+    ): Promise<{ orderId: string; committed: boolean; finalStatus: string }> {
+        const commitWriteContext = writeContext ?? { source: "unknown", action: "commit_draft_po" };
+        try {
+            assertFinaleWriteAllowed(commitWriteContext);
+            await recordFinaleWriteAttempt({
+                source: commitWriteContext.source,
+                action: commitWriteContext.action,
+                allowed: true,
+                target: { orderId },
+            });
+        } catch (err: any) {
+            await recordFinaleWriteAttempt({
+                source: commitWriteContext.source,
+                action: commitWriteContext.action,
+                allowed: false,
+                denialReason: err?.message ?? String(err),
+                target: { orderId },
+            });
+            throw err;
+        }
+
         const po = await this.getOrderDetails(orderId);
 
         if (po.statusId !== "ORDER_CREATED") {

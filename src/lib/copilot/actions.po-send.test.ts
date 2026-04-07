@@ -153,4 +153,21 @@ describe("PO send actions", () => {
         expect(result.userMessage).toMatch(/committed/i);
         expect(result.userMessage).toMatch(/email/i);
     });
+
+    it("commits with the dashboard write context", async () => {
+        const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
+
+        await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+            skipEmail: true,
+        });
+
+        expect(commitDraftPOMock).toHaveBeenCalledWith("PO-1004", {
+            source: "dashboard",
+            action: "commit_draft_po",
+        });
+    });
 });

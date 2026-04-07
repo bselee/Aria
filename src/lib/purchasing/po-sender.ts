@@ -9,6 +9,7 @@ import { createClient } from '../supabase';
 import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
+import type { FinaleWriteContext } from "../finale/write-access";
 import type { CopilotChannel } from '../copilot/types';
 
 // ──────────────────────────────────────────────────
@@ -282,7 +283,8 @@ export async function commitAndSendPO(
 
     // 1. Commit in Finale
     const finale = new FinaleClient();
-    await finale.commitDraftPO(orderId);
+    const writeContext: FinaleWriteContext = { source: "dashboard", action: "commit_draft_po" };
+    await finale.commitDraftPO(orderId, writeContext);
     const committedAt = new Date().toISOString();
 
     // 2. Send email via bill.selee@buildasoil.com (if not skipped and email exists)

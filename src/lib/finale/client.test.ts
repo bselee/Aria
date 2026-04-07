@@ -237,3 +237,87 @@ describe("FinaleClient receivings pagination", () => {
         expect(graphqlBodies[1]).toContain('after: "cursor-1"');
     });
 });
+
+describe("FinaleClient PO write gating", () => {
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    it("denies draft PO creation without an allowed write context", async () => {
+        const client = new FinaleClient();
+
+        await expect(client.createDraftPurchaseOrder(
+            "vendor-1",
+            [{ productId: "SKU-1", quantity: 5, unitPrice: 2.5 }],
+        )).rejects.toThrow(/Finale write denied/);
+
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("allows draft PO creation when the dashboard write context is provided", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            orderId: "PO-900",
+            orderUrl: "/buildasoil/api/order/PO-900",
+            orderItemList: [
+                { productUrl: "/buildasoil/api/product/SKU-1" },
+            ],
+        }) as any);
+
+        const client = new FinaleClient();
+        vi.spyOn(client, "checkDuplicatePOs").mockResolvedValue([]);
+        vi.spyOn(client, "checkPriceChange").mockResolvedValue(null);
+        vi.spyOn(client, "validateProductExists").mockResolvedValue(true);
+        vi.spyOn(client, "getFacilityUrl").mockResolvedValue("/buildasoil/api/facility/shipping");
+
+        const result = await client.createDraftPurchaseOrder(
+            "vendor-1",
+            [{ productId: "SKU-1", quantity: 5, unitPrice: 2.5 }],
+            undefined,
+            undefined,
+            { source: "dashboard", action: "create_draft_po" },
+        );
+
+        expect(result.orderId).toBe("PO-900");
+        expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("denies draft PO commit without an allowed write context", async () => {
+        const client = new FinaleClient();
+
+        await expect(client.commitDraftPO("PO-1001")).rejects.toThrow(/Finale write denied/);
+
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("allows draft PO commit when the dashboard write context is provided", async () => {
+        const client = new FinaleClient();
+        vi.spyOn(client, "getOrderDetails").mockResolvedValue({
+            orderId: "PO-1001",
+            statusId: "ORDER_CREATED",
+            actionUrlComplete: "/buildasoil/api/order/PO-1001/complete",
+        } as any);
+        const postSpy = vi.spyOn(client as any, "post").mockResolvedValue({
+            statusId: "ORDER_LOCKED",
+        });
+
+        const result = await client.commitDraftPO("PO-1001", {
+            source: "dashboard",
+            action: "commit_draft_po",
+        });
+
+        expect(result).toEqual({
+            orderId: "PO-1001",
+            committed: true,
+            finalStatus: "ORDER_LOCKED",
+        });
+        expect(postSpy).toHaveBeenCalledWith(
+            "/buildasoil/api/order/PO-1001/complete",
+            {},
+        );
+    });
+});
