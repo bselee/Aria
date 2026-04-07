@@ -1,20 +1,39 @@
 /**
- * assess-purchases.ts — Cross-reference scraped purchasing suggestions against Finale inventory.
+ * assess-purchases.ts — Cross-reference scraped purchasing suggestions AND pending purchase requests
  *
- * Reads purchases-data.json (scraped from basauto.vercel.app/purchases), queries Finale for
- * each SKU's stock, sales velocity, open POs, and lead time, then ranks items by genuine need.
+ * TWO INPUTS:
+ *   1. purchases-data.json (scraped from basauto.vercel.app/purchases) — vendor suggestions
+ *   2. purchase-requests.json (scraped from Purchase Request Form) — team requests
+ *
+ * For each SKU from purchases tab: queries Finale for stock, sales velocity, open POs, lead time,
+ * then ranks items by genuine need (HIGH_NEED / MEDIUM / LOW / NOISE).
+ *
+ * For each Pending request: fuzzy-matches the details string to a Finale SKU (reuses Slack watchdog's
+ * Fuse.js pattern), queries Finale, and classifies the same way. Filters to status === 'Pending' only.
+ *
+ * Output distinguishes between: VENDOR_SUGGESTION vs TEAM_REQUEST source.
  *
  * Usage:
  *   node --import tsx src/cli/assess-purchases.ts
  *   node --import tsx src/cli/assess-purchases.ts --json          # Machine-readable output
- *   node --import tsx src/cli/assess-purchases.ts --vendor ULINE  # Filter to one vendor
+ *   node --import tsx src/cli/assess-purchases.ts --vendor ULINE  # Filter purchases to one vendor
  */
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import * as fs from 'fs';
 import * as path from 'path';
+import Fuse from 'fuse.js';
 import { FinaleClient } from '../lib/finale/client';
+import { createClient } from '../lib/supabase';
+import { FuzzyMatcher, KnownProduct } from '../lib/scraping/fuzzy-matcher';
+
+// ── Configuration ──
+
+const PRODUCT_CATALOG_LIMIT = 100; // recent POs to build catalog from
+const FUZZY_THRESHOLD = 0.4;       // same as Slack watchdog
+const FUZZY_MIN_MATCH = 3;
+const REQUEST_WORKERS = 2;         // fewer workers for request matching (less critical)
 
 // ── Types ──
 
@@ -22,29 +41,52 @@ interface ScrapedItem {
     sku: string;
     description: string;
     urgency: string;
-    [key: string]: string; // remaining fields all empty strings
+    [key: string]: string;
 }
 
 type ScrapedData = Record<string, ScrapedItem[]>;
 
+type ItemSource = 'VENDOR_SUGGESTION' | 'TEAM_REQUEST';
+
+interface PurchaseRequest {
+    date: string;
+    department: string;
+    type: 'Existing product' | 'New product';
+    details: string;
+    quantity: string;
+    link: string;
+    status: string;
+    ordered: string;
+}
+
+interface RawRequestsData {
+    scrapedAt: string;
+    requests: PurchaseRequest[];
+    rawDump?: string;
+}
+
 type NecessityLevel = 'HIGH_NEED' | 'MEDIUM' | 'LOW' | 'NOISE';
 
-interface AssessedItem {
+export interface AssessedItem {
     sku: string;
     description: string;
-    scrapedUrgency: string;         // what the dashboard claimed
-    necessity: NecessityLevel;       // our computed verdict
+    source: ItemSource;
+    rawDetails?: string;
+    rawRequest?: PurchaseRequest;
+    scrapedUrgency?: string; // only for vendor suggestions
+    fuzzyMatchScore?: number; // only for requests: 0-1 confidence
+    necessity: NecessityLevel;
     stockOnHand: number;
-    stockOnOrder: number;            // committed POs
-    salesVelocity: number;           // units/day (90d)
-    purchaseVelocity: number;        // units/day (90d)
-    dailyRate: number;               // best signal
-    runwayDays: number;              // stock / dailyRate
-    adjustedRunwayDays: number;      // (stock + onOrder) / dailyRate
+    stockOnOrder: number;
+    salesVelocity: number;
+    purchaseVelocity: number;
+    dailyRate: number;
+    runwayDays: number;
+    adjustedRunwayDays: number;
     leadTimeDays: number;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     explanation: string;
-    finaleFound: boolean;            // false if SKU not in Finale at all
+    finaleFound: boolean;
     doNotReorder: boolean;
 }
 
@@ -207,6 +249,146 @@ function parseNum(val: any): number {
     return isNaN(n) ? 0 : n;
 }
 
+// ── Product catalog for fuzzy matching (mirrors Slack watchdog) ──
+
+async function buildKnownProducts(): Promise<KnownProduct[]> {
+    const supabase = createClient();
+    if (!supabase) {
+        console.warn('⚠️ No Supabase connection — using empty catalog');
+        return [];
+    }
+
+    try {
+        const { data: pos } = await supabase
+            .from('purchase_orders')
+            .select('line_items, vendor_name, created_at')
+            .order('created_at', { ascending: false })
+            .limit(PRODUCT_CATALOG_LIMIT);
+
+        const seen = new Set<string>();
+        const products: KnownProduct[] = [];
+
+        for (const po of (pos || [])) {
+            for (const item of (po.line_items || [])) {
+                const key = (item.sku || item.description || '').toLowerCase();
+                if (key && !seen.has(key)) {
+                    seen.add(key);
+                    products.push({
+                        name: item.description || item.name || key,
+                        sku: item.sku || 'N/A',
+                        vendor: po.vendor_name,
+                        lastOrdered: po.created_at,
+                    });
+                }
+            }
+        }
+
+        console.log(`📦 Product catalog loaded: ${products.length} unique items from PO history`);
+        return products;
+    } catch (err: any) {
+        console.warn('⚠️ Catalog build error:', err.message);
+        return [];
+    }
+}
+
+
+
+// ── Unified assessment routine (used for both vendor items and requests) ──
+
+async function assessSku(
+    sku: string,
+    description: string,
+    source: ItemSource,
+    client: FinaleClient,
+    apiBase: string,
+    accountPath: string,
+    authHeader: string,
+    DAYS_BACK: number,
+    scrapedUrgency?: string,
+    rawRequest?: PurchaseRequest,
+    vendorName?: string,
+    matcher?: FuzzyMatcher,
+): Promise<AssessedItem> {
+    // Step 1: REST product lookup
+    let prodData: any = null;
+    let finaleFound = false;
+    let doNotReorder = false;
+    let leadTimeDays = 14;
+
+    try {
+        const res = await fetch(`${apiBase}/${accountPath}/api/product/${encodeURIComponent(sku)}`, {
+            headers: { Authorization: authHeader, Accept: 'application/json', 'Content-Type': 'application/json' },
+        });
+        if (res.ok) {
+            prodData = await res.json();
+            finaleFound = true;
+            doNotReorder = FinaleClient.isDoNotReorder(prodData);
+            const rawLead = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
+            if (!isNaN(rawLead) && rawLead > 0) leadTimeDays = rawLead;
+        }
+    } catch {
+    }
+
+    // Fuzzy retry if not found
+    if (!finaleFound && matcher) {
+        const fuzzy = matcher.match(description);
+        if (fuzzy) {
+            const fuzzyResult = await assessSku(fuzzy.sku, description, source, client, apiBase, accountPath, authHeader, DAYS_BACK, scrapedUrgency, rawRequest, vendorName);
+            if (fuzzyResult.finaleFound) {
+                fuzzyResult.fuzzyMatchScore = fuzzy.score;
+                fuzzyResult.rawDetails = (fuzzyResult.rawDetails || '') + ' (fuzzy matched to ' + fuzzy.sku + ')';
+                return fuzzyResult;
+            }
+        }
+    }
+
+    // Step 2: GraphQL activity
+    const activity = await getSkuActivity(client, sku, accountPath, apiBase, authHeader, DAYS_BACK);
+    if (!finaleFound && activity.stockOnHand > 0) finaleFound = true;
+
+    const stockOnHand = finaleFound
+        ? (activity.stockOnHand || parseNum(prodData?.quantityOnHand ?? 0))
+        : 0;
+    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
+    const purchaseVelocity = activity.purchasedQty / DAYS_BACK;
+    const salesVelocity = activity.soldQty / DAYS_BACK;
+    const dailyRate = Math.max(purchaseVelocity, salesVelocity);
+    const runwayDays = dailyRate > 0 ? stockOnHand / dailyRate : Infinity;
+    const adjustedRunwayDays = dailyRate > 0 ? (stockOnHand + stockOnOrder) / dailyRate : Infinity;
+
+    const { necessity, explanation } = computeNecessity(
+        stockOnHand, stockOnOrder, dailyRate, leadTimeDays, finaleFound, doNotReorder,
+    );
+
+    const openPOs = activity.openPOs.map(po => ({
+        orderId: po.orderId,
+        quantity: po.quantityOnOrder,
+        orderDate: po.orderDate,
+    }));
+
+    return {
+        sku,
+        description,
+        source,
+        rawDetails: rawRequest?.details,
+        rawRequest,
+        scrapedUrgency,
+        necessity,
+        stockOnHand,
+        stockOnOrder,
+        salesVelocity,
+        purchaseVelocity,
+        dailyRate,
+        runwayDays: runwayDays === Infinity ? -1 : Math.round(runwayDays),
+        adjustedRunwayDays: adjustedRunwayDays === Infinity ? -1 : Math.round(adjustedRunwayDays),
+        leadTimeDays,
+        openPOs,
+        explanation,
+        finaleFound,
+        doNotReorder,
+    };
+}
+
 // ── Necessity scoring ──
 
 function computeNecessity(
@@ -224,7 +406,6 @@ function computeNecessity(
         return { necessity: 'NOISE', explanation: 'Marked "Do Not Reorder" in Finale.' };
     }
     if (dailyRate === 0) {
-        // No movement at all in 90 days
         if (stockOnHand <= 0) {
             return { necessity: 'LOW', explanation: 'Zero stock, but no sales/purchase activity in 90 days — likely dormant.' };
         }
@@ -281,10 +462,9 @@ async function main() {
     }
     const scrapedData: ScrapedData = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
 
-    // Flatten into work queue
+    // Flatten into work queue for vendor suggestions
     const workQueue: Array<{ vendor: string; item: ScrapedItem }> = [];
     for (const [vendorKey, items] of Object.entries(scrapedData)) {
-        // Vendor keys have trailing digits from scraper (e.g., "ULINE7") — strip them
         const vendor = vendorKey.replace(/\d+$/, '').trim();
         if (vendorFilter && !vendor.toLowerCase().includes(vendorFilter)) continue;
         for (const item of items) {
@@ -298,97 +478,39 @@ async function main() {
     const client = new FinaleClient();
     await client.testConnection();
 
-    // We need raw auth for GraphQL calls (getProductActivity is private on the class)
     const accountPath = process.env.FINALE_ACCOUNT_PATH || '';
     const apiBase = process.env.FINALE_BASE_URL || 'https://app.finaleinventory.com';
     const authHeader = `Basic ${Buffer.from(`${process.env.FINALE_API_KEY || ''}:${process.env.FINALE_API_SECRET || ''}`).toString('base64')}`;
 
     const DAYS_BACK = 90;
     const results: Map<string, AssessedItem[]> = new Map();
-
-    // 3 concurrent workers, 100ms inter-SKU throttle (matches getPurchasingIntelligence pattern)
-    const queue = [...workQueue];
     const assessed: Array<{ vendor: string; assessed: AssessedItem }> = [];
 
+    // ── Process vendor suggestions (3 concurrent workers) ──
+    const vendorQueue = [...workQueue];
     await Promise.all(Array.from({ length: 3 }, async () => {
-        while (queue.length > 0) {
-            const work = queue.shift()!;
+        while (vendorQueue.length > 0) {
+            const work = vendorQueue.shift()!;
             const { vendor, item } = work;
             const sku = item.sku;
 
             try {
-                // Step 1: REST product lookup — stock, lead time, supplier, do-not-reorder check
-                let prodData: any = null;
-                let finaleFound = false;
-                let doNotReorder = false;
-                let leadTimeDays = 14; // default
-
-                try {
-                    const res = await fetch(`${apiBase}/${accountPath}/api/product/${encodeURIComponent(sku)}`, {
-                        headers: { Authorization: authHeader, Accept: 'application/json', 'Content-Type': 'application/json' },
-                    });
-                    if (res.ok) {
-                        prodData = await res.json();
-                        finaleFound = true;
-                        doNotReorder = FinaleClient.isDoNotReorder(prodData);
-                        const rawLead = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
-                        if (!isNaN(rawLead) && rawLead > 0) leadTimeDays = rawLead;
-                    }
-                } catch {
-                    // Product not found or API error — finaleFound stays false
-                }
-
-                // Step 2: GraphQL activity query (even if REST 404'd — GraphQL may still find stock/orders)
-                const activity = await getSkuActivity(client, sku, accountPath, apiBase, authHeader, DAYS_BACK);
-
-                // If REST failed but GraphQL found stock, mark as found
-                if (!finaleFound && activity.stockOnHand > 0) finaleFound = true;
-
-                const stockOnHand = finaleFound
-                    ? (activity.stockOnHand || parseNum(prodData?.quantityOnHand ?? 0))
-                    : 0;
-                const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
-
-                const purchaseVelocity = activity.purchasedQty / DAYS_BACK;
-                const salesVelocity = activity.soldQty / DAYS_BACK;
-                const dailyRate = Math.max(purchaseVelocity, salesVelocity);
-                const runwayDays = dailyRate > 0 ? stockOnHand / dailyRate : Infinity;
-                const adjustedRunwayDays = dailyRate > 0 ? (stockOnHand + stockOnOrder) / dailyRate : Infinity;
-
-                const { necessity, explanation } = computeNecessity(
-                    stockOnHand, stockOnOrder, dailyRate, leadTimeDays, finaleFound, doNotReorder,
-                );
-
-                const openPOs = activity.openPOs.map(po => ({
-                    orderId: po.orderId,
-                    quantity: po.quantityOnOrder,
-                    orderDate: po.orderDate,
-                }));
-
-                const assessedItem: AssessedItem = {
+                const assessedItem = await assessSku(
                     sku,
-                    description: item.description,
-                    scrapedUrgency: item.urgency || '(none)',
-                    necessity,
-                    stockOnHand,
-                    stockOnOrder,
-                    salesVelocity,
-                    purchaseVelocity,
-                    dailyRate,
-                    runwayDays: runwayDays === Infinity ? -1 : Math.round(runwayDays),
-                    adjustedRunwayDays: adjustedRunwayDays === Infinity ? -1 : Math.round(adjustedRunwayDays),
-                    leadTimeDays,
-                    openPOs,
-                    explanation,
-                    finaleFound,
-                    doNotReorder,
-                };
-
+                    item.description,
+                    'VENDOR_SUGGESTION',
+                    client,
+                    apiBase,
+                    accountPath,
+                    authHeader,
+                    DAYS_BACK,
+                    item.urgency || undefined
+                );
                 assessed.push({ vendor, assessed: assessedItem });
 
-                const icon = necessity === 'HIGH_NEED' ? '🔴' : necessity === 'MEDIUM' ? '🟡' : necessity === 'LOW' ? '🟠' : '⚪';
+                const icon = assessedItem.necessity === 'HIGH_NEED' ? '🔴' : assessedItem.necessity === 'MEDIUM' ? '🟡' : assessedItem.necessity === 'LOW' ? '🟠' : '⚪';
                 if (!jsonOutput) {
-                    console.log(`  ${icon} ${sku.padEnd(12)} ${necessity.padEnd(10)} stock=${Math.round(stockOnHand)} vel=${dailyRate.toFixed(2)}/d runway=${runwayDays === -1 ? '∞' : Math.round(runwayDays as number) + 'd'}`);
+                    console.log(`  ${icon} ${sku.padEnd(12)} ${assessedItem.necessity.padEnd(10)} stock=${Math.round(assessedItem.stockOnHand)} vel=${assessedItem.dailyRate.toFixed(2)}/d runway=${assessedItem.runwayDays === -1 ? '∞' : assessedItem.runwayDays + 'd'}`);
                 }
             } catch (err: any) {
                 console.error(`  [error] ${sku}: ${err.message}`);
@@ -397,6 +519,7 @@ async function main() {
                     assessed: {
                         sku,
                         description: item.description,
+                        source: 'VENDOR_SUGGESTION',
                         scrapedUrgency: item.urgency || '(none)',
                         necessity: 'NOISE',
                         stockOnHand: 0,
@@ -415,25 +538,133 @@ async function main() {
                 });
             }
 
-            // 100ms throttle between SKU dispatches
             await new Promise(r => setTimeout(r, 100));
         }
     }));
 
-    // ── Group by vendor ──
+    // ── Process pending purchase requests (fuzzy match → assess) ──
+    const requestsPath = path.resolve(__dirname, '../../purchase-requests.json');
+    if (fs.existsSync(requestsPath) && !vendorFilter) {
+        const rawData: RawRequestsData = JSON.parse(fs.readFileSync(requestsPath, 'utf-8'));
+        const pendingRequests = rawData.requests.filter(r => r.status === 'Pending');
+
+        if (pendingRequests.length > 0) {
+            console.log(`\n  Assessing ${pendingRequests.length} pending purchase requests...\n`);
+
+            const { fuse } = await buildProductCatalog();
+            const requestQueue = [...pendingRequests];
+            const requestResults: Array<{ vendor: string; assessed: AssessedItem }> = [];
+
+            await Promise.all(Array.from({ length: REQUEST_WORKERS }, async () => {
+                while (requestQueue.length > 0) {
+                    const req = requestQueue.shift()!;
+                    const details = req.details;
+
+                    try {
+                        const match = fuzzyMatch(fuse, details);
+                        if (!match || match.score < FUZZY_THRESHOLD) {
+                            // No SKU match — treat as NOISE
+                            const assessedItem: AssessedItem = {
+                                sku: '(no match)',
+                                description: details,
+                                source: 'TEAM_REQUEST',
+                                rawDetails: details,
+                                rawRequest: req,
+                                necessity: 'NOISE',
+                                stockOnHand: 0,
+                                stockOnOrder: 0,
+                                salesVelocity: 0,
+                                purchaseVelocity: 0,
+                                dailyRate: 0,
+                                runwayDays: -1,
+                                adjustedRunwayDays: -1,
+                                leadTimeDays: 14,
+                                openPOs: [],
+                                explanation: 'Could not fuzzy-match to a known SKU in Finale.',
+                                finaleFound: false,
+                                doNotReorder: false,
+                                fuzzyMatchScore: match?.score,
+                            };
+                            requestResults.push({ vendor: req.department, assessed: assessedItem });
+                            if (!jsonOutput) {
+                                console.log(`  ⚪ NO MATCH — "${details.substring(0, 40)}..." (score: ${match?.score?.toFixed(2) || 0})`);
+                            }
+                            continue;
+                        }
+
+                        const sku = match.product.sku;
+                        const assessedItem = await assessSku(
+                            sku,
+                            details,
+                            'TEAM_REQUEST',
+                            client,
+                            apiBase,
+                            accountPath,
+                            authHeader,
+                            DAYS_BACK,
+                            undefined,
+                            req,
+                            req.department
+                        );
+                        // Attach fuzzy score
+                        assessedItem.fuzzyMatchScore = match.score;
+
+                        requestResults.push({ vendor: req.department, assessed: assessedItem });
+
+                        const icon = assessedItem.necessity === 'HIGH_NEED' ? '🔴' : assessedItem.necessity === 'MEDIUM' ? '🟡' : assessedItem.necessity === 'LOW' ? '🟠' : '⚪';
+                        if (!jsonOutput) {
+                            console.log(`  ${icon} [REQ] ${sku.padEnd(12)} ${assessedItem.necessity.padEnd(10)} stock=${Math.round(assessedItem.stockOnHand)} vel=${assessedItem.dailyRate.toFixed(2)}/d runway=${assessedItem.runwayDays === -1 ? '∞' : assessedItem.runwayDays + 'd'} (match: ${match.score.toFixed(2)})`);
+                        }
+                    } catch (err: any) {
+                        console.error(`  [error] request "${details.substring(0, 30)}...": ${err.message}`);
+                        requestResults.push({
+                            vendor: req.department,
+                            assessed: {
+                                sku: '(error)',
+                                description: details,
+                                source: 'TEAM_REQUEST',
+                                rawDetails: details,
+                                rawRequest: req,
+                                necessity: 'NOISE',
+                                stockOnHand: 0,
+                                stockOnOrder: 0,
+                                salesVelocity: 0,
+                                purchaseVelocity: 0,
+                                dailyRate: 0,
+                                runwayDays: -1,
+                                adjustedRunwayDays: -1,
+                                leadTimeDays: 14,
+                                openPOs: [],
+                                explanation: `Error: ${err.message}`,
+                                finaleFound: false,
+                                doNotReorder: false,
+                            },
+                        });
+                    }
+
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }));
+
+            // Merge request results into assessed array for grouping
+            assessed.push(...requestResults);
+        }
+    }
+
+    // ── Group by vendor (or department for requests) ──
     for (const { vendor, assessed: item } of assessed) {
         if (!results.has(vendor)) results.set(vendor, []);
         results.get(vendor)!.push(item);
     }
 
-    // ── Sort: HIGH_NEED first within each vendor, vendors with most HIGH_NEED first ──
+    // ── Sort: HIGH_NEED first within each group, groups with most HIGH_NEED first ──
     const necessityRank: Record<NecessityLevel, number> = { HIGH_NEED: 0, MEDIUM: 1, LOW: 2, NOISE: 3 };
     const vendorAssessments: VendorAssessment[] = [];
 
-    for (const [vendor, items] of results) {
+    for (const [group, items] of results) {
         items.sort((a, b) => necessityRank[a.necessity] - necessityRank[b.necessity]);
         vendorAssessments.push({
-            vendor,
+            vendor: group,
             items,
             highNeedCount: items.filter(i => i.necessity === 'HIGH_NEED').length,
             mediumCount: items.filter(i => i.necessity === 'MEDIUM').length,
@@ -448,7 +679,6 @@ async function main() {
         process.exit(0);
     }
 
-    // Summary counts
     const allItems = vendorAssessments.flatMap(v => v.items);
     const highCount = allItems.filter(i => i.necessity === 'HIGH_NEED').length;
     const medCount = allItems.filter(i => i.necessity === 'MEDIUM').length;
@@ -456,7 +686,7 @@ async function main() {
     const noiseCount = allItems.filter(i => i.necessity === 'NOISE').length;
 
     console.log('\n' + '═'.repeat(80));
-    console.log(`  PURCHASE ASSESSMENT — ${allItems.length} SKUs from scraped dashboard`);
+    console.log(`  PURCHASE ASSESSMENT — ${allItems.length} items (${workQueue.length} vendor suggestions + ${assessed.length - workQueue.length} requests)`);
     console.log('═'.repeat(80));
     console.log(`  🔴 HIGH NEED: ${highCount}   🟡 MEDIUM: ${medCount}   🟠 LOW: ${lowCount}   ⚪ NOISE: ${noiseCount}`);
     console.log('─'.repeat(80));
@@ -466,7 +696,8 @@ async function main() {
         console.log('  │');
         for (const item of va.items) {
             const icon = item.necessity === 'HIGH_NEED' ? '🔴' : item.necessity === 'MEDIUM' ? '🟡' : item.necessity === 'LOW' ? '🟠' : '⚪';
-            console.log(`  │  ${icon} ${item.necessity.padEnd(10)} ${item.sku.padEnd(14)} ${item.description}`);
+            const sourceTag = item.source === 'TEAM_REQUEST' ? '[REQ]' : '';
+            console.log(`  │  ${icon} ${sourceTag} ${item.necessity.padEnd(10)} ${item.sku.padEnd(14)} ${item.description}`);
             console.log(`  │     ${item.explanation}`);
             if (item.openPOs.length > 0) {
                 const poList = item.openPOs.map(po => `${po.orderId} (qty ${Math.round(po.quantity)})`).join(', ');
@@ -474,6 +705,12 @@ async function main() {
             }
             if (item.scrapedUrgency && item.scrapedUrgency !== '(none)') {
                 console.log(`  │     Dashboard claimed: ${item.scrapedUrgency}`);
+            }
+            if (item.fuzzyMatchScore !== undefined) {
+                console.log(`  │     Fuzzy match score: ${item.fuzzyMatchScore.toFixed(2)}`);
+            }
+            if (item.rawDetails && item.rawDetails !== item.description) {
+                console.log(`  │     Request: ${item.rawDetails}`);
             }
         }
         console.log('  └─');
