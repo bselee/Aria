@@ -283,7 +283,7 @@ export async function commitAndSendPO(
 
     // 1. Commit in Finale
     const finale = new FinaleClient();
-    const writeContext: FinaleWriteContext = { source: "dashboard", action: "commit_draft_po" };
+    const writeContext: FinaleWriteContext = { source: triggeredBy, action: "commit_draft_po" };
     await finale.commitDraftPO(orderId, writeContext);
     const committedAt = new Date().toISOString();
 

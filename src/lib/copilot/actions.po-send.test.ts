@@ -170,4 +170,21 @@ describe("PO send actions", () => {
             action: "commit_draft_po",
         });
     });
+
+    it("propagates the telegram write context for telegram-triggered sends", async () => {
+        const sendId = await storePendingPOSend("PO-1005", makeReview("PO-1005"), "vendor@example.com", "vendor_profiles", {
+            channel: "telegram",
+        });
+
+        await executePOSendAction({
+            sendId,
+            triggeredBy: "telegram",
+            skipEmail: true,
+        });
+
+        expect(commitDraftPOMock).toHaveBeenCalledWith("PO-1005", {
+            source: "telegram",
+            action: "commit_draft_po",
+        });
+    });
 });

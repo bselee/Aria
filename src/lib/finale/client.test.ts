@@ -294,6 +294,17 @@ describe("FinaleClient PO write gating", () => {
         expect(global.fetch).not.toHaveBeenCalled();
     });
 
+    it("denies draft PO commit when telegram context is provided", async () => {
+        const client = new FinaleClient();
+
+        await expect(client.commitDraftPO("PO-1001", {
+            source: "telegram",
+            action: "commit_draft_po",
+        })).rejects.toThrow(/Finale write denied/);
+
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
     it("allows draft PO commit when the dashboard write context is provided", async () => {
         const client = new FinaleClient();
         vi.spyOn(client, "getOrderDetails").mockResolvedValue({
