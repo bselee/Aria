@@ -60,7 +60,13 @@ export async function POST(req: NextRequest) {
         }
 
         const client = new FinaleClient();
-        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
+        const result = await client.createDraftPurchaseOrder(
+            vendorPartyId,
+            items,
+            memo,
+            purchaseDestination,
+            { source: 'dashboard', action: 'create_draft_po' },
+        );
 
         // Invalidate cache so next GET reflects the new PO
         cache = null;

@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
     finaleCtorMock,
     assessGroupsMock,
+    createDraftPurchaseOrderMock,
 } = vi.hoisted(() => ({
     finaleCtorMock: vi.fn(),
     assessGroupsMock: vi.fn(),
+    createDraftPurchaseOrderMock: vi.fn(),
 }));
 
 vi.mock("@/lib/finale/client", () => ({
@@ -60,6 +62,13 @@ describe("dashboard purchasing route", () => {
                     ],
                 },
             ]);
+            this.createDraftPurchaseOrder = createDraftPurchaseOrderMock.mockResolvedValue({
+                orderId: "PO-900",
+                finaleUrl: "https://finale.example/po/PO-900",
+                facilityName: "Shipping",
+                duplicateWarnings: [],
+                priceAlerts: [],
+            });
         });
 
         assessGroupsMock.mockReturnValue({
@@ -159,5 +168,34 @@ describe("dashboard purchasing route", () => {
                 actionableCount: 1,
             }),
         ]);
+    });
+
+    it("passes the dashboard write context when creating a draft PO", async () => {
+        const { POST } = await import("./route");
+
+        const response = await POST({
+            json: async () => ({
+                vendorPartyId: "party-1",
+                items: [
+                    { productId: "BOX-101", quantity: 10, unitPrice: 1.15 },
+                ],
+                memo: "restock",
+                purchaseDestination: "Shipping",
+            }),
+        } as any);
+
+        expect(response.status).toBe(200);
+        expect(createDraftPurchaseOrderMock).toHaveBeenCalledWith(
+            "party-1",
+            [
+                { productId: "BOX-101", quantity: 10, unitPrice: 1.15 },
+            ],
+            "restock",
+            "Shipping",
+            {
+                source: "dashboard",
+                action: "create_draft_po",
+            },
+        );
     });
 });
