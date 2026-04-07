@@ -18,9 +18,11 @@ import {
     applyReconciliation,
     ReconciliationResult,
     storePendingApproval,
+    enqueueForDashboardReview,
     updatePendingApprovalMessageId,
     buildAuditMetadata,
     buildReconciliationReport,
+    validateInvoiceBalance,
 } from "../finale/reconciler";
 import { recordFeedback } from "./feedback-loop";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
@@ -1508,10 +1510,14 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 await this.sendReconciliationNotification(result);
 
             } else if (result.overallVerdict === "needs_approval") {
-                // Store for Telegram bot approval and send inline keyboard
-                const approvalId = await storePendingApproval(result, finaleClient);
-                writeReconciliationMemory("needs_approval");
-                await this.sendApprovalRequest(result, approvalId);
+                // Enqueue for dashboard review instead of Telegram approval
+                const balanceCheck = validateInvoiceBalance(invoice);
+                await enqueueForDashboardReview(result, balanceCheck);
+                writeReconciliationMemory("dashboard_review");
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID!,
+                    `🔍 Invoice #${result.invoiceNumber} (${result.vendorName}) changes outside guardrails — enqueued for dashboard review\n\n${result.summary}\n\nCheck the AP / Invoices panel to approve or dismiss.`
+                );
 
             } else if (result.overallVerdict === "rejected") {
                 // Magnitude error — alert but do NOT apply

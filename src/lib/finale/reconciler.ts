@@ -2231,6 +2231,48 @@ export function buildReconciliationReport(
 }
 
 // ──────────────────────────────────────────────────
+// DASHBOARD REVIEW ENQUEUE
+// ──────────────────────────────────────────────────
+
+/**
+ * Enqueue a reconciliation result for dashboard review instead of Telegram approval.
+ * Inserts a new row in ap_activity_log with status="pending" in metadata.
+ * Assumes the reconciliation has been determined to be outside guardrails for auto-apply.
+ */
+export async function enqueueForDashboardReview(
+    result: ReconciliationResult,
+    balanceCheck: { valid: boolean; gap: number; message: string }
+): Promise<void> {
+    try {
+        const supabase = createClient();
+        if (supabase) {
+            await supabase.from("ap_activity_log").insert({
+                email_from: result.vendorName,
+                email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId} - Dashboard Review Required`,
+                intent: "RECONCILIATION",
+                action_taken: "Dashboard review required - awaiting approval",
+                metadata: {
+                    invoiceNumber: result.invoiceNumber,
+                    orderId: result.orderId,
+                    vendorName: result.vendorName,
+                    overallVerdict: result.overallVerdict,
+                    totalDollarImpact: result.totalDollarImpact,
+                    priceChanges: result.priceChanges,
+                    feeChanges: result.feeChanges,
+                    status: "pending",
+                    balanceCheck,
+                    matchStrategy: result.matchStrategy,
+                    notes: result.notes,
+                },
+                reconciliation_report: result.report,
+            });
+        }
+    } catch (err: any) {
+        console.warn(`[reconciler] Failed to enqueue for dashboard review: ${err.message}`);
+    }
+}
+
+// ──────────────────────────────────────────────────
 // PRICE CHANGE AUDIT LOG — flat, queryable table
 // ──────────────────────────────────────────────────
 

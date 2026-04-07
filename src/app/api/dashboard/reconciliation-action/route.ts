@@ -60,30 +60,51 @@ export async function POST(req: Request) {
         if (action === "approve") {
             const finale = new FinaleClient();
 
-            // DECISION(2026-03-04): Re-run reconciliation against Finale instead of
-            // relying on the bot's in-memory pendingApprovals Map. This approach:
-            //   - Works across process boundaries (Next.js ≠ PM2 bot)
-            //   - Survives bot restarts
-            //   - Gets latest PO state from Finale (prices may have changed)
-            //   - Eliminates stale-approval risk
-            const reconResult: ReconciliationResult = await reconcileInvoiceToPO(
-                {
+            let reconResult: ReconciliationResult;
+
+            if (logEntry.intent === "RECONCILIATION" && logEntry.action_taken === "Dashboard review required - awaiting approval" && metadata.priceChanges) {
+                // Use stored reconciliation result from dashboard review entry
+                reconResult = {
+                    orderId: metadata.orderId,
                     invoiceNumber: metadata.invoiceNumber,
                     vendorName: metadata.vendorName || logEntry.email_from,
-                    poNumber: metadata.orderId,
-                    total: 0,
-                    lineItems: [],
-                    fees: [],
-                } as any,
-                metadata.orderId,
-                finale
-            );
+                    invoiceTotal: 0, // Not stored, set to 0
+                    priceChanges: metadata.priceChanges,
+                    feeChanges: metadata.feeChanges,
+                    trackingUpdate: null,
+                    overallVerdict: metadata.overallVerdict,
+                    summary: `Dashboard approved: ${metadata.totalDollarImpact || 0} impact`,
+                    totalDollarImpact: metadata.totalDollarImpact || 0,
+                    autoApplicable: false,
+                    warnings: metadata.balanceCheck?.message ? [metadata.balanceCheck.message] : [],
+                    report: metadata.reconciliation_report,
+                };
+            } else {
+                // DECISION(2026-03-04): Re-run reconciliation against Finale instead of
+                // relying on the bot's in-memory pendingApprovals Map. This approach:
+                //   - Works across process boundaries (Next.js ≠ PM2 bot)
+                //   - Survives bot restarts
+                //   - Gets latest PO state from Finale (prices may have changed)
+                //   - Eliminates stale-approval risk
+                reconResult = await reconcileInvoiceToPO(
+                    {
+                        invoiceNumber: metadata.invoiceNumber,
+                        vendorName: metadata.vendorName || logEntry.email_from,
+                        poNumber: metadata.orderId,
+                        total: 0,
+                        lineItems: [],
+                        fees: [],
+                    } as any,
+                    metadata.orderId,
+                    finale
+                );
 
-            if (reconResult.overallVerdict === "duplicate") {
-                return NextResponse.json({
-                    success: false,
-                    message: "This invoice has already been reconciled.",
-                });
+                if (reconResult.overallVerdict === "duplicate") {
+                    return NextResponse.json({
+                        success: false,
+                        message: "This invoice has already been reconciled.",
+                    });
+                }
             }
 
             // Approve ALL changes — same as Telegram approve flow
