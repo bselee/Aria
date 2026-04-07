@@ -29,6 +29,7 @@ dotenv.config({ path: '.env.local' });
 import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { BrowserManager } from '../lib/scraping/browser-manager';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -38,7 +39,7 @@ import os from 'os';
 const INVOICES_URL = 'https://www.uline.com/MyAccount/Invoices';
 const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
 const JSON_PATH = path.join(SANDBOX_DIR, 'uline-invoice-details.json');
-const CHROME_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
+const UL_SESSION_FILE = '.uline-session.json';
 const FREIGHT_PROMO = '/buildasoilorganics/api/productpromo/10007';
 const TAX_PROMO = '/buildasoilorganics/api/productpromo/10008';
 
@@ -58,6 +59,11 @@ const ULINE_TO_FINALE: Record<string, string> = {
 
 function toFinaleId(ulineSku: string): string {
     return ULINE_TO_FINALE[ulineSku] || ulineSku;
+}
+
+function cookiesFromFile(filePath: string): any[] {
+    if (!fs.existsSync(filePath)) return [];
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -197,12 +203,9 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
 
     if (!fs.existsSync(SANDBOX_DIR)) fs.mkdirSync(SANDBOX_DIR, { recursive: true });
 
-    const context = await chromium.launchPersistentContext(
-        path.join(CHROME_PROFILE, 'Default'),
-        { headless: false, channel: 'chrome', acceptDownloads: true, viewport: { width: 1280, height: 900 }, args: ['--disable-blink-features=AutomationControlled'] }
-    );
-
-    const page = context.pages()[0] || await context.newPage();
+    const manager = BrowserManager.getInstance();
+    const page = await manager.launchBrowser({ headless: false });
+    await page.context().addCookies(cookiesFromFile(UL_SESSION_FILE));
     const invoices: UlineInvoice[] = [];
 
     try {
@@ -292,7 +295,7 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
         }
         console.log(`   ✅ Archived ${archived}/${invoices.length} invoices`);
     } finally {
-        await context.close();
+        await manager.close();
     }
 
     return invoices;

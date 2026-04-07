@@ -1,5 +1,6 @@
 // src/lib/scraping/browser-manager.ts
 import { chromium, BrowserContext, Page } from 'playwright';
+import fs from 'fs';
 
 export interface BrowserOptions {
   headless?: boolean;
@@ -29,7 +30,11 @@ export class BrowserManager {
       });
     }
     this.context = await this.browser.newContext();
-    const page = await this.context.newPage();
+    if (options.cookiesPath && fs.existsSync(options.cookiesPath)) {
+      const cookies = JSON.parse(fs.readFileSync(options.cookiesPath, 'utf-8'));
+      await this.context!.addCookies(cookies);
+    }
+    const page = await this.context!.newPage();
     return page;
   }
 
