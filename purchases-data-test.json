@@ -1,0 +1,26 @@
+{
+  "TestVendor1": [
+    {
+      "sku": "TEST101",
+      "description": "Test item for scraping",
+      "urgency": "",
+      "purchaseAgainBy": "",
+      "recommendedReorderQty": "",
+      "supplierLeadTime": "",
+      "remaining": "",
+      "last30DaysSold": "",
+      "last90DaysSold": "",
+      "dailyVelocity": "",
+      "ninetyDayConsumed": "",
+      "avgBuildConsumption": "",
+      "daysBuildsLeft": "",
+      "lastReceived": "",
+      "ytdQtyBought": "",
+      "ytdPurchaseCost": "",
+      "cogsExclShip": "",
+      "ytdQtySold": "",
+      "ytdRevenue": "",
+      "itemMargin": ""
+    }
+  ]
+}
