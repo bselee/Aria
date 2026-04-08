@@ -35,13 +35,14 @@
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
-import { chromium, type Page } from 'playwright';
+import { type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
 import {
     convertFinaleItemToUlineOrder,
     toUlineModel,
 } from '../lib/purchasing/uline-ordering';
 import {
+    diffObservedUlineCartRows,
     scrapeObservedUlineCartRows,
     syncVerifiedUlineCartPricesToDraftPO,
 } from '../lib/purchasing/uline-cart-live';
@@ -57,13 +58,10 @@ import {
     type CartVerificationResult,
     type ObservedUlineCartRow,
 } from './order-uline-cart';
-import path from 'path';
-import os from 'os';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const QUICK_ORDER_URL = 'https://www.uline.com/Ordering/QuickOrder';
-const CHROME_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -248,10 +246,10 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
  * @param finale - FinaleClient instance
  * @returns OrderManifest with auto-detected items (sourceType='auto_reorder')
  */
-async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManifest> {
+export async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManifest> {
     console.log('   🤖 Running purchasing intelligence scan for ULINE items...');
-    console.log('   ⏳ This scans all active products — may take 1-2 minutes...\n');
-    const groups = await finale.getPurchasingIntelligence();
+    console.log('   ⏳ Using Finale vendor-scoped purchasing intelligence for ULINE...\n');
+    const groups = await finale.getPurchasingIntelligence(365, 'ULINE');
     const plans = buildVendorDraftPlans(groups, {}, 'uline');
 
     if (plans.length === 0) {
@@ -372,7 +370,7 @@ async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManife
  * @param manifest - OrderManifest with items to include
  * @returns Updated manifest with sourcePO set to the new PO number
  */
-async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderManifest): Promise<OrderManifest> {
+export async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderManifest): Promise<OrderManifest> {
     console.log('\n   📝 Creating draft PO in Finale...');
 
     // DECISION(2026-03-16): Use findVendorPartyByName instead of re-running the
@@ -393,7 +391,7 @@ async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderManifest
 
     const finaleItems = manifest.items.map(item => ({
         productId: item.finaleSku,
-        quantity: item.finaleEachQuantity,
+        quantity: item.effectiveEachQuantity,
         unitPrice: item.finaleUnitPrice,
     }));
 
@@ -421,8 +419,10 @@ async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderManifest
         }
     }
 
+    const savedManifest = await gatherFromPO(finale, result.orderId);
+
     return {
-        ...manifest,
+        ...savedManifest,
         sourcePO: result.orderId,
     };
 }
@@ -586,45 +586,14 @@ async function placeViaQuickOrderPaste(
     console.log('\n   🌐 Launching browser (Paste Items method)...');
     if (!autonomous) console.log('   ⚠️  Chrome must be closed for this step\n');
 
-    const context = await chromium.launchPersistentContext(
-        path.join(CHROME_PROFILE, 'Default'),
-        {
-            headless: false,
-            channel: 'chrome',
-            acceptDownloads: true,
-            viewport: { width: 1280, height: 900 },
-            args: ['--disable-blink-features=AutomationControlled'],
-        }
-    );
+    const session = await launchUlineSession({ headless: false });
+    const { context } = session;
 
     const page = context.pages()[0] || await context.newPage();
 
     try {
         // Navigate to Quick Order page
         await openUlinePasteItemsPage(page);
-
-        // Handle login if needed
-        const landed = await Promise.race([
-            page.waitForSelector('text=Paste Items Page', { timeout: 15_000 }).then(() => 'ready' as const),
-            page.waitForSelector('#txtEmail', { timeout: 15_000 }).then(() => 'login' as const),
-        ]).catch(() => 'unknown' as const);
-
-        if (landed === 'login') {
-            console.log('   🔐 Login required — filling credentials...');
-            await page.fill('#txtEmail', process.env.ULINE_EMAIL || '');
-            await page.fill('#txtPassword', process.env.ULINE_PASSWORD || '');
-            await page.click('#btnSignIn');
-            console.log('   ⏳ Waiting for login (solve CAPTCHA if needed)...');
-            await page.waitForSelector('text=Paste Items Page', { timeout: 120_000 });
-        }
-
-        if (landed === 'unknown') {
-            throw new Error('Could not detect Quick Order page or login form');
-        }
-
-        // Click "Paste Items Page" link
-        await page.click('text=Paste Items Page');
-        await page.waitForSelector('#txtPaste', { timeout: 10_000 });
         console.log('   ✅ Paste Items Page loaded\n');
 
         // Format items: "ModelNumber, Quantity" per line
@@ -646,6 +615,7 @@ async function placeViaQuickOrderPaste(
         // DECISION(2026-03-16): ULINE's Paste Items Page uses a variety of button types.
         // We try multiple selectors and fallback strategies. If all fail, we leave
         // the page open for manual click rather than crashing.
+        const beforeRows = await scrapeObservedUlineCartRows(page);
         let addClicked = false;
 
         // Strategy 1: broad CSS selector search
@@ -697,7 +667,7 @@ async function placeViaQuickOrderPaste(
         }
 
         const observedRows = addClicked
-            ? await scrapeObservedUlineCartRows(page)
+            ? diffObservedUlineCartRows(beforeRows, await scrapeObservedUlineCartRows(page))
             : [];
         const verification = verifyUlineCart(items, observedRows);
         const message = formatCartVerificationMessage(verification);
@@ -716,7 +686,7 @@ async function placeViaQuickOrderPaste(
         if (autonomous) {
             console.log('\n   🤖 Autonomous mode — closing browser after cart fill.');
             await page.waitForTimeout(2_000);
-            await context.close();
+            await session.close();
             return {
                 message: addClicked ? message : 'Cart fill attempted; manual verification needed.',
                 verification,
@@ -739,7 +709,7 @@ async function placeViaQuickOrderPaste(
             // Timeout is fine — user just didn't close the tab
         }
 
-        await context.close();
+        await session.close();
 
         return {
             message,
@@ -751,7 +721,7 @@ async function placeViaQuickOrderPaste(
     } catch (err) {
         if (autonomous) {
             // Autonomous mode: close and report the error — don't hang
-            try { await context.close(); } catch { /* best effort */ }
+            try { await session.close(); } catch { /* best effort */ }
             return {
                 message: `⚠️ Cart fill failed: ${(err as Error).message}`,
                 verification: {
@@ -775,7 +745,7 @@ async function placeViaQuickOrderPaste(
             await page.waitForEvent('close', { timeout: 600_000 });
         } catch { /* timeout ok */ }
 
-        await context.close();
+        await session.close();
         return {
             message: 'Cart fill attempted; manual verification needed.',
             verification: {
@@ -803,16 +773,8 @@ async function placeViaQuickOrderGrid(items: OrderLineItem[]): Promise<string> {
     console.log('\n   🌐 Launching browser (Grid method)...');
     console.log('   ⚠️  Chrome must be closed for this step\n');
 
-    const context = await chromium.launchPersistentContext(
-        path.join(CHROME_PROFILE, 'Default'),
-        {
-            headless: false,
-            channel: 'chrome',
-            acceptDownloads: true,
-            viewport: { width: 1280, height: 900 },
-            args: ['--disable-blink-features=AutomationControlled'],
-        }
-    );
+    const session = await launchUlineSession({ headless: false });
+    const { context } = session;
 
     const page = context.pages()[0] || await context.newPage();
 
@@ -887,7 +849,7 @@ async function placeViaQuickOrderGrid(items: OrderLineItem[]): Promise<string> {
         return `Added ${items.length} items to ULINE cart via Grid method`;
 
     } finally {
-        await context.close();
+        await session.close();
     }
 }
 
@@ -916,7 +878,9 @@ function printManifest(manifest: OrderManifest) {
 
 function getBlockingGuardrailWarnings(items: OrderLineItem[]): string[] {
     return items.flatMap(item =>
-        item.guardrailWarnings.filter(warning => warning.includes('exceeds the')),
+        item.guardrailWarnings.filter(warning =>
+            warning.includes('exceeds the') || warning.includes('BLOCKING GUARDRAIL'),
+        ),
     );
 }
 

@@ -39,6 +39,8 @@ import os from 'os';
 const INVOICES_URL = 'https://www.uline.com/MyAccount/Invoices';
 const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
 const JSON_PATH = path.join(SANDBOX_DIR, 'uline-invoice-details.json');
+// Local file (dotfile) for storing ULINE login session cookies.
+// Placed in project root to avoid cluttering user documents.
 const UL_SESSION_FILE = '.uline-session.json';
 const FREIGHT_PROMO = '/buildasoilorganics/api/productpromo/10007';
 const TAX_PROMO = '/buildasoilorganics/api/productpromo/10008';
@@ -63,7 +65,17 @@ function toFinaleId(ulineSku: string): string {
 
 function cookiesFromFile(filePath: string): any[] {
     if (!fs.existsSync(filePath)) return [];
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    try {
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        if (!Array.isArray(data)) {
+            console.warn(`Cookie file ${filePath} does not contain an array, got ${typeof data}`);
+            return [];
+        }
+        return data;
+    } catch (error) {
+        console.warn(`Failed to parse cookie file ${filePath}: ${error}`);
+        return [];
+    }
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -204,8 +216,9 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
     if (!fs.existsSync(SANDBOX_DIR)) fs.mkdirSync(SANDBOX_DIR, { recursive: true });
 
     const manager = BrowserManager.getInstance();
-    const page = await manager.launchBrowser({ headless: false });
-    await page.context().addCookies(cookiesFromFile(UL_SESSION_FILE));
+    // headless: false - use visible browser for manual session setup and bypass bot detection
+    // via PersistentSession. Switched from persistent context to avoid multiple process conflicts.
+    const page = await manager.launchBrowser({ headless: false, cookiesPath: UL_SESSION_FILE });
     const invoices: UlineInvoice[] = [];
 
     try {
@@ -222,6 +235,8 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
             await page.click('#btnSignIn');
             console.log('   🔐 Waiting for login (solve CAPTCHA if needed)...');
             await page.waitForSelector('a[href*="InvoiceDetail"]', { timeout: 120_000 });
+            // Save cookies after successful login
+            await manager.saveCookies();
         }
 
         if (landed === 'unknown') throw new Error('Could not detect invoice table or login');

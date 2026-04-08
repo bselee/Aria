@@ -1,7 +1,7 @@
 import type { Page } from "playwright";
 import type { FinaleClient } from "../finale/client";
 import {
-    planDraftPOPriceUpdates,
+    planDraftPOCartUpdates,
     type CartVerificationResult,
     type ExpectedUlineCartItem,
     type ObservedUlineCartRow,
@@ -18,6 +18,10 @@ function parseCurrency(value: string | null | undefined): number | null {
 function extractUlineModel(text: string): string | null {
     const match = text.match(/\b[A-Z]{1,3}-\d{3,6}[A-Z]?\b/);
     return match ? match[0] : null;
+}
+
+function normalizeModel(model: string): string {
+    return (model || "").trim().toUpperCase();
 }
 
 export async function scrapeObservedUlineCartRows(page: Page): Promise<ObservedUlineCartRow[]> {
@@ -46,17 +50,26 @@ export async function scrapeObservedUlineCartRows(page: Page): Promise<ObservedU
         ).filter((value): value is number => value !== null);
 
         const quantityMatch = row.quantityValue
-            || row.text.match(/\bQty(?:\s*[:#-]?\s*|\s+)(\d[\d,]*)\b/i)?.[1]
-            || row.text.match(new RegExp(`${ulineModel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(\\d[\\d,]*)`))?.[1];
+            || row.text.match(/\bQty(?:\s*[:#-]?\s*|\s+)(\d[\d,]*)\b/i)?.[1];
 
-        const quantity = quantityMatch ? Number(String(quantityMatch).replace(/,/g, "")) : NaN;
+        let quantity = quantityMatch ? Number(String(quantityMatch).replace(/,/g, "")) : NaN;
+        const unitPrice = moneyMatches[0] ?? null;
+        const lineTotal = moneyMatches.length > 1 ? moneyMatches[moneyMatches.length - 1] : null;
+
+        if ((!Number.isFinite(quantity) || quantity <= 0) && unitPrice && lineTotal) {
+            const derivedQuantity = lineTotal / unitPrice;
+            if (Number.isFinite(derivedQuantity) && derivedQuantity > 0 && Math.abs(derivedQuantity - Math.round(derivedQuantity)) < 0.0001) {
+                quantity = Math.round(derivedQuantity);
+            }
+        }
+
         if (!Number.isFinite(quantity) || quantity <= 0) return [];
 
         return [{
             ulineModel,
             quantity,
-            unitPrice: moneyMatches[0] ?? null,
-            lineTotal: moneyMatches.length > 1 ? moneyMatches[moneyMatches.length - 1] : null,
+            unitPrice,
+            lineTotal,
         }];
     });
 
@@ -65,6 +78,34 @@ export async function scrapeObservedUlineCartRows(page: Page): Promise<ObservedU
         unique.set(row.ulineModel, row);
     }
     return Array.from(unique.values());
+}
+
+export function diffObservedUlineCartRows(
+    beforeRows: ObservedUlineCartRow[],
+    afterRows: ObservedUlineCartRow[],
+): ObservedUlineCartRow[] {
+    const beforeByModel = new Map(
+        beforeRows.map((row) => [normalizeModel(row.ulineModel), row]),
+    );
+
+    return afterRows.flatMap((row) => {
+        const before = beforeByModel.get(normalizeModel(row.ulineModel));
+        const quantityDelta = row.quantity - (before?.quantity ?? 0);
+        if (!Number.isFinite(quantityDelta) || quantityDelta <= 0) return [];
+
+        const afterLineTotal = row.lineTotal ?? null;
+        const beforeLineTotal = before?.lineTotal ?? 0;
+        const lineTotalDelta = afterLineTotal === null
+            ? null
+            : Math.round((afterLineTotal - beforeLineTotal) * 100) / 100;
+
+        return [{
+            ulineModel: row.ulineModel,
+            quantity: quantityDelta,
+            unitPrice: row.unitPrice ?? null,
+            lineTotal: lineTotalDelta,
+        }];
+    });
 }
 
 export async function syncVerifiedUlineCartPricesToDraftPO(
@@ -76,11 +117,20 @@ export async function syncVerifiedUlineCartPricesToDraftPO(
 ): Promise<number> {
     if (!orderId) return 0;
 
-    const updates = planDraftPOPriceUpdates(expectedItems, observedRows, verification);
+    const updates = planDraftPOCartUpdates(expectedItems, observedRows, verification);
     let applied = 0;
 
     for (const update of updates) {
-        await finale.updateOrderItemPrice(orderId, update.finaleSku, update.newUnitPrice);
+        if (typeof (finale as any).updateOrderItemQuantityAndPrice === "function") {
+            await (finale as any).updateOrderItemQuantityAndPrice(
+                orderId,
+                update.finaleSku,
+                update.newQuantity,
+                update.newUnitPrice,
+            );
+        } else {
+            await finale.updateOrderItemPrice(orderId, update.finaleSku, update.newUnitPrice);
+        }
         applied += 1;
     }
 

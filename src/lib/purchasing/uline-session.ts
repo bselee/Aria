@@ -15,36 +15,15 @@ export interface LaunchUlineSessionOptions {
 }
 
 export async function launchUlineSession(opts: LaunchUlineSessionOptions): Promise<UlineSession> {
-    const email = process.env.ULINE_EMAIL;
-    const password = process.env.ULINE_PASSWORD;
-
-    if (email && password) {
-        const browser = await chromium.launch({
-            headless: opts.headless,
-            channel: "chrome",
-            args: ["--disable-blink-features=AutomationControlled"],
-        });
-        const context = await browser.newContext({
-            viewport: { width: 1280, height: 900 },
-        });
-        return {
-            context,
-            close: async () => {
-                await context.close();
-                await browser.close();
-            },
-        };
-    }
-
     try {
         const context = await chromium.launchPersistentContext(
-            path.join(CHROME_PROFILE, "Default"),
+            CHROME_PROFILE,
             {
                 headless: opts.headless,
                 channel: "chrome",
                 acceptDownloads: true,
                 viewport: { width: 1280, height: 900 },
-                args: ["--disable-blink-features=AutomationControlled"],
+                args: ["--profile-directory=Default", "--disable-blink-features=AutomationControlled"],
             },
         );
         return {
@@ -76,9 +55,11 @@ export async function openUlineQuickOrder(page: Page): Promise<"ready" | "login"
     await page.goto(QUICK_ORDER_URL, { waitUntil: "load", timeout: 30_000 });
 
     const landed = await Promise.race([
-        page.waitForSelector("text=Paste Items Page", { timeout: 15_000 }).then(() => "ready" as const),
-        page.waitForSelector("#txtEmail", { timeout: 15_000 }).then(() => "login" as const),
-    ]).catch(() => "unknown" as const);
+        page.waitForSelector("text=Paste Items Page", { timeout: 15_000 }).then(() => "ready" as const).catch(() => null),
+        page.waitForSelector("text=Catalog Quick Order", { timeout: 15_000 }).then(() => "ready" as const).catch(() => null),
+        page.waitForSelector("#txtEmail", { timeout: 15_000 }).then(() => "login" as const).catch(() => null),
+        page.waitForTimeout(15_000).then(() => "unknown" as const),
+    ]);
 
     if (landed === "unknown") {
         throw new Error("Could not detect ULINE Quick Order page");

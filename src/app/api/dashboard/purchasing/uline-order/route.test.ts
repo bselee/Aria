@@ -5,6 +5,7 @@ const {
   openUlinePasteItemsPageMock,
   convertMock,
   scrapeObservedMock,
+  diffObservedMock,
   syncPricesMock,
   verifyMock,
   finaleCtorMock,
@@ -13,6 +14,7 @@ const {
   openUlinePasteItemsPageMock: vi.fn(),
   convertMock: vi.fn(),
   scrapeObservedMock: vi.fn(),
+  diffObservedMock: vi.fn(),
   syncPricesMock: vi.fn(),
   verifyMock: vi.fn(),
   finaleCtorMock: vi.fn(),
@@ -29,6 +31,7 @@ vi.mock("@/lib/purchasing/uline-ordering", () => ({
 
 vi.mock("@/lib/purchasing/uline-cart-live", () => ({
   scrapeObservedUlineCartRows: scrapeObservedMock,
+  diffObservedUlineCartRows: diffObservedMock,
   syncVerifiedUlineCartPricesToDraftPO: syncPricesMock,
 }));
 
@@ -97,6 +100,7 @@ describe("dashboard uline order route", () => {
       { ulineModel: "S-3902", quantity: 1, unitPrice: 230, lineTotal: 230 },
       { ulineModel: "S-4551", quantity: 105, unitPrice: 4.22, lineTotal: 443.1 },
     ]);
+    diffObservedMock.mockImplementation((_before: any, after: any) => after);
 
     verifyMock.mockReturnValue({
       status: "verified",
