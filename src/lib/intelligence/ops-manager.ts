@@ -53,6 +53,13 @@ import {
     getPurchasingEventDate,
     shouldKeepReceivedPurchase,
 } from "../purchasing/calendar-lifecycle";
+import {
+    addCalendarDays,
+    buildPurchasingCalendarEvent,
+    buildTrackingEntries,
+    formatCalendarDate,
+    shouldSyncPurchasingCalendarEvent,
+} from "../purchasing/calendar-display";
 import { loadActivePurchases } from "../purchasing/active-purchases";
 import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader";
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
@@ -1388,41 +1395,38 @@ export class OpsManager {
                         const receivedDateKey = po.receiveDate
                             ? po.receiveDate.toString().split('T')[0]
                             : new Date().toISOString().split('T')[0];
-                        const title = this.buildPOEventTitle({
-                            orderId: po.orderId,
-                            vendorName: po.supplier,
-                            status: 'completed',
-                        } as FullPO, lifecycle);
-                        const description = await this.buildPOEventDescription(
-                            {
+                        const event = buildPurchasingCalendarEvent({
+                            po: {
                                 orderId: po.orderId,
                                 vendorName: po.supplier,
-                                status: 'completed',
                                 orderDate: po.orderDate || '',
                                 receiveDate: po.receiveDate || new Date().toISOString(),
-                                total: po.total || 0,
                                 items: po.items || [],
                                 finaleUrl: po.finaleUrl,
                             } as FullPO,
-                            po.orderDate || receivedDateKey,
-                            'receipt update',
-                            [],
-                            undefined,
-                            lifecycle
-                        );
+                            lifecycle,
+                            expectedDate: po.orderDate || receivedDateKey,
+                            leadProvenance: 'receipt update',
+                            trackingEntries: [],
+                            eventDate: receivedDateKey,
+                        });
 
                         const calendar = new CalendarClient();
                         await calendar.updateEventTitleAndDescription(
                             calRow.calendar_id,
                             calRow.event_id,
-                            title,
-                            description,
+                            event.title,
+                            event.description,
                             lifecycle.colorId,
                             receivedDateKey
                         );
 
                         await supabase.from('purchasing_calendar_events')
-                            .update({ status: lifecycle.calendarStatus, updated_at: new Date().toISOString() })
+                            .update({
+                                status: lifecycle.calendarStatus,
+                                event_signature: event.signature,
+                                updated_at: new Date().toISOString(),
+                            })
                             .eq('po_number', po.orderId);
 
                         console.log(`ðŸ“… [po-watcher] Calendar event updated for PO ${po.orderId}`);
@@ -2070,18 +2074,14 @@ Data: ${JSON.stringify(data)}`;
      * Format a YYYY-MM-DD or ISO date string as "Mar 3, 2026".
      */
     private fmtDate(dateStr: string | null | undefined): string {
-        if (!dateStr) return 'Unknown';
-        const d = new Date(dateStr);
-        return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        return formatCalendarDate(dateStr);
     }
 
     /**
      * Add N calendar days to a YYYY-MM-DD string, returns YYYY-MM-DD.
      */
     private addDays(dateStr: string, days: number): string {
-        const d = new Date(dateStr);
-        d.setUTCDate(d.getUTCDate() + days);
-        return d.toISOString().split('T')[0];
+        return addCalendarDays(dateStr, days);
     }
 
     /**
@@ -2089,6 +2089,14 @@ Data: ${JSON.stringify(data)}`;
      * DECISION(2026-03-11): Unreceived POs get ðŸ”´ prefix for visual urgency.
      */
     private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status)): string {
+        return buildPurchasingCalendarEvent({
+            po,
+            lifecycle,
+            expectedDate: po.expectedDate || po.orderDate || new Date().toISOString().split('T')[0],
+            leadProvenance: 'legacy builder',
+            trackingEntries: [],
+            eventDate: po.receiveDate || po.expectedDate || po.orderDate || new Date().toISOString().split('T')[0],
+        }).title;
         return `${lifecycle.titleEmoji} PO #${po.orderId} â€” ${po.vendorName}`;
     }
 
@@ -2103,6 +2111,22 @@ Data: ${JSON.stringify(data)}`;
         prefetchedStatuses?: Map<string, TrackingStatus | null>,
         lifecycle = derivePurchasingLifecycle(po.status)
     ): Promise<string> {
+        const trackingStatuses = prefetchedStatuses
+            ? prefetchedStatuses
+            : new Map(await Promise.all(trackingNumbers.map(async (trackingNumber) => [
+                trackingNumber,
+                await getTrackingStatus(trackingNumber),
+            ] as const)));
+
+        return buildPurchasingCalendarEvent({
+            po,
+            lifecycle,
+            expectedDate,
+            leadProvenance,
+            trackingEntries: buildTrackingEntries(trackingNumbers, trackingStatuses),
+            eventDate: getPurchasingEventDate(expectedDate, po.receiveDate, lifecycle),
+        }).description;
+
         const isReceived = lifecycle.isReceived;
         const isCancelled = lifecycle.isCancelled;
 
@@ -2188,8 +2212,14 @@ Data: ${JSON.stringify(data)}`;
             // Load existing Supabase rows into a Map for O(1) lookup
             const { data: existingRows } = await supabase
                 .from('purchasing_calendar_events')
-                .select('po_number, event_id, calendar_id, status, last_tracking');
-            const existing = new Map<string, { event_id: string; calendar_id: string; status: string; last_tracking: string }>();
+                .select('po_number, event_id, calendar_id, status, last_tracking, event_signature');
+            const existing = new Map<string, {
+                event_id: string;
+                calendar_id: string;
+                status: string;
+                last_tracking: string;
+                event_signature?: string | null;
+            }>();
             for (const row of existingRows ?? []) {
                 existing.set(row.po_number, row);
             }
@@ -2200,8 +2230,19 @@ Data: ${JSON.stringify(data)}`;
                 .select('po_number, tracking_numbers')
                 .in('po_number', pos.map(p => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
+            const sentAtMap = new Map<string, string | null>();
             for (const row of poRows ?? []) {
                 trackingMap.set(row.po_number, row.tracking_numbers || []);
+            }
+            const { data: sendRows } = await supabase
+                .from('po_sends')
+                .select('po_number, sent_at')
+                .in('po_number', pos.map(p => p.orderId).filter(Boolean))
+                .order('sent_at', { ascending: false });
+            for (const row of sendRows ?? []) {
+                if (!sentAtMap.has(row.po_number)) {
+                    sentAtMap.set(row.po_number, row.sent_at || null);
+                }
             }
             const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
             const shipmentRecords = await listShipmentsForPurchaseOrders(pos.map(p => p.orderId).filter(Boolean));
@@ -2294,10 +2335,19 @@ Data: ${JSON.stringify(data)}`;
                     unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
                 });
                 const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState);
-                const title = this.buildPOEventTitle(po, lifecycle);
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
                 const newStatus = lifecycle.calendarStatus;
                 const eventDate = getPurchasingEventDate(expectedDate, po.receiveDate, lifecycle);
+                const event = buildPurchasingCalendarEvent({
+                    po: {
+                        ...po,
+                        sentAt: sentAtMap.get(po.orderId) || null,
+                    },
+                    lifecycle,
+                    expectedDate,
+                    leadProvenance,
+                    trackingEntries: buildTrackingEntries(trackingNumbers, trackingStatuses),
+                    eventDate,
+                });
 
                 const existingRow = existing.get(po.orderId);
                 if (completionState === 'complete' && lifecycle.isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
@@ -2312,41 +2362,49 @@ Data: ${JSON.stringify(data)}`;
                     continue;
                 }
 
-                const colorId = lifecycle.colorId;
-
                 if (!existingRow) {
                     // New PO â€” create calendar event
                     try {
                         const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
-                            title,
-                            description,
-                            date: eventDate,
-                            colorId,
+                            title: event.title,
+                            description: event.description,
+                            date: event.eventDate,
+                            colorId: event.colorId,
                         });
                         await supabase.from('purchasing_calendar_events').insert({
                             po_number: po.orderId,
                             event_id: eventId,
                             calendar_id: PURCHASING_CALENDAR_ID,
                             status: newStatus,
-                            last_tracking: trackingHash
+                            last_tracking: trackingHash,
+                            event_signature: event.signature
                         });
                         counts.created++;
                         console.log(`ðŸ“… [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${eventDate}`);
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
+                } else if (shouldSyncPurchasingCalendarEvent(existingRow, {
+                    status: newStatus,
+                    trackingHash,
+                    signature: event.signature,
+                })) {
                     // Status changed or tracking changed â€” update in place
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
                         existingRow.event_id,
-                        title,
-                        description,
-                        colorId,
-                        eventDate
+                        event.title,
+                        event.description,
+                        event.colorId,
+                        event.eventDate
                     );
                     await supabase.from('purchasing_calendar_events')
-                        .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
+                        .update({
+                            status: newStatus,
+                            last_tracking: trackingHash,
+                            event_signature: event.signature,
+                            updated_at: new Date().toISOString(),
+                        })
                         .eq('po_number', po.orderId);
                     counts.updated++;
                     console.log(`ðŸ“… [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus}, tracking changed=${existingRow.last_tracking !== trackingHash}`);

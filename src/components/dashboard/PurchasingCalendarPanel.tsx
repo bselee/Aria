@@ -12,6 +12,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, ExternalLink, Package } from "lucide-react";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS } from "@/lib/purchasing/calendar-lifecycle";
+import { formatCalendarDate } from "@/lib/purchasing/calendar-display";
 import type { POCompletionState } from "@/lib/purchasing/po-completion-state";
 
 // â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -20,6 +21,7 @@ type ActivePurchase = {
     vendorName: string;
     status: string;
     orderDate: string;
+    sentAt: string | null;
     expectedDate: string;
     receiveDate: string | null;
     total: number;
@@ -62,8 +64,10 @@ function friendlyDate(dateKey: string, todayKey: string): string {
 /** Format a date string as "Mar 25" */
 function shortDate(dateStr: string | null): string {
     if (!dateStr) return "??";
-    const d = new Date(dateStr);
-    return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const formatted = formatCalendarDate(dateStr);
+    return formatted === "Unknown"
+        ? dateStr
+        : formatted.replace(/, \d{4}$/, "");
 }
 
 /** Days between two YYYY-MM-DD dates (positive = future, negative = past) */
@@ -110,6 +114,7 @@ export default function PurchasingCalendarPanel() {
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
+    const [syncingCalendar, setSyncingCalendar] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [isCollapsed, setIsCollapsed] = useState(false);
     const [bodyHeight, setBodyHeight] = useState(400);
@@ -159,6 +164,25 @@ export default function PurchasingCalendarPanel() {
             setRefreshing(false);
         }
     }, []);
+
+    const syncCalendar = useCallback(async () => {
+        setSyncingCalendar(true);
+        setError(null);
+        try {
+            const resp = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "resync_calendar", daysBack: 60 }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            await fetchData(true);
+        } catch (err: any) {
+            setError(err.message);
+        } finally {
+            setSyncingCalendar(false);
+        }
+    }, [fetchData]);
 
     useEffect(() => { fetchData(); }, [fetchData]);
     // Auto-refresh every 5 minutes
@@ -241,6 +265,14 @@ export default function PurchasingCalendarPanel() {
                     title="Refresh"
                 >
                     <RefreshCw className={`h-3 w-3 text-zinc-500 ${refreshing ? "animate-spin" : ""}`} />
+                </button>
+
+                <button
+                    onClick={e => { e.stopPropagation(); void syncCalendar(); }}
+                    className="px-1.5 py-1 rounded hover:bg-zinc-700/50 transition-colors text-[10px] font-mono text-zinc-400"
+                    title="Resync purchasing calendar"
+                >
+                    {syncingCalendar ? "SYNCING" : "SYNC CAL"}
                 </button>
 
                 <ChevronDown className={`h-3.5 w-3.5 text-zinc-500 transition-transform ${isCollapsed ? "-rotate-90" : ""}`} />
@@ -487,6 +519,10 @@ function PORow({
                     {/* Items summary */}
                     <div className="text-[10px] text-zinc-500 font-mono mt-0.5 truncate">
                         {topSkus}{more} Â· {itemCount.toLocaleString()} units
+                    </div>
+
+                    <div className="text-[9px] text-zinc-600 font-mono mt-0.5">
+                        Sent: {shortDate(po.sentAt || po.orderDate)}
                     </div>
 
                     {needsAPFollowUp && (

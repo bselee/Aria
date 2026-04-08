@@ -2,6 +2,7 @@ import { leadTimeService } from "../builds/lead-time-service";
 import type { FinaleClient, FullPO } from "../finale/client";
 import { createClient } from "../supabase";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "./calendar-lifecycle";
+import { addCalendarDays } from "./calendar-display";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
@@ -9,16 +10,11 @@ import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
     leadProvenance: string;
+    sentAt: string | null;
     trackingNumbers: string[];
     shipments: ShipmentRecord[];
     isReceived: boolean;
     completionState: POCompletionState;
-}
-
-function addDays(dateStr: string, days: number): string {
-    const d = new Date(dateStr);
-    d.setUTCDate(d.getUTCDate() + days);
-    return d.toISOString().split("T")[0];
 }
 
 export async function loadActivePurchases(
@@ -32,6 +28,7 @@ export async function loadActivePurchases(
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
     const trackingMap = new Map<string, string[]>();
     const shipmentMap = new Map<string, ShipmentRecord[]>();
+    const sentAtMap = new Map<string, string | null>();
 
     if (supabase && poNumbers.length > 0) {
         try {
@@ -44,6 +41,18 @@ export async function loadActivePurchases(
 
                 for (const dp of dbPOs || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
+                }
+
+                const { data: sendRows } = await supabase
+                    .from("po_sends")
+                    .select("po_number, sent_at")
+                    .in("po_number", chunk)
+                    .order("sent_at", { ascending: false });
+
+                for (const sendRow of sendRows || []) {
+                    if (!sentAtMap.has(sendRow.po_number)) {
+                        sentAtMap.set(sendRow.po_number, sendRow.sent_at || null);
+                    }
                 }
             }
 
@@ -94,7 +103,7 @@ export async function loadActivePurchases(
 
         if (po.orderDate) {
             const lt = await leadTimeService.getForVendor(po.vendorName);
-            expectedDate = addDays(po.orderDate, lt.days);
+            expectedDate = addCalendarDays(po.orderDate, lt.days);
             leadProvenance = lt.label;
         } else {
             expectedDate = new Date().toISOString().split("T")[0];
@@ -107,6 +116,7 @@ export async function loadActivePurchases(
             leadProvenance,
             isReceived,
             completionState,
+            sentAt: sentAtMap.get(po.orderId) || null,
             trackingNumbers: trackingMap.get(po.orderId) || [],
             shipments,
         });

@@ -31,6 +31,12 @@ export interface CalendarEvent {
     calendarId: string;
 }
 
+function addOneDayToDateOnly(dateStr: string): string {
+    const date = new Date(`${dateStr}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString().split('T')[0];
+}
+
 export class CalendarClient {
     private calendar: calendar_v3.Calendar | null = null;
 
@@ -154,10 +160,7 @@ export class CalendarClient {
     ): Promise<string> {
         await this.init();
         // Google Calendar all-day events: end.date must be the NEXT day (exclusive)
-        const startDate = new Date(event.date);
-        const endDate = new Date(startDate);
-        endDate.setUTCDate(endDate.getUTCDate() + 1);
-        const endDateStr = endDate.toISOString().split('T')[0];
+        const endDateStr = addOneDayToDateOnly(event.date);
 
         const requestBody: any = {
             summary: event.title,
@@ -203,11 +206,8 @@ export class CalendarClient {
             const requestBody: any = { summary: title, description };
             if (colorId) requestBody.colorId = colorId;
             if (date) {
-                const startDate = new Date(date);
-                const endDate = new Date(startDate);
-                endDate.setUTCDate(endDate.getUTCDate() + 1);
                 requestBody.start = { date };
-                requestBody.end = { date: endDate.toISOString().split("T")[0] };
+                requestBody.end = { date: addOneDayToDateOnly(date) };
             }
             await this.calendar!.events.patch({
                 calendarId,
