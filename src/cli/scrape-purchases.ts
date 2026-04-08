@@ -48,43 +48,6 @@ function parseArgs() {
   };
 }
 
-async function openContext(headless: boolean): Promise<BrowserContext> {
-  if (!fs.existsSync(PROFILE_DIR)) fs.mkdirSync(PROFILE_DIR, { recursive: true });
-  const args = ['--disable-blink-features=AutomationControlled'];
-
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless,
-    viewport: { width: 1440, height: 900 },
-    args,
-  });
-
-  // Inject session cookies from .basauto-session.json if present. This is the
-  // primary auth path — extracting the NextAuth session-token from Will's main
-  // Chrome DevTools and dropping it into the scraper context sidesteps OAuth
-  // + 1Password entirely.
-  if (fs.existsSync(SESSION_FILE)) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
-      const cookies = (raw.cookies || []).map((c: any) => ({
-        name: c.name,
-        value: c.value,
-        domain: c.domain,
-        path: c.path || '/',
-        expires: c.expires,
-        httpOnly: c.httpOnly ?? true,
-        secure: c.secure ?? true,
-        sameSite: (c.sameSite || 'Lax') as 'Strict' | 'Lax' | 'None',
-      }));
-      await context.addCookies(cookies);
-      console.log(`  [session] injected ${cookies.length} cookies from .basauto-session.json`);
-    } catch (err: any) {
-      console.warn(`  [session] failed to load .basauto-session.json: ${err.message}`);
-    }
-  }
-
-  return context;
-}
-
 async function sendExpiryAlert() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -371,7 +334,7 @@ async function scrapeRequestsTab(page: Page): Promise<{ requests: any[]; rawDump
 async function main() {
   const opts = parseArgs();
   const manager = BrowserManager.getInstance();
-  const sessionValid = await manager.checkSession(PURCHASES_URL);
+  const sessionValid = await manager.checkSession(PURCHASES_URL, SESSION_FILE);
   if (!sessionValid) {
     if (!opts.login) {
       throw new Error('Session expired');

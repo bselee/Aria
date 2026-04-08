@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { FinaleClient } from "../../../../../lib/finale/client";
 import { verifyUlineCart } from "../../../../../cli/order-uline-cart";
 import {
+    diffObservedUlineCartRows,
     scrapeObservedUlineCartRows,
     syncVerifiedUlineCartPricesToDraftPO,
 } from "../../../../../lib/purchasing/uline-cart-live";
@@ -51,7 +52,9 @@ export async function POST(req: NextRequest): Promise<NextResponse<UlineOrderRes
             description: item.productId,
         }));
         const blockingWarnings = convertedItems.flatMap(item =>
-            item.guardrailWarnings.filter(warning => warning.includes("exceeds the")),
+            item.guardrailWarnings.filter(warning =>
+                warning.includes("exceeds the") || warning.includes("BLOCKING GUARDRAIL"),
+            ),
         );
 
         if (blockingWarnings.length > 0) {
@@ -80,6 +83,7 @@ export async function POST(req: NextRequest): Promise<NextResponse<UlineOrderRes
 
         try {
             await openUlinePasteItemsPage(page);
+            const beforeRows = await scrapeObservedUlineCartRows(page);
             await page.fill("#txtPaste", pasteText);
             await page.waitForTimeout(500);
 
@@ -121,7 +125,7 @@ export async function POST(req: NextRequest): Promise<NextResponse<UlineOrderRes
 
             const errors: string[] = [];
             const observedRows = addClicked
-                ? await scrapeObservedUlineCartRows(page)
+                ? diffObservedUlineCartRows(beforeRows, await scrapeObservedUlineCartRows(page))
                 : [];
             const verification = verifyUlineCart(convertedItems, observedRows);
             const errorText = await page.$eval(

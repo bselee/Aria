@@ -212,9 +212,12 @@ export default function PurchasingCalendarPanel() {
     return (
         <div className="flex flex-col border border-zinc-800 rounded bg-[#0c0c0e] overflow-hidden">
             {/* Header */}
-            <button
+            <div
+                role="button"
+                tabIndex={0}
                 onClick={() => setIsCollapsed(c => !c)}
-                className="flex items-center gap-2 px-3 py-2.5 bg-[#0c0c0e] hover:bg-zinc-800/40 transition-colors w-full text-left group"
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setIsCollapsed(c => !c); } }}
+                className="flex items-center gap-2 px-3 py-2.5 bg-[#0c0c0e] hover:bg-zinc-800/40 transition-colors w-full text-left group cursor-pointer"
             >
                 <Calendar className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
                 <span className="text-[11px] font-mono tracking-wider text-zinc-300 uppercase">
@@ -244,7 +247,7 @@ export default function PurchasingCalendarPanel() {
                 </button>
 
                 <ChevronDown className={`h-3.5 w-3.5 text-zinc-500 transition-transform ${isCollapsed ? "-rotate-90" : ""}`} />
-            </button>
+            </div>
 
             {/* Body */}
             {!isCollapsed && (

@@ -665,12 +665,18 @@ export class FinaleClient {
     ): Promise<Array<{ orderId: string; status: string; orderDate: string; overlappingSKUs: string[]; finaleUrl: string }>> {
         try {
             const partyId = vendorPartyId.split('/').pop() || vendorPartyId;
+            const now = new Date();
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - 180);
+            const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const endStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
             const query = {
                 query: `{
                     orderViewConnection(
                         first: 200
                         type: ["PURCHASE_ORDER"]
-                        statusId: ["ORDER_CREATED", "ORDER_COMMITTED"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
                     ) {
                         edges { node {
                             orderId orderUrl status orderDate
@@ -696,6 +702,7 @@ export class FinaleClient {
 
             for (const edge of edges) {
                 const po = edge.node;
+                if (!["Draft", "Committed"].includes(po.status || "")) continue;
                 // Match vendor by partyUrl suffix
                 const poVendorId = po.supplier?.partyUrl?.split('/').pop() || '';
                 if (poVendorId !== partyId) continue;
@@ -2740,6 +2747,56 @@ export class FinaleClient {
         }
     }
 
+    async findActiveDraftPOsForVendor(
+        vendorPartyId: string,
+    ): Promise<Array<{ orderId: string; status: string; orderDate: string; finaleUrl: string }>> {
+        try {
+            const partyId = vendorPartyId.split('/').pop() || vendorPartyId;
+            const now = new Date();
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - 180);
+            const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const endStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 100
+                        type: ["PURCHASE_ORDER"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            orderId orderUrl status orderDate
+                            supplier { partyUrl name }
+                        }}
+                    }
+                }`,
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            return edges
+                .map((edge) => edge.node)
+                .filter((po) => po.status === "Draft")
+                .filter((po) => (po.supplier?.partyUrl?.split('/').pop() || '') === partyId)
+                .map((po) => ({
+                    orderId: po.orderId,
+                    status: po.status,
+                    orderDate: po.orderDate || '',
+                    finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
+                }));
+        } catch (err: any) {
+            console.warn('[finale] findActiveDraftPOsForVendor failed:', err.message);
+            return [];
+        }
+    }
+
     /**
      * Add a fee/charge adjustment to a PO's orderAdjustmentList.
      * This uses Finale's native fee system and automatically affects landed cost per unit.
@@ -2898,6 +2955,46 @@ export class FinaleClient {
         return { updated: true, oldPrice, newPrice: newUnitPrice, orderData: updated, supplierPartyUrl };
     }
 
+    async updateOrderItemQuantityAndPrice(
+        orderId: string,
+        productId: string,
+        newQuantity: number,
+        newUnitPrice: number,
+    ): Promise<{ updated: boolean; oldQuantity: number; newQuantity: number; oldPrice: number; newPrice: number; orderData: any }> {
+        const encodedId = encodeURIComponent(orderId);
+        const currentPO = await this.getOrderDetails(orderId);
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
+
+        const items = currentPO.orderItemList || [];
+        const targetItem = items.find((item: any) => item.productId === productId);
+
+        if (!targetItem) {
+            await this.restoreOrderStatus(orderId, originalStatus);
+            throw new Error(`Product ${productId} not found in PO ${orderId}`);
+        }
+
+        const oldQuantity = targetItem.quantity;
+        const oldPrice = targetItem.unitPrice;
+        targetItem.quantity = newQuantity;
+        targetItem.unitPrice = newUnitPrice;
+
+        const updated = await this.post(
+            `/${this.accountPath}/api/order/${encodedId}`,
+            currentPO,
+        );
+
+        await this.restoreOrderStatus(orderId, originalStatus);
+
+        return {
+            updated: true,
+            oldQuantity,
+            newQuantity,
+            oldPrice,
+            newPrice: newUnitPrice,
+            orderData: updated,
+        };
+    }
+
     /**
      * Add new line items to an existing PO.
      * Used when a draft PO has no items and needs to be populated from an invoice.
@@ -2920,6 +3017,75 @@ export class FinaleClient {
         currentPO.orderItemList = [...(currentPO.orderItemList || []), ...newItems];
         await this.post(`/${this.accountPath}/api/order/${encodedId}`, currentPO);
         await this.restoreOrderStatus(orderId, originalStatus);
+    }
+
+    private buildFinaleOrderUrl(orderUrl: string | null | undefined, orderId: string): string {
+        const rawOrderUrl = orderUrl || `/${this.accountPath}/api/order/${orderId}`;
+        const encodedUrl = Buffer.from(rawOrderUrl).toString('base64');
+        return `${this.apiBase}/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
+    }
+
+    private normalizeOrderLineProductId(item: any): string {
+        const direct = String(item?.productId || "").trim();
+        if (direct) return direct;
+
+        const productUrl = String(item?.productUrl || "");
+        const match = productUrl.match(/\/product\/([^/?#]+)$/i);
+        return match ? decodeURIComponent(match[1]) : "";
+    }
+
+    private mergeDraftOrderItems(
+        existingItems: any[],
+        incomingItems: Array<{ productId: string; quantity: number; unitPrice: number }>,
+    ): any[] {
+        const merged = [...(existingItems || [])];
+
+        for (const incoming of incomingItems) {
+            const index = merged.findIndex((item) => this.normalizeOrderLineProductId(item) === incoming.productId);
+            if (index >= 0) {
+                const current = merged[index];
+                merged[index] = {
+                    ...current,
+                    productId: this.normalizeOrderLineProductId(current) || incoming.productId,
+                    productUrl: current.productUrl || `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
+                    quantity: Math.max(Number(current.quantity || 0), incoming.quantity),
+                    unitPrice: incoming.unitPrice > 0 ? incoming.unitPrice : current.unitPrice,
+                };
+                continue;
+            }
+
+            merged.push({
+                productId: incoming.productId,
+                productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
+                quantity: incoming.quantity,
+                unitPrice: incoming.unitPrice,
+            });
+        }
+
+        return merged;
+    }
+
+    private async reuseExistingDraftPurchaseOrder(
+        orderId: string,
+        items: Array<{ productId: string; quantity: number; unitPrice: number }>,
+    ): Promise<{ orderId: string; finaleUrl: string; facilityName: string; duplicateWarnings: string[]; priceAlerts: string[] }> {
+        const currentPO = await this.getOrderDetails(orderId);
+        const originalStatus = await this.unlockForEditing(currentPO, orderId);
+
+        try {
+            currentPO.orderItemList = this.mergeDraftOrderItems(currentPO.orderItemList || [], items);
+            const updated = await this.post(`/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`, currentPO);
+
+            return {
+                orderId,
+                finaleUrl: this.buildFinaleOrderUrl(updated?.orderUrl || currentPO.orderUrl, orderId),
+                facilityName: "Existing Draft",
+                duplicateWarnings: [`Reused existing draft PO #${orderId} for this vendor.`],
+                priceAlerts: [],
+            };
+        } finally {
+            await this.restoreOrderStatus(orderId, originalStatus);
+        }
     }
 
     /**
@@ -3926,9 +4092,28 @@ export class FinaleClient {
         // DECISION(2026-03-04): Check for existing open/committed POs from the same
         // vendor with overlapping SKUs. We warn but still create — the caller decides.
         const duplicateWarnings: string[] = [];
+        const productIds = items.map(i => i.productId);
+        const activeDrafts = await this.findActiveDraftPOsForVendor(vendorPartyId);
+        if (activeDrafts.length > 0) {
+            const existing = activeDrafts[0];
+            console.log(`[finale] createDraftPurchaseOrder: reusing active draft PO #${existing.orderId} for vendor ${vendorPartyId}`);
+
+            for (const item of items) {
+                const exists = await this.validateProductExists(item.productId);
+                if (!exists) {
+                    throw new Error(
+                        `Product "${item.productId}" not found in Finale. ` +
+                        `Cannot reuse draft PO with unlinked products. ` +
+                        `Verify the SKU exists in Finale before retrying.`
+                    );
+                }
+            }
+
+            return this.reuseExistingDraftPurchaseOrder(existing.orderId, items);
+        }
+        let dups: Array<{ orderId: string; status: string; orderDate: string; overlappingSKUs: string[]; finaleUrl: string }> = [];
         try {
-            const productIds = items.map(i => i.productId);
-            const dups = await this.checkDuplicatePOs(vendorPartyId, productIds);
+            dups = await this.checkDuplicatePOs(vendorPartyId, productIds);
             for (const dup of dups) {
                 const skuList = dup.overlappingSKUs.slice(0, 3).join(', ');
                 const more = dup.overlappingSKUs.length > 3 ? ` +${dup.overlappingSKUs.length - 3} more` : '';
@@ -4083,9 +4268,7 @@ export class FinaleClient {
         }
 
         // Build the human-readable Finale URL (same base64 pattern used throughout client.ts)
-        const rawOrderUrl = data.orderUrl || `/${this.accountPath}/api/order/${orderId}`;
-        const encodedUrl = Buffer.from(rawOrderUrl).toString('base64');
-        const finaleUrl = `${this.apiBase}/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
+        const finaleUrl = this.buildFinaleOrderUrl(data.orderUrl, orderId);
 
         console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items) → ${facilityName}${facilityUrl ? '' : ' (facility URL not found)'}`);
         if (duplicateWarnings.length > 0) console.log(`[finale] Duplicate warnings: ${duplicateWarnings.join(' | ')}`);
@@ -4275,8 +4458,9 @@ export class FinaleClient {
      *
      * @param daysBack  Lookback window for velocity calculation (default: 90 days)
      */
-    async getPurchasingIntelligence(daysBack = 365): Promise<PurchasingGroup[]> {
+    async getPurchasingIntelligence(daysBack = 365, vendorFilter?: string | null): Promise<PurchasingGroup[]> {
         const PAGE_SIZE = 500;
+        const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
 
         // ── Step 1: Page productViewConnection — presence signal only ──
         // Two signals qualify a product as "actively moving":
@@ -4285,48 +4469,69 @@ export class FinaleClient {
         // NOTE: consumptionQuantity alone misses purchased-for-resale items (boxes, packaging, etc.)
         // which have consumptionQuantity=0 but reorderQuantityToOrder>0 and demandQuantity>0.
         const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
-        let cursor: string | null = null;
 
-        while (true) {
-            const afterClause: string = cursor ? `, after: "${cursor}"` : '';
-            const query: { query: string } = {
-                query: `{
-                    productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
-                        pageInfo { hasNextPage endCursor }
-                        edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay } }
-                    }
-                }`
-            };
-
-            const res: Response = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-            const json: any = await res.json();
-            const conn: any = json.data?.productViewConnection;
-            if (!conn) break;
-
-            for (const edge of conn.edges || []) {
-                const p = edge.node;
-                if (p.status !== 'Active') continue;
-                const consumption = this.parseFinaleNum(p.consumptionQuantity);
-                const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
-                const stockoutDays = this.parseFinaleNum(p.stockoutDays);
-                const demandQty = this.parseFinaleNum(p.demandQuantity);
-                const demandPerDay = this.parseFinaleNum(p.demandPerDay);
-                candidates.push({
-                    productId: p.productId,
-                    finaleReorderQty: reorderQty,
-                    finaleStockoutDays: stockoutDays,
-                    finaleConsumptionQty: consumption,
-                    finaleDemandQty: demandQty,
-                    finaleDemandPerDay: demandPerDay,
-                });
+        if (normalizedVendorFilter) {
+            const externalGroups = await this.getExternalReorderItems();
+            const vendorCandidates = externalGroups
+                .filter(group => group.vendorName.toLowerCase().includes(normalizedVendorFilter))
+                .flatMap(group => group.items.map(item => ({
+                    productId: item.productId,
+                    finaleReorderQty: item.reorderQty,
+                    finaleStockoutDays: item.stockoutDays,
+                    finaleConsumptionQty: item.consumptionQty,
+                    finaleDemandQty: null,
+                    finaleDemandPerDay: null,
+                })));
+            const deduped = new Map<string, typeof vendorCandidates[number]>();
+            for (const candidate of vendorCandidates) {
+                deduped.set(candidate.productId, candidate);
             }
+            candidates.push(...deduped.values());
+            console.log(`[finale] getPurchasingIntelligence: vendor filter "${vendorFilter}" seeded ${candidates.length} candidates`);
+        } else {
+            let cursor: string | null = null;
 
-            if (!conn.pageInfo.hasNextPage) break;
-            cursor = conn.pageInfo.endCursor;
+            while (true) {
+                const afterClause: string = cursor ? `, after: "${cursor}"` : '';
+                const query: { query: string } = {
+                    query: `{
+                        productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
+                            pageInfo { hasNextPage endCursor }
+                            edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay } }
+                        }
+                    }`
+                };
+
+                const res: Response = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                    method: 'POST',
+                    headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                    body: JSON.stringify(query),
+                });
+                const json: any = await res.json();
+                const conn: any = json.data?.productViewConnection;
+                if (!conn) break;
+
+                for (const edge of conn.edges || []) {
+                    const p = edge.node;
+                    if (p.status !== 'Active') continue;
+                    const consumption = this.parseFinaleNum(p.consumptionQuantity);
+                    const reorderQty = this.parseFinaleNum(p.reorderQuantityToOrder);
+                    const stockoutDays = this.parseFinaleNum(p.stockoutDays);
+                    const demandQty = this.parseFinaleNum(p.demandQuantity);
+                    const demandPerDay = this.parseFinaleNum(p.demandPerDay);
+                    candidates.push({
+                        productId: p.productId,
+                        finaleReorderQty: reorderQty,
+                        finaleStockoutDays: stockoutDays,
+                        finaleConsumptionQty: consumption,
+                        finaleDemandQty: demandQty,
+                        finaleDemandPerDay: demandPerDay,
+                    });
+                }
+
+                if (!conn.pageInfo.hasNextPage) break;
+                cursor = conn.pageInfo.endCursor;
+            }
         }
 
         console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates found`);

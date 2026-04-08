@@ -12,6 +12,8 @@
 
 import type { BotCommand, BotDeps } from './types';
 import { getCmdText } from './types';
+import * as fs from 'fs';
+import * as path from 'path';
 
 /**
  * /buildrisk — 30-day build risk analysis (Calendar → BOM → Stock + POs).
@@ -327,16 +329,73 @@ const notifyCommand: BotCommand = {
                 .eq('id', requestId);
 
             await ctx.reply(`Sent to ${req.requester_name} in Slack.`);
-        } catch (err: any) {
-            await ctx.reply(`Failed: ${err.message}`);
-        }
-    },
-};
+         } catch (err: any) {
+             await ctx.reply(`Failed: ${err.message}`);
+         }
+     },
+ };
 
-export const operationsCommands: BotCommand[] = [
-    buildriskCommand,
-    requestsCommand,
-    alertsCommand,
-    correlateCommand,
-    notifyCommand,
-];
+ /**
+  * /purchases — Run purchasing intelligence pipeline on-demand.
+  * Scrapes basauto dashboard → assesses SKUs → shows new HIGH_NEED items and pending requests.
+  */
+ const purchasesCommand: BotCommand = {
+     name: 'purchases',
+     description: 'Run purchasing intelligence pipeline (scrape→assess)',
+     handler: async (ctx, deps) => {
+         ctx.sendChatAction('typing');
+         await ctx.reply('🛒 Starting purchasing intelligence run...\nThis will scrape the dashboard and assess all items.');
+
+         try {
+             const { runPurchasingIntelligence } = await import('../../lib/intelligence/purchasing-intelligence');
+             const result = await runPurchasingIntelligence({
+                 source: 'manual',
+                 triggeredBy: ctx.from?.username || 'telegram',
+             });
+
+             // Send the full Telegram report (already sent via bot if new alerts)
+             // But for manual, we also want to show the summary in the command reply.
+             await ctx.reply(result.telegramMessage, { parse_mode: 'HTML' });
+         } catch (err: any) {
+             console.error('Purchasing command error:', err);
+             await ctx.reply(`❌ Purchasing intelligence failed: ${err.message}`);
+         }
+      },
+  };
+
+  /**
+   * /scrape_purchasing_dashboard — Run purchasing intelligence pipeline on-demand.
+   * Scrapes basauto dashboard, assesses SKUs, sends alerts if needed.
+   */
+  const scrapePurchasingDashboardCommand: BotCommand = {
+      name: 'scrape_purchasing_dashboard',
+      description: 'Run purchasing intelligence pipeline (scrape dashboard + assess)',
+      handler: async (ctx, deps) => {
+          ctx.sendChatAction('typing');
+          await ctx.reply('🛒 Starting purchasing dashboard scrape & assessment run...\nThis will scrape the dashboard and assess all items.');
+
+          try {
+              const { runPurchasingIntelligence } = await import('../../lib/intelligence/purchasing-pipeline');
+              const result = await runPurchasingIntelligence({
+                  source: 'manual',
+                  triggeredBy: ctx.from?.username || 'telegram',
+              });
+
+              // Send the full Telegram report
+              await ctx.reply(result.telegramMessage, { parse_mode: 'HTML' });
+          } catch (err: any) {
+              console.error('Purchasing command error:', err);
+              await ctx.reply(`❌ Purchasing intelligence failed: ${err.message}`);
+          }
+      },
+  };
+
+  export const operationsCommands: BotCommand[] = [
+      buildriskCommand,
+      requestsCommand,
+      alertsCommand,
+      correlateCommand,
+      notifyCommand,
+      purchasesCommand,
+      scrapePurchasingDashboardCommand,
+  ];

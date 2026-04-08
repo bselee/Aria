@@ -1243,7 +1243,22 @@ bot.on('text', async (ctx) => {
             }
         } catch { /* non-critical */ }
     }, CRON_WATCHDOG_INTERVAL);
-})();
+    // On-demand purchasing assessment: /purchases
+    // Triggers scrape → assess → store → diff → Telegram
+    bot.command('purchases', async (ctx) => {
+        await ctx.reply('🔍 Starting purchase assessment pipeline... This may take a few minutes.');
+        const { exec } = await import('child_process');
+        const { promisify } = await import('util');
+        const execAsync = promisify(exec);
+        try {
+            await execAsync('node --import tsx src/cli/run-purchase-assessment.ts', { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+            await ctx.reply('✅ Pipeline triggered. You will receive a Telegram digest when complete.');
+        } catch (err: any) {
+            await ctx.reply(`❌ Failed to start pipeline: ${err.message}`);
+        }
+    });
+
+    })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

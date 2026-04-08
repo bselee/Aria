@@ -57,6 +57,10 @@ check_logs.ts
 .worktrees/
 worktrees/
 
+# ─── Scraper browser profiles (auth cookies, never commit) ───
+.basauto-profile/
+.basauto-session.json
+
 # ─── AI Agent Configs (catch-all) ─────────────────
 # Only .agents/ and .firecrawl/ are tracked for this project.
 # All other AI tool config dirs are ignored.

@@ -26,7 +26,8 @@ import * as path from 'path';
 import Fuse from 'fuse.js';
 import { FinaleClient } from '../lib/finale/client';
 import { createClient } from '../lib/supabase';
-import { FuzzyMatcher, KnownProduct } from '../lib/scraping/fuzzy-matcher';
+import { FuzzyMatcher, KnownProduct } from '@/lib/scraping/fuzzy-matcher';
+import { buildProductCatalog } from '@/lib/purchases/assessor';
 
 // ── Configuration ──
 
@@ -333,10 +334,10 @@ async function assessSku(
     if (!finaleFound && matcher) {
         const fuzzy = matcher.match(description);
         if (fuzzy) {
-            const fuzzyResult = await assessSku(fuzzy.sku, description, source, client, apiBase, accountPath, authHeader, DAYS_BACK, scrapedUrgency, rawRequest, vendorName);
+            const fuzzyResult = await assessSku(fuzzy.product.sku, description, source, client, apiBase, accountPath, authHeader, DAYS_BACK, scrapedUrgency, rawRequest, vendorName);
             if (fuzzyResult.finaleFound) {
                 fuzzyResult.fuzzyMatchScore = fuzzy.score;
-                fuzzyResult.rawDetails = (fuzzyResult.rawDetails || '') + ' (fuzzy matched to ' + fuzzy.sku + ')';
+                fuzzyResult.rawDetails = (fuzzyResult.rawDetails || '') + ' (fuzzy matched to ' + fuzzy.product.sku + ')';
                 return fuzzyResult;
             }
         }
@@ -551,7 +552,8 @@ async function main() {
         if (pendingRequests.length > 0) {
             console.log(`\n  Assessing ${pendingRequests.length} pending purchase requests...\n`);
 
-            const { fuse } = await buildProductCatalog();
+            const { products } = await buildProductCatalog();
+            const matcher = new FuzzyMatcher(products);
             const requestQueue = [...pendingRequests];
             const requestResults: Array<{ vendor: string; assessed: AssessedItem }> = [];
 
@@ -561,7 +563,7 @@ async function main() {
                     const details = req.details;
 
                     try {
-                        const match = fuzzyMatch(fuse, details);
+                        const match = matcher.match(details);
                         if (!match || match.score < FUZZY_THRESHOLD) {
                             // No SKU match — treat as NOISE
                             const assessedItem: AssessedItem = {

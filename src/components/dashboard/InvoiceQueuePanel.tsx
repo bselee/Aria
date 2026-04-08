@@ -363,50 +363,8 @@ export default function InvoiceQueuePanel() {
             );
           })}
 
-          {/* Remaining invoices — compact scrollable list */}
-          {rest.length > 0 && (
-            <div className="max-h-[160px] overflow-y-auto">
-              {rest.slice(0, 20).map(inv => {
-                const cfg = statusCfg(inv.status);
-                return (
-                  <div
-                    key={inv.id}
-                    className="flex items-center gap-2.5 px-4 py-1.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors"
-                  >
-                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
-                    <span className="text-xs font-mono text-zinc-300 truncate flex-1">
-                      {inv.vendorName}
-                    </span>
-                    {inv.invoiceNumber && (
-                      <span className="text-[10px] font-mono text-zinc-600 shrink-0">
-                        #{inv.invoiceNumber}
-                      </span>
-                    )}
-                    {inv.poNumber && (
-                      <span className="text-[10px] font-mono text-blue-400/60 shrink-0">
-                        PO {inv.poNumber}
-                      </span>
-                    )}
-                    {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
-                      <span
-                        className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
-                        title={inv.balanceWarning ?? undefined}
-                      >
-                        {inv.dollarImpact >= 0 ? "+" : ""}${Math.abs(inv.dollarImpact).toFixed(2)}
-                        {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
-                      </span>
-                    )}
-                    <span className="text-[10px] font-mono font-semibold shrink-0 text-zinc-500">
-                      {cfg.label}
-                    </span>
-                    <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 w-6 text-right">
-                      {timeAgo(inv.processedAt)}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+           {/* Removed status-heavy log section for action-first focus */}
+           {/* Previously showed completed invoices with status labels; now focus on pending actions only */}
         </>
       )}
     </div>

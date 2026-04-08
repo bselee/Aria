@@ -339,6 +339,14 @@ export class OpsManager {
             this.safeRun("UlineFridayOrder", () => this.runFridayUlineOrder());
         }, { timezone: "America/Denver" });
 
+        // Purchasing Intelligence Pipeline at 9:00 AM Mon-Fri
+        cron.schedule("0 9 * * 1-5", () => {
+          this.safeRun("PurchasingPipeline", async () => {
+            const { runPurchasingIntelligence } = await import('./purchasing-pipeline');
+            await runPurchasingIntelligence({ source: 'cron', triggeredBy: 'cron' });
+          });
+        }, { timezone: "America/Denver" });
+
         // Email Maintenance (Advertisements) every hour
         cron.schedule("0 * * * *", () => {
             this.safeRun("AdMaintenance", () => this.processAdvertisements());
@@ -347,6 +355,14 @@ export class OpsManager {
         // Tracking Agent polls processing queue every 60 minutes
         cron.schedule("0 * * * *", () => {
             this.safeRun("TrackingAgent", () => this.trackingAgent.processUnreadEmails());
+        }, TZ);
+
+        // Background Shipment API Refresh every 15 minutes
+        cron.schedule("*/15 * * * *", () => {
+            this.safeRun("ShipmentRefreshWorker", async () => {
+                const { refreshActiveShipmentsBackgroundJob } = await import("../tracking/shipment-intelligence");
+                await refreshActiveShipmentsBackgroundJob();
+            });
         }, TZ);
 
         // Slack Tracking ETA Sync every 2 hours
@@ -613,6 +629,8 @@ export class OpsManager {
             });
         }, { timezone: "America/Denver" });
 
+
+
     }
 
     /**
@@ -656,9 +674,23 @@ export class OpsManager {
     }
 
     /**
+     * Run the full purchasing assessment pipeline: scrape dashboard → assess items → snapshot → diff.
+      * Sends Telegram alerts for new HIGH_NEED items and new Pending requests since last run.
+      * Delegates to purchasing-pipeline module.
+     *
+     * @param source      - 'cron' for automated run, 'manual' for on-demand bot command
+     * @param triggeredBy - Optional user ID who triggered the manual run
+     * @returns Object with Telegram message summary
+     */
+     async runPurchasingAssessment(source: 'cron' | 'manual' = 'cron', triggeredBy?: string): Promise<{ telegramMessage: string }> {
+          const { runPurchasingIntelligence } = await import('../intelligence/purchasing-pipeline');
+         return await runPurchasingIntelligence({ source, triggeredBy });
+     }
+
+    /**
      * Enqueue unprocessed AP emails into nightshift_queue for local LLM classification.
      * Called at 6 PM weekdays so the llama-server (starting at 6:05 PM) has tasks ready.
-     * source_inbox='ap' filter is critical â€” default inbox emails never need AP classification.
+     * source_inbox='ap' filter is critical — default inbox emails never need AP classification.
      */
     private async enqueueNightshiftEmails(): Promise<void> {
         const supabase = createClient();
@@ -854,7 +886,7 @@ export class OpsManager {
                                 poNumber,
                                 vendorName,
                                 source: "po_thread_sync",
-                                sourceRef: threadId,
+                                sourceRef: thread.id,
                                 confidence: 0.9,
                             });
                         }
@@ -1065,7 +1097,7 @@ export class OpsManager {
                                                 poNumber,
                                                 vendorName,
                                                 source: "outside_thread_tracking",
-                                                sourceRef: msg.id,
+                                                sourceRef: m.id,
                                                 confidence: 0.75,
                                             });
                                         }

@@ -7,6 +7,7 @@ export interface ExpectedUlineCartItem {
     unitPrice: number;
     finaleUnitPrice?: number;
     orderUnitEaches?: number;
+    effectiveEachQuantity?: number;
 }
 
 export interface ObservedUlineCartRow {
@@ -30,9 +31,11 @@ export interface CartVerificationResult {
     unexpectedModels: string[];
 }
 
-export interface DraftPOPriceUpdate {
+export interface DraftPOCartUpdate {
     finaleSku: string;
     ulineModel: string;
+    oldQuantity: number;
+    newQuantity: number;
     oldUnitPrice: number;
     newUnitPrice: number;
 }
@@ -97,38 +100,48 @@ export function verifyUlineCart(
     };
 }
 
-export function planDraftPOPriceUpdates(
+export function planDraftPOCartUpdates(
     expectedItems: ExpectedUlineCartItem[],
     observedRows: ObservedUlineCartRow[],
     verification: CartVerificationResult,
-): DraftPOPriceUpdate[] {
+): DraftPOCartUpdate[] {
     if (verification.status === 'unverified') return [];
 
-    const verifiedModels = new Set(verification.matchedModels.map(normalizeModel));
     const observedByModel = new Map(
         observedRows.map(row => [normalizeModel(row.ulineModel), row]),
     );
 
     return expectedItems.flatMap(item => {
-        if (!verifiedModels.has(normalizeModel(item.ulineModel))) return [];
         const observed = observedByModel.get(normalizeModel(item.ulineModel));
-        const observedPrice = observed?.unitPrice;
+        if (!observed) return [];
+
+        const observedPrice = observed.unitPrice;
         if (observedPrice === null || observedPrice === undefined) return [];
+
+        const orderUnitEaches = item.orderUnitEaches ?? 1;
+        const oldQuantity = item.effectiveEachQuantity ?? (item.quantity * orderUnitEaches);
+        const newQuantity = observed.quantity * orderUnitEaches;
         const normalizedObservedPrice = normalizeObservedUlinePriceToFinaleEaches(
             observedPrice,
-            item.orderUnitEaches ?? 1,
+            orderUnitEaches,
         );
         const expectedFinalePrice = item.finaleUnitPrice ?? item.unitPrice;
-        if (Math.abs(normalizedObservedPrice - expectedFinalePrice) < 0.0001) return [];
+        const quantityChanged = oldQuantity !== newQuantity;
+        const priceChanged = Math.abs(normalizedObservedPrice - expectedFinalePrice) >= 0.0001;
+        if (!quantityChanged && !priceChanged) return [];
 
         return [{
             finaleSku: item.finaleSku,
             ulineModel: item.ulineModel,
+            oldQuantity,
+            newQuantity,
             oldUnitPrice: expectedFinalePrice,
             newUnitPrice: normalizedObservedPrice,
         }];
     });
 }
+
+export const planDraftPOPriceUpdates = planDraftPOCartUpdates;
 
 export function formatCartVerificationMessage(result: CartVerificationResult): string {
     if (result.status === 'verified') {

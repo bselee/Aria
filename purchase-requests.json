@@ -1,0 +1,72 @@
+{
+  "scrapedAt": "2026-04-07T21:51:15.676Z",
+  "requests": [
+    {
+      "_source": "table",
+      "date": "4/3/2026, 7:59:10 AM",
+      "department": "Shipping",
+      "type": "Existing product",
+      "details": "Gription Cut Resistant Gloves - Lime, Medium",
+      "quantity": "1",
+      "link": "Open product",
+      "status": "Pending",
+      "ordered": "Mark ordered"
+    },
+    {
+      "_source": "table",
+      "date": "4/3/2026, 7:53:32 AM",
+      "department": "Shipping",
+      "type": "Existing product",
+      "details": "Brother Genuine TN830XL Black High Yield 9Shipping)",
+      "quantity": "2",
+      "link": "Open product",
+      "status": "Ordered",
+      "ordered": "Mark ordered"
+    },
+    {
+      "_source": "table",
+      "date": "4/2/2026, 3:51:19 PM",
+      "department": "Shipping",
+      "type": "Existing product",
+      "details": "LR44 Batteries Ea",
+      "quantity": "100",
+      "link": "Open product",
+      "status": "Ordered",
+      "ordered": "Mark ordered"
+    },
+    {
+      "_source": "table",
+      "date": "4/2/2026, 3:40:50 PM",
+      "department": "Customer Service",
+      "type": "New product",
+      "details": "80mm Thermal Receipt Paper for TSP100: We are down to our last roll of receipt printer for the POS cash drawer system",
+      "quantity": "—",
+      "link": "Open product",
+      "status": "Ordered",
+      "ordered": "Mark ordered"
+    },
+    {
+      "_source": "table",
+      "date": "4/2/2026, 3:25:58 PM",
+      "department": "Soil",
+      "type": "Existing product",
+      "details": "Soap-Seventh Generation Liquid - (8 Pk)",
+      "quantity": "1",
+      "link": "Open product",
+      "status": "Ordered",
+      "ordered": "Mark ordered"
+    },
+    {
+      "_source": "table",
+      "date": "3/30/2026, 3:18:31 PM",
+      "department": "MFG",
+      "type": "Existing product",
+      "details": "Extra Large Gloves",
+      "quantity": "1",
+      "link": "Open product",
+      "status": "Ordered",
+      "ordered": "Mark ordered"
+    }
+  ],
+  "rawDump": "Purchases▼Tutorial 🚀PurchasesOverdue HistoryPurchase Request FormRequest FormDepartmentSoilMFGITShippingFreightOpsInventoryCustomer ServiceProduct typeExisting productRequest new productScan product barcodeOnly these Finale categories: Bottles/Caps, Boxes, Envelopes, Equipment-Asset, First Aid, Job Supplies, Office Supplies, PPE-Personal Protective Equipment, Supplies. Use scan gun to quickly find products.Or search by descriptionQuantitySubmit requestRequest logDateDepartmentTypeDetailsQuantityLinkStatusOrdered4/3/2026, 7:59:10 AMShippingExisting productGription Cut Resistant Gloves - Lime, Medium1Open productPendingMark ordered4/3/2026, 7:53:32 AMShippingExisting productBrother Genuine TN830XL Black High Yield 9Shipping)2Open productOrderedMark ordered4/2/2026, 3:51:19 PMShippingExisting productLR44 Batteries Ea100Open productOrderedMark ordered4/2/2026, 3:40:50 PMCustomer ServiceNew product80mm Thermal Receipt Paper for TSP100: We are down to our last roll of receipt printer for the POS cash drawer system—Open productOrderedMark ordered4/2/2026, 3:25:58 PMSoilExisting productSoap-Seventh Generation Liquid - (8 Pk)1Open productOrderedMark ordered3/30/2026, 3:18:31 PMMFGExisting productExtra Large Gloves1Open productOrderedMark ordered"
+}
