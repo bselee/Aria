@@ -61,6 +61,14 @@ import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
 import {
+    appendShippingEvidence,
+    type POShippingEvidence,
+} from "../purchasing/po-lifecycle-evidence";
+import {
+    derivePOLifecycleState,
+    shouldRequestTrackingFollowUp,
+} from "../purchasing/po-lifecycle-state";
+import {
     recordCronRun,
     getAllCronRunStatuses,
     formatCronStatusReport,
@@ -79,6 +87,62 @@ const execAsync = promisify(exec);
 // Prevents hung Playwright browsers or network stalls from running indefinitely.
 const RECONCILE_TIMEOUT_MS = 5 * 60 * 1000;
 const RECONCILE_MAX_BUFFER = 10 * 1024 * 1024; // 10MB stdout cap
+
+function summarizeShippingEvidence(text: string): string {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    return normalized.slice(0, 180);
+}
+
+function extractPOThreadShippingEvidence(input: {
+    threadId: string;
+    happenedAt: string;
+    text: string;
+}): POShippingEvidence[] {
+    const summary = summarizeShippingEvidence(input.text);
+    if (!summary) return [];
+
+    const source = `po_thread:${input.threadId}`;
+    const evidence: POShippingEvidence[] = [];
+    const lower = summary.toLowerCase();
+
+    const hasEta =
+        /\b(eta|estimated arrival|expected arrival|expected delivery|arrive|arrival|delivery date)\b/i.test(summary) ||
+        /\b(mon|tue|wed|thu|fri|sat|sun)(day)?\b/i.test(summary) && /\b(arrive|arrival|delivery|eta)\b/i.test(summary);
+    const hasShipmentLanguage =
+        /\b(shipped|shipment|freight|dispatch(?:ed)?|left|in transit|on the way)\b/i.test(summary);
+    const hasTrackingUnavailable =
+        /\b(no tracking|tracking unavailable|don't have tracking|do not have tracking|without tracking)\b/i.test(lower);
+
+    if (hasEta) {
+        evidence.push({
+            kind: "vendor_eta",
+            source,
+            happenedAt: input.happenedAt,
+            summary,
+            trustworthyTracking: true,
+        });
+    } else if (hasShipmentLanguage) {
+        evidence.push({
+            kind: "vendor_shipment",
+            source,
+            happenedAt: input.happenedAt,
+            summary,
+            trustworthyTracking: false,
+        });
+    }
+
+    if (hasTrackingUnavailable) {
+        evidence.push({
+            kind: "tracking_unavailable",
+            source,
+            happenedAt: input.happenedAt,
+            summary,
+            trustworthyTracking: false,
+        });
+    }
+
+    return evidence;
+}
 
 // DECISION(2026-03-19): Tracking logic extracted to src/lib/carriers/tracking-service.ts.
 // Removed ~340 lines: TRACKING_PATTERNS, LTL_CARRIER_KEYWORDS, detectLTLCarrier,
@@ -832,12 +896,25 @@ export class OpsManager {
                     }
                 };
                 let trackingNumbers: string[] = [];
+                let threadShippingEvidence: POShippingEvidence[] = [];
                 for (const msg of thread.messages) {
                     const bodyParts: string[] = [msg.snippet || ''];
                     const payload = msg.payload;
                     if (payload?.body?.data) bodyParts.push(_decodeGmailBody(payload.body.data));
                     if (payload?.parts) _walkMsgParts(payload.parts, bodyParts);
                     const bodyText = bodyParts.join('\n');
+                    const fromHeader = msg.payload?.headers?.find((h: any) => h.name === "From")?.value || "";
+                    const isVendorMessage = !!fromHeader && !fromHeader.includes("buildasoil.com");
+
+                    if (isVendorMessage && msg.internalDate) {
+                        for (const evidence of extractPOThreadShippingEvidence({
+                            threadId: thread.id || m.threadId || poNumber,
+                            happenedAt: new Date(parseInt(msg.internalDate)).toISOString(),
+                            text: bodyText,
+                        })) {
+                            threadShippingEvidence = appendShippingEvidence(threadShippingEvidence, evidence);
+                        }
+                    }
 
                     // Detect LTL carrier name once per message for PRO/BOL encoding
                     const ltlCarrier = detectLTLCarrier(bodyText);
@@ -870,10 +947,39 @@ export class OpsManager {
                 const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
 
                 // Always read existing tracking so we can merge â€” never overwrite inbox-sourced tracking
-                const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers, line_items").eq("po_number", poNumber).maybeSingle();
+                const { data: existingPO } = await supabase
+                    .from("purchase_orders")
+                    .select("tracking_numbers, line_items, shipping_evidence, tracking_requested_at, tracking_request_count, follow_up_sent_at, po_sent_at, committed_at, vendor_acknowledged_at, vendor_ack_source")
+                    .eq("po_number", poNumber)
+                    .maybeSingle();
                 const oldTracking = existingPO?.tracking_numbers || [];
                 // Merge: inbox-backfilled numbers stay even if PO thread doesn't mention them
                 const mergedTracking = [...new Set([...oldTracking, ...trackingNumbers])];
+                const vendorAcknowledgedAt = existingPO?.vendor_acknowledged_at || (responseAt ? new Date(responseAt).toISOString() : null);
+                const vendorAckSource = vendorAcknowledgedAt ? (existingPO?.vendor_ack_source || `po_thread:${thread.id || m.threadId || poNumber}`) : null;
+                const poSentAtIso = existingPO?.po_sent_at || new Date(sentAt).toISOString();
+                const existingShippingEvidence = Array.isArray(existingPO?.shipping_evidence) ? existingPO.shipping_evidence as POShippingEvidence[] : [];
+                let mergedShippingEvidence = [...existingShippingEvidence];
+                for (const evidence of threadShippingEvidence) {
+                    mergedShippingEvidence = appendShippingEvidence(mergedShippingEvidence, evidence);
+                }
+                for (const trackingNumber of mergedTracking) {
+                    mergedShippingEvidence = appendShippingEvidence(mergedShippingEvidence, {
+                        kind: trackingNumber.includes(":::") ? "bol" : "tracking",
+                        source: `po_thread:${thread.id || m.threadId || poNumber}`,
+                        happenedAt: vendorAcknowledgedAt || poSentAtIso,
+                        summary: `Tracking identified: ${trackingNumber.includes(":::") ? trackingNumber.replace(":::", " ") : trackingNumber}`,
+                        trustworthyTracking: true,
+                    });
+                }
+                let lifecycleStage = derivePOLifecycleState({
+                    committedAt: existingPO?.committed_at || null,
+                    poSentAt: poSentAtIso,
+                    vendorAcknowledgedAt,
+                    shippingEvidence: mergedShippingEvidence,
+                    trackingRequestedAt: existingPO?.tracking_requested_at || null,
+                    trackingRequestCount: existingPO?.tracking_request_count || 0,
+                });
 
                 // Alert for NEW tracking numbers
                 if (trackingNumbers.length > 0) {
@@ -898,6 +1004,11 @@ export class OpsManager {
                             vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                             vendor_response_time_minutes: responseTimeMins,
                             tracking_numbers: mergedTracking,
+                            po_sent_at: poSentAtIso,
+                            vendor_acknowledged_at: vendorAcknowledgedAt,
+                            vendor_ack_source: vendorAckSource,
+                            shipping_evidence: mergedShippingEvidence,
+                            lifecycle_stage: lifecycleStage,
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
 
@@ -963,6 +1074,11 @@ export class OpsManager {
                     vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                     vendor_response_time_minutes: responseTimeMins,
                     tracking_numbers: mergedTracking,
+                    po_sent_at: poSentAtIso,
+                    vendor_acknowledged_at: vendorAcknowledgedAt,
+                    vendor_ack_source: vendorAckSource,
+                    shipping_evidence: mergedShippingEvidence,
+                    lifecycle_stage: lifecycleStage,
                     updated_at: new Date().toISOString()
                 }, { onConflict: "po_number" });
 
@@ -1023,9 +1139,18 @@ export class OpsManager {
                 // thread), skip the follow-up entirely. This prevents nagging vendors
                 // like Stockie who responded in a separate thread.
                 const vendorReplied = responseAt !== null;
-                const poIsOlderThan3Days = sentAt < Date.now() - 3 * 86_400_000;
+                const poIsOlderThan3Days = new Date(poSentAtIso).getTime() < Date.now() - 3 * 86_400_000;
+                const shouldNudgeForResponse = !vendorReplied && trackingNumbers.length === 0 && poIsOlderThan3Days && !!vendorEmail;
+                const shouldAskForTracking = trackingNumbers.length === 0 && !!vendorEmail && shouldRequestTrackingFollowUp({
+                    committedAt: existingPO?.committed_at || null,
+                    poSentAt: poSentAtIso,
+                    vendorAcknowledgedAt,
+                    shippingEvidence: mergedShippingEvidence,
+                    trackingRequestedAt: existingPO?.tracking_requested_at || null,
+                    trackingRequestCount: existingPO?.tracking_request_count || 0,
+                }, new Date());
 
-                if (!vendorReplied && trackingNumbers.length === 0 && poIsOlderThan3Days && vendorEmail) {
+                if (shouldNudgeForResponse || shouldAskForTracking) {
                     // 1. Outside-thread search FIRST: look for vendor replies in other Gmail threads
                     // If we find ANY communication from the vendor domain, treat them as "responded"
                     // and suppress the follow-up email.
@@ -1118,33 +1243,51 @@ export class OpsManager {
                     //    has NOT communicated at all â€” including outside-thread emails)
                     if (!vendorCommunicatedOutsideThread) {
                         try {
-                            const { data: poRow } = await supabase
-                                .from("purchase_orders")
-                                .select("follow_up_sent_at")
-                                .eq("po_number", poNumber)
-                                .maybeSingle();
+                            const shouldSendFollowUp = shouldAskForTracking || !existingPO?.follow_up_sent_at;
 
-                            if (!poRow?.follow_up_sent_at) {
+                            if (shouldSendFollowUp) {
                                 const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
                                     month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
                                 });
                                 const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
+                                const followUpBody = shouldAskForTracking
+                                    ? `Hi,\n\nThanks for the update on PO #${poNumber}. Could you share the tracking number or a clear ETA for the shipment?\n\nThank you!`
+                                    : `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Could you share an expected ship date or tracking number?\n\nThank you!`;
                                 const rawEmail = buildFollowUpEmail({
                                     to: vendorEmail,
                                     subject: `Re: ${subject}`,
                                     inReplyTo: firstMsgId,
                                     references: firstMsgId,
-                                    body: `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Could you share an expected ship date or tracking number?\n\nThank you!`,
+                                    body: followUpBody,
                                 });
                                 await gmail.users.messages.send({
                                     userId: 'me',
                                     requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
                                 });
-                                await supabase.from("purchase_orders").upsert({
+                                const followUpAt = new Date().toISOString();
+                                const followUpUpdate: Record<string, any> = {
                                     po_number: poNumber,
-                                    follow_up_sent_at: new Date().toISOString(),
+                                    follow_up_sent_at: followUpAt,
                                     updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" });
+                                };
+
+                                if (shouldAskForTracking) {
+                                    const trackingRequestCount = (existingPO?.tracking_request_count || 0) + 1;
+                                    lifecycleStage = derivePOLifecycleState({
+                                        committedAt: existingPO?.committed_at || null,
+                                        poSentAt: poSentAtIso,
+                                        vendorAcknowledgedAt,
+                                        shippingEvidence: mergedShippingEvidence,
+                                        trackingRequestedAt: followUpAt,
+                                        trackingRequestCount,
+                                    });
+                                    followUpUpdate.tracking_requested_at = followUpAt;
+                                    followUpUpdate.tracking_request_count = trackingRequestCount;
+                                    followUpUpdate.tracking_unavailable_at = followUpAt;
+                                    followUpUpdate.lifecycle_stage = lifecycleStage;
+                                }
+
+                                await supabase.from("purchase_orders").upsert(followUpUpdate, { onConflict: "po_number" });
                                 console.log(`ðŸ“§ [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
                                 this.bot.telegram.sendMessage(
                                     process.env.TELEGRAM_CHAT_ID || "",

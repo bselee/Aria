@@ -36,6 +36,10 @@ function hasTrustworthyTracking(input: POLifecycleEvidenceInput): boolean {
     return !!findLatestTrustworthyTrackingEvidence(input.shippingEvidence);
 }
 
+function hasTrackingRequest(input: POLifecycleEvidenceInput): boolean {
+    return !!input.trackingRequestedAt || (input.trackingRequestCount || 0) > 0;
+}
+
 export function derivePOLifecycleState(input: POLifecycleEvidenceInput): POLifecycleStage {
     if (input.receiveDate) {
         if (input.completionState === "complete") return "complete";
@@ -44,6 +48,7 @@ export function derivePOLifecycleState(input: POLifecycleEvidenceInput): POLifec
     }
 
     if (hasTrustworthyTracking(input)) return "moving_with_tracking";
+    if (hasBroadShippingEvidence(input) && hasTrackingRequest(input)) return "tracking_unavailable";
     if (hasBroadShippingEvidence(input)) return "in_transit";
     if (input.vendorAcknowledgedAt) return "vendor_acknowledged";
     if (input.poSentAt) return "sent";

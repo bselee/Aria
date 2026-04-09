@@ -61,6 +61,36 @@ describe("derivePOLifecycleState", () => {
         }))).toBe("moving_with_tracking");
     });
 
+    it("returns moving_with_tracking for a trustworthy vendor ETA even without a tracking number", () => {
+        expect(derivePOLifecycleState(buildInput({
+            committedAt: "2026-04-09T10:00:00Z",
+            poSentAt: "2026-04-09T10:05:00Z",
+            shippingEvidence: [{
+                kind: "vendor_eta",
+                source: "po_thread_sync",
+                happenedAt: "2026-04-10T09:00:00Z",
+                summary: "Vendor confirmed ETA Apr 15",
+                trustworthyTracking: true,
+            }],
+        }))).toBe("moving_with_tracking");
+    });
+
+    it("returns tracking_unavailable when shipment evidence exists and a follow-up ask has been sent", () => {
+        expect(derivePOLifecycleState(buildInput({
+            committedAt: "2026-04-09T10:00:00Z",
+            poSentAt: "2026-04-09T10:05:00Z",
+            shippingEvidence: [{
+                kind: "vendor_shipment",
+                source: "po_thread_sync",
+                happenedAt: "2026-04-10T09:00:00Z",
+                summary: "Vendor says the freight shipment left Friday",
+                trustworthyTracking: false,
+            }],
+            trackingRequestedAt: "2026-04-13T09:00:00Z",
+            trackingRequestCount: 1,
+        }))).toBe("tracking_unavailable");
+    });
+
     it("returns received once receipt evidence exists", () => {
         expect(derivePOLifecycleState(buildInput({
             receiveDate: "2026-04-12",
