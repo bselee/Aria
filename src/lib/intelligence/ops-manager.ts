@@ -58,7 +58,7 @@ import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader"
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
-import { derivePOLifecycleState } from "../purchasing/derive-po-lifecycle";
+import { derivePOLifecycleState, shouldRequestTrackingFollowUp } from "../purchasing/derive-po-lifecycle";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -907,12 +907,24 @@ export class OpsManager {
                             trackingNumbers: mergedTracking,
                             acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
                         });
+                        // Read existing row to conditionally set ack fields (first-write-wins)
+                        const { data: existingAckRow } = await supabase
+                            .from("purchase_orders")
+                            .select("vendor_acknowledged_at, shipping_evidence")
+                            .eq("po_number", poNumber)
+                            .maybeSingle();
+
                         await supabase.from("purchase_orders").upsert({
                             po_number: poNumber,
                             vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                             vendor_response_time_minutes: responseTimeMins,
                             tracking_numbers: mergedTracking,
                             lifecycle_stage: poLifecycle902.state,
+                            // First-write-wins for vendor acknowledgement
+                            ...(responseAt !== null && !existingAckRow?.vendor_acknowledged_at ? {
+                                vendor_acknowledged_at: new Date(responseAt).toISOString(),
+                                vendor_ack_source: 'po_thread_reply',
+                            } : {}),
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
 
@@ -1184,18 +1196,42 @@ export class OpsManager {
                                     requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
                                 });
                                 const followUpSentAt = new Date().toISOString();
+
+                                // Read existing tracking request state
+                                const { data: existingFollowUpRow } = await supabase
+                                    .from("purchase_orders")
+                                    .select("tracking_request_count, shipping_evidence")
+                                    .eq("po_number", poNumber)
+                                    .maybeSingle();
+
+                                const currentCount = existingFollowUpRow?.tracking_request_count ?? 0;
+                                const newCount = currentCount + 1;
+                                const evidenceCount = (existingFollowUpRow?.shipping_evidence || []).length;
+                                const noMoreFollowUps = !shouldRequestTrackingFollowUp(newCount, evidenceCount, false);
+
                                 const poLifecycle1176 = derivePOLifecycleState({
                                     id: poNumber,
                                     hasVendorAck: false,
                                     hasTracking: false,
                                     followUpSentAt,
+                                    trackingRequestCount: newCount,
+                                    shippingEvidenceCount: evidenceCount,
                                 });
-                                await supabase.from("purchase_orders").upsert({
+
+                                const followUpUpdate: Record<string, any> = {
                                     po_number: poNumber,
                                     follow_up_sent_at: followUpSentAt,
+                                    tracking_requested_at: followUpSentAt,
+                                    tracking_request_count: newCount,
                                     lifecycle_stage: poLifecycle1176.state,
                                     updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" });
+                                };
+
+                                if (noMoreFollowUps) {
+                                    followUpUpdate.tracking_unavailable_at = followUpSentAt;
+                                }
+
+                                await supabase.from("purchase_orders").upsert(followUpUpdate, { onConflict: "po_number" });
 
                                 // Alarm: PO in 'sent' state >24h with no vendor communication
                                 const hoursSinceSent = (Date.now() - sentAt) / 3_600_000;
