@@ -1,0 +1,306 @@
+PO Lifecycle, Calendar Sync, and PO Email — Completion Plan
+
+ Context
+
+ The PO lifecycle redesign (docs/plans/2026-04-09-po-lifecycle-evidence.md) was partially executed today. The goal was to make purchasing surfaces — calendar    
+ events, dashboard, daily messages — derive from a single shared lifecycle helper backed by 14 normalized evidence columns on purchase_orders. After auditing    
+ the working tree, the visual calendar rewrite landed in source but is uncommitted, the persistence layer is broken in two ways at once, and Tasks 3–7 of the    
+ original plan never completed. "Most of the work" exists in pieces but does not add up to perfect functionality.
+
+ This plan brings the calendar, PO email path, and lifecycle persistence to a coherent, working state — committing the salvageable rewrite, fixing the
+ schema/code mismatch that is silently failing every PO sync today, then landing the missing writers and dashboard exposure.
+
+ Current State (audit findings)
+
+ What works
+
+ - Migration 20260409000003_fix_po_lifecycle_columns.sql is applied — purchase_orders has all 14 lifecycle columns and 3 indexes; the obsolete lifecycle_state + 
+  evidence columns were dropped.
+ - src/lib/purchasing/po-receipt-state.ts (untracked) + tests — 4 passing.
+ - src/lib/purchasing/calendar-lifecycle.ts (uncommitted rewrite) — new statuses (in_transit / awaiting_tracking / past_due), prefixText, ETA-aware
+ getPurchasingEventDate. Tests rewritten in calendar-lifecycle.test.ts — 7 passing.
+ - src/lib/purchasing/active-purchases.ts (uncommitted) — uses resolvePurchaseOrderReceiptDate and hasPurchaseOrderReceipt, exposes new isReceived to the        
+ dashboard panel.
+ - src/components/dashboard/ActivePurchasesPanel.tsx (uncommitted) — consumes isReceived directly from API.
+ - src/lib/intelligence/ops-manager.ts calendar sync (uncommitted) — uses getHighConfidenceTrackingForPOs, ETA-driven event dates, new prefixText titles, Oak    
+ Harbor LTL parsing, force-update for description encoding cleanup.
+ - src/lib/purchasing/derive-po-lifecycle.ts — simplified 5-state helper (sent / vendor_acknowledged / tracking_unavailable / moving_with_tracking /
+ ap_follow_up) with 19 passing tests. Used by syncPOConversations.
+ - Whole vitest suite: 464 passed / 2 skipped.
+
+ What is broken or missing
+
+ 1. CRITICAL — silent write failure on every PO sync. src/lib/intelligence/ops-manager.ts upserts to purchase_orders.lifecycle_state and
+ purchase_orders.evidence at lines 915–916, 989–990, 1088, 1152, 1200. Both columns were dropped by migration 20260409000003. Schema column is lifecycle_stage,  
+ not lifecycle_state, and there is no evidence column anymore. PostgREST returns errors on undefined columns; these upserts are either erroring on every cycle   
+ or silently dropping the lifecycle write while the rest of the row still lands. Either way, the lifecycle write has never reached the DB since the morning fix  
+ migration ran.
+ 2. Task 3 — PO email lifecycle persistence is missing. src/lib/purchasing/po-sender.ts commitAndSendPO() writes only to po_sends (line 326) and ap_activity_log 
+  (line 338). It never updates purchase_orders.committed_at / po_sent_at / po_email_message_id / lifecycle_stage. The previous attempt (commit 05bca0c) was      
+ reverted in a3dbfa5.
+ 3. Task 4 — vendor acknowledgement / shipping evidence never landed. Nothing writes vendor_acknowledged_at, vendor_ack_source, shipping_evidence,
+ tracking_requested_at, tracking_unavailable_at, tracking_request_count. syncPOConversations only sets vendor_response_at (legacy column) and the broken
+ lifecycle_state.
+ 4. Task 5 — tracking-agent / shipment-intelligence never feed lifecycle columns. Neither src/lib/intelligence/tracking-agent.ts nor
+ src/lib/tracking/shipment-intelligence.ts touches purchase_orders.tracking_status_summary, last_tracking_evidence_at, last_movement_summary,
+ last_movement_update_at, or shipping_evidence. Tracking truth lives only in the shipments table.
+ 5. Task 6 — active-purchases API does not expose lifecycle stage. The ActivePurchase interface has no lifecycleStage, lifecycleSummary, lastMovementSummary,    
+ trackingUnavailable, or trackingRequestedAt. Dashboard cannot render the new states even after the writers exist.
+ 6. Calendar sync has two cleanup items in the uncommitted diff.
+   - buildPOEventDescription (ops-manager.ts:2204) re-imports getHighConfidenceTrackingForPOs and refetches per PO at line 2216, even though the caller (sync    
+ loop, line 2397) already has highConfTracking in scope. Pure N+1; cut it.
+   - shouldForceUpdate = true (ops-manager.ts:2453) is a debug flag that defeats the last_tracking change-detection. It should be removed (or scoped to a        
+ one-shot env var) before this commits to main.
+ 7. Repo hygiene. ~20 untracked debugging scratch files at the repo root (check-*.ts, check-*.mjs, force-calendar-*.js, verify-events*.mjs,
+ typecheck_output.txt, demo-calendar-update.js, diagnose-*.js, run-sync.mjs, sync-calendar.js, test-po-124557.js, test-regex-3.js) accumulated during the        
+ morning's diagnosis.
+
+ Implementation Plan
+
+ Phase 1 — Stop the bleeding (single commit)
+
+ Goal: make syncPOConversations stop trying to write dropped columns.
+
+ Files:
+ - src/lib/intelligence/ops-manager.ts
+
+ Changes: in all five upserts (lines ~915, ~989, ~1088, ~1152, ~1200), rename lifecycle_state → lifecycle_stage and delete the evidence: field entirely (the     
+ column does not exist; the evidence object will be persisted into the new normalized columns by Phase 3, not into a JSONB bag).
+
+ Verify: npm run typecheck:cli clean. Run node --import tsx src/cli/start-bot.ts briefly (or trigger one PO sync via existing CLI) and confirm no PostgREST 400s 
+  in logs.
+
+ Commit: fix(purchasing): write lifecycle_stage instead of dropped lifecycle_state column
+
+ Phase 2 — Land the calendar / dashboard rewrite (one commit)
+
+ Goal: ship the working visual layer that already lives in the working tree.
+
+ Files (stage exactly these):
+ - src/lib/purchasing/po-receipt-state.ts (new)
+ - src/lib/purchasing/po-receipt-state.test.ts (new)
+ - src/lib/purchasing/calendar-lifecycle.ts
+ - src/lib/purchasing/calendar-lifecycle.test.ts
+ - src/lib/purchasing/active-purchases.ts
+ - src/components/dashboard/ActivePurchasesPanel.tsx
+ - src/lib/intelligence/ops-manager.ts
+
+ Cleanups before committing:
+ 1. In ops-manager.ts buildPOEventDescription (~line 2204): drop the inline await import('../tracking/shipment-intelligence') +
+ getHighConfidenceTrackingForPOs([po.orderId]) refetch. Pass the prefetched tracking array down through the existing parameter list (already accepts
+ trackingNumbers and prefetchedStatuses); thread the eta / movement string from the loop's highConfTracking into the description builder.
+ 2. In ops-manager.ts calendar sync loop (~line 2453): remove const shouldForceUpdate = true; and the shouldForceUpdate || clause in the update gate. The        
+ last_tracking hash already includes status displays so the dedup will be correct.
+ 3. Keep PurchasingCalendarStatus aligned with the new union; verify no other file imports the removed received_pending_invoice /
+ received_pending_reconciliation / complete / open strings (PurchasingCalendarPanel.tsx only uses these as completion signal labels, not lifecycle statuses —    
+ leave alone).
+
+ Verify:
+ - npx vitest run src/lib/purchasing/calendar-lifecycle.test.ts src/lib/purchasing/po-receipt-state.test.ts
+ - npm run typecheck:cli
+ - Dry-run one PO through syncPurchasingCalendar against an existing event id; confirm title uses prefixText, description renders ETA-driven date, no duplicate  
+ tracking fetch in logs.
+
+ Commit: feat(purchasing): smart past-due lifecycle + ETA-driven calendar sync
+
+ Phase 3 — Persist PO send lifecycle evidence (re-land Task 3)
+
+ Goal: every successful commitAndSendPO() writes the four send-stage columns.
+
+ Files:
+ - src/lib/purchasing/po-sender.ts
+ - src/lib/copilot/actions.po-send.test.ts (extend)
+
+ Changes: in commitAndSendPO() after the po_sends insert, add a third upsert to purchase_orders keyed on po_number writing:
+ - committed_at = committedAt
+ - po_sent_at = sentAt (only when email actually sent — otherwise leave null)
+ - po_email_message_id = gmailMessageId
+ - lifecycle_stage = derived from derivePOLifecycleState({ id: orderId, sentDate: sentAt, hasTracking: false, hasVendorAck: false }) → 'sent'
+ - vendor_name, updated_at
+
+ Use Promise.allSettled so a missing purchase_orders row (PO created out-of-band) does not break the sender.
+
+ Test: assert the upsert is called with the expected payload when email succeeds, and that po_sent_at is null when skipEmail is true.
+
+ Verify: npx vitest run src/lib/copilot/actions.po-send.test.ts + npm run typecheck:cli.
+
+ Commit: feat(purchasing): persist PO send lifecycle evidence
+
+ Phase 4 — Capture vendor ack + tracking-request anti-nag (Task 4)
+
+ Goal: populate ack, shipping_evidence append, and tracking-request bookkeeping from syncPOConversations.
+
+ Files:
+ - src/lib/intelligence/ops-manager.ts (within syncPOConversations)
+ - src/lib/purchasing/derive-po-lifecycle.ts (extend POInput to accept trackingRequestedAt, trackingRequestCount, lastShippingEvidenceKind)
+ - src/lib/purchasing/derive-po-lifecycle.test.ts (extend)
+
+ Changes:
+ 1. Replace each of the five upserts touched in Phase 1 to also write:
+   - vendor_acknowledged_at ← first non-null responseAt (only set if currently NULL — read existing row first)
+   - vendor_ack_source ← 'po_thread_reply'
+   - shipping_evidence ← append a normalized entry { kind: 'tracking_added' | 'invoice_inline' | 'eta_stated', source: 'po_thread', at, ref: thread.id, summary  
+ } using jsonb_build_array() semantics (read–merge–write)
+ 2. When the existing follow-up tracking request fires (search for the existing tracking-request branch in syncPOConversations), increment
+ tracking_request_count and set tracking_requested_at = now().
+ 3. Set tracking_unavailable_at only when tracking_request_count >= 2 AND no shipping evidence exists yet (gate via the helper shouldRequestTrackingFollowUp —   
+ add it to derive-po-lifecycle.ts).
+ 4. Persist lifecycle_stage via derivePOLifecycleState enriched with the new inputs.
+
+ Test: add src/lib/intelligence/ops-manager.po-sync.test.ts covering: first vendor reply records ack, second non-acknowledged sync after 24h sets
+ tracking_unavailable_at, repeated tracking captures append (not overwrite) shipping_evidence, derived stage transitions from sent → vendor_acknowledged →       
+ moving_with_tracking.
+
+ Verify: vitest + typecheck + one live PO thread sync against the dev DB.
+
+ Commit: feat(purchasing): capture PO acknowledgement and shipping evidence
+
+ Phase 5 — Feed trusted tracking movement (Task 5)
+
+ Goal: tracking-agent and shipment-intelligence write the four "movement" columns when material updates land.
+
+ Files:
+ - src/lib/intelligence/tracking-agent.ts
+ - src/lib/tracking/shipment-intelligence.ts (or its upsertShipmentEvidence)
+ - src/lib/intelligence/tracking-agent.test.ts (extend)
+ - src/lib/tracking/shipment-intelligence-read.test.ts (extend)
+
+ Changes:
+ 1. In upsertShipmentEvidence (or a new sibling function), after writing to shipments and resolving the linked po_number, upsert to purchase_orders:
+   - last_tracking_evidence_at = now()
+   - tracking_status_summary = ts.display
+   - last_movement_summary = ts.display and last_movement_update_at = now() only when the new status_category differs from the existing row (read first; skip    
+ otherwise — prevents spam).
+   - Append a normalized { kind: 'tracking_update', source, at, ref: trackingNumber, summary } entry to shipping_evidence.
+ 2. Where tracking-agent enqueues a status check, also call derivePOLifecycleState with hasTracking: true and persist the resulting lifecycle_stage (it will     
+ become moving_with_tracking once the vendor ack is also present).
+
+ Test: assert that two consecutive identical statuses produce only one last_movement_update_at write, and a status change produces two.
+
+ Verify: vitest + typecheck.
+
+ Commit: feat(tracking): feed PO lifecycle movement evidence
+
+ Phase 6 — Expose lifecycle to dashboard (Task 6)
+
+ Goal: dashboard panels render the new states.
+
+ Files:
+ - src/lib/purchasing/active-purchases.ts
+ - src/app/api/dashboard/active-purchases/route.ts
+ - src/components/dashboard/ActivePurchasesPanel.tsx
+ - src/components/dashboard/PurchasingCalendarPanel.tsx
+
+ Changes:
+ 1. Extend ActivePurchase with: lifecycleStage, lifecycleSummary, trackingUnavailable, lastMovementSummary, trackingRequestedAt, vendorAcknowledgedAt. Read the  
+ new columns in loadActivePurchases (the existing Supabase query for purchase_orders already pulls all columns by default, but the FullPO type may need
+ extension).
+ 2. In ActivePurchasesPanel.tsx, replace the existing string ladder (isReceived → 'Received', else 'In Transit') with a switch over lifecycleStage that renders  
+ Sent, Awaiting Tracking, Tracking Unavailable, In Transit, Moving — <summary>, Received, AP Follow-up.
+ 3. In PurchasingCalendarPanel.tsx, surface tracking_unavailable_at and last_movement_summary in the per-event hover/sidebar.
+
+ Test: add src/components/dashboard/ActivePurchasesPanel.test.tsx covering the seven label cases.
+
+ Verify: vitest + npm run typecheck (full Next.js config).
+
+ Commit: refactor(dashboard): show shared PO lifecycle state
+
+ Phase 7 — Wire lifecycle into calendar sync + daily movement messages (Task 7)
+
+ Goal: the calendar event title/description and the daily Telegram movement message use the same lifecycle data, never inventing tracking detail when none       
+ exists.
+
+ Files:
+ - src/lib/intelligence/ops-manager.ts (syncPurchasingCalendar + the daily movement message path)
+ - src/lib/purchasing/calendar-lifecycle.ts (read from shared lifecycle helper)
+
+ Changes:
+ 1. In syncPurchasingCalendar, fetch the purchase_orders row alongside the Finale PO; pass lifecycle_stage, last_movement_summary, tracking_unavailable_at,      
+ vendor_acknowledged_at into buildPOEventDescription.
+ 2. In buildPOEventDescription, append a "Lifecycle: " line, and only show movement detail when last_movement_summary is set.
+ 3. For the daily movement summary cron, send a message only when last_movement_update_at advanced since the last cron run (track via a small Supabase
+ scratchpad table or per-PO cursor).
+
+ Test: extend calendar-lifecycle.test.ts to assert lifecycle summary appears in the event description (mock the helper).
+
+ Verify: vitest + dry-run sync + typecheck.
+
+ Commit: feat(calendar): sync purchasing calendar with PO lifecycle evidence
+
+ Phase 8 — Verification + repo hygiene
+
+ 1. Full focused test pass:
+ npx vitest run \
+   src/lib/purchasing/po-receipt-state.test.ts \
+   src/lib/purchasing/calendar-lifecycle.test.ts \
+   src/lib/purchasing/derive-po-lifecycle.test.ts \
+   src/lib/copilot/actions.po-send.test.ts \
+   src/lib/intelligence/ops-manager.po-sync.test.ts \
+   src/lib/intelligence/tracking-agent.test.ts \
+   src/lib/tracking/shipment-intelligence-read.test.ts \
+   src/components/dashboard/ActivePurchasesPanel.test.tsx
+ 2. npm run typecheck:all
+ 3. End-to-end smoke: send one real PO through commitAndSendPO, watch:
+   - purchase_orders row gets committed_at, po_sent_at, po_email_message_id, lifecycle_stage='sent'
+   - vendor reply moves it to vendor_acknowledged
+   - tracking ingestion moves it to moving_with_tracking and populates last_movement_summary
+   - calendar event title shows the right prefixText, description contains lifecycle line
+   - dashboard panel shows the new label
+ 4. Hygiene commit: delete or move to scripts/scratch/ (gitignored) the untracked root probes: check-cal.mjs, check-cals.mjs, check-cals.ts, check-cals2.mjs,    
+ check-cols.ts, check-derive.ts, check-direct.ts, check-finale-pos.ts, check-ops-pos.ts, check-pos.ts, check-status.ts, check-sync-debug.ts,
+ demo-calendar-update.js, diagnose-shipments.js, diagnose-tracking.js, force-calendar-sync.js, force-calendar-update.js, force-wipe-calendar.js,
+ run-calendar-sync.js, run-sync.mjs, sync-calendar.js, test-po-124557.js, test-regex-3.js, verify-events.mjs, verify-events2.mjs, typecheck_output.txt. Add      
+ scripts/scratch/ and typecheck_output.txt to .gitignore if keeping any.
+ 5. pm2 restart aria-bot.
+
+
+ Critical Files to Modify
+
+ ┌──────────────────────────────────────────────────────┬────────────┬────────────────────────────────────────────────────┐
+ │                         Path                         │   Phase    │                        Why                         │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/intelligence/ops-manager.ts                  │ 1, 2, 4, 7 │ Calendar sync, syncPOConversations, daily movement │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/purchasing/po-sender.ts                      │ 3          │ Send lifecycle persistence                         │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/purchasing/calendar-lifecycle.ts + test      │ 2, 7       │ Visual lifecycle helper                            │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/purchasing/po-receipt-state.ts + test        │ 2          │ Receipt resolution helper (new)                    │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/purchasing/active-purchases.ts               │ 2, 6       │ Dashboard data source                              │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/components/dashboard/ActivePurchasesPanel.tsx    │ 2, 6       │ Dashboard rendering                                │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/components/dashboard/PurchasingCalendarPanel.tsx │ 6          │ Calendar UI                                        │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/purchasing/derive-po-lifecycle.ts + test     │ 4          │ Extend helper for ack/tracking inputs              │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/intelligence/tracking-agent.ts + test        │ 5          │ Movement evidence writer                           │
+ ├──────────────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────┤
+ │ src/lib/tracking/shipment-intelligence.ts + test     │ 5          │ upsertShipmentEvidence → PO lifecycle sync         │
+ └──────────────────────────────────────────────────────┴────────────┴────────────────────────────────────────────────────┘
+
+ Reused Existing Utilities
+
+ - derivePOLifecycleState() — src/lib/purchasing/derive-po-lifecycle.ts — already implements the 5-state model; extend its POInput rather than creating a        
+ parallel helper.
+ - hasPurchaseOrderReceipt() / resolvePurchaseOrderReceiptDate() — src/lib/purchasing/po-receipt-state.ts — already used by active-purchases.ts and
+ calendar-lifecycle.ts.
+ - derivePOCompletionState() — src/lib/purchasing/po-completion-state.ts — keep as the AP-side completion truth; lifecycle is the transit truth.
+ - getHighConfidenceTrackingForPOs() — src/lib/tracking/shipment-intelligence.ts:837 — already used by ops-manager calendar sync.
+ - upsertShipmentEvidence() — src/lib/tracking/shipment-intelligence.ts:604 — extension point for Phase 5.
+ - loadPOCompletionSignalIndex() / derivePOCompletionState() — already wired into loadActivePurchases.
+
+ Verification Checklist
+
+ - npm run typecheck:all clean
+ - All 8 test files in Phase 8 step 1 pass
+ - One live PO produces non-null committed_at, po_sent_at, po_email_message_id, lifecycle_stage in purchase_orders
+ - Vendor reply on that thread sets vendor_acknowledged_at exactly once
+ - A second sync 24h+ later without new evidence sets tracking_unavailable_at
+ - Tracking arrival bumps last_movement_summary + last_movement_update_at
+ - Calendar event for that PO renders with new prefixText and lifecycle line
+ - Dashboard ActivePurchasesPanel row renders the new lifecycle stage label
+ - No PostgREST 400s in pm2 logs aria-bot after one full sync cycle
+ - git status clean of scratch root files
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌

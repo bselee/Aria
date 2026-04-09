@@ -20,6 +20,7 @@ export const READ_TOOL_NAMES = [
     "query_purchase_orders",
     "build_risk_analysis",
     "inspect_artifact",
+    "scrape_purchasing_dashboard",
 ] as const;
 
 export type ReadToolName = typeof READ_TOOL_NAMES[number];
@@ -201,6 +202,16 @@ export function getSharedReadTools(opts?: { threadId?: string }) {
                 } catch (err: any) {
                     return `Artifact lookup failed: ${err.message}`;
                 }
+            },
+        }),
+
+        scrape_purchasing_dashboard: tool({
+            description: "Run the basauto.vercel.app purchasing scrape, assess vs Finale, snapshot to Supabase, and return new HIGH_NEED + pending requests since the last run.",
+            inputSchema: z.object({}),
+            execute: async () => {
+                const { runPurchasingIntelligence } = await import('@/lib/intelligence/purchasing-pipeline');
+                const result = await runPurchasingIntelligence({ source: 'manual', triggeredBy: 'bot' });
+                return result.telegramMessage;
             },
         }),
     };

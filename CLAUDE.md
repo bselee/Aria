@@ -102,6 +102,15 @@ Raw SDK access: `src/lib/anthropic.ts` exports a lazy-init `getAnthropicClient()
 
 **Dashboard exception:** `src/app/api/dashboard/chat/route.ts` uses **Gemini 2.5 Flash** (`@ai-sdk/google`) — completely separate from the Telegram bot stack. Requires `GOOGLE_GENERATIVE_AI_API_KEY`.
 
+### BrowserManager Standard
+Any new Playwright/scraping work MUST use BrowserManager.getInstance() from src/lib/scraping/browser-manager.ts. Do not call chromium.launch() directly.
+
+Prefer connection to running Chrome if user-friendly (useRunningBrowser: true).
+
+Create separate profile dirs in .{vendor}-profile/ (always gitignored) that can be manually seeded with .session.json files.
+
+Shortcuts: use --headed and --login options during initial setup.
+
 ### In-Memory State Warning ⚠️
 Both `reconciler.ts` (`pendingApprovals`, 24h TTL) and `dropship-store.ts` (`pendingDropships`, 48h TTL) use in-memory Maps. **`pm2 restart aria-bot` silently drops all pending Telegram approval requests and unmatched dropship invoices.** There is no persistence layer for these — intentionally ephemeral. Check for pending Telegram approvals before restarting during active invoice processing.
 

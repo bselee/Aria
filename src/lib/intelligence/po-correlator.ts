@@ -614,19 +614,34 @@ function extractTrackingFromThread(messages: any[]): string[] {
         // UPS
         /\b1Z[A-Z0-9]{16}\b/g,
         // FedEx
-        /\b\d{12,22}\b/g,
+        /\b(96\d{18}|\d{15}|\d{12})\b/g,
         // USPS
-        /\b(94|93|92|94|95)\d{18,22}\b/g,
+        /\b(?:94|92|93|95)\d{20}\b/g,
+        // DHL
+        /\bJD\d{18}\b/gi,
+        // LTL PRO (PRO #1234567, PRO 12345)
+        /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi,
+        // BOL (BOL #12345)
+        /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/gi,
         // Generic "tracking" followed by number
-        /tracking[:\s#]*([A-Z0-9]{10,30})/gi,
+        /tracking[:\s#]*([A-Z0-9]{8,30})/gi,
+        // Oak Harbor Freight Lines (30884911)
+        /\b(?:Oak\s+Harbor(?:\s+Freight(?:\s+Lines)?)?.*?)\b(\d{8,12})\b/gi,
+        // Generic tracking number sentence structure ("tracking number is 12345678")
+        /tracking\s+number\s+is\s+([A-Z0-9]{8,30})/gi,
     ];
 
     for (const msg of messages) {
         const snippet = msg.snippet || "";
         for (const pattern of trackingPatterns) {
-            const matches = snippet.match(pattern);
-            if (matches) {
-                trackingNumbers.push(...matches);
+            const matches = snippet.matchAll(pattern);
+            for (const match of matches) {
+                // Usually tracking numbers are in capture group 1 if present, else entire match
+                const trackingNumber = match[1] || match[0];
+                // Must contain digits to filter out words
+                if (trackingNumber && (trackingNumber.match(/\d/g)?.length ?? 0) >= 2) {
+                    trackingNumbers.push(trackingNumber);
+                }
             }
         }
     }

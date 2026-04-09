@@ -50,6 +50,8 @@ export const TRACKING_PATTERNS = {
     // LTL freight identifiers — whitespace required after keyword
     pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
     bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
+    // Oak Harbor explicitly
+    oakharbor: /\b(?:Oak\s+Harbor(?:\s+Freight(?:\s+Lines)?)?.*?)?\b(\d{8,12})\b/i,
 };
 
 // ──────────────────────────────────────────────────
@@ -77,6 +79,8 @@ const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
     [/\bestes\s+express\b/i, "Estes"],
     [/\bestes\b/i, "Estes"],
     [/\bsaia\b/i, "Saia"],
+    [/\boak\s+harbor\s+freight\s+lines\b/i, "Oak Harbor Freight Lines"],
+    [/\boak\s+harbor\b/i, "Oak Harbor Freight Lines"],
 ];
 
 /**
@@ -110,6 +114,7 @@ const LTL_DIRECT_LINKS: Record<string, string> = {
     "Central Transport": "https://www.centraltransport.com/forms/tracking.aspx?pro={PRO}",
     "ABF Freight": "https://arcb.com/tools/tracking.html?pro={PRO}",
     "ArcBest": "https://arcb.com/tools/tracking.html?pro={PRO}",
+    "Oak Harbor Freight Lines": "https://www.oakh.com/tracking?pro={PRO}",
 };
 
 // ──────────────────────────────────────────────────

@@ -352,7 +352,7 @@ async function main() {
   try {
     const signedIn = await ensureSignedIn(page, opts.headed);
     if (!signedIn) {
-      await manager.close();
+      await manager.destroy();
       process.exit(1);
     }
 
@@ -360,7 +360,7 @@ async function main() {
       console.log('\n✓ Signed in. Cookies saved to .basauto-session.json');
       console.log('  You can now run without --login for headless scrapes.\n');
       await manager.saveCookies();
-      await manager.close();
+      await manager.destroy();
       process.exit(0);
     }
 
@@ -412,7 +412,7 @@ async function main() {
     console.log(`OVERDUE: ${byUrgency.OVERDUE.length} | URGENT: ${byUrgency.URGENT.length} | PURCHASE: ${byUrgency.PURCHASE.length}`);
     if (!opts.skipRequests) console.log(`Requests: ${requests.length}`);
   } finally {
-    await manager.close();
+    await manager.destroy();
   }
 }
 

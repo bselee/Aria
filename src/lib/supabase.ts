@@ -6,11 +6,14 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'mock-key';
 let supabase: any = null;
 
 export function createClient() {
-    if (!supabase && process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-        supabase = createSupabaseClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_ROLE_KEY
-        );
+    // Force initialization if env vars are missing but we are in Node
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!supabase && url && key) {
+        supabase = createSupabaseClient(url, key);
+    } else if (!supabase) {
+        console.warn('⚠️ Supabase env vars missing. NEXT_PUBLIC_SUPABASE_URL:', !!url, 'SUPABASE_SERVICE_ROLE_KEY:', !!key);
     }
     return supabase;
 }

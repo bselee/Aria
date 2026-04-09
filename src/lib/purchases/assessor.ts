@@ -461,9 +461,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
         }
     }
 
-    if (!jsonOutput) {
-        console.log(`\n  Assessing ${workQueue.length} SKUs across ${new Set(workQueue.map(w => w.vendor)).size} vendors...\n`);
-    }
+
 
     const client = new FinaleClient();
     await client.testConnection();
@@ -499,12 +497,8 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
                 );
                 assessed.push({ vendor, assessed: assessedItem });
 
-                if (!jsonOutput) {
-                    const icon = assessedItem.necessity === 'HIGH_NEED' ? '🔴' : assessedItem.necessity === 'MEDIUM' ? '🟡' : assessedItem.necessity === 'LOW' ? '🟠' : '⚪';
-                    console.log(`  ${icon} ${sku.padEnd(12)} ${assessedItem.necessity.padEnd(10)} stock=${Math.round(assessedItem.stockOnHand)} vel=${assessedItem.dailyRate.toFixed(2)}/d runway=${assessedItem.runwayDays === -1 ? '∞' : assessedItem.runwayDays + 'd'}`);
-                }
+
             } catch (err: any) {
-                console.error(`  [error] ${sku}: ${err.message}`);
                 assessed.push({
                     vendor,
                     assessed: {
@@ -537,9 +531,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
     // Pending requests
     const pendingRequests = finalRequestsData.requests.filter(r => r.status === 'Pending');
     if (pendingRequests.length > 0) {
-        if (!jsonOutput) {
-            console.log(`\n  Assessing ${pendingRequests.length} pending purchase requests...\n`);
-        }
+
         const { products } = await buildProductCatalog();
         const matcher = new FuzzyMatcher(products);
         const requestQueue = [...pendingRequests];
@@ -576,9 +568,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
                             fuzzyMatchScore: match?.score,
                         };
                         requestResults.push({ vendor: req.department, assessed: assessedItem });
-                        if (!jsonOutput) {
-                            console.log(`  ⚪ NO MATCH — "${details.substring(0, 40)}..." (score: ${match?.score?.toFixed(2) || 0})`);
-                        }
+
                         continue;
                     }
 
@@ -600,12 +590,8 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
 
                     requestResults.push({ vendor: req.department, assessed: assessedItem });
 
-                    if (!jsonOutput) {
-                        const icon = assessedItem.necessity === 'HIGH_NEED' ? '🔴' : assessedItem.necessity === 'MEDIUM' ? '🟡' : assessedItem.necessity === 'LOW' ? '🟠' : '⚪';
-                        console.log(`  ${icon} [REQ] ${sku.padEnd(12)} ${assessedItem.necessity.padEnd(10)} stock=${Math.round(assessedItem.stockOnHand)} vel=${assessedItem.dailyRate.toFixed(2)}/d runway=${assessedItem.runwayDays === -1 ? '∞' : assessedItem.runwayDays + 'd'} (match: ${match.score.toFixed(2)})`);
-                    }
+
                 } catch (err: any) {
-                    console.error(`  [error] request "${details.substring(0, 30)}...": ${err.message}`);
                     requestResults.push({
                         vendor: req.department,
                         assessed: {
