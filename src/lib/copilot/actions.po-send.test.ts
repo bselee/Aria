@@ -42,6 +42,7 @@ const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.h
 
             return {
                 insert: async (_row: any) => ({ data: null, error: null }),
+                upsert: async (_row: any, _options?: any) => ({ data: null, error: null }),
             };
         },
     }));

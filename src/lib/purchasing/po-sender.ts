@@ -355,6 +355,15 @@ export async function commitAndSendPO(
                     emailError,
                 },
             }),
+            db.from('purchase_orders').upsert({
+                po_number: orderId,
+                vendor_name: review.vendorName,
+                committed_at: committedAt,
+                po_sent_at: sentAt,
+                po_email_message_id: gmailMessageId,
+                lifecycle_stage: 'sent',
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'po_number' }),
         ]);
     }
 
