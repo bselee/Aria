@@ -601,6 +601,71 @@ function isReceivedPurchaseOrderStatus(status: string | null | undefined): boole
     return normalized === "received" || normalized === "completed";
 }
 
+/**
+ * Syncs PO lifecycle columns from a shipment record.
+ * Only writes when the tracking status has materially changed.
+ */
+async function syncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const now = new Date().toISOString();
+    const statusSummary = shipment.status_display || null;
+
+    // Read existing row to detect status changes
+    const { data: existingPO } = await supabase
+        .from("purchase_orders")
+        .select("tracking_status_summary, lifecycle_stage, vendor_acknowledged_at")
+        .eq("po_number", poNumber)
+        .maybeSingle();
+
+    const prevStatus = existingPO?.tracking_status_summary;
+    const statusChanged = statusSummary && statusSummary !== prevStatus;
+
+    const update: Record<string, any> = {
+        po_number: poNumber,
+        last_tracking_evidence_at: now,
+        updated_at: now,
+    };
+
+    if (statusSummary) {
+        update.tracking_status_summary = statusSummary;
+    }
+
+    // Only write movement summary on status change (prevent spam)
+    if (statusChanged) {
+        update.last_movement_summary = statusSummary;
+        update.last_movement_update_at = now;
+    }
+
+    // Derive lifecycle stage: moving_with_tracking if tracking is present
+    if (shipment.status_category === 'delivered' || shipment.status_category === 'shipped') {
+        const hasVendorAck = !!existingPO?.vendor_acknowledged_at;
+        update.lifecycle_stage = hasVendorAck ? 'moving_with_tracking' : (existingPO?.lifecycle_stage || 'sent');
+    }
+
+    // Append shipping evidence entry
+    const evidenceEntry = {
+        kind: 'tracking_update',
+        source: shipment.last_source || 'shipment_intelligence',
+        at: now,
+        ref: shipment.tracking_number,
+        summary: statusSummary || 'tracking added',
+    };
+
+    // Read existing shipping_evidence and append
+    const { data: poRow } = await supabase
+        .from("purchase_orders")
+        .select("shipping_evidence")
+        .eq("po_number", poNumber)
+        .maybeSingle();
+
+    const existingEvidence = poRow?.shipping_evidence || [];
+    update.shipping_evidence = [...existingEvidence, evidenceEntry];
+
+    await supabase.from("purchase_orders").upsert(update, { onConflict: "po_number" });
+}
+
 export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promise<ShipmentRecord | null> {
     const supabase = createClient();
     if (!supabase) return null;
@@ -658,6 +723,7 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
 
     if (input.poNumber) {
         await syncLegacyPurchaseOrderTracking(input.poNumber);
+        await syncPOLifecycleFromShipment(input.poNumber, merged);
     }
 
     return data as ShipmentRecord;
@@ -820,6 +886,47 @@ export async function getDashboardTrackingBoard(): Promise<DashboardTrackingBoar
         shipments: shipments.map((shipment) => rollupShipment(shipment, nowIso)),
         asOf: nowIso,
     };
+}
+
+export function isHighConfidenceTracking(shipment: ShipmentRecord): boolean {
+    const hasValidCarrier = shipment.carrier_name && !shipment.carrier_name.toLowerCase().includes('unknown') && !shipment.carrier_name.toLowerCase().includes('parcelsapp');
+    const hasAssociatedPO = (shipment.po_numbers && shipment.po_numbers.length > 0) || shipment.po_numbers;
+    
+    // We consider it high confidence if it came from a reliable internal source
+    const isTriggerSource = shipment.source_refs.some((ref) =>
+        ['po_thread_sync', 'ap_invoice', 'email_tracking'].includes(ref.source)
+    );
+
+    return !!(hasValidCarrier && hasAssociatedPO && (isTriggerSource || shipment.status_category));
+}
+
+export async function getHighConfidenceTrackingForPOs(poNumbers: string[]): Promise<Array<{
+    trackingNumber: string;
+    carrier: string;
+    status: string;
+    eta?: string;
+    carrierUrl: string;
+    display: string;
+    updatedAt: string;
+}>> {
+    const allShipments = await listActiveShipmentsForRead();
+    return allShipments
+        .filter((shipment) => isHighConfidenceTracking(shipment) && 
+            shipment.po_numbers && 
+            shipment.po_numbers.some((po: string) => poNumbers.includes(po)))
+        .map((shipment) => {
+            const cleanNum = shipment.tracking_number.includes(':::') ? shipment.tracking_number.split(':::')[1] : shipment.tracking_number;
+            return {
+                trackingNumber: cleanNum,
+                carrier: shipment.carrier_name || 'Unknown',
+                status: shipment.status_display || shipment.status_category || 'Pending',
+                eta: shipment.estimated_delivery_at || undefined,
+                carrierUrl: shipment.public_tracking_url || `https://parcelsapp.com/en/tracking/${cleanNum}`,
+                display: cleanNum,
+                updatedAt: shipment.updated_at,
+            };
+        })
+        .sort((a, b) => a.trackingNumber.localeCompare(b.trackingNumber));
 }
 
 export async function getBestTrackingAnswerForQuery(query: string): Promise<BestTrackingAnswer | null> {
