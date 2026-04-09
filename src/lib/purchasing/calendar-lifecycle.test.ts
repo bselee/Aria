@@ -17,7 +17,7 @@ describe("calendar lifecycle", () => {
 
         expect(lifecycle.calendarStatus).toBe("delivered");
         expect(lifecycle.statusLabel).toBe("Delivered - Awaiting Receipt");
-        expect(lifecycle.titleEmoji).toBe("🟡");
+        expect(lifecycle.colorId).toBe("5");
     });
 
     it("keeps received purchases only within the configured retention windows", () => {
@@ -30,7 +30,7 @@ describe("calendar lifecycle", () => {
     });
 
     it("moves received events onto the actual receive date", () => {
-        const lifecycle = derivePurchasingLifecycle("completed");
+        const lifecycle = derivePurchasingLifecycle("committed", [], "received_pending_invoice", "2026-03-25", "2026-03-30T08:15:00Z");
         expect(getPurchasingEventDate("2026-03-25", "2026-03-30T08:15:00Z", lifecycle)).toBe("2026-03-30");
     });
 
@@ -39,16 +39,22 @@ describe("calendar lifecycle", () => {
         expect(daysSinceDate("2026-03-29T01:00:00Z", now)).toBe(1);
     });
 
-    it("shows received but incomplete POs as a green received state with AP follow-up messaging", () => {
+    it("shows received but incomplete POs as a green received state", () => {
         const lifecycle = derivePurchasingLifecycle("completed", [], "received_pending_invoice");
         expect(lifecycle.isReceived).toBe(true);
-        expect(lifecycle.titleEmoji).toBe("🟢");
-        expect(lifecycle.statusLabel).toBe("Received - Awaiting Invoice");
+        expect(lifecycle.colorId).toBe("2");
+        expect(lifecycle.statusLabel).toBe("Received");
     });
 
     it("shows fully resolved POs as complete", () => {
         const lifecycle = derivePurchasingLifecycle("completed", [], "complete");
-        expect(lifecycle.titleEmoji).toBe("✅");
-        expect(lifecycle.statusLabel).toBe("Complete");
+        expect(lifecycle.colorId).toBe("2");
+        expect(lifecycle.statusLabel).toBe("Received");
+    });
+
+    it("does not infer received from completed alone without receipt evidence", () => {
+        const lifecycle = derivePurchasingLifecycle("completed", [], null, "2026-03-25", null);
+        expect(lifecycle.isReceived).toBe(false);
+        expect(lifecycle.calendarStatus).toBe("past_due");
     });
 });

@@ -5,6 +5,7 @@ import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from ".
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
+import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -69,8 +70,17 @@ export async function loadActivePurchases(
         const status = (po.status || "").toLowerCase();
         if (!["committed", "completed"].includes(status)) continue;
 
-        const isReceived = status === "completed";
         const shipments = shipmentMap.get(po.orderId) || [];
+        const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
+            status: po.status,
+            receiveDate: po.receiveDate,
+            shipments: po.shipments,
+        });
+        const isReceived = hasPurchaseOrderReceipt({
+            status: po.status,
+            receiveDate: po.receiveDate,
+            shipments: po.shipments,
+        });
         const completionSignal = completionSignals.get(po.orderId);
         const completionState = derivePOCompletionState({
             finaleReceived: isReceived,
@@ -84,7 +94,7 @@ export async function loadActivePurchases(
         if (
             completionState === "complete" &&
             isReceived &&
-            !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)
+            !shouldKeepReceivedPurchase(resolvedReceiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)
         ) {
             continue;
         }
@@ -103,6 +113,7 @@ export async function loadActivePurchases(
 
         activePos.push({
             ...po,
+            receiveDate: resolvedReceiveDate,
             expectedDate,
             leadProvenance,
             isReceived,

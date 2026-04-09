@@ -14,6 +14,8 @@ type ActivePurchase = {
     items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
     leadProvenance: string;
+    isReceived: boolean;
+    completionState: string;
     trackingNumbers?: string[];
     shipments?: Array<{
         tracking_number: string;
@@ -227,7 +229,7 @@ export default function ActivePurchasesPanel() {
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50" style={{ height: bodyHeight }}>
                             {visiblePurchases.map(po => {
-                                const isReceived = po.status.toLowerCase() === "completed";
+                                const isReceived = po.isReceived;
                                 const isCancelled = po.status.toLowerCase() === "cancelled";
 
                                 let statusLabel = "In Transit";
