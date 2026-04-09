@@ -1,7 +1,10 @@
 // types/purchase-orders.ts
 // Shared types for PO lifecycle and evidence
 
-// PO Lifecycle States
+/**
+ * Purchase Order Lifecycle States
+ * Represents the progression of a PO from creation to fulfillment
+ */
 export type POLifecycleState =
   | "DRAFT"
   | "COMMITTED"
@@ -10,37 +13,73 @@ export type POLifecycleState =
   | "IN_TRANSIT"
   | "RECEIVED";
 
-// Evidence Entry Types
+/**
+ * Evidence entry for email-related events
+ */
 export interface EmailEvidence {
+  /** Discriminant type */
   type: "email";
+  /** Gmail message ID */
   emailId: string;
-  timestamp: string; // ISO 8601
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Optional description */
   description?: string;
+  /** Email subject line */
   subject?: string;
 }
 
+/**
+ * Evidence entry for tracking number updates
+ */
 export interface TrackingEvidence {
+  /** Discriminant type */
   type: "tracking";
+  /** Array of tracking numbers */
   trackingNumbers: string[];
+  /** Source of the tracking info */
   source: "email" | "telegram" | "portal" | "api";
-  timestamp: string; // ISO 8601
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Optional description */
   description?: string;
 }
 
+/**
+ * Evidence entry for significant timestamps (acknowledgment, receipt, etc.)
+ */
 export interface TimestampEvidence {
+  /** Discriminant type */
   type: "timestamp";
-  event: "sent" | "acknowledged" | "received" | "in_transit";
-  timestamp: string; // ISO 8601
+  /** The specific event type */
+  event: "SENT" | "ACKNOWLEDGED" | "RECEIVED" | "IN_TRANSIT";
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Optional description */
   description?: string;
 }
 
-// Union type for all evidence entries
+/**
+ * Union type for all possible evidence entries that can be stored in a PO's evidence record
+ */
 export type EvidenceEntry = EmailEvidence | TrackingEvidence | TimestampEvidence;
 
-// Evidence as a record of timestamps to entries
+/**
+ * The evidence record for a PO - keys are ISO 8601 timestamp strings representing when the evidence was captured,
+ * values are the evidence entries themselves
+ */
 export type POEvidence = Record<string, EvidenceEntry>;
 
-// Validation utility for lifecycle state transitions
+/**
+ * Get the valid next states from a given PO lifecycle state
+ * @param currentState - The current lifecycle state
+ * @returns Array of valid next states
+ * @example
+ * ```ts
+ * getValidNextStates("DRAFT") // ["COMMITTED"]
+ * getValidNextStates("SENT") // ["ACKNOWLEDGED", "IN_TRANSIT"]
+ * ```
+ */
 export function getValidNextStates(currentState: POLifecycleState): POLifecycleState[] {
   switch (currentState) {
     case "DRAFT":
@@ -60,6 +99,17 @@ export function getValidNextStates(currentState: POLifecycleState): POLifecycleS
   }
 }
 
+/**
+ * Validate if a transition from one PO lifecycle state to another is allowed
+ * @param from - The starting state
+ * @param to - The target state
+ * @returns True if the transition is valid, false otherwise
+ * @example
+ * ```ts
+ * isValidTransition("DRAFT", "COMMITTED") // true
+ * isValidTransition("DRAFT", "SENT") // false
+ * ```
+ */
 export function isValidTransition(from: POLifecycleState, to: POLifecycleState): boolean {
   return getValidNextStates(from).includes(to);
 }
