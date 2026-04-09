@@ -1,5 +1,6 @@
 import type { TrackingStatus } from "../carriers/tracking-service";
 import type { POCompletionState } from "./po-completion-state";
+import { hasPurchaseOrderReceipt } from "./po-receipt-state";
 
 export const RECEIVED_CALENDAR_RETENTION_DAYS = 14;
 export const RECEIVED_DASHBOARD_RETENTION_DAYS = 3;
@@ -8,17 +9,17 @@ export type PurchasingCalendarStatus =
     | "open"
     | "delivered"
     | "received"
-    | "received_pending_invoice"
-    | "received_pending_reconciliation"
-    | "complete"
+    | "cancelled"
     | "exception"
-    | "cancelled";
+    | "in_transit"
+    | "awaiting_tracking"
+    | "past_due";
 
 export interface PurchasingLifecycleState {
     calendarStatus: PurchasingCalendarStatus;
     completionState: POCompletionState | null;
     colorId: string;
-    titleEmoji: string;
+    prefixText: string;
     statusLabel: string;
     isReceived: boolean;
     isCancelled: boolean;
@@ -55,10 +56,12 @@ export function shouldKeepReceivedPurchase(
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
     trackingStatuses: Array<TrackingStatus | null> = [],
-    completionState: POCompletionState | null = null
+    completionState: POCompletionState | null = null,
+    expectedDeliveryDate?: string,
+    receiveDate?: string | null
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
-    const isReceived = normalized === "completed";
+    const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate });
     const isCancelled = normalized === "cancelled";
     const knownStatuses = trackingStatuses.filter((item): item is TrackingStatus => item !== null);
     const hasDeliveredProof =
@@ -68,64 +71,17 @@ export function derivePurchasingLifecycle(
         knownStatuses.length === trackingStatuses.length &&
         knownStatuses.every(item => item.category === "delivered");
 
-    if (isReceived) {
-        switch (completionState) {
-            case "complete":
-                return {
-                    calendarStatus: "complete",
-                    completionState,
-                    colorId: "2",
-                    titleEmoji: "✅",
-                    statusLabel: "Complete",
-                    isReceived: true,
-                    isCancelled: false,
-                    isDeliveredAwaitingReceipt: false,
-                };
-            case "received_pending_invoice":
-                return {
-                    calendarStatus: "received_pending_invoice",
-                    completionState,
-                    colorId: "2",
-                    titleEmoji: "🟢",
-                    statusLabel: "Received - Awaiting Invoice",
-                    isReceived: true,
-                    isCancelled: false,
-                    isDeliveredAwaitingReceipt: false,
-                };
-            case "received_pending_reconciliation":
-                return {
-                    calendarStatus: "received_pending_reconciliation",
-                    completionState,
-                    colorId: "2",
-                    titleEmoji: "🟢",
-                    statusLabel: "Received - AP Follow-Up Needed",
-                    isReceived: true,
-                    isCancelled: false,
-                    isDeliveredAwaitingReceipt: false,
-                };
-            case "exception":
-                return {
-                    calendarStatus: "exception",
-                    completionState,
-                    colorId: "6",
-                    titleEmoji: "🟠",
-                    statusLabel: "Received - Exception Needs Review",
-                    isReceived: true,
-                    isCancelled: false,
-                    isDeliveredAwaitingReceipt: false,
-                };
-            default:
-                return {
-                    calendarStatus: "received",
-                    completionState,
-                    colorId: "2",
-                    titleEmoji: "✅",
-                    statusLabel: "Received",
-                    isReceived: true,
-                    isCancelled: false,
-                    isDeliveredAwaitingReceipt: false,
-                };
-        }
+    if (isReceived || (completionState && (completionState.includes('received') || completionState === 'complete'))) {
+        return {
+            calendarStatus: "received",
+            completionState,
+            colorId: "2",
+            prefixText: "RCV",
+            statusLabel: "Received",
+            isReceived: true,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+        };
     }
 
     if (isCancelled) {
@@ -133,7 +89,7 @@ export function derivePurchasingLifecycle(
             calendarStatus: "cancelled",
             completionState,
             colorId: "11",
-            titleEmoji: "❌",
+            prefixText: "CNCL",
             statusLabel: "Cancelled",
             isReceived: false,
             isCancelled: true,
@@ -146,7 +102,7 @@ export function derivePurchasingLifecycle(
             calendarStatus: "delivered",
             completionState,
             colorId: "5",
-            titleEmoji: "🟡",
+            prefixText: "DLVD",
             statusLabel: "Delivered - Awaiting Receipt",
             isReceived: false,
             isCancelled: false,
@@ -154,12 +110,74 @@ export function derivePurchasingLifecycle(
         };
     }
 
+    // Smart logic for past-due items - reduce red, show orange for overdue
+    const hasAnyTracking = trackingStatuses.length > 0;
+    const ageDays = daysSinceDate(expectedDeliveryDate || undefined) || 0;
+
+    // If past expected and has tracking → treat as likely delivered
+    if (ageDays > 14 && hasAnyTracking) {
+        return {
+            calendarStatus: "delivered",
+            completionState,
+            colorId: "5",
+            prefixText: "LATE",
+            statusLabel: "Past Due - Verify Receipt in Finale",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: true,
+        };
+    }
+
+    // Very old with no tracking = exception
+    if (ageDays > 35) {
+        return {
+            calendarStatus: "exception",
+            completionState,
+            colorId: "6",
+            prefixText: "EXCP",
+            statusLabel: "Long Outstanding - Needs Attention",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+        };
+    }
+
+    // "Way past due should be red"
+    // If it's past expected date and NOT delivered, it's Past Due
+    if (ageDays > 0) {
+        return {
+            calendarStatus: "past_due",
+            completionState,
+            colorId: "11", // Tomato Red
+            prefixText: "LATE",
+            statusLabel: "Past Due - Needs Follow-up",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+        };
+    }
+
+    // "but we need an in transit color, on track industry standards"
+    if (hasAnyTracking) {
+        return {
+            calendarStatus: "in_transit",
+            completionState,
+            colorId: "9", // Blueberry (Blue) - Industry standard for active transit
+            prefixText: "IT",
+            statusLabel: "In Transit",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+        };
+    }
+
+    // Awaiting tracking / processing
     return {
-        calendarStatus: "open",
+        calendarStatus: "awaiting_tracking",
         completionState,
-        colorId: "11",
-        titleEmoji: "🔴",
-        statusLabel: "In Transit",
+        colorId: "8", // Graphite (Grey)
+        prefixText: "AT",
+        statusLabel: "Awaiting Tracking",
         isReceived: false,
         isCancelled: false,
         isDeliveredAwaitingReceipt: false,
@@ -169,7 +187,31 @@ export function derivePurchasingLifecycle(
 export function getPurchasingEventDate(
     expectedDate: string,
     receiveDate: string | null | undefined,
-    lifecycle: PurchasingLifecycleState
+    lifecycle: PurchasingLifecycleState,
+    latestETA?: string
 ): string {
-    return lifecycle.isReceived ? toDateOnly(receiveDate) || expectedDate : expectedDate;
+    // Priority: actual receive date > latest tracking ETA > original expected date
+    // If not received and calculated date is in the past, push to today
+    const todayKey = toDateOnly(new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" }))!;
+
+    if (lifecycle.isReceived) {
+        if (receiveDate) {
+            const parsed = toDateOnly(receiveDate);
+            if (parsed) return parsed;
+        }
+        // If we absolutely don't have a receiveDate, leave it on its expected date
+        // (or today if you prefer, but "actual day" is best effort via receiveDate)
+    }
+
+    let eventDate = expectedDate;
+    if (latestETA) {
+        eventDate = toDateOnly(latestETA) || expectedDate;
+    }
+
+    // Push past due unreceived items forward to today for visibility
+    if (!lifecycle.isReceived && eventDate < todayKey) {
+        return todayKey;
+    }
+
+    return eventDate;
 }

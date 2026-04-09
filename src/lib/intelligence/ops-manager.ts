@@ -2196,7 +2196,9 @@ Data: ${JSON.stringify(data)}`;
         leadProvenance: string,
         trackingNumbers: string[],
         prefetchedStatuses?: Map<string, TrackingStatus | null>,
-        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate)
+        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate),
+        latestETA?: string,
+        highConfTracking?: Array<{ trackingNumber: string; carrier: string; status: string; eta?: string; carrierUrl?: string; updatedAt?: string }>
     ): Promise<string> {
         const isReceived = lifecycle.isReceived;
         const isCancelled = lifecycle.isCancelled;
@@ -2205,14 +2207,6 @@ Data: ${JSON.stringify(data)}`;
 
         // Always show placement date with vendor
         lines.push(`Placed with Vendor: ${this.fmtDate(po.orderDate)}`);
-
-        // Check if tracking ETA overrides the default expected date
-        let latestETA: string | undefined;
-        const { getHighConfidenceTrackingForPOs } = await import('../tracking/shipment-intelligence');
-        const highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
-        if (highConfTracking.length > 0) {
-            latestETA = highConfTracking[0]?.eta;
-        }
 
         // Always show expected receipt if not cancelled
         if (!isCancelled) {
@@ -2239,9 +2233,10 @@ Data: ${JSON.stringify(data)}`;
             lines.push(`Actual Receipt: Not yet received`);
         }
 
-        if (highConfTracking.length > 0) {
+        const trackingData = highConfTracking || [];
+        if (trackingData.length > 0) {
             lines.push(`\nLIVE TRACKING`);
-            for (const t of highConfTracking) {
+            for (const t of trackingData) {
                 const etaStr = t.eta ? `<b>ETA: ${new Date(t.eta).toLocaleDateString()}</b>` : 'ETA: Pending';
                 const link = `<a href="${t.carrierUrl || '#' }">${t.trackingNumber}</a> (${t.carrier})`;
 
@@ -2438,26 +2433,11 @@ Data: ${JSON.stringify(data)}`;
                 const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
                 const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate);
                 const title = this.buildPOEventTitle(po, lifecycle);
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking);
                 const newStatus = lifecycle.calendarStatus;
                 const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
 
                 const existingRow = existing.get(po.orderId);
-
-                // Force update for all POs to fix any lingering encoding/formatting issues
-                const shouldForceUpdate = true;
-
-                if (completionState === 'complete' && lifecycle.isReceived && !shouldKeepReceivedPurchase(actualReceiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
-                    if (existingRow) {
-                        await calendar.deleteEvent(existingRow.calendar_id, existingRow.event_id);
-                        await supabase.from('purchasing_calendar_events').delete().eq('po_number', po.orderId);
-                        counts.cleared++;
-                        console.log(`🗑️ [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
-                    } else {
-                        counts.skipped++;
-                    }
-                    continue;
-                }
 
                 const colorId = lifecycle.colorId;
 
@@ -2482,7 +2462,7 @@ Data: ${JSON.stringify(data)}`;
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (shouldForceUpdate || existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
+                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
                     // Status changed, tracking changed, or forced update for received/past-due POs
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
@@ -2496,7 +2476,7 @@ Data: ${JSON.stringify(data)}`;
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
                         .eq('po_number', po.orderId);
                     counts.updated++;
-                    console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText}), forced=${shouldForceUpdate}`);
+                    console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText})`);
                 } else {
                     counts.skipped++;
                 }
