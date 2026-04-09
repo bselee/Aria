@@ -14,6 +14,12 @@ export interface ActivePurchase extends FullPO {
     shipments: ShipmentRecord[];
     isReceived: boolean;
     completionState: POCompletionState;
+    lifecycleStage?: string;
+    lifecycleSummary?: string;
+    lastMovementSummary?: string | null;
+    trackingUnavailableAt?: string | null;
+    trackingRequestedAt?: string | null;
+    vendorAcknowledgedAt?: string | null;
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -33,6 +39,7 @@ export async function loadActivePurchases(
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
     const trackingMap = new Map<string, string[]>();
     const shipmentMap = new Map<string, ShipmentRecord[]>();
+    const lifecycleMap = new Map<string, Record<string, any>>();
 
     if (supabase && poNumbers.length > 0) {
         try {
@@ -40,11 +47,12 @@ export async function loadActivePurchases(
                 const chunk = poNumbers.slice(i, i + 100);
                 const { data: dbPOs } = await supabase
                     .from("purchase_orders")
-                    .select("po_number, tracking_numbers")
+                    .select("po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at")
                     .in("po_number", chunk);
 
                 for (const dp of dbPOs || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
+                    lifecycleMap.set(dp.po_number, dp);
                 }
             }
 
@@ -111,6 +119,8 @@ export async function loadActivePurchases(
             leadProvenance = "14d default";
         }
 
+        const poLifecycle = lifecycleMap.get(po.orderId);
+
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
@@ -120,6 +130,11 @@ export async function loadActivePurchases(
             completionState,
             trackingNumbers: trackingMap.get(po.orderId) || [],
             shipments,
+            lifecycleStage: poLifecycle?.lifecycle_stage || undefined,
+            lastMovementSummary: poLifecycle?.last_movement_summary || null,
+            trackingUnavailableAt: poLifecycle?.tracking_unavailable_at || null,
+            trackingRequestedAt: poLifecycle?.tracking_requested_at || null,
+            vendorAcknowledgedAt: poLifecycle?.vendor_acknowledged_at || null,
         });
     }
 
