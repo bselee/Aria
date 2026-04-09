@@ -241,6 +241,21 @@ export default function ActivePurchasesPanel() {
                                 } else if (isCancelled) {
                                     statusLabel = "Cancelled";
                                     statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
+                                } else if (po.lifecycleStage === 'sent') {
+                                    statusLabel = "Sent";
+                                    statusColor = "text-zinc-400 bg-zinc-500/10 border-zinc-500/30";
+                                } else if (po.lifecycleStage === 'vendor_acknowledged') {
+                                    statusLabel = "Awaiting Tracking";
+                                    statusColor = "text-yellow-400 bg-yellow-500/10 border-yellow-500/30";
+                                } else if (po.lifecycleStage === 'tracking_unavailable') {
+                                    statusLabel = "Tracking Unavailable";
+                                    statusColor = "text-orange-400 bg-orange-500/10 border-orange-500/30";
+                                } else if (po.lifecycleStage === 'ap_follow_up') {
+                                    statusLabel = "AP Follow-up";
+                                    statusColor = "text-purple-400 bg-purple-500/10 border-purple-500/30";
+                                } else if (po.lifecycleStage === 'moving_with_tracking') {
+                                    statusLabel = po.lastMovementSummary ? `Moving — ${po.lastMovementSummary}` : "In Transit";
+                                    statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
                                 } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
                                     statusLabel = "Out Today";
                                     statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
