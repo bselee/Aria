@@ -396,6 +396,4 @@ const notifyCommand: BotCommand = {
       alertsCommand,
       correlateCommand,
       notifyCommand,
-      purchasesCommand,
-      scrapePurchasingDashboardCommand,
   ];
