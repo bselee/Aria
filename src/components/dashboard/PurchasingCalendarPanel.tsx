@@ -35,6 +35,8 @@ type ActivePurchase = {
     }>;
     isReceived: boolean;
     completionState: POCompletionState;
+    lifecycleStage?: string | null;
+    lifecycleSummary?: string | null;
 };
 
 type DayGroup = {
@@ -82,6 +84,25 @@ function followUpLabel(state: POCompletionState): string {
 
 function todayKey(): string {
     return new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+}
+
+function lifecycleLabel(stage: string | null | undefined): string | null {
+    switch (stage) {
+        case "sent":
+            return "Sent";
+        case "vendor_acknowledged":
+            return "Awaiting Tracking";
+        case "tracking_unavailable":
+            return "Tracking Unavailable";
+        case "moving_with_tracking":
+            return "Moving";
+        case "ap_follow_up":
+            return "AP Follow-Up";
+        case "received":
+            return "Received";
+        default:
+            return null;
+    }
 }
 
 /** Build clickable carrier tracking URL */
@@ -419,7 +440,8 @@ function PORow({
     const topSkus = po.items.slice(0, 3).map(i => i.productId).join(", ");
     const more = po.items.length > 3 ? ` +${po.items.length - 3}` : "";
     const hasTracking = (po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0;
-    const needsAPFollowUp = po.isReceived && po.completionState !== "complete";
+    const needsAPFollowUp = po.lifecycleStage === "ap_follow_up" || (po.isReceived && po.completionState !== "complete");
+    const statusLabel = lifecycleLabel(po.lifecycleStage);
     const daysOverdue = variant === "overdue" ? Math.abs(daysDiff(po.expectedDate, today)) : 0;
     const displayShipments = (po.shipments?.length
         ? po.shipments.map((shipment) => ({
@@ -476,6 +498,11 @@ function PORow({
                         <span className="text-[10px] text-zinc-500 truncate">
                             {po.vendorName}
                         </span>
+                        {statusLabel && (
+                            <span className="text-[9px] font-mono text-zinc-400 px-1 py-0.5 rounded border border-zinc-700/50">
+                                {statusLabel}
+                            </span>
+                        )}
                         {/* Finale link icon */}
                         <a
                             href={po.finaleUrl}
@@ -495,6 +522,12 @@ function PORow({
                     {needsAPFollowUp && (
                         <div className="mt-1 text-[10px] font-mono text-emerald-300/80">
                             {followUpLabel(po.completionState)}
+                        </div>
+                    )}
+
+                    {po.lifecycleStage === "moving_with_tracking" && po.lifecycleSummary && (
+                        <div className="mt-1 text-[10px] font-mono text-cyan-300/80">
+                            {po.lifecycleSummary}
                         </div>
                     )}
 

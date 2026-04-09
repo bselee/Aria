@@ -2307,7 +2307,11 @@ Data: ${JSON.stringify(data)}`;
             }));
             lines.push(`Tracking: ${trackingLines.join(' | ')}`);
         } else if (!isReceived && !isCancelled) {
-            lines.push(`Tracking: Awaiting Tracking`);
+            lines.push(`Tracking: ${lifecycle.statusLabel === "Tracking Unavailable" ? "Tracking Unavailable" : "Awaiting Tracking"}`);
+        }
+
+        if (lifecycle.movementSummary && !isReceived && !isCancelled) {
+            lines.push(`Movement: ${lifecycle.movementSummary}`);
         }
 
         // Line items â€” max 5 + overflow count
@@ -2372,11 +2376,13 @@ Data: ${JSON.stringify(data)}`;
             // Also fetch all tracking numbers from purchase_orders for the recent POs
             const { data: poRows } = await supabase
                 .from('purchase_orders')
-                .select('po_number, tracking_numbers')
+                .select('po_number, tracking_numbers, committed_at, po_sent_at, vendor_acknowledged_at, shipping_evidence, tracking_requested_at, tracking_request_count, lifecycle_stage, tracking_status_summary, last_movement_summary')
                 .in('po_number', pos.map(p => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
+            const lifecycleRowMap = new Map<string, any>();
             for (const row of poRows ?? []) {
                 trackingMap.set(row.po_number, row.tracking_numbers || []);
+                lifecycleRowMap.set(row.po_number, row);
             }
             const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
             const shipmentRecords = await listShipmentsForPurchaseOrders(pos.map(p => p.orderId).filter(Boolean));
@@ -2432,6 +2438,7 @@ Data: ${JSON.stringify(data)}`;
                 }
 
                 // Get tracking array for this PO
+                const lifecycleRow = lifecycleRowMap.get(po.orderId);
                 const trackingNumbers = trackingMap.get(po.orderId) || [];
                 const shipmentRollups = shipmentMap.get(po.orderId) || [];
 
@@ -2455,12 +2462,14 @@ Data: ${JSON.stringify(data)}`;
                 // Hash = sorted "num:status" pairs â€” changes when EasyPost status changes
                 const trackingHash = trackingNumbers.slice().sort().map(t => {
                     const ts = trackingStatuses.get(t);
-                    return ts ? `${t}:${ts.category}` : t;
+                    return ts ? `${t}:${ts.category}:${ts.display}` : t;
                 }).join(',');
 
                 const completionSignal = completionSignals.get(po.orderId);
+                const shippingEvidence = Array.isArray(lifecycleRow?.shipping_evidence) ? lifecycleRow.shipping_evidence : [];
+                const isReceived = !!po.receiveDate;
                 const completionState = derivePOCompletionState({
-                    finaleReceived: (po.status || '').toLowerCase() === 'completed',
+                    finaleReceived: isReceived,
                     trackingDelivered: Array.from(trackingStatuses.values()).length > 0 &&
                         Array.from(trackingStatuses.values()).every(ts => ts?.category === 'delivered'),
                     hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
@@ -2468,7 +2477,21 @@ Data: ${JSON.stringify(data)}`;
                     freightResolved: completionSignal?.freightResolved || false,
                     unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
                 });
-                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState);
+                const poLifecycleStage = lifecycleRow?.lifecycle_stage || derivePOLifecycleState({
+                    committedAt: lifecycleRow?.committed_at || po.orderDate || null,
+                    poSentAt: lifecycleRow?.po_sent_at || po.orderDate || null,
+                    vendorAcknowledgedAt: lifecycleRow?.vendor_acknowledged_at || null,
+                    shippingEvidence,
+                    trackingRequestedAt: lifecycleRow?.tracking_requested_at || null,
+                    trackingRequestCount: lifecycleRow?.tracking_request_count || 0,
+                    receiveDate: isReceived ? po.receiveDate : null,
+                    completionState,
+                });
+                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, {
+                    lifecycleStage: poLifecycleStage,
+                    receiveDate: po.receiveDate,
+                    movementSummary: lifecycleRow?.last_movement_summary || lifecycleRow?.tracking_status_summary || null,
+                });
                 const title = this.buildPOEventTitle(po, lifecycle);
                 const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
                 const newStatus = lifecycle.calendarStatus;

@@ -34,6 +34,17 @@ describe("calendar lifecycle", () => {
         expect(getPurchasingEventDate("2026-03-25", "2026-03-30T08:15:00Z", lifecycle)).toBe("2026-03-30");
     });
 
+    it("does not treat raw completed status as received without lifecycle receipt evidence", () => {
+        const lifecycle = derivePurchasingLifecycle("completed", [], null, {
+            lifecycleStage: "moving_with_tracking",
+            receiveDate: null,
+        });
+
+        expect(lifecycle.isReceived).toBe(false);
+        expect(lifecycle.statusLabel).toBe("Moving");
+        expect(getPurchasingEventDate("2026-03-25", null, lifecycle)).toBe("2026-03-25");
+    });
+
     it("computes date age in Denver-calendar days", () => {
         const now = new Date("2026-03-30T23:00:00Z");
         expect(daysSinceDate("2026-03-29T01:00:00Z", now)).toBe(1);
@@ -50,5 +61,14 @@ describe("calendar lifecycle", () => {
         const lifecycle = derivePurchasingLifecycle("completed", [], "complete");
         expect(lifecycle.titleEmoji).toBe("✅");
         expect(lifecycle.statusLabel).toBe("Complete");
+    });
+
+    it("shows tracking unavailable as an explicit open-state label", () => {
+        const lifecycle = derivePurchasingLifecycle("committed", [], null, {
+            lifecycleStage: "tracking_unavailable",
+        });
+
+        expect(lifecycle.calendarStatus).toBe("open");
+        expect(lifecycle.statusLabel).toBe("Tracking Unavailable");
     });
 });

@@ -1,5 +1,6 @@
 import type { TrackingStatus } from "../carriers/tracking-service";
 import type { POCompletionState } from "./po-completion-state";
+import type { POLifecycleStage } from "./po-lifecycle-state";
 
 export const RECEIVED_CALENDAR_RETENTION_DAYS = 14;
 export const RECEIVED_DASHBOARD_RETENTION_DAYS = 3;
@@ -23,6 +24,13 @@ export interface PurchasingLifecycleState {
     isReceived: boolean;
     isCancelled: boolean;
     isDeliveredAwaitingReceipt: boolean;
+    movementSummary: string | null;
+}
+
+export interface PurchasingLifecycleOptions {
+    lifecycleStage?: POLifecycleStage | null;
+    receiveDate?: string | null;
+    movementSummary?: string | null;
 }
 
 export function toDateOnly(dateStr: string | null | undefined): string | null {
@@ -30,7 +38,7 @@ export function toDateOnly(dateStr: string | null | undefined): string | null {
     const isoPrefix = /^(\d{4}-\d{2}-\d{2})/.exec(dateStr);
     if (isoPrefix) return isoPrefix[1];
     const parsed = new Date(dateStr);
-    return isNaN(parsed.getTime()) ? null : parsed.toISOString().split("T")[0];
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().split("T")[0];
 }
 
 export function daysSinceDate(dateStr: string | null | undefined, now: Date = new Date()): number | null {
@@ -45,20 +53,32 @@ export function daysSinceDate(dateStr: string | null | undefined, now: Date = ne
 export function shouldKeepReceivedPurchase(
     receiveDate: string | null | undefined,
     retentionDays: number,
-    now: Date = new Date()
+    now: Date = new Date(),
 ): boolean {
     const ageDays = daysSinceDate(receiveDate, now);
     if (ageDays === null) return true;
     return ageDays <= retentionDays;
 }
 
+function buildLifecycleState(input: Omit<PurchasingLifecycleState, "movementSummary">, movementSummary: string | null): PurchasingLifecycleState {
+    return {
+        ...input,
+        movementSummary,
+    };
+}
+
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
     trackingStatuses: Array<TrackingStatus | null> = [],
-    completionState: POCompletionState | null = null
+    completionState: POCompletionState | null = null,
+    options: PurchasingLifecycleOptions = {},
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
-    const isReceived = normalized === "completed";
+    const lifecycleStage = options.lifecycleStage || null;
+    const movementSummary = options.movementSummary || null;
+    const isReceived = lifecycleStage
+        ? ["received", "ap_follow_up", "complete"].includes(lifecycleStage)
+        : normalized === "completed";
     const isCancelled = normalized === "cancelled";
     const knownStatuses = trackingStatuses.filter((item): item is TrackingStatus => item !== null);
     const hasDeliveredProof =
@@ -66,12 +86,12 @@ export function derivePurchasingLifecycle(
         !isCancelled &&
         trackingStatuses.length > 0 &&
         knownStatuses.length === trackingStatuses.length &&
-        knownStatuses.every(item => item.category === "delivered");
+        knownStatuses.every((item) => item.category === "delivered");
 
     if (isReceived) {
         switch (completionState) {
             case "complete":
-                return {
+                return buildLifecycleState({
                     calendarStatus: "complete",
                     completionState,
                     colorId: "2",
@@ -80,9 +100,9 @@ export function derivePurchasingLifecycle(
                     isReceived: true,
                     isCancelled: false,
                     isDeliveredAwaitingReceipt: false,
-                };
+                }, movementSummary);
             case "received_pending_invoice":
-                return {
+                return buildLifecycleState({
                     calendarStatus: "received_pending_invoice",
                     completionState,
                     colorId: "2",
@@ -91,9 +111,9 @@ export function derivePurchasingLifecycle(
                     isReceived: true,
                     isCancelled: false,
                     isDeliveredAwaitingReceipt: false,
-                };
+                }, movementSummary);
             case "received_pending_reconciliation":
-                return {
+                return buildLifecycleState({
                     calendarStatus: "received_pending_reconciliation",
                     completionState,
                     colorId: "2",
@@ -102,9 +122,9 @@ export function derivePurchasingLifecycle(
                     isReceived: true,
                     isCancelled: false,
                     isDeliveredAwaitingReceipt: false,
-                };
+                }, movementSummary);
             case "exception":
-                return {
+                return buildLifecycleState({
                     calendarStatus: "exception",
                     completionState,
                     colorId: "6",
@@ -113,9 +133,9 @@ export function derivePurchasingLifecycle(
                     isReceived: true,
                     isCancelled: false,
                     isDeliveredAwaitingReceipt: false,
-                };
+                }, movementSummary);
             default:
-                return {
+                return buildLifecycleState({
                     calendarStatus: "received",
                     completionState,
                     colorId: "2",
@@ -124,12 +144,12 @@ export function derivePurchasingLifecycle(
                     isReceived: true,
                     isCancelled: false,
                     isDeliveredAwaitingReceipt: false,
-                };
+                }, movementSummary);
         }
     }
 
     if (isCancelled) {
-        return {
+        return buildLifecycleState({
             calendarStatus: "cancelled",
             completionState,
             colorId: "11",
@@ -138,11 +158,11 @@ export function derivePurchasingLifecycle(
             isReceived: false,
             isCancelled: true,
             isDeliveredAwaitingReceipt: false,
-        };
+        }, movementSummary);
     }
 
     if (hasDeliveredProof) {
-        return {
+        return buildLifecycleState({
             calendarStatus: "delivered",
             completionState,
             colorId: "5",
@@ -151,25 +171,72 @@ export function derivePurchasingLifecycle(
             isReceived: false,
             isCancelled: false,
             isDeliveredAwaitingReceipt: true,
-        };
+        }, movementSummary);
     }
 
-    return {
-        calendarStatus: "open",
-        completionState,
-        colorId: "11",
-        titleEmoji: "🔴",
-        statusLabel: "In Transit",
-        isReceived: false,
-        isCancelled: false,
-        isDeliveredAwaitingReceipt: false,
-    };
+    switch (lifecycleStage) {
+        case "moving_with_tracking":
+            return buildLifecycleState({
+                calendarStatus: "open",
+                completionState,
+                colorId: "10",
+                titleEmoji: "📦",
+                statusLabel: "Moving",
+                isReceived: false,
+                isCancelled: false,
+                isDeliveredAwaitingReceipt: false,
+            }, movementSummary);
+        case "tracking_unavailable":
+            return buildLifecycleState({
+                calendarStatus: "open",
+                completionState,
+                colorId: "6",
+                titleEmoji: "🟠",
+                statusLabel: "Tracking Unavailable",
+                isReceived: false,
+                isCancelled: false,
+                isDeliveredAwaitingReceipt: false,
+            }, movementSummary);
+        case "vendor_acknowledged":
+            return buildLifecycleState({
+                calendarStatus: "open",
+                completionState,
+                colorId: "5",
+                titleEmoji: "🟡",
+                statusLabel: "Awaiting Tracking",
+                isReceived: false,
+                isCancelled: false,
+                isDeliveredAwaitingReceipt: false,
+            }, movementSummary);
+        case "sent":
+            return buildLifecycleState({
+                calendarStatus: "open",
+                completionState,
+                colorId: "9",
+                titleEmoji: "📤",
+                statusLabel: "Sent",
+                isReceived: false,
+                isCancelled: false,
+                isDeliveredAwaitingReceipt: false,
+            }, movementSummary);
+        default:
+            return buildLifecycleState({
+                calendarStatus: "open",
+                completionState,
+                colorId: "11",
+                titleEmoji: "🔴",
+                statusLabel: "In Transit",
+                isReceived: false,
+                isCancelled: false,
+                isDeliveredAwaitingReceipt: false,
+            }, movementSummary);
+    }
 }
 
 export function getPurchasingEventDate(
     expectedDate: string,
     receiveDate: string | null | undefined,
-    lifecycle: PurchasingLifecycleState
+    lifecycle: PurchasingLifecycleState,
 ): string {
     return lifecycle.isReceived ? toDateOnly(receiveDate) || expectedDate : expectedDate;
 }
