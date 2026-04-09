@@ -2234,7 +2234,8 @@ Data: ${JSON.stringify(data)}`;
         prefetchedStatuses?: Map<string, TrackingStatus | null>,
         lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate),
         latestETA?: string,
-        highConfTracking?: Array<{ trackingNumber: string; carrier: string; status: string; eta?: string; carrierUrl?: string; updatedAt?: string }>
+        highConfTracking?: Array<{ trackingNumber: string; carrier: string; status: string; eta?: string; carrierUrl?: string; updatedAt?: string }>,
+        lifecycleData?: Record<string, any> | null
     ): Promise<string> {
         const isReceived = lifecycle.isReceived;
         const isCancelled = lifecycle.isCancelled;
@@ -2303,6 +2304,22 @@ Data: ${JSON.stringify(data)}`;
 
         lines.push(`Status: ${lifecycle.statusLabel}`);
 
+        // Lifecycle evidence summary from purchase_orders lifecycle columns
+        if (lifecycleData?.lifecycle_stage && lifecycleData.lifecycle_stage !== 'sent') {
+            const stageLabels: Record<string, string> = {
+                vendor_acknowledged: 'Vendor Acknowledged',
+                tracking_unavailable: 'Tracking Unavailable',
+                moving_with_tracking: 'In Transit',
+                ap_follow_up: 'AP Follow-up',
+            };
+            const stageLabel = stageLabels[lifecycleData.lifecycle_stage] || lifecycleData.lifecycle_stage;
+            let lifecycleLine = `Lifecycle: ${stageLabel}`;
+            if (lifecycleData.last_movement_summary) {
+                lifecycleLine += ` — ${lifecycleData.last_movement_summary}`;
+            }
+            lines.push(lifecycleLine);
+        }
+
         if (lifecycle.isDeliveredAwaitingReceipt) {
             lines.push(`ACTION REQUIRED: TRACKING SHOWS DELIVERED - VERIFY RECEIVING IN FINALE`);
         } else if (!isReceived && !isCancelled) {
@@ -2355,14 +2372,16 @@ Data: ${JSON.stringify(data)}`;
                 existing.set(row.po_number, row);
             }
 
-            // Also fetch all tracking numbers from purchase_orders for the recent POs
+            // Also fetch all tracking numbers and lifecycle data from purchase_orders for the recent POs
             const { data: poRows } = await supabase
                 .from('purchase_orders')
-                .select('po_number, tracking_numbers')
+                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at')
                 .in('po_number', pos.map(p => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
+            const lifecycleMap = new Map<string, Record<string, any>>();
             for (const row of poRows ?? []) {
                 trackingMap.set(row.po_number, row.tracking_numbers || []);
+                lifecycleMap.set(row.po_number, row);
             }
             const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
             const shipmentRecords = await listShipmentsForPurchaseOrders(pos.map(p => p.orderId).filter(Boolean));
@@ -2469,7 +2488,8 @@ Data: ${JSON.stringify(data)}`;
                 const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
                 const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate);
                 const title = this.buildPOEventTitle(po, lifecycle);
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking);
+                const poLifecycleData = lifecycleMap.get(po.orderId);
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, poLifecycleData);
                 const newStatus = lifecycle.calendarStatus;
                 const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
 
