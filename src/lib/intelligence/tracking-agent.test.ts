@@ -191,4 +191,55 @@ describe("TrackingAgent", () => {
             { poNumber: "23371057-DropshipPO", trackingNumbers: ["1Z22YV580360436423"] },
         ]);
     });
+
+    it("preserves carrier-qualified freight tracking numbers when LTL extraction upgrades the match", async () => {
+        queueState.messages = [
+            {
+                id: 3,
+                gmail_message_id: "gmail-freight",
+                from_email: "dispatch@olddominion.com",
+                subject: "BuildASoil PO #124700 freight update",
+                body_snippet: "PRO 1234567 scheduled for delivery",
+                source_inbox: "default",
+            },
+        ];
+
+        purchaseOrdersState.rows = [
+            {
+                po_number: "124700",
+                vendor_name: "Old Dominion",
+                created_at: "2026-04-02T19:00:00.000Z",
+            },
+        ];
+
+        gmailGetMock.mockResolvedValue({
+            data: {
+                payload: {
+                    body: {
+                        data: encodeBody("Freight update for PO 124700. PRO 1234567 with Old Dominion."),
+                    },
+                },
+            },
+        });
+
+        unifiedObjectGenerationMock.mockResolvedValue({
+            shipments: [
+                {
+                    carrierName: "Old Dominion",
+                    trackingNumber: "1234567",
+                    type: "PRO",
+                },
+            ],
+        });
+
+        const result = await new TrackingAgent().processUnreadEmails();
+
+        expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(expect.objectContaining({
+            poNumber: "124700",
+            trackingNumber: "Old Dominion:::1234567",
+        }));
+        expect(result).toEqual([
+            { poNumber: "124700", trackingNumbers: ["Old Dominion:::1234567"] },
+        ]);
+    });
 });

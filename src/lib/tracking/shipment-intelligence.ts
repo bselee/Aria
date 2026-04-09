@@ -8,6 +8,12 @@ import {
     type TrackingCategory,
     type TrackingStatus,
 } from "@/lib/carriers/tracking-service";
+import {
+    appendShippingEvidence,
+    summarizeMovementUpdate,
+    type POShippingEvidence,
+} from "@/lib/purchasing/po-lifecycle-evidence";
+import { derivePOLifecycleState } from "@/lib/purchasing/po-lifecycle-state";
 
 export type ShipmentTrackingKind = "parcel" | "ltl_pro" | "ltl_bol" | "unknown";
 
@@ -596,6 +602,80 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
     }
 }
 
+function buildTrackingEvidenceSummary(record: ShipmentRecord): string {
+    if (record.status_display?.trim()) return record.status_display.trim();
+    const trackingLabel = record.tracking_number.includes(":::")
+        ? record.tracking_number.replace(":::", " ")
+        : record.tracking_number;
+    return `Tracking identified: ${trackingLabel}`;
+}
+
+function buildTrackingEvidence(record: ShipmentRecord, happenedAt: string): POShippingEvidence {
+    return {
+        kind: record.tracking_kind === "ltl_bol" ? "bol" : "tracking",
+        source: record.last_source || "shipment_sync",
+        happenedAt,
+        summary: buildTrackingEvidenceSummary(record),
+        trustworthyTracking: true,
+    };
+}
+
+async function syncPurchaseOrderLifecycleFromShipment(
+    record: ShipmentRecord,
+    options: { trackingEvidenceAt?: string | null } = {},
+): Promise<void> {
+    const supabase = createClient();
+    if (!supabase || !record.po_numbers?.length) return;
+
+    const { data: purchaseOrders, error } = await supabase
+        .from("purchase_orders")
+        .select("po_number, committed_at, po_sent_at, vendor_acknowledged_at, shipping_evidence, tracking_requested_at, tracking_request_count, last_movement_summary")
+        .in("po_number", record.po_numbers);
+
+    if (error) {
+        throw new Error(`Purchase order lifecycle sync failed: ${error.message}`);
+    }
+
+    const happenedAt = options.trackingEvidenceAt || record.last_checked_at || record.updated_at || new Date().toISOString();
+    const trackingEvidence = buildTrackingEvidence(record, happenedAt);
+
+    for (const purchaseOrder of purchaseOrders || []) {
+        let shippingEvidence = Array.isArray(purchaseOrder?.shipping_evidence)
+            ? purchaseOrder.shipping_evidence as POShippingEvidence[]
+            : [];
+        shippingEvidence = appendShippingEvidence(shippingEvidence, trackingEvidence);
+
+        const nextMovementSummary = summarizeMovementUpdate(purchaseOrder?.last_movement_summary, trackingEvidence);
+        const lifecycleStage = derivePOLifecycleState({
+            committedAt: purchaseOrder?.committed_at || null,
+            poSentAt: purchaseOrder?.po_sent_at || null,
+            vendorAcknowledgedAt: purchaseOrder?.vendor_acknowledged_at || null,
+            shippingEvidence,
+            trackingRequestedAt: purchaseOrder?.tracking_requested_at || null,
+            trackingRequestCount: purchaseOrder?.tracking_request_count || 0,
+        });
+
+        const update: Record<string, unknown> = {
+            po_number: purchaseOrder.po_number,
+            shipping_evidence: shippingEvidence,
+            tracking_status_summary: trackingEvidence.summary,
+            lifecycle_stage: lifecycleStage,
+            updated_at: new Date().toISOString(),
+        };
+
+        if (options.trackingEvidenceAt) {
+            update.last_tracking_evidence_at = options.trackingEvidenceAt;
+        }
+
+        if (nextMovementSummary) {
+            update.last_movement_summary = nextMovementSummary;
+            update.last_movement_update_at = happenedAt;
+        }
+
+        await supabase.from("purchase_orders").upsert(update, { onConflict: "po_number" });
+    }
+}
+
 function isReceivedPurchaseOrderStatus(status: string | null | undefined): boolean {
     const normalized = String(status || "").toLowerCase();
     return normalized === "received" || normalized === "completed";
@@ -658,6 +738,9 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
 
     if (input.poNumber) {
         await syncLegacyPurchaseOrderTracking(input.poNumber);
+        await syncPurchaseOrderLifecycleFromShipment(data as ShipmentRecord, {
+            trackingEvidenceAt: now,
+        });
     }
 
     return data as ShipmentRecord;
@@ -696,6 +779,8 @@ export async function refreshShipmentStatus(record: ShipmentRecord): Promise<Shi
     if (error) {
         throw new Error(`Shipment refresh failed: ${error.message}`);
     }
+
+    await syncPurchaseOrderLifecycleFromShipment(data as ShipmentRecord);
 
     return data as ShipmentRecord;
 }
