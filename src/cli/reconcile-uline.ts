@@ -310,7 +310,7 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
         }
         console.log(`   ✅ Archived ${archived}/${invoices.length} invoices`);
     } finally {
-        await manager.close();
+        await manager.destroy();
     }
 
     return invoices;

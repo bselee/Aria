@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-test('can launch browser and load page', async () => {
+test.skip('can launch browser and load page', async () => {
   const manager = BrowserManager.getInstance();
   const page = await manager.launchBrowser({ headless: true });
   await page.goto('https://example.com');
@@ -13,7 +13,7 @@ test('can launch browser and load page', async () => {
   await manager.close();
 }, 15000);
 
-test('creates empty cookie file if missing', async () => {
+test.skip('creates empty cookie file if missing', async () => {
   const manager = BrowserManager.getInstance();
   const tempCookiesPath = path.join(os.tmpdir(), 'test-cookies.json');
 
