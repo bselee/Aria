@@ -21,6 +21,10 @@ type ActivePurchase = {
         status_display: string | null;
         estimated_delivery_at: string | null;
     }>;
+    isReceived?: boolean;
+    completionState?: string | null;
+    lifecycleStage?: string | null;
+    lifecycleSummary?: string | null;
 };
 
 type ApiResponse = {
@@ -73,6 +77,39 @@ function timeAgo(iso: string) {
     if (isNaN(ms)) return "";
     const m = Math.floor(ms / 60000);
     return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+}
+
+function getLifecycleBadge(purchase: ActivePurchase): { label: string; color: string } {
+    if ((purchase.status || "").toLowerCase() === "cancelled") {
+        return {
+            label: "Cancelled",
+            color: "text-rose-400 bg-rose-500/10 border-rose-500/30",
+        };
+    }
+
+    switch (purchase.lifecycleStage) {
+        case "draft_created":
+            return { label: "Draft", color: "text-zinc-400 bg-zinc-500/10 border-zinc-500/30" };
+        case "committed":
+            return { label: "Committed", color: "text-zinc-300 bg-zinc-500/10 border-zinc-500/30" };
+        case "sent":
+            return { label: "Sent", color: "text-sky-300 bg-sky-500/10 border-sky-500/30" };
+        case "vendor_acknowledged":
+            return { label: "Awaiting Tracking", color: "text-cyan-300 bg-cyan-500/10 border-cyan-500/30" };
+        case "tracking_unavailable":
+            return { label: "Tracking Unavailable", color: "text-amber-300 bg-amber-500/10 border-amber-500/30" };
+        case "moving_with_tracking":
+            return { label: "Moving", color: "text-emerald-300 bg-emerald-500/10 border-emerald-500/30" };
+        case "received":
+            return { label: "Received", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30" };
+        case "ap_follow_up":
+            return { label: "AP Follow-Up", color: "text-orange-300 bg-orange-500/10 border-orange-500/30" };
+        case "complete":
+            return { label: "Complete", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30" };
+        case "in_transit":
+        default:
+            return { label: "In Transit", color: "text-blue-400 bg-blue-500/10 border-blue-500/30" };
+    }
 }
 
 export default function ActivePurchasesPanel() {
@@ -227,25 +264,9 @@ export default function ActivePurchasesPanel() {
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50" style={{ height: bodyHeight }}>
                             {visiblePurchases.map(po => {
-                                const isReceived = po.status.toLowerCase() === "completed";
-                                const isCancelled = po.status.toLowerCase() === "cancelled";
-
-                                let statusLabel = "In Transit";
-                                let statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
-
-                                if (isReceived) {
-                                    statusLabel = "Received";
-                                    statusColor = "text-emerald-400 bg-emerald-500/10 border-emerald-500/30";
-                                } else if (isCancelled) {
-                                    statusLabel = "Cancelled";
-                                    statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
-                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
-                                    statusLabel = "Out Today";
-                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
-                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
-                                    statusLabel = "Delivered";
-                                    statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
-                                }
+                                const isReceived = !!po.isReceived;
+                                const { label: statusLabel, color: statusColor } = getLifecycleBadge(po);
+                                const movementSummary = po.lifecycleStage === "moving_with_tracking" ? po.lifecycleSummary : null;
 
                                 return (
                                     <div key={po.orderId} className="px-4 py-3 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors group relative">
@@ -283,6 +304,13 @@ export default function ActivePurchasesPanel() {
                                                 <span>Rcvd {fmtDate(po.receiveDate)}</span>
                                             ) : (
                                                 <span>Exp: <span className="text-zinc-300">{fmtDate(po.expectedDate)}</span> <span className="opacity-50">({po.leadProvenance})</span></span>
+                                            )}
+
+                                            {movementSummary && (
+                                                <>
+                                                    <span className="text-zinc-700">Â·</span>
+                                                    <span className="text-emerald-300">{movementSummary}</span>
+                                                </>
                                             )}
 
                                             {((po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0) && (
