@@ -2214,7 +2214,7 @@ Data: ${JSON.stringify(data)}`;
      * Build the calendar event title for a PO.
      * DECISION(2026-03-11): Unreceived POs get ðŸ”´ prefix for visual urgency.
      */
-    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status, [], null, undefined, po.receiveDate)): string {
+    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status, [], null, undefined, po.receiveDate, po.shipments)): string {
         let skuStr = '';
         if (po.items && po.items.length > 0) {
             const skus = po.items.map(i => i.productId).slice(0, 2).join(', ');
@@ -2232,7 +2232,7 @@ Data: ${JSON.stringify(data)}`;
         leadProvenance: string,
         trackingNumbers: string[],
         prefetchedStatuses?: Map<string, TrackingStatus | null>,
-        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate),
+        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate, po.shipments),
         latestETA?: string,
         highConfTracking?: Array<{ trackingNumber: string; carrier: string; status: string; eta?: string; carrierUrl?: string; updatedAt?: string }>,
         lifecycleData?: Record<string, any> | null
@@ -2490,7 +2490,7 @@ Data: ${JSON.stringify(data)}`;
                 }
 
                 const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
-                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate);
+                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate, po.shipments);
                 const title = this.buildPOEventTitle(po, lifecycle);
                 const poLifecycleData = lifecycleMap.get(po.orderId);
                 const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, poLifecycleData);

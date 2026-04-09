@@ -53,16 +53,22 @@ export function shouldKeepReceivedPurchase(
     return ageDays <= retentionDays;
 }
 
+export interface POShipmentLike {
+    status?: string | null;
+    receiveDate?: string | null;
+}
+
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
     trackingStatuses: Array<TrackingStatus | null> = [],
     completionState: POCompletionState | null = null,
     expectedDeliveryDate?: string,
-    receiveDate?: string | null
+    receiveDate?: string | null,
+    shipments?: POShipmentLike[] | null
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
-    const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate });
-    const isCancelled = normalized === "cancelled";
+    const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate, shipments });
+    const isCancelled = normalized === "cancelled" || normalized === "canceled";
     const knownStatuses = trackingStatuses.filter((item): item is TrackingStatus => item !== null);
     const hasDeliveredProof =
         !isReceived &&
