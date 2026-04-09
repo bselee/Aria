@@ -28,7 +28,7 @@ describe("po receipt state", () => {
         })).toBe(true);
     });
 
-    it("does not treat partial shipments as received", () => {
+    it("treats partial received shipments as received", () => {
         expect(hasPurchaseOrderReceipt({
             status: "Committed",
             receiveDate: null,
@@ -36,7 +36,18 @@ describe("po receipt state", () => {
                 { status: "Received", receiveDate: "2026-04-07" },
                 { status: "Shipped", receiveDate: null },
             ],
-        })).toBe(false);
+        })).toBe(true);
+    });
+
+    it("treats received + cancelled shipments as received", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Completed",
+            receiveDate: null,
+            shipments: [
+                { status: "Received", receiveDate: "2026-03-04" },
+                { status: "Canceled", receiveDate: "2026-03-16" },
+            ],
+        })).toBe(true);
     });
 
     it("does not trust completed alone without shipments", () => {

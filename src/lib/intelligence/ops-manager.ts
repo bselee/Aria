@@ -2267,12 +2267,7 @@ Data: ${JSON.stringify(data)}`;
 
             if (latestShip) {
                 const recvDate = this.fmtDate(latestShip.receiveDate!);
-                const receiver = (latestShip as any).receivedBy;
-                if (receiver) {
-                    lines.push(`Received: ${recvDate} by ${receiver}`);
-                } else {
-                    lines.push(`Received: ${recvDate}`);
-                }
+                lines.push(`Received: ${recvDate}`);
             } else if (po.receiveDate) {
                 lines.push(`Received: ${this.fmtDate(po.receiveDate)}`);
             } else {
@@ -2282,7 +2277,14 @@ Data: ${JSON.stringify(data)}`;
             lines.push(`Actual Receipt: Not yet received`);
         }
 
-        const trackingData = highConfTracking || [];
+        const rawData = highConfTracking || [];
+        // Dedup by tracking number to prevent doubled display
+        const seen = new Set<string>();
+        const trackingData = rawData.filter(t => {
+            if (!t.trackingNumber || seen.has(t.trackingNumber)) return false;
+            seen.add(t.trackingNumber);
+            return true;
+        });
         if (trackingData.length > 0) {
             lines.push(`\nLIVE TRACKING`);
             for (const t of trackingData) {
