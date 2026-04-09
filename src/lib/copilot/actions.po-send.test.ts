@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DraftPOReview } from "../finale/client";
 
-const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.hoisted(() => {
+const { sessionRows, purchaseOrderRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.hoisted(() => {
     const sessionRows = new Map<string, any>();
+    const purchaseOrderRows = new Map<string, any>();
     const commitDraftPOMock = vi.fn().mockResolvedValue(undefined);
     const gmailSendMock = vi.fn().mockResolvedValue({ data: { id: "gmail-1" } });
 
@@ -40,13 +41,22 @@ const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.h
                 };
             }
 
+            if (table === "purchase_orders") {
+                return {
+                    upsert: async (row: any) => {
+                        purchaseOrderRows.set(row.po_number, { ...(purchaseOrderRows.get(row.po_number) || {}), ...row });
+                        return { data: row, error: null };
+                    },
+                };
+            }
+
             return {
                 insert: async (_row: any) => ({ data: null, error: null }),
             };
         },
     }));
 
-    return { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock };
+    return { sessionRows, purchaseOrderRows, commitDraftPOMock, gmailSendMock, createClientMock };
 });
 
 vi.mock("../supabase", () => ({
@@ -104,6 +114,7 @@ function makeReview(orderId = "PO-1001"): DraftPOReview {
 describe("PO send actions", () => {
     beforeEach(() => {
         sessionRows.clear();
+        purchaseOrderRows.clear();
         vi.clearAllMocks();
         commitDraftPOMock.mockResolvedValue(undefined);
         gmailSendMock.mockResolvedValue({ data: { id: "gmail-1" } });
@@ -152,5 +163,26 @@ describe("PO send actions", () => {
         expect(result.status).toBe("partial_success");
         expect(result.userMessage).toMatch(/committed/i);
         expect(result.userMessage).toMatch(/email/i);
+    });
+
+    it("persists purchase order lifecycle evidence when send succeeds", async () => {
+        const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
+
+        const result = await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+        });
+
+        expect(result.status).toBe("success");
+        expect(purchaseOrderRows.get("PO-1004")).toEqual(expect.objectContaining({
+            po_number: "PO-1004",
+            vendor_name: "ULINE",
+            po_email_message_id: "gmail-1",
+            lifecycle_stage: "sent",
+        }));
+        expect(purchaseOrderRows.get("PO-1004")?.committed_at).toBeTruthy();
+        expect(purchaseOrderRows.get("PO-1004")?.po_sent_at).toBeTruthy();
     });
 });

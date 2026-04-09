@@ -262,6 +262,27 @@ export function generatePOEmailBody(review: DraftPOReview): { subject: string; b
     return { subject, body };
 }
 
+async function persistPurchaseOrderLifecycle(input: {
+    orderId: string;
+    review: DraftPOReview;
+    committedAt: string;
+    sentAt: string | null;
+    gmailMessageId: string | null;
+}) {
+    const db = createClient();
+    if (!db) return;
+
+    await db.from("purchase_orders").upsert({
+        po_number: input.orderId,
+        vendor_name: input.review.vendorName,
+        committed_at: input.committedAt,
+        po_sent_at: input.sentAt,
+        po_email_message_id: input.gmailMessageId,
+        lifecycle_stage: input.sentAt ? "sent" : "committed",
+        updated_at: new Date().toISOString(),
+    }, { onConflict: "po_number" });
+}
+
 // ──────────────────────────────────────────────────
 // COMMIT + SEND
 // ──────────────────────────────────────────────────
@@ -323,6 +344,13 @@ export async function commitAndSendPO(
     const db = createClient();
     if (db) {
         await Promise.allSettled([
+            persistPurchaseOrderLifecycle({
+                orderId,
+                review,
+                committedAt,
+                sentAt,
+                gmailMessageId,
+            }),
             db.from('po_sends').insert({
                 po_number: orderId,
                 vendor_name: review.vendorName,
