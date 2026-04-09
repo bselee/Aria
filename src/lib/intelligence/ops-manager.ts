@@ -436,8 +436,9 @@ export class OpsManager {
 
         // Purchasing Calendar Sync every 4 hours
         // Creates/updates calendar events for outgoing and received POs.
+        // Uses 60d lookback so late/excp POs keep flowing forward each day.
         cron.schedule("0 */4 * * *", () => {
-            this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar());
+            this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
         }, { timezone: "America/Denver" });
 
         // Morning Heartbeat @ 7:00 AM weekdays
@@ -2522,8 +2523,8 @@ Data: ${JSON.stringify(data)}`;
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
-                    // Status changed, tracking changed, or forced update for received/past-due POs
+                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash || lifecycle.calendarStatus === 'past_due' || lifecycle.calendarStatus === 'exception') {
+                    // Status changed, tracking changed, or past-due/exception POs need date flow-forward
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
                         existingRow.event_id,
