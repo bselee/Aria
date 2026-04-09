@@ -2257,14 +2257,26 @@ Data: ${JSON.stringify(data)}`;
 
         // Show actual receipt if received, with timing vs expected
         if (isReceived) {
-            if (po.receiveDate) {
-                const expectedMs = new Date(expectedDate).getTime();
-                const actualMs = new Date(po.receiveDate).getTime();
-                const diff = Math.round((actualMs - expectedMs) / 86_400_000);
-                const timing = diff === 0 ? 'on time' : diff > 0 ? `${diff}d late` : `${Math.abs(diff)}d early`;
-                lines.push(`Actual Receipt: ${this.fmtDate(po.receiveDate)} (${timing})`);
+            // Find the latest received shipment for receiver info
+            const receivedShipments = (po.shipments || []).filter(s =>
+                String(s.status || '').toLowerCase().includes('received') && s.receiveDate
+            );
+            const latestShip = receivedShipments.sort((a, b) =>
+                String(b.receiveDate).localeCompare(String(a.receiveDate))
+            )[0];
+
+            if (latestShip) {
+                const recvDate = this.fmtDate(latestShip.receiveDate!);
+                const receiver = (latestShip as any).receivedBy;
+                if (receiver) {
+                    lines.push(`Received: ${recvDate} by ${receiver}`);
+                } else {
+                    lines.push(`Received: ${recvDate}`);
+                }
+            } else if (po.receiveDate) {
+                lines.push(`Received: ${this.fmtDate(po.receiveDate)}`);
             } else {
-                lines.push(`Actual Receipt: Date Unknown`);
+                lines.push(`Received`);
             }
         } else {
             lines.push(`Actual Receipt: Not yet received`);
@@ -2315,8 +2327,6 @@ Data: ${JSON.stringify(data)}`;
             lines.push(`ACTION REQUIRED: TRACKING SHOWS DELIVERED - VERIFY RECEIVING IN FINALE`);
         } else if (!isReceived && !isCancelled) {
             lines.push(`NOT YET RECEIVED`);
-        } else if (isReceived) {
-            lines.push(`RECEIVED IN FINALE`);
         }
 
         lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);

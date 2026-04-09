@@ -149,7 +149,7 @@ export interface FullPO {
     total: number;
     items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
-    shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null }>;
+    shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null; receivedBy?: string | null }>;
 }
 
 export interface DraftPOReview {
@@ -3691,6 +3691,7 @@ export class FinaleClient {
                                         status
                                         shipDate
                                         receiveDate
+                                        receivedBy
                                     }
                                     itemList(first: 50) {
                                         edges {
@@ -3737,6 +3738,7 @@ export class FinaleClient {
                     status: s.status,
                     receiveDate: toISODate(s.receiveDate),
                     shipDate: toISODate(s.shipDate),
+                    receivedBy: s.receivedBy || null,
                 }));
                 return {
                     orderId: po.orderId,
