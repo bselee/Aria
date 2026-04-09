@@ -2,31 +2,52 @@ import { describe, expect, it } from "vitest";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
 
 describe("po receipt state", () => {
-    it("treats only status 'received' as received", () => {
+    it("treats status 'received' as received", () => {
         expect(hasPurchaseOrderReceipt({
             status: "Received",
             receiveDate: "2026-03-27",
         })).toBe(true);
     });
 
-    it("does not treat committed with receive date as received", () => {
+    it("does not treat committed with receive date alone as received", () => {
         expect(hasPurchaseOrderReceipt({
             status: "Committed",
             receiveDate: "2026-03-27",
         })).toBe(false);
     });
 
-    it("does not treat shipment-level evidence as received without PO status", () => {
+    it("treats all shipments received as received (staff receptions)", () => {
         expect(hasPurchaseOrderReceipt({
-            status: "Completed",
+            status: "Committed",
             receiveDate: null,
             shipments: [
-                { status: "Received", receiveDate: "2026-03-24" },
+                { status: "Received", receiveDate: "2026-04-07" },
+                { status: "Received", receiveDate: "2026-04-08" },
+                { status: "Received", receiveDate: "2026-04-09" },
+            ],
+        })).toBe(true);
+    });
+
+    it("does not treat partial shipments as received", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Committed",
+            receiveDate: null,
+            shipments: [
+                { status: "Received", receiveDate: "2026-04-07" },
+                { status: "Shipped", receiveDate: null },
             ],
         })).toBe(false);
     });
 
-    it("does not trust completed alone without any receipt evidence", () => {
+    it("does not trust completed alone without shipments", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Completed",
+            receiveDate: null,
+            shipments: [],
+        })).toBe(false);
+    });
+
+    it("does not trust completed with only in-transit shipments", () => {
         expect(hasPurchaseOrderReceipt({
             status: "Completed",
             receiveDate: null,
