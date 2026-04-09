@@ -2274,21 +2274,12 @@ Data: ${JSON.stringify(data)}`;
         if (trackingData.length > 0) {
             lines.push(`\nLIVE TRACKING`);
             for (const t of trackingData) {
-                const etaStr = t.eta ? `<b>ETA: ${new Date(t.eta).toLocaleDateString()}</b>` : 'ETA: Pending';
+                const etaStr = t.eta ? `<b>ETA: ${new Date(t.eta).toLocaleDateString()}</b>` : '';
                 const link = `<a href="${t.carrierUrl || '#' }">${t.trackingNumber}</a> (${t.carrier})`;
 
-                // Format relative freshness
-                let freshness = '';
-                if (t.updatedAt) {
-                    const diffMins = Math.round((Date.now() - new Date(t.updatedAt).getTime()) / 60000);
-                    if (diffMins < 60) freshness = `<i>(Checked ${diffMins}m ago)</i>`;
-                    else if (diffMins < 1440) freshness = `<i>(Checked ${Math.round(diffMins/60)}h ago)</i>`;
-                    else freshness = `<i>(Checked ${Math.round(diffMins/1440)}d ago)</i>`;
-                }
-
                 lines.push(`• ${link}`);
-                lines.push(`  Status: ${t.status} ${freshness}`);
-                lines.push(`  ${etaStr}`);
+                lines.push(`  Status: ${t.status}`);
+                if (etaStr) lines.push(`  ${etaStr}`);
             }
             lines.push(``); // Spacer
         } else if (!isReceived && !isCancelled) {
@@ -2419,7 +2410,8 @@ Data: ${JSON.stringify(data)}`;
                 // Skip dropship POs â€” they're pass-through orders, not BuildASoil inventory
                 if (po.orderId.toLowerCase().includes('dropship')) continue;
                 // Only show committed or received â€” skip drafts and cancelled
-                if (!['committed', 'completed'].includes((po.status || '').toLowerCase())) continue;
+                // Show committed, completed, and received POs
+                if (!['committed', 'completed', 'received'].includes((po.status || '').toLowerCase())) continue;
 
                 // Determine expected arrival date.
                 // NOTE: Finale's dueDate is payment terms (Net 30 etc), NOT delivery estimate â€” ignored.

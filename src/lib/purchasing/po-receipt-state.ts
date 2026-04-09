@@ -34,7 +34,18 @@ export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): str
 
 export function hasPurchaseOrderReceipt(input: POReceiptStateInput): boolean {
     const normalizedStatus = String(input.status || "").toLowerCase();
-    // Only trust explicit "received" status — Finale auto-populates shipment receiveDate
-    // when items are booked into inventory, which does NOT mean physical receipt.
-    return normalizedStatus === "received";
+
+    // Manual confirmation: user changed PO status to "received"
+    if (normalizedStatus === "received") return true;
+
+    // Staff receptions: all shipments show "Received" status
+    const shipments = input.shipments || [];
+    if (shipments.length > 0) {
+        const allReceived = shipments.every(s =>
+            String(s.status || '').toLowerCase().includes('received')
+        );
+        if (allReceived) return true;
+    }
+
+    return false;
 }
