@@ -10,7 +10,6 @@ import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
-import type { EvidenceEntry, POEvidence, POLifecycleState, isValidTransition } from '../types/purchase-orders';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -281,60 +280,10 @@ export async function commitAndSendPO(
 
     const { orderId, review, vendorEmail } = pending;
 
-    // Persist evidence for lifecycle transitions
-    const db = createClient();
-    if (!db) throw new Error('Database not available');
-
-    // Read current PO state and evidence
-    const { data: poRow } = await db.from('purchase_orders')
-        .select('lifecycle_state, evidence')
-        .eq('po_number', orderId)
-        .maybeSingle();
-
-    const currentEvidence: POEvidence = (poRow?.evidence as POEvidence) || {};
-    const currentState: POLifecycleState = (poRow?.lifecycle_state as POLifecycleState) || 'DRAFT';
-
-    // If PO not in DB, initialize with DRAFT evidence
-    if (!poRow) {
-        const now = new Date().toISOString();
-        currentEvidence[now] = {
-            type: 'timestamp',
-            event: 'DRAFT',
-            timestamp: now,
-            description: 'Draft PO created via commit process'
-        };
-        await db.from('purchase_orders').upsert({
-            po_number: orderId,
-            lifecycle_state: 'DRAFT',
-            evidence: currentEvidence,
-            vendor_name: review.vendorName,
-            vendor_party_id: review.vendorPartyId,
-            updated_at: now
-        }, { onConflict: 'po_number' });
-    }
-
-    // Validate transition to COMMITTED
-    if (!isValidTransition(currentState, 'COMMITTED')) {
-        throw new Error(`Cannot commit PO #${orderId} from state '${currentState}'`);
-    }
-
     // 1. Commit in Finale
     const finale = new FinaleClient();
     await finale.commitDraftPO(orderId);
     const committedAt = new Date().toISOString();
-
-    // Persist committed evidence and state
-    currentEvidence[committedAt] = {
-        type: 'timestamp',
-        event: 'COMMITTED',
-        timestamp: committedAt,
-        description: 'Committed in Finale'
-    };
-    await db.from('purchase_orders').update({
-        lifecycle_state: 'COMMITTED',
-        evidence: currentEvidence,
-        updated_at: committedAt
-    }).eq('po_number', orderId);
 
     // 2. Send email via bill.selee@buildasoil.com (if not skipped and email exists)
     let gmailMessageId = null;
@@ -363,20 +312,6 @@ export async function commitAndSendPO(
 
             gmailMessageId = sendResult.data.id || '';
             sentAt = new Date().toISOString();
-
-            // Persist sent evidence and state
-            currentEvidence[sentAt] = {
-                type: 'email',
-                emailId: gmailMessageId,
-                timestamp: sentAt,
-                subject: subject,
-                description: `Sent to ${vendorEmail}`
-            };
-            await db.from('purchase_orders').update({
-                lifecycle_state: 'SENT',
-                evidence: currentEvidence,
-                updated_at: sentAt
-            }).eq('po_number', orderId);
         } catch (err: any) {
             emailError = err.message;
         }
