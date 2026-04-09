@@ -29,6 +29,8 @@ export interface POInput {
     followUpSentAt?: string | null;
     trackingNumbers?: string[];
     acknowledgmentDate?: string | null;
+    trackingRequestCount?: number;
+    shippingEvidenceCount?: number;
 }
 
 export function derivePOLifecycleState(po: POInput): POLifecycleResult {
@@ -67,4 +69,20 @@ export function derivePOLifecycleState(po: POInput): POLifecycleResult {
     }
 
     return { state: 'sent', evidence };
+}
+
+/**
+ * Returns true when a tracking follow-up should be sent.
+ * Gate: >=2 follow-ups already sent AND no shipping evidence exists yet
+ * means we should NOT keep nagging — the vendor likely can't provide tracking.
+ */
+export function shouldRequestTrackingFollowUp(
+    trackingRequestCount: number,
+    shippingEvidenceCount: number,
+    hasVendorAck: boolean
+): boolean {
+    if (trackingRequestCount >= 2 && shippingEvidenceCount === 0) return false;
+    if (!hasVendorAck && trackingRequestCount === 0) return true;
+    if (hasVendorAck && shippingEvidenceCount === 0 && trackingRequestCount < 2) return true;
+    return false;
 }

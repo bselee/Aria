@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { derivePOLifecycleState, type POLifecycleState, type POLifecycleResult } from './derive-po-lifecycle';
+import { derivePOLifecycleState, shouldRequestTrackingFollowUp, type POLifecycleState, type POLifecycleResult } from './derive-po-lifecycle';
 
 describe('derivePOLifecycleState', () => {
     test('returns sent state for minimal input', () => {
@@ -171,5 +171,27 @@ describe('derivePOLifecycleState', () => {
             followUpSentAt: '2026-04-05T14:00:00Z',
         });
         expect(result.state).toBe('moving_with_tracking');
+    });
+});
+
+describe('shouldRequestTrackingFollowUp', () => {
+    test('allows first follow-up when vendor has not acked', () => {
+        expect(shouldRequestTrackingFollowUp(0, 0, false)).toBe(true);
+    });
+
+    test('blocks follow-up after 2 requests with no evidence', () => {
+        expect(shouldRequestTrackingFollowUp(2, 0, false)).toBe(false);
+    });
+
+    test('blocks follow-up after 2 requests with no evidence even with ack', () => {
+        expect(shouldRequestTrackingFollowUp(2, 0, true)).toBe(false);
+    });
+
+    test('allows follow-up when acked but no tracking evidence yet (count < 2)', () => {
+        expect(shouldRequestTrackingFollowUp(1, 0, true)).toBe(true);
+    });
+
+    test('blocks follow-up when shipping evidence exists', () => {
+        expect(shouldRequestTrackingFollowUp(0, 1, true)).toBe(false);
     });
 });
