@@ -56,7 +56,9 @@ import {
 import { loadActivePurchases } from "../purchasing/active-purchases";
 import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader";
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
+import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
+import { derivePOLifecycleState } from "../purchasing/derive-po-lifecycle";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -847,15 +849,20 @@ export class OpsManager {
                         const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
                         let match;
                         while ((match = gRegex.exec(bodyText)) !== null) {
-                            // pro/bol/generic: group[1] is the number; others: full match[0]
-                            const trackingNum = ['generic', 'pro', 'bol'].includes(carrier) ? (match[1] || match[0]) : match[0];
-                            // Must contain â‰¥2 digits â€” filters pure-word false positives
+                            // pro/bol/generic/oakharbor: group[1] is the number; others: full match[0]
+                            const trackingNum = ['generic', 'pro', 'bol', 'oakharbor'].includes(carrier) ? (match[1] || match[0]) : match[0];
+                            // Must contain ≥2 digits — filters pure-word false positives
                             const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
                             if (!trackingNum || !hasDigits) continue;
-                            // For PRO/BOL: encode with carrier name if detected in same message
-                            const encoded = (carrier === 'pro' || carrier === 'bol') && ltlCarrier
-                                ? `${ltlCarrier}:::${trackingNum}`
-                                : trackingNum;
+
+                            // For LTL carriers: encode with carrier name if detected
+                            let encoded = trackingNum;
+                            if (carrier === 'oakharbor') {
+                                encoded = `Oak Harbor Freight Lines:::${trackingNum}`;
+                            } else if ((carrier === 'pro' || carrier === 'bol') && ltlCarrier) {
+                                encoded = `${ltlCarrier}:::${trackingNum}`;
+                            }
+
                             const rawNum = encoded.split(':::')[1] || encoded;
                             if (!trackingNumbers.some(t => (t.split(':::')[1] || t) === rawNum)) {
                                 trackingNumbers.push(encoded);
@@ -893,11 +900,19 @@ export class OpsManager {
 
                         // Persist tracking numbers FIRST â€” prevents duplicate alerts if two
                         // processes run concurrently (e.g. PM2 restart during a sync cycle).
+                        const poLifecycle902 = derivePOLifecycleState({
+                            id: poNumber,
+                            hasVendorAck: responseAt !== null,
+                            hasTracking: mergedTracking.length > 0,
+                            trackingNumbers: mergedTracking,
+                            acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
+                        });
                         await supabase.from("purchase_orders").upsert({
                             po_number: poNumber,
                             vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                             vendor_response_time_minutes: responseTimeMins,
                             tracking_numbers: mergedTracking,
+                            lifecycle_stage: poLifecycle902.state,
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
 
@@ -957,12 +972,20 @@ export class OpsManager {
                 );
 
                 // Update DB (full record sync â€” use merged tracking to preserve inbox-sourced numbers)
+                const poLifecycle976 = derivePOLifecycleState({
+                    id: poNumber,
+                    hasVendorAck: responseAt !== null,
+                    hasTracking: mergedTracking.length > 0,
+                    trackingNumbers: mergedTracking,
+                    acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
+                });
                 await supabase.from("purchase_orders").upsert({
                     po_number: poNumber,
                     vendor_name: vendorName,
                     vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
                     vendor_response_time_minutes: responseTimeMins,
                     tracking_numbers: mergedTracking,
+                    lifecycle_stage: poLifecycle976.state,
                     updated_at: new Date().toISOString()
                 }, { onConflict: "po_number" });
 
@@ -1050,6 +1073,19 @@ export class OpsManager {
                                 // Any email from the vendor domain counts as communication,
                                 // even if it doesn't match shipping keywords.
                                 vendorCommunicatedOutsideThread = true;
+
+                                // Update lifecycle: vendor acknowledged (even without tracking)
+                                const poLifecycleAck = derivePOLifecycleState({
+                                    id: poNumber,
+                                    hasVendorAck: true,
+                                    hasTracking: trackingNumbers.length > 0,
+                                    trackingNumbers,
+                                });
+                                supabase.from("purchase_orders").upsert({
+                                    po_number: poNumber,
+                                    lifecycle_stage: poLifecycleAck.state,
+                                    updated_at: new Date().toISOString(),
+                                }, { onConflict: "po_number" }).then(() => { }).catch(() => { });
                                 // DEDUP: Skip messages we've already alerted on (persisted across restarts)
                                 if (this.seenOutsideThreadMsgIds.has(outsideMsg.id!)) continue;
                                 // DEDUP: Skip if we already alerted on a different message in this same thread
@@ -1101,9 +1137,16 @@ export class OpsManager {
                                                 confidence: 0.75,
                                             });
                                         }
+                                        const poLifecycle1129 = derivePOLifecycleState({
+                                            id: poNumber,
+                                            hasVendorAck: vendorCommunicatedOutsideThread,
+                                            hasTracking: merged.length > 0,
+                                            trackingNumbers: merged,
+                                        });
                                         await supabase.from("purchase_orders").upsert({
                                             po_number: poNumber,
                                             tracking_numbers: merged,
+                                            lifecycle_stage: poLifecycle1129.state,
                                             updated_at: new Date().toISOString(),
                                         }, { onConflict: "po_number" });
                                     }
@@ -1140,11 +1183,26 @@ export class OpsManager {
                                     userId: 'me',
                                     requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
                                 });
+                                const followUpSentAt = new Date().toISOString();
+                                const poLifecycle1176 = derivePOLifecycleState({
+                                    id: poNumber,
+                                    hasVendorAck: false,
+                                    hasTracking: false,
+                                    followUpSentAt,
+                                });
                                 await supabase.from("purchase_orders").upsert({
                                     po_number: poNumber,
-                                    follow_up_sent_at: new Date().toISOString(),
+                                    follow_up_sent_at: followUpSentAt,
+                                    lifecycle_stage: poLifecycle1176.state,
                                     updated_at: new Date().toISOString(),
                                 }, { onConflict: "po_number" });
+
+                                // Alarm: PO in 'sent' state >24h with no vendor communication
+                                const hoursSinceSent = (Date.now() - sentAt) / 3_600_000;
+                                if (hoursSinceSent > 24) {
+                                    console.warn(`[po-sync] ALARM: PO #${poNumber} (${vendorName}) in 'sent' state for ${Math.round(hoursSinceSent)}h with no vendor communication`);
+                                }
+
                                 console.log(`ðŸ“§ [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
                                 this.bot.telegram.sendMessage(
                                     process.env.TELEGRAM_CHAT_ID || "",
@@ -2120,8 +2178,13 @@ Data: ${JSON.stringify(data)}`;
      * Build the calendar event title for a PO.
      * DECISION(2026-03-11): Unreceived POs get ðŸ”´ prefix for visual urgency.
      */
-    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status)): string {
-        return `${lifecycle.titleEmoji} PO #${po.orderId} â€” ${po.vendorName}`;
+    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status, [], null, undefined, po.receiveDate)): string {
+        let skuStr = '';
+        if (po.items && po.items.length > 0) {
+            const skus = po.items.map(i => i.productId).slice(0, 2).join(', ');
+            skuStr = po.items.length > 2 ? ` [${skus} +${po.items.length - 2}]` : ` [${skus}]`;
+        }
+        return `${lifecycle.prefixText} PO #${po.orderId} - ${po.vendorName}${skuStr}`;
     }
 
     /**
@@ -2133,42 +2196,75 @@ Data: ${JSON.stringify(data)}`;
         leadProvenance: string,
         trackingNumbers: string[],
         prefetchedStatuses?: Map<string, TrackingStatus | null>,
-        lifecycle = derivePurchasingLifecycle(po.status)
+        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate)
     ): Promise<string> {
         const isReceived = lifecycle.isReceived;
         const isCancelled = lifecycle.isCancelled;
 
         const lines: string[] = [];
 
-        if (isReceived && po.receiveDate) {
-            // Compute on-time vs late
-            const expectedMs = new Date(expectedDate).getTime();
-            const actualMs = new Date(po.receiveDate).getTime();
-            const diff = Math.round((actualMs - expectedMs) / 86_400_000);
-            const timing = diff === 0 ? 'on time' : diff > 0 ? `${diff}d late` : `${Math.abs(diff)}d early`;
-            lines.push(`Ordered: ${this.fmtDate(po.orderDate)} | Received: ${this.fmtDate(po.receiveDate)} (${timing})`);
-        } else {
-            lines.push(`Ordered: ${this.fmtDate(po.orderDate)}`);
-            if (!isCancelled) {
-                lines.push(`Expected: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
+        // Always show placement date with vendor
+        lines.push(`Placed with Vendor: ${this.fmtDate(po.orderDate)}`);
+
+        // Check if tracking ETA overrides the default expected date
+        let latestETA: string | undefined;
+        const { getHighConfidenceTrackingForPOs } = await import('../tracking/shipment-intelligence');
+        const highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
+        if (highConfTracking.length > 0) {
+            latestETA = highConfTracking[0]?.eta;
+        }
+
+        // Always show expected receipt if not cancelled
+        if (!isCancelled) {
+            if (latestETA && !isReceived) {
+                lines.push(`Expected Receipt: <b>${this.fmtDate(latestETA)}</b> <i>(Updated via Live Carrier Tracking)</i>`);
+                lines.push(`Original Expected: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
+            } else {
+                lines.push(`Expected Receipt: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
             }
         }
 
-        if (trackingNumbers.length > 0) {
-            const trackingLines = await Promise.all(trackingNumbers.map(async t => {
-                const ts = prefetchedStatuses?.has(t) ? prefetchedStatuses.get(t)! : await getTrackingStatus(t);
-                const statusStr = ts ? ` ${ts.display}` : "";
-                const link = ts?.public_url || carrierUrl(t);
-                const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
-                return `<a href="${link}">${displayT}</a><i>${statusStr}</i>`;
-            }));
-            lines.push(`Tracking: ${trackingLines.join(' | ')}`);
-        } else if (!isReceived && !isCancelled) {
-            lines.push(`Tracking: Awaiting Tracking`);
+        // Show actual receipt if received, with timing vs expected
+        if (isReceived) {
+            if (po.receiveDate) {
+                const expectedMs = new Date(expectedDate).getTime();
+                const actualMs = new Date(po.receiveDate).getTime();
+                const diff = Math.round((actualMs - expectedMs) / 86_400_000);
+                const timing = diff === 0 ? 'on time' : diff > 0 ? `${diff}d late` : `${Math.abs(diff)}d early`;
+                lines.push(`Actual Receipt: ${this.fmtDate(po.receiveDate)} (${timing})`);
+            } else {
+                lines.push(`Actual Receipt: Date Unknown`);
+            }
+        } else {
+            lines.push(`Actual Receipt: Not yet received`);
         }
 
-        // Line items â€” max 5 + overflow count
-        const itemLines = po.items.slice(0, 5).map(i => `${i.productId} Ã— ${i.quantity.toLocaleString()}`);
+        if (highConfTracking.length > 0) {
+            lines.push(`\nLIVE TRACKING`);
+            for (const t of highConfTracking) {
+                const etaStr = t.eta ? `<b>ETA: ${new Date(t.eta).toLocaleDateString()}</b>` : 'ETA: Pending';
+                const link = `<a href="${t.carrierUrl || '#' }">${t.trackingNumber}</a> (${t.carrier})`;
+
+                // Format relative freshness
+                let freshness = '';
+                if (t.updatedAt) {
+                    const diffMins = Math.round((Date.now() - new Date(t.updatedAt).getTime()) / 60000);
+                    if (diffMins < 60) freshness = `<i>(Checked ${diffMins}m ago)</i>`;
+                    else if (diffMins < 1440) freshness = `<i>(Checked ${Math.round(diffMins/60)}h ago)</i>`;
+                    else freshness = `<i>(Checked ${Math.round(diffMins/1440)}d ago)</i>`;
+                }
+
+                lines.push(`• ${link}`);
+                lines.push(`  Status: ${t.status} ${freshness}`);
+                lines.push(`  ${etaStr}`);
+            }
+            lines.push(``); // Spacer
+        } else if (!isReceived && !isCancelled) {
+            lines.push(`\nTracking: Awaiting tracking from vendor\n`);
+        }
+
+        // Line items — max 5 + overflow count
+        const itemLines = po.items.slice(0, 5).map(i => `${i.productId} × ${i.quantity.toLocaleString()}`);
         if (po.items.length > 5) itemLines.push(`+ ${po.items.length - 5} more`);
         lines.push(`Items: ${itemLines.join(', ')}`);
 
@@ -2177,12 +2273,14 @@ Data: ${JSON.stringify(data)}`;
         lines.push(`Status: ${lifecycle.statusLabel}`);
 
         if (lifecycle.isDeliveredAwaitingReceipt) {
-            lines.push(`ðŸŸ¡ <b>TRACKING SHOWS DELIVERED â€” VERIFY RECEIVING IN FINALE</b>`);
+            lines.push(`ACTION REQUIRED: TRACKING SHOWS DELIVERED - VERIFY RECEIVING IN FINALE`);
         } else if (!isReceived && !isCancelled) {
-            lines.push(`ðŸ”´ <b>NOT YET RECEIVED</b>`);
+            lines.push(`NOT YET RECEIVED`);
+        } else if (isReceived) {
+            lines.push(`RECEIVED IN FINALE`);
         }
 
-        lines.push(`â†’ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
+        lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
 
         return lines.join('\n');
     }
@@ -2289,35 +2387,38 @@ Data: ${JSON.stringify(data)}`;
                 }
 
                 // Get tracking array for this PO
-                const trackingNumbers = trackingMap.get(po.orderId) || [];
-                const shipmentRollups = shipmentMap.get(po.orderId) || [];
+                // Use high-confidence tracking exclusively for calendar consistency
+                const { getHighConfidenceTrackingForPOs } = await import('../tracking/shipment-intelligence');
+                const highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
+                const trackingNumbers = highConfTracking.map((t: any) => t.trackingNumber);
 
                 const trackingStatuses = new Map<string, TrackingStatus | null>();
-                if (shipmentRollups.length > 0) {
-                    for (const shipment of shipmentRollups) {
-                        trackingStatuses.set(shipment.tracking_number, shipment.status_category && shipment.status_display ? {
-                            category: shipment.status_category as TrackingCategory,
-                            display: shipment.status_display,
-                            public_url: shipment.public_tracking_url || undefined,
-                            estimated_delivery_at: shipment.estimated_delivery_at || undefined,
-                            delivered_at: shipment.delivered_at || undefined,
-                        } : null);
-                    }
-                } else {
-                    await Promise.all(trackingNumbers.map(async t => {
-                        trackingStatuses.set(t, await getTrackingStatus(t));
-                    }));
+                for (const t of highConfTracking) {
+                    trackingStatuses.set(t.trackingNumber, {
+                        category: (t.status.toLowerCase().includes('delivered') ? 'delivered' : 'shipped') as any,
+                        display: t.status,
+                        public_url: t.carrierUrl || '',
+                        estimated_delivery_at: t.eta,
+                    });
                 }
 
                 // Hash = sorted "num:status" pairs â€” changes when EasyPost status changes
-                const trackingHash = trackingNumbers.slice().sort().map(t => {
-                    const ts = trackingStatuses.get(t);
-                    return ts ? `${t}:${ts.category}` : t;
-                }).join(',');
+                // Simplified hash - forces update when tracking changes
+                const trackingHash = trackingNumbers.sort().join(',') + '|' +
+                                   Array.from(trackingStatuses.values()).map(ts => ts?.display || '').join(',');
 
                 const completionSignal = completionSignals.get(po.orderId);
+                let actualReceiveDate = resolvePurchaseOrderReceiptDate({
+                    status: po.status,
+                    receiveDate: po.receiveDate,
+                    shipments: po.shipments,
+                });
                 const completionState = derivePOCompletionState({
-                    finaleReceived: (po.status || '').toLowerCase() === 'completed',
+                    finaleReceived: hasPurchaseOrderReceipt({
+                        status: po.status,
+                        receiveDate: po.receiveDate,
+                        shipments: po.shipments,
+                    }),
                     trackingDelivered: Array.from(trackingStatuses.values()).length > 0 &&
                         Array.from(trackingStatuses.values()).every(ts => ts?.category === 'delivered'),
                     hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
@@ -2325,19 +2426,33 @@ Data: ${JSON.stringify(data)}`;
                     freightResolved: completionSignal?.freightResolved || false,
                     unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
                 });
-                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState);
+                const latestETA = highConfTracking
+                    .map((t: any) => t.eta)
+                    .filter(Boolean)
+                    .sort()
+                    .pop();
+                if (actualReceiveDate) {
+                    po.receiveDate = actualReceiveDate;
+                }
+
+                const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
+                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate);
                 const title = this.buildPOEventTitle(po, lifecycle);
                 const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle);
                 const newStatus = lifecycle.calendarStatus;
-                const eventDate = getPurchasingEventDate(expectedDate, po.receiveDate, lifecycle);
+                const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
 
                 const existingRow = existing.get(po.orderId);
-                if (completionState === 'complete' && lifecycle.isReceived && !shouldKeepReceivedPurchase(po.receiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
+
+                // Force update for all POs to fix any lingering encoding/formatting issues
+                const shouldForceUpdate = true;
+
+                if (completionState === 'complete' && lifecycle.isReceived && !shouldKeepReceivedPurchase(actualReceiveDate, RECEIVED_CALENDAR_RETENTION_DAYS)) {
                     if (existingRow) {
                         await calendar.deleteEvent(existingRow.calendar_id, existingRow.event_id);
                         await supabase.from('purchasing_calendar_events').delete().eq('po_number', po.orderId);
                         counts.cleared++;
-                        console.log(`ðŸ“… [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
+                        console.log(`🗑️ [cal-sync] Cleared received PO #${po.orderId} after ${RECEIVED_CALENDAR_RETENTION_DAYS} days`);
                     } else {
                         counts.skipped++;
                     }
@@ -2367,21 +2482,21 @@ Data: ${JSON.stringify(data)}`;
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
-                    // Status changed or tracking changed â€” update in place
+                } else if (shouldForceUpdate || existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash) {
+                    // Status changed, tracking changed, or forced update for received/past-due POs
                     await calendar.updateEventTitleAndDescription(
                         existingRow.calendar_id,
                         existingRow.event_id,
                         title,
                         description,
-                        colorId,
+                        lifecycle.colorId,
                         eventDate
                     );
                     await supabase.from('purchasing_calendar_events')
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
                         .eq('po_number', po.orderId);
                     counts.updated++;
-                    console.log(`ðŸ“… [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus}, tracking changed=${existingRow.last_tracking !== trackingHash}`);
+                    console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText}), forced=${shouldForceUpdate}`);
                 } else {
                     counts.skipped++;
                 }
