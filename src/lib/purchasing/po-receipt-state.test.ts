@@ -2,21 +2,28 @@ import { describe, expect, it } from "vitest";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
 
 describe("po receipt state", () => {
-    it("treats a committed PO with a receive date as received", () => {
+    it("treats only status 'received' as received", () => {
         expect(hasPurchaseOrderReceipt({
-            status: "Committed",
+            status: "Received",
             receiveDate: "2026-03-27",
         })).toBe(true);
     });
 
-    it("treats shipment-level received evidence as received when the PO receive date is blank", () => {
+    it("does not treat committed with receive date as received", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Committed",
+            receiveDate: "2026-03-27",
+        })).toBe(false);
+    });
+
+    it("does not treat shipment-level evidence as received without PO status", () => {
         expect(hasPurchaseOrderReceipt({
             status: "Completed",
             receiveDate: null,
             shipments: [
                 { status: "Received", receiveDate: "2026-03-24" },
             ],
-        })).toBe(true);
+        })).toBe(false);
     });
 
     it("does not trust completed alone without any receipt evidence", () => {
@@ -31,7 +38,7 @@ describe("po receipt state", () => {
 
     it("uses the latest known shipment receive date for reporting", () => {
         expect(resolvePurchaseOrderReceiptDate({
-            status: "Committed",
+            status: "Received",
             receiveDate: "2026-03-27",
             shipments: [
                 { status: "Received", receiveDate: "2026-03-16" },
