@@ -23,9 +23,9 @@ function isShipmentMarkedReceived(shipment: POShipmentReceiptLike): boolean {
 }
 
 export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): string | null {
-    // Only trust receiveDate if the PO is actually marked as received
-    const normalizedStatus = String(input.status || "").toLowerCase();
-    const isPOReceived = normalizedStatus === "received";
+    // Trust PO-level receiveDate as a fallback — Finale sets it when any reception is created
+    // (even if the PO status stays "Committed"/"Completed" rather than "Received")
+    const poLevelDate = normalizeDateOnly(input.receiveDate);
 
     // For shipments, only trust dates from shipments that are actually marked "Received"
     const receivedShipmentDates = (input.shipments || [])
@@ -38,13 +38,12 @@ export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): str
 
     const receiveDates: string[] = [];
 
-    // Only include PO-level receiveDate if PO status is "received"
-    if (isPOReceived && input.receiveDate) {
-        const d = normalizeDateOnly(input.receiveDate);
-        if (d) receiveDates.push(d);
+    // Always trust PO-level receiveDate (Finale sets it when reception is created)
+    if (poLevelDate) {
+        receiveDates.push(poLevelDate);
     }
 
-    // Include shipment receiveDates only for shipments marked "Received"
+    // Also include shipment receiveDates for shipments marked "Received"
     receiveDates.push(...receivedShipmentDates);
 
     if (receiveDates.length === 0) return null;
