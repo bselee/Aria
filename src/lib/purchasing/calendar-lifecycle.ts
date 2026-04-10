@@ -77,7 +77,13 @@ export function derivePurchasingLifecycle(
         knownStatuses.length === trackingStatuses.length &&
         knownStatuses.every(item => item.category === "delivered");
 
-    if (isReceived || (completionState && (completionState.includes('received') || completionState === 'complete'))) {
+    // Only show as received if actually received in Finale (hasPurchaseOrderReceipt)
+    // OR if completionState is explicitly a received-pending state
+    // NOTE: completionState === 'complete' means AP pipeline done, NOT physically received
+    const isReceivedCompletionState = completionState &&
+        (completionState.includes('received') || completionState === 'delivered_awaiting_receipt');
+
+    if (isReceived || isReceivedCompletionState) {
         return {
             calendarStatus: "received",
             completionState,

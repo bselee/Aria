@@ -46,8 +46,17 @@ describe("calendar lifecycle", () => {
         expect(lifecycle.statusLabel).toBe("Received");
     });
 
-    it("shows fully resolved POs as complete", () => {
+    it("does not show completed+complete POs as received without actual receipt evidence", () => {
+        // completionState === 'complete' means AP pipeline done, NOT physically received
+        // A PO should only show as Received if hasPurchaseOrderReceipt returns true
         const lifecycle = derivePurchasingLifecycle("completed", [], "complete");
+        expect(lifecycle.isReceived).toBe(false);
+        expect(lifecycle.colorId).toBe("8"); // awaiting_tracking grey
+    });
+
+    it("shows received_pending_invoice as received (actual receipt exists)", () => {
+        // This has isReceivedCompletionState = true, showing as received
+        const lifecycle = derivePurchasingLifecycle("completed", [], "received_pending_invoice");
         expect(lifecycle.colorId).toBe("2");
         expect(lifecycle.statusLabel).toBe("Received");
     });
