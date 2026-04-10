@@ -33,6 +33,38 @@ export interface PurchasingLifecycleState {
     isHumanEscalated?: boolean;
 }
 
+export function toDateOnly(dateStr: string | null | undefined): string | null {
+    if (!dateStr) return null;
+    const isoPrefix = /^(\d{4}-\d{2}-\d{2})/.exec(dateStr);
+    if (isoPrefix) return isoPrefix[1];
+    const parsed = new Date(dateStr);
+    return isNaN(parsed.getTime()) ? null : parsed.toISOString().split("T")[0];
+}
+
+export function daysSinceDate(dateStr: string | null | undefined, now: Date = new Date()): number | null {
+    const dateOnly = toDateOnly(dateStr);
+    if (!dateOnly) return null;
+    const todayKey = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    const thenMs = new Date(`${dateOnly}T12:00:00Z`).getTime();
+    const nowMs = new Date(`${todayKey}T12:00:00Z`).getTime();
+    return Math.round((nowMs - thenMs) / 86_400_000);
+}
+
+export function shouldKeepReceivedPurchase(
+    receiveDate: string | null | undefined,
+    retentionDays: number,
+    now: Date = new Date()
+): boolean {
+    const ageDays = daysSinceDate(receiveDate, now);
+    if (ageDays === null) return true;
+    return ageDays <= retentionDays;
+}
+
+export interface POShipmentLike {
+    status?: string | null;
+    receiveDate?: string | null;
+}
+
 /**
  * High-level purchasing event states that drive the calendar rendering.
  */
@@ -212,7 +244,7 @@ export function derivePurchasingLifecycle(
         return {
             calendarStatus: "past_due",
             completionState,
-            colorId: "11", // Graphite/Grey (actually Graphite 11)
+            colorId: "11",
             prefixText: "LATE",
             statusLabel: "Past Due - Needs Follow-up",
             isReceived: false,
@@ -265,7 +297,6 @@ export function getPurchasingEventDate(
 
     // Push past due unreceived items forward to today for visibility
     if (!lifecycle.isReceived && eventDate < todayKey) {
-        // Also apply to PARTIAL/NONCOMM/EXCEPTION/PAST_DUE
         return todayKey;
     }
 
