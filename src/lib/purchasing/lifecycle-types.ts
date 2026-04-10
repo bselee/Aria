@@ -30,6 +30,7 @@ export const LIFECYCLE_STAGES = {
         PAST_DUE: "past_due" as const,
         NONCOMM: "noncomm" as const,
         PARTIAL: "partial" as const,
+        MULTI: "multi" as const,
     },
 } as const;
 
@@ -40,7 +41,8 @@ export const LIFECYCLE_COLORS: Record<string, string> = {
     exception: "6",
     past_due: "11",
     noncomm: "6", 
-    partial: "7", // Cyan/Teal for Partial/Multi
+    partial: "7", // Cyan for RCV P
+    multi: "10",  // Purple for intended MULTI
     in_transit: "9",
     awaiting_tracking: "8",
     open: "8",
@@ -64,9 +66,8 @@ export const LIFECYCLE_LABELS: Record<string, string> = {
     exception: "Long Outstanding - Needs Attention",
     past_due: "Past Due - Needs Follow-up",
     noncomm: "Vendor Non-Communicative",
-    partial: "Partial Receipt / Multi-Shipment",
-    in_transit: "In Transit",
-    awaiting_tracking: "Awaiting Tracking",
+    partial: "RCV P - Partial / Backordered",
+    multi: "MULTI - Intended Multi-Shipment",
     open: "Open",
     human_escalated: "Human Intervened",
 };
