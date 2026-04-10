@@ -108,6 +108,27 @@ export function shouldUseL2FollowUp(trackingRequestCount: number): boolean {
     return trackingRequestCount >= 2;
 }
 
+export const VENDOR_THANK_YOU_MESSAGES = [
+    "Got it, thanks!",
+    "Appreciate the update, thanks!",
+    "Thanks for the tracking!",
+    "Thanks, received!",
+] as const;
+
+export function getVendorThankYou(): string {
+    return VENDOR_THANK_YOU_MESSAGES[Math.floor(Math.random() * VENDOR_THANK_YOU_MESSAGES.length)];
+}
+
+export const VENDOR_CLARIFY_MESSAGES = [
+    "Hi, thanks for the update. Could you send the tracking number or PRO/BOL again? Having trouble reading it.",
+    "Hi, got your message but couldn't read the tracking info. Could you resend the tracking or PRO number?",
+    "Hi, thanks! Could you send the tracking number in text format? Having trouble reading the attachment.",
+] as const;
+
+export function getVendorClarifyRequest(): string {
+    return VENDOR_CLARIFY_MESSAGES[Math.floor(Math.random() * VENDOR_CLARIFY_MESSAGES.length)];
+}
+
 /**
  * Returns true when a tracking follow-up should be sent.
  * After 2 follow-ups with no response, returns false — escalation to human should happen instead.

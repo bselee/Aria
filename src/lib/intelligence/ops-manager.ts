@@ -58,7 +58,8 @@ import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader"
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
-import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp } from "../purchasing/derive-po-lifecycle";
+import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp, getVendorThankYou, getVendorClarifyRequest } from "../purchasing/derive-po-lifecycle";
+import { VendorCommsAgent } from "./vendor-comms-agent";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -775,6 +776,7 @@ export class OpsManager {
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
+            const vendorComms = new VendorCommsAgent(gmail);
 
             // Only scan POs from the last 14 days â€” tracking arrives well within that window
             const since = new Date();
@@ -988,6 +990,27 @@ export class OpsManager {
                             msg,
                             { parse_mode: "HTML" }
                         );
+
+                        // Send thank you to vendor for clear tracking
+                        const lastVendorMsg = thread.messages.slice(1).reverse().find((msg: any) => {
+                            const from = msg.payload?.headers?.find((h: any) => h.name === 'From')?.value || "";
+                            return !from.includes("buildasoil.com");
+                        });
+                        if (lastVendorMsg) {
+                            const msgId = lastVendorMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
+                            await vendorComms.sendThankYou({
+                                poNumber,
+                                vendorEmail,
+                                vendorName,
+                                subject,
+                                threadId: m.threadId!,
+                                messageId: msgId,
+                                sentAt: new Date(sentAt),
+                                hasTracking: true,
+                                trackingQuality: 'clear',
+                                responseType: 'thank_you',
+                            });
+                        }
                     }
                 }
 
