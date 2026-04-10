@@ -455,7 +455,7 @@ export class OpsManager {
                 await this.bot.telegram.sendMessage(
                     chatId,
                     `â˜€ï¸ <b>Aria Morning Check-In</b>\n\n` +
-                    `âœ… Bot is online and healthy\n` +
+                    `✅ Bot is online and healthy\n` +
                     `â± Uptime: ${uptimeHrs}h | Memory: ${heapMB}MB\n` +
                     `ðŸ“‹ Next: Build Risk (7:30), Daily Summary (8:00)`,
                     { parse_mode: "HTML" }
@@ -500,7 +500,7 @@ export class OpsManager {
                             `ðŸ“‹ <b>OOS Report Generated</b>\n\n` +
                             `ðŸ“Š ${result.totalItems} out-of-stock items analyzed\n` +
                             `ðŸš¨ ${result.needsOrder.length} need ordering\n` +
-                            `âœ… ${result.onOrder.length} on order\n` +
+                            `✅ ${result.onOrder.length} on order\n` +
                             `âš ï¸ ${result.agingPOs.length} aging POs\n` +
                             `ðŸ”§ ${result.internalBuild.length} internal builds\n\n` +
                             `ðŸ“ Saved to: <code>${result.outputPath}</code>`,
@@ -668,7 +668,7 @@ export class OpsManager {
         if (chatId) {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `âœ… <b>${vendorName} Reconciliation Complete</b>\n\n` +
+                `✅ <b>${vendorName} Reconciliation Complete</b>\n\n` +
                 `â± Duration: ${durationSec}s\n` +
                 `<pre>${summary.slice(0, 500)}</pre>`,
                 { parse_mode: "HTML" }
@@ -760,7 +760,7 @@ export class OpsManager {
                 }
             });
 
-            console.log(`âœ… Moved ${ids.length} advertisements.`);
+            console.log(`✅ Moved ${ids.length} advertisements.`);
         } catch (err: any) {
             console.error("Cleanup error:", err.message);
         }
@@ -1276,7 +1276,7 @@ export class OpsManager {
                 text,
                 mrkdwn: true,
             });
-            console.log(`âœ… ${label} posted to Slack ${this.slackChannel}`);
+            console.log(`✅ ${label} posted to Slack ${this.slackChannel}`);
         } catch (err: any) {
             // Non-fatal: Telegram message was already sent
             console.error(`âŒ Slack post failed (${label}):`, err.data?.error || err.message);
@@ -1637,7 +1637,7 @@ export class OpsManager {
      *
      * On completion detected:
      *   1. Sends a Telegram notification to Will
-     *   2. Appends "âœ… Completed: [timestamp]" to the matching Google Calendar event description
+     *   2. Appends "✅ Completed: [timestamp]" to the matching Google Calendar event description
      *
      * Calendar writes are best-effort â€” description-only PATCH, no color/title changes.
      * Finale endpoint discovery is required; see src/cli/test-finale-builds.ts.
@@ -1687,12 +1687,12 @@ export class OpsManager {
                         const existingEvent = await calendar.getEventRaw(matched.calendarId, matched.eventId);
                         const existingDesc = existingEvent?.description || '';
                         const existingTitle = existingEvent?.summary || '';
-                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('âœ…') || existingTitle.startsWith('ðŸŸ¡')) {
+                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('✅') || existingTitle.startsWith('ðŸŸ¡')) {
                             console.log(`â­ï¸ [build-watcher] ${build.sku} already annotated, skipping`);
                         } else {
                             const scheduledQty = matched.quantity;
-                            // Determine icon: ðŸŸ¡ partial if under scheduled, âœ… if met or exceeded
-                            const icon = (scheduledQty && build.quantity < scheduledQty) ? 'ðŸŸ¡' : 'âœ…';
+                            // Determine icon: ðŸŸ¡ partial if under scheduled, ✅ if met or exceeded
+                            const icon = (scheduledQty && build.quantity < scheduledQty) ? 'ðŸŸ¡' : '✅';
 
                             // 1. Prepend icon to title so it's visible on calendar grid
                             const newTitle = `${icon} ${existingTitle}`;
@@ -1741,7 +1741,7 @@ export class OpsManager {
                 // Build completions are now annotated directly onto the existing build plan
                 // event (above) to avoid duplicate entries on the same calendar day.
 
-                console.log(`âœ… [build-watcher] Build complete: ${build.sku} Ã— ${build.quantity} @ ${timeStr}`);
+                console.log(`✅ [build-watcher] Build complete: ${build.sku} Ã— ${build.quantity} @ ${timeStr}`);
             }
         } catch (err: any) {
             console.error('[build-watcher] pollBuildCompletions error:', err.message);
@@ -1797,7 +1797,7 @@ export class OpsManager {
 
                     if (restocked.length > 0) {
                         // Telegram alert
-                        const restockMsg = `âœ… *Component Restock Alert*\n` +
+                        const restockMsg = `✅ *Component Restock Alert*\n` +
                             restocked.map(sku => `â€¢ \`${sku}\` â€” back in stock, was ${lastSnapshot[sku].riskLevel}`).join('\n') +
                             `\n_Affected builds are no longer blocked by these components._`;
                         this.bot.telegram.sendMessage(
@@ -1825,7 +1825,7 @@ export class OpsManager {
                                     await calClient.appendToEventDescription(
                                         build.calendarId,
                                         build.eventId,
-                                        `âœ… ${sku} replenished â€” Build now Green (${today})`
+                                        `✅ ${sku} replenished â€” Build now Green (${today})`
                                     );
                                 }
                             }
@@ -1895,7 +1895,7 @@ export class OpsManager {
 
                                 const poLabel = `PO#${po.orderId} from ${po.supplier} (${po.quantity.toLocaleString()} units)`;
                                 if (etaStr) {
-                                    note += `\n   ${arrivesBefore ? 'âœ…' : 'âš ï¸'} ${poLabel} ETA ~${etaStr}`;
+                                    note += `\n   ${arrivesBefore ? '✅' : 'âš ï¸'} ${poLabel} ETA ~${etaStr}`;
                                     if (!arrivesBefore) {
                                         const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
                                         const etaMs = new Date(po.orderDate).getTime() + (demand.leadTimeDays ?? 0) * 86400000;
@@ -1982,7 +1982,7 @@ export class OpsManager {
                 }
             });
 
-            console.log(`âœ… Build risk report sent: ðŸ”´ ${report.criticalCount} Â· ðŸŸ¡ ${report.warningCount} Â· ðŸ‘€ ${report.watchCount} Â· âœ… ${report.okCount}`);
+            console.log(`✅ Build risk report sent: ðŸ”´ ${report.criticalCount} Â· ðŸŸ¡ ${report.warningCount} Â· ðŸ‘€ ${report.watchCount} Â· ✅ ${report.okCount}`);
         } catch (err: any) {
             console.error("âŒ Build risk analysis failed:", err.message);
 
@@ -2188,9 +2188,9 @@ Data: ${JSON.stringify(data)}`;
      */
     private poStatusEmoji(status: string): string {
         const s = (status || '').toLowerCase();
-        if (s === 'completed') return 'âœ…';
-        if (s === 'cancelled') return 'âŒ';
-        return 'ðŸ”œ';
+        if (s === 'completed') return '✅';
+        if (s === 'cancelled') return '❌';
+        return '🔴';
     }
 
     /**
@@ -2587,7 +2587,7 @@ Data: ${JSON.stringify(data)}`;
         if (result.itemCount === 0) {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `âœ… <b>ULINE Friday Order â€” All Stocked</b>\n\n` +
+                `✅ <b>ULINE Friday Order â€” All Stocked</b>\n\n` +
                 `Purchasing intelligence scanned all ULINE items.\n` +
                 `Everything is above reorder threshold â€” no order needed this week. ðŸŽ‰`,
                 { parse_mode: 'HTML' }
@@ -2636,7 +2636,7 @@ Data: ${JSON.stringify(data)}`;
             disable_web_page_preview: true,
         });
 
-        console.log(`[uline-friday] âœ… Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
+        console.log(`[uline-friday] ✅ Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
     }
 
     /**
