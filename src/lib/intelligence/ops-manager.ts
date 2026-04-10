@@ -58,7 +58,7 @@ import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader"
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
-import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate } from "../purchasing/derive-po-lifecycle";
+import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp } from "../purchasing/derive-po-lifecycle";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -1211,32 +1211,42 @@ export class OpsManager {
                                 console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — human reply detected`);
                             } else if (!shouldRequestTrackingFollowUp(currentCount, evidenceCount, false)) {
                                 // After 2 failed follow-ups: escalate to Telegram instead of silently giving up
+                                // Also mark vendor as noncomm
                                 console.log(`[po-sync] Escalating PO #${poNumber} to human — ${currentCount} follow-ups with no response`);
                                 const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
                                     month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
                                 });
+                                const noncommAt = new Date().toISOString();
 
                                 await supabase.from("purchase_orders").upsert({
                                     po_number: poNumber,
-                                    tracking_unavailable_at: new Date().toISOString(),
+                                    tracking_unavailable_at: noncommAt,
+                                    vendor_noncomm_at: noncommAt,
                                     lifecycle_stage: 'tracking_unavailable',
                                     updated_at: new Date().toISOString(),
                                 }, { onConflict: "po_number" });
 
+                                // Mark vendor as noncomm in vendor_profiles
+                                await supabase.from("vendor_profiles")
+                                    .update({ is_noncomm: true })
+                                    .ilike("vendor_name", vendorName);
+
                                 // Send escalation to Telegram
                                 this.bot.telegram.sendMessage(
                                     process.env.TELEGRAM_CHAT_ID || "",
-                                    `<b>⚠️ Vendor Not Responding</b>\n\nPO #${poNumber} to <b>${vendorName}</b> sent ${sentDateStr}\n\n${currentCount} follow-ups sent with no tracking or ETA received.\n\n<a href="${`https://mail.google.com/mail/u/0/?view=cm&fs=1&tf=1&to=${vendorEmail}`}">Reply manually</a> or investigate.`,
+                                    `<b>⚠️ Noncomm Vendor</b>\n\nPO #${poNumber} to <b>${vendorName}</b> sent ${sentDateStr}\n\n${currentCount} follow-ups sent with no tracking or ETA received.\n\nLabeled: <b>NONCOMM</b>\n\n<a href="${`https://mail.google.com/mail/u/0/?view=cm&fs=1&tf=1&to=${vendorEmail}`}">Reply manually</a> or investigate.`,
                                     { parse_mode: "HTML" }
                                 );
                             } else {
-                                // Send follow-up using rotating template
+                                // Send follow-up using rotating template (L1 or L2 based on count)
                                 const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
                                     month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
                                 });
                                 const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
 
-                                const bodyTemplate = getFollowUpTemplate(currentCount);
+                                const bodyTemplate = shouldUseL2FollowUp(currentCount)
+                                    ? getFollowUpTemplateL2(currentCount)
+                                    : getFollowUpTemplate(currentCount);
                                 const body = bodyTemplate
                                     .replace('{po}', poNumber)
                                     .replace('{date}', sentDateStr);
