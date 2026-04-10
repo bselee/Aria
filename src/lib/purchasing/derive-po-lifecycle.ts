@@ -81,7 +81,7 @@ export function derivePOLifecycleState(po: POInput): POLifecycleResult {
     return { state: 'sent', evidence };
 }
 
-export const FOLLOW_UP_TEMPLATES = [
+export const FOLLOW_UP_TEMPLATES_L1 = [
     "Hi,\n\nFollowing up on PO #{po} sent {date}. Do you have an expected ship date or tracking?\n\nThanks!",
     "Hi,\n\nChecking in on PO #{po} — any update on tracking or estimated arrival?\n\nThanks!",
     "Hi,\n\nJust wanted to check on PO #{po} sent {date}. Tracking or ETA would be great!\n\nThanks!",
@@ -89,8 +89,23 @@ export const FOLLOW_UP_TEMPLATES = [
     "Hi,\n\nPO #{po} from {date} — do you have tracking or ship date?\n\nThanks!",
 ] as const;
 
+export const FOLLOW_UP_TEMPLATES_L2 = [
+    "Hi,\n\nFollowing up again on PO #{po} sent {date}. We really need the tracking or ship date to plan our receiving.\n\nThanks!",
+    "Hi,\n\nHaven't heard back on PO #{po}. Do you have an ETA or tracking info?\n\nThanks!",
+    "Hi,\n\nChecking in again on PO #{po}. Any shipping updates or tracking?\n\nThanks!",
+    "Hi,\n\nStill waiting on tracking for PO #{po} from {date}. Can you help?\n\nThanks!",
+] as const;
+
 export function getFollowUpTemplate(index: number): string {
-    return FOLLOW_UP_TEMPLATES[index % FOLLOW_UP_TEMPLATES.length];
+    return FOLLOW_UP_TEMPLATES_L1[index % FOLLOW_UP_TEMPLATES_L1.length];
+}
+
+export function getFollowUpTemplateL2(index: number): string {
+    return FOLLOW_UP_TEMPLATES_L2[index % FOLLOW_UP_TEMPLATES_L2.length];
+}
+
+export function shouldUseL2FollowUp(trackingRequestCount: number): boolean {
+    return trackingRequestCount >= 2;
 }
 
 /**
