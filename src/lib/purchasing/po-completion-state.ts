@@ -1,10 +1,23 @@
+/**
+ * PO Completion States - AP Pipeline tracking (NOT physical receipt)
+ *
+ * IMPORTANT: These states track the AP/invoice pipeline, NOT physical receipt.
+ * Physical receipt is tracked separately via hasPurchaseOrderReceipt().
+ *
+ * A PO is truly "complete" (all AP steps done) when ALL of these are true:
+ *   - finaleReceived: Physical goods received in Finale (staff confirmed)
+ *   - hasMatchedInvoice: Invoice matched to this PO
+ *   - freightResolved: Shipping charges verified/added
+ *   - reconciliationVerdict: Pricing verified (auto_approve, no_change, duplicate)
+ *   - unresolvedBlockers: [] (no exceptions)
+ */
 export type POCompletionState =
-    | "in_transit"
-    | "delivered_awaiting_receipt"
-    | "received_pending_invoice"
-    | "received_pending_reconciliation"
-    | "complete"
-    | "exception";
+    | "in_transit"                        // Not received, no delivered tracking
+    | "delivered_awaiting_receipt"        // Tracking shows delivered, awaiting staff receipt in Finale
+    | "received_pending_invoice"           // Received but no invoice matched yet
+    | "received_pending_reconciliation"    // Invoice matched, reconciliation in progress
+    | "complete"                          // ALL AP steps done: received + invoice + freight + pricing verified
+    | "exception";                        // Blockers or reconciliation failed
 
 export interface POCompletionInputs {
     finaleReceived: boolean;

@@ -77,9 +77,15 @@ export function derivePurchasingLifecycle(
         knownStatuses.length === trackingStatuses.length &&
         knownStatuses.every(item => item.category === "delivered");
 
-    // Only show as received if actually received in Finale (hasPurchaseOrderReceipt)
-    // OR if completionState is explicitly a received-pending state
-    // NOTE: completionState === 'complete' means AP pipeline done, NOT physically received
+    // CALENDAR RECEIPT LOGIC: Only use hasPurchaseOrderReceipt (physical receipt in Finale)
+    //
+    // completionState tracks the AP/invoice pipeline (matching, pricing, freight).
+    // It should NEVER affect calendar receipt status because:
+    //   - AP pipeline can be "complete" before goods are physically received
+    //   - Goods can be received without any invoice matching yet
+    //
+    // The ONLY exceptions are states that explicitly include "received" in their name,
+    // indicating physical receipt IS part of that state.
     const isReceivedCompletionState = completionState &&
         (completionState.includes('received') || completionState === 'delivered_awaiting_receipt');
 
