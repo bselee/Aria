@@ -80,7 +80,8 @@ export function derivePurchasingLifecycle(
         human_reply_detected_at?: string | null;
         lifecycle_stage?: string | null;
         is_intended_multi?: boolean | null;
-        notes?: string | null;
+        notes?: string | null;    // Internal notes (fallback)
+        comments?: string | null; // External notes (primary for MULTI detection)
     }
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
@@ -94,10 +95,13 @@ export function derivePurchasingLifecycle(
     const hasAnyReceivedShipment = shipmentList.some(s => String(s.status || "").toLowerCase() === "received");
     
     // AUTONOMOUS CLASSIFICATION
-    // 1. Is it intended multi? (Check DB flag OR scan notes for keywords)
-    const notes = (poData?.notes || "").toLowerCase();
+    // 1. Is it intended multi? (Check DB flag OR scan external comments/internal notes for keywords)
+    const externalNotes = (poData?.comments || "").toLowerCase();
+    const internalNotes = (poData?.notes || "").toLowerCase();
+    const combinedNotes = `${externalNotes} ${internalNotes}`;
+    
     const multiKeywords = ["blanket", "quarterly", "scheduled", "advance", "multi", "split"];
-    const isIntendedMulti = poData?.is_intended_multi || multiKeywords.some(k => notes.includes(k));
+    const isIntendedMulti = poData?.is_intended_multi || multiKeywords.some(k => combinedNotes.includes(k));
 
     // 2. Is it an accidental partial?
     const isPartial = !isReceived && !isCancelled && (hasMultipleShipments || hasAnyReceivedShipment) && !isIntendedMulti;
@@ -152,7 +156,8 @@ export function derivePurchasingLifecycle(
     }
 
     // MULTI (Purple) - Intended blanket/scheduled POs
-    if (isIntendedMulti && (hasMultipleShipments || hasAnyReceivedShipment)) {
+    // These show as MULTI even before shipments arrive to indicate an intentional long-lead item.
+    if (isIntendedMulti && !isReceived && !isCancelled) {
         return {
             calendarStatus: "multi",
             completionState,
