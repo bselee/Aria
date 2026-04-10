@@ -147,6 +147,8 @@ export interface FullPO {
     receiveDate: string | null;  // null if not yet received
     status: string;              // 'Committed' | 'Completed' | 'Cancelled' | etc.
     total: number;
+    notes?: string | null;       // Internal notes
+    comments?: string | null;    // External notes (to vendor)
     items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
     shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null }>;
@@ -3685,6 +3687,8 @@ export class FinaleClient {
                                     dueDate
                                     receiveDate
                                     total
+                                    notes
+                                    comments
                                     supplier { name }
                                     shipmentList {
                                         shipmentId
@@ -3746,6 +3750,8 @@ export class FinaleClient {
                     receiveDate: toISODate(po.receiveDate),
                     status: po.status ?? '',
                     total: parseFinaleNumber(po.total),
+                    notes: po.notes ?? '',
+                    comments: po.comments ?? '',
                     items,
                     finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
                     shipments

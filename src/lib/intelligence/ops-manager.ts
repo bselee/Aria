@@ -778,15 +778,16 @@ export class OpsManager {
             const supabase = createClient();
             const vendorComms = new VendorCommsAgent(gmail);
 
-            // Only scan POs from the last 14 days â€” tracking arrives well within that window
+            // Only scan POs from the last 45 days — captures slow vendors and blanket/multi POs
             const since = new Date();
-            since.setDate(since.getDate() - 14);
+            since.setDate(since.getDate() - 45);
             const sinceStr = since.toISOString().slice(0, 10).replace(/-/g, '/');
 
+            // Search for PO threads — inclusive of labeled and subject-matched threads
             const { data: search } = await gmail.users.messages.list({
                 userId: "me",
-                q: `label:PO after:${sinceStr}`,
-                maxResults: 50
+                q: `(label:PO OR "BuildASoil PO #") after:${sinceStr}`,
+                maxResults: 100
             });
 
             if (!search.messages?.length) return;
@@ -2631,7 +2632,8 @@ Data: ${JSON.stringify(data)}`;
                         human_reply_detected_at: poLifecycleData?.human_reply_detected_at,
                         lifecycle_stage: poLifecycleData?.lifecycle_stage,
                         is_intended_multi: poLifecycleData?.is_intended_multi,
-                        notes: poLifecycleData?.notes,
+                        notes: po.notes,
+                        comments: po.comments,
                     }
                 );
                 const title = this.buildPOEventTitle(po, lifecycle);
