@@ -56,12 +56,14 @@ export function hasPurchaseOrderReceipt(input: POReceiptStateInput): boolean {
     // Manual confirmation: user changed PO status to "received"
     if (normalizedStatus === "received") return true;
 
-    // Staff receptions: at least one shipment shows "Received" status
+    // Staff receptions: at least one shipment has EXACT status "received"
+    // Be strict - don't match "Partially Received", "Received into Stock", etc.
     const shipments = input.shipments || [];
     if (shipments.length > 0) {
-        const hasReceivedShipment = shipments.some(s =>
-            String(s.status || '').toLowerCase().includes('received')
-        );
+        const hasReceivedShipment = shipments.some(s => {
+            const sStatus = String(s.status || "").toLowerCase().trim();
+            return sStatus === "received";
+        });
         if (hasReceivedShipment) return true;
     }
 
