@@ -3,7 +3,8 @@ export type POLifecycleState =
     | 'vendor_acknowledged'
     | 'tracking_unavailable'
     | 'moving_with_tracking'
-    | 'ap_follow_up';
+    | 'ap_follow_up'
+    | 'human_escalated';
 
 export interface POLifecycleEvidence {
     sentDate?: string;
@@ -12,6 +13,7 @@ export interface POLifecycleEvidence {
     trackingStatuses?: string[];
     apFollowUpReason?: string;
     followUpSentAt?: string;
+    humanReplyDetectedAt?: string;
     computedAt: string;
 }
 
@@ -31,6 +33,7 @@ export interface POInput {
     acknowledgmentDate?: string | null;
     trackingRequestCount?: number;
     shippingEvidenceCount?: number;
+    humanReplyDetectedAt?: string | null;
 }
 
 export function derivePOLifecycleState(po: POInput): POLifecycleResult {
@@ -49,6 +52,13 @@ export function derivePOLifecycleState(po: POInput): POLifecycleResult {
     }
     if (po.followUpSentAt) {
         evidence.followUpSentAt = po.followUpSentAt;
+    }
+    if (po.humanReplyDetectedAt) {
+        evidence.humanReplyDetectedAt = po.humanReplyDetectedAt;
+    }
+
+    if (po.humanReplyDetectedAt) {
+        return { state: 'human_escalated', evidence };
     }
 
     if (po.hasVendorAck && po.hasTracking) {
@@ -71,10 +81,21 @@ export function derivePOLifecycleState(po: POInput): POLifecycleResult {
     return { state: 'sent', evidence };
 }
 
+export const FOLLOW_UP_TEMPLATES = [
+    "Hi,\n\nFollowing up on PO #{po} sent {date}. Do you have an expected ship date or tracking?\n\nThanks!",
+    "Hi,\n\nChecking in on PO #{po} — any update on tracking or estimated arrival?\n\nThanks!",
+    "Hi,\n\nJust wanted to check on PO #{po} sent {date}. Tracking or ETA would be great!\n\nThanks!",
+    "Hi,\n\nFollowing up on our PO #{po}. Do you have shipping info or an ETA?\n\nThanks!",
+    "Hi,\n\nPO #{po} from {date} — do you have tracking or ship date?\n\nThanks!",
+] as const;
+
+export function getFollowUpTemplate(index: number): string {
+    return FOLLOW_UP_TEMPLATES[index % FOLLOW_UP_TEMPLATES.length];
+}
+
 /**
  * Returns true when a tracking follow-up should be sent.
- * Gate: >=2 follow-ups already sent AND no shipping evidence exists yet
- * means we should NOT keep nagging — the vendor likely can't provide tracking.
+ * After 2 follow-ups with no response, returns false — escalation to human should happen instead.
  */
 export function shouldRequestTrackingFollowUp(
     trackingRequestCount: number,

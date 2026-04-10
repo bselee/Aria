@@ -58,7 +58,7 @@ import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader"
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
-import { derivePOLifecycleState, shouldRequestTrackingFollowUp } from "../purchasing/derive-po-lifecycle";
+import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate } from "../purchasing/derive-po-lifecycle";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
@@ -814,12 +814,29 @@ export class OpsManager {
                 // Calculate response time
                 const sentAt = parseInt(firstMsg.internalDate!);
                 let responseAt: number | null = null;
+                let lastVendorMsgAt: number | null = null;
+                let humanReplyDetectedAt: string | null = null;
 
+                // Detect vendor replies and human intervention
                 for (const msg of thread.messages.slice(1)) {
                     const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "";
+                    const msgTime = parseInt(msg.internalDate!);
                     if (!from.includes("buildasoil.com")) {
-                        responseAt = parseInt(msg.internalDate!);
-                        break;
+                        if (!responseAt) responseAt = msgTime;
+                        lastVendorMsgAt = msgTime;
+                    } else if (lastVendorMsgAt && !humanReplyDetectedAt) {
+                        // BuildASoil replied AFTER vendor last message — human intervention detected
+                        humanReplyDetectedAt = new Date(msgTime).toISOString();
+                    }
+                }
+
+                // Also check if Will replied before any vendor response (human intervened early)
+                if (!humanReplyDetectedAt && thread.messages.length > 1) {
+                    const firstReply = thread.messages[1];
+                    const firstReplyFrom = firstReply.payload?.headers?.find(h => h.name === 'From')?.value || "";
+                    if (firstReplyFrom.includes("buildasoil.com")) {
+                        const firstReplyTime = parseInt(firstReply.internalDate!);
+                        humanReplyDetectedAt = new Date(firstReplyTime).toISOString();
                     }
                 }
 
@@ -907,11 +924,12 @@ export class OpsManager {
                             hasTracking: mergedTracking.length > 0,
                             trackingNumbers: mergedTracking,
                             acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
+                            humanReplyDetectedAt,
                         });
                         // Read existing row to conditionally set ack fields (first-write-wins)
                         const { data: existingAckRow } = await supabase
                             .from("purchase_orders")
-                            .select("vendor_acknowledged_at, shipping_evidence")
+                            .select("vendor_acknowledged_at, shipping_evidence, human_reply_detected_at")
                             .eq("po_number", poNumber)
                             .maybeSingle();
 
@@ -925,6 +943,10 @@ export class OpsManager {
                             ...(responseAt !== null && !existingAckRow?.vendor_acknowledged_at ? {
                                 vendor_acknowledged_at: new Date(responseAt).toISOString(),
                                 vendor_ack_source: 'po_thread_reply',
+                            } : {}),
+                            // First-write-wins for human reply detection
+                            ...(humanReplyDetectedAt && !existingAckRow?.human_reply_detected_at ? {
+                                human_reply_detected_at: humanReplyDetectedAt,
                             } : {}),
                             updated_at: new Date().toISOString()
                         }, { onConflict: "po_number" });
@@ -1170,47 +1192,70 @@ export class OpsManager {
                         }
                     }
 
-                    // 2. Follow-up email in original thread (once per PO, only if vendor
-                    //    has NOT communicated at all â€” including outside-thread emails)
+                    // 2. Follow-up email in original thread (only if vendor has NOT communicated)
                     if (!vendorCommunicatedOutsideThread) {
                         try {
-                            const { data: poRow } = await supabase
+                            // Read existing tracking request state
+                            const { data: existingFollowUpRow } = await supabase
                                 .from("purchase_orders")
-                                .select("follow_up_sent_at")
+                                .select("tracking_request_count, shipping_evidence, follow_up_sent_at, human_reply_detected_at")
                                 .eq("po_number", poNumber)
                                 .maybeSingle();
 
-                            if (!poRow?.follow_up_sent_at) {
+                            const currentCount = existingFollowUpRow?.tracking_request_count ?? 0;
+                            const evidenceCount = (existingFollowUpRow?.shipping_evidence || []).length;
+                            const humanReplied = Boolean(existingFollowUpRow?.human_reply_detected_at);
+
+                            // Skip if human has already intervened or we've exhausted follow-ups
+                            if (humanReplied) {
+                                console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — human reply detected`);
+                            } else if (!shouldRequestTrackingFollowUp(currentCount, evidenceCount, false)) {
+                                // After 2 failed follow-ups: escalate to Telegram instead of silently giving up
+                                console.log(`[po-sync] Escalating PO #${poNumber} to human — ${currentCount} follow-ups with no response`);
+                                const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
+                                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
+                                });
+
+                                await supabase.from("purchase_orders").upsert({
+                                    po_number: poNumber,
+                                    tracking_unavailable_at: new Date().toISOString(),
+                                    lifecycle_stage: 'tracking_unavailable',
+                                    updated_at: new Date().toISOString(),
+                                }, { onConflict: "po_number" });
+
+                                // Send escalation to Telegram
+                                this.bot.telegram.sendMessage(
+                                    process.env.TELEGRAM_CHAT_ID || "",
+                                    `<b>⚠️ Vendor Not Responding</b>\n\nPO #${poNumber} to <b>${vendorName}</b> sent ${sentDateStr}\n\n${currentCount} follow-ups sent with no tracking or ETA received.\n\n<a href="${`https://mail.google.com/mail/u/0/?view=cm&fs=1&tf=1&to=${vendorEmail}`}">Reply manually</a> or investigate.`,
+                                    { parse_mode: "HTML" }
+                                );
+                            } else {
+                                // Send follow-up using rotating template
                                 const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
                                     month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
                                 });
                                 const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
+
+                                const bodyTemplate = getFollowUpTemplate(currentCount);
+                                const body = bodyTemplate
+                                    .replace('{po}', poNumber)
+                                    .replace('{date}', sentDateStr);
+
                                 const rawEmail = buildFollowUpEmail({
                                     to: vendorEmail,
                                     subject: `Re: ${subject}`,
                                     inReplyTo: firstMsgId,
                                     references: firstMsgId,
-                                    body: `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Could you share an expected ship date or tracking number?\n\nThank you!`,
+                                    body,
                                 });
                                 await gmail.users.messages.send({
                                     userId: 'me',
                                     requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
                                 });
                                 const followUpSentAt = new Date().toISOString();
-
-                                // Read existing tracking request state
-                                const { data: existingFollowUpRow } = await supabase
-                                    .from("purchase_orders")
-                                    .select("tracking_request_count, shipping_evidence")
-                                    .eq("po_number", poNumber)
-                                    .maybeSingle();
-
-                                const currentCount = existingFollowUpRow?.tracking_request_count ?? 0;
                                 const newCount = currentCount + 1;
-                                const evidenceCount = (existingFollowUpRow?.shipping_evidence || []).length;
-                                const noMoreFollowUps = !shouldRequestTrackingFollowUp(newCount, evidenceCount, false);
 
-                                const poLifecycle1176 = derivePOLifecycleState({
+                                const poLifecycleNew = derivePOLifecycleState({
                                     id: poNumber,
                                     hasVendorAck: false,
                                     hasTracking: false,
@@ -1219,18 +1264,23 @@ export class OpsManager {
                                     shippingEvidenceCount: evidenceCount,
                                 });
 
-                                const followUpUpdate: Record<string, any> = {
+                                await supabase.from("purchase_orders").upsert({
                                     po_number: poNumber,
                                     follow_up_sent_at: followUpSentAt,
                                     tracking_requested_at: followUpSentAt,
                                     tracking_request_count: newCount,
-                                    lifecycle_stage: poLifecycle1176.state,
+                                    lifecycle_stage: poLifecycleNew.state,
                                     updated_at: new Date().toISOString(),
-                                };
+                                }, { onConflict: "po_number" });
 
-                                if (noMoreFollowUps) {
-                                    followUpUpdate.tracking_unavailable_at = followUpSentAt;
-                                }
+                                console.log(`[po-sync] Sent follow-up #${newCount} to ${vendorEmail} for PO #${poNumber}`);
+                            }
+                        } catch (e: any) {
+                            console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
+                        }
+                    } else {
+                        console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — vendor ${vendorName} already communicated`);
+                    }
 
                                 await supabase.from("purchase_orders").upsert(followUpUpdate, { onConflict: "po_number" });
 
