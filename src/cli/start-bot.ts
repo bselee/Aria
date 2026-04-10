@@ -964,8 +964,8 @@ bot.on('text', async (ctx) => {
             await ctx.editMessageText(
                 (ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message ? ctx.callbackQuery.message.text : '') +
                 (result.status === 'partial_success'
-                    ? `\n\nâš ï¸ PO #${details.orderId} committed in Finale, but vendor email failed: ${details.emailError}`
-                    : `\n\nâœ… PO #${details.orderId} committed in Finale and emailed to ${details.sentTo}`)
+                    ? `\n\n⚠️ PO #${details.orderId} committed in Finale, but vendor email failed: ${details.emailError}`
+                    : `\n\n✅ PO #${details.orderId} committed in Finale and emailed to ${details.sentTo}`)
             );
 
             // DECISION(2026-03-19): Generate a copy-paste Slack response for Will.

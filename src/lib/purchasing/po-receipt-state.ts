@@ -23,10 +23,29 @@ function isShipmentMarkedReceived(shipment: POShipmentReceiptLike): boolean {
 }
 
 export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): string | null {
-    const receiveDates = [
-        normalizeDateOnly(input.receiveDate),
-        ...((input.shipments || []).map((shipment) => normalizeDateOnly(shipment.receiveDate))),
-    ].filter((value): value is string => Boolean(value));
+    // Only trust receiveDate if the PO is actually marked as received
+    const normalizedStatus = String(input.status || "").toLowerCase();
+    const isPOReceived = normalizedStatus === "received";
+
+    // For shipments, only trust dates from shipments that are actually marked "Received"
+    const receivedShipmentDates = (input.shipments || [])
+        .filter(s => {
+            const sStatus = String(s.status || "").toLowerCase();
+            return sStatus.includes("received") && s.receiveDate;
+        })
+        .map(s => normalizeDateOnly(s.receiveDate))
+        .filter((value): value is string => Boolean(value));
+
+    const receiveDates: string[] = [];
+
+    // Only include PO-level receiveDate if PO status is "received"
+    if (isPOReceived && input.receiveDate) {
+        const d = normalizeDateOnly(input.receiveDate);
+        if (d) receiveDates.push(d);
+    }
+
+    // Include shipment receiveDates only for shipments marked "Received"
+    receiveDates.push(...receivedShipmentDates);
 
     if (receiveDates.length === 0) return null;
     return receiveDates.sort().at(-1) || null;
