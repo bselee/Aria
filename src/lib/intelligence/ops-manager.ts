@@ -2667,7 +2667,8 @@ Data: ${JSON.stringify(data)}`;
                     existingRow.last_tracking !== trackingHash || 
                     lifecycle.calendarStatus === 'past_due' || 
                     lifecycle.calendarStatus === 'exception' ||
-                    lifecycle.calendarStatus === 'noncomm'
+                    lifecycle.calendarStatus === 'noncomm' ||
+                    lifecycle.calendarStatus === 'partial'
                 ) {
                     // Status changed, tracking changed, or past-due/exception/noncomm POs need date flow-forward
                     await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {

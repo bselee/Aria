@@ -14,6 +14,7 @@ export type PurchasingCalendarStatus =
     | "in_transit"
     | "awaiting_tracking"
     | "noncomm"
+    | "partial"
     | "past_due";
 
 export interface PurchasingLifecycleState {
@@ -26,39 +27,8 @@ export interface PurchasingLifecycleState {
     isCancelled: boolean;
     isDeliveredAwaitingReceipt: boolean;
     isNoncomm?: boolean;
+    isPartial?: boolean;
     isHumanEscalated?: boolean;
-}
-
-export function toDateOnly(dateStr: string | null | undefined): string | null {
-    if (!dateStr) return null;
-    const isoPrefix = /^(\d{4}-\d{2}-\d{2})/.exec(dateStr);
-    if (isoPrefix) return isoPrefix[1];
-    const parsed = new Date(dateStr);
-    return isNaN(parsed.getTime()) ? null : parsed.toISOString().split("T")[0];
-}
-
-export function daysSinceDate(dateStr: string | null | undefined, now: Date = new Date()): number | null {
-    const dateOnly = toDateOnly(dateStr);
-    if (!dateOnly) return null;
-    const todayKey = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-    const thenMs = new Date(`${dateOnly}T12:00:00Z`).getTime();
-    const nowMs = new Date(`${todayKey}T12:00:00Z`).getTime();
-    return Math.round((nowMs - thenMs) / 86_400_000);
-}
-
-export function shouldKeepReceivedPurchase(
-    receiveDate: string | null | undefined,
-    retentionDays: number,
-    now: Date = new Date()
-): boolean {
-    const ageDays = daysSinceDate(receiveDate, now);
-    if (ageDays === null) return true;
-    return ageDays <= retentionDays;
-}
-
-export interface POShipmentLike {
-    status?: string | null;
-    receiveDate?: string | null;
 }
 
 /**
@@ -81,6 +51,14 @@ export function derivePurchasingLifecycle(
     const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate, shipments });
     const isCancelled = normalized === "cancelled" || normalized === "canceled";
     const knownStatuses = trackingStatuses.filter((item): item is TrackingStatus => item !== null);
+    
+    // PARTIAL / MULTI-SHIPMENT DETECTION
+    // If not fully received, but we have multiple shipments OR at least one shipment is received
+    const shipmentList = shipments || [];
+    const hasMultipleShipments = shipmentList.length > 1;
+    const hasAnyReceivedShipment = shipmentList.some(s => String(s.status || "").toLowerCase() === "received");
+    const isPartial = !isReceived && !isCancelled && (hasMultipleShipments || hasAnyReceivedShipment);
+
     const hasDeliveredProof =
         !isReceived &&
         !isCancelled &&
@@ -157,6 +135,21 @@ export function derivePurchasingLifecycle(
             isCancelled: false,
             isDeliveredAwaitingReceipt: false,
             isNoncomm: true,
+        };
+    }
+
+    // PARTIAL (Cyan/Teal) - Should take priority over LATE
+    if (isPartial) {
+        return {
+            calendarStatus: "partial",
+            completionState,
+            colorId: "7", // Cyan/Teal
+            prefixText: "PARTIAL",
+            statusLabel: "Partial Receipt / Multi-Shipment",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+            isPartial: true,
         };
     }
 
@@ -246,6 +239,7 @@ export function getPurchasingEventDate(
 
     // Push past due unreceived items forward to today for visibility
     if (!lifecycle.isReceived && eventDate < todayKey) {
+        // Also apply to PARTIAL/NONCOMM/EXCEPTION/PAST_DUE
         return todayKey;
     }
 
