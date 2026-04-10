@@ -69,9 +69,9 @@ export class VendorCommsAgent {
 
     /**
      * Request clarification for unclear/missing tracking.
-     * Leaves in inbox for human review - drafts the email but doesn't send automatically.
+     * Leaves in inbox for human review - drafts the email.
      */
-    async requestClarification(context: VendorCommContext): Promise<{ draft: string; shouldSend: boolean }> {
+    async requestClarification(context: VendorCommContext): Promise<{ draftId: string }> {
         const clarifyMessages = [
             "Hi, thanks for the update. Could you send the tracking number or PRO/BOL again? Having trouble reading it.",
             "Hi, got your message but couldn't read the tracking info clearly. Could you resend the tracking or PRO number?",
@@ -87,6 +87,17 @@ export class VendorCommsAgent {
             body: msg,
         });
 
+        // Create as a DRAFT in Gmail instead of sending
+        const draftRes = await this.gmail.users.drafts.create({
+            userId: 'me',
+            requestBody: {
+                message: {
+                    raw: Buffer.from(rawEmail).toString('base64url'),
+                    threadId: context.threadId,
+                }
+            }
+        });
+
         // Mark as needing human review
         const supabase = createClient();
         await supabase.from("purchase_orders").update({
@@ -94,11 +105,10 @@ export class VendorCommsAgent {
             updated_at: new Date().toISOString(),
         }).eq("po_number", context.poNumber);
 
-        console.log(`[vendor-comms] Clarification needed for PO #${context.poNumber} - marked for human review`);
+        console.log(`[vendor-comms] Clarification DRAFT created for PO #${context.poNumber} - draftId: ${draftRes.data.id}`);
 
         return {
-            draft: rawEmail,
-            shouldSend: false, // Human reviews first
+            draftId: draftRes.data.id,
         };
     }
 
