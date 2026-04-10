@@ -832,6 +832,18 @@ export class OpsManager {
                     }
                 }
 
+                // If no human reply detected in thread, check if any message is a draft
+                if (!humanReplyDetectedAt) {
+                    const hasDraft = thread.messages.some((msg: any) => 
+                        msg.labelIds?.includes('DRAFT') && 
+                        msg.payload?.headers?.find((h: any) => h.name === 'From')?.value?.includes('bill.selee@buildasoil.com')
+                    );
+                    if (hasDraft) {
+                        // Draft exists - treat as human intervention pending (stops auto-followup)
+                        humanReplyDetectedAt = new Date().toISOString();
+                    }
+                }
+
                 // Also check if Will replied before any vendor response (human intervened early)
                 if (!humanReplyDetectedAt && thread.messages.length > 1) {
                     const firstReply = thread.messages[1];
@@ -842,18 +854,24 @@ export class OpsManager {
                     }
                 }
 
-                const responseTimeMins = responseAt ? Math.round((responseAt - sentAt) / 60000) : null;
-
-                // ðŸ” Extract Tracking Numbers from full message body (snippet is too short â€” truncates numbers)
-                const _decodeGmailBody = (data: string): string =>
-                    Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
-                const _walkMsgParts = (parts: any[], out: string[]) => {
-                    for (const part of parts ?? []) {
-                        if (part.mimeType === 'text/plain' && part.body?.data) out.push(_decodeGmailBody(part.body.data));
-                        if (part.parts?.length) _walkMsgParts(part.parts, out);
+                // Calculate reliability score (respondedCount / totalPOs in vendorProfile)
+                const { data: vendorProfile } = await supabase
+                    .from("vendor_profiles")
+                    .select("total_pos, responded_count, is_noncomm")
+                    .ilike("vendor_name", vendorName)
+                    .maybeSingle();
+                
+                let skipL1 = false;
+                if (vendorProfile) {
+                    const total = vendorProfile.total_pos || 0;
+                    const resp = vendorProfile.responded_count || 0;
+                    const reliability = total > 0 ? (resp / total) * 100 : 100;
+                    // If reliability < 40 or already marked noncomm, skip Level 1 (go straight to L2/Escalate)
+                    if (reliability < 40 || vendorProfile.is_noncomm) {
+                        skipL1 = true;
                     }
-                };
-                let trackingNumbers: string[] = [];
+                }
+
                 for (const msg of thread.messages) {
                     const bodyParts: string[] = [msg.snippet || ''];
                     const payload = msg.payload;
@@ -991,14 +1009,15 @@ export class OpsManager {
                             { parse_mode: "HTML" }
                         );
 
-                        // Send thank you to vendor for clear tracking
+                        // Send thank you to vendor for clear tracking - but ONLY if tracking is valid/tested
                         const lastVendorMsg = thread.messages.slice(1).reverse().find((msg: any) => {
                             const from = msg.payload?.headers?.find((h: any) => h.name === 'From')?.value || "";
                             return !from.includes("buildasoil.com");
                         });
+                        
                         if (lastVendorMsg) {
                             const msgId = lastVendorMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
-                            await vendorComms.sendThankYou({
+                            const commContext: any = {
                                 poNumber,
                                 vendorEmail,
                                 vendorName,
@@ -1006,10 +1025,35 @@ export class OpsManager {
                                 threadId: m.threadId!,
                                 messageId: msgId,
                                 sentAt: new Date(sentAt),
-                                hasTracking: true,
-                                trackingQuality: 'clear',
-                                responseType: 'thank_you',
-                            });
+                                hasTracking: trackingNumbers.length > 0,
+                            };
+
+                            // Validate tracking before thanking
+                            let allTrackingValid = true;
+                            if (trackingNumbers.length > 0) {
+                                for (const t of trackingNumbers) {
+                                    const ts = await getTrackingStatus(t);
+                                    // If tracking is unknown/invalid (less than 'shipped' confidence), mark as unclear
+                                    if (!ts || ts.display.toLowerCase().includes('unknown') || ts.display.toLowerCase().includes('not found')) {
+                                        allTrackingValid = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                allTrackingValid = false; // No tracking found in message
+                            }
+
+                            if (allTrackingValid) {
+                                await vendorComms.sendThankYou(commContext);
+                            } else {
+                                // Tracking is unclear or missing - create clarification DRAFT
+                                const { draftId } = await vendorComms.requestClarification(commContext);
+                                this.bot.telegram.sendMessage(
+                                    process.env.TELEGRAM_CHAT_ID || "",
+                                    `💬 <b>Clarification Drafted</b> for PO #${poNumber} (${vendorName})\n\nVendor sent a reply but I couldn't find valid tracking. I've staged a draft in Gmail for your review.\n\n<a href="https://mail.google.com/mail/u/0/#drafts/${draftId}">Open Drafts</a>`,
+                                    { parse_mode: "HTML" }
+                                );
+                            }
                         }
                     }
                 }
@@ -1267,7 +1311,7 @@ export class OpsManager {
                                 });
                                 const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
 
-                                const bodyTemplate = shouldUseL2FollowUp(currentCount)
+                                const bodyTemplate = (shouldUseL2FollowUp(currentCount) || skipL1)
                                     ? getFollowUpTemplateL2(currentCount)
                                     : getFollowUpTemplate(currentCount);
                                 const body = bodyTemplate
@@ -2462,7 +2506,7 @@ Data: ${JSON.stringify(data)}`;
             // Also fetch all tracking numbers and lifecycle data from purchase_orders for the recent POs
             const { data: poRows } = await supabase
                 .from('purchase_orders')
-                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at')
+                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at, vendor_noncomm_at, human_reply_detected_at')
                 .in('po_number', pos.map(p => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
             const lifecycleMap = new Map<string, Record<string, any>>();
@@ -2574,9 +2618,21 @@ Data: ${JSON.stringify(data)}`;
                 }
 
                 const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
-                const lifecycle = derivePurchasingLifecycle(po.status, Array.from(trackingStatuses.values()), completionState, derivedExpectedDate, actualReceiveDate, po.shipments);
-                const title = this.buildPOEventTitle(po, lifecycle);
                 const poLifecycleData = lifecycleMap.get(po.orderId);
+                const lifecycle = derivePurchasingLifecycle(
+                    po.status,
+                    Array.from(trackingStatuses.values()),
+                    completionState,
+                    derivedExpectedDate,
+                    actualReceiveDate,
+                    po.shipments,
+                    {
+                        vendor_noncomm_at: poLifecycleData?.vendor_noncomm_at,
+                        human_reply_detected_at: poLifecycleData?.human_reply_detected_at,
+                        lifecycle_stage: poLifecycleData?.lifecycle_stage,
+                    }
+                );
+                const title = this.buildPOEventTitle(po, lifecycle);
                 const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, poLifecycleData);
                 const newStatus = lifecycle.calendarStatus;
                 const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
@@ -2606,16 +2662,20 @@ Data: ${JSON.stringify(data)}`;
                     } catch (e: any) {
                         console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (existingRow.status !== newStatus || existingRow.last_tracking !== trackingHash || lifecycle.calendarStatus === 'past_due' || lifecycle.calendarStatus === 'exception') {
-                    // Status changed, tracking changed, or past-due/exception POs need date flow-forward
-                    await calendar.updateEventTitleAndDescription(
-                        existingRow.calendar_id,
-                        existingRow.event_id,
+                } else if (
+                    existingRow.status !== newStatus || 
+                    existingRow.last_tracking !== trackingHash || 
+                    lifecycle.calendarStatus === 'past_due' || 
+                    lifecycle.calendarStatus === 'exception' ||
+                    lifecycle.calendarStatus === 'noncomm'
+                ) {
+                    // Status changed, tracking changed, or past-due/exception/noncomm POs need date flow-forward
+                    await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {
                         title,
                         description,
-                        lifecycle.colorId,
-                        eventDate
-                    );
+                        colorId: lifecycle.colorId,
+                        date: eventDate
+                    });
                     await supabase.from('purchasing_calendar_events')
                         .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
                         .eq('po_number', po.orderId);

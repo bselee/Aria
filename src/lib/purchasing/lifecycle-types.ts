@@ -28,6 +28,7 @@ export const LIFECYCLE_STAGES = {
         IN_TRANSIT: "in_transit" as const,
         AWAITING_TRACKING: "awaiting_tracking" as const,
         PAST_DUE: "past_due" as const,
+        NONCOMM: "noncomm" as const,
     },
 } as const;
 
@@ -37,6 +38,7 @@ export const LIFECYCLE_COLORS: Record<string, string> = {
     delivered: "5",
     exception: "6",
     past_due: "11",
+    noncomm: "6", // Red for noncomm
     in_transit: "9",
     awaiting_tracking: "8",
     open: "8",
@@ -45,6 +47,7 @@ export const LIFECYCLE_COLORS: Record<string, string> = {
     tracking_unavailable: "6",
     moving_with_tracking: "9",
     ap_follow_up: "6",
+    human_escalated: "10", // Purple for human intervention
 };
 
 export const LIFECYCLE_LABELS: Record<string, string> = {
@@ -58,9 +61,11 @@ export const LIFECYCLE_LABELS: Record<string, string> = {
     delivered: "Delivered - Awaiting Receipt",
     exception: "Long Outstanding - Needs Attention",
     past_due: "Past Due - Needs Follow-up",
+    noncomm: "Vendor Non-Communicative",
     in_transit: "In Transit",
     awaiting_tracking: "Awaiting Tracking",
     open: "Open",
+    human_escalated: "Human Intervened",
 };
 
 export function isPreReceiptStage(stage: string): boolean {

@@ -13,6 +13,7 @@ export type PurchasingCalendarStatus =
     | "exception"
     | "in_transit"
     | "awaiting_tracking"
+    | "noncomm"
     | "past_due";
 
 export interface PurchasingLifecycleState {
@@ -24,6 +25,8 @@ export interface PurchasingLifecycleState {
     isReceived: boolean;
     isCancelled: boolean;
     isDeliveredAwaitingReceipt: boolean;
+    isNoncomm?: boolean;
+    isHumanEscalated?: boolean;
 }
 
 export function toDateOnly(dateStr: string | null | undefined): string | null {
@@ -58,13 +61,21 @@ export interface POShipmentLike {
     receiveDate?: string | null;
 }
 
+/**
+ * High-level purchasing event states that drive the calendar rendering.
+ */
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
     trackingStatuses: Array<TrackingStatus | null> = [],
     completionState: POCompletionState | null = null,
     expectedDeliveryDate?: string,
     receiveDate?: string | null,
-    shipments?: POShipmentLike[] | null
+    shipments?: POShipmentLike[] | null,
+    poData?: {
+        vendor_noncomm_at?: string | null;
+        human_reply_detected_at?: string | null;
+        lifecycle_stage?: string | null;
+    }
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
     const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate, shipments });
@@ -77,15 +88,6 @@ export function derivePurchasingLifecycle(
         knownStatuses.length === trackingStatuses.length &&
         knownStatuses.every(item => item.category === "delivered");
 
-    // CALENDAR RECEIPT LOGIC: Only use hasPurchaseOrderReceipt (physical receipt in Finale)
-    //
-    // completionState tracks the AP/invoice pipeline (matching, pricing, freight).
-    // It should NEVER affect calendar receipt status because:
-    //   - AP pipeline can be "complete" before goods are physically received
-    //   - Goods can be received without any invoice matching yet
-    //
-    // The ONLY exceptions are states that explicitly include "received" in their name,
-    // indicating physical receipt IS part of that state.
     const isReceivedCompletionState = completionState &&
         (completionState.includes('received') || completionState === 'delivered_awaiting_receipt');
 
@@ -128,11 +130,39 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // Smart logic for past-due items - reduce red, show orange for overdue
+    // HUMAN ESCALATED (Purple)
+    if (poData?.human_reply_detected_at || poData?.lifecycle_stage === 'human_escalated') {
+        return {
+            calendarStatus: "open",
+            completionState,
+            colorId: "10", // Purple
+            prefixText: "HUMAN",
+            statusLabel: "Human Intervened",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+            isHumanEscalated: true,
+        };
+    }
+
+    // NONCOMM (Red/Exception)
+    if (poData?.vendor_noncomm_at || poData?.lifecycle_stage === 'tracking_unavailable') {
+        return {
+            calendarStatus: "noncomm",
+            completionState,
+            colorId: "6", // Tomato/Red
+            prefixText: "NONCOMM",
+            statusLabel: "Vendor Non-Communicative",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+            isNoncomm: true,
+        };
+    }
+
     const hasAnyTracking = trackingStatuses.length > 0;
     const ageDays = daysSinceDate(expectedDeliveryDate || undefined) || 0;
 
-    // If past expected and has tracking → treat as likely delivered
     if (ageDays > 14 && hasAnyTracking) {
         return {
             calendarStatus: "delivered",
@@ -146,7 +176,6 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // Very old with no tracking = exception
     if (ageDays > 35) {
         return {
             calendarStatus: "exception",
@@ -160,13 +189,11 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // "Way past due should be red"
-    // If it's past expected date and NOT delivered, it's Past Due
     if (ageDays > 0) {
         return {
             calendarStatus: "past_due",
             completionState,
-            colorId: "11", // Tomato Red
+            colorId: "11", // Graphite/Grey (actually Graphite 11)
             prefixText: "LATE",
             statusLabel: "Past Due - Needs Follow-up",
             isReceived: false,
@@ -175,12 +202,11 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // "but we need an in transit color, on track industry standards"
     if (hasAnyTracking) {
         return {
             calendarStatus: "in_transit",
             completionState,
-            colorId: "9", // Blueberry (Blue) - Industry standard for active transit
+            colorId: "9", // Blueberry (Blue)
             prefixText: "IT",
             statusLabel: "In Transit",
             isReceived: false,
@@ -189,7 +215,6 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // Awaiting tracking / processing
     return {
         calendarStatus: "awaiting_tracking",
         completionState,
@@ -204,21 +229,14 @@ export function derivePurchasingLifecycle(
 
 export function getPurchasingEventDate(
     expectedDate: string,
-    receiveDate: string | null | undefined,
+    actualReceiveDate: string | null,
     lifecycle: PurchasingLifecycleState,
-    latestETA?: string
+    latestETA?: string | null
 ): string {
-    // Priority: actual receive date > latest tracking ETA > original expected date
-    // If not received and calculated date is in the past, push to today
-    const todayKey = toDateOnly(new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" }))!;
-
-    if (lifecycle.isReceived) {
-        if (receiveDate) {
-            const parsed = toDateOnly(receiveDate);
-            if (parsed) return parsed;
-        }
-        // If we absolutely don't have a receiveDate, leave it on its expected date
-        // (or today if you prefer, but "actual day" is best effort via receiveDate)
+    const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    
+    if (actualReceiveDate) {
+        return toDateOnly(actualReceiveDate) || actualReceiveDate;
     }
 
     let eventDate = expectedDate;
