@@ -46,18 +46,21 @@ import {
     type TrackingCategory,
 } from '../carriers/tracking-service';
 import { scanAxiomDemand } from "../purchasing/axiom-scanner";
+import { parseUlineConfirmationEmail, type UlineOrderConfirmation } from "../purchasing/uline-confirmation";
 import {
     RECEIVED_CALENDAR_RETENTION_DAYS,
     RECEIVED_DASHBOARD_RETENTION_DAYS,
     derivePurchasingLifecycle,
     getPurchasingEventDate,
     shouldKeepReceivedPurchase,
+    daysSinceDate,
 } from "../purchasing/calendar-lifecycle";
 import { loadActivePurchases } from "../purchasing/active-purchases";
 import { loadPOCompletionSignalIndex } from "../purchasing/po-completion-loader";
 import { derivePOCompletionState } from "../purchasing/po-completion-state";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../purchasing/po-receipt-state";
 import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recommendation-feedback-sync";
+import { withAdvisoryLock } from "../purchasing/advisory-lock";
 import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp, getVendorThankYou, getVendorClarifyRequest } from "../purchasing/derive-po-lifecycle";
 import { VendorCommsAgent } from "./vendor-comms-agent";
 import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
@@ -115,6 +118,14 @@ export class OpsManager {
     // Prevents the same vendor email from triggering a Telegram notification on every sync cycle.
     // Hydrated from Supabase on startup.
     private seenOutsideThreadMsgIds = new Set<string>();
+
+    // Pending ULINE Friday approval — set when cron sends pre-check Telegram message.
+    // Cleared when user approves or skips.
+    private pendingUlineFriday: {
+        messageId: number;
+        manifest: any;
+        manifestJson: string;
+    } | null = null;
 
     constructor(bot: Telegraf) {
         this.bot = bot;
@@ -357,7 +368,15 @@ export class OpsManager {
 
         // Tracking Agent polls processing queue every 60 minutes
         cron.schedule("0 * * * *", () => {
-            this.safeRun("TrackingAgent", () => this.trackingAgent.processUnreadEmails());
+            this.safeRun("TrackingAgent", async () => {
+                const results = await this.trackingAgent.processUnreadEmails();
+                // Immediately refresh calendar for POs with significant tracking (shipped or delivered)
+                for (const { poNumber, statusCategory } of results) {
+                    if (statusCategory === 'shipped' || statusCategory === 'delivered') {
+                        await this.refreshCalendarForPO(poNumber);
+                    }
+                }
+            });
         }, TZ);
 
         // Background Shipment API Refresh every 15 minutes
@@ -420,6 +439,13 @@ export class OpsManager {
             this.safeRun("ReconcileULINE", async () => {
                 await this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts");
             });
+        }, { timezone: "America/Denver" });
+
+        // ULINE Order Confirmation Sync @ every 15 minutes
+        // Monitors bill.selee@buildasoil.com Gmail for ULINE order confirmations.
+        // Parses confirmation, updates Finale PO prices, archives to vendor_invoices.
+        cron.schedule("*/15 * * * *", () => {
+            this.safeRun("UlineConfirmationSync", () => this.runUlineConfirmationSync());
         }, { timezone: "America/Denver" });
 
         // Build Completion Watcher every 30 minutes
@@ -615,7 +641,16 @@ export class OpsManager {
             });
         }, { timezone: "America/Denver" });
 
-        // Daily Dedup Set Reset â€” midnight Denver (OOM prevention)
+        // Stale MULTI PO Escalation @ 7:45 AM weekdays
+        // DECISION(2026-04-10): Catches committed MULTI POs older than 60 days that
+        // lack tracking. These POs slip through syncPOConversations (45d Gmail thread
+        // window) and calendar sync (no PO thread = no trigger). Flags for human review
+        // and sends a Telegram alert with direct Finale link.
+        cron.schedule("45 7 * * 1-5", () => {
+            this.safeRun("StaleMultiPOFlag", () => this.flagStaleMultiPOs());
+        }, { timezone: "America/Denver" });
+
+        // Daily Dedup Set Reset — midnight Denver (OOM prevention)
         // DECISION(2026-03-09): These Sets grow by ~50-100 entries/day and are
         // never pruned during runtime. Over weeks, thousands of entries accumulate.
         // Safe to clear nightly because Sets are re-hydrated from Supabase/Finale
@@ -632,6 +667,8 @@ export class OpsManager {
                 console.log(`[ops-manager] Daily dedup reset: cleared ${sizeBefore} entries across 3 Sets`);
             });
         }, { timezone: "America/Denver" });
+
+
 
 
 
@@ -947,30 +984,31 @@ export class OpsManager {
                             acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
                             humanReplyDetectedAt,
                         });
-                        // Read existing row to conditionally set ack fields (first-write-wins)
-                        const { data: existingAckRow } = await supabase
-                            .from("purchase_orders")
-                            .select("vendor_acknowledged_at, shipping_evidence, human_reply_detected_at")
-                            .eq("po_number", poNumber)
-                            .maybeSingle();
+                        // Use advisory lock to prevent race with TrackingAgent
+                        await withAdvisoryLock(`po:${poNumber}`, async () => {
+                            // Re-read inside lock to get the latest state
+                            const { data: existingAckRow } = await supabase
+                                .from("purchase_orders")
+                                .select("vendor_acknowledged_at, shipping_evidence, human_reply_detected_at")
+                                .eq("po_number", poNumber)
+                                .maybeSingle();
 
-                        await supabase.from("purchase_orders").upsert({
-                            po_number: poNumber,
-                            vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
-                            vendor_response_time_minutes: responseTimeMins,
-                            tracking_numbers: mergedTracking,
-                            lifecycle_stage: poLifecycle902.state,
-                            // First-write-wins for vendor acknowledgement
-                            ...(responseAt !== null && !existingAckRow?.vendor_acknowledged_at ? {
-                                vendor_acknowledged_at: new Date(responseAt).toISOString(),
-                                vendor_ack_source: 'po_thread_reply',
-                            } : {}),
-                            // First-write-wins for human reply detection
-                            ...(humanReplyDetectedAt && !existingAckRow?.human_reply_detected_at ? {
-                                human_reply_detected_at: humanReplyDetectedAt,
-                            } : {}),
-                            updated_at: new Date().toISOString()
-                        }, { onConflict: "po_number" });
+                            await supabase.from("purchase_orders").upsert({
+                                po_number: poNumber,
+                                vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
+                                vendor_response_time_minutes: responseTimeMins,
+                                tracking_numbers: mergedTracking,
+                                lifecycle_stage: poLifecycle902.state,
+                                ...(responseAt !== null && !existingAckRow?.vendor_acknowledged_at ? {
+                                    vendor_acknowledged_at: new Date(responseAt).toISOString(),
+                                    vendor_ack_source: 'po_thread_reply',
+                                } : {}),
+                                ...(humanReplyDetectedAt && !existingAckRow?.human_reply_detected_at ? {
+                                    human_reply_detected_at: humanReplyDetectedAt,
+                                } : {}),
+                                updated_at: new Date().toISOString()
+                            }, { onConflict: "po_number" });
+                        });
 
                         // Format PO sent date
                         const sentDate = new Date(sentAt).toLocaleDateString('en-US', {
@@ -1059,22 +1097,27 @@ export class OpsManager {
                     }
                 }
 
-                // Index to Pinecone for RAG â€” sanitize nulls (Pinecone rejects null metadata values)
-                const pineconeMetadata: Record<string, string | number | boolean | string[]> = {
-                    po_number: poNumber,
-                    subject,
-                    tracking_numbers: trackingNumbers,
-                };
-                if (responseTimeMins !== null && responseTimeMins !== undefined) {
-                    pineconeMetadata.vendor_response_time = responseTimeMins;
+                // Index to Pinecone for RAG — only when there is meaningful new context.
+                // Without this guard, POs with no vendor response and no tracking (e.g. PO #124447)
+                // trigger a re-index every 30-min sync cycle indefinitely.
+                if (responseAt !== null || trackingNumbers.length > 0) {
+                    const pineconeMetadata: Record<string, string | number | boolean | string[]> = {
+                        po_number: poNumber,
+                        subject,
+                        tracking_numbers: trackingNumbers,
+                    };
+                    if (responseTimeMins !== null && responseTimeMins !== undefined) {
+                        pineconeMetadata.vendor_response_time = responseTimeMins;
+                    }
+                    await indexOperationalContext(
+                        `po-${poNumber}`,
+                        `PO ${poNumber} for ${subject}. Sent: ${new Date(sentAt).toLocaleString()}. Response: ${responseAt ? new Date(responseAt).toLocaleString() : 'Pending'}. Tracking: ${trackingNumbers.join(", ") || 'None'}`,
+                        pineconeMetadata
+                    );
                 }
-                await indexOperationalContext(
-                    `po-${poNumber}`,
-                    `PO ${poNumber} for ${subject}. Sent: ${new Date(sentAt).toLocaleString()}. Response: ${responseAt ? new Date(responseAt).toLocaleString() : 'Pending'}. Tracking: ${trackingNumbers.join(", ") || 'None'}`,
-                    pineconeMetadata
-                );
 
-                // Update DB (full record sync â€” use merged tracking to preserve inbox-sourced numbers)
+                // Update DB (full record sync — use merged tracking to preserve inbox-sourced numbers)
+                // Use advisory lock to prevent race with TrackingAgent writing lifecycle_stage
                 const poLifecycle976 = derivePOLifecycleState({
                     id: poNumber,
                     hasVendorAck: responseAt !== null,
@@ -1082,15 +1125,30 @@ export class OpsManager {
                     trackingNumbers: mergedTracking,
                     acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
                 });
-                await supabase.from("purchase_orders").upsert({
-                    po_number: poNumber,
-                    vendor_name: vendorName,
-                    vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
-                    vendor_response_time_minutes: responseTimeMins,
-                    tracking_numbers: mergedTracking,
-                    lifecycle_stage: poLifecycle976.state,
-                    updated_at: new Date().toISOString()
-                }, { onConflict: "po_number" });
+                await withAdvisoryLock(`po:${poNumber}`, async () => {
+                    // Re-read inside lock to get the latest state before writing
+                    const { data: latestPO } = await supabase
+                        .from("purchase_orders")
+                        .select("lifecycle_stage, vendor_acknowledged_at")
+                        .eq("po_number", poNumber)
+                        .maybeSingle();
+                    // Only update lifecycle_stage if the lock-holder's state is "more informative"
+                    // Priority: human_escalated > ap_follow_up > tracking_unavailable > moving_with_tracking
+                    const PRIORITY = ['sent', 'moving_with_tracking', 'tracking_unavailable', 'ap_follow_up', 'human_escalated'];
+                    const existingPriority = PRIORITY.indexOf(latestPO?.lifecycle_stage || 'sent');
+                    const newPriority = PRIORITY.indexOf(poLifecycle976.state);
+                    const finalLifecycle = newPriority >= existingPriority ? poLifecycle976.state : latestPO?.lifecycle_stage;
+
+                    await supabase.from("purchase_orders").upsert({
+                        po_number: poNumber,
+                        vendor_name: vendorName,
+                        vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
+                        vendor_response_time_minutes: responseTimeMins,
+                        tracking_numbers: mergedTracking,
+                        lifecycle_stage: finalLifecycle,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: "po_number" });
+                });
 
                 // Lazily populate line_items for the Slack watchdog product catalog.
                 // Only fetch from Finale once per PO (existingPO.line_items is [] on first sync).
@@ -1128,15 +1186,23 @@ export class OpsManager {
 
                     const { data: existing } = await supabase
                         .from("vendor_profiles")
-                        .select("vendor_emails")
+                        .select("vendor_emails, vendor_domains")
                         .eq("vendor_name", vendorNameForProfile)
                         .maybeSingle();
 
                     const mergedEmails = [...new Set([...(existing?.vendor_emails || []), ...vendorEmails])];
+                    // Extract domains from all known emails
+                    const allEmails = [...new Set([...mergedEmails, ...vendorEmails])];
+                    const mergedDomains = [...new Set(
+                        allEmails
+                            .map(e => { const at = e.lastIndexOf('@'); return at >= 0 ? e.slice(at + 1).toLowerCase() : null; })
+                            .filter((d): d is string => d !== null && !d.includes('buildasoil.com') && d.length > 0)
+                    )];
 
                     await supabase.from("vendor_profiles").upsert({
                         vendor_name: vendorNameForProfile,
                         vendor_emails: mergedEmails,
+                        vendor_domains: mergedDomains,
                         communication_pattern: responseAt ? "thread_reply" : "no_response",
                         last_po_date: new Date(sentAt).toISOString(),
                         updated_at: new Date().toISOString(),
@@ -1153,16 +1219,30 @@ export class OpsManager {
 
                 if (!vendorReplied && trackingNumbers.length === 0 && poIsOlderThan3Days && vendorEmail) {
                     // 1. Outside-thread search FIRST: look for vendor replies in other Gmail threads
-                    // If we find ANY communication from the vendor domain, treat them as "responded"
-                    // and suppress the follow-up email.
+                    // If we find ANY communication from any known vendor domain, treat them as "responded"
+                    // and suppress the follow-up email. Supports multi-domain vendors.
                     let vendorCommunicatedOutsideThread = false;
-                    const vendorDomain = vendorEmail.split('@')[1];
-                    if (vendorDomain && !vendorDomain.includes('buildasoil.com')) {
+                    const primaryDomain = vendorEmail.split('@')[1] || '';
+
+                    // Gather all known domains for this vendor from vendor_profiles
+                    const { data: vendorProfileForDomains } = await supabase
+                        .from("vendor_profiles")
+                        .select("vendor_domains")
+                        .ilike("vendor_name", vendorName)
+                        .maybeSingle();
+
+                    const knownDomains = vendorProfileForDomains?.vendor_domains || [];
+                    const allDomains = [...new Set([primaryDomain, ...knownDomains])]
+                        .filter(d => d && !d.includes('buildasoil.com'));
+
+                    if (allDomains.length > 0) {
                         try {
                             const sendDateStr = new Date(sentAt).toISOString().slice(0, 10).replace(/-/g, '/');
+                            // Build OR query for all known domains
+                            const domainQuery = allDomains.map(d => `from:${d}`).join(' OR ');
                             const { data: outsideSearch } = await gmail.users.messages.list({
                                 userId: 'me',
-                                q: `from:${vendorDomain} after:${sendDateStr} -label:PO`,
+                                q: `(${domainQuery}) after:${sendDateStr} -label:PO`,
                                 maxResults: 5,
                             });
                             // Dedup by thread: only alert once per outside Gmail thread per PO
@@ -1256,7 +1336,7 @@ export class OpsManager {
                                 }
                             }
                         } catch (e: any) {
-                            console.warn(`[po-sync] Outside-thread search failed for ${vendorDomain}: ${e.message}`);
+                            console.warn(`[po-sync] Outside-thread search failed for domains [${allDomains.join(', ')}]: ${e.message}`);
                         }
                     }
 
@@ -1271,13 +1351,21 @@ export class OpsManager {
                                 .maybeSingle();
 
                             const currentCount = existingFollowUpRow?.tracking_request_count ?? 0;
-                            const evidenceCount = (existingFollowUpRow?.shipping_evidence || []).length;
+                            const evidenceList = existingFollowUpRow?.shipping_evidence || [];
+                            const evidenceCount = evidenceList.length;
                             const humanReplied = Boolean(existingFollowUpRow?.human_reply_detected_at);
+                            // Only block follow-ups if we have confirmed DELIVERY evidence.
+                            // "label created", "shipped", "in_transit" are not delivery — keep following up.
+                            const deliveryKeywords = ['delivered', 'received', 'completed', 'exception'];
+                            const hasDeliveredEvidence = evidenceList.some((e: any) =>
+                                typeof e.summary === 'string' &&
+                                deliveryKeywords.some(kw => e.summary.toLowerCase().includes(kw))
+                            );
 
                             // Skip if human has already intervened or we've exhausted follow-ups
                             if (humanReplied) {
                                 console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — human reply detected`);
-                            } else if (!shouldRequestTrackingFollowUp(currentCount, evidenceCount, false)) {
+                            } else if (!shouldRequestTrackingFollowUp(currentCount, hasDeliveredEvidence, false)) {
                                 // After 2 failed follow-ups: escalate to Telegram instead of silently giving up
                                 // Also mark vendor as noncomm
                                 console.log(`[po-sync] Escalating PO #${poNumber} to human — ${currentCount} follow-ups with no response`);
@@ -1358,28 +1446,6 @@ export class OpsManager {
                         }
                     } else {
                         console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — vendor ${vendorName} already communicated`);
-                    }
-
-                                await supabase.from("purchase_orders").upsert(followUpUpdate, { onConflict: "po_number" });
-
-                                // Alarm: PO in 'sent' state >24h with no vendor communication
-                                const hoursSinceSent = (Date.now() - sentAt) / 3_600_000;
-                                if (hoursSinceSent > 24) {
-                                    console.warn(`[po-sync] ALARM: PO #${poNumber} (${vendorName}) in 'sent' state for ${Math.round(hoursSinceSent)}h with no vendor communication`);
-                                }
-
-                                console.log(`ðŸ“§ [po-sync] Sent follow-up to ${vendorEmail} for PO #${poNumber}`);
-                                this.bot.telegram.sendMessage(
-                                    process.env.TELEGRAM_CHAT_ID || "",
-                                    `ðŸ“§ Sent ETA follow-up to <b>${vendorName}</b> for PO #${poNumber} (${sentDateStr}, no response in 3+ days)`,
-                                    { parse_mode: "HTML" }
-                                );
-                            }
-                        } catch (e: any) {
-                            console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
-                        }
-                    } else {
-                        console.log(`ðŸ“§ [po-sync] Skipping follow-up for PO #${poNumber} â€” vendor ${vendorName} already communicated outside PO thread`);
                     }
                 }
             }
@@ -1757,6 +1823,92 @@ export class OpsManager {
             console.log(`ðŸ“‹ [ops-manager] Sent stale draft alert for ${stale.length} PO(s).`);
         } catch (err: any) {
             console.error('[ops-manager] alertStaleDraftPOs error:', err.message);
+        }
+    }
+
+    /**
+     * Flag stale committed MULTI POs for human follow-up.
+     *
+     * Catches the gap left by syncPOConversations (45d Gmail thread window) and
+     * calendar sync (no PO thread = no trigger): committed MULTI POs older than
+     * 60 days with no tracking. Transitions lifecycle_stage to human_escalated
+     * and sends a Telegram alert with PO details and Finale deep-link.
+     *
+     * Runs daily @ 7:45 AM via StaleMultiPOFlag cron.
+     */
+    private async flagStaleMultiPOs(): Promise<void> {
+        const STALE_THRESHOLD_DAYS = 60;
+        const supabase = createClient();
+        if (!supabase) {
+            console.warn('[ops-manager] flagStaleMultiPOs: Supabase unavailable');
+            return;
+        }
+
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - STALE_THRESHOLD_DAYS);
+        const cutoffStr = cutoffDate.toISOString();
+
+        try {
+            const { data: staleRows, error } = await supabase
+                .from('purchase_orders')
+                .select('po_number, vendor_name, issue_date, created_at, lifecycle_stage, tracking_numbers, notes')
+                .eq('status', 'committed')
+                .eq('is_intended_multi', true)
+                .not('lifecycle_stage', 'in', '("received","cancelled","human_escalated","delivered","delivered_awaiting_receipt")')
+                .or(`issue_date.lt.${cutoffStr},and(issue_date.is.null,created_at.lt.${cutoffStr})`);
+
+            if (error) {
+                console.error('[ops-manager] flagStaleMultiPOs query error:', error.message);
+                return;
+            }
+
+            if (!staleRows || staleRows.length === 0) {
+                console.log('[ops-manager] flagStaleMultiPOs: no stale committed MULTI POs found.');
+                return;
+            }
+
+            const flagged: string[] = [];
+            const now = new Date().toISOString();
+
+            for (const row of staleRows) {
+                const tracking = row.tracking_numbers ?? [];
+                if (tracking.length > 0) continue;
+
+                await supabase.from('purchase_orders').update({
+                    lifecycle_stage: 'human_escalated',
+                    needs_human_review: true,
+                    updated_at: now,
+                }).eq('po_number', row.po_number);
+
+                flagged.push(row.po_number);
+                console.log(`[ops-manager] Flagged stale MULTI PO #${row.po_number} (${row.vendor_name ?? 'unknown vendor'})`);
+            }
+
+            if (flagged.length > 0) {
+                const lines = flagged.map(po => {
+                    const row = staleRows.find((r: any) => r.po_number === po);
+                    const age = row?.issue_date ? daysSinceDate(row.issue_date) ?? '?' : '?';
+                    const vendor = row?.vendor_name ?? 'Unknown vendor';
+                    const note = row?.notes ? ` — ${row.notes.slice(0, 60)}` : '';
+                    return `  ${po} | ${vendor} | ~${age}d old${note}`;
+                });
+
+                const msg =
+                    `[STALE] <b>Stale MULTI PO${flagged.length > 1 ? 's' : ''} Flagged</b>\n\n` +
+                    `Committed + MULTI + >${STALE_THRESHOLD_DAYS}d + no tracking:\n\n` +
+                    lines.join('\n') +
+                    `\n\nLifecycle set to: <code>human_escalated</code>`;
+
+                this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || '',
+                    msg,
+                    { parse_mode: 'HTML' }
+                ).catch((e: any) => console.warn('[ops-manager] Stale MULTI alert failed:', e.message));
+
+                console.log(`[ops-manager] Flagged ${flagged.length} stale committed MULTI POs`);
+            }
+        } catch (err: any) {
+            console.error('[ops-manager] flagStaleMultiPOs error:', err.message);
         }
     }
 
@@ -2490,7 +2642,32 @@ Data: ${JSON.stringify(data)}`;
                 leadTimeService.warmCache(),
             ]);
 
-            if (pos.length === 0) {
+            // Also fetch any is_intended_multi POs that may be older than daysBack window.
+            // These POs (blanket/quarterly buys) often have long lead times and can be
+            // 6+ months old but still need calendar events. Without this, MULTI POs older
+            // than 60 days are never synced because getRecentPurchaseOrders(60) excludes them.
+            const { data: multiPORows } = await supabase
+                .from('purchase_orders')
+                .select('po_number')
+                .eq('is_intended_multi', true);
+
+            const existingPOIds = new Set(pos.map((p: any) => p.orderId));
+            const missingMultiPOs = (multiPORows ?? [])
+                .map((r: any) => r.po_number)
+                .filter((poNum: string) => !existingPOIds.has(poNum));
+
+            let allPOSet = pos;
+            if (missingMultiPOs.length > 0) {
+                // Fetch these older MULTI POs from Finale using a 365-day window
+                const olderPOs = await finale.getRecentPurchaseOrders(365);
+                const matching = olderPOs.filter((p: any) => missingMultiPOs.includes(p.orderId));
+                allPOSet = [...pos, ...matching];
+                if (matching.length > 0) {
+                    console.log(`[cal-sync] Including ${matching.length} older MULTI POs in calendar sync`);
+                }
+            }
+
+            if (allPOSet.length === 0) {
                 console.log('[cal-sync] No recent POs found');
                 return counts;
             }
@@ -2508,7 +2685,7 @@ Data: ${JSON.stringify(data)}`;
             const { data: poRows } = await supabase
                 .from('purchase_orders')
                 .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at, vendor_noncomm_at, human_reply_detected_at, is_intended_multi, notes')
-                .in('po_number', pos.map(p => p.orderId).filter(Boolean));
+                .in('po_number', allPOSet.map((p: any) => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
             const lifecycleMap = new Map<string, Record<string, any>>();
             for (const row of poRows ?? []) {
@@ -2516,7 +2693,7 @@ Data: ${JSON.stringify(data)}`;
                 lifecycleMap.set(row.po_number, row);
             }
             const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
-            const shipmentRecords = await listShipmentsForPurchaseOrders(pos.map(p => p.orderId).filter(Boolean));
+            const shipmentRecords = await listShipmentsForPurchaseOrders(allPOSet.map((p: any) => p.orderId).filter(Boolean));
             for (const shipment of shipmentRecords) {
                 for (const poNumber of shipment.po_numbers || []) {
                     if (!shipmentMap.has(poNumber)) shipmentMap.set(poNumber, []);
@@ -2525,9 +2702,9 @@ Data: ${JSON.stringify(data)}`;
             }
 
             const calendar = new CalendarClient();
-            const completionSignals = await loadPOCompletionSignalIndex(supabase, pos.map(p => p.orderId).filter(Boolean));
+            const completionSignals = await loadPOCompletionSignalIndex(supabase, allPOSet.map((p: any) => p.orderId).filter(Boolean));
             const feedbackSync = await syncRecommendationFeedbackForPurchaseOrders(
-                pos
+                allPOSet
                     .filter(po => Boolean(po.orderId))
                     .map(po => ({
                         vendorName: po.vendorName,
@@ -2546,7 +2723,7 @@ Data: ${JSON.stringify(data)}`;
                 );
             }
 
-            for (const po of pos) {
+            for (const po of allPOSet) {
                 if (!po.orderId) continue;
                 // Skip dropship POs â€” they're pass-through orders, not BuildASoil inventory
                 if (po.orderId.toLowerCase().includes('dropship')) continue;
@@ -2676,17 +2853,44 @@ Data: ${JSON.stringify(data)}`;
                     lifecycle.calendarStatus === 'multi'
                 ) {
                     // Status changed, tracking changed, or past-due/exception/noncomm POs need date flow-forward
-                    await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {
+                    const updateResult = await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {
                         title,
                         description,
                         colorId: lifecycle.colorId,
                         date: eventDate
                     });
-                    await supabase.from('purchasing_calendar_events')
-                        .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
-                        .eq('po_number', po.orderId);
-                    counts.updated++;
-                    console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText})`);
+
+                    if (updateResult === null) {
+                        // Event was deleted on Google side (403/404) — delete stale DB record and recreate
+                        await supabase.from('purchasing_calendar_events')
+                            .delete()
+                            .eq('po_number', po.orderId);
+                        try {
+                            const newEventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
+                                title,
+                                description,
+                                date: eventDate,
+                                colorId,
+                            });
+                            await supabase.from('purchasing_calendar_events').insert({
+                                po_number: po.orderId,
+                                event_id: newEventId,
+                                calendar_id: PURCHASING_CALENDAR_ID,
+                                status: newStatus,
+                                last_tracking: trackingHash
+                            });
+                            counts.created++;
+                            console.log(`🔄 [cal-sync] Recreated event for PO #${po.orderId} (event was deleted on Google side)`);
+                        } catch (e: any) {
+                            console.warn(`[cal-sync] Could not recreate event for PO #${po.orderId}: ${e.message}`);
+                        }
+                    } else {
+                        await supabase.from('purchasing_calendar_events')
+                            .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
+                            .eq('po_number', po.orderId);
+                        counts.updated++;
+                        console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText})`);
+                    }
                 } else {
                     counts.skipped++;
                 }
@@ -2700,6 +2904,94 @@ Data: ${JSON.stringify(data)}`;
     }
 
     /**
+     * Immediately refresh the calendar event for a single PO.
+     * Called by TrackingAgent when high-confidence tracking is found,
+     * so the calendar reflects the update without waiting for the next
+     * 30-minute sync cycle.
+     */
+    async refreshCalendarForPO(poNumber: string): Promise<void> {
+        try {
+            const supabase = createClient();
+            const calendar = new CalendarClient();
+            if (!supabase) return;
+
+            // Read PO + its calendar event record
+            const [{ data: poRow }, { data: calEvent }] = await Promise.all([
+                supabase.from("purchase_orders").select("*").eq("po_number", poNumber).maybeSingle(),
+                supabase.from("purchasing_calendar_events").select("*").eq("po_number", poNumber).maybeSingle(),
+            ]);
+
+            if (!calEvent) return; // No calendar event exists yet — skip
+
+            const { data: shipments } = await supabase
+                .from("shipments")
+                .select("*")
+                .contains("po_numbers", [poNumber]);
+
+            // Derive lifecycle from Supabase data (no Finale call — keeps this lightweight)
+            const trackingStatuses = (shipments || [])
+                .filter(s => s.status_display)
+                .map(s => ({ category: s.status_category, display: s.status_display, estimated_delivery_at: s.estimated_delivery_at }));
+
+            const lifecycle = derivePurchasingLifecycle(
+                poRow?.status,
+                trackingStatuses,
+                null,
+                poRow?.required_date,
+                poRow?.receive_date,
+                shipments,
+                {
+                    vendor_noncomm_at: poRow?.vendor_noncomm_at,
+                    human_reply_detected_at: poRow?.human_reply_detected_at,
+                    lifecycle_stage: poRow?.lifecycle_stage,
+                    is_intended_multi: poRow?.is_intended_multi,
+                    notes: poRow?.notes,
+                    comments: poRow?.comments,
+                },
+            );
+
+            // Build a minimal PO-like object for the title/description builders
+            const fakePO: any = {
+                orderId: poNumber,
+                vendorName: poRow?.vendor_name || 'Unknown Vendor',
+                items: [],
+                status: poRow?.status,
+                receiveDate: poRow?.receive_date,
+                notes: poRow?.notes,
+                comments: poRow?.comments,
+                shipments: shipments || [],
+            };
+
+            const expectedDate = poRow?.required_date
+                ? new Date(poRow.required_date).toISOString().split('T')[0]
+                : new Date().toISOString().split('T')[0];
+
+            const title = this.buildPOEventTitle(fakePO, lifecycle);
+            const description = await this.buildPOEventDescription(
+                fakePO, expectedDate, 'vendor', poRow?.tracking_numbers || [],
+                new Map(trackingStatuses.map((s, i) => [String(i), s as any])),
+                lifecycle, undefined, undefined, poRow?.lifecycle_stage ? { lifecycle_stage: poRow.lifecycle_stage } : null
+            );
+            const eventDate = getPurchasingEventDate(expectedDate, poRow?.receive_date, lifecycle, undefined);
+
+            await calendar.updateEvent(calEvent.calendar_id, calEvent.event_id, {
+                title,
+                description,
+                colorId: lifecycle.colorId,
+                date: eventDate,
+            });
+
+            await supabase.from("purchasing_calendar_events")
+                .update({ status: lifecycle.calendarStatus, updated_at: new Date().toISOString() })
+                .eq("po_number", poNumber);
+
+            console.log(`ðŸ“… [cal-sync] Immediate refresh for PO #${poNumber}: ${lifecycle.calendarStatus}`);
+        } catch (err: any) {
+            console.warn(`[cal-sync] refreshCalendarForPO(${poNumber}) failed: ${err.message}`);
+        }
+    }
+
+    /**
      * Friday morning autonomous ULINE ordering pipeline.
      *
      * DECISION(2026-03-16): Full end-to-end automation:
@@ -2708,84 +3000,226 @@ Data: ${JSON.stringify(data)}`;
      *   3. Fill ULINE Quick Order cart via Chrome automation
      *   4. Send Telegram notification with manifest, PO link, and cart status
      *
-     * Runs via cron at 8:30 AM Denver every Friday. Never throws â€” errors are
-     * caught and reported via Telegram. Will just reviews cart and checks out.
+     * Runs via cron at 8:30 AM Denver every Friday.
+     * Phase 1: checks for recent draft PO, scans purchasing intelligence, sends Telegram approval message.
+     * Phase 2 (approval): executed by the approve_uline_friday callback in start-bot.ts.
      */
     async runFridayUlineOrder() {
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!chatId) return;
 
-        console.log('[uline-friday] ðŸ›’ Starting Friday ULINE auto-order...');
+        console.log('[uline-friday] Running pre-check...');
 
-        const { runAutonomousUlineOrder } = await import('../../cli/order-uline');
-        const result = await runAutonomousUlineOrder();
+        const { runFridayUlinePreCheck } = await import('../../cli/order-uline');
+        const finale = new (await import('../../lib/finale/client')).FinaleClient();
+        const preCheck = await runFridayUlinePreCheck(finale);
 
-        // Case 1: Pipeline error
-        if (!result.success) {
+        // Case 1: recent PO exists — nothing needed
+        if (preCheck.reason === 'recent_po_exists') {
+            const po = preCheck.recentDraftPO!;
+            const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+            const poUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}`;
             await this.bot.telegram.sendMessage(
                 chatId,
-                `ðŸš¨ <b>ULINE Friday Order â€” Failed</b>\n\n` +
-                `<b>Error:</b> <code>${result.error || 'Unknown error'}</code>\n\n` +
-                `Run manually: <code>node --import tsx src/cli/order-uline.ts --auto-reorder --create-po</code>`,
+                `✅ <b>ULINE Friday Check</b>\n\n` +
+                `Draft PO <a href="${poUrl}">#${po.orderId}</a> ` +
+                `already created this week.\n` +
+                `Nothing to do — review the existing PO and ULINE cart.`,
                 { parse_mode: 'HTML' }
             );
             return;
         }
 
-        // Case 2: Nothing to order
-        if (result.itemCount === 0) {
+        // Case 2: nothing needs ordering
+        if (preCheck.reason === 'no_items_needed') {
             await this.bot.telegram.sendMessage(
                 chatId,
-                `✅ <b>ULINE Friday Order â€” All Stocked</b>\n\n` +
-                `Purchasing intelligence scanned all ULINE items.\n` +
-                `Everything is above reorder threshold â€” no order needed this week. ðŸŽ‰`,
+                `✅ <b>ULINE Friday Check</b>\n\n` +
+                `All ULINE items are above reorder threshold.\n` +
+                `No order needed this week.`,
                 { parse_mode: 'HTML' }
             );
             return;
         }
 
-        // Case 3: Items ordered â€” build rich notification
-        const itemLines = result.items
+        // Case 3: items need ordering — build approval message with inline buttons
+        const manifest = preCheck.manifest;
+        const itemLines = manifest.items
+            .slice(0, 15)
             .map(i => {
-                const qtyLabel = i.finaleEachQty === i.effectiveEachQty
-                    ? `${i.qty}`
-                    : `${i.qty} <i>(Finale ${i.finaleEachQty} ea â†’ ${i.effectiveEachQty} ea)</i>`;
-                return `  <code>${i.ulineModel}</code> Ã— ${qtyLabel}  ($${(i.qty * i.unitPrice).toFixed(2)})`;
+                const qtyLabel = i.finaleEachQuantity === i.effectiveEachQuantity
+                    ? `${i.quantity}`
+                    : `${i.quantity} <i>(→ ${i.effectiveEachQuantity} ea)</i>`;
+                return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.quantity * i.unitPrice).toFixed(2)})`;
             })
             .join('\n');
+        const more = manifest.items.length > 15 ? `\n  <i>…and ${manifest.items.length - 15} more items</i>` : '';
 
-        const poLine = result.finalePO && result.finaleUrl
-            ? `ðŸ“„ <a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
-            : result.finalePO
-                ? `ðŸ“„ Finale PO #${result.finalePO}`
-                : 'âš ï¸ PO creation skipped';
+        const skippedNote = manifest.skippedLowVelocity && manifest.skippedLowVelocity.length > 0
+            ? `\n<i>⚠️ ${manifest.skippedLowVelocity.length} low-velocity items skipped (runway data unclear)</i>\n`
+            : '';
 
-        const cartIcon = result.cartVerificationStatus === 'verified'
-            ? 'ðŸ›’'
-            : result.cartVerificationStatus === 'partial'
-                ? 'âš ï¸'
-                : 'ðŸŸ¡';
+        const msg = `🛒 <b>ULINE Friday Order — Approval Needed</b>\n\n` +
+            `${skippedNote}` +
+            `📦 ${manifest.items.length} item${manifest.items.length === 1 ? '' : 's'} needing reorder\n` +
+            `💰 Est. Total: <b>$${manifest.totalEstimate.toFixed(2)}</b>\n\n` +
+            `${itemLines}${more}\n\n` +
+            `<i>Create draft PO and fill ULINE cart?</i>`;
 
-        let msg = `ðŸ›’ <b>ULINE Friday Order â€” Ready for Checkout</b>\n\n`;
-        msg += `${poLine}\n`;
-        msg += `ðŸ’° Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n`;
-        msg += `ðŸ“¦ ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n`;
-        msg += `${itemLines}\n\n`;
-        msg += `${cartIcon} Cart: ${result.cartResult}\n`;
-        if (result.priceUpdatesApplied > 0) {
-            msg += `ðŸ’° Draft PO price sync: ${result.priceUpdatesApplied} line item update(s) applied\n`;
-        }
-        msg += `\n`;
-        msg += `<i>Review your ULINE cart and checkout when ready.</i>\n`;
-        msg += `<i>ðŸ”— <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a></i>`;
-
-        await this.bot.telegram.sendMessage(chatId, msg, {
+        const sentMsg = await this.bot.telegram.sendMessage(chatId, msg, {
             parse_mode: 'HTML',
-            // @ts-expect-error Telegraf types lag behind Bot API
-            disable_web_page_preview: true,
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '✅ Approve & Fill Cart', callback_data: 'approve_uline_friday' },
+                    { text: '⏭️ Skip This Week', callback_data: 'skip_uline_friday' },
+                ]],
+            },
         });
 
-        console.log(`[uline-friday] ✅ Telegram notification sent (${result.itemCount} items, $${result.estimatedTotal.toFixed(2)})`);
+        this.pendingUlineFriday = {
+            messageId: sentMsg.message_id,
+            manifest,
+            manifestJson: JSON.stringify(manifest),
+        };
+
+        console.log(`[uline-friday] Pre-check sent: ${manifest.items.length} items, awaiting approval (message ${sentMsg.message_id})`);
+    }
+
+    /**
+     * â”€â”€ ULINE ORDER CONFIRMATION SYNC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     * Polls bill.selee@buildasoil.com Gmail for ULINE order confirmations.
+     * Parses confirmation email, updates Finale PO with actual prices,
+     * archives to vendor_invoices, and notifies Will.
+     */
+    async runUlineConfirmationSync() {
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!chatId) return;
+
+        try {
+            const auth = await getAuthenticatedClient('default');
+            const gmail = GmailApi({ version: 'v1', auth });
+
+            const searchRes = await gmail.users.messages.list({
+                userId: 'me',
+                q: 'from:customer.service@uline.com subject:"ORDER CONFIRMATION" after:2026/04/10',
+                maxResults: 10,
+            });
+
+            const messages = searchRes.data.messages || [];
+            if (messages.length === 0) return;
+
+            const finale = new FinaleClient();
+            const supabase = createClient();
+
+            for (const msg of messages) {
+                const detail = await gmail.users.messages.get({ userId: 'me', id: msg.id!, format: 'full' });
+                const headers = detail.data.payload?.headers || [];
+                const subject = headers.find((h: any) => h.name === 'Subject')?.value || '';
+
+                const body = (() => {
+                    const decode = (p: any): string => {
+                        if (p?.body?.data) return Buffer.from(p.body.data, 'base64').toString('utf-8');
+                        if (p?.parts) for (const pt of p.parts) { const d = decode(pt); if (d) return d; }
+                        return '';
+                    };
+                    return decode(detail.data.payload);
+                })();
+
+                const confirmation = parseUlineConfirmationEmail(subject, body, msg.id!);
+                if (!confirmation || !confirmation.poNumber) continue;
+
+                // Check if already processed (idempotency)
+                if (supabase) {
+                    const { data: existing } = await supabase
+                        .from('ap_activity_log')
+                        .select('id')
+                        .eq('gmail_message_id', msg.id!)
+                        .single();
+                    if (existing) {
+                        console.log(`[uline-confirm] Already processed ${msg.id}`);
+                        continue;
+                    }
+                }
+
+                console.log(`[uline-confirm] Processing order ${confirmation.orderNumber} for PO #${confirmation.poNumber}`);
+
+                // Archive to vendor_invoices
+                if (supabase) {
+                    const lineItems = confirmation.items
+                        .filter(i => !i.isKitComponent)
+                        .map(i => ({
+                            item_number: i.itemNumber,
+                            description: i.description,
+                            quantity: i.qty,
+                            unit: i.unit,
+                            unit_price: i.unitPrice,
+                            extended_price: i.extendedPrice,
+                        }));
+
+                    await supabase.from('vendor_invoices').upsert({
+                        vendor_name: 'ULINE',
+                        invoice_number: confirmation.orderNumber,
+                        invoice_date: confirmation.orderDate,
+                        po_number: confirmation.poNumber,
+                        total: confirmation.total,
+                        subtotal: confirmation.subtotal,
+                        tax: confirmation.tax,
+                        shipping: confirmation.shipping,
+                        line_items: lineItems,
+                        source: 'email_confirmation',
+                        gmail_message_id: msg.id!,
+                    }, { onConflict: 'vendor_name,invoice_number' });
+
+                    await supabase.from('ap_activity_log').insert({
+                        action: 'uline_confirmation_processed',
+                        gmail_message_id: msg.id!,
+                        details: { orderNumber: confirmation.orderNumber, poNumber: confirmation.poNumber, total: confirmation.total },
+                    });
+                }
+
+                // Update Finale PO with actual prices
+                let updated = 0;
+                for (const item of confirmation.items.filter(i => !i.isKitComponent)) {
+                    try {
+                        await finale.updateOrderItemPrice(confirmation.poNumber, item.itemNumber, item.unitPrice);
+                        updated++;
+                    } catch (e: any) {
+                        console.warn(`[uline-confirm] Could not update ${item.itemNumber}: ${e.message}`);
+                    }
+                }
+
+                // Mark email as read
+                await gmail.users.messages.modify({
+                    userId: 'me',
+                    id: msg.id!,
+                    requestBody: { addLabelIds: [], removeLabelIds: ['UNREAD'] },
+                }).catch(() => {});
+
+                const poUrl = `https://app.finaleinventory.com/${process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics'}/purchaseOrder?orderId=${confirmation.poNumber}`;
+                const itemLines = confirmation.items
+                    .filter(i => !i.isKitComponent)
+                    .slice(0, 8)
+                    .map(i => `  ${i.qty} ${i.unit} <code>${i.itemNumber}</code> — ${i.description.substring(0, 30)}… $${i.extendedPrice.toFixed(2)}`)
+                    .join('\n');
+                const more = confirmation.items.filter(i => !i.isKitComponent).length > 8
+                    ? `\n  <i>…and ${confirmation.items.filter(i => !i.isKitComponent).length - 8} more items</i>` : '';
+
+                await this.bot.telegram.sendMessage(
+                    chatId,
+                    `✅ <b>ULINE Order Confirmed</b>\n\n` +
+                    `📄 <a href="${poUrl}">PO #${confirmation.poNumber}</a> → ULINE Order #${confirmation.orderNumber}\n` +
+                    `💰 Total: <b>$${confirmation.total.toFixed(2)}</b>` +
+                    (confirmation.shipDate ? ` | Shipped: ${confirmation.shipDate}` : '') + `\n` +
+                    `🔄 ${updated} line price update(s) applied to Finale\n\n` +
+                    `${itemLines}${more}`,
+                    { parse_mode: 'HTML', disable_web_page_preview: true }
+                ).catch((e: any) => console.warn('[uline-confirm] Telegram notify failed:', e.message));
+
+                console.log(`[uline-confirm] ✅ Order ${confirmation.orderNumber} / PO ${confirmation.poNumber} synced`);
+            }
+        } catch (err: any) {
+            console.warn(`[uline-confirm] Sync error: ${err.message}`);
+        }
     }
 
     /**

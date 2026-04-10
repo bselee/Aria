@@ -176,22 +176,26 @@ describe('derivePOLifecycleState', () => {
 
 describe('shouldRequestTrackingFollowUp', () => {
     test('allows first follow-up when vendor has not acked', () => {
-        expect(shouldRequestTrackingFollowUp(0, 0, false)).toBe(true);
+        expect(shouldRequestTrackingFollowUp(0, false, false)).toBe(true);
     });
 
-    test('blocks follow-up after 2 requests with no evidence', () => {
-        expect(shouldRequestTrackingFollowUp(2, 0, false)).toBe(false);
+    test('blocks follow-up after 2 requests with no delivery evidence', () => {
+        expect(shouldRequestTrackingFollowUp(2, false, false)).toBe(false);
     });
 
-    test('blocks follow-up after 2 requests with no evidence even with ack', () => {
-        expect(shouldRequestTrackingFollowUp(2, 0, true)).toBe(false);
+    test('blocks follow-up after 2 requests with no delivery evidence even with ack', () => {
+        expect(shouldRequestTrackingFollowUp(2, false, true)).toBe(false);
     });
 
-    test('allows follow-up when acked but no tracking evidence yet (count < 2)', () => {
-        expect(shouldRequestTrackingFollowUp(1, 0, true)).toBe(true);
+    test('allows follow-up when acked but no delivery evidence yet (count < 2)', () => {
+        expect(shouldRequestTrackingFollowUp(1, false, true)).toBe(true);
     });
 
-    test('blocks follow-up when shipping evidence exists', () => {
-        expect(shouldRequestTrackingFollowUp(0, 1, true)).toBe(false);
+    test('blocks follow-up when DELIVERY evidence exists', () => {
+        expect(shouldRequestTrackingFollowUp(0, true, true)).toBe(false);
+    });
+
+    test('does NOT block follow-up when only tracking evidence exists (not delivered)', () => {
+        expect(shouldRequestTrackingFollowUp(1, false, true)).toBe(true);
     });
 });

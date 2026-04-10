@@ -66,7 +66,31 @@ export interface POShipmentLike {
 }
 
 /**
- * High-level purchasing event states that drive the calendar rendering.
+
+ * Derives the calendar/purchasing lifecycle state for a PO.
+ *
+ * EDGE CASES & STATE PRIORITY (highest to lowest):
+ * 1. RECEIVED (green) — PO has at least one "received" shipment OR status="received"
+ * 2. CANCELLED (yellow) — PO status is "cancelled"
+ * 3. DELIVERED (orange) — All tracking shows "delivered" but not yet marked received in Finale
+ * 4. MULTI (purple) — PO is an intended multi-shipment (blanket/quarterly). Shown even before shipments arrive.
+ *    Detection: DB flag `is_intended_multi` OR keywords in notes/comments OR 2+ date patterns in notes
+ * 5. HUMAN ESCALATED (purple) — Human reply detected or lifecycle_stage='human_escalated'
+ * 6. NONCOMM (red) — Vendor marked non-communicative (vendor_noncomm_at set or lifecycle_stage='tracking_unavailable')
+ * 7. PARTIAL (cyan) — Accidental partial shipment. Has multiple shipments or received shipments but NOT intended multi.
+ *    Detection: hasMultipleShipments || hasAnyReceivedShipment, NOT isIntendedMulti, NOT isReceived, NOT isCancelled
+ * 8. PAST DUE (yellow) — Expected date has passed but not yet received
+ * 9. EXCEPTION (red) — More than 35 days old with no delivery
+ * 10. IN TRANSIT (blue) — Has tracking but not delivered
+ * 11. AWAITING TRACKING (grey) — No tracking information
+ *
+ * MULTI vs PARTIAL distinction:
+ * - MULTI: Vendor intentionally splitting delivery (blanket PO, scheduled deliveries). Keyword-triggered.
+ * - PARTIAL: Accidental partial shipment or backorder. Unintended.
+ * These two states are mutually exclusive — a PO cannot be both MULTI and PARTIAL.
+ *
+ * The `is_intended_multi` DB flag takes precedence over keyword detection. Once set, the PO
+ * stays in MULTI state even if shipments arrive, until explicitly unmarked or fully received.
  */
 export function derivePurchasingLifecycle(
     status: string | null | undefined,
@@ -100,8 +124,19 @@ export function derivePurchasingLifecycle(
     const internalNotes = (poData?.notes || "").toLowerCase();
     const combinedNotes = `${externalNotes} ${internalNotes}`;
     
-    const multiKeywords = ["blanket", "quarterly", "scheduled", "advance", "multi", "split"];
-    const isIntendedMulti = poData?.is_intended_multi || multiKeywords.some(k => combinedNotes.includes(k));
+    const multiKeywords = [
+        "blanket", "quarterly", "scheduled", "advance", "multi", "split",
+        "monthly", "deliveries", "stages", "expected delivery", "delivery date",
+        "multiple shipments", "shipping schedule", "expected deliveries", "dates"
+    ];
+    
+    // Also check for multiple dates in notes (e.g. "6/1, 8/1, 10/1")
+    const datePattern = /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/g;
+    const dateMatches = combinedNotes.match(datePattern) || [];
+    
+    const isIntendedMulti = poData?.is_intended_multi || 
+        multiKeywords.some(k => combinedNotes.includes(k)) ||
+        dateMatches.length >= 2; // Multiple dates in notes is a strong MULTI signal
 
     // 2. Is it an accidental partial?
     const isPartial = !isReceived && !isCancelled && (hasMultipleShipments || hasAnyReceivedShipment) && !isIntendedMulti;

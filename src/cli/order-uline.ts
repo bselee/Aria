@@ -49,6 +49,7 @@ import {
 import {
     launchUlineSession,
     openUlinePasteItemsPage,
+    emailUlineCart,
 } from '../lib/purchasing/uline-session';
 import { buildVendorDraftPlans } from '../lib/purchasing/vendor-draft-plans';
 import {
@@ -84,12 +85,14 @@ interface OrderManifest {
     sourcePO: string | null;
     items: OrderLineItem[];
     totalEstimate: number;
+    skippedLowVelocity?: Array<{ productId: string; dailyRate: number; explanation: string }>;
 }
 
 interface UlineCartFillResult {
     message: string;
     verification: CartVerificationResult;
     observedRows: ObservedUlineCartRow[];
+    cartUrl?: string | null;
     errorText?: string;
 }
 
@@ -246,6 +249,167 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
  * @param finale - FinaleClient instance
  * @returns OrderManifest with auto-detected items (sourceType='auto_reorder')
  */
+/**
+ * Result of the Friday pre-check — what items need ordering and whether a PO is needed.
+ */
+export interface UlineFridayPreCheckResult {
+    needsOrder: boolean;
+    reason: 'no_items_needed' | 'recent_po_exists' | 'items_need_order';
+    recentDraftPO: { orderId: string; orderDate: string; finaleUrl: string } | null;
+    manifest: OrderManifest;
+}
+
+/**
+ * Phase 1 of the Friday ULINE flow.
+ * Scans purchasing intelligence and checks for a recent draft PO (last 7 days).
+ * Does NOT create a PO or touch the browser — returns data for Telegram.
+ */
+export async function runFridayUlinePreCheck(finale: FinaleClient): Promise<UlineFridayPreCheckResult> {
+    const [manifest, recentDrafts] = await Promise.all([
+        gatherAutoReorderItems(finale),
+        finale.findRecentUlineDraftPOs(7),
+    ]);
+
+    if (manifest.items.length === 0) {
+        return {
+            needsOrder: false,
+            reason: 'no_items_needed',
+            recentDraftPO: null,
+            manifest,
+        };
+    }
+
+    if (recentDrafts.length > 0) {
+        return {
+            needsOrder: false,
+            reason: 'recent_po_exists',
+            recentDraftPO: recentDrafts[0],
+            manifest,
+        };
+    }
+
+    return {
+        needsOrder: true,
+        reason: 'items_need_order',
+        recentDraftPO: null,
+        manifest,
+    };
+}
+
+function manifestItemsToResultItems(items: OrderLineItem[]) {
+    return items.map(i => ({
+        sku: i.finaleSku,
+        ulineModel: i.ulineModel,
+        qty: i.quantity,
+        unitPrice: i.unitPrice,
+        finaleEachQty: i.finaleEachQuantity,
+        effectiveEachQty: i.effectiveEachQuantity,
+    }));
+}
+
+/**
+ * Phase 2 of the Friday ULINE flow — runs after user approval.
+ * Creates the draft PO in Finale and fills the ULINE cart.
+ * Exported for the Telegram callback handler in start-bot.ts.
+ */
+export async function executeUlineFridayApproval(
+    manifest: OrderManifest,
+): Promise<UlineOrderResult> {
+    const finale = new FinaleClient();
+
+    // Phase 2: Create draft PO in Finale
+    let updatedManifest = manifest;
+    let finaleUrl: string | null = null;
+    try {
+        updatedManifest = await createFinaleDraftPO(finale, manifest);
+        if (updatedManifest.sourcePO) {
+            const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+            finaleUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${updatedManifest.sourcePO}`;
+        }
+    } catch (poErr: any) {
+        console.error('[uline-friday] PO creation failed:', poErr.message);
+        return {
+            success: false,
+            itemCount: manifest.items.length,
+            items: manifestItemsToResultItems(manifest.items),
+            estimatedTotal: manifest.totalEstimate,
+            finalePO: null,
+            finaleUrl: null,
+            cartResult: '',
+            cartVerificationStatus: 'unverified',
+            cartUrl: null,
+            priceUpdatesApplied: 0,
+            skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
+            error: `PO creation failed: ${poErr.message}`,
+        };
+    }
+
+    // Check guardrails before touching the browser
+    const blockingWarnings = getBlockingGuardrailWarnings(updatedManifest.items);
+    if (blockingWarnings.length > 0) {
+        return {
+            success: false,
+            itemCount: updatedManifest.items.length,
+            items: manifestItemsToResultItems(updatedManifest.items),
+            estimatedTotal: updatedManifest.totalEstimate,
+            finalePO: updatedManifest.sourcePO,
+            finaleUrl,
+            cartResult: '',
+            cartVerificationStatus: 'unverified',
+            cartUrl: null,
+            priceUpdatesApplied: 0,
+            skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
+            error: `ULINE guardrail blocked: ${blockingWarnings[0]}`,
+        };
+    }
+
+    // Phase 3: Fill ULINE cart via browser
+    let cartFill: UlineCartFillResult;
+    try {
+        cartFill = await placeViaQuickOrderPaste(finale, updatedManifest.items, {
+            autonomous: true,
+            draftPO: updatedManifest.sourcePO,
+        });
+    } catch (cartErr: any) {
+        console.error('[uline-friday] Cart fill failed:', cartErr.message);
+        cartFill = {
+            message: `⚠️ Cart fill failed: ${cartErr.message}`,
+            verification: {
+                status: 'unverified',
+                matchedModels: [],
+                missingModels: updatedManifest.items.map(item => item.ulineModel),
+                quantityMismatches: [],
+                unexpectedModels: [],
+            },
+            observedRows: [],
+            cartUrl: null,
+            errorText: cartErr.message,
+        };
+    }
+
+    const priceUpdatesApplied = planDraftPOPriceUpdates(
+        updatedManifest.items,
+        cartFill.observedRows,
+        cartFill.verification,
+    ).length;
+
+    console.log(`[uline-friday] Done: ${updatedManifest.items.length} items, PO ${updatedManifest.sourcePO || 'none'}, cart: ${cartFill.message}`);
+
+    return {
+        success: true,
+        itemCount: updatedManifest.items.length,
+        items: manifestItemsToResultItems(updatedManifest.items),
+        estimatedTotal: updatedManifest.totalEstimate,
+        finalePO: updatedManifest.sourcePO,
+        finaleUrl,
+        cartResult: cartFill.message,
+        cartVerificationStatus: cartFill.verification.status,
+        cartUrl: cartFill.cartUrl,
+        priceUpdatesApplied,
+        skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
+    };
+}
+
 export async function gatherAutoReorderItems(finale: FinaleClient): Promise<OrderManifest> {
     console.log('   🤖 Running purchasing intelligence scan for ULINE items...');
     console.log('   ⏳ Using Finale vendor-scoped purchasing intelligence for ULINE...\n');
@@ -254,7 +418,7 @@ export async function gatherAutoReorderItems(finale: FinaleClient): Promise<Orde
 
     if (plans.length === 0) {
         console.log('   ℹ️  No ULINE vendor group found in purchasing intelligence');
-        return { sourceType: 'auto_reorder', sourcePO: null, items: [], totalEstimate: 0 };
+        return { sourceType: 'auto_reorder', sourcePO: null, items: [], totalEstimate: 0, skippedLowVelocity: [] };
     }
 
     console.log(`   Found ${plans.length} ULINE group(s): ${plans.map(g => g.vendorName).join(', ')}\n`);
@@ -359,6 +523,7 @@ export async function gatherAutoReorderItems(finale: FinaleClient): Promise<Orde
         sourcePO: null,
         items,
         totalEstimate: total,
+        skippedLowVelocity,
     };
 }
 
@@ -651,11 +816,16 @@ async function placeViaQuickOrderPaste(
         }
 
         let errorText = '';
+        let cartUrl: string | null = null;
         if (addClicked) {
             console.log('   🛒 Clicked "Add to Cart" — items should be in your ULINE cart now!');
 
             // Wait a moment for the cart to update
             await page.waitForTimeout(3_000);
+
+            // Email the cart to the user so they can load it in any browser (1Password workaround)
+            const cartEmail = process.env.ULINE_EMAIL || 'bill.selee@buildasoil.com';
+            cartUrl = await emailUlineCart(page, cartEmail);
 
             // Check if there are any error messages
             errorText = await page.$eval('.error, .errorMessage, .alert-danger', el => el.textContent?.trim() || '').catch(() => '');
@@ -691,6 +861,7 @@ async function placeViaQuickOrderPaste(
                 message: addClicked ? message : 'Cart fill attempted; manual verification needed.',
                 verification,
                 observedRows,
+                cartUrl,
                 errorText,
             };
         }
@@ -715,6 +886,7 @@ async function placeViaQuickOrderPaste(
             message,
             verification,
             observedRows,
+            cartUrl,
             errorText,
         };
 
@@ -1045,6 +1217,7 @@ export interface UlineOrderResult {
     finaleUrl: string | null;
     cartResult: string;
     cartVerificationStatus: CartVerificationResult['status'];
+    cartUrl?: string | null;
     priceUpdatesApplied: number;
     skippedLowVelocity: number;
     error?: string;
@@ -1084,6 +1257,7 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
                 finaleUrl: null,
                 cartResult: 'No items need reordering',
                 cartVerificationStatus: 'verified',
+                cartUrl: null,
                 priceUpdatesApplied: 0,
                 skippedLowVelocity: 0,
             };
@@ -1120,8 +1294,9 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
                 finaleUrl,
                 cartResult: '',
                 cartVerificationStatus: 'unverified',
+                cartUrl: null,
                 priceUpdatesApplied: 0,
-                skippedLowVelocity: 0,
+                skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
                 error: `ULINE guardrail blocked the order: ${blockingWarnings[0]}`,
             };
         }
@@ -1145,6 +1320,7 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
                     unexpectedModels: [],
                 },
                 observedRows: [],
+                cartUrl: null,
                 errorText: cartErr.message,
             };
         }
@@ -1173,8 +1349,9 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
             finaleUrl,
             cartResult: cartFill.message,
             cartVerificationStatus: cartFill.verification.status,
+            cartUrl: cartFill.cartUrl,
             priceUpdatesApplied,
-            skippedLowVelocity: 0,
+            skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
         };
 
     } catch (err: any) {
@@ -1188,6 +1365,7 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
             finaleUrl: null,
             cartResult: '',
             cartVerificationStatus: 'unverified',
+            cartUrl: null,
             priceUpdatesApplied: 0,
             skippedLowVelocity: 0,
             error: err.message,

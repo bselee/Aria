@@ -1024,7 +1024,68 @@ bot.on('text', async (ctx) => {
         await ctx.answerCbQuery('Skipped');
         const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
-        await ctx.editMessageText(original + '\n\n_Skipped Ã¢â‚¬â€ PO stays as draft in Finale._', { parse_mode: 'Markdown' });
+        await ctx.editMessageText(original + '\n\n_Skipped Ã¢Å¡â‚¬â€� PO stays as draft in Finale._', { parse_mode: 'Markdown' });
+    });
+
+    // ── ULINE FRIDAY APPROVAL ──────────────────────────────────────────────────
+    bot.action('approve_uline_friday', async (ctx) => {
+        await ctx.answerCbQuery('Creating PO and filling cart…');
+        const pending = (ops as any).pendingUlineFriday;
+        if (!pending) {
+            await ctx.reply('No pending ULINE order found. The pre-check may have timed out or was already processed.');
+            return;
+        }
+
+        const manifest = JSON.parse(pending.manifestJson);
+        await ctx.reply('✅ Approved — creating draft PO and filling ULINE cart…');
+
+        const { executeUlineFridayApproval } = await import('./cli/order-uline');
+        const result = await executeUlineFridayApproval(manifest);
+
+        (ops as any).pendingUlineFriday = null;
+
+        if (!result.success) {
+            await ctx.reply(
+                `ðŸš¨ <b>ULINE Order Failed</b>\n\n` +
+                `<b>Error:</b> ${result.error || 'Unknown error'}\n\n` +
+                `Items: ${result.itemCount} | Total: $${result.estimatedTotal.toFixed(2)}`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const itemLines = result.items
+            .slice(0, 10)
+            .map((i: any) => `  <code>${i.ulineModel}</code> × ${i.qty}  ($${(i.qty * i.unitPrice).toFixed(2)})`)
+            .join('\n');
+        const more = result.items.length > 10 ? `\n  <i>…and ${result.items.length - 10} more</i>` : '';
+
+        const poLine = result.finalePO && result.finaleUrl
+            ? `ðŸ“„ <a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
+            : `ðŸ“„ Finale PO #${result.finalePO}`;
+
+        const cartIcon = result.cartVerificationStatus === 'verified' ? 'ðŸ›’'
+            : result.cartVerificationStatus === 'partial' ? 'âš ï¸' : 'ðŸŸ¡';
+
+        const msg = `ðŸ›’ <b>ULINE Order — Done</b>\n\n` +
+            `${poLine}\n` +
+            `ðŸ’° Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n` +
+            `ðŸ“¦ ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n` +
+            `${itemLines}${more}\n\n` +
+            `${cartIcon} Cart: ${result.cartResult}\n` +
+            (result.cartUrl
+                ? `ðŸ—“ Cart link: <a href="${result.cartUrl}">Load in browser</a>\n`
+                : `ðŸ—“ <a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a>`);
+
+        await ctx.reply(msg, { parse_mode: 'HTML', disable_web_page_preview: true });
+    });
+
+    bot.action('skip_uline_friday', async (ctx) => {
+        await ctx.answerCbQuery('Skipped this week');
+        (ops as any).pendingUlineFriday = null;
+        const original = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+            ? ctx.callbackQuery.message.text : '';
+        await ctx.editMessageText(original + '\n\n_Skipped this week._', { parse_mode: 'Markdown' });
     });
 
     // Fire-and-forget the launch, then start OpsManager right away.
@@ -1256,6 +1317,158 @@ bot.on('text', async (ctx) => {
         } catch (err: any) {
             await ctx.reply(`❌ Failed to start pipeline: ${err.message}`);
         }
+    });
+
+    bot.command('uline', async (ctx) => {
+        await ctx.reply('🔍 Checking ULINE status…');
+        const ops = (bot.context as any).opsManager;
+        if (!ops) {
+            await ctx.reply('OpsManager not initialized.');
+            return;
+        }
+        const { runFridayUlinePreCheck } = await import('./cli/order-uline');
+        const FinaleClient = (await import('./lib/finale/client')).FinaleClient;
+        const finale = new FinaleClient();
+
+        let preCheck: Awaited<ReturnType<typeof runFridayUlinePreCheck>>;
+        try {
+            preCheck = await runFridayUlinePreCheck(finale);
+        } catch (err: any) {
+            await ctx.reply(`❌ Pre-check failed: ${err.message}`);
+            return;
+        }
+
+        const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+
+        if (preCheck.reason === 'recent_po_exists') {
+            const po = preCheck.recentDraftPO!;
+            const poUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}`;
+            await ctx.reply(
+                `✅ <b>ULINE Status</b>\n\n` +
+                `Draft PO <a href="${poUrl}">#${po.orderId}</a> ` +
+                `created ${new Date(po.orderDate).toLocaleDateString('en-US', { timeZone: 'America/Denver' })}.\n` +
+                `A ULINE order may already be in progress — review the PO and cart.`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        if (preCheck.reason === 'no_items_needed') {
+            await ctx.reply(
+                `✅ <b>ULINE Status</b>\n\n` +
+                `All ULINE items are above reorder threshold.\n` +
+                `No order needed.`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const manifest = preCheck.manifest;
+        const itemLines = manifest.items
+            .slice(0, 15)
+            .map((i: any) => {
+                const qtyLabel = i.finaleEachQuantity === i.effectiveEachQuantity
+                    ? `${i.quantity}`
+                    : `${i.quantity} <i>(→ ${i.effectiveEachQuantity} ea)</i>`;
+                return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.quantity * i.unitPrice).toFixed(2)})`;
+            })
+            .join('\n');
+        const more = manifest.items.length > 15 ? `\n  <i>…and ${manifest.items.length - 15} more items</i>` : '';
+
+        const skippedNote = manifest.skippedLowVelocity && manifest.skippedLowVelocity.length > 0
+            ? `\n<i>⚠️ ${manifest.skippedLowVelocity.length} low-velocity items skipped</i>\n`
+            : '';
+
+        const msg = `🛒 <b>ULINE Order — Approval Needed</b>\n\n` +
+            `${skippedNote}` +
+            `📦 ${manifest.items.length} item${manifest.items.length === 1 ? '' : 's'} needing reorder\n` +
+            `💰 Est. Total: <b>$${manifest.totalEstimate.toFixed(2)}</b>\n\n` +
+            `${itemLines}${more}\n\n` +
+            `<i>Create draft PO and fill ULINE cart?</i>`;
+
+        const sentMsg = await ctx.reply(msg, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '✅ Approve & Fill Cart', callback_data: 'approve_uline_friday' },
+                    { text: '⏭️ Skip', callback_data: 'skip_uline_friday' },
+                ]],
+            },
+        });
+
+        (ops as any).pendingUlineFriday = {
+            messageId: sentMsg.message_id,
+            manifest,
+            manifestJson: JSON.stringify(manifest),
+        };
+    });
+
+    bot.command('ulinetest', async (ctx) => {
+        const args = ctx.message.text.split(' ').slice(1);
+        const poId = args[0];
+
+        await ctx.reply(poId
+            ? `🔍 Testing ULINE flow with PO #${poId}…`
+            : '🔍 Testing ULINE flow with most recent draft PO…');
+
+        const { gatherFromPO, executeUlineFridayApproval, gatherAllUlineDraftPOs } = await import('./cli/order-uline');
+        const FinaleClient = (await import('./lib/finale/client')).FinaleClient;
+        const finale = new FinaleClient();
+
+        let manifest: any;
+        if (poId) {
+            manifest = await gatherFromPO(finale, poId);
+        } else {
+            const allDrafts = await gatherAllUlineDraftPOs(finale);
+            if (allDrafts.length === 0) {
+                await ctx.reply('❌ No ULINE draft POs found in Finale.');
+                return;
+            }
+            manifest = allDrafts[0];
+        }
+
+        if (manifest.items.length === 0) {
+            await ctx.reply(`❌ No ULINE items found in PO #${poId || 'latest draft'}.`);
+            return;
+        }
+
+        const result = await executeUlineFridayApproval(manifest);
+
+        if (!result.success) {
+            await ctx.reply(
+                `🚨 <b>ULINE Test Failed</b>\n\n` +
+                `<b>Error:</b> ${result.error || 'Unknown error'}\n` +
+                `Items: ${result.itemCount} | Total: $${result.estimatedTotal.toFixed(2)}`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const itemLines = result.items
+            .slice(0, 10)
+            .map((i: any) => `  <code>${i.ulineModel}</code> × ${i.qty}  ($${(i.qty * i.unitPrice).toFixed(2)})`)
+            .join('\n');
+        const more = result.items.length > 10 ? `\n  <i>…and ${result.items.length - 10} more</i>` : '';
+
+        const poLine = result.finalePO && result.finaleUrl
+            ? `<a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
+            : result.finalePO ? `Finale PO #${result.finalePO}` : '⚠️ PO creation skipped';
+
+        const cartIcon = result.cartVerificationStatus === 'verified' ? '🛒'
+            : result.cartVerificationStatus === 'partial' ? '⚠️' : '🟡';
+
+        await ctx.reply(
+            `🛒 <b>ULINE Test — Done</b>\n\n` +
+            `📄 ${poLine}\n` +
+            `💰 Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n` +
+            `📦 ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n` +
+            `${itemLines}${more}\n\n` +
+            `${cartIcon} Cart: ${result.cartResult}\n` +
+            (result.cartUrl
+                ? `Cart link: <a href="${result.cartUrl}">Load in browser</a>`
+                : `<a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a>`),
+            { parse_mode: 'HTML', disable_web_page_preview: true }
+        );
     });
 
     })();

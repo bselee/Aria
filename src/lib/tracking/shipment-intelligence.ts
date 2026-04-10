@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase";
+import { withAdvisoryLock } from "@/lib/purchasing/advisory-lock";
 import { FinaleClient } from "@/lib/finale/client";
 import {
     carrierUrl,
@@ -601,47 +602,109 @@ function isReceivedPurchaseOrderStatus(status: string | null | undefined): boole
     return normalized === "received" || normalized === "completed";
 }
 
+export interface LifecycleTransitionEntry {
+    at: string;
+    from: string | null;
+    to: string;
+    trigger: string;
+    detail: string;
+}
+
+/**
+ * Appends a lifecycle transition entry to the purchase_orders lifecycle_transitions array.
+ * Uses a single atomic upsert to prevent race conditions between TrackingAgent
+ * and syncPOConversations both writing to the same PO simultaneously.
+ */
+async function appendLifecycleTransition(
+    poNumber: string,
+    entry: LifecycleTransitionEntry,
+): Promise<void> {
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { data: existing } = await supabase
+        .from("purchase_orders")
+        .select("lifecycle_transitions")
+        .eq("po_number", poNumber)
+        .maybeSingle();
+
+    const existingTransitions: LifecycleTransitionEntry[] = existing?.lifecycle_transitions || [];
+    const updatedTransitions = [...existingTransitions, entry];
+
+    await supabase
+        .from("purchase_orders")
+        .update({ lifecycle_transitions: updatedTransitions })
+        .eq("po_number", poNumber);
+}
+
 /**
  * Syncs PO lifecycle columns from a shipment record.
- * Only writes when the tracking status has materially changed.
+ * Uses advisory lock to prevent concurrent writes from multiple agents
+ * (TrackingAgent and syncPOConversations both write to the same PO).
+ * Appends every meaningful transition to lifecycle_transitions (append-only audit trail).
  */
 async function syncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
+    await withAdvisoryLock(`po:${poNumber}`, async () => {
+        await _doSyncPOLifecycleFromShipment(poNumber, shipment);
+    }, { skipIfLocked: true });
+}
+
+async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
     const supabase = createClient();
     if (!supabase) return;
 
     const now = new Date().toISOString();
     const statusSummary = shipment.status_display || null;
+    const statusCategory = shipment.status_category || null;
 
-    // Read existing row to detect status changes
+    // Single atomic read of all columns we need to evaluate + write atomically
     const { data: existingPO } = await supabase
         .from("purchase_orders")
-        .select("tracking_status_summary, lifecycle_stage, vendor_acknowledged_at")
+        .select(
+            "tracking_status_summary, lifecycle_stage, vendor_acknowledged_at, " +
+            "shipping_evidence, lifecycle_transitions",
+        )
         .eq("po_number", poNumber)
         .maybeSingle();
 
-    const prevStatus = existingPO?.tracking_status_summary;
-    const statusChanged = statusSummary && statusSummary !== prevStatus;
+    const prevStatus = existingPO?.tracking_status_summary ?? null;
+    const prevLifecycle = existingPO?.lifecycle_stage ?? 'sent';
+    const statusChanged = statusSummary !== null && statusSummary !== prevStatus;
 
+    // Determine new lifecycle stage
+    let newLifecycle = prevLifecycle;
+    if (statusCategory === 'delivered') {
+        newLifecycle = 'moving_with_tracking';
+    } else if (statusCategory === 'shipped' && newLifecycle === 'sent') {
+        // Only auto-promote if we don't already have a more advanced state
+        const advancedStates = ['moving_with_tracking', 'vendor_acknowledged', 'ap_follow_up'];
+        if (!advancedStates.includes(newLifecycle)) {
+            newLifecycle = 'moving_with_tracking';
+        }
+    }
+
+    // Build update object
     const update: Record<string, any> = {
         po_number: poNumber,
         last_tracking_evidence_at: now,
         updated_at: now,
+        lifecycle_stage: newLifecycle,
     };
 
     if (statusSummary) {
         update.tracking_status_summary = statusSummary;
     }
 
-    // Only write movement summary on status change (prevent spam)
-    if (statusChanged) {
-        update.last_movement_summary = statusSummary;
-        update.last_movement_update_at = now;
+    // Always write last_movement_summary when we have evidence — preserves every
+    // intermediate state (label_created → shipped → in_transit → delivered).
+    // last_movement_update_at only advances on actual category transitions.
+    if (statusSummary) {
+        update.last_movement_summary = statusCategory
+            ? `[${statusCategory}] ${statusSummary}`
+            : statusSummary;
     }
-
-    // Derive lifecycle stage: moving_with_tracking if tracking is present
-    if (shipment.status_category === 'delivered' || shipment.status_category === 'shipped') {
-        const hasVendorAck = !!existingPO?.vendor_acknowledged_at;
-        update.lifecycle_stage = hasVendorAck ? 'moving_with_tracking' : (existingPO?.lifecycle_stage || 'sent');
+    if (statusChanged && statusCategory) {
+        update.last_movement_update_at = now;
     }
 
     // Append shipping evidence entry
@@ -653,17 +716,47 @@ async function syncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentR
         summary: statusSummary || 'tracking added',
     };
 
-    // Read existing shipping_evidence and append
-    const { data: poRow } = await supabase
-        .from("purchase_orders")
-        .select("shipping_evidence")
-        .eq("po_number", poNumber)
-        .maybeSingle();
-
-    const existingEvidence = poRow?.shipping_evidence || [];
+    const existingEvidence: any[] = existingPO?.shipping_evidence || [];
     update.shipping_evidence = [...existingEvidence, evidenceEntry];
 
+    // Append to lifecycle_transitions if meaningful change
+    if (statusChanged) {
+        const transitionEntry: LifecycleTransitionEntry = {
+            at: now,
+            from: prevStatus ? `[${existingPO?.lifecycle_stage || 'unknown'}] ${prevStatus}` : null,
+            to: `[${newLifecycle}] ${statusSummary}`,
+            trigger: 'shipment_status_change',
+            detail: `Tracking ${shipment.tracking_number} updated: ${statusCategory || 'unknown'} → ${statusSummary}`,
+        };
+        update.lifecycle_transitions = [
+            ...(existingPO?.lifecycle_transitions || []),
+            transitionEntry,
+        ];
+    } else if (!existingPO) {
+        // New PO with first tracking — record initial transition
+        const transitionEntry: LifecycleTransitionEntry = {
+            at: now,
+            from: null,
+            to: `[${newLifecycle}] ${statusSummary || 'tracking added'}`,
+            trigger: 'first_tracking_evidence',
+            detail: `First tracking evidence for PO: ${shipment.tracking_number}`,
+        };
+        update.lifecycle_transitions = [transitionEntry];
+    }
+    // If no meaningful change, still update tracking evidence timestamp without cluttering history
+
     await supabase.from("purchase_orders").upsert(update, { onConflict: "po_number" });
+
+    // Also record transition via append-only column update when status changed
+    if (statusChanged) {
+        await appendLifecycleTransition(poNumber, {
+            at: now,
+            from: prevStatus,
+            to: statusSummary || 'unknown',
+            trigger: 'shipment_status_change',
+            detail: `${shipment.tracking_number} (${statusCategory || 'unknown'})`,
+        });
+    }
 }
 
 export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promise<ShipmentRecord | null> {
