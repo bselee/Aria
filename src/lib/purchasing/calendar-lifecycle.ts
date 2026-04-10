@@ -15,6 +15,7 @@ export type PurchasingCalendarStatus =
     | "awaiting_tracking"
     | "noncomm"
     | "partial"
+    | "multi"
     | "past_due";
 
 export interface PurchasingLifecycleState {
@@ -28,6 +29,7 @@ export interface PurchasingLifecycleState {
     isDeliveredAwaitingReceipt: boolean;
     isNoncomm?: boolean;
     isPartial?: boolean;
+    isIntendedMulti?: boolean;
     isHumanEscalated?: boolean;
 }
 
@@ -45,6 +47,8 @@ export function derivePurchasingLifecycle(
         vendor_noncomm_at?: string | null;
         human_reply_detected_at?: string | null;
         lifecycle_stage?: string | null;
+        is_intended_multi?: boolean | null;
+        notes?: string | null;
     }
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
@@ -53,11 +57,18 @@ export function derivePurchasingLifecycle(
     const knownStatuses = trackingStatuses.filter((item): item is TrackingStatus => item !== null);
     
     // PARTIAL / MULTI-SHIPMENT DETECTION
-    // If not fully received, but we have multiple shipments OR at least one shipment is received
     const shipmentList = shipments || [];
     const hasMultipleShipments = shipmentList.length > 1;
     const hasAnyReceivedShipment = shipmentList.some(s => String(s.status || "").toLowerCase() === "received");
-    const isPartial = !isReceived && !isCancelled && (hasMultipleShipments || hasAnyReceivedShipment);
+    
+    // AUTONOMOUS CLASSIFICATION
+    // 1. Is it intended multi? (Check DB flag OR scan notes for keywords)
+    const notes = (poData?.notes || "").toLowerCase();
+    const multiKeywords = ["blanket", "quarterly", "scheduled", "advance", "multi", "split"];
+    const isIntendedMulti = poData?.is_intended_multi || multiKeywords.some(k => notes.includes(k));
+
+    // 2. Is it an accidental partial?
+    const isPartial = !isReceived && !isCancelled && (hasMultipleShipments || hasAnyReceivedShipment) && !isIntendedMulti;
 
     const hasDeliveredProof =
         !isReceived &&
@@ -108,6 +119,21 @@ export function derivePurchasingLifecycle(
         };
     }
 
+    // MULTI (Purple) - Intended blanket/scheduled POs
+    if (isIntendedMulti && (hasMultipleShipments || hasAnyReceivedShipment)) {
+        return {
+            calendarStatus: "multi",
+            completionState,
+            colorId: "10", // Purple
+            prefixText: "MULTI",
+            statusLabel: "MULTI - Intended Multi-Shipment",
+            isReceived: false,
+            isCancelled: false,
+            isDeliveredAwaitingReceipt: false,
+            isIntendedMulti: true,
+        };
+    }
+
     // HUMAN ESCALATED (Purple)
     if (poData?.human_reply_detected_at || poData?.lifecycle_stage === 'human_escalated') {
         return {
@@ -138,14 +164,14 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    // PARTIAL (Cyan/Teal) - Should take priority over LATE
+    // RCV P (Cyan) - Accidental partials/backorders
     if (isPartial) {
         return {
             calendarStatus: "partial",
             completionState,
             colorId: "7", // Cyan/Teal
-            prefixText: "PARTIAL",
-            statusLabel: "Partial Receipt / Multi-Shipment",
+            prefixText: "RCV P",
+            statusLabel: "RCV P - Partial / Backordered",
             isReceived: false,
             isCancelled: false,
             isDeliveredAwaitingReceipt: false,

@@ -2506,7 +2506,7 @@ Data: ${JSON.stringify(data)}`;
             // Also fetch all tracking numbers and lifecycle data from purchase_orders for the recent POs
             const { data: poRows } = await supabase
                 .from('purchase_orders')
-                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at, vendor_noncomm_at, human_reply_detected_at')
+                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at, vendor_noncomm_at, human_reply_detected_at, is_intended_multi, notes')
                 .in('po_number', pos.map(p => p.orderId).filter(Boolean));
             const trackingMap = new Map<string, string[]>();
             const lifecycleMap = new Map<string, Record<string, any>>();
@@ -2630,6 +2630,8 @@ Data: ${JSON.stringify(data)}`;
                         vendor_noncomm_at: poLifecycleData?.vendor_noncomm_at,
                         human_reply_detected_at: poLifecycleData?.human_reply_detected_at,
                         lifecycle_stage: poLifecycleData?.lifecycle_stage,
+                        is_intended_multi: poLifecycleData?.is_intended_multi,
+                        notes: poLifecycleData?.notes,
                     }
                 );
                 const title = this.buildPOEventTitle(po, lifecycle);
@@ -2668,7 +2670,8 @@ Data: ${JSON.stringify(data)}`;
                     lifecycle.calendarStatus === 'past_due' || 
                     lifecycle.calendarStatus === 'exception' ||
                     lifecycle.calendarStatus === 'noncomm' ||
-                    lifecycle.calendarStatus === 'partial'
+                    lifecycle.calendarStatus === 'partial' ||
+                    lifecycle.calendarStatus === 'multi'
                 ) {
                     // Status changed, tracking changed, or past-due/exception/noncomm POs need date flow-forward
                     await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {
