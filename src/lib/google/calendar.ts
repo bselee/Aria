@@ -220,6 +220,55 @@ export class CalendarClient {
     }
 
     /**
+     * Update an existing event by ID. Used by syncPurchasingCalendar.
+     * 
+     * On Forbidden (event deleted on Google side) or Not Found — attempts to delete
+     * the stale DB record and recreate the event so the calendar stays in sync.
+     * On Bad Request — logs the attempted payload for diagnosis.
+     * 
+     * @returns The event ID (existing if updated, new if recreated, null if failed)
+     */
+    async updateEvent(
+        calendarId: string,
+        eventId: string,
+        updates: { title: string; description: string; colorId?: string; date?: string }
+    ): Promise<string | null> {
+        await this.init();
+        const { title, description, colorId, date } = updates;
+
+        const requestBody: any = { summary: title, description };
+        if (colorId) requestBody.colorId = colorId;
+        if (date) {
+            const startDate = new Date(date);
+            const endDate = new Date(startDate);
+            endDate.setUTCDate(endDate.getUTCDate() + 1);
+            requestBody.start = { date };
+            requestBody.end = { date: endDate.toISOString().split("T")[0] };
+        }
+
+        try {
+            await this.calendar!.events.patch({ calendarId, eventId, requestBody });
+            return eventId;
+        } catch (err: any) {
+            const status = err.response?.status;
+            const errorMessage = err.message;
+
+            if (status === 403 || status === 404) {
+                console.warn(`⚠️ [Calendar] Event ${eventId} is inaccessible (${status}) — event was likely deleted on Google side. Returning null so caller can recreate.`);
+                return null;
+            }
+
+            if (status === 400) {
+                console.warn(`⚠️ [Calendar] Bad Request updating event ${eventId} — payload may be malformed. title="${title}", date="${date}", colorId="${colorId}". Error: ${errorMessage}`);
+            } else {
+                console.warn(`⚠️ [Calendar] Could not update event ${eventId}: ${errorMessage}`);
+            }
+
+            return null;
+        }
+    }
+
+    /**
      * Fetch upcoming events from all configured production calendars
      */
     async getAllUpcomingBuilds(daysOut: number = 30): Promise<CalendarEvent[]> {

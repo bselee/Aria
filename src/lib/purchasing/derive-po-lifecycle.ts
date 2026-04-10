@@ -33,6 +33,7 @@ export interface POInput {
     acknowledgmentDate?: string | null;
     trackingRequestCount?: number;
     shippingEvidenceCount?: number;
+    hasDeliveredEvidence?: boolean;
     humanReplyDetectedAt?: string | null;
 }
 
@@ -132,14 +133,18 @@ export function getVendorClarifyRequest(): string {
 /**
  * Returns true when a tracking follow-up should be sent.
  * After 2 follow-ups with no response, returns false — escalation to human should happen instead.
+ *
+ * Key principle: only actual DELIVERY evidence blocks follow-ups.
+ * "Label created", "shipped", "in_transit" evidence does NOT block — the goods
+ * haven't been received yet and Will still needs vendor responsiveness.
  */
 export function shouldRequestTrackingFollowUp(
     trackingRequestCount: number,
-    shippingEvidenceCount: number,
+    hasDeliveredEvidence: boolean,
     hasVendorAck: boolean
 ): boolean {
-    if (trackingRequestCount >= 2 && shippingEvidenceCount === 0) return false;
+    if (trackingRequestCount >= 2 && !hasDeliveredEvidence) return false;
     if (!hasVendorAck && trackingRequestCount === 0) return true;
-    if (hasVendorAck && shippingEvidenceCount === 0 && trackingRequestCount < 2) return true;
+    if (hasVendorAck && !hasDeliveredEvidence && trackingRequestCount < 2) return true;
     return false;
 }
