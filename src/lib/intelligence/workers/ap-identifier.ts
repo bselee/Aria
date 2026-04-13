@@ -40,6 +40,7 @@ import {
     queueStatementEmailIntake,
     queueStatementMetadataOnly,
 } from "@/lib/statements/email-intake";
+import { splitAAACooperStatementAttachments } from "../aaa-cooper-splitter";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -118,6 +119,11 @@ const MULTI_INVOICE_STATEMENT_VENDORS: Array<{
         label: 'AAA Cooper',
     },
 ];
+
+type MultiInvoiceStatementResult =
+    | { status: "handled"; queuedCount: number }
+    | { status: "needs_review"; reason: string }
+    | { status: "fallthrough"; reason?: string };
 
 export class APIdentifierAgent {
 
@@ -518,7 +524,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             const handled = await this.handleMultiInvoiceStatement(
                                 m, gmail, supabase, multiInvVendor.label,
                             );
-                            if (handled) {
+                            if (handled.status === "handled") {
                                 // Successfully split — label as processed and archive
                                 try {
                                     await gmail.users.messages.modify({
@@ -530,6 +536,10 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                         }
                                     });
                                 } catch (e) { /* ignore */ }
+                                continue;
+                            }
+                            if (handled.status === "needs_review") {
+                                console.log(`     ⚠️ ${multiInvVendor.label} statement needs review — leaving unread`);
                                 continue;
                             }
                             // Fall through to normal STATEMENT handling if split failed
@@ -1141,7 +1151,9 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         gmail: any,
         supabase: any,
         vendorLabel: string,
-    ): Promise<boolean> {
+    ): Promise<any> {
+        return this.handleMultiInvoiceStatementShared(emailRow, gmail, supabase, vendorLabel);
+
         const subject = emailRow.subject || 'No Subject';
         const from = emailRow.from_email || 'Unknown';
         const msgId = emailRow.gmail_message_id;
@@ -1371,6 +1383,217 @@ If no invoice number is found, use null.`,
         }
 
         return queuedCount > 0;
+    }
+
+    private async handleMultiInvoiceStatementShared(
+        emailRow: any,
+        gmail: any,
+        supabase: any,
+        vendorLabel: string,
+    ): Promise<MultiInvoiceStatementResult> {
+        const subject = emailRow.subject || "No Subject";
+        const from = emailRow.from_email || "Unknown";
+        const msgId = emailRow.gmail_message_id;
+
+        console.log(`     ✂️ Multi-invoice statement detected (${vendorLabel}): "${subject}"`);
+
+        let msg: any;
+        try {
+            msg = await gmail.users.messages.get({ userId: "me", id: msgId });
+        } catch (err: any) {
+            console.error(`     ❌ Failed to fetch message for statement split:`, err.message);
+            return { status: "fallthrough", reason: "message_fetch_failed" };
+        }
+
+        const pdfParts: any[] = [];
+        const walkParts = (parts: any[]): void => {
+            for (const part of parts) {
+                if (part.filename && part.filename.toLowerCase().endsWith(".pdf")) {
+                    pdfParts.push(part);
+                }
+                if (part.parts?.length) walkParts(part.parts);
+            }
+        };
+        walkParts(msg.data.payload?.parts || []);
+
+        if (pdfParts.length === 0) {
+            console.log("     ⚠️ No PDF attachment found on statement email — falling through");
+            return { status: "fallthrough", reason: "missing_pdf" };
+        }
+
+        const attachments: Array<{ attachmentId: string; filename: string; pdfBuffer: Buffer }> = [];
+        for (const pdfPart of pdfParts) {
+            if (!pdfPart.body?.attachmentId) continue;
+            try {
+                const response = await gmail.users.messages.attachments.get({
+                    userId: "me",
+                    messageId: msgId,
+                    id: pdfPart.body.attachmentId,
+                });
+                const attachmentData = response.data.data;
+                if (!attachmentData) continue;
+                const buffer = Buffer.from(attachmentData, "base64url");
+                attachments.push({
+                    attachmentId: pdfPart.body.attachmentId,
+                    filename: pdfPart.filename || "statement.pdf",
+                    pdfBuffer: buffer,
+                });
+                console.log(`     📄 Downloaded ${pdfPart.filename} (${(buffer.length / 1024).toFixed(0)} KB)`);
+            } catch (err: any) {
+                console.error(`     ❌ Failed to download PDF attachment ${pdfPart.filename}:`, err.message);
+            }
+        }
+
+        if (attachments.length === 0) {
+            return { status: "fallthrough", reason: "attachment_download_failed" };
+        }
+
+        const splitResult = await splitAAACooperStatementAttachments({ attachments });
+        if (splitResult.status === "needs_review") {
+            const reason = splitResult.diagnostics.weakReason || "OCR confidence too weak";
+            await this.logActivity(
+                supabase,
+                from,
+                subject,
+                "MULTI_INVOICE_STATEMENT",
+                `${vendorLabel} statement held for review: ${reason}`,
+                {
+                    vendor: vendorLabel,
+                    status: splitResult.status,
+                    diagnostics: splitResult.diagnostics,
+                },
+            );
+            return { status: "needs_review", reason };
+        }
+
+        if (splitResult.status !== "split_ready" || splitResult.invoices.length === 0) {
+            console.log("     ⚠️ No invoice pages identified in statement — falling through");
+            return { status: "fallthrough", reason: "no_invoice_pages" };
+        }
+
+        console.log(`     📋 Found ${splitResult.invoices.length} invoice(s); discarded ${splitResult.discardedCount} paperwork page(s): ${splitResult.invoices.map((page) => page.invoiceNumber || `page${page.page}`).join(", ")}`);
+
+        const { PDFDocument } = await import("pdf-lib");
+        const attachmentLookup = new Map(attachments.map((attachment) => [attachment.attachmentId, attachment]));
+        const sourcePdfs = new Map<string, any>();
+        let queuedCount = 0;
+
+        for (const invoice of splitResult.invoices) {
+            const attachment = invoice.attachmentId ? attachmentLookup.get(invoice.attachmentId) : undefined;
+            if (!attachment) continue;
+
+            let sourcePdf = sourcePdfs.get(attachment.attachmentId);
+            if (!sourcePdf) {
+                sourcePdf = await PDFDocument.load(attachment.pdfBuffer);
+                sourcePdfs.set(attachment.attachmentId, sourcePdf);
+            }
+
+            const pageIdx = invoice.page - 1;
+            if (pageIdx < 0 || pageIdx >= sourcePdf.getPageCount()) continue;
+
+            const invoiceNumber = invoice.invoiceNumber || `page${invoice.page}`;
+            const safeInvoiceNumber = invoiceNumber.replace(/[^a-zA-Z0-9-]/g, "_");
+            const invoiceFilename = `${safeInvoiceNumber}.pdf`;
+
+            const singlePdf = await PDFDocument.create();
+            const [copiedPage] = await singlePdf.copyPages(sourcePdf, [pageIdx]);
+            singlePdf.addPage(copiedPage);
+            const pageBuffer = Buffer.from(await singlePdf.save());
+
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+            const { data: existingInv } = await supabase
+                .from("ap_inbox_queue")
+                .select("id")
+                .eq("email_from", from)
+                .eq("pdf_filename", invoiceFilename)
+                .gte("created_at", sevenDaysAgo)
+                .maybeSingle();
+
+            if (existingInv) {
+                console.log(`     ⚠️ DEDUP: ${invoiceFilename} already queued from ${from} — skipping`);
+                continue;
+            }
+
+            const storagePath = `${msgId}/split_${Date.now()}_${invoiceFilename}`;
+            const { error: uploadError } = await supabase.storage
+                .from("ap_invoices")
+                .upload(storagePath, pageBuffer, {
+                    contentType: "application/pdf",
+                    upsert: true,
+                });
+
+            if (uploadError) {
+                console.error(`     ❌ Storage upload failed for ${invoiceFilename}:`, uploadError.message);
+                continue;
+            }
+
+            const uniqueMsgId = `${msgId}_split_${safeInvoiceNumber}`;
+            const { error: insertError } = await supabase.from("ap_inbox_queue").insert({
+                message_id: uniqueMsgId,
+                email_from: from,
+                email_subject: `${vendorLabel} Invoice ${invoiceNumber}`,
+                intent: "INVOICE",
+                pdf_path: storagePath,
+                pdf_filename: invoiceFilename,
+                status: "PENDING_FORWARD",
+                source_inbox: emailRow.source_inbox || "ap",
+            });
+
+            if (insertError) {
+                console.error(`     ❌ Queue insert failed for ${invoiceFilename}:`, insertError.message);
+                continue;
+            }
+
+            const amountStr = invoice.amount ? ` ($${invoice.amount.toFixed(2)})` : "";
+            console.log(`     ✅ Queued ${invoiceFilename}${amountStr} → PENDING_FORWARD`);
+            queuedCount++;
+        }
+
+        await this.logActivity(
+            supabase,
+            from,
+            subject,
+            "MULTI_INVOICE_STATEMENT",
+            `Split ${vendorLabel} statement: ${queuedCount} invoice(s) queued for Bill.com`,
+            {
+                vendor: vendorLabel,
+                invoicesFound: splitResult.invoices.length,
+                invoicesQueued: queuedCount,
+                discardedPages: splitResult.discardedCount,
+                invoiceNumbers: splitResult.invoices.map((invoice) => invoice.invoiceNumber).filter(Boolean),
+                sourceFilenames: attachments.map((attachment) => attachment.filename),
+                diagnostics: splitResult.diagnostics,
+            },
+        );
+
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (chatId && this.bot) {
+            const invoiceList = splitResult.invoices
+                .map((invoice) => {
+                    const num = invoice.invoiceNumber || `page${invoice.page}`;
+                    const amt = invoice.amount ? ` — $${invoice.amount.toFixed(2)}` : "";
+                    return `  • ${num}${amt}`;
+                })
+                .join("\n");
+            const total = splitResult.invoices.reduce((sum, invoice) => sum + (invoice.amount || 0), 0);
+            const totalStr = total > 0 ? `\n<b>Statement Total:</b> $${total.toFixed(2)}` : "";
+
+            try {
+                await this.bot.telegram.sendMessage(chatId, [
+                    `✂️ <b>${vendorLabel} Statement Split</b>`,
+                    "",
+                    `Split <b>${queuedCount}</b> invoice(s); discarded <b>${splitResult.discardedCount}</b> non-invoice page(s):`,
+                    invoiceList,
+                    totalStr,
+                    "",
+                    "📤 Queued for Bill.com forwarding",
+                ].filter(Boolean).join("\n"), { parse_mode: "HTML" });
+            } catch {
+                // Non-critical notification failure.
+            }
+        }
+
+        return { status: "handled", queuedCount };
     }
 
     /** Escape HTML special characters for Telegram messages. */
