@@ -1319,6 +1319,121 @@ bot.on('text', async (ctx) => {
         }
     });
 
+    bot.command('vendor', async (ctx) => {
+        const { exec: _exec } = await import('child_process');
+        const { promisify: _promisify } = await import('util');
+        const execAsync = _promisify(_exec);
+
+        const args = ctx.message.text.split(' ').slice(1);
+        const [vendor, ...flags] = args;
+        const dryRun = flags.includes('--dry-run');
+        const scrapeOnly = flags.includes('--scrape-only');
+        const updateOnly = flags.includes('--update-only');
+        const poFlag = flags.includes('--po') ? flags[flags.indexOf('--po') + 1] : null;
+        const csvFlag = flags.includes('--csv') ? flags[flags.indexOf('--csv') + 1] : null;
+
+        const VENDORS: Record<string, { script: string; label: string; needsChrome?: boolean; needsCsv?: boolean }> = {
+            uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
+            axiom:     { script: 'src/cli/reconcile-axiom.ts',      label: 'Axiom Print', needsChrome: true },
+            fedex:     { script: 'src/cli/reconcile-fedex.ts',       label: 'FedEx', needsCsv: true },
+            teraganix: { script: 'src/cli/reconcile-teraganix.ts',   label: 'TeraGanix' },
+            aaa:       { script: '',                                 label: 'AAA Cooper' },
+        };
+
+        const FLAG_HINTS: Record<string, string> = {
+            uline:     '--dry-run --scrape-only --update-only --po <id>',
+            axiom:     '--dry-run --scrape-only --update-only --po <id>',
+            fedex:     '--dry-run --csv <path>',
+            teraganix: '--dry-run',
+            aaa:       '(lookup only — no reconciler)',
+        };
+
+        if (!vendor) {
+            const rows = Object.entries(VENDORS).map(([key, v]) => {
+                return `/vendor ${key.padEnd(10)} — ${v.label.padEnd(12)} [${FLAG_HINTS[key]}]`;
+            }).join('\n');
+            await ctx.reply(
+                `🛒 <b>Vendor Commands</b>\n\n` +
+                `${rows}\n\n` +
+                `Also: <code>/received</code> — sweep received POs for invoice matches\n` +
+                `Also: <code>/uline</code> — ULINE pre-check + order\n` +
+                `Also: <code>/ulinetest &lt;po&gt;</code> — test ULINE flow against a specific PO\n\n` +
+                `<i>Flags: --dry-run | --scrape-only | --update-only | --po &lt;id&gt; | --csv &lt;path&gt;</i>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        const key = vendor.toLowerCase();
+        const entry = VENDORS[key];
+        if (!entry) {
+            await ctx.reply(`❌ Unknown vendor: <b>${vendor}</b>\n\nTry: <code>/vendor</code> to see available vendors.`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        // AAA Cooper — no reconciler yet, show recent Finale POs
+        if (key === 'aaa') {
+            await ctx.reply('🔍 Looking up AAA Cooper data in Finale…');
+            const FinaleClient = (await import('./lib/finale/client')).FinaleClient;
+            const finale = new FinaleClient();
+            try {
+                const partyId = await finale.findVendorPartyByName('AAA COOPER');
+                if (!partyId) {
+                    await ctx.reply('⚠️ AAA Cooper vendor not found in Finale.');
+                    return;
+                }
+                const pos = await finale.findOrdersByVendor(partyId, { status: ['OPEN', 'RECEIVED'], limit: 10 });
+                if (!pos || pos.length === 0) {
+                    await ctx.reply('✅ No recent AAA Cooper POs found.');
+                    return;
+                }
+                const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+                const lines = pos.slice(0, 8).map((po: any) => {
+                    const d = new Date(po.orderDate).toLocaleDateString('en-US', { timeZone: 'America/Denver' });
+                    return `  <a href="https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}">#${po.orderId}</a>  ${d}  ${po.status}`;
+                }).join('\n');
+                await ctx.reply(`📦 <b>AAA Cooper — Recent POs</b>\n\n${lines}`, { parse_mode: 'HTML', disable_web_page_preview: true });
+            } catch (err: any) {
+                await ctx.reply(`❌ Lookup failed: ${err.message}`);
+            }
+            return;
+        }
+
+        // Build flags list per vendor
+        const extraFlags: string[] = [];
+        if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix'].includes(key)) extraFlags.push('--dry-run');
+        if (scrapeOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--scrape-only');
+        if (updateOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--update-only');
+        if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
+        if (csvFlag && key === 'fedex') extraFlags.push('--csv', csvFlag);
+
+        const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
+        const cmd = `node --import tsx ${entry.script}${flagStr}`;
+
+        const chromeNote = entry.needsChrome ? '\n⚠️ <i>Close Chrome before running (Playwright).</i>' : '';
+        const csvNote = entry.needsCsv ? '\n📎 <i>Auto-finds latest CSV in Sandbox if --csv omitted.</i>' : '';
+
+        await ctx.reply(`🔄 Running <b>${entry.label}</b>…${chromeNote}${csvNote}`, { parse_mode: 'HTML' });
+
+        try {
+            const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+            const out = (stdout || '').slice(-2000);
+            const errOut = (stderr || '').slice(-500);
+            const summary = out || errOut || 'No output';
+            await ctx.reply(
+                `✅ <b>${entry.label} Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`,
+                { parse_mode: 'HTML', disable_web_page_preview: true }
+            );
+        } catch (err: any) {
+            const out = (err.stdout || '').slice(-1500);
+            const errOut = (err.stderr || '').slice(-500);
+            await ctx.reply(
+                `⚠️ <b>${entry.label} Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`,
+                { parse_mode: 'HTML', disable_web_page_preview: true }
+            );
+        }
+    });
+
     bot.command('uline', async (ctx) => {
         await ctx.reply('🔍 Checking ULINE status…');
         const ops = (bot.context as any).opsManager;
@@ -1469,6 +1584,42 @@ bot.on('text', async (ctx) => {
                 : `<a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a>`),
             { parse_mode: 'HTML', disable_web_page_preview: true }
         );
+    });
+
+    // ── RECEIVED PO SWEEP ───────────────────────────────────────────────────────
+    bot.command('received', async (ctx) => {
+        const args = ctx.message.text.split(' ').slice(1);
+        const dryRun = args.includes('--dry-run');
+        const daysArg = args.find((a: string) => a.startsWith('--days='));
+        const days = daysArg ? daysArg.split('=')[1] : '60';
+        const flagStr = dryRun ? ' --dry-run' : '';
+
+        await ctx.reply(`🔄 Running PO sweep (last ${days} days)…`);
+
+        const { exec: _exec } = await import('child_process');
+        const { promisify: _promisify } = await import('util');
+        const execAsync = _promisify(_exec);
+
+        try {
+            const { stdout, stderr } = await execAsync(
+                `node --import tsx src/cli/reconcile-received-pos.ts --days=${days}${flagStr}`,
+                { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 }
+            );
+            const out = (stdout || '').slice(-2000);
+            const errOut = (stderr || '').slice(-500);
+            const summary = out || errOut || 'No output';
+            await ctx.reply(
+                `✅ <b>PO Sweep Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`,
+                { parse_mode: 'HTML', disable_web_page_preview: true }
+            );
+        } catch (err: any) {
+            const out = (err.stdout || '').slice(-1500);
+            const errOut = (err.stderr || '').slice(-500);
+            await ctx.reply(
+                `⚠️ <b>PO Sweep Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`,
+                { parse_mode: 'HTML', disable_web_page_preview: true }
+            );
+        }
     });
 
     })();
