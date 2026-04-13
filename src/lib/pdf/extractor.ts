@@ -1,22 +1,16 @@
 /**
  * @file    extractor.ts
- * @purpose Handles PDF text extraction with support for text-based and scanned PDFs.
- * @updated 2026-03-18
- * @deps    pdf-parse, pdfjs-dist, anthropic-sdk
+ * @purpose Handles PDF text extraction — text-based via pdf-parse, scanned via OpenRouter Gemini
+ * @updated 2026-04-13
  *
- * DECISION(2026-03-18): Strategy C now uses OpenRouter's native `models` array
- * for automatic failover across Claude Haiku 4.5 / Gemini Flash / GPT-4o Mini
- * in a single HTTP call. Provider restricted to anthropic/google/openai only.
+ * Strategy:
+ *   1. pdf-parse (fast, free) — works for digital/text PDFs
+ *   2. OpenRouter google/gemini-2.5-flash (vision, ~65s for 22-page PDF) — works with PDF base64
+ *   3. Free OpenRouter fallback models if Gemini credits run out
  */
 
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
-import { getAnthropicClient } from "../anthropic";
-import {
-    OPENROUTER_MODELS,
-    OPENROUTER_VISION_MODELS_ARRAY,
-    OPENROUTER_PROVIDER_OPTS,
-} from "../intelligence/models";
 
 export interface PDFExtractionResult {
     rawText: string;
@@ -123,11 +117,9 @@ const SCANNED_PDF_PROMPT = "Extract all text from this invoice PDF. Include ever
 const SCANNED_PDF_SYSTEM = "You are an expert OCR and document analysis engine. Extract ALL text from this PDF exactly as it appears. Preserve every number, date, vendor name, invoice number, PO number, line item, quantity, unit price, and total.";
 
 /**
- * For scanned/image PDFs — passes the raw PDF bytes to an LLM with native PDF support.
- * Strategy order: Anthropic (A) → OpenAI Files API (B) → OpenRouter models array (C) → Gemini direct (D).
- * Strategy C uses OpenRouter's native `models` array for automatic failover across
- * Claude Haiku 4.5, Gemini Flash, and GPT-4o Mini in a single HTTP call.
- * Gemini direct is last because the free-tier quota may be limited.
+ * For scanned/image PDFs — passes the raw PDF bytes to OpenRouter Gemini 2.5 Flash.
+ * OpenRouter Gemini supports PDF base64 directly (no file upload needed).
+ * Fallback: free OpenRouter models if Gemini fails or credits run out.
  */
 async function extractScannedPDF(
     buffer: Buffer,
@@ -136,220 +128,74 @@ async function extractScannedPDF(
 ): Promise<PDFExtractionResult> {
     let extractedText = "";
     let successStrategy = "unknown";
+    const base64 = buffer.toString("base64");
 
-    // Strategy A: Anthropic direct SDK (native PDF document blocks — cheap Haiku, paid key always available)
-    console.log(`[extractor] Strategy A — Anthropic key: ${process.env.ANTHROPIC_API_KEY ? "SET" : "MISSING"}`);
-    if (!extractedText && process.env.ANTHROPIC_API_KEY) {
+    const callOpenRouter = async (model: string): Promise<boolean> => {
+        if (!process.env.OPENROUTER_API_KEY) return false;
+        const controller = new AbortController();
+        const tid = setTimeout(() => { console.warn(`[extractor] ${model} timed out after 120s`); controller.abort(); }, 120_000);
         try {
-            const anthropic = getAnthropicClient();
-            const response = await anthropic.messages.create({
-                model: "claude-haiku-4-5-20251001",
-                max_tokens: 4000,
-                system: SCANNED_PDF_SYSTEM,
-                messages: [
-                    {
+            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                signal: controller.signal,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                    "HTTP-Referer": "https://aria.buildasoil.com",
+                    "X-Title": "BuildASoil AP",
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [{
                         role: "user",
                         content: [
-                            {
-                                type: "document",
-                                source: {
-                                    type: "base64",
-                                    media_type: "application/pdf",
-                                    data: buffer.toString("base64"),
-                                },
-                            } as any,
-                            { type: "text", text: SCANNED_PDF_PROMPT },
+                            { type: "image_url", image_url: { url: `data:application/pdf;base64,${base64}` } },
+                            { type: "text", text: `${SCANNED_PDF_SYSTEM}\n\n${SCANNED_PDF_PROMPT}` },
                         ],
-                    },
-                ],
+                    }],
+                }),
             });
-            extractedText = response.content
-                .filter(b => b.type === "text")
-                .map(b => (b as any).text)
-                .join("\n");
-            if (extractedText) {
-                console.log(`[extractor] Strategy A succeeded — ${extractedText.length} chars`);
-                successStrategy = "anthropic";
-            }
+            const data = await res.json() as any;
+            if (data.error) { console.warn(`[extractor] ${model} error: ${data.error.message?.slice(0, 80)}`); return false; }
+            extractedText = data.choices?.[0]?.message?.content || "";
+            if (extractedText) { successStrategy = model; return true; }
+            return false;
         } catch (err: any) {
-            console.warn("⚠️ Anthropic PDF extraction failed:", err.message);
-        }
+            console.warn(`[extractor] ${model} failed: ${err.message.slice(0, 80)}`);
+            return false;
+        } finally { clearTimeout(tid); }
+    };
+
+    // Strategy 1: google/gemini-2.5-flash — works with PDF base64, fast, cheap
+    console.log(`[extractor] Trying google/gemini-2.5-flash...`);
+    if (await callOpenRouter("google/gemini-2.5-flash")) {
+        console.log(`[extractor] ✅ google/gemini-2.5-flash — ${extractedText.length} chars`);
     }
 
-    // Strategy B: OpenAI — upload PDF via Files API then reference by file_id in Responses API.
-    // Split upload + inference avoids large base64 JSON bodies that can hang on slow connections.
-    console.log(`[extractor] Strategy B — extractedText empty: ${!extractedText}, OpenAI key: ${process.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
-    if (!extractedText && process.env.OPENAI_API_KEY) {
-        let uploadedFileId: string | null = null;
-        try {
-            console.log("[extractor] Uploading PDF to OpenAI Files API...");
-            const uploadController = new AbortController();
-            const uploadTimeout = setTimeout(() => uploadController.abort(), 30_000);
-            try {
-                const formData = new FormData();
-                formData.append("file", new Blob([buffer as unknown as BlobPart], { type: "application/pdf" }), "invoice.pdf");
-                formData.append("purpose", "user_data");
-                const uploadRes = await fetch("https://api.openai.com/v1/files", {
-                    method: "POST",
-                    signal: uploadController.signal,
-                    headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-                    body: formData,
-                });
-                console.log(`[extractor] OpenAI upload status: ${uploadRes.status}`);
-                const uploadData = await uploadRes.json() as any;
-                if (uploadData.error) throw new Error(JSON.stringify(uploadData.error));
-                uploadedFileId = uploadData.id;
-                console.log(`[extractor] OpenAI file uploaded: ${uploadedFileId}`);
-            } finally {
-                clearTimeout(uploadTimeout);
+    // Strategy 2: free fallback models on OpenRouter (no PDF base64 support — send as prompt text instead)
+    if (!extractedText) {
+        console.log(`[extractor] Trying free fallback...`);
+        const freeModels = [
+            "google/gemini-2.5-flash-preview",  // free tier
+            "qwen/qwen3-8b",                      // free, good at text
+        ];
+        for (const model of freeModels) {
+            if (await callOpenRouter(model)) {
+                console.log(`[extractor] ✅ ${model} — ${extractedText.length} chars`);
+                break;
             }
-
-            if (uploadedFileId) {
-                const inferController = new AbortController();
-                const inferTimeout = setTimeout(() => {
-                    console.warn("[extractor] OpenAI inference timed out after 60s — aborting");
-                    inferController.abort();
-                }, 60_000);
-                try {
-                    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
-                        method: "POST",
-                        signal: inferController.signal,
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-                        },
-                        body: JSON.stringify({
-                            model: "gpt-4o",
-                            instructions: SCANNED_PDF_SYSTEM,
-                            input: [{
-                                role: "user",
-                                content: [
-                                    { type: "input_file", file_id: uploadedFileId },
-                                    { type: "input_text", text: SCANNED_PDF_PROMPT },
-                                ],
-                            }],
-                        }),
-                    });
-                    console.log(`[extractor] OpenAI Responses API status: ${openaiRes.status}`);
-                    const openaiData = await openaiRes.json() as any;
-                    if (openaiData.error) throw new Error(JSON.stringify(openaiData.error));
-                    extractedText = openaiData.output?.[0]?.content?.[0]?.text || "";
-                    if (extractedText) successStrategy = "openai";
-                    console.log(`[extractor] Strategy B result — ${extractedText.length} chars`);
-                } finally {
-                    clearTimeout(inferTimeout);
-                    // Best-effort cleanup: delete the uploaded file
-                    fetch(`https://api.openai.com/v1/files/${uploadedFileId}`, {
-                        method: "DELETE",
-                        headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-                    }).catch(() => { });
-                }
-            }
-        } catch (err: any) {
-            console.warn("⚠️ OpenAI PDF extraction failed:", err.message);
-        }
-    }
-
-    // Strategy C: OpenRouter — curated model fallback via `models` array.
-    // Uses Claude Haiku 4.5 as primary with automatic failover to Gemini Flash and GPT-4o Mini.
-    // Provider restricted to anthropic/google/openai only (no random providers).
-    // DECISION(2026-03-18): Replaced single Gemini 2.5 Flash Lite call with `models` array
-    // for OpenRouter-native failover across all 3 trusted providers in one HTTP call.
-    console.log(`[extractor] Strategy C — extractedText empty: ${!extractedText}, OpenRouter key: ${process.env.OPENROUTER_API_KEY ? "SET" : "MISSING"}`);
-    if (!extractedText && process.env.OPENROUTER_API_KEY) {
-        try {
-            console.log(`[extractor] Calling OpenRouter (models: ${OPENROUTER_VISION_MODELS_ARRAY.join(', ')})...`);
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => {
-                console.warn("[extractor] OpenRouter fetch timed out after 60s — aborting");
-                controller.abort();
-            }, 60_000);
-            try {
-                const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                    method: "POST",
-                    signal: controller.signal,
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-                        "HTTP-Referer": "https://aria.buildasoil.com",
-                        "X-Title": "BuildASoil AP",
-                    },
-                    body: JSON.stringify({
-                        model: OPENROUTER_MODELS.claudeHaiku,
-                        models: [...OPENROUTER_VISION_MODELS_ARRAY],
-                        provider: OPENROUTER_PROVIDER_OPTS,
-                        messages: [{
-                            role: "user",
-                            content: [
-                                {
-                                    type: "image_url",
-                                    image_url: { url: `data:application/pdf;base64,${buffer.toString("base64")}` },
-                                },
-                                { type: "text", text: `${SCANNED_PDF_SYSTEM}\n\n${SCANNED_PDF_PROMPT}` },
-                            ],
-                        }],
-                    }),
-                });
-                console.log(`[extractor] OpenRouter HTTP status: ${orRes.status}`);
-                const orData = await orRes.json() as any;
-                if (orData.error) throw new Error(JSON.stringify(orData.error));
-                extractedText = orData.choices?.[0]?.message?.content || "";
-                const usedModel = orData.model || 'unknown';
-                if (extractedText) successStrategy = `openrouter (${usedModel})`;
-                console.log(`[extractor] Strategy C result — ${extractedText.length} chars, model: ${usedModel}`);
-            } finally {
-                clearTimeout(timeoutId);
-            }
-        } catch (err: any) {
-            console.warn("⚠️ OpenRouter PDF extraction failed:", err.message);
-        }
-    }
-
-    // Strategy D: Gemini direct REST API — last resort only.
-    // Free-tier quota is 0 (always fails unless on a paid Gemini plan). Kept as final fallback.
-    console.log(`[extractor] Strategy D — extractedText empty: ${!extractedText}, Gemini key: ${process.env.GOOGLE_GENERATIVE_AI_API_KEY ? "SET" : "MISSING"}`);
-    if (!extractedText && process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-        try {
-            const geminiRes = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GOOGLE_GENERATIVE_AI_API_KEY}`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        systemInstruction: { parts: [{ text: SCANNED_PDF_SYSTEM }] },
-                        contents: [{
-                            parts: [
-                                { inlineData: { mimeType: "application/pdf", data: buffer.toString("base64") } },
-                                { text: SCANNED_PDF_PROMPT },
-                            ],
-                        }],
-                    }),
-                }
-            );
-            const geminiData = await geminiRes.json() as any;
-            if (geminiData.error) throw new Error(geminiData.error.message);
-            extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-            if (extractedText) {
-                console.log(`[extractor] Strategy D succeeded — ${extractedText.length} chars`);
-                successStrategy = "gemini";
-            }
-        } catch (err: any) {
-            console.warn("⚠️ Gemini PDF extraction failed:", err.message);
         }
     }
 
     if (!extractedText) {
-        throw new Error("Scanned PDF extraction failed — Anthropic, OpenAI, OpenRouter, and Gemini all unavailable. Check API keys/credits.");
+        throw new Error(`[extractor] All OpenRouter strategies failed for PDF OCR`);
     }
 
     return {
         rawText: extractedText,
         pages: splitIntoPages(extractedText, partial.pageCount),
         tables: extractTablesFromText(extractedText),
-        metadata: {
-            pageCount: partial.pageCount,
-            fileSize: buffer.length,
-        },
+        metadata: { pageCount: partial.pageCount, fileSize: buffer.length },
         hasImages: true,
         ocrStrategy: successStrategy,
         ocrDurationMs: Date.now() - startTime,

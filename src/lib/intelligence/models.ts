@@ -75,7 +75,7 @@ export const OPENROUTER_CHAT_CHAIN = [
  * Used by extractor.ts for server-side model fallback (one HTTP call).
  */
 export const OPENROUTER_VISION_MODELS_ARRAY = [
-    OPENROUTER_MODELS.claudeHaiku,
-    OPENROUTER_MODELS.geminiFlash,
-    OPENROUTER_MODELS.gpt4oMini,
+    OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first
+    OPENROUTER_MODELS.claudeHaiku,  // ❌ PDF base64 → 400 error
+    OPENROUTER_MODELS.gpt4oMini,    // Unlikely to support PDF base64
 ] as const;

@@ -16,6 +16,7 @@
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
+import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@supabase/supabase-js";
 import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
@@ -62,7 +63,7 @@ function parseArgs() {
 
 async function fetchAAACooperStatements(): Promise<StatementEmail[]> {
     const auth = await getAuthenticatedClient("ap");
-    const gmail = (await import("googleapis")).google.gmail({ version: "v1", auth });
+    const gmail = GmailApi({ version: "v1", auth });
 
     console.log("Searching ap@buildasoil.com for AAA Cooper statements...");
 
@@ -269,7 +270,7 @@ async function main() {
     console.log(`\nProcessing up to ${limit} statement email(s)...\n`);
 
     const auth = await getAuthenticatedClient("ap");
-    const gmail = (await import("googleapis")).google.gmail({ version: "v1", auth });
+    const gmail = GmailApi({ version: "v1", auth });
     const supabase = createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         process.env.SUPABASE_SERVICE_ROLE_KEY!,

@@ -63,6 +63,7 @@ worktrees/
 .basauto-profile/
 .basauto-session.json
 chrome-profile/
+AppData/
 
 # ─── AI Agent Configs (catch-all) ─────────────────
 # Only .agents/ and .firecrawl/ are tracked for this project.
