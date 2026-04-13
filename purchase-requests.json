@@ -1,6 +1,17 @@
 {
-  "scrapedAt": "2026-04-09T15:01:09.466Z",
+  "scrapedAt": "2026-04-13T15:01:02.212Z",
   "requests": [
+    {
+      "_source": "table",
+      "date": "4/9/2026, 11:05:54 AM",
+      "department": "Shipping",
+      "type": "Existing product",
+      "details": "WALGLASS Double-Sided White Board, 24\" x 18\" Dry Erase Board",
+      "quantity": "1",
+      "link": "Open product",
+      "status": "Pending",
+      "ordered": "Mark ordered"
+    },
     {
       "_source": "table",
       "date": "4/8/2026, 12:48:10 PM",
@@ -31,7 +42,7 @@
       "details": "Poly Bags-Reclosable - (12\"x15\" - 4mil - 500/Box)",
       "quantity": "2",
       "link": "Open product",
-      "status": "Pending",
+      "status": "Ordered",
       "ordered": "Mark ordered"
     },
     {
@@ -42,7 +53,7 @@
       "details": "Laser Labels Fl Red - (8.5\"x11\")",
       "quantity": "4",
       "link": "Open product",
-      "status": "Pending",
+      "status": "Ordered",
       "ordered": "Mark ordered"
     },
     {
@@ -53,7 +64,7 @@
       "details": "Poly Bags-Reclosable - (12\"x15\" - 6mil - 500/Box)",
       "quantity": "1",
       "link": "Open product",
-      "status": "Pending",
+      "status": "Ordered",
       "ordered": "Mark ordered"
     },
     {
@@ -64,7 +75,7 @@
       "details": "Poly Bags-Reclosable - (9\"x12\" - 6mil - 500/Box)",
       "quantity": "1",
       "link": "Open product",
-      "status": "Pending",
+      "status": "Ordered",
       "ordered": "Mark ordered"
     },
     {
@@ -75,7 +86,7 @@
       "details": "Gription Cut Resistant Gloves - Lime, Medium",
       "quantity": "1",
       "link": "Open product",
-      "status": "Pending",
+      "status": "Ordered",
       "ordered": "Mark ordered"
     },
     {
@@ -134,5 +145,5 @@
       "ordered": "Mark ordered"
     }
   ],
-  "rawDump": "Purchases▼Tutorial 🚀PurchasesOverdue HistoryPurchase Request FormRequest FormDepartmentSoilMFGITShippingFreightOpsInventoryCustomer ServiceProduct typeExisting productRequest new productScan product barcodeOnly these Finale categories: Bottles/Caps, Boxes, Envelopes, Equipment-Asset, First Aid, Job Supplies, Office Supplies, PPE-Personal Protective Equipment, Supplies. Use scan gun to quickly find products.Or search by descriptionQuantitySubmit requestRequest logDateDepartmentTypeDetailsQuantityLinkStatusOrdered4/8/2026, 12:48:10 PMFreightNew productAcrylic Organizer with 16 Drawers: Organize our shelves and keep dust out.—Open productPendingMark ordered4/8/2026, 12:26:59 PMSoilNew productS-26579BL Sharpie S-Gel Medium (pack of 12): To write epic tales of majestic kingdoms and buxom princesses.—Open productPendingMark ordered4/8/2026, 12:19:05 PMFreightExisting productPoly Bags-Reclosable - (12\"x15\" - 4mil - 500/Box)2Open productPendingMark ordered4/8/2026, 12:17:45 PMFreightExisting productLaser Labels Fl Red - (8.5\"x11\")4Open productPendingMark ordered4/8/2026, 11:03:45 AMShippingExisting productPoly Bags-Reclosable - (12\"x15\" - 6mil - 500/Box)1Open productPendingMark ordered4/8/2026, 11:03:22 AMShippingExisting productPoly Bags-Reclosable - (9\"x12\" - 6mil - 500/Box)1Open productPendingMark ordered4/3/2026, 7:59:10 AMShippingExisting productGription Cut Resistant Gloves - Lime, Medium1Open productPendingMark ordered4/3/2026, 7:53:32 AMShippingExisting productBrother Genuine TN830XL Black High Yield 9Shipping)2Open productOrderedMark ordered4/2/2026, 3:51:19 PMShippingExisting productLR44 Batteries Ea100Open productOrderedMark ordered4/2/2026, 3:40:50 PMCustomer ServiceNew product80mm Thermal Receipt Paper for TSP100: We are down to our last roll of receipt printer for the POS cash drawer system—Open productOrderedMark ordered4/2/2026, 3:25:58 PMSoilExisting productSoap-Seventh Generation Liquid - (8 Pk)1Open productOrderedMark ordered3/30/2026, 3:18:31 PMMFGExisting productExtra Large Gloves1Open productOrderedMark ordered"
+  "rawDump": "Purchases▼Tutorial 🚀PurchasesOverdue HistoryPurchase Request FormRequest FormDepartmentSoilMFGITShippingFreightOpsInventoryCustomer ServiceProduct typeExisting productRequest new productScan product barcodeOnly these Finale categories: Bottles/Caps, Boxes, Envelopes, Equipment-Asset, First Aid, Job Supplies, Office Supplies, PPE-Personal Protective Equipment, Supplies. Use scan gun to quickly find products.Or search by descriptionQuantitySubmit requestRequest logDateDepartmentTypeDetailsQuantityLinkStatusOrdered4/9/2026, 11:05:54 AMShippingExisting productWALGLASS Double-Sided White Board, 24\" x 18\" Dry Erase Board 1Open productPendingMark ordered4/8/2026, 12:48:10 PMFreightNew productAcrylic Organizer with 16 Drawers: Organize our shelves and keep dust out.—Open productPendingMark ordered4/8/2026, 12:26:59 PMSoilNew productS-26579BL Sharpie S-Gel Medium (pack of 12): To write epic tales of majestic kingdoms and buxom princesses.—Open productPendingMark ordered4/8/2026, 12:19:05 PMFreightExisting productPoly Bags-Reclosable - (12\"x15\" - 4mil - 500/Box)2Open productOrderedMark ordered4/8/2026, 12:17:45 PMFreightExisting productLaser Labels Fl Red - (8.5\"x11\")4Open productOrderedMark ordered4/8/2026, 11:03:45 AMShippingExisting productPoly Bags-Reclosable - (12\"x15\" - 6mil - 500/Box)1Open productOrderedMark ordered4/8/2026, 11:03:22 AMShippingExisting productPoly Bags-Reclosable - (9\"x12\" - 6mil - 500/Box)1Open productOrderedMark ordered4/3/2026, 7:59:10 AMShippingExisting productGription Cut Resistant Gloves - Lime, Medium1Open productOrderedMark ordered4/3/2026, 7:53:32 AMShippingExisting productBrother Genuine TN830XL Black High Yield 9Shipping)2Open productOrderedMark ordered4/2/2026, 3:51:19 PMShippingExisting productLR44 Batteries Ea100Open productOrderedMark ordered4/2/2026, 3:40:50 PMCustomer ServiceNew product80mm Thermal Receipt Paper for TSP100: We are down to our last roll of receipt printer for the POS cash drawer system—Open productOrderedMark ordered4/2/2026, 3:25:58 PMSoilExisting productSoap-Seventh Generation Liquid - (8 Pk)1Open productOrderedMark ordered3/30/2026, 3:18:31 PMMFGExisting productExtra Large Gloves1Open productOrderedMark ordered"
 }

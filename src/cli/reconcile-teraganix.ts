@@ -351,46 +351,55 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
 async function main() {
     const args = process.argv.slice(2);
     const dryRun = args.includes('--dry-run');
+    const scrapeOnly = args.includes('--scrape-only');
+    const updateOnly = args.includes('--update-only');
+    const poIdx = args.indexOf('--po');
+    const targetPO = poIdx >= 0 ? args[poIdx + 1] : null;
     
     console.log('╔══════════════════════════════════════════════════╗');
     console.log('║   TeraGanix → Finale Invoice Reconciliation      ║');
     console.log('╚══════════════════════════════════════════════════╝');
     
     if (dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
+    if (scrapeOnly) console.log('   📄 SCRAPE ONLY — fetch emails only, skip Finale\n');
+    if (updateOnly) console.log('   🔄 UPDATE ONLY — using cached email data\n');
+    if (targetPO) console.log(`   🎯 TARGET PO: ${targetPO}\n`);
 
     const invoices = await fetchEmails();
     console.log(`\nExtracted ${invoices.length} valid invoices from emails.`);
     if (invoices.length === 0) return;
 
     // Archive each TeraGanix invoice into vendor_invoices
-    console.log('\n📦 Archiving TeraGanix invoices to vendor_invoices...');
-    let archived = 0;
-    for (const inv of invoices) {
-        try {
-            await upsertVendorInvoice({
-                vendor_name: 'TeraGanix',
-                invoice_number: inv.orderNumber,
-                invoice_date: inv.date,
-                subtotal: inv.subtotal,
-                freight: inv.shipping,
-                tax: inv.tax,
-                total: inv.total,
-                status: 'received',
-                source: 'email_attachment',
-                source_ref: `teraganix-email-${inv.orderNumber}`,
-                line_items: inv.items.map(i => ({
-                    sku: Object.values(skuMapping).find(m => i.name.toLowerCase().includes(Object.keys(skuMapping).find(k => i.name.toLowerCase().includes(k)) || ''))?.sku || i.name,
-                    description: i.name,
-                    qty: i.qty,
-                    unit_price: i.unitPrice,
-                    ext_price: i.lineTotal,
-                })),
-                raw_data: inv as unknown as Record<string, unknown>,
-            });
-            archived++;
-        } catch { /* dedup collision is fine */ }
+    if (!scrapeOnly) {
+        console.log('\n📦 Archiving TeraGanix invoices to vendor_invoices...');
+        let archived = 0;
+        for (const inv of invoices) {
+            try {
+                await upsertVendorInvoice({
+                    vendor_name: 'TeraGanix',
+                    invoice_number: inv.orderNumber,
+                    invoice_date: inv.date,
+                    subtotal: inv.subtotal,
+                    freight: inv.shipping,
+                    tax: inv.tax,
+                    total: inv.total,
+                    status: 'received',
+                    source: 'email_attachment',
+                    source_ref: `teraganix-email-${inv.orderNumber}`,
+                    line_items: inv.items.map(i => ({
+                        sku: Object.values(skuMapping).find(m => i.name.toLowerCase().includes(Object.keys(skuMapping).find(k => i.name.toLowerCase().includes(k)) || ''))?.sku || i.name,
+                        description: i.name,
+                        qty: i.qty,
+                        unit_price: i.unitPrice,
+                        ext_price: i.lineTotal,
+                    })),
+                    raw_data: inv as unknown as Record<string, unknown>,
+                });
+                archived++;
+            } catch { /* dedup collision is fine */ }
+        }
+        console.log(`✅ Archived ${archived}/${invoices.length} TeraGanix invoices`);
     }
-    console.log(`✅ Archived ${archived}/${invoices.length} TeraGanix invoices`);
 
     const finale = new FinaleClient();
     const get = (finale as any).get.bind(finale);
@@ -408,11 +417,19 @@ async function main() {
 
 
     for (const invoice of invoices) {
-        // Find best match 
+        // Find best match
         let bestMatch = null;
         let minDiff = 99999;
         const invDate = new Date(invoice.date).getTime();
         
+        if (targetPO) {
+            const match = vendorPOs.find((po: any) => po.orderId === targetPO);
+            if (match) bestMatch = match;
+            if (!bestMatch) {
+                console.log(`\n❌ Target PO ${targetPO} not found.`);
+                continue;
+            }
+        } else {
         for (const po of vendorPOs) {
             const poDate = new Date(po.orderDate).getTime();
             const diffDays = (invDate - poDate) / (1000 * 60 * 60 * 24);
@@ -444,6 +461,7 @@ async function main() {
                     }
                 }
             }
+        }
         }
 
         if (bestMatch) {
