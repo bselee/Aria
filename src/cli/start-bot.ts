@@ -1331,13 +1331,14 @@ bot.on('text', async (ctx) => {
         const updateOnly = flags.includes('--update-only');
         const poFlag = flags.includes('--po') ? flags[flags.indexOf('--po') + 1] : null;
         const csvFlag = flags.includes('--csv') ? flags[flags.indexOf('--csv') + 1] : null;
+        const limitFlag = flags.includes('--limit') ? flags[flags.indexOf('--limit') + 1] : null;
 
         const VENDORS: Record<string, { script: string; label: string; needsChrome?: boolean; needsCsv?: boolean }> = {
             uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
             axiom:     { script: 'src/cli/reconcile-axiom.ts',      label: 'Axiom Print', needsChrome: true },
             fedex:     { script: 'src/cli/reconcile-fedex.ts',       label: 'FedEx', needsCsv: true },
             teraganix: { script: 'src/cli/reconcile-teraganix.ts',   label: 'TeraGanix' },
-            aaa:       { script: '',                                 label: 'AAA Cooper' },
+            aaa:       { script: 'src/cli/reconcile-aaa.ts',         label: 'AAA Cooper' },
         };
 
         const FLAG_HINTS: Record<string, string> = {
@@ -1345,7 +1346,7 @@ bot.on('text', async (ctx) => {
             axiom:     '--dry-run --scrape-only --update-only --po <id>',
             fedex:     '--dry-run --csv <path>',
             teraganix: '--dry-run',
-            aaa:       '(lookup only — no reconciler)',
+            aaa:       '--dry-run --scrape-only --limit <N>',
         };
 
         if (!vendor) {
@@ -1371,38 +1372,33 @@ bot.on('text', async (ctx) => {
             return;
         }
 
-        // AAA Cooper — no reconciler yet, show recent Finale POs
+        // AAA Cooper — extract invoices from ap@ Gmail, forward each to Bill.com
         if (key === 'aaa') {
-            await ctx.reply('🔍 Looking up AAA Cooper data in Finale…');
-            const FinaleClient = (await import('./lib/finale/client')).FinaleClient;
-            const finale = new FinaleClient();
+            const extraFlags: string[] = [];
+            if (dryRun) extraFlags.push('--dry-run');
+            if (scrapeOnly) extraFlags.push('--scrape-only');
+            if (limitFlag) extraFlags.push('--limit', limitFlag);
+            const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
+            const cmd = `node --import tsx src/cli/reconcile-aaa.ts${flagStr}`;
+            await ctx.reply('🔄 Running <b>AAA Cooper</b> invoice extraction…\n<i>Scans ap@buildasoil.com, splits statement PDFs, forwards invoices to Bill.com.</i>', { parse_mode: 'HTML' });
             try {
-                const partyId = await finale.findVendorPartyByName('AAA COOPER');
-                if (!partyId) {
-                    await ctx.reply('⚠️ AAA Cooper vendor not found in Finale.');
-                    return;
-                }
-                const pos = await finale.findOrdersByVendor(partyId, { status: ['OPEN', 'RECEIVED'], limit: 10 });
-                if (!pos || pos.length === 0) {
-                    await ctx.reply('✅ No recent AAA Cooper POs found.');
-                    return;
-                }
-                const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-                const lines = pos.slice(0, 8).map((po: any) => {
-                    const d = new Date(po.orderDate).toLocaleDateString('en-US', { timeZone: 'America/Denver' });
-                    return `  <a href="https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}">#${po.orderId}</a>  ${d}  ${po.status}`;
-                }).join('\n');
-                await ctx.reply(`📦 <b>AAA Cooper — Recent POs</b>\n\n${lines}`, { parse_mode: 'HTML', disable_web_page_preview: true });
+                const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+                const out = (stdout || '').slice(-2000);
+                const errOut = (stderr || '').slice(-500);
+                const summary = out || errOut || 'No output';
+                await ctx.reply(`✅ <b>AAA Cooper Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`, { parse_mode: 'HTML', disable_web_page_preview: true });
             } catch (err: any) {
-                await ctx.reply(`❌ Lookup failed: ${err.message}`);
+                const out = (err.stdout || '').slice(-1500);
+                const errOut = (err.stderr || '').slice(-500);
+                await ctx.reply(`⚠️ <b>AAA Cooper Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`, { parse_mode: 'HTML', disable_web_page_preview: true });
             }
             return;
         }
 
         // Build flags list per vendor
         const extraFlags: string[] = [];
-        if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix'].includes(key)) extraFlags.push('--dry-run');
-        if (scrapeOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--scrape-only');
+        if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix', 'aaa'].includes(key)) extraFlags.push('--dry-run');
+        if (scrapeOnly && ['uline', 'axiom', 'aaa'].includes(key)) extraFlags.push('--scrape-only');
         if (updateOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--update-only');
         if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
         if (csvFlag && key === 'fedex') extraFlags.push('--csv', csvFlag);
