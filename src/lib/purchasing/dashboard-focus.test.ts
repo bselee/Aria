@@ -75,4 +75,44 @@ describe("dashboard focus helpers", () => {
   it("blocks direct ordering for on-site-order Finale methods", () => {
     expect(canUseDirectOrdering("ULINE", "on_site_order")).toBe(false);
   });
+
+  it("returns 'later' for critical urgency with runway > leadTime (AND logic)", () => {
+    expect(getOrderingFocusBucket({
+      ...baseItem,
+      urgency: "critical",
+      runwayDays: 30,
+      leadTimeDays: 14,
+    })).toBe("later");
+  });
+
+  it("returns 'later' for warning urgency with runway > leadTime+7 (AND logic)", () => {
+    expect(getOrderingFocusBucket({
+      ...baseItem,
+      urgency: "warning",
+      runwayDays: 45,
+      leadTimeDays: 14,
+    })).toBe("later");
+  });
+
+  it("does NOT auto-select when decision is 'hold' even if urgency is critical", () => {
+    expect(shouldAutoSelectItem({
+      ...baseItem,
+      urgency: "critical",
+      assessment: { decision: "hold" },
+    })).toBe(false);
+  });
+
+  it("does NOT auto-select when assessment is absent", () => {
+    expect(shouldAutoSelectItem({
+      ...baseItem,
+      assessment: {},
+    })).toBe(false);
+  });
+
+  it("auto-selects when decision is 'reduce'", () => {
+    expect(shouldAutoSelectItem({
+      ...baseItem,
+      assessment: { decision: "reduce" },
+    })).toBe(true);
+  });
 });

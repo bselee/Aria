@@ -3,6 +3,14 @@
  * @purpose Derive immediate build-component ordering needs + 12-week forward projection
  *          from BuildRiskReport data. No new API calls — all computation from existing
  *          snapshot data (builds, components, fgVelocity).
+ *
+ * ⚠️  DUAL DEMAND MODEL — two panels show different numbers for the same SKU:
+ *   - Build Demand Oracle: component demand derived from BOM explosion + calendar builds
+ *     (forecast, top-down, from build schedule)
+ *   - PurchasingPanel:     component demand from Finale purchaseVelocity / demandVelocity
+ *     (actual, bottom-up, from purchase history)
+ *   Oracle numbers are a FORECAST — they may diverge from PurchasingPanel actuals.
+ *   Use Oracle for build-planning signal; use PurchasingPanel for actual PO decisions.
  */
 
 import type { BuildRiskReport, ComponentDemand, FGVelocity } from './build-risk';
@@ -65,9 +73,20 @@ export interface BuildDemandOracle {
 // ──────────────────────────────────────────────────
 
 /**
+ * Gate: set to true once batch vendor lookup is wired.
+ * Until then, all components show as "Unknown Vendor" — the PO routing
+ * in "Orders Needed Now" won't work, so the banner is hidden.
+ */
+export const ORACLE_ENABLED = false;
+
+export function isOracleEnabled(): boolean {
+    return ORACLE_ENABLED;
+}
+
+/**
  * Placeholder vendor resolver. Returns "Unknown Vendor" until we wire up a batch
  * Finale lookup to get supplier info for each component SKU.
- * 
+ *
  * TODO: wire up `finale.lookupProduct(sku).supplier` batch to resolve real vendor names.
  */
 function resolveVendorName(_sku: string): { vendorName: string; vendorPartyId: string | null } {

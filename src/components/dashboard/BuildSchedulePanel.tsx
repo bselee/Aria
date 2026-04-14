@@ -3,7 +3,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { createBrowserClient } from "@/lib/supabase";
 import { Calendar, AlertTriangle, CheckCircle2, ChevronDown, ShoppingCart, TrendingUp } from "lucide-react";
-import { computeBuildDemandOracle, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
+import { computeBuildDemandOracle, isOracleEnabled, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
 
 type Build = {
   sku: string;
@@ -439,10 +439,10 @@ export default function BuildSchedulePanel() {
       )}
 
       {/* ── Build Demand Oracle: Orders Needed Now ── */}
-      <BuildDemandSection snapshot={snapshot} />
+      {isOracleEnabled() && <BuildDemandSection snapshot={snapshot} />}
 
       {/* ── Build Demand Oracle: 12-Week Forecast ── */}
-      <OracleForecastSection snapshot={snapshot} />
+      {isOracleEnabled() && <OracleForecastSection snapshot={snapshot} />}
     </div>
   );
 }

@@ -425,7 +425,7 @@ export function chooseVelocitySignal(input: {
     salesVelocity: number;
     purchaseVelocity?: number;
     consumptionQty?: number | null;
-}): { dailyRate: number; signal: "demand" | "sales" | "none" } {
+}): { dailyRate: number; signal: "demand" | "sales" | "receipts" | "none" } {
     const reorderMethod = input.reorderMethod ?? "default";
     const demandVelocity = input.demandVelocity > 0 ? input.demandVelocity : 0;
     const salesVelocity = input.salesVelocity > 0 ? input.salesVelocity : 0;
@@ -445,12 +445,8 @@ export function chooseVelocitySignal(input: {
         if (rate > 0) return { dailyRate: rate, signal };
     }
 
-    // FIX(2026-04-14): For BOM items (consumptionQty > 0) where demandVelocity is 0 or negligibly
-    // small but purchaseVelocity has real signal, return purchase signal so the fallback in
-    // getPurchasingIntelligence can use it. This fixes the case where Finale doesn't track BOM
-    // consumption in demandVelocity but purchase history is informative.
-    if (hasConsumption && demandVelocity === 0 && input.purchaseVelocity != null && input.purchaseVelocity > 0) {
-        return { dailyRate: input.purchaseVelocity, signal: "demand" as "sales" | "demand" };
+    if (hasConsumption && input.purchaseVelocity != null && input.purchaseVelocity > 0) {
+        return { dailyRate: input.purchaseVelocity, signal: "receipts" };
     }
 
     return { dailyRate: 0, signal: "none" };
@@ -4509,10 +4505,6 @@ export class FinaleClient {
                         : '14d default';
 
                     // DECISION(2026-03-16): Use GraphQL stock from getProductActivity().
-                    // FIX(2026-04-14): Use this.parseFinaleNum() for the REST fallback — it returns
-                    // null for "--" and missing values instead of 0, so missing data doesn't become
-                    // false-critical stock=0. GraphQL already returns null via parseFinaleNum in
-                    // getProductActivity (line 4326), so activity.stockOnHand is already null-safe.
                     const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
                     const stockOnHand = activity.stockOnHand ?? restStock;
 
@@ -4530,36 +4522,18 @@ export class FinaleClient {
                             ? candidate.finaleDemandQty / 90
                             : 0;
 
-                    // DECISION(2026-03-31): Reverting to prefer demandVelocity (Finale's 90-day calculation)
-                    // over purchaseVelocity. Using `max(demand, purchase)` caused items with historic bulk
-                    // purchases to artificially inflate the daily rate, causing ARIA to warn of stockouts
-                    // when Finale correctly showed 90+ days of runway based on current velocity.
-                    // We only fall back to purchaseVelocity if demand is strictly 0 (e.g., untracked boxes).
+                    // DECISION(2026-03-31): Prefer demandVelocity over purchaseVelocity.
+                    // We fall back to purchaseVelocity via chooseVelocitySignal BOM→receipts fallback
+                    // (handles items where Finale doesn't track BOM consumption in demandVelocity).
                     const chosenVelocity = chooseVelocitySignal({
                         reorderMethod,
                         demandVelocity,
                         salesVelocity,
+                        purchaseVelocity,
                         consumptionQty: candidate.finaleConsumptionQty,
                     });
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
-                    // FIX(2026-04-14): Fall back to purchaseVelocity when demandVelocity is negligibly small
-                    // but purchase history is informative. "Strictly 0" was too strict — BOM items often have
-                    // demandVelocity ≈ 0 (Finale doesn't track BOM consumption) while purchase history is
-                    // the only real signal. Also check demandVelocity < 0.01 (≈ 1 unit in 100 days) as
-                    // effectively zero, especially for BOM components where Finale under-reports demand.
-                    const isDemandNegligible = demandVelocity < 0.01;
-                    if (isDemandNegligible && purchaseVelocity > 0) {
-                        let daysSinceLastPurchase = 999;
-                        if (activity.lastPurchaseDate) {
-                            const lp = new Date(activity.lastPurchaseDate);
-                            daysSinceLastPurchase = (Date.now() - lp.getTime()) / (1000 * 60 * 60 * 24);
-                        }
-                        if (daysSinceLastPurchase <= 180 || activity.openPOs.length > 0) {
-                            dailyRate = purchaseVelocity;
-                            rateSource = "receipts";
-                        }
-                    }
 
                     if (dailyRate === 0) continue; // no actual movement within windows
 
@@ -4571,12 +4545,8 @@ export class FinaleClient {
                             ? `${daysBack}d sales`
                             : `${daysBack}d receipts`;
 
-                    // FIX(2026-04-14): stockOnHand can be null if GraphQL and REST both lack data
-                    // (both returned null/"--"). Use ?? 0 so we still compute runway (as unknown/0),
-                    // but also check for null to skip items with zero computed runway as a safety guard.
                     const effectiveStock = stockOnHand ?? 0;
                     if (effectiveStock === 0 && stockOnHand === null) {
-                        // No stock data from either GraphQL or REST — item is untrackable; skip it
                         console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku}, skipping`);
                         continue;
                     }
