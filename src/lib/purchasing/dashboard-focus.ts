@@ -23,6 +23,16 @@ export function getOrderingFocusBucket(item: FocusItem): OrderingFocusBucket {
   const runwayDays = Number.isFinite(item.runwayDays) ? item.runwayDays : Number.POSITIVE_INFINITY;
   const leadTimeDays = item.leadTimeDays && item.leadTimeDays > 0 ? item.leadTimeDays : 7;
 
+  // FIX(2026-04-14): Use AND logic — item must have urgency AND runway pressure to qualify.
+  // Previously used OR, which made any "warning" item land in "week" regardless of runway,
+  // and any item within leadTime land in "today" regardless of urgency.
+  if (item.urgency === "critical" && runwayDays <= leadTimeDays) {
+    return "today";
+  }
+  if (item.urgency === "warning" && runwayDays <= leadTimeDays + 7) {
+    return "week";
+  }
+  // catch-alls for orphaned states
   if (item.urgency === "critical" || runwayDays <= leadTimeDays) {
     return "today";
   }
@@ -43,12 +53,12 @@ export function shouldAutoSelectItem(
     return false;
   }
 
+  // FIX(2026-04-14): Only auto-select items with an explicit policy decision of "order" or
+  // "reduce". Previously fell back to `urgency === "critical"`, which auto-selected held items
+  // (critical urgency but decision=hold), showing editable qty = nonzero suggestedQty even
+  // though the policy engine recommended 0. A held item should never be pre-checked.
   const decision = item.assessment?.decision;
-  if (decision === "order" || decision === "reduce") {
-    return true;
-  }
-
-  return item.urgency === "critical" || item.urgency === "warning";
+  return decision === "order" || decision === "reduce";
 }
 
 export function canIncludeInDraftPO(

@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { createBrowserClient } from "@/lib/supabase";
-import { Calendar, AlertTriangle, CheckCircle2, ChevronDown } from "lucide-react";
+import { Calendar, AlertTriangle, CheckCircle2, ChevronDown, ShoppingCart, TrendingUp } from "lucide-react";
+import { computeBuildDemandOracle, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
 
 type Build = {
   sku: string;
@@ -436,6 +437,167 @@ export default function BuildSchedulePanel() {
           )}
         </div>
       )}
+
+      {/* ── Build Demand Oracle: Orders Needed Now ── */}
+      <BuildDemandSection snapshot={snapshot} />
+
+      {/* ── Build Demand Oracle: 12-Week Forecast ── */}
+      <OracleForecastSection snapshot={snapshot} />
     </div>
   );
+}
+
+// ── Build Demand Oracle: Orders Needed Now ──────────────────────────────────
+
+function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  const oracle = useMemo<BuildDemandOracle | null>(() => {
+    if (!snapshot) return null;
+    // Build a minimal BuildRiskReport from snapshot data
+    const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
+    return computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+  }, [snapshot]);
+
+  if (!oracle || oracle.ordersNeededNow.length === 0) return null;
+
+  return (
+    <div className="border-t border-zinc-800/50">
+      <button
+        onClick={() => setCollapsed(!collapsed)}
+        className="w-full px-4 py-2.5 flex items-center justify-between bg-amber-500/5 hover:bg-amber-500/10 transition-colors border-y border-amber-500/20"
+      >
+        <div className="flex items-center gap-2">
+          <ShoppingCart className="w-3.5 h-3.5 text-amber-400" />
+          <span className="text-[12px] font-mono font-semibold text-amber-300 uppercase tracking-widest">Build Demand — Orders Needed Now</span>
+          <span className="text-[10px] font-mono text-amber-600 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded-full">
+            {oracle.stats.criticalCount} CRIT · {oracle.stats.warningCount} WARN
+          </span>
+        </div>
+        <ChevronDown className={`w-3.5 h-3.5 text-amber-400/50 transition-transform ${collapsed ? "" : "rotate-180"}`} />
+      </button>
+
+      {!collapsed && (
+        <div className="divide-y divide-zinc-800/30">
+          {oracle.ordersNeededNow.map(group => (
+            <div key={group.vendorName} className="px-4 py-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[11px] font-mono font-semibold text-zinc-300">{group.vendorName}</span>
+                <span className="text-[10px] font-mono text-amber-500">
+                  {group.components.reduce((s, c) => s + c.orderQty, 0).toLocaleString()} units to order
+                </span>
+              </div>
+              <div className="space-y-1.5">
+                {group.components.map(comp => (
+                  <div key={comp.componentSku} className="flex items-center gap-2 text-[11px]">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : 'bg-amber-400'}`} />
+                    <span className="font-mono font-semibold text-zinc-200 w-24 truncate">{comp.componentSku}</span>
+                    <span className="text-zinc-500 font-mono">×{comp.thirtyDayNeed.toLocaleString()} need</span>
+                    <span className={`font-mono ml-auto ${comp.gap < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                      {comp.gap < 0 ? `⚠️ gap ${Math.abs(comp.gap).toLocaleString()}` : `${comp.onHand ?? 0} on hand`}
+                    </span>
+                    <span className="font-mono text-zinc-600 text-[10px]">{comp.leadTimeDays ?? 14}d LT</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Build Demand Oracle: 12-Week Forecast ──────────────────────────────────
+
+function OracleForecastSection({ snapshot }: { snapshot: Snapshot | null }) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  const oracle = useMemo<BuildDemandOracle | null>(() => {
+    if (!snapshot) return null;
+    const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
+    return computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+  }, [snapshot]);
+
+  if (!oracle || oracle.twelveWeekForecast.length === 0) return null;
+
+  return (
+    <div className="border-t border-zinc-800/50">
+      <button
+        onClick={() => setCollapsed(!collapsed)}
+        className="w-full px-4 py-2.5 flex items-center justify-between bg-blue-500/5 hover:bg-blue-500/10 transition-colors border-y border-blue-500/20"
+      >
+        <div className="flex items-center gap-2">
+          <TrendingUp className="w-3.5 h-3.5 text-blue-400" />
+          <span className="text-[12px] font-mono font-semibold text-blue-300 uppercase tracking-widest">Oracle: 12-Week Forecast</span>
+          <span className="text-[10px] font-mono text-blue-600 border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 rounded-full">
+            {oracle.stats.totalComponentsTracked} tracked
+          </span>
+        </div>
+        <ChevronDown className={`w-3.5 h-3.5 text-blue-400/50 transition-transform ${collapsed ? "" : "rotate-180"}`} />
+      </button>
+
+      {!collapsed && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-[11px] font-mono">
+            <thead>
+              <tr className="border-b border-zinc-800/50">
+                <th className="px-4 py-2 text-left text-zinc-500 font-semibold">SKU</th>
+                <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 1-4</th>
+                <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 5-8</th>
+                <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 9-12</th>
+                <th className="px-3 py-2 text-right text-zinc-500 font-semibold">On Hand</th>
+                <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Runway</th>
+                <th className="px-4 py-2 text-right text-zinc-500 font-semibold">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-800/20">
+              {oracle.twelveWeekForecast.flatMap(g =>
+                g.components.map(comp => (
+                  <tr key={comp.componentSku} className="hover:bg-zinc-800/20">
+                    <td className="px-4 py-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : comp.riskLevel === 'WARNING' ? 'bg-amber-400' : 'bg-blue-400'}`} />
+                        <span className="font-semibold text-zinc-200 truncate">{comp.componentSku}</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW149 > 0 ? comp.weeklyNeedW149.toLocaleString() : '—'}</td>
+                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW158 > 0 ? `${comp.weeklyNeedW158.toLocaleString()} (est.)` : '—'}</td>
+                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW1912 > 0 ? `${comp.weeklyNeedW1912.toLocaleString()} (est.)` : '—'}</td>
+                    <td className="px-3 py-2 text-right text-zinc-400">{comp.onHand ?? '?'}</td>
+                    <td className="px-3 py-2 text-right">
+                      {comp.stockoutDays != null ? `${comp.stockoutDays}d` : '—'}
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      <span className={`font-semibold ${comp.oracleStatus === 'ORDER NOW' ? 'text-rose-400' : comp.oracleStatus === 'REORDER SOON' ? 'text-amber-400' : 'text-emerald-400'}`}>
+                        {comp.oracleStatus}
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Snapshot → BuildRiskReport adapter ─────────────────────────────────────
+
+function snapshotDataToReport(snapshot: Snapshot) {
+  // Convert plain-object snapshot (no Sets/Maps) to BuildRiskReport shape
+  const builds = snapshot.builds.map((b: Build) => ({
+    ...b,
+    designations: new Set([b.designation]),
+  }));
+  const components = new Map<string, any>(
+    Object.entries(snapshot.components ?? {}).map(([sku, comp]: [string, any]) => [
+      sku,
+      { ...comp, usedIn: new Set(comp.usedIn ?? []), designations: new Set() },
+    ]),
+  );
+  const fgVelocity = new Map<string, any>();
+  return { builds, components, fgVelocity };
 }
