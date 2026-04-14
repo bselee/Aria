@@ -48,4 +48,33 @@ describe("normalizeFinaleReorderMethod", () => {
       consumptionQty: 20,
     })).toEqual({ dailyRate: 1, signal: "sales" });
   });
+
+  it("returns receipts signal + purchaseVelocity when demand=0, sales=0, consumption > 0, purchaseVelocity > 0", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0,
+      salesVelocity: 0,
+      purchaseVelocity: 5,
+      consumptionQty: 20,
+    })).toEqual({ dailyRate: 5, signal: "receipts" });
+  });
+
+  it("does not fall back to receipts when purchaseVelocity is not provided", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0,
+      salesVelocity: 0,
+      consumptionQty: 20,
+    })).toEqual({ dailyRate: 0, signal: "none" });
+  });
+
+  it("prefers demand signal over receipts even with consumption + purchaseVelocity", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 3,
+      salesVelocity: 0,
+      purchaseVelocity: 5,
+      consumptionQty: 20,
+    })).toEqual({ dailyRate: 3, signal: "demand" });
+  });
 });
