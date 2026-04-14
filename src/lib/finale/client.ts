@@ -423,6 +423,7 @@ export function chooseVelocitySignal(input: {
     reorderMethod?: FinaleReorderMethod;
     demandVelocity: number;
     salesVelocity: number;
+    purchaseVelocity?: number;
     consumptionQty?: number | null;
 }): { dailyRate: number; signal: "demand" | "sales" | "none" } {
     const reorderMethod = input.reorderMethod ?? "default";
@@ -442,6 +443,14 @@ export function chooseVelocitySignal(input: {
     for (const signal of preferredSignals) {
         const rate = signal === "demand" ? demandVelocity : salesVelocity;
         if (rate > 0) return { dailyRate: rate, signal };
+    }
+
+    // FIX(2026-04-14): For BOM items (consumptionQty > 0) where demandVelocity is 0 or negligibly
+    // small but purchaseVelocity has real signal, return purchase signal so the fallback in
+    // getPurchasingIntelligence can use it. This fixes the case where Finale doesn't track BOM
+    // consumption in demandVelocity but purchase history is informative.
+    if (hasConsumption && demandVelocity === 0 && input.purchaseVelocity != null && input.purchaseVelocity > 0) {
+        return { dailyRate: input.purchaseVelocity, signal: "demand" as "sales" | "demand" };
     }
 
     return { dailyRate: 0, signal: "none" };
@@ -4500,13 +4509,15 @@ export class FinaleClient {
                         : '14d default';
 
                     // DECISION(2026-03-16): Use GraphQL stock from getProductActivity().
-                    // REST prodData.quantityOnHand is always undefined for these products,
-                    // which caused all stock to default to 0 → every item flagged critical.
-                    // GraphQL productViewConnection returns real stock (same as getSalesQty).
-                    const stockOnHand = activity.stockOnHand ?? parseFinaleNumber(prodData.quantityOnHand ?? prodData.stockLevel ?? 0);
+                    // FIX(2026-04-14): Use this.parseFinaleNum() for the REST fallback — it returns
+                    // null for "--" and missing values instead of 0, so missing data doesn't become
+                    // false-critical stock=0. GraphQL already returns null via parseFinaleNum in
+                    // getProductActivity (line 4326), so activity.stockOnHand is already null-safe.
+                    const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
+                    const stockOnHand = activity.stockOnHand ?? restStock;
 
                     // Open PO supply
-                    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
+                    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
 
                     // Step 4: velocity + runway
                     const purchaseVelocity = activity.purchasedQty / daysBack;
@@ -4532,14 +4543,18 @@ export class FinaleClient {
                     });
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
-                    if (dailyRate === 0 && purchaseVelocity > 0) {
+                    // FIX(2026-04-14): Fall back to purchaseVelocity when demandVelocity is negligibly small
+                    // but purchase history is informative. "Strictly 0" was too strict — BOM items often have
+                    // demandVelocity ≈ 0 (Finale doesn't track BOM consumption) while purchase history is
+                    // the only real signal. Also check demandVelocity < 0.01 (≈ 1 unit in 100 days) as
+                    // effectively zero, especially for BOM components where Finale under-reports demand.
+                    const isDemandNegligible = demandVelocity < 0.01;
+                    if (isDemandNegligible && purchaseVelocity > 0) {
                         let daysSinceLastPurchase = 999;
                         if (activity.lastPurchaseDate) {
                             const lp = new Date(activity.lastPurchaseDate);
                             daysSinceLastPurchase = (Date.now() - lp.getTime()) / (1000 * 60 * 60 * 24);
                         }
-
-                        // We enforce a 180-day activity window (or an active open PO) to stay on the radar.
                         if (daysSinceLastPurchase <= 180 || activity.openPOs.length > 0) {
                             dailyRate = purchaseVelocity;
                             rateSource = "receipts";
@@ -4556,8 +4571,18 @@ export class FinaleClient {
                             ? `${daysBack}d sales`
                             : `${daysBack}d receipts`;
 
-                    const runwayDays = stockOnHand / dailyRate;
-                    const adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyRate;
+                    // FIX(2026-04-14): stockOnHand can be null if GraphQL and REST both lack data
+                    // (both returned null/"--"). Use ?? 0 so we still compute runway (as unknown/0),
+                    // but also check for null to skip items with zero computed runway as a safety guard.
+                    const effectiveStock = stockOnHand ?? 0;
+                    if (effectiveStock === 0 && stockOnHand === null) {
+                        // No stock data from either GraphQL or REST — item is untrackable; skip it
+                        console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku}, skipping`);
+                        continue;
+                    }
+
+                    const runwayDays = effectiveStock / dailyRate;
+                    const adjustedRunwayDays = (effectiveStock + stockOnOrder) / dailyRate;
 
                     // Step 6: urgency based on ADJUSTED runway (on-hand + on-order)
                     // DECISION(2026-03-09): Changed from raw runwayDays to adjustedRunwayDays.
@@ -4570,7 +4595,7 @@ export class FinaleClient {
                                     : 'ok';
                     const parts: string[] = [
                         `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
-                        `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays)}d`,
+                        `${Math.round(effectiveStock)} in stock → ${Math.round(runwayDays)}d`,
                         `Lead ${leadTimeDays}d`,
                     ];
                     if (stockOnOrder > 0) {
@@ -4599,7 +4624,7 @@ export class FinaleClient {
                         supplierName: party.groupName,
                         supplierPartyId: partyId,
                         unitPrice,
-                        stockOnHand,
+                        stockOnHand: stockOnHand as number,  // guaranteed non-null — we skip above if null
                         stockOnOrder,
                         purchaseVelocity,
                         salesVelocity,
@@ -4611,7 +4636,7 @@ export class FinaleClient {
                         leadTimeProvenance,
                         openPOs: activity.openPOs.map(po => ({
                             orderId: po.orderId,
-                            quantity: po.quantityOnOrder,
+                            quantity: po.quantity,
                             orderDate: po.orderDate,
                         })),
                         urgency,
