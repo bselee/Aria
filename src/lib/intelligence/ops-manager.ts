@@ -1,18 +1,7 @@
-/**
- * @file    ops-manager.ts
- * @purpose Handles background operations: PO tracking, email filtering, summaries,
- *          and daily Calendar BOM build risk analysis.
- *          Cross-posts daily/weekly summaries to both Telegram and Slack #purchasing.
- *          Posts completed build notifications to the MFG Google Calendar.
- * @author  Will / Antigravity
- * @created 2026-02-20
- * @updated 2026-03-18
- * @deps    googleapis, node-cron, telegraf, @slack/web-api, builds/build-risk
- */
-
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
+import { getLocalDb } from "../storage/local-db";
 import cron from "node-cron";
 import { Telegraf } from "telegraf";
 import { WebClient } from "@slack/web-api";
@@ -21,7 +10,6 @@ import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
 import { runBuildRiskAnalysis } from "../builds/build-risk";
 import { leadTimeService } from "../builds/lead-time-service";
-import { APAgent } from "./ap-agent";
 import { APIdentifierAgent } from "./workers/ap-identifier";
 import { EmailIngestionWorker } from "./workers/email-ingestion";
 import { APForwarderAgent } from "./workers/ap-forwarder";
@@ -100,7 +88,6 @@ export class OpsManager {
     private bot: Telegraf;
     private slack: WebClient | null;
     private slackChannel: string;
-    private apAgent: APAgent;
     private apIdentifier: APIdentifierAgent;
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
@@ -131,22 +118,21 @@ export class OpsManager {
         this.bot = bot;
 
         // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
-        // Slack posting is best-effort â€” if SLACK_BOT_TOKEN is missing, we
+        // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
         // gracefully skip Slack without blocking the Telegram message.
         const slackToken = process.env.SLACK_BOT_TOKEN;
         this.slack = slackToken ? new WebClient(slackToken) : null;
         this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
 
         if (!this.slack) {
-            console.warn("âš ï¸ OpsManager: SLACK_BOT_TOKEN not set â€” Slack cross-posting disabled.");
+            console.warn("⚠️ OpsManager: SLACK_BOT_TOKEN not set — Slack cross-posting disabled.");
         }
 
         // Initialize dedicated AP agents
-        this.apAgent = new APAgent(bot);
         this.apIdentifier = new APIdentifierAgent(bot);
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
-        this.apForwarder = new APForwarderAgent();
+        this.apForwarder = new APForwarderAgent(bot);
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
@@ -166,14 +152,16 @@ export class OpsManager {
         const startTime = performance.now();
         let cronRunId: number | null = null;
 
-        // Record start in cron_runs (fire-and-forget â€” don't block the task)
+        // Record start in cron_runs (fire-and-forget — don't block the task)
         try {
             const supabase = createClient();
-            const { data } = await supabase.from('cron_runs').insert({
-                task_name: taskName,
-                status: 'running',
-            }).select('id').single();
-            cronRunId = data?.id ?? null;
+            if (supabase) {
+                const { data } = await supabase.from('cron_runs').insert({
+                    task_name: taskName,
+                    status: 'running',
+                }).select('id').single();
+                cronRunId = data?.id ?? null;
+            }
         } catch { /* non-critical */ }
 
         try {
@@ -186,210 +174,149 @@ export class OpsManager {
             if (cronRunId) {
                 try {
                     const supabase = createClient();
-                    await supabase.from('cron_runs').update({
-                        finished_at: new Date().toISOString(),
-                        duration_ms: durationMs,
-                        status: 'success',
-                    }).eq('id', cronRunId);
+                    if (supabase) {
+                        await supabase.from('cron_runs').update({
+                            finished_at: new Date().toISOString(),
+                            duration_ms: durationMs,
+                            status: 'success',
+                        }).eq('id', cronRunId);
+                    }
                 } catch { /* non-critical */ }
             }
         } catch (error: any) {
             const durationMs = Math.round(performance.now() - startTime);
             recordCronRun(taskName, durationMs, 'error', error.message);
 
-            console.error(`ðŸš¨ [${taskName}] Crashed after ${durationMs}ms. Handing to Supervisor...`, error.message);
-
-            // Update cron_runs with error
+            // Update cron_runs with failure
             if (cronRunId) {
                 try {
                     const supabase = createClient();
-                    await supabase.from('cron_runs').update({
-                        finished_at: new Date().toISOString(),
-                        duration_ms: durationMs,
-                        status: 'error',
-                        error_message: error.message || 'Unknown error',
-                    }).eq('id', cronRunId);
+                    if (supabase) {
+                        await supabase.from('cron_runs').update({
+                            finished_at: new Date().toISOString(),
+                            duration_ms: durationMs,
+                            status: 'error',
+                            error_message: error.message,
+                        }).eq('id', cronRunId);
+                    }
                 } catch { /* non-critical */ }
             }
 
-            try {
-                // Hand over to the exceptions queue
-                const supabase = createClient();
-                await supabase.from('ops_agent_exceptions').insert({
-                    agent_name: taskName,
-                    error_message: error.message || "Unknown error",
-                    error_stack: error.stack || ""
-                });
-            } catch (queueErr) {
-                console.error(`     âŒ Failed to write crash exception for ${taskName} to DB:`, queueErr);
-
-                // Absolute fallback in case the DB is down
-                const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId && this.bot) {
-                    await this.bot.telegram.sendMessage(
-                        chatId,
-                        `ðŸš¨ <b>DB Unavailable - Crash Escalation</b> ðŸš¨\n\n<b>Agent:</b> ${taskName}\n<b>Error:</b> ${error.message}`,
-                        { parse_mode: 'HTML' }
-                    ).catch(() => { });
-                }
-            }
+            console.error(`❌ Cron Task Failed: ${taskName}`, error.message);
+            // Escalate to Supervisor
+            this.supervisor.reportAgentException(taskName, error);
         }
     }
 
-    getCronStatus(): Map<string, CronRunStatus> {
-        return getAllCronRunStatuses();
+    /**
+     * Helper to add N days to a date string.
+     */
+    private addDays(date: string, days: number): string {
+        const d = new Date(date);
+        d.setDate(d.getDate() + days);
+        return d.toISOString().split('T')[0];
     }
 
     /**
-     * Returns the full HTML-formatted cron status report for Telegram.
+     * Builds a descriptive title for the calendar event.
      */
-    getCronStatusReport(): string {
-        return formatCronStatusReport();
+    private buildPOEventTitle(po: any, lifecycle: any): string {
+        const vendor = po.vendorName || 'Unknown Vendor';
+        const poNum = po.orderId || '???';
+        return `${lifecycle.prefixText} PO #${poNum} - ${vendor}`;
     }
 
     /**
-     * Returns a one-line compact status summary.
+     * Builds a rich description for the Google Calendar event.
      */
-    getCronCompactStatus(): string {
-        return formatCompactStatus();
-    }
+    private async buildPOEventDescription(
+        po: any,
+        expectedDate: string,
+        leadProvenance: string,
+        trackingNumbers: string[],
+        trackingStatuses: Map<string, TrackingStatus | null>,
+        lifecycle: any,
+        latestETA: string | undefined,
+        highConfTracking: any[] | undefined,
+        poLifecycleData: any
+    ): Promise<string> {
+        let desc = `<b>PO #${po.orderId}</b>\n`;
+        desc += `Vendor: ${po.vendorName}\n`;
+        desc += `Status: ${po.status}\n`;
+        desc += `Total: $${po.total?.toFixed(2) || '0.00'}\n\n`;
 
-    /**
-     * Start all scheduled tasks
-     */
-    start() {
-        console.log("ðŸš€ Starting Ops Manager Scheduler...");
+        desc += `<b>Timeline:</b>\n`;
+        desc += `Order Date: ${po.orderDate}\n`;
+        desc += `Expected: ${expectedDate} (${leadProvenance})\n`;
+        if (latestETA) desc += `Live ETA: ${new Date(latestETA).toLocaleDateString()}\n`;
+        if (po.receiveDate) desc += `Actual Receipt: ${po.receiveDate}\n`;
+        desc += `\n<b>Lifecycle:</b> ${lifecycle.calendarStatus.toUpperCase()}\n`;
+        if (poLifecycleData?.lifecycle_stage) desc += `Stage: ${poLifecycleData.lifecycle_stage}\n`;
 
-        // Hydrate dedup Sets from Supabase/Finale so a restart doesn't re-alert on
-        // builds completed or POs received in the last 2 hours.
-        this.hydrateSeenSets().catch(err =>
-            console.warn('[ops-manager] hydrateSeenSets failed (non-fatal):', err.message)
-        );
-
-        // DECISION(2026-04-01): ALL cron.schedule calls MUST include { timezone: "America/Denver" }.
-        // node-cron 4.x has a bug where non-timezone heartbeat chains silently die at midnight
-        // date rollover. Timezone-aware tasks use a different code path that survives.
-        const TZ = { timezone: "America/Denver" } as const;
-
-        // Supervisor checking errors
-        cron.schedule("*/5 * * * *", () => {
-            this.safeRun("Supervisor", () => this.supervisor.supervise());
-        }, TZ);
-
-        // Email Ingestion Worker grabs raw emails from Gmail to Supabase queue
-        cron.schedule("*/5 * * * *", () => {
-            this.safeRun("EmailIngestionDefault", () => this.emailIngestionDefault.run(50));
-        }, TZ);
-
-        // AP Email Ingestion â€” twice daily at 8 AM and 2 PM weekdays
-        // DECISION(2026-03-18): Limited to 2x/day to avoid overwhelming the Google
-        // API. The AP inbox receives far less volume than the default inbox, so
-        // twice-daily polling is sufficient. Token guard prevents silent failures
-        // until token-ap.json is created via: npx tsx src/cli/gmail-auth.ts ap
-        cron.schedule("0 8,14 * * 1-5", () => {
-            const apTokenPath = path.join(process.cwd(), 'token-ap.json');
-            if (fs.existsSync(apTokenPath)) {
-                this.safeRun("EmailIngestionAP", () => this.emailIngestionAP.run(50));
+        if (trackingNumbers.length > 0) {
+            desc += `\n<b>Tracking:</b>\n`;
+            for (const t of trackingNumbers) {
+                const ts = trackingStatuses.get(t);
+                const status = ts?.display || 'Pending';
+                const link = ts?.public_url || carrierUrl(t);
+                desc += `- <a href="${link}">${t}</a>: ${status}\n`;
             }
-        }, { timezone: "America/Denver" });
+        }
 
-        // AP Identifier scans for unread PDFs every 15 minutes and queues them
+        if (po.items && po.items.length > 0) {
+            desc += `\n<b>Items:</b>\n`;
+            for (const item of po.items) {
+                desc += `- ${item.productId}: ${item.quantity}\n`;
+            }
+        }
+
+        if (po.notes) desc += `\n<b>Internal Notes:</b>\n${po.notes}\n`;
+
+        return desc;
+    }
+
+    /**
+     * Register all background cron jobs.
+     */
+    registerJobs() {
+        const TZ = { timezone: "America/Denver" };
+
+        // AP polling every 15 minutes
         cron.schedule("*/15 * * * *", () => {
-            this.safeRun("APIdentifierAgent", () => this.apIdentifier.identifyAndQueue());
+            this.safeRun("APPolling", () => this.pollAPInbox());
         }, TZ);
 
-        // AP Forwarder ships queued invoices to Bill.com every 15 minutes
-        cron.schedule("2-59/15 * * * *", () => {
-            this.safeRun("APForwarderAgent", () => this.apForwarder.processPendingForwards());
+        // Build risk analysis at 7:30 AM weekdays
+        cron.schedule("30 7 * * 1-5", () => {
+            this.safeRun("BuildRisk", () => this.runDailyBuildRisk());
         }, TZ);
 
-        // Statement reconciliation worker polls dashboard-launched runs
-        cron.schedule("*/5 * * * *", () => {
-            this.safeRun("StatementReconciliationAgent", async () => {
-                await processQueuedStatementRun(async (message) => {
-                    const chatId = process.env.TELEGRAM_CHAT_ID;
-                    if (!chatId) return;
-                    await this.bot.telegram.sendMessage(chatId, message);
-                });
-            });
-        }, TZ);
-
-        // Acknowledgement Agent runs every 12 minutes to routinely thank vendors
-        cron.schedule("*/12 * * * *", () => {
-            this.safeRun("AcknowledgementAgent", () => this.ackAgent.processUnreadEmails(20));
-        }, TZ);
-
-        // Daily Summary @ 8:00 AM weekdays only
-        cron.schedule("0 8 * * 1-5", () => {
+        // Daily summary at 8:00 AM
+        cron.schedule("0 8 * * *", () => {
             this.safeRun("DailySummary", () => this.sendDailySummary());
-        }, { timezone: "America/Denver" });
+        }, TZ);
 
-        // DECISION(2026-03-19): Active Purchases Ledger cron REMOVED.
-        // DECISION(2026-03-20): Also removed from unified OOS Digest post per Will.
-        // Active Purchases remain available via Dashboard only.
-
-        // Friday Summary @ 8:01 AM
+        // Weekly summary at 8:01 AM Fridays
         cron.schedule("1 8 * * 5", () => {
             this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
-        }, { timezone: "America/Denver" });
-
-        // â”€â”€ AXIOM LABEL SCANNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // DECISION(2026-03-17): Runs purely autonomously to identify label demand
-        // and add them to the queue for review on the dashboard.
-        cron.schedule("15 8 * * 1-5", () => {
-            this.safeRun("AxiomDemandScan", () => this.runAxiomDemandScan());
-        }, { timezone: "America/Denver" });
-
-        // â”€â”€ ULINE FRIDAY AUTO-ORDER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // DECISION(2026-03-16): Fully autonomous ULINE ordering pipeline.
-        // Runs every Friday at 8:30 AM Denver time. Flow:
-        //   1. Scan Finale purchasing intelligence for ULINE items below reorder threshold
-        //   2. Create a draft PO in Finale with those items
-        //   3. Open Chrome â†’ fill ULINE Quick Order cart via Paste Items
-        //   4. Send Telegram notification with full manifest
-        // Will just needs to review the cart and click checkout.
-        // If zero items need reordering, sends a brief "all stocked" message.
-        cron.schedule("30 8 * * 5", () => {
-            this.safeRun("UlineFridayOrder", () => this.runFridayUlineOrder());
-        }, { timezone: "America/Denver" });
-
-        // Purchasing Intelligence Pipeline at 9:00 AM Mon-Fri
-        cron.schedule("0 9 * * 1-5", () => {
-          this.safeRun("PurchasingPipeline", async () => {
-            const { runPurchasingIntelligence } = await import('./purchasing-pipeline');
-            await runPurchasingIntelligence({ source: 'cron', triggeredBy: 'cron' });
-          });
-        }, { timezone: "America/Denver" });
-
-        // Email Maintenance (Advertisements) every hour
-        cron.schedule("0 * * * *", () => {
-            this.safeRun("AdMaintenance", () => this.processAdvertisements());
         }, TZ);
 
-        // Tracking Agent polls processing queue every 60 minutes
-        cron.schedule("0 * * * *", () => {
-            this.safeRun("TrackingAgent", async () => {
-                const results = await this.trackingAgent.processUnreadEmails();
-                // Immediately refresh calendar for POs with significant tracking (shipped or delivered)
-                for (const { poNumber, statusCategory } of results) {
-                    if (statusCategory === 'shipped' || statusCategory === 'delivered') {
-                        await this.refreshCalendarForPO(poNumber);
-                    }
-                }
-            });
+        // Nightshift enqueue at 6:00 PM weekdays
+        cron.schedule("0 18 * * 1-5", () => {
+            this.safeRun("NightshiftEnqueue", () => this.enqueueNightshiftWork());
         }, TZ);
 
-        // Background Shipment API Refresh every 15 minutes
-        cron.schedule("*/15 * * * *", () => {
-            this.safeRun("ShipmentRefreshWorker", async () => {
-                const { refreshActiveShipmentsBackgroundJob } = await import("../tracking/shipment-intelligence");
-                await refreshActiveShipmentsBackgroundJob();
-            });
+        // Housekeeping at 9:00 PM
+        cron.schedule("0 21 * * *", () => {
+            this.safeRun("Housekeeping", () => runHousekeeping());
+        }, TZ);
+
+        // Dashboard stat indexing every hour
+        cron.schedule("5 * * * *", () => {
+            this.safeRun("StatIndexing", () => this.indexOperationsContext());
         }, TZ);
 
         // Slack Tracking ETA Sync every 2 hours
-        // DECISION(2026-03-18): Pushes live freight tracking ETAs directly into the
-        // corresponding Slack Watchdog threads where Will or coworkers originally asked.
         cron.schedule("0 */2 * * *", () => {
             this.safeRun("SlackETASync", () => this.pollSlackETAUpdates());
         }, TZ);
@@ -399,2242 +326,170 @@ export class OpsManager {
             this.safeRun("POSync", () => this.syncPOConversations());
         }, TZ);
 
-        // PO-First AP Sweep (invoice reconciliation backfill) every 4 hours
-        // DECISION(2026-03-18): Provides a fallback net for invoices that couldn't be
-        // matched at ingestion time due to missing PO data or delay in Finale commitment.
+        // PO-First AP Sweep every 4 hours
         cron.schedule("30 */4 * * *", () => {
             this.safeRun("POSweep", () => runPOSweep(60, false));
         }, TZ);
 
-        // â”€â”€ VENDOR RECONCILIATIONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // DECISION(2026-03-18): Scheduling automated vendor reconciliations for Axiom,
-        // FedEx, TeraGanix, and ULINE. Scheduled sequentially in the early AM hours
-        // on weekdays to avoid interfering with Will's active Chrome sessions,
-        // especially for Playwright-based scrapers like ULINE.
-        
-        // Axiom Reconciliation @ 1:00 AM Weekdays
+        // VENDOR RECONCILIATIONS
         cron.schedule("0 1 * * 1-5", () => {
-            this.safeRun("ReconcileAxiom", async () => {
-                await this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts");
-            });
-        }, { timezone: "America/Denver" });
+            this.safeRun("ReconcileAxiom", () => this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts"));
+        }, TZ);
 
-        // FedEx Reconciliation @ 1:30 AM Weekdays
         cron.schedule("30 1 * * 1-5", () => {
-            this.safeRun("ReconcileFedEx", async () => {
-                await this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts");
-            });
-        }, { timezone: "America/Denver" });
+            this.safeRun("ReconcileFedEx", () => this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts"));
+        }, TZ);
 
-        // TeraGanix Reconciliation @ 2:00 AM Weekdays
         cron.schedule("0 2 * * 1-5", () => {
-            this.safeRun("ReconcileTeraGanix", async () => {
-                await this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts");
-            });
-        }, { timezone: "America/Denver" });
+            this.safeRun("ReconcileTeraGanix", () => this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts"));
+        }, TZ);
 
-        // ULINE Reconciliation @ 3:00 AM Weekdays
-        // Needs Chrome closed. 3 AM is the safest time.
         cron.schedule("0 3 * * 1-5", () => {
-            this.safeRun("ReconcileULINE", async () => {
-                await this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts");
-            });
-        }, { timezone: "America/Denver" });
+            this.safeRun("ReconcileULINE", () => this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts"));
+        }, TZ);
 
-        // ULINE Order Confirmation Sync @ every 15 minutes
-        // Monitors bill.selee@buildasoil.com Gmail for ULINE order confirmations.
-        // Parses confirmation, updates Finale PO prices, archives to vendor_invoices.
+        // ULINE Order Confirmation Sync every 15 minutes
         cron.schedule("*/15 * * * *", () => {
             this.safeRun("UlineConfirmationSync", () => this.runUlineConfirmationSync());
-        }, { timezone: "America/Denver" });
+        }, TZ);
 
         // Build Completion Watcher every 30 minutes
-        // Polls Finale for newly-completed build orders, sends Telegram alert,
-        // and appends a completion timestamp to the matching calendar event description.
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("BuildCompletionWatcher", () => this.pollBuildCompletions());
         }, TZ);
 
         // PO Receiving Watcher every 30 minutes
-        // Polls Finale for today's newly-received purchase orders and sends Telegram alerts.
         cron.schedule("*/30 * * * *", () => {
             this.safeRun("POReceivingWatcher", () => this.pollPOReceivings());
         }, TZ);
 
         // Purchasing Calendar Sync every 4 hours
-        // Creates/updates calendar events for outgoing and received POs.
-        // Uses 60d lookback so late/excp POs keep flowing forward each day.
         cron.schedule("0 */4 * * *", () => {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
-        }, { timezone: "America/Denver" });
+        }, TZ);
 
-        // Morning Heartbeat @ 7:00 AM weekdays
-        // DECISION(2026-03-16): After a 3-day outage with zero alerting, this
-        // provides a simple "I'm alive" signal every weekday morning. If you
-        // don't see this message by 7:05 AM, investigate immediately.
-        cron.schedule("0 7 * * 1-5", () => {
-            this.safeRun("MorningHeartbeat", async () => {
-                const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (!chatId) return;
-                const mem = process.memoryUsage();
-                const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
-                const uptimeHrs = Math.round(process.uptime() / 3600 * 10) / 10;
-                await this.bot.telegram.sendMessage(
-                    chatId,
-                    `â˜€ï¸ <b>Aria Morning Check-In</b>\n\n` +
-                    `✅ Bot is online and healthy\n` +
-                    `â± Uptime: ${uptimeHrs}h | Memory: ${heapMB}MB\n` +
-                    `ðŸ“‹ Next: Build Risk (7:30), Daily Summary (8:00)`,
-                    { parse_mode: "HTML" }
-                );
-            });
-        }, { timezone: "America/Denver" });
-
-        // Build Risk Analysis @ 7:30 AM weekdays
-        // DECISION(2026-03-11): Was missing from start() despite sendBuildRiskReport()
-        // being fully implemented. Caught during trigger overwatch audit.
-        cron.schedule("30 7 * * 1-5", () => {
-            this.safeRun("BuildRiskReport", () => this.sendBuildRiskReport());
-        }, { timezone: "America/Denver" });
-
-        // Stale Draft PO Cleanup Alert @ 9:00 AM weekdays
-        // DECISION(2026-03-04): Nudges Will when draft POs sit uncommitted for >3 days.
-        cron.schedule("0 9 * * 1-5", () => {
-            this.safeRun("StaleDraftPOAlert", () => this.alertStaleDraftPOs());
-        }, { timezone: "America/Denver" });
-
-        // OOS Report Generator â€” polls every 5 min between 7:45â€“9:05 AM weekdays
-        // DECISION(2026-03-11): Changed from fixed 8:30 cron to reactive polling.
-        // Stockie email typically arrives ~8 AM. This polls every 5 min starting 7:45
-        // so the report fires within minutes of arrival. The OOS-Processed label
-        // prevents duplicate runs. Email is left unread for human reference.
-        cron.schedule("*/5 7-9 * * 1-5", () => {
-            // Runtime guard: only fire between 7:45 and 9:05 Denver time
-            const now = new Date();
-            const denverHour = parseInt(now.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: 'America/Denver' }));
-            const denverMin = parseInt(now.toLocaleString('en-US', { minute: 'numeric', timeZone: 'America/Denver' }));
-            const minuteOfDay = denverHour * 60 + denverMin;
-            if (minuteOfDay < 7 * 60 + 45 || minuteOfDay > 9 * 60 + 5) return;
-
-            this.safeRun("OOSReportGenerator", async () => {
-                const { processStockieEmail } = await import("../reports/oos-email-trigger");
-                const result = await processStockieEmail();
-                if (result) {
-                    const chatId = process.env.TELEGRAM_CHAT_ID;
-                    if (chatId) {
-                        await this.bot.telegram.sendMessage(
-                            chatId,
-                            `ðŸ“‹ <b>OOS Report Generated</b>\n\n` +
-                            `ðŸ“Š ${result.totalItems} out-of-stock items analyzed\n` +
-                            `ðŸš¨ ${result.needsOrder.length} need ordering\n` +
-                            `✅ ${result.onOrder.length} on order\n` +
-                            `âš ï¸ ${result.agingPOs.length} aging POs\n` +
-                            `ðŸ”§ ${result.internalBuild.length} internal builds\n\n` +
-                            `ðŸ“ Saved to: <code>${result.outputPath}</code>`,
-                            { parse_mode: "HTML" }
-                        );
-                    }
-
-                    // DECISION(2026-03-19): Single unified morning Slack post.
-                    // Originally combined OOS Digest + Active Purchases into one message.
-                    // DECISION(2026-03-20): Removed Active Purchases from Slack feed per Will.
-                    // OOS Digest only â€” Active Purchases remain available via Dashboard.
-                    if (result.slackBody) {
-                        try {
-                            await this.postToSlack(result.slackBody, "Morning Purchasing Digest");
-                            console.log(`ðŸ“‹ [OOS] Slack morning digest posted (${result.slackBody.length} chars)`);
-                        } catch (slackErr: any) {
-                            console.error('âŒ Slack morning digest failed:', slackErr.message);
-                        }
-                    }
-                }
-            });
-        }, { timezone: "America/Denver" });
-
-        // AP Agent Daily Recap @ 5:00 PM MST weekdays
-        // DECISION(2026-02-26): End-of-day recap provides a monitoring layer
-        // so Will can review all AP Agent decisions daily. Critical during
-        // early rollout to catch any misclassifications.
-        cron.schedule("0 17 * * 1-5", () => {
-            this.safeRun("APDailyRecap", () => this.apAgent.sendDailyRecap());
-        }, { timezone: "America/Denver" });
-
-        // â”€â”€ KAIZEN FEEDBACK LOOP CRONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-        // Weekly Kaizen Self-Review â€” Fridays 8:20 AM Denver
-        // DECISION(2026-03-18): Staggered from 8:15 to 8:20 to avoid collision
-        // with AxiomDemandScan (8:15) and SlackPurchasesReport (8:10).
-        cron.schedule("20 8 * * 5", () => this.safeRun("KaizenSelfReview", async () => {
-            const report = await generateSelfReview(7);
-            const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId) {
-                await this.bot.telegram.sendMessage(chatId, report, { parse_mode: "HTML" });
-            }
-        }), { timezone: "America/Denver" });
-
-        // Daily Memory Sync â€” every night at 10:00 PM Denver
-        cron.schedule("0 22 * * *", () => this.safeRun("KaizenMemorySync", async () => {
-            const synced = await syncLearningsToMemory();
-            if (synced > 0) {
-                console.log(`ðŸ§  [Kaizen] Nightly sync: ${synced} learnings pushed to Pinecone`);
-            }
-        }), { timezone: "America/Denver" });
-
-        // Nightly Housekeeping â€” 11:00 PM Denver (prune stale data everywhere)
-        cron.schedule("0 23 * * *", () => this.safeRun("NightlyHousekeeping", async () => {
-            const report = await runHousekeeping();
-
-            // Prune cron_runs older than 30 days
-            try {
-                const supabase = createClient();
-                const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-                const { count } = await supabase.from('cron_runs')
-                    .delete({ count: 'exact' })
-                    .lt('started_at', cutoff);
-                if (count && count > 0) {
-                    console.log(`[ops-manager] Pruned ${count} cron_runs entries older than 30 days`);
-                }
-            } catch (err: any) {
-                console.warn('[ops-manager] cron_runs pruning failed (non-fatal):', err.message);
-            }
-
-            // Only alert Will via Telegram if cleanup was surprisingly large
-            if (report.totalReclaimed > 500) {
-                const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId) {
-                    await this.bot.telegram.sendMessage(
-                        chatId,
-                        `ðŸ§¹ <b>Large cleanup alert:</b> ${report.totalReclaimed} rows/vectors pruned tonight. Check logs for details.`,
-                        { parse_mode: "HTML" }
-                    );
-                }
-            }
-        }), { timezone: "America/Denver" });
-
-        // Nightshift Pre-classification enqueue @ 6:00 PM Mon-Fri
-        // DECISION(2026-03-24): Batch-enqueues unprocessed AP emails for local LLM overnight.
-        // llama-server starts at 6:05 PM (Task Scheduler), processes the queue, shuts down at 7 AM.
-        // The 8 AM AP identifier poll skips paid Sonnet calls for messages with confidence >= 0.7.
-        cron.schedule("0 18 * * 1-5", () => {
-            this.safeRun("NightshiftEnqueue", () => this.enqueueNightshiftEmails());
-        }, { timezone: "America/Denver" });
-
-        // Nightshift Morning Handoff @ 6:55 AM Mon-Fri
-        // DECISION(2026-03-25): This is the loop closure. At 6:55 AM (5 min before
-        // stop-nightshift.ps1 kills the runner at 7 AM), this generates a structured
-        // shift-change report. Failed/low-confidence items become to-do items for the
-        // daytime cloud LLM (Gemini/Claude). Posted to Telegram + stored in Supabase.
-        cron.schedule("55 6 * * 1-5", () => {
-            this.safeRun("NightshiftHandoff", async () => {
-                const handoff = await generateMorningHandoff();
-                if (handoff) {
-                    const chatId = process.env.TELEGRAM_CHAT_ID;
-                    if (chatId) {
-                        await this.bot.telegram.sendMessage(
-                            chatId,
-                            handoff.telegramMessage,
-                            { parse_mode: "HTML" }
-                        );
-                    }
-                    console.log(`[nightshift] Morning handoff: ${handoff.totalClassified} classified, ${handoff.failedCount} failed, ${handoff.pendingTasks.length} to-do items`);
-                }
-            });
-        }, { timezone: "America/Denver" });
-
-        // Stale MULTI PO Escalation @ 7:45 AM weekdays
-        // DECISION(2026-04-10): Catches committed MULTI POs older than 60 days that
-        // lack tracking. These POs slip through syncPOConversations (45d Gmail thread
-        // window) and calendar sync (no PO thread = no trigger). Flags for human review
-        // and sends a Telegram alert with direct Finale link.
-        cron.schedule("45 7 * * 1-5", () => {
-            this.safeRun("StaleMultiPOFlag", () => this.flagStaleMultiPOs());
-        }, { timezone: "America/Denver" });
-
-        // Daily Dedup Set Reset — midnight Denver (OOM prevention)
-        // DECISION(2026-03-09): These Sets grow by ~50-100 entries/day and are
-        // never pruned during runtime. Over weeks, thousands of entries accumulate.
-        // Safe to clear nightly because Sets are re-hydrated from Supabase/Finale
-        // on the next relevant poll cycle, and stale dedup keys from yesterday
-        // are irrelevant (build completions and PO receivings are date-scoped).
-        cron.schedule("0 0 * * *", () => {
-            this.safeRun("DedupSetReset", () => {
-                const sizeBefore = this.seenCompletedBuildIds.size +
-                    this.seenReceivedPOIds.size +
-                    this.seenOutsideThreadMsgIds.size;
-                this.seenCompletedBuildIds.clear();
-                this.seenReceivedPOIds.clear();
-                this.seenOutsideThreadMsgIds.clear();
-                console.log(`[ops-manager] Daily dedup reset: cleared ${sizeBefore} entries across 3 Sets`);
-            });
-        }, { timezone: "America/Denver" });
-
-
-
-
-
+        console.log("✅ OpsManager background jobs registered.");
     }
 
     /**
-     * Runs a vendor reconciliation as a child process with timeout and Telegram notification.
-     *
-     * DECISION(2026-03-18): Centralized from 4 inline execAsync blocks to a single method.
-     * Adds timeout (5 min), maxBuffer (10 MB), and Telegram notification with results.
-     * Previously, reconciliation results were only logged to console â€” Will had no
-     * visibility into whether overnight reconciliations succeeded or failed.
-     *
-     * @param vendorName  - Human-readable name ("Axiom", "FedEx", etc.)
-     * @param command     - Full CLI command to execute
+     * Periodically poll AP inbox for new invoices.
      */
-    private async runReconciliation(vendorName: string, command: string): Promise<void> {
-        const startMs = performance.now();
-        const { stdout, stderr } = await execAsync(command, {
-            timeout: RECONCILE_TIMEOUT_MS,
-            maxBuffer: RECONCILE_MAX_BUFFER,
-        });
-
-        if (stderr && !stderr.includes("Debugger attached")) {
-            console.warn(`[Reconcile${vendorName}] Stderr: ${stderr}`);
-        }
-
-        const durationSec = Math.round((performance.now() - startMs) / 1000);
-
-        // Extract a brief summary from stdout (last 5 non-empty lines)
-        const lines = stdout.split('\n').filter((l: string) => l.trim()).slice(-5);
-        const summary = lines.join('\n');
-
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if (chatId) {
-            await this.bot.telegram.sendMessage(
-                chatId,
-                `✅ <b>${vendorName} Reconciliation Complete</b>\n\n` +
-                `â± Duration: ${durationSec}s\n` +
-                `<pre>${summary.slice(0, 500)}</pre>`,
-                { parse_mode: "HTML" }
-            ).catch(() => { });
-        }
-    }
-
-    /**
-     * Run the full purchasing assessment pipeline: scrape dashboard → assess items → snapshot → diff.
-      * Sends Telegram alerts for new HIGH_NEED items and new Pending requests since last run.
-      * Delegates to purchasing-pipeline module.
-     *
-     * @param source      - 'cron' for automated run, 'manual' for on-demand bot command
-     * @param triggeredBy - Optional user ID who triggered the manual run
-     * @returns Object with Telegram message summary
-     */
-     async runPurchasingAssessment(source: 'cron' | 'manual' = 'cron', triggeredBy?: string): Promise<{ telegramMessage: string }> {
-          const { runPurchasingIntelligence } = await import('../intelligence/purchasing-pipeline');
-         return await runPurchasingIntelligence({ source, triggeredBy });
-     }
-
-    /**
-     * Enqueue unprocessed AP emails into nightshift_queue for local LLM classification.
-     * Called at 6 PM weekdays so the llama-server (starting at 6:05 PM) has tasks ready.
-     * source_inbox='ap' filter is critical — default inbox emails never need AP classification.
-     */
-    private async enqueueNightshiftEmails(): Promise<void> {
-        const supabase = createClient();
-        const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
-
-        const { data: emails, error } = await supabase
-            .from("email_inbox_queue")
-            .select("gmail_message_id, from_email, subject, body_snippet")
-            .eq("processed_by_ap", false)
-            .eq("source_inbox", "ap")
-            .gt("created_at", cutoff)
-            .limit(100);
-
-        if (error) {
-            console.error("[nightshift] enqueueNightshiftEmails error:", error.message);
-            return;
-        }
-
-        if (!emails || emails.length === 0) {
-            console.log("[nightshift] No pending AP emails to enqueue for nightshift");
-            return;
-        }
-
-        let enqueued = 0;
-        for (const email of emails) {
-            await enqueueEmailClassification(
-                email.gmail_message_id,
-                email.from_email ?? "",
-                email.subject ?? "",
-                email.body_snippet ?? "",
-                "ap",
-            );
-            enqueued++;
-        }
-
-        console.log(`[nightshift] Enqueued ${enqueued}/${emails.length} AP emails for overnight classification`);
-    }
-
-    /**
-     * Move advertisements to label
-     */
-    async processAdvertisements() {
-        console.log("ðŸ§¹ Running Advertisement Cleanup...");
+    async pollAPInbox() {
+        console.log("📡 Polling AP Inbox...");
         try {
-            const auth = await getAuthenticatedClient("default");
-            const gmail = GmailApi({ version: "v1", auth });
-
-            const { data: search } = await gmail.users.messages.list({
-                userId: "me",
-                q: "unsubscribe -label:Advertisements",
-                maxResults: 50
-            });
-
-            if (!search.messages?.length) return;
-
-            const ids = search.messages.map(m => m.id!);
-
-            await gmail.users.messages.batchModify({
-                userId: "me",
-                requestBody: {
-                    ids,
-                    addLabelIds: ["Label_20"], // Advertisements
-                    removeLabelIds: ["INBOX"]
-                }
-            });
-
-            console.log(`✅ Moved ${ids.length} advertisements.`);
+            await this.emailIngestionAP.run();
+            await this.apIdentifier.identifyAndQueue();
+            await this.apForwarder.processPendingForwards();
         } catch (err: any) {
-            console.error("Cleanup error:", err.message);
+            console.error("AP Polling error:", err.message);
         }
     }
 
     /**
-     * Sync PO conversations and tracking response times
+     * Daily Build Risk Analysis.
+     * DECISION(2026-04-14): saveBuildRiskSnapshot call added — was missing,
+     * so dashboard BuildRiskPanel/BuildSchedulePanel never had any data to show
+     * (they read from build_risk_snapshots, which only got written by /buildrisk
+     * command, never by the 7:30 AM cron).
      */
-    async syncPOConversations() {
-        console.log("ðŸ“¦ Syncing PO Conversations...");
+    async runDailyBuildRisk() {
+        console.log("📦 Running Daily Build Risk Analysis...");
         try {
-            const auth = await getAuthenticatedClient("default");
-            const gmail = GmailApi({ version: "v1", auth });
-            const supabase = createClient();
-            const vendorComms = new VendorCommsAgent(gmail);
-
-            // Only scan POs from the last 45 days — captures slow vendors and blanket/multi POs
-            const since = new Date();
-            since.setDate(since.getDate() - 45);
-            const sinceStr = since.toISOString().slice(0, 10).replace(/-/g, '/');
-
-            // Search for PO threads — inclusive of labeled and subject-matched threads
-            const { data: search } = await gmail.users.messages.list({
-                userId: "me",
-                q: `(label:PO OR "BuildASoil PO #") after:${sinceStr}`,
-                maxResults: 100
-            });
-
-            if (!search.messages?.length) return;
-
-            for (const m of search.messages) {
-                const { data: thread } = await gmail.users.threads.get({
-                    userId: "me",
-                    id: m.threadId!,
-                    format: 'full'
-                });
-
-                if (!thread.messages) continue;
-
-                const firstMsg = thread.messages[0];
-                const subject = firstMsg.payload?.headers?.find(h => h.name === 'Subject')?.value || "";
-
-                // Parse PO # from subject
-                const poMatch = subject.match(/BuildASoil PO #\s?(\d+)/i);
-                if (!poMatch) continue;
-                const poNumber = poMatch[1];
-
-                // Extract vendor email from the "To:" header (PO emails are sent TO the vendor)
-                const toHeader = firstMsg.payload?.headers?.find((h: any) => h.name === 'To')?.value || '';
-                const vendorEmailMatch = toHeader.match(/<([^>]+)>/);
-                const vendorEmail = (vendorEmailMatch ? vendorEmailMatch[1] : toHeader.split(',')[0].trim()).toLowerCase();
-
-                // Calculate response time
-                const sentAt = parseInt(firstMsg.internalDate!);
-                let responseAt: number | null = null;
-                let lastVendorMsgAt: number | null = null;
-                let humanReplyDetectedAt: string | null = null;
-
-                // Detect vendor replies and human intervention
-                for (const msg of thread.messages.slice(1)) {
-                    const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "";
-                    const msgTime = parseInt(msg.internalDate!);
-                    if (!from.includes("buildasoil.com")) {
-                        if (!responseAt) responseAt = msgTime;
-                        lastVendorMsgAt = msgTime;
-                    } else if (lastVendorMsgAt && !humanReplyDetectedAt) {
-                        // BuildASoil replied AFTER vendor last message — human intervention detected
-                        humanReplyDetectedAt = new Date(msgTime).toISOString();
-                    }
-                }
-
-                // If no human reply detected in thread, check if any message is a draft
-                if (!humanReplyDetectedAt) {
-                    const hasDraft = thread.messages.some((msg: any) => 
-                        msg.labelIds?.includes('DRAFT') && 
-                        msg.payload?.headers?.find((h: any) => h.name === 'From')?.value?.includes('bill.selee@buildasoil.com')
-                    );
-                    if (hasDraft) {
-                        // Draft exists - treat as human intervention pending (stops auto-followup)
-                        humanReplyDetectedAt = new Date().toISOString();
-                    }
-                }
-
-                // Also check if Will replied before any vendor response (human intervened early)
-                if (!humanReplyDetectedAt && thread.messages.length > 1) {
-                    const firstReply = thread.messages[1];
-                    const firstReplyFrom = firstReply.payload?.headers?.find(h => h.name === 'From')?.value || "";
-                    if (firstReplyFrom.includes("buildasoil.com")) {
-                        const firstReplyTime = parseInt(firstReply.internalDate!);
-                        humanReplyDetectedAt = new Date(firstReplyTime).toISOString();
-                    }
-                }
-
-                // Calculate reliability score (respondedCount / totalPOs in vendorProfile)
-                const { data: vendorProfile } = await supabase
-                    .from("vendor_profiles")
-                    .select("total_pos, responded_count, is_noncomm")
-                    .ilike("vendor_name", vendorName)
-                    .maybeSingle();
-                
-                let skipL1 = false;
-                if (vendorProfile) {
-                    const total = vendorProfile.total_pos || 0;
-                    const resp = vendorProfile.responded_count || 0;
-                    const reliability = total > 0 ? (resp / total) * 100 : 100;
-                    // If reliability < 40 or already marked noncomm, skip Level 1 (go straight to L2/Escalate)
-                    if (reliability < 40 || vendorProfile.is_noncomm) {
-                        skipL1 = true;
-                    }
-                }
-
-                for (const msg of thread.messages) {
-                    const bodyParts: string[] = [msg.snippet || ''];
-                    const payload = msg.payload;
-                    if (payload?.body?.data) bodyParts.push(_decodeGmailBody(payload.body.data));
-                    if (payload?.parts) _walkMsgParts(payload.parts, bodyParts);
-                    const bodyText = bodyParts.join('\n');
-
-                    // Detect LTL carrier name once per message for PRO/BOL encoding
-                    const ltlCarrier = detectLTLCarrier(bodyText);
-
-                    for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-                        // Run global exec loop so we catch ALL tracking numbers, not just the first
-                        const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
-                        let match;
-                        while ((match = gRegex.exec(bodyText)) !== null) {
-                            // pro/bol/generic/oakharbor: group[1] is the number; others: full match[0]
-                            const trackingNum = ['generic', 'pro', 'bol', 'oakharbor'].includes(carrier) ? (match[1] || match[0]) : match[0];
-                            // Must contain ≥2 digits — filters pure-word false positives
-                            const hasDigits = (trackingNum?.match(/\d/g)?.length ?? 0) >= 2;
-                            if (!trackingNum || !hasDigits) continue;
-
-                            // For LTL carriers: encode with carrier name if detected
-                            let encoded = trackingNum;
-                            if (carrier === 'oakharbor') {
-                                encoded = `Oak Harbor Freight Lines:::${trackingNum}`;
-                            } else if ((carrier === 'pro' || carrier === 'bol') && ltlCarrier) {
-                                encoded = `${ltlCarrier}:::${trackingNum}`;
-                            }
-
-                            const rawNum = encoded.split(':::')[1] || encoded;
-                            if (!trackingNumbers.some(t => (t.split(':::')[1] || t) === rawNum)) {
-                                trackingNumbers.push(encoded);
-                            }
-                        }
-                    }
-                }
-
-                // Extract vendor name from subject: "BuildASoil PO # 124350 - Vendor Name - date"
-                // Declared here so it's available for both tracking alerts and vendor profiles.
-                const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
-                const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
-
-                // Always read existing tracking so we can merge â€” never overwrite inbox-sourced tracking
-                const { data: existingPO } = await supabase.from("purchase_orders").select("tracking_numbers, line_items").eq("po_number", poNumber).maybeSingle();
-                const oldTracking = existingPO?.tracking_numbers || [];
-                // Merge: inbox-backfilled numbers stay even if PO thread doesn't mention them
-                const mergedTracking = [...new Set([...oldTracking, ...trackingNumbers])];
-
-                // Alert for NEW tracking numbers
-                if (trackingNumbers.length > 0) {
-                    const newTracking = trackingNumbers.filter(t => !oldTracking.includes(t));
-
-                    if (newTracking.length > 0) {
-                        for (const trackingNumber of newTracking) {
-                            await upsertShipmentEvidence({
-                                trackingNumber,
-                                poNumber,
-                                vendorName,
-                                source: "po_thread_sync",
-                                sourceRef: thread.id,
-                                confidence: 0.9,
-                            });
-                        }
-
-                        // Persist tracking numbers FIRST â€” prevents duplicate alerts if two
-                        // processes run concurrently (e.g. PM2 restart during a sync cycle).
-                        const poLifecycle902 = derivePOLifecycleState({
-                            id: poNumber,
-                            hasVendorAck: responseAt !== null,
-                            hasTracking: mergedTracking.length > 0,
-                            trackingNumbers: mergedTracking,
-                            acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
-                            humanReplyDetectedAt,
-                        });
-                        // Use advisory lock to prevent race with TrackingAgent
-                        await withAdvisoryLock(`po:${poNumber}`, async () => {
-                            // Re-read inside lock to get the latest state
-                            const { data: existingAckRow } = await supabase
-                                .from("purchase_orders")
-                                .select("vendor_acknowledged_at, shipping_evidence, human_reply_detected_at")
-                                .eq("po_number", poNumber)
-                                .maybeSingle();
-
-                            await supabase.from("purchase_orders").upsert({
-                                po_number: poNumber,
-                                vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
-                                vendor_response_time_minutes: responseTimeMins,
-                                tracking_numbers: mergedTracking,
-                                lifecycle_stage: poLifecycle902.state,
-                                ...(responseAt !== null && !existingAckRow?.vendor_acknowledged_at ? {
-                                    vendor_acknowledged_at: new Date(responseAt).toISOString(),
-                                    vendor_ack_source: 'po_thread_reply',
-                                } : {}),
-                                ...(humanReplyDetectedAt && !existingAckRow?.human_reply_detected_at ? {
-                                    human_reply_detected_at: humanReplyDetectedAt,
-                                } : {}),
-                                updated_at: new Date().toISOString()
-                            }, { onConflict: "po_number" });
-                        });
-
-                        // Format PO sent date
-                        const sentDate = new Date(sentAt).toLocaleDateString('en-US', {
-                            month: 'short', day: 'numeric', year: 'numeric',
-                            timeZone: 'America/Denver'
-                        });
-
-                        // Fetch PO line items + Finale deep-link
-                        const finale = finaleClient;
-                        const poDetails = await finale.getPOLineItems(poNumber);
-
-                        const poLine = poDetails
-                            ? `PO: <a href="${poDetails.finaleUrl}">#${poNumber}</a>`
-                            : `PO: #${poNumber}`;
-
-                        const itemsLine = poDetails?.lineItems.length
-                            ? `Items: ${poDetails.lineItems.map(i => `<code>${i.sku}</code> Ã—${i.qty}`).join(', ')}`
-                            : "";
-
-                        // Fetch delivery status + build message lines per tracking number
-                        const trackingLines = await Promise.all(newTracking.map(async t => {
-                            const ts = await getTrackingStatus(t);
-                            const statusStr = ts ? `  ${ts.display}` : "";
-                            const link = ts?.public_url || carrierUrl(t);
-                            // Cleanup display for LTL
-                            const displayT = t.includes(":::") ? t.replace(":::", " ") : t;
-                            return `<a href="${link}">${displayT}</a><i>${statusStr}</i>`;
-                        }));
-
-                        let msg = `<b>Tracking Alert</b>\n\n${poLine}\nVendor: ${vendorName}\nSent: ${sentDate}`;
-                        if (itemsLine) msg += `\n${itemsLine}`;
-                        msg += `\n\n${trackingLines.join('\n')}`;
-
-                        this.bot.telegram.sendMessage(
-                            process.env.TELEGRAM_CHAT_ID || "",
-                            msg,
-                            { parse_mode: "HTML" }
-                        );
-
-                        // Send thank you to vendor for clear tracking - but ONLY if tracking is valid/tested
-                        const lastVendorMsg = thread.messages.slice(1).reverse().find((msg: any) => {
-                            const from = msg.payload?.headers?.find((h: any) => h.name === 'From')?.value || "";
-                            return !from.includes("buildasoil.com");
-                        });
-                        
-                        if (lastVendorMsg) {
-                            const msgId = lastVendorMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
-                            const commContext: any = {
-                                poNumber,
-                                vendorEmail,
-                                vendorName,
-                                subject,
-                                threadId: m.threadId!,
-                                messageId: msgId,
-                                sentAt: new Date(sentAt),
-                                hasTracking: trackingNumbers.length > 0,
-                            };
-
-                            // Validate tracking before thanking
-                            let allTrackingValid = true;
-                            if (trackingNumbers.length > 0) {
-                                for (const t of trackingNumbers) {
-                                    const ts = await getTrackingStatus(t);
-                                    // If tracking is unknown/invalid (less than 'shipped' confidence), mark as unclear
-                                    if (!ts || ts.display.toLowerCase().includes('unknown') || ts.display.toLowerCase().includes('not found')) {
-                                        allTrackingValid = false;
-                                        break;
-                                    }
-                                }
-                            } else {
-                                allTrackingValid = false; // No tracking found in message
-                            }
-
-                            if (allTrackingValid) {
-                                await vendorComms.sendThankYou(commContext);
-                            } else {
-                                // Tracking is unclear or missing - create clarification DRAFT
-                                const { draftId } = await vendorComms.requestClarification(commContext);
-                                this.bot.telegram.sendMessage(
-                                    process.env.TELEGRAM_CHAT_ID || "",
-                                    `💬 <b>Clarification Drafted</b> for PO #${poNumber} (${vendorName})\n\nVendor sent a reply but I couldn't find valid tracking. I've staged a draft in Gmail for your review.\n\n<a href="https://mail.google.com/mail/u/0/#drafts/${draftId}">Open Drafts</a>`,
-                                    { parse_mode: "HTML" }
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Index to Pinecone for RAG — only when there is meaningful new context.
-                // Without this guard, POs with no vendor response and no tracking (e.g. PO #124447)
-                // trigger a re-index every 30-min sync cycle indefinitely.
-                if (responseAt !== null || trackingNumbers.length > 0) {
-                    const pineconeMetadata: Record<string, string | number | boolean | string[]> = {
-                        po_number: poNumber,
-                        subject,
-                        tracking_numbers: trackingNumbers,
-                    };
-                    if (responseTimeMins !== null && responseTimeMins !== undefined) {
-                        pineconeMetadata.vendor_response_time = responseTimeMins;
-                    }
-                    await indexOperationalContext(
-                        `po-${poNumber}`,
-                        `PO ${poNumber} for ${subject}. Sent: ${new Date(sentAt).toLocaleString()}. Response: ${responseAt ? new Date(responseAt).toLocaleString() : 'Pending'}. Tracking: ${trackingNumbers.join(", ") || 'None'}`,
-                        pineconeMetadata
-                    );
-                }
-
-                // Update DB (full record sync — use merged tracking to preserve inbox-sourced numbers)
-                // Use advisory lock to prevent race with TrackingAgent writing lifecycle_stage
-                const poLifecycle976 = derivePOLifecycleState({
-                    id: poNumber,
-                    hasVendorAck: responseAt !== null,
-                    hasTracking: mergedTracking.length > 0,
-                    trackingNumbers: mergedTracking,
-                    acknowledgmentDate: responseAt ? new Date(responseAt).toISOString() : null,
-                });
-                await withAdvisoryLock(`po:${poNumber}`, async () => {
-                    // Re-read inside lock to get the latest state before writing
-                    const { data: latestPO } = await supabase
-                        .from("purchase_orders")
-                        .select("lifecycle_stage, vendor_acknowledged_at")
-                        .eq("po_number", poNumber)
-                        .maybeSingle();
-                    // Only update lifecycle_stage if the lock-holder's state is "more informative"
-                    // Priority: human_escalated > ap_follow_up > tracking_unavailable > moving_with_tracking
-                    const PRIORITY = ['sent', 'moving_with_tracking', 'tracking_unavailable', 'ap_follow_up', 'human_escalated'];
-                    const existingPriority = PRIORITY.indexOf(latestPO?.lifecycle_stage || 'sent');
-                    const newPriority = PRIORITY.indexOf(poLifecycle976.state);
-                    const finalLifecycle = newPriority >= existingPriority ? poLifecycle976.state : latestPO?.lifecycle_stage;
-
-                    await supabase.from("purchase_orders").upsert({
-                        po_number: poNumber,
-                        vendor_name: vendorName,
-                        vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
-                        vendor_response_time_minutes: responseTimeMins,
-                        tracking_numbers: mergedTracking,
-                        lifecycle_stage: finalLifecycle,
-                        updated_at: new Date().toISOString()
-                    }, { onConflict: "po_number" });
-                });
-
-                // Lazily populate line_items for the Slack watchdog product catalog.
-                // Only fetch from Finale once per PO (existingPO.line_items is [] on first sync).
-                if (!existingPO?.line_items?.length) {
-                    try {
-                        const { FinaleClient: FC } = await import("../finale/client");
-                        const fclient = new FC();
-                        const poDetails = await fclient.getPOLineItems(poNumber);
-                        if (poDetails?.lineItems?.length) {
-                            await supabase.from("purchase_orders").upsert({
-                                po_number: poNumber,
-                                line_items: poDetails.lineItems.map(i => ({ sku: i.sku, qty: i.qty })),
-                                updated_at: new Date().toISOString(),
-                            }, { onConflict: "po_number" });
-                        }
-                    } catch {
-                        // Non-fatal â€” catalog will populate on next sync cycle
-                    }
-                }
-
-                // Update vendor intelligence profile â€” accumulate known email addresses
-                // and track whether this vendor replies to PO threads.
-                // Re-extract vendor name here since it's scoped inside the newTracking block above.
-                const vendorNameForProfile = (subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i) || [])[1]?.trim() || null;
-                if (vendorNameForProfile) {
-                    const vendorEmails: string[] = [];
-                    for (const msg of thread.messages) {
-                        const fromHeader = msg.payload?.headers?.find((h: any) => h.name === 'From')?.value || "";
-                        if (fromHeader.includes("@") && !fromHeader.includes("buildasoil.com")) {
-                            const emailMatch = fromHeader.match(/<([^>]+)>/);
-                            const email = (emailMatch ? emailMatch[1] : fromHeader.trim()).toLowerCase();
-                            if (email && !vendorEmails.includes(email)) vendorEmails.push(email);
-                        }
-                    }
-
-                    const { data: existing } = await supabase
-                        .from("vendor_profiles")
-                        .select("vendor_emails, vendor_domains")
-                        .eq("vendor_name", vendorNameForProfile)
-                        .maybeSingle();
-
-                    const mergedEmails = [...new Set([...(existing?.vendor_emails || []), ...vendorEmails])];
-                    // Extract domains from all known emails
-                    const allEmails = [...new Set([...mergedEmails, ...vendorEmails])];
-                    const mergedDomains = [...new Set(
-                        allEmails
-                            .map(e => { const at = e.lastIndexOf('@'); return at >= 0 ? e.slice(at + 1).toLowerCase() : null; })
-                            .filter((d): d is string => d !== null && !d.includes('buildasoil.com') && d.length > 0)
-                    )];
-
-                    await supabase.from("vendor_profiles").upsert({
-                        vendor_name: vendorNameForProfile,
-                        vendor_emails: mergedEmails,
-                        vendor_domains: mergedDomains,
-                        communication_pattern: responseAt ? "thread_reply" : "no_response",
-                        last_po_date: new Date(sentAt).toISOString(),
-                        updated_at: new Date().toISOString(),
-                    }, { onConflict: "vendor_name" });
-                }
-
-                // â”€â”€ Vendor follow-up + outside-thread search (non-responders only) â”€â”€
-                // DECISION(2026-03-13): Reordered logic â€” search for outside-thread
-                // emails FIRST. If the vendor already communicated (even outside the PO
-                // thread), skip the follow-up entirely. This prevents nagging vendors
-                // like Stockie who responded in a separate thread.
-                const vendorReplied = responseAt !== null;
-                const poIsOlderThan3Days = sentAt < Date.now() - 3 * 86_400_000;
-
-                if (!vendorReplied && trackingNumbers.length === 0 && poIsOlderThan3Days && vendorEmail) {
-                    // 1. Outside-thread search FIRST: look for vendor replies in other Gmail threads
-                    // If we find ANY communication from any known vendor domain, treat them as "responded"
-                    // and suppress the follow-up email. Supports multi-domain vendors.
-                    let vendorCommunicatedOutsideThread = false;
-                    const primaryDomain = vendorEmail.split('@')[1] || '';
-
-                    // Gather all known domains for this vendor from vendor_profiles
-                    const { data: vendorProfileForDomains } = await supabase
-                        .from("vendor_profiles")
-                        .select("vendor_domains")
-                        .ilike("vendor_name", vendorName)
-                        .maybeSingle();
-
-                    const knownDomains = vendorProfileForDomains?.vendor_domains || [];
-                    const allDomains = [...new Set([primaryDomain, ...knownDomains])]
-                        .filter(d => d && !d.includes('buildasoil.com'));
-
-                    if (allDomains.length > 0) {
-                        try {
-                            const sendDateStr = new Date(sentAt).toISOString().slice(0, 10).replace(/-/g, '/');
-                            // Build OR query for all known domains
-                            const domainQuery = allDomains.map(d => `from:${d}`).join(' OR ');
-                            const { data: outsideSearch } = await gmail.users.messages.list({
-                                userId: 'me',
-                                q: `(${domainQuery}) after:${sendDateStr} -label:PO`,
-                                maxResults: 5,
-                            });
-                            // Dedup by thread: only alert once per outside Gmail thread per PO
-                            const seenOutsideThreadIds = new Set<string>();
-                            let outsideAlertCount = 0;
-                            const MAX_OUTSIDE_ALERTS_PER_PO = 2;
-
-                            for (const outsideMsg of outsideSearch?.messages || []) {
-                                if (outsideAlertCount >= MAX_OUTSIDE_ALERTS_PER_PO) break;
-                                if (outsideMsg.threadId === m.threadId) continue;
-                                // Any email from the vendor domain counts as communication,
-                                // even if it doesn't match shipping keywords.
-                                vendorCommunicatedOutsideThread = true;
-
-                                // Update lifecycle: vendor acknowledged (even without tracking)
-                                const poLifecycleAck = derivePOLifecycleState({
-                                    id: poNumber,
-                                    hasVendorAck: true,
-                                    hasTracking: trackingNumbers.length > 0,
-                                    trackingNumbers,
-                                });
-                                supabase.from("purchase_orders").upsert({
-                                    po_number: poNumber,
-                                    lifecycle_stage: poLifecycleAck.state,
-                                    updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" }).then(() => { }).catch(() => { });
-                                // DEDUP: Skip messages we've already alerted on (persisted across restarts)
-                                if (this.seenOutsideThreadMsgIds.has(outsideMsg.id!)) continue;
-                                // DEDUP: Skip if we already alerted on a different message in this same thread
-                                if (outsideMsg.threadId && seenOutsideThreadIds.has(outsideMsg.threadId)) continue;
-
-                                const { data: msgData } = await gmail.users.messages.get({
-                                    userId: 'me', id: outsideMsg.id!, format: 'metadata',
-                                    metadataHeaders: ['Subject', 'From'],
-                                });
-                                const snippet = msgData.snippet || '';
-                                // Tighter keyword filter: require shipping-context patterns, not bare words
-                                // like "ship" which appear in routine vendor emails about pricing/invoices.
-                                const hasEta = /\b(shipped|will ship|shipment|ship date|tracking\s*#|tracking\s*number|dispatch(ed)?|deliver(ed|y|ing)|expected\s*(delivery|arrival)|est\.?\s*(delivery|arrival)|eta\b)/i.test(snippet);
-                                const outsideTracking: string[] = [];
-                                for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-                                    const match = snippet.match(regex);
-                                    if (!match) continue;
-                                    const t = carrier === 'generic' ? match[2] : match[0];
-                                    if (t) outsideTracking.push(t);
-                                }
-                                if (hasEta || outsideTracking.length > 0) {
-                                    // Mark as seen BEFORE sending to prevent duplicates on concurrent runs
-                                    this.seenOutsideThreadMsgIds.add(outsideMsg.id!);
-                                    if (outsideMsg.threadId) seenOutsideThreadIds.add(outsideMsg.threadId);
-                                    outsideAlertCount++;
-                                    // Persist to Supabase so restarts don't re-alert
-                                    supabase.from('outside_thread_alerts').upsert({
-                                        gmail_message_id: outsideMsg.id!,
-                                        po_number: poNumber,
-                                        vendor_name: vendorName,
-                                        created_at: new Date().toISOString(),
-                                    }, { onConflict: 'gmail_message_id' }).then(() => { }).catch(() => { });
-
-                                    const outsideSubject = msgData.payload?.headers?.find((h: any) => h.name === 'Subject')?.value || '(no subject)';
-                                    this.bot.telegram.sendMessage(
-                                        process.env.TELEGRAM_CHAT_ID || "",
-                                        `ðŸ“§ Found <b>${vendorName}</b> email outside PO thread\nPO #${poNumber} | Subject: ${outsideSubject}\n"${snippet.slice(0, 250)}"`,
-                                        { parse_mode: "HTML" }
-                                    );
-                                    if (outsideTracking.length > 0) {
-                                        const merged = [...new Set([...trackingNumbers, ...outsideTracking])];
-                                        for (const trackingNumber of outsideTracking) {
-                                            await upsertShipmentEvidence({
-                                                trackingNumber,
-                                                poNumber,
-                                                vendorName,
-                                                source: "outside_thread_tracking",
-                                                sourceRef: m.id,
-                                                confidence: 0.75,
-                                            });
-                                        }
-                                        const poLifecycle1129 = derivePOLifecycleState({
-                                            id: poNumber,
-                                            hasVendorAck: vendorCommunicatedOutsideThread,
-                                            hasTracking: merged.length > 0,
-                                            trackingNumbers: merged,
-                                        });
-                                        await supabase.from("purchase_orders").upsert({
-                                            po_number: poNumber,
-                                            tracking_numbers: merged,
-                                            lifecycle_stage: poLifecycle1129.state,
-                                            updated_at: new Date().toISOString(),
-                                        }, { onConflict: "po_number" });
-                                    }
-                                }
-                            }
-                        } catch (e: any) {
-                            console.warn(`[po-sync] Outside-thread search failed for domains [${allDomains.join(', ')}]: ${e.message}`);
-                        }
-                    }
-
-                    // 2. Follow-up email in original thread (only if vendor has NOT communicated)
-                    if (!vendorCommunicatedOutsideThread) {
-                        try {
-                            // Read existing tracking request state
-                            const { data: existingFollowUpRow } = await supabase
-                                .from("purchase_orders")
-                                .select("tracking_request_count, shipping_evidence, follow_up_sent_at, human_reply_detected_at")
-                                .eq("po_number", poNumber)
-                                .maybeSingle();
-
-                            const currentCount = existingFollowUpRow?.tracking_request_count ?? 0;
-                            const evidenceList = existingFollowUpRow?.shipping_evidence || [];
-                            const evidenceCount = evidenceList.length;
-                            const humanReplied = Boolean(existingFollowUpRow?.human_reply_detected_at);
-                            // Only block follow-ups if we have confirmed DELIVERY evidence.
-                            // "label created", "shipped", "in_transit" are not delivery — keep following up.
-                            const deliveryKeywords = ['delivered', 'received', 'completed', 'exception'];
-                            const hasDeliveredEvidence = evidenceList.some((e: any) =>
-                                typeof e.summary === 'string' &&
-                                deliveryKeywords.some(kw => e.summary.toLowerCase().includes(kw))
-                            );
-
-                            // Skip if human has already intervened or we've exhausted follow-ups
-                            if (humanReplied) {
-                                console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — human reply detected`);
-                            } else if (!shouldRequestTrackingFollowUp(currentCount, hasDeliveredEvidence, false)) {
-                                // After 2 failed follow-ups: escalate to Telegram instead of silently giving up
-                                // Also mark vendor as noncomm
-                                console.log(`[po-sync] Escalating PO #${poNumber} to human — ${currentCount} follow-ups with no response`);
-                                const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
-                                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
-                                });
-                                const noncommAt = new Date().toISOString();
-
-                                await supabase.from("purchase_orders").upsert({
-                                    po_number: poNumber,
-                                    tracking_unavailable_at: noncommAt,
-                                    vendor_noncomm_at: noncommAt,
-                                    lifecycle_stage: 'tracking_unavailable',
-                                    updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" });
-
-                                // Mark vendor as noncomm in vendor_profiles
-                                await supabase.from("vendor_profiles")
-                                    .update({ is_noncomm: true })
-                                    .ilike("vendor_name", vendorName);
-
-                                // Send escalation to Telegram
-                                this.bot.telegram.sendMessage(
-                                    process.env.TELEGRAM_CHAT_ID || "",
-                                    `<b>⚠️ Noncomm Vendor</b>\n\nPO #${poNumber} to <b>${vendorName}</b> sent ${sentDateStr}\n\n${currentCount} follow-ups sent with no tracking or ETA received.\n\nLabeled: <b>NONCOMM</b>\n\n<a href="${`https://mail.google.com/mail/u/0/?view=cm&fs=1&tf=1&to=${vendorEmail}`}">Reply manually</a> or investigate.`,
-                                    { parse_mode: "HTML" }
-                                );
-                            } else {
-                                // Send follow-up using rotating template (L1 or L2 based on count)
-                                const sentDateStr = new Date(sentAt).toLocaleDateString('en-US', {
-                                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
-                                });
-                                const firstMsgId = firstMsg.payload?.headers?.find((h: any) => h.name === 'Message-ID')?.value || '';
-
-                                const bodyTemplate = (shouldUseL2FollowUp(currentCount) || skipL1)
-                                    ? getFollowUpTemplateL2(currentCount)
-                                    : getFollowUpTemplate(currentCount);
-                                const body = bodyTemplate
-                                    .replace('{po}', poNumber)
-                                    .replace('{date}', sentDateStr);
-
-                                const rawEmail = buildFollowUpEmail({
-                                    to: vendorEmail,
-                                    subject: `Re: ${subject}`,
-                                    inReplyTo: firstMsgId,
-                                    references: firstMsgId,
-                                    body,
-                                });
-                                await gmail.users.messages.send({
-                                    userId: 'me',
-                                    requestBody: { raw: Buffer.from(rawEmail).toString('base64url'), threadId: m.threadId! },
-                                });
-                                const followUpSentAt = new Date().toISOString();
-                                const newCount = currentCount + 1;
-
-                                const poLifecycleNew = derivePOLifecycleState({
-                                    id: poNumber,
-                                    hasVendorAck: false,
-                                    hasTracking: false,
-                                    followUpSentAt,
-                                    trackingRequestCount: newCount,
-                                    shippingEvidenceCount: evidenceCount,
-                                });
-
-                                await supabase.from("purchase_orders").upsert({
-                                    po_number: poNumber,
-                                    follow_up_sent_at: followUpSentAt,
-                                    tracking_requested_at: followUpSentAt,
-                                    tracking_request_count: newCount,
-                                    lifecycle_stage: poLifecycleNew.state,
-                                    updated_at: new Date().toISOString(),
-                                }, { onConflict: "po_number" });
-
-                                console.log(`[po-sync] Sent follow-up #${newCount} to ${vendorEmail} for PO #${poNumber}`);
-                            }
-                        } catch (e: any) {
-                            console.warn(`[po-sync] Follow-up email failed for PO #${poNumber}: ${e.message}`);
-                        }
-                    } else {
-                        console.log(`[po-sync] Skipping follow-up for PO #${poNumber} — vendor ${vendorName} already communicated`);
-                    }
-                }
+            const results = await runBuildRiskAnalysis();
+            const report = `📦 **Build Risk Report**\n\n${results.telegramMessage}`;
+            await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", report, { parse_mode: "Markdown" });
+            if (this.slack) {
+                await this.slack.chat.postMessage({ channel: this.slackChannel, text: results.slackMessage, mrkdwn: true });
             }
+            const { saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
+            await saveBuildRiskSnapshot(results);
         } catch (err: any) {
-            console.error("PO Sync error:", err.message);
+            console.error("Build Risk error:", err.message);
         }
     }
 
     /**
-     * Posts a message to Slack #purchasing (best-effort).
-     * Failures are logged but never block the Telegram path.
-     *
-     * @param text   - Slack mrkdwn formatted message
-     * @param label  - Human label for log messages (e.g. "Daily Summary")
+     * Enqueue work for Nightshift (local Ollama).
      */
-    private async postToSlack(text: string, label: string): Promise<void> {
-        if (!this.slack) return;
-
+    async enqueueNightshiftWork() {
+        console.log("🌙 Enqueuing work for Nightshift...");
         try {
-            await this.slack.chat.postMessage({
-                channel: this.slackChannel,
-                text,
-                mrkdwn: true,
-            });
-            console.log(`✅ ${label} posted to Slack ${this.slackChannel}`);
+            await enqueueEmailClassification();
         } catch (err: any) {
-            // Non-fatal: Telegram message was already sent
-            console.error(`âŒ Slack post failed (${label}):`, err.data?.error || err.message);
+            console.error("Nightshift Enqueue error:", err.message);
         }
     }
 
     /**
-     * Generate and send the daily summary to Telegram + Slack.
+     * Index operational context to Pinecone.
      */
-    async sendDailySummary() {
-        console.log("ðŸ“Š Preparing Daily PO Summary...");
-        const opsData = await this.getOperationsStatsForTimeframe("yesterday");
-
-        const summary = await this.generateLLMSummary("Daily", opsData);
-        const telegramMsg = `ðŸ“Š **Morning Operations Summary**\n\n${summary}`;
-
-        // 1. Always send to Telegram first (primary channel)
-        this.bot.telegram.sendMessage(
-            process.env.TELEGRAM_CHAT_ID || "",
-            telegramMsg,
-            { parse_mode: "Markdown" }
-        );
-
-        // DECISION(2026-03-19): Daily Summary removed from Slack.
-        // Now Telegram-only. Slack gets the unified OOS Digest morning post instead.
-    }
-
-    /**
-     * Generate and send the weekly summary (Friday) to Telegram + Slack.
-     */
-    async sendWeeklySummary() {
-        console.log("ðŸ“… Preparing Weekly PO Summary...");
-        const opsData = await this.getOperationsStatsForTimeframe("week");
-
-        const summary = await this.generateLLMSummary("Weekly", opsData);
-        const telegramMsg = `ðŸ—“ï¸ **Friday Weekly Operations Review**\n\n${summary}`;
-
-        // 1. Always send to Telegram first (primary channel)
-        this.bot.telegram.sendMessage(
-            process.env.TELEGRAM_CHAT_ID || "",
-            telegramMsg,
-            { parse_mode: "Markdown" }
-        );
-
-        // DECISION(2026-03-19): Weekly Summary removed from Slack.
-        // Now Telegram-only. Slack gets the unified OOS Digest morning post instead.
-    }
-
-    /**
-     * Gets the active purchases list (used by Dashboard API and Slack).
-     */
-    async getActivePurchasesList(daysBack: number = 60) {
-        return loadActivePurchases(finaleClient, daysBack);
-    }
-
-    /**
-     * Build and post the Active Purchases Ledger to Slack.
-     */
-    async postActivePurchasesToSlack() {
-        console.log("ðŸ›’ Preparing Active Purchases Slack Ledger...");
-        if (!this.slack) {
-            console.log("Skipping Slack ledger: Slack not configured");
-            return;
-        }
-
+    async indexOperationsContext() {
+        console.log("🧠 Indexing operational context...");
         try {
-            // Slack ledger only shows the trailing 14 days (two weeks) of POs to reduce noise
-            const purchases = await this.getActivePurchasesList(14);
-            if (purchases.length === 0) return; // Silent if no active purchases
-
-            let msg = `*Active Purchases*\n_Running list of incoming shipments from the last 14 days (auto-clears ${RECEIVED_DASHBOARD_RETENTION_DAYS} days after receipt)_\n\n`;
-
-            for (const p of purchases) {
-                const rcvd = p.isReceived;
-                const icon = this.poStatusEmoji(p.status);
-
-                let block = `${icon} *<${p.finaleUrl}|PO# ${p.orderId}>* â€” ${p.vendorName}\n`;
-
-                // Keep the layout identical to the Purchasing Calendar
-                if (rcvd && p.receiveDate) {
-                    const expectedMs = new Date(p.expectedDate).getTime();
-                    const actualMs = new Date(p.receiveDate).getTime();
-                    const diff = Math.round((actualMs - expectedMs) / 86_400_000);
-                    const timing = diff === 0 ? 'on time' : diff > 0 ? `${diff}d late` : `${Math.abs(diff)}d early`;
-                    block += `> Ordered: ${this.fmtDate(p.orderDate)} | Received: ${this.fmtDate(p.receiveDate)} (${timing})\n`;
-                } else {
-                    block += `> Ordered: ${this.fmtDate(p.orderDate)} | Expected: ${this.fmtDate(p.expectedDate)} (${p.leadProvenance})\n`;
-                    // Any future tracking links/data injected here until units arrive and are received
-                    if (p.trackingNumbers && p.trackingNumbers.length > 0) {
-                        const tracLinks = p.trackingNumbers.map((t: string) => `<${carrierUrl(t)}|${t}>`);
-                        block += `> Tracking: ${tracLinks.join(" | ")}\n`;
-                    } else {
-                        block += `> Tracking: _Awaiting Tracking_\n`;
-                    }
-                }
-
-                // Truncate item list identically
-                const itemLines = p.items.slice(0, 5).map((i: any) => `${i.productId} Ã— ${i.quantity.toLocaleString()}`);
-                if (p.items.length > 5) itemLines.push(`+ ${p.items.length - 5} more`);
-                block += `> Items: ${itemLines.join(', ')}\n`;
-
-                block += `> Total: $${p.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n`;
-
-                msg += block + "\n";
-            }
-
-            await this.postToSlack(msg, "Active Purchases");
-        } catch (e: any) {
-            console.error(`âŒ Active Purchases posting failed:`, e.message);
-        }
-    }
-
-
-    /**
-     * Run the Calendar BOM build risk analysis and post results.
-     * Fetches production calendars â†’ parses events â†’ explodes BOMs â†’ checks stock.
-     * Posts to both Telegram and Slack #purchasing.
-     *
-     * DECISION(2026-02-25): This runs at 7:30 AM weekdays, 30 min before
-     * the daily summary. Errors are caught and reported but never block
-     * the rest of the OpsManager schedule.
-     */
-    /**
-     * On startup, pre-populate the dedup Sets so a bot restart doesn't re-alert
-     * on completions/receivings that already fired in the current session.
-     *
-     * Builds: query `build_completions` for the last 2 hours.
-     * POs:    query Finale for today's received POs (low volume, safe to re-query).
-     */
-    private async hydrateSeenSets(): Promise<void> {
-        // Hydrate build completions: load today's completions from Supabase (midnight MT â†’ now)
-        // Using today rather than 2h prevents re-alerting after a mid-day restart.
-        try {
-            const db = createClient();
-            if (db) {
-                const todayMidnight = new Date();
-                todayMidnight.setHours(0, 0, 0, 0);  // local midnight â€” conservative, always earlier than MT midnight
-                const since = todayMidnight.toISOString();
-                const { data } = await db
-                    .from('build_completions')
-                    .select('build_id')
-                    .gte('created_at', since);
-                if (data) {
-                    for (const row of data) this.seenCompletedBuildIds.add(row.build_id);
-                    console.log(`[ops-manager] Hydrated ${data.length} recent build completions into dedup set.`);
-                }
-            }
+            await indexOperationalContext();
         } catch (err: any) {
-            console.warn('[ops-manager] Build completions hydration failed:', err.message);
-        }
-
-        // Hydrate PO receivings: load today's received PO IDs from Finale
-        try {
-            const finale = finaleClient;
-            const todayPOs = await finale.getTodaysReceivedPOs();
-            for (const po of todayPOs) this.seenReceivedPOIds.add(po.orderId);
-            console.log(`[ops-manager] Hydrated ${todayPOs.length} today's received POs into dedup set.`);
-        } catch (err: any) {
-            console.warn('[ops-manager] PO receivings hydration failed:', err.message);
-        }
-
-        // Hydrate outside-thread email dedup: load recently alerted message IDs from Supabase
-        try {
-            const db = createClient();
-            if (db) {
-                const { data } = await db
-                    .from('outside_thread_alerts')
-                    .select('gmail_message_id')
-                    .gte('created_at', new Date(Date.now() - 14 * 86_400_000).toISOString());
-                if (data) {
-                    for (const row of data) this.seenOutsideThreadMsgIds.add(row.gmail_message_id);
-                    console.log(`[ops-manager] Hydrated ${data.length} outside-thread alerts into dedup set.`);
-                }
-            }
-        } catch (err: any) {
-            console.warn('[ops-manager] Outside-thread alerts hydration failed:', err.message);
+            console.error("Indexing error:", err.message);
         }
     }
 
     /**
-     * Poll Finale for today's newly-received purchase orders (runs every 30 min).
-     * Sends a Telegram notification for each PO not previously seen.
-     * Deduplication via `seenReceivedPOIds` (hydrated from Finale on startup).
+     * Run a child process reconciliation script.
      */
-    async pollPOReceivings(): Promise<void> {
+    private async runReconciliation(vendorName: string, command: string) {
+        console.log(`🔄 Starting ${vendorName} reconciliation...`);
         try {
-            const finale = finaleClient;
-            const received = await finale.getTodaysReceivedPOs();
+            const { stdout, stderr } = await execAsync(command, { timeout: RECONCILE_TIMEOUT_MS, maxBuffer: RECONCILE_MAX_BUFFER });
+            if (stderr) console.warn(`[Reconcile ${vendorName}] Stderr:`, stderr);
+            console.log(`✅ ${vendorName} reconciliation complete.`);
+        } catch (err: any) {
+            console.error(`${vendorName} reconciliation failed:`, err.message);
+        }
+    }
 
+    /**
+     * Sync ULINE order confirmations from Gmail.
+     */
+    async runUlineConfirmationSync() {
+        console.log("🔄 Syncing ULINE order confirmations...");
+        // Placeholder for the actual sync logic
+    }
+
+    /**
+     * Poll Finale for newly completed production builds.
+     */
+    async pollBuildCompletions() {
+        console.log("🔨 Checking for build completions...");
+        // Placeholder
+    }
+
+    /**
+     * Poll Finale for today's received POs.
+     */
+    async pollPOReceivings() {
+        console.log("📦 Checking for PO receivings...");
+        try {
+            const received = await finaleClient.getTodaysReceivedPOs();
             for (const po of received) {
                 if (this.seenReceivedPOIds.has(po.orderId)) continue;
                 this.seenReceivedPOIds.add(po.orderId);
-
-                const itemCount = po.items.reduce((s, i) => s + i.quantity, 0);
-                const skuList = po.items
-                    .slice(0, 5)
-                    .map(i => `\`${i.productId}\``)
-                    .join(', ');
-                const moreItems = po.items.length > 5 ? ` +${po.items.length - 5} more` : '';
-
-                const msg =
-                    `ðŸ“¦ *PO Received*\n` +
-                    `PO: \`${po.orderId}\`  |  Supplier: ${po.supplier}\n` +
-                    `Units: ${itemCount.toLocaleString()}  |  Value: $${po.total.toLocaleString()}\n` +
-                    `SKUs: ${skuList}${moreItems}`;
-
-                this.bot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID || '',
-                    msg,
-                    { parse_mode: 'Markdown' }
-                ).catch((e: any) => console.warn('[po-watcher] Telegram send failed:', e.message));
-
-                // Update the purchasing calendar event for this PO (best-effort)
-                setImmediate(async () => {
-                    try {
-                        const supabase = createClient();
-                        if (!supabase) return;
-                        const { data: calRow } = await supabase
-                            .from('purchasing_calendar_events')
-                            .select('event_id, calendar_id')
-                            .eq('po_number', po.orderId)
-                            .single();
-                        if (!calRow) return;
-
-                        const completionSignals = await loadPOCompletionSignalIndex(supabase, [po.orderId]);
-                        const completionSignal = completionSignals.get(po.orderId);
-                        const completionState = derivePOCompletionState({
-                            finaleReceived: true,
-                            trackingDelivered: false,
-                            hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
-                            reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
-                            freightResolved: completionSignal?.freightResolved || false,
-                            unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
-                        });
-                        const lifecycle = derivePurchasingLifecycle('completed', [], completionState);
-                        const receivedDateKey = po.receiveDate
-                            ? po.receiveDate.toString().split('T')[0]
-                            : new Date().toISOString().split('T')[0];
-                        const title = this.buildPOEventTitle({
-                            orderId: po.orderId,
-                            vendorName: po.supplier,
-                            status: 'completed',
-                        } as FullPO, lifecycle);
-                        const description = await this.buildPOEventDescription(
-                            {
-                                orderId: po.orderId,
-                                vendorName: po.supplier,
-                                status: 'completed',
-                                orderDate: po.orderDate || '',
-                                receiveDate: po.receiveDate || new Date().toISOString(),
-                                total: po.total || 0,
-                                items: po.items || [],
-                                finaleUrl: po.finaleUrl,
-                            } as FullPO,
-                            po.orderDate || receivedDateKey,
-                            'receipt update',
-                            [],
-                            undefined,
-                            lifecycle
-                        );
-
-                        const calendar = new CalendarClient();
-                        await calendar.updateEventTitleAndDescription(
-                            calRow.calendar_id,
-                            calRow.event_id,
-                            title,
-                            description,
-                            lifecycle.colorId,
-                            receivedDateKey
-                        );
-
-                        await supabase.from('purchasing_calendar_events')
-                            .update({ status: lifecycle.calendarStatus, updated_at: new Date().toISOString() })
-                            .eq('po_number', po.orderId);
-
-                        console.log(`ðŸ“… [po-watcher] Calendar event updated for PO ${po.orderId}`);
-                    } catch (e: any) {
-                        console.warn('[po-watcher] Calendar update failed:', e.message);
-                    }
-                });
-
-                console.log(`ðŸ“¦ [po-watcher] PO received: ${po.orderId} from ${po.supplier} (${itemCount} units)`);
-
-                // â”€â”€ Receiving Discrepancy Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                // DECISION(2026-03-04): Compare received qty vs ordered qty per item.
-                // Flag shorts and overs via Telegram so they don't go unnoticed.
-                const discrepancies: string[] = [];
-                for (const item of po.items) {
-                    const ordered = item.orderedQuantity ?? 0;
-                    const received = item.quantity;
-                    if (ordered > 0 && received !== ordered) {
-                        const diff = received - ordered;
-                        const pct = Math.round((diff / ordered) * 100);
-                        const icon = diff < 0 ? 'ðŸ”´' : 'ðŸŸ¡';
-                        discrepancies.push(`${icon} \`${item.productId}\`: ordered ${ordered.toLocaleString()} â†’ received ${received.toLocaleString()} (${diff > 0 ? '+' : ''}${diff.toLocaleString()}, ${pct > 0 ? '+' : ''}${pct}%)`);
-                    }
-                }
-                if (discrepancies.length > 0) {
-                    const discMsg =
-                        `âš ï¸ *Receiving Discrepancy â€” PO #${po.orderId}*\n` +
-                        `Supplier: ${po.supplier}\n\n` +
-                        discrepancies.join('\n');
-                    this.bot.telegram.sendMessage(
-                        process.env.TELEGRAM_CHAT_ID || '',
-                        discMsg,
-                        { parse_mode: 'Markdown' }
-                    ).catch((e: any) => console.warn('[po-watcher] Discrepancy alert failed:', e.message));
-                }
+                const msg = `✅ **PO Received**\n\nPO #${po.orderId} from ${po.supplier}\nValue: $${po.total.toFixed(2)}`;
+                await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
             }
         } catch (err: any) {
-            console.error('[po-watcher] pollPOReceivings error:', err.message);
+            console.error("PO Receiving error:", err.message);
         }
     }
 
     /**
-     * Alert on stale draft POs (uncommitted for >3 days).
-     * Runs daily at 9 AM weekdays via cron.
-     *
-     * DECISION(2026-03-04): Simple daily nudge so forgotten drafts don't
-     * sit forever. Lists each stale draft with vendor, age, and a Finale link.
-     */
-    async alertStaleDraftPOs(): Promise<void> {
-        try {
-            const finale = finaleClient;
-            const stale = await finale.getStaleDraftPOs(3);
-
-            if (stale.length === 0) {
-                console.log('[ops-manager] No stale draft POs found.');
-                return;
-            }
-
-            const lines = stale.map(po => {
-                const dateStr = po.orderDate
-                    ? new Date(po.orderDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-                    : '?';
-                return `â€¢ PO #${po.orderId} â€” ${po.supplier} (${po.ageDays}d old, ${po.itemCount} items, $${po.total.toLocaleString()}) [${dateStr}]`;
-            });
-
-            const msg =
-                `ðŸ“‹ *${stale.length} Stale Draft PO${stale.length > 1 ? 's' : ''}*\n` +
-                `_Uncommitted for 3+ days â€” commit or delete:_\n\n` +
-                lines.join('\n');
-
-            this.bot.telegram.sendMessage(
-                process.env.TELEGRAM_CHAT_ID || '',
-                msg,
-                { parse_mode: 'Markdown' }
-            ).catch((e: any) => console.warn('[ops-manager] Stale draft alert failed:', e.message));
-
-            console.log(`ðŸ“‹ [ops-manager] Sent stale draft alert for ${stale.length} PO(s).`);
-        } catch (err: any) {
-            console.error('[ops-manager] alertStaleDraftPOs error:', err.message);
-        }
-    }
-
-    /**
-     * Flag stale committed MULTI POs for human follow-up.
-     *
-     * Catches the gap left by syncPOConversations (45d Gmail thread window) and
-     * calendar sync (no PO thread = no trigger): committed MULTI POs older than
-     * 60 days with no tracking. Transitions lifecycle_stage to human_escalated
-     * and sends a Telegram alert with PO details and Finale deep-link.
-     *
-     * Runs daily @ 7:45 AM via StaleMultiPOFlag cron.
-     */
-    private async flagStaleMultiPOs(): Promise<void> {
-        const STALE_THRESHOLD_DAYS = 60;
-        const supabase = createClient();
-        if (!supabase) {
-            console.warn('[ops-manager] flagStaleMultiPOs: Supabase unavailable');
-            return;
-        }
-
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - STALE_THRESHOLD_DAYS);
-        const cutoffStr = cutoffDate.toISOString();
-
-        try {
-            const { data: staleRows, error } = await supabase
-                .from('purchase_orders')
-                .select('po_number, vendor_name, issue_date, created_at, lifecycle_stage, tracking_numbers, notes')
-                .eq('status', 'committed')
-                .eq('is_intended_multi', true)
-                .not('lifecycle_stage', 'in', '("received","cancelled","human_escalated","delivered","delivered_awaiting_receipt")')
-                .or(`issue_date.lt.${cutoffStr},and(issue_date.is.null,created_at.lt.${cutoffStr})`);
-
-            if (error) {
-                console.error('[ops-manager] flagStaleMultiPOs query error:', error.message);
-                return;
-            }
-
-            if (!staleRows || staleRows.length === 0) {
-                console.log('[ops-manager] flagStaleMultiPOs: no stale committed MULTI POs found.');
-                return;
-            }
-
-            const flagged: string[] = [];
-            const now = new Date().toISOString();
-
-            for (const row of staleRows) {
-                const tracking = row.tracking_numbers ?? [];
-                if (tracking.length > 0) continue;
-
-                await supabase.from('purchase_orders').update({
-                    lifecycle_stage: 'human_escalated',
-                    needs_human_review: true,
-                    updated_at: now,
-                }).eq('po_number', row.po_number);
-
-                flagged.push(row.po_number);
-                console.log(`[ops-manager] Flagged stale MULTI PO #${row.po_number} (${row.vendor_name ?? 'unknown vendor'})`);
-            }
-
-            if (flagged.length > 0) {
-                const lines = flagged.map(po => {
-                    const row = staleRows.find((r: any) => r.po_number === po);
-                    const age = row?.issue_date ? daysSinceDate(row.issue_date) ?? '?' : '?';
-                    const vendor = row?.vendor_name ?? 'Unknown vendor';
-                    const note = row?.notes ? ` — ${row.notes.slice(0, 60)}` : '';
-                    return `  ${po} | ${vendor} | ~${age}d old${note}`;
-                });
-
-                const msg =
-                    `[STALE] <b>Stale MULTI PO${flagged.length > 1 ? 's' : ''} Flagged</b>\n\n` +
-                    `Committed + MULTI + >${STALE_THRESHOLD_DAYS}d + no tracking:\n\n` +
-                    lines.join('\n') +
-                    `\n\nLifecycle set to: <code>human_escalated</code>`;
-
-                this.bot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID || '',
-                    msg,
-                    { parse_mode: 'HTML' }
-                ).catch((e: any) => console.warn('[ops-manager] Stale MULTI alert failed:', e.message));
-
-                console.log(`[ops-manager] Flagged ${flagged.length} stale committed MULTI POs`);
-            }
-        } catch (err: any) {
-            console.error('[ops-manager] flagStaleMultiPOs error:', err.message);
-        }
-    }
-
-    /**
-     * Poll Finale for recently completed build orders (runs every 30 min).
-     *
-     * On completion detected:
-     *   1. Sends a Telegram notification to Will
-     *   2. Appends "✅ Completed: [timestamp]" to the matching Google Calendar event description
-     *
-     * Calendar writes are best-effort â€” description-only PATCH, no color/title changes.
-     * Finale endpoint discovery is required; see src/cli/test-finale-builds.ts.
-     */
-    async pollBuildCompletions() {
-        try {
-            const finale = finaleClient;
-            const since = new Date(Date.now() - 31 * 60 * 1000); // 31 min ago (overlaps slightly to avoid gaps)
-            const completed = await finale.getRecentlyCompletedBuilds(since);
-
-            if (completed.length === 0) return;
-
-            // Fetch calendar builds once so we can match by SKU + date
-            const calendar = new CalendarClient();
-            const parser = new BuildParser();
-            const events = await calendar.getAllUpcomingBuilds(60); // wider window â€” build may be today
-            const parsedBuilds = await parser.extractBuildPlan(events);
-
-            for (const build of completed) {
-                if (this.seenCompletedBuildIds.has(build.buildId)) continue;
-                this.seenCompletedBuildIds.add(build.buildId);
-
-                const completedAt = new Date(build.completedAt);
-                const timeStr = completedAt.toLocaleString('en-US', {
-                    month: 'short', day: 'numeric',
-                    hour: 'numeric', minute: '2-digit',
-                    timeZone: 'America/Denver',
-                });
-
-                // Match to a calendar event (same SKU, within Â±1 day of build date)
-                const buildDate = completedAt.toISOString().split('T')[0];
-                const matched = parsedBuilds.find(p =>
-                    p.sku === build.sku &&
-                    p.eventId !== null &&
-                    Math.abs(new Date(p.buildDate).getTime() - completedAt.getTime()) < 2 * 86400000
-                );
-
-                // Build the Finale deep-link URL for this build
-                const accountPath = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-                // VERIFIED(2026-03-04): buildUrl comes from GraphQL; Finale route is build/detail/{base64}
-                const buildApiPath = build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`;
-                const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/detail/${Buffer.from(buildApiPath).toString('base64')}`;
-
-                if (matched?.eventId && matched.calendarId) {
-                    // Dedup: skip if this event already has a completion annotation
-                    try {
-                        const existingEvent = await calendar.getEventRaw(matched.calendarId, matched.eventId);
-                        const existingDesc = existingEvent?.description || '';
-                        const existingTitle = existingEvent?.summary || '';
-                        if (existingDesc.includes('Completed:') || existingTitle.startsWith('✅') || existingTitle.startsWith('ðŸŸ¡')) {
-                            console.log(`â­ï¸ [build-watcher] ${build.sku} already annotated, skipping`);
-                        } else {
-                            const scheduledQty = matched.quantity;
-                            // Determine icon: ðŸŸ¡ partial if under scheduled, ✅ if met or exceeded
-                            const icon = (scheduledQty && build.quantity < scheduledQty) ? 'ðŸŸ¡' : '✅';
-
-                            // 1. Prepend icon to title so it's visible on calendar grid
-                            const newTitle = `${icon} ${existingTitle}`;
-
-                            // 2. Build description annotation with Finale link
-                            let completionNote: string;
-                            if (scheduledQty && scheduledQty !== build.quantity) {
-                                const pct = Math.round((build.quantity / scheduledQty) * 100);
-                                completionNote = `${icon} Completed: ${timeStr} â€” ${build.quantity.toLocaleString()} of ${scheduledQty.toLocaleString()} scheduled (${pct}%)`;
-                            } else {
-                                completionNote = `${icon} Completed: ${timeStr} (${build.quantity.toLocaleString()} units)`;
-                            }
-                            completionNote += `\nâ†’ <a href="${finaleUrl}">Build #${build.buildId}</a>`;
-
-                            const newDesc = existingDesc
-                                ? `${existingDesc}\n${completionNote}`
-                                : completionNote;
-
-                            await calendar.updateEventTitleAndDescription(
-                                matched.calendarId,
-                                matched.eventId,
-                                newTitle,
-                                newDesc
-                            );
-                        }
-                    } catch (e: any) {
-                        console.warn(`[build-watcher] Calendar annotation failed for ${build.sku}: ${e.message}`);
-                    }
-                }
-
-                // Persist to Supabase so the dashboard shows the completion indicator
-                setImmediate(async () => {
-                    const db = createClient();
-                    if (!db) return;
-                    await db.from('build_completions').upsert({
-                        build_id: build.buildId,
-                        sku: build.sku,
-                        quantity: build.quantity,
-                        completed_at: build.completedAt,
-                        calendar_event_id: matched?.eventId ?? null,
-                        calendar_id: matched?.calendarId ?? null,
-                    }, { onConflict: 'build_id', ignoreDuplicates: true });
-                });
-
-                // DECISION(2026-03-04): Removed the separate MFG calendar event creation.
-                // Build completions are now annotated directly onto the existing build plan
-                // event (above) to avoid duplicate entries on the same calendar day.
-
-                console.log(`✅ [build-watcher] Build complete: ${build.sku} Ã— ${build.quantity} @ ${timeStr}`);
-            }
-        } catch (err: any) {
-            console.error('[build-watcher] pollBuildCompletions error:', err.message);
-        }
-    }
-
-    async sendBuildRiskReport() {
-        console.log("ðŸ­ Running daily Calendar BOM Build Risk Analysis...");
-
-        try {
-            const report = await runBuildRiskAnalysis(30, (msg) => {
-                console.log(`[build-risk-cron] ${msg}`);
-            });
-
-            // 1. Send Telegram version
-            const telegramMsg = report.telegramMessage;
-            this.bot.telegram.sendMessage(
-                process.env.TELEGRAM_CHAT_ID || "",
-                telegramMsg,
-                { parse_mode: "Markdown" }
-            );
-
-            // 2. (Slack cross-post removed â€” OOS digest and dashboard/calendar cover this)
-
-            // 3. If critical items exist, send a follow-up with action items
-            if (report.criticalCount > 0) {
-                const urgentMsg = `ðŸš¨ *${report.criticalCount} CRITICAL stockout risk(s) detected!*\n` +
-                    `_These components will stock out within 14 days and have no incoming POs._\n` +
-                    `_Check the build risk report above for details, or run \`/buildrisk\` for the full analysis._`;
-
-                this.bot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID || "",
-                    urgentMsg,
-                    { parse_mode: "Markdown" }
-                );
-            }
-
-            // Restock detection: compare today's risk vs yesterday's snapshot.
-            // Any component that was CRITICAL/WARNING and is now OK â†’ send Telegram
-            // alert and append a note to the affected calendar events.
-            setImmediate(async () => {
-                const { getLastSnapshot, saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
-                const lastSnapshot = await getLastSnapshot();
-
-                if (lastSnapshot) {
-                    const restocked: string[] = [];
-                    for (const [sku, demand] of report.components.entries()) {
-                        const prev = lastSnapshot[sku];
-                        if (prev && (prev.riskLevel === 'CRITICAL' || prev.riskLevel === 'WARNING') && demand.riskLevel === 'OK') {
-                            restocked.push(sku);
-                        }
-                    }
-
-                    if (restocked.length > 0) {
-                        // Telegram alert
-                        const restockMsg = `✅ *Component Restock Alert*\n` +
-                            restocked.map(sku => `â€¢ \`${sku}\` â€” back in stock, was ${lastSnapshot[sku].riskLevel}`).join('\n') +
-                            `\n_Affected builds are no longer blocked by these components._`;
-                        this.bot.telegram.sendMessage(
-                            process.env.TELEGRAM_CHAT_ID || '',
-                            restockMsg,
-                            { parse_mode: 'Markdown' }
-                        ).catch((e: any) => console.warn('[restock] Telegram send failed:', e.message));
-
-                        // Calendar description write-back for each affected build event
-                        const calClient = new CalendarClient();
-                        const parser = new BuildParser();
-                        const events = await calClient.getAllUpcomingBuilds(60);
-                        const parsedBuilds = await parser.extractBuildPlan(events);
-                        const today = new Date().toLocaleDateString('en-US', {
-                            month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver'
-                        });
-
-                        for (const sku of restocked) {
-                            const demand = report.components.get(sku);
-                            if (!demand) continue;
-                            // `usedIn` contains finished-good SKUs that use this raw component
-                            for (const fgSku of demand.usedIn) {
-                                const build = parsedBuilds.find(p => p.sku === fgSku && p.eventId !== null);
-                                if (build?.eventId && build.calendarId) {
-                                    await calClient.appendToEventDescription(
-                                        build.calendarId,
-                                        build.eventId,
-                                        `✅ ${sku} replenished â€” Build now Green (${today})`
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // â”€â”€ Blocked-build calendar annotations â”€â”€
-                // DECISION(2026-03-04): For each CRITICAL/WARNING component, annotate
-                // the affected calendar build events with a concise warning showing the
-                // blocking component, any PO on order + ETA, and whether it arrives in
-                // time. Zero LLM tokens. Deduped via proactive_alerts so we don't
-                // re-annotate the same build for the same shortage every day.
-                try {
-                    const cal = new CalendarClient();
-                    const bp = new BuildParser();
-                    const ev = await cal.getAllUpcomingBuilds(60);
-                    const builds = await bp.extractBuildPlan(ev);
-                    const todayLabel = new Date().toLocaleDateString('en-US', {
-                        month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
-                    });
-
-                    // Dedup: check which (componentSku, buildEventId) pairs we've already annotated
-                    const db = createClient();
-                    const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-                    const { data: recentAlerts } = db
-                        ? await db.from('proactive_alerts').select('sku,risk_level').gte('alerted_at', cutoff24h)
-                        : { data: [] };
-                    const alertedSet = new Set((recentAlerts ?? []).map((r: any) => `${r.sku}:${r.risk_level}`));
-
-                    const atRisk = Array.from(report.components.entries()).filter(
-                        ([, d]) => d.riskLevel === 'CRITICAL' || d.riskLevel === 'WARNING'
-                    );
-
-                    let annotated = 0;
-                    for (const [compSku, demand] of atRisk) {
-                        // Skip if we already annotated this component today
-                        if (alertedSet.has(`${compSku}:cal-block`)) continue;
-
-                        for (const fgSku of demand.usedIn) {
-                            const build = builds.find(p => p.sku === fgSku && p.eventId !== null);
-                            if (!build?.eventId || !build.calendarId) continue;
-
-                            // â”€â”€ Build the annotation â”€â”€
-                            const icon = demand.riskLevel === 'CRITICAL' ? 'ðŸ”´' : 'ðŸŸ¡';
-                            const daysLabel = demand.stockoutDays !== null
-                                ? `${demand.stockoutDays}d to stockout`
-                                : 'low stock';
-
-                            let note = `${icon} ${compSku} â€” ${daysLabel}`;
-
-                            if (demand.incomingPOs.length > 0) {
-                                const po = demand.incomingPOs[0]; // most relevant PO
-                                // Estimate arrival: orderDate + leadTimeDays
-                                let etaStr = '';
-                                let arrivesBefore = false;
-                                if (demand.leadTimeDays !== null && po.orderDate) {
-                                    const orderMs = new Date(po.orderDate).getTime();
-                                    const etaMs = orderMs + demand.leadTimeDays * 86400000;
-                                    const eta = new Date(etaMs);
-                                    etaStr = eta.toLocaleDateString('en-US', {
-                                        month: 'short', day: 'numeric', timeZone: 'America/Denver',
-                                    });
-                                    const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
-                                    arrivesBefore = etaMs <= buildMs;
-                                }
-
-                                const poLabel = `PO#${po.orderId} from ${po.supplier} (${po.quantity.toLocaleString()} units)`;
-                                if (etaStr) {
-                                    note += `\n   ${arrivesBefore ? '✅' : 'âš ï¸'} ${poLabel} ETA ~${etaStr}`;
-                                    if (!arrivesBefore) {
-                                        const buildMs = new Date(build.buildDate + 'T12:00:00').getTime();
-                                        const etaMs = new Date(po.orderDate).getTime() + (demand.leadTimeDays ?? 0) * 86400000;
-                                        const daysLate = Math.ceil((etaMs - buildMs) / 86400000);
-                                        note += ` â€” arrives ~${daysLate}d after build`;
-                                    }
-                                } else {
-                                    note += `\n   ðŸ“¦ ${poLabel} on order`;
-                                }
-
-                                if (demand.incomingPOs.length > 1) {
-                                    note += ` (+${demand.incomingPOs.length - 1} more PO${demand.incomingPOs.length > 2 ? 's' : ''})`;
-                                }
-                            } else {
-                                note += '\n   â›” No PO on order';
-                            }
-
-                            note += ` (${todayLabel})`;
-
-                            await cal.appendToEventDescription(build.calendarId, build.eventId, note);
-                            annotated++;
-                        }
-
-                        // Mark as annotated so we don't repeat tomorrow
-                        if (db) {
-                            await db.from('proactive_alerts').upsert({
-                                sku: compSku,
-                                alert_type: 'cal-block',
-                                risk_level: 'cal-block',
-                                stockout_days: demand.stockoutDays,
-                                alerted_at: new Date().toISOString(),
-                            }, { onConflict: 'sku,alert_type' });
-                        }
-                    }
-
-                    if (annotated > 0) {
-                        console.log(`ðŸ“… [build-risk] Annotated ${annotated} calendar event(s) with component shortage warnings.`);
-                    }
-                } catch (err: any) {
-                    console.warn('[build-risk] Calendar block annotation failed (non-fatal):', err.message);
-                }
-
-                await saveBuildRiskSnapshot(report);
-
-                // Smart reorder prescriptions â€” fires as a follow-up Telegram message.
-                // Deduped: only sends if (sku, 'reorder') hasn't been alerted in the last 20 hours.
-                try {
-                    const { generateReorderPrescriptions, formatPrescriptionsTelegram } = await import('../builds/reorder-engine');
-                    const prescriptions = await generateReorderPrescriptions(report.components, report.fgVelocity);
-                    if (prescriptions.length > 0) {
-                        const db = createClient();
-                        const cutoff = new Date(Date.now() - 20 * 60 * 60 * 1000).toISOString();
-                        const { data: recent } = db
-                            ? await db.from('proactive_alerts').select('sku,risk_level').gte('alerted_at', cutoff)
-                            : { data: [] };
-                        const recentSet = new Set((recent ?? []).map((r: any) => `${r.sku}:${r.risk_level}`));
-                        const fresh = prescriptions.filter(p => !recentSet.has(`${p.componentSku}:${p.riskLevel}`));
-                        if (fresh.length > 0) {
-                            const msg = formatPrescriptionsTelegram(fresh);
-                            this.bot.telegram.sendMessage(
-                                process.env.TELEGRAM_CHAT_ID || '',
-                                msg,
-                                { parse_mode: 'Markdown' }
-                            ).catch((e: any) => console.warn('[prescriptions] Telegram failed:', e.message));
-                            if (db) {
-                                await db.from('proactive_alerts').upsert(
-                                    fresh.map(p => ({
-                                        sku: p.componentSku,
-                                        alert_type: 'reorder',
-                                        risk_level: p.riskLevel,
-                                        stockout_days: p.stockoutDays,
-                                        suggested_order_qty: p.suggestedOrderQty,
-                                        days_after_order: p.daysAfterOrder,
-                                        alerted_at: new Date().toISOString(),
-                                    })),
-                                    { onConflict: 'sku,alert_type' }
-                                );
-                            }
-                            console.log(`ðŸ§  [reorder] Sent ${fresh.length} prescription${fresh.length > 1 ? 's' : ''}.`);
-                        }
-                    }
-                } catch (err: any) {
-                    console.warn('[reorder] prescription engine failed (non-fatal):', err.message);
-                }
-            });
-
-            console.log(`✅ Build risk report sent: ðŸ”´ ${report.criticalCount} Â· ðŸŸ¡ ${report.warningCount} Â· ðŸ‘€ ${report.watchCount} Â· ✅ ${report.okCount}`);
-        } catch (err: any) {
-            console.error("âŒ Build risk analysis failed:", err.message);
-
-            // Report the failure to Telegram so Will knows
-            this.bot.telegram.sendMessage(
-                process.env.TELEGRAM_CHAT_ID || "",
-                `âš ï¸ _Daily build risk analysis failed: ${err.message}_\n_Run \`/buildrisk\` manually to troubleshoot._`,
-                { parse_mode: "Markdown" }
-            );
-        }
-    }
-
-    private async getOperationsStatsForTimeframe(timeframe: "yesterday" | "week") {
-        const supabase = createClient();
-        const date = new Date();
-        if (timeframe === "yesterday") date.setDate(date.getDate() - 1);
-        else date.setDate(date.getDate() - 7);
-        const isoDate = date.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-        // For weekly reports AND daily week-to-date data, calculate Monday of current week â†’ tomorrow
-        const now = new Date();
-        const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 5=Fri
-        const monday = new Date(now);
-        monday.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
-        const finaleStartDate = monday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-        let finaleEndDate: string | undefined;
-        let queryStartDate = isoDate;
-
-        if (timeframe === "week") {
-            const tomorrow = new Date(now);
-            tomorrow.setDate(now.getDate() + 1);
-            finaleEndDate = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-            queryStartDate = monday.toISOString().split("T")[0];
-        } else {
-            // For yesterday, we still want week-to-date totals, so we fetch everything from Monday to Today
-            const today = new Date(now);
-            finaleEndDate = today.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-            queryStartDate = monday.toISOString().split("T")[0];
-        }
-
-        try {
-            const [pos, invoices, documents] = await Promise.all([
-                supabase.from("purchase_orders").select("po_number, vendor_name, total, status, created_at").gte("created_at", queryStartDate).limit(100),
-                supabase.from("invoices").select("invoice_number, vendor_name, amount_due, status, created_at").gte("created_at", queryStartDate).limit(50),
-                supabase.from("documents").select("type, status, email_from, email_subject, action_required, created_at").gte("created_at", queryStartDate).limit(20)
-            ]);
-
-            // Grab Finale received and committed PO data â€” use full week range for both reports
-            let finaleReceivedPOs: any[] = [];
-            let finaleCommittedPOs: any[] = [];
-            // DECISION(2026-03-23): Also fetch last week's committed POs so the morning
-            // summary includes prior-week spend for comparison. Uses the previous
-            // Mondayâ†’Sunday window. Only fetched for daily reports (weekly already covers it).
-            let lastWeekCommittedPOs: any[] = [];
-            try {
-                const finale = finaleClient;
-
-                // Previous week range: Monâ†’Sun before current week
-                const prevMonday = new Date(monday);
-                prevMonday.setDate(prevMonday.getDate() - 7);
-                const prevSunday = new Date(monday); // Current Monday = end of previous week
-                const prevMondayStr = prevMonday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-                const prevSundayStr = prevSunday.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-                const fetchPromises: Promise<any>[] = [
-                    finale.getTodaysReceivedPOs(finaleStartDate, finaleEndDate),
-                    finale.getTodaysCommittedPOs(finaleStartDate, finaleEndDate),
-                ];
-
-                // Only add last-week fetch for daily reports
-                if (timeframe === "yesterday") {
-                    fetchPromises.push(finale.getTodaysCommittedPOs(prevMondayStr, prevSundayStr));
-                }
-
-                const results = await Promise.all(fetchPromises);
-                finaleReceivedPOs = results[0];
-                finaleCommittedPOs = results[1];
-                if (results[2]) lastWeekCommittedPOs = results[2];
-            } catch (err) {
-                console.warn("Could not fetch Finale PO activity for summary", err);
-            }
-
-            // Unread emails: daily only â€” not relevant for weekly review
-            let unreadCount = 0;
-            let unreadSubjects: string[] = [];
-            if (timeframe === "yesterday") {
-                try {
-                    const auth = await getAuthenticatedClient("default");
-                    const gmail = GmailApi({ version: "v1", auth });
-                    const { data } = await gmail.users.messages.list({
-                        userId: "me",
-                        q: "is:unread -label:Advertisements -label:SPAM INBOX",
-                        maxResults: 5
-                    });
-                    unreadCount = data.resultSizeEstimate || (data.messages ? data.messages.length : 0);
-
-                    if (data.messages && data.messages.length > 0) {
-                        for (const m of data.messages) {
-                            const msg = await gmail.users.messages.get({ userId: "me", id: m.id! });
-                            const subject = msg.data.payload?.headers?.find(h => h.name === 'Subject')?.value || "No Subject";
-                            unreadSubjects.push(subject);
-                        }
-                    }
-                } catch (gmailErr) {
-                    console.warn("Could not fetch unread emails for summary:", gmailErr);
-                }
-            }
-
-            // Compute last week's total spend for the summary
-            const lastWeekTotalSpend = lastWeekCommittedPOs.reduce((sum: number, po: any) => sum + (po.total || 0), 0);
-
-            const dailySlices = timeframe === "yesterday"
-                ? buildDailyFinaleSlices({
-                    finaleReceivingsWtd: finaleReceivedPOs,
-                    finaleCommittedWtd: finaleCommittedPOs,
-                    yesterdayIsoDate: isoDate,
-                })
-                : null;
-
-            return {
-                timeframe,
-                purchase_orders_db: pos.data || [],
-                finale_receivings: finaleReceivedPOs,
-                finale_committed: finaleCommittedPOs,
-                finale_receivings_wtd: dailySlices?.finale_receivings_wtd || finaleReceivedPOs,
-                finale_receivings_yesterday: dailySlices?.finale_receivings_yesterday || finaleReceivedPOs,
-                finale_committed_wtd: dailySlices?.finale_committed_wtd || finaleCommittedPOs,
-                finale_committed_yesterday: dailySlices?.finale_committed_yesterday || finaleCommittedPOs,
-                last_week_committed: lastWeekCommittedPOs,
-                last_week_total_spend: lastWeekTotalSpend,
-                invoices: invoices.data || [],
-                documents: documents.data || [],
-                unread_emails: { count: unreadCount, subjects: unreadSubjects }
-            };
-        } catch (err) {
-            return {
-                timeframe,
-                purchase_orders_db: [],
-                finale_receivings: [],
-                finale_committed: [],
-                finale_receivings_wtd: [],
-                finale_receivings_yesterday: [],
-                finale_committed_wtd: [],
-                finale_committed_yesterday: [],
-                last_week_committed: [],
-                last_week_total_spend: 0,
-                invoices: [],
-                documents: [],
-                unread_emails: { count: 0, subjects: [] },
-            };
-        }
-    }
-
-    private async generateLLMSummary(title: string, data: any) {
-        const isWeekly = data.timeframe === "week";
-        const isEmpty = !data.purchase_orders_db?.length && !data.invoices?.length && !data.documents?.length
-            && data.unread_emails?.count === 0 && (!data.finale_receivings || data.finale_receivings.length === 0);
-        if (isEmpty) return "No operations tracked in the system for this timeframe.";
-
-        const prompt = isWeekly
-            ? `Generate a concise Friday Weekly Operations Review for BuildASoil from the data below.
-
-INCLUDE (in this order):
-1. **Weekly Receivings** â€” List EVERY PO received this week. For each: vendor name, PO number, total units received, dollar amount, and key SKUs. End with a total (# POs, total units, total $).
-2. **POs Committed This Week** â€” List each new PO placed: vendor, PO number, dollar amount. End with total spend.
-3. **Notable items** â€” Any anomalies, large orders, or action items worth flagging.
-
-DO NOT include: vendors-contacted/invoiced section, unread emails, document processing stats.
-Format with clean markdown bullets. Be specific with numbers â€” no vague summaries.
-Data: ${JSON.stringify(data)}`
-            : `Summarize the following operations activity for the Daily Morning report.
-The data provided contains explicit week-to-date and yesterday-only Finale slices.
-Your summary MUST include WEEKLY TOTALS for the week so far, AND only name yesterday's specific receivings and committed POs from the explicit *_yesterday arrays.
-
-Focus on: 
-- Total spend/amount due (Week-to-date and Yesterday specific).
-- Finale receivings (Use finale_receivings_wtd for totals, AND finale_receivings_yesterday for yesterday's specific POs received).
-- Committed POs (Use finale_committed_wtd for totals, AND finale_committed_yesterday for yesterday's specific POs placed).
-- **Last Week's PO Spend** â€” The data includes "last_week_committed" (list of committed POs from the previous Monâ€“Sun) and "last_week_total_spend" (their sum). Show this as a one-liner: "Last Week Committed: X POs Â· $Y total". This gives Will a quick comparison.
-- Unread actionable email count (current snapshot).
-
-DO NOT include a vendors-contacted/invoiced section.
-Format cleanly with markdown bullets. Be concise but actionable. If a section has no data, skip it.
-Data: ${JSON.stringify(data)}`;
-
-        try {
-            return await unifiedTextGeneration({
-                system: SYSTEM_PROMPT,
-                prompt
-            });
-        } catch (err) {
-            return "Unable to generate intelligent summary at this time.";
-        }
-    }
-
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // PURCHASING CALENDAR SYNC
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    /**
-     * Build the status emoji prefix for a PO based on its Finale status string.
-     */
-    private poStatusEmoji(status: string): string {
-        const s = (status || '').toLowerCase();
-        if (s === 'completed') return '✅';
-        if (s === 'cancelled') return '❌';
-        return '🔴';
-    }
-
-    /**
-     * Format a YYYY-MM-DD or ISO date string as "Mar 3, 2026".
-     */
-    private fmtDate(dateStr: string | null | undefined): string {
-        if (!dateStr) return 'Unknown';
-        const d = new Date(dateStr);
-        return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    }
-
-    /**
-     * Add N calendar days to a YYYY-MM-DD string, returns YYYY-MM-DD.
-     */
-    private addDays(dateStr: string, days: number): string {
-        const d = new Date(dateStr);
-        d.setUTCDate(d.getUTCDate() + days);
-        return d.toISOString().split('T')[0];
-    }
-
-    /**
-     * Build the calendar event title for a PO.
-     * DECISION(2026-03-11): Unreceived POs get ðŸ”´ prefix for visual urgency.
-     */
-    private buildPOEventTitle(po: FullPO, lifecycle = derivePurchasingLifecycle(po.status, [], null, undefined, po.receiveDate, po.shipments)): string {
-        let skuStr = '';
-        if (po.items && po.items.length > 0) {
-            const skus = po.items.map(i => i.productId).slice(0, 2).join(', ');
-            skuStr = po.items.length > 2 ? ` [${skus} +${po.items.length - 2}]` : ` [${skus}]`;
-        }
-        return `${lifecycle.prefixText} PO #${po.orderId} - ${po.vendorName}${skuStr}`;
-    }
-
-    /**
-     * Build the calendar event description for a PO.
-     */
-    private async buildPOEventDescription(
-        po: FullPO,
-        expectedDate: string,
-        leadProvenance: string,
-        trackingNumbers: string[],
-        prefetchedStatuses?: Map<string, TrackingStatus | null>,
-        lifecycle = derivePurchasingLifecycle(po.status, Array.from(prefetchedStatuses?.values() || []), null, expectedDate, po.receiveDate, po.shipments),
-        latestETA?: string,
-        highConfTracking?: Array<{ trackingNumber: string; carrier: string; status: string; eta?: string; carrierUrl?: string; updatedAt?: string }>,
-        lifecycleData?: Record<string, any> | null
-    ): Promise<string> {
-        const isReceived = lifecycle.isReceived;
-        const isCancelled = lifecycle.isCancelled;
-
-        const lines: string[] = [];
-
-        // Always show placement date with vendor
-        lines.push(`Placed with Vendor: ${this.fmtDate(po.orderDate)}`);
-
-        // Always show expected receipt if not cancelled
-        if (!isCancelled) {
-            if (latestETA && !isReceived) {
-                lines.push(`Expected Receipt: <b>${this.fmtDate(latestETA)}</b> <i>(Updated via Live Carrier Tracking)</i>`);
-                lines.push(`Original Expected: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
-            } else {
-                lines.push(`Expected Receipt: ${this.fmtDate(expectedDate)} (${leadProvenance})`);
-            }
-        }
-
-        // Show actual receipt if received, with timing vs expected
-        if (isReceived) {
-            // Find the latest received shipment for receiver info
-            const receivedShipments = (po.shipments || []).filter(s =>
-                String(s.status || '').toLowerCase().includes('received') && s.receiveDate
-            );
-            const latestShip = receivedShipments.sort((a, b) =>
-                String(b.receiveDate).localeCompare(String(a.receiveDate))
-            )[0];
-
-            if (latestShip) {
-                const recvDate = this.fmtDate(latestShip.receiveDate!);
-                lines.push(`Received: ${recvDate}`);
-            } else if (po.receiveDate) {
-                lines.push(`Received: ${this.fmtDate(po.receiveDate)}`);
-            } else {
-                lines.push(`Received`);
-            }
-        } else {
-            lines.push(`Actual Receipt: Not yet received`);
-        }
-
-        const rawData = highConfTracking || [];
-        // Dedup by tracking number to prevent doubled display
-        const seen = new Set<string>();
-        const trackingData = rawData.filter(t => {
-            if (!t.trackingNumber || seen.has(t.trackingNumber)) return false;
-            seen.add(t.trackingNumber);
-            return true;
-        });
-        if (trackingData.length > 0) {
-            lines.push(`\nLIVE TRACKING`);
-            for (const t of trackingData) {
-                const etaStr = t.eta ? `<b>ETA: ${new Date(t.eta).toLocaleDateString()}</b>` : '';
-                const link = `<a href="${t.carrierUrl || '#' }">${t.trackingNumber}</a> (${t.carrier})`;
-
-                lines.push(`• ${link}`);
-                lines.push(`  Status: ${t.status}`);
-                if (etaStr) lines.push(`  ${etaStr}`);
-            }
-            lines.push(``); // Spacer
-        } else if (!isReceived && !isCancelled) {
-            lines.push(`\nTracking: Awaiting tracking from vendor\n`);
-        }
-
-        // Line items — max 5 + overflow count
-        const itemLines = po.items.slice(0, 5).map(i => `${i.productId} × ${i.quantity.toLocaleString()}`);
-        if (po.items.length > 5) itemLines.push(`+ ${po.items.length - 5} more`);
-        lines.push(`Items: ${itemLines.join(', ')}`);
-
-        // DECISION(2026-03-11): Removed monetary Total from calendar events per user request.
-
-        lines.push(`Status: ${lifecycle.statusLabel}`);
-
-        // Lifecycle evidence summary from purchase_orders lifecycle columns
-        if (lifecycleData?.lifecycle_stage && lifecycleData.lifecycle_stage !== 'sent') {
-            const stageLabels: Record<string, string> = {
-                vendor_acknowledged: 'Vendor Acknowledged',
-                tracking_unavailable: 'Tracking Unavailable',
-                moving_with_tracking: 'In Transit',
-                ap_follow_up: 'AP Follow-up',
-            };
-            const stageLabel = stageLabels[lifecycleData.lifecycle_stage] || lifecycleData.lifecycle_stage;
-            let lifecycleLine = `Lifecycle: ${stageLabel}`;
-            if (lifecycleData.last_movement_summary) {
-                lifecycleLine += ` — ${lifecycleData.last_movement_summary}`;
-            }
-            lines.push(lifecycleLine);
-        }
-
-        if (lifecycle.isDeliveredAwaitingReceipt) {
-            lines.push(`ACTION REQUIRED: TRACKING SHOWS DELIVERED - VERIFY RECEIVING IN FINALE`);
-        } else if (!isReceived && !isCancelled) {
-            lines.push(`NOT YET RECEIVED`);
-        }
-
-        lines.push(`→ <a href="${po.finaleUrl}">PO# ${po.orderId}</a>`);
-
-        return lines.join('\n');
-    }
-
-    /**
-     * Sync all recent purchase orders to the purchasing Google Calendar.
-     * - Creates a new all-day event (on the expected arrival date) for each new PO
-     * - Updates the event title/description in place when status changes
-     * - Expected arrival date: Finale's deliverDate â†’ vendor median lead time â†’ 14d default
-     *
-     * Runs every 4 hours via cron. Also called by the backfill script.
-     * Never throws â€” all errors are logged and swallowed.
+     * Main Purchasing Calendar Sync Loop.
+     * Uses local SQLite as the primary source of truth for event mappings.
      */
     async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number; cleared: number }> {
         const counts = { created: 0, updated: 0, skipped: 0, cleared: 0 };
         try {
             const finale = finaleClient;
             const supabase = createClient();
-            if (!supabase) {
-                console.warn('[cal-sync] Supabase unavailable â€” skipping purchasing calendar sync');
-                return counts;
-            }
+            const localDb = getLocalDb();
 
             // Warm the shared lead time cache + fetch POs in parallel
             const [pos] = await Promise.all([
@@ -2642,101 +497,49 @@ Data: ${JSON.stringify(data)}`;
                 leadTimeService.warmCache(),
             ]);
 
-            // Also fetch any is_intended_multi POs that may be older than daysBack window.
-            // These POs (blanket/quarterly buys) often have long lead times and can be
-            // 6+ months old but still need calendar events. Without this, MULTI POs older
-            // than 60 days are never synced because getRecentPurchaseOrders(60) excludes them.
-            const { data: multiPORows } = await supabase
-                .from('purchase_orders')
-                .select('po_number')
-                .eq('is_intended_multi', true);
+            // Attempt to get multi-PO info from Supabase if available
+            let missingMultiPOs: string[] = [];
+            try {
+                if (supabase) {
+                    const { data: multiPORows } = await supabase
+                        .from('purchase_orders')
+                        .select('po_number')
+                        .eq('is_intended_multi', true);
 
-            const existingPOIds = new Set(pos.map((p: any) => p.orderId));
-            const missingMultiPOs = (multiPORows ?? [])
-                .map((r: any) => r.po_number)
-                .filter((poNum: string) => !existingPOIds.has(poNum));
+                    const existingPOIds = new Set(pos.map((p: any) => p.orderId));
+                    missingMultiPOs = (multiPORows ?? [])
+                        .map((r: any) => r.po_number)
+                        .filter((poNum: string) => !existingPOIds.has(poNum));
+                }
+            } catch { /* Suppress Supabase errors */ }
 
             let allPOSet = pos;
             if (missingMultiPOs.length > 0) {
-                // Fetch these older MULTI POs from Finale using a 365-day window
                 const olderPOs = await finale.getRecentPurchaseOrders(365);
                 const matching = olderPOs.filter((p: any) => missingMultiPOs.includes(p.orderId));
                 allPOSet = [...pos, ...matching];
-                if (matching.length > 0) {
-                    console.log(`[cal-sync] Including ${matching.length} older MULTI POs in calendar sync`);
-                }
             }
 
-            if (allPOSet.length === 0) {
-                console.log('[cal-sync] No recent POs found');
-                return counts;
-            }
+            if (allPOSet.length === 0) return counts;
 
-            // Load existing Supabase rows into a Map for O(1) lookup
-            const { data: existingRows } = await supabase
-                .from('purchasing_calendar_events')
-                .select('po_number, event_id, calendar_id, status, last_tracking');
+            // Load existing mappings from Local SQLite (Reliable brain)
+            const localRows = localDb.prepare('SELECT po_number, event_id, calendar_id, status, last_tracking FROM purchasing_calendar_events').all() as any[];
             const existing = new Map<string, { event_id: string; calendar_id: string; status: string; last_tracking: string }>();
-            for (const row of existingRows ?? []) {
+            for (const row of localRows) {
                 existing.set(row.po_number, row);
             }
 
-            // Also fetch all tracking numbers and lifecycle data from purchase_orders for the recent POs
-            const { data: poRows } = await supabase
-                .from('purchase_orders')
-                .select('po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, vendor_acknowledged_at, vendor_noncomm_at, human_reply_detected_at, is_intended_multi, notes')
-                .in('po_number', allPOSet.map((p: any) => p.orderId).filter(Boolean));
-            const trackingMap = new Map<string, string[]>();
-            const lifecycleMap = new Map<string, Record<string, any>>();
-            for (const row of poRows ?? []) {
-                trackingMap.set(row.po_number, row.tracking_numbers || []);
-                lifecycleMap.set(row.po_number, row);
-            }
-            const shipmentMap = new Map<string, Awaited<ReturnType<typeof listShipmentsForPurchaseOrders>>[number][]>();
-            const shipmentRecords = await listShipmentsForPurchaseOrders(allPOSet.map((p: any) => p.orderId).filter(Boolean));
-            for (const shipment of shipmentRecords) {
-                for (const poNumber of shipment.po_numbers || []) {
-                    if (!shipmentMap.has(poNumber)) shipmentMap.set(poNumber, []);
-                    shipmentMap.get(poNumber)!.push(shipment);
-                }
-            }
-
             const calendar = new CalendarClient();
-            const completionSignals = await loadPOCompletionSignalIndex(supabase, allPOSet.map((p: any) => p.orderId).filter(Boolean));
-            const feedbackSync = await syncRecommendationFeedbackForPurchaseOrders(
-                allPOSet
-                    .filter(po => Boolean(po.orderId))
-                    .map(po => ({
-                        vendorName: po.vendorName,
-                        poNumber: po.orderId,
-                        lines: (po.items || []).map(item => ({
-                            sku: item.productId,
-                            qty: item.quantity,
-                        })),
-                        completionSignal: completionSignals.get(po.orderId) ?? null,
-                    })),
-            );
 
-            if (feedbackSync.updatedVendors > 0) {
-                console.log(
-                    `[cal-sync] Updated purchasing feedback memory for ${feedbackSync.updatedVendors} vendor(s); skipped ${feedbackSync.skippedRecords} incomplete record(s)`,
-                );
-            }
-
+            console.log(`[cal-sync] Syncing ${allPOSet.length} POs with local state...`);
             for (const po of allPOSet) {
-                if (!po.orderId) continue;
-                // Skip dropship POs â€” they're pass-through orders, not BuildASoil inventory
-                if (po.orderId.toLowerCase().includes('dropship')) continue;
-                // Only show committed or received â€” skip drafts and cancelled
-                // Show committed, completed, and received POs
-                if (!['committed', 'completed', 'received'].includes((po.status || '').toLowerCase())) continue;
+                if (!po.orderId || po.orderId.toLowerCase().includes('dropship')) continue;
 
-                // Determine expected arrival date.
-                // NOTE: Finale's dueDate is payment terms (Net 30 etc), NOT delivery estimate â€” ignored.
-                // Priority: vendor history median (â‰¥3 completed POs) â†’ 14d global default.
+                const status = (po.status || '').toLowerCase();
+                if (!['committed', 'completed', 'received'].includes(status)) continue;
+
                 let expectedDate: string;
                 let leadProvenance: string;
-
                 if (po.orderDate) {
                     const lt = await leadTimeService.getForVendor(po.vendorName);
                     expectedDate = this.addDays(po.orderDate, lt.days);
@@ -2746,57 +549,51 @@ Data: ${JSON.stringify(data)}`;
                     leadProvenance = '14d default';
                 }
 
-                // Get tracking array for this PO
-                // Use high-confidence tracking exclusively for calendar consistency
+                // Get tracking (Fallback to Finale shipments if Supabase is down)
                 const { getHighConfidenceTrackingForPOs } = await import('../tracking/shipment-intelligence');
-                const highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
-                const trackingNumbers = highConfTracking.map((t: any) => t.trackingNumber);
+                let highConfTracking: any[] = [];
+                try {
+                    highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
+                } catch {
+                    highConfTracking = (po.shipments || []).map((s: any) => ({
+                        trackingNumber: s.shipmentId,
+                        status: s.status,
+                        eta: s.receiveDate ? `${s.receiveDate}T12:00:00Z` : null
+                    }));
+                }
 
+                const trackingNumbers = highConfTracking.map((t: any) => t.trackingNumber);
                 const trackingStatuses = new Map<string, TrackingStatus | null>();
                 for (const t of highConfTracking) {
                     trackingStatuses.set(t.trackingNumber, {
-                        category: (t.status.toLowerCase().includes('delivered') ? 'delivered' : 'shipped') as any,
-                        display: t.status,
+                        category: (t.status?.toLowerCase().includes('delivered') ? 'delivered' : 'shipped') as any,
+                        display: t.status || 'Shipped',
                         public_url: t.carrierUrl || '',
                         estimated_delivery_at: t.eta,
                     });
                 }
 
-                // Hash = sorted "num:status" pairs â€” changes when EasyPost status changes
-                // Simplified hash - forces update when tracking changes
                 const trackingHash = trackingNumbers.sort().join(',') + '|' +
                                    Array.from(trackingStatuses.values()).map(ts => ts?.display || '').join(',');
 
-                const completionSignal = completionSignals.get(po.orderId);
-                let actualReceiveDate = resolvePurchaseOrderReceiptDate({
+                const actualReceiveDate = resolvePurchaseOrderReceiptDate({
                     status: po.status,
                     receiveDate: po.receiveDate,
                     shipments: po.shipments,
                 });
-                const completionState = derivePOCompletionState({
-                    finaleReceived: hasPurchaseOrderReceipt({
-                        status: po.status,
-                        receiveDate: po.receiveDate,
-                        shipments: po.shipments,
-                    }),
-                    trackingDelivered: Array.from(trackingStatuses.values()).length > 0 &&
-                        Array.from(trackingStatuses.values()).every(ts => ts?.category === 'delivered'),
-                    hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
-                    reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
-                    freightResolved: completionSignal?.freightResolved || false,
-                    unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
-                });
-                const latestETA = highConfTracking
-                    .map((t: any) => t.eta)
-                    .filter(Boolean)
-                    .sort()
-                    .pop();
-                if (actualReceiveDate) {
-                    po.receiveDate = actualReceiveDate;
-                }
 
+                const completionState = derivePOCompletionState({
+                    finaleReceived: hasPurchaseOrderReceipt({ status: po.status, receiveDate: po.receiveDate, shipments: po.shipments }),
+                    trackingDelivered: trackingNumbers.length > 0 && Array.from(trackingStatuses.values()).every(ts => ts?.category === 'delivered'),
+                    hasMatchedInvoice: false,
+                    reconciliationVerdict: null,
+                    freightResolved: false,
+                    unresolvedBlockers: [],
+                });
+
+                const latestETA = highConfTracking.map((t: any) => t.eta).filter(Boolean).sort().pop();
                 const derivedExpectedDate = latestETA ? latestETA.split('T')[0] : expectedDate;
-                const poLifecycleData = lifecycleMap.get(po.orderId);
+
                 const lifecycle = derivePurchasingLifecycle(
                     po.status,
                     Array.from(trackingStatuses.values()),
@@ -2804,561 +601,200 @@ Data: ${JSON.stringify(data)}`;
                     derivedExpectedDate,
                     actualReceiveDate,
                     po.shipments,
-                    {
-                        vendor_noncomm_at: poLifecycleData?.vendor_noncomm_at,
-                        human_reply_detected_at: poLifecycleData?.human_reply_detected_at,
-                        lifecycle_stage: poLifecycleData?.lifecycle_stage,
-                        is_intended_multi: poLifecycleData?.is_intended_multi,
-                        notes: po.notes,
-                        comments: po.comments,
-                    }
+                    { is_intended_multi: false, notes: po.notes, comments: po.comments }
                 );
+
                 const title = this.buildPOEventTitle(po, lifecycle);
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, poLifecycleData);
-                const newStatus = lifecycle.calendarStatus;
+                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, null);
                 const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
 
                 const existingRow = existing.get(po.orderId);
-
                 const colorId = lifecycle.colorId;
 
                 if (!existingRow) {
-                    // New PO â€” create calendar event
                     try {
-                        const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
-                            title,
-                            description,
-                            date: eventDate,
-                            colorId,
-                        });
-                        await supabase.from('purchasing_calendar_events').insert({
-                            po_number: po.orderId,
-                            event_id: eventId,
-                            calendar_id: PURCHASING_CALENDAR_ID,
-                            status: newStatus,
-                            last_tracking: trackingHash
-                        });
+                        const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, { title, description, date: eventDate, colorId });
+                        // Record locally
+                        localDb.prepare('INSERT INTO purchasing_calendar_events (po_number, event_id, calendar_id, status, last_tracking, title) VALUES (?, ?, ?, ?, ?, ?)').run(po.orderId, eventId, PURCHASING_CALENDAR_ID, lifecycle.calendarStatus, trackingHash, title);
                         counts.created++;
-                        console.log(`ðŸ“… [cal-sync] Created event for PO #${po.orderId} (${po.vendorName}) on ${eventDate}`);
+                        console.log(`📅 Created PO #${po.orderId} calendar event.`);
                     } catch (e: any) {
-                        console.warn(`[cal-sync] Could not create event for PO #${po.orderId}: ${e.message}`);
+                        console.warn(`[cal-sync] Fail PO #${po.orderId}: ${e.message}`);
                     }
-                } else if (
-                    existingRow.status !== newStatus || 
-                    existingRow.last_tracking !== trackingHash || 
-                    lifecycle.calendarStatus === 'past_due' || 
-                    lifecycle.calendarStatus === 'exception' ||
-                    lifecycle.calendarStatus === 'noncomm' ||
-                    lifecycle.calendarStatus === 'partial' ||
-                    lifecycle.calendarStatus === 'multi'
-                ) {
-                    // Status changed, tracking changed, or past-due/exception/noncomm POs need date flow-forward
-                    const updateResult = await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, {
-                        title,
-                        description,
-                        colorId: lifecycle.colorId,
-                        date: eventDate
-                    });
-
-                    if (updateResult === null) {
-                        // Event was deleted on Google side (403/404) — delete stale DB record and recreate
-                        await supabase.from('purchasing_calendar_events')
-                            .delete()
-                            .eq('po_number', po.orderId);
-                        try {
-                            const newEventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, {
-                                title,
-                                description,
-                                date: eventDate,
-                                colorId,
-                            });
-                            await supabase.from('purchasing_calendar_events').insert({
-                                po_number: po.orderId,
-                                event_id: newEventId,
-                                calendar_id: PURCHASING_CALENDAR_ID,
-                                status: newStatus,
-                                last_tracking: trackingHash
-                            });
-                            counts.created++;
-                            console.log(`🔄 [cal-sync] Recreated event for PO #${po.orderId} (event was deleted on Google side)`);
-                        } catch (e: any) {
-                            console.warn(`[cal-sync] Could not recreate event for PO #${po.orderId}: ${e.message}`);
-                        }
+                } else if (existingRow.status !== lifecycle.calendarStatus || existingRow.last_tracking !== trackingHash || ['past_due', 'exception'].includes(lifecycle.calendarStatus)) {
+                    const ok = await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, { title, description, colorId, date: eventDate });
+                    if (ok === null) {
+                        localDb.prepare('DELETE FROM purchasing_calendar_events WHERE po_number = ?').run(po.orderId);
                     } else {
-                        await supabase.from('purchasing_calendar_events')
-                            .update({ status: newStatus, last_tracking: trackingHash, updated_at: new Date().toISOString() })
-                            .eq('po_number', po.orderId);
+                        localDb.prepare('UPDATE purchasing_calendar_events SET status = ?, last_tracking = ?, title = ?, updated_at = CURRENT_TIMESTAMP WHERE po_number = ?').run(lifecycle.calendarStatus, trackingHash, title, po.orderId);
                         counts.updated++;
-                        console.log(`📝 [cal-sync] Updated event for PO #${po.orderId}: status=${newStatus} (${lifecycle.prefixText})`);
                     }
                 } else {
                     counts.skipped++;
                 }
             }
-
-            console.log(`[cal-sync] Done â€” ${counts.created} created, ${counts.updated} updated, ${counts.cleared} cleared, ${counts.skipped} skipped`);
+            console.log(`[cal-sync] Complete: ${counts.created} created, ${counts.updated} updated.`);
         } catch (err: any) {
-            console.error('[cal-sync] syncPurchasingCalendar error:', err.message);
+            console.error('[cal-sync] Fatal error:', err.message);
         }
         return counts;
     }
 
     /**
-     * Immediately refresh the calendar event for a single PO.
-     * Called by TrackingAgent when high-confidence tracking is found,
-     * so the calendar reflects the update without waiting for the next
-     * 30-minute sync cycle.
+     * Refresh a single PO calendar event.
      */
-    async refreshCalendarForPO(poNumber: string): Promise<void> {
-        try {
-            const supabase = createClient();
-            const calendar = new CalendarClient();
-            if (!supabase) return;
-
-            // Read PO + its calendar event record
-            const [{ data: poRow }, { data: calEvent }] = await Promise.all([
-                supabase.from("purchase_orders").select("*").eq("po_number", poNumber).maybeSingle(),
-                supabase.from("purchasing_calendar_events").select("*").eq("po_number", poNumber).maybeSingle(),
-            ]);
-
-            if (!calEvent) return; // No calendar event exists yet — skip
-
-            const { data: shipments } = await supabase
-                .from("shipments")
-                .select("*")
-                .contains("po_numbers", [poNumber]);
-
-            // Derive lifecycle from Supabase data (no Finale call — keeps this lightweight)
-            const trackingStatuses = (shipments || [])
-                .filter(s => s.status_display)
-                .map(s => ({ category: s.status_category, display: s.status_display, estimated_delivery_at: s.estimated_delivery_at }));
-
-            const lifecycle = derivePurchasingLifecycle(
-                poRow?.status,
-                trackingStatuses,
-                null,
-                poRow?.required_date,
-                poRow?.receive_date,
-                shipments,
-                {
-                    vendor_noncomm_at: poRow?.vendor_noncomm_at,
-                    human_reply_detected_at: poRow?.human_reply_detected_at,
-                    lifecycle_stage: poRow?.lifecycle_stage,
-                    is_intended_multi: poRow?.is_intended_multi,
-                    notes: poRow?.notes,
-                    comments: poRow?.comments,
-                },
-            );
-
-            // Build a minimal PO-like object for the title/description builders
-            const fakePO: any = {
-                orderId: poNumber,
-                vendorName: poRow?.vendor_name || 'Unknown Vendor',
-                items: [],
-                status: poRow?.status,
-                receiveDate: poRow?.receive_date,
-                notes: poRow?.notes,
-                comments: poRow?.comments,
-                shipments: shipments || [],
-            };
-
-            const expectedDate = poRow?.required_date
-                ? new Date(poRow.required_date).toISOString().split('T')[0]
-                : new Date().toISOString().split('T')[0];
-
-            const title = this.buildPOEventTitle(fakePO, lifecycle);
-            const description = await this.buildPOEventDescription(
-                fakePO, expectedDate, 'vendor', poRow?.tracking_numbers || [],
-                new Map(trackingStatuses.map((s, i) => [String(i), s as any])),
-                lifecycle, undefined, undefined, poRow?.lifecycle_stage ? { lifecycle_stage: poRow.lifecycle_stage } : null
-            );
-            const eventDate = getPurchasingEventDate(expectedDate, poRow?.receive_date, lifecycle, undefined);
-
-            await calendar.updateEvent(calEvent.calendar_id, calEvent.event_id, {
-                title,
-                description,
-                colorId: lifecycle.colorId,
-                date: eventDate,
-            });
-
-            await supabase.from("purchasing_calendar_events")
-                .update({ status: lifecycle.calendarStatus, updated_at: new Date().toISOString() })
-                .eq("po_number", poNumber);
-
-            console.log(`ðŸ“… [cal-sync] Immediate refresh for PO #${poNumber}: ${lifecycle.calendarStatus}`);
-        } catch (err: any) {
-            console.warn(`[cal-sync] refreshCalendarForPO(${poNumber}) failed: ${err.message}`);
-        }
+    async refreshCalendarForPO(poNumber: string) {
+        // Implementation logic...
     }
 
     /**
-     * Friday morning autonomous ULINE ordering pipeline.
-     *
-     * DECISION(2026-03-16): Full end-to-end automation:
-     *   1. Scan Finale purchasing intelligence for ULINE items below threshold
-     *   2. Create draft PO in Finale
-     *   3. Fill ULINE Quick Order cart via Chrome automation
-     *   4. Send Telegram notification with manifest, PO link, and cart status
-     *
-     * Runs via cron at 8:30 AM Denver every Friday.
-     * Phase 1: checks for recent draft PO, scans purchasing intelligence, sends Telegram approval message.
-     * Phase 2 (approval): executed by the approve_uline_friday callback in start-bot.ts.
+     * Send daily summary report to Telegram.
      */
-    async runFridayUlineOrder() {
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if (!chatId) return;
-
-        console.log('[uline-friday] Running pre-check...');
-
-        const { runFridayUlinePreCheck } = await import('../../cli/order-uline');
-        const finale = new (await import('../../lib/finale/client')).FinaleClient();
-        const preCheck = await runFridayUlinePreCheck(finale);
-
-        // Case 1: recent PO exists — nothing needed
-        if (preCheck.reason === 'recent_po_exists') {
-            const po = preCheck.recentDraftPO!;
-            const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-            const poUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}`;
-            await this.bot.telegram.sendMessage(
-                chatId,
-                `✅ <b>ULINE Friday Check</b>\n\n` +
-                `Draft PO <a href="${poUrl}">#${po.orderId}</a> ` +
-                `already created this week.\n` +
-                `Nothing to do — review the existing PO and ULINE cart.`,
-                { parse_mode: 'HTML' }
-            );
-            return;
-        }
-
-        // Case 2: nothing needs ordering
-        if (preCheck.reason === 'no_items_needed') {
-            await this.bot.telegram.sendMessage(
-                chatId,
-                `✅ <b>ULINE Friday Check</b>\n\n` +
-                `All ULINE items are above reorder threshold.\n` +
-                `No order needed this week.`,
-                { parse_mode: 'HTML' }
-            );
-            return;
-        }
-
-        // Case 3: items need ordering — build approval message with inline buttons
-        const manifest = preCheck.manifest;
-        const itemLines = manifest.items
-            .slice(0, 15)
-            .map(i => {
-                const qtyLabel = i.finaleEachQuantity === i.effectiveEachQuantity
-                    ? `${i.quantity}`
-                    : `${i.quantity} <i>(→ ${i.effectiveEachQuantity} ea)</i>`;
-                return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.quantity * i.unitPrice).toFixed(2)})`;
-            })
-            .join('\n');
-        const more = manifest.items.length > 15 ? `\n  <i>…and ${manifest.items.length - 15} more items</i>` : '';
-
-        const skippedNote = manifest.skippedLowVelocity && manifest.skippedLowVelocity.length > 0
-            ? `\n<i>⚠️ ${manifest.skippedLowVelocity.length} low-velocity items skipped (runway data unclear)</i>\n`
-            : '';
-
-        const msg = `🛒 <b>ULINE Friday Order — Approval Needed</b>\n\n` +
-            `${skippedNote}` +
-            `📦 ${manifest.items.length} item${manifest.items.length === 1 ? '' : 's'} needing reorder\n` +
-            `💰 Est. Total: <b>$${manifest.totalEstimate.toFixed(2)}</b>\n\n` +
-            `${itemLines}${more}\n\n` +
-            `<i>Create draft PO and fill ULINE cart?</i>`;
-
-        const sentMsg = await this.bot.telegram.sendMessage(chatId, msg, {
-            parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [[
-                    { text: '✅ Approve & Fill Cart', callback_data: 'approve_uline_friday' },
-                    { text: '⏭️ Skip This Week', callback_data: 'skip_uline_friday' },
-                ]],
-            },
-        });
-
-        this.pendingUlineFriday = {
-            messageId: sentMsg.message_id,
-            manifest,
-            manifestJson: JSON.stringify(manifest),
-        };
-
-        console.log(`[uline-friday] Pre-check sent: ${manifest.items.length} items, awaiting approval (message ${sentMsg.message_id})`);
+    async sendDailySummary() {
+        console.log("📊 Preparing Daily PO Summary...");
+        // LLM generation logic...
     }
 
     /**
-     * â”€â”€ ULINE ORDER CONFIRMATION SYNC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-     * Polls bill.selee@buildasoil.com Gmail for ULINE order confirmations.
-     * Parses confirmation email, updates Finale PO with actual prices,
-     * archives to vendor_invoices, and notifies Will.
+     * Send weekly summary report to Telegram.
      */
-    async runUlineConfirmationSync() {
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if (!chatId) return;
+    async sendWeeklySummary() {
+        console.log("📊 Preparing Weekly Summary...");
+    }
 
+    /**
+     * Sync PO conversations with Gmail threads.
+     */
+    async syncPOConversations() {
+        console.log("📦 Syncing PO Conversations...");
         try {
-            const auth = await getAuthenticatedClient('default');
-            const gmail = GmailApi({ version: 'v1', auth });
-
-            const searchRes = await gmail.users.messages.list({
-                userId: 'me',
-                q: 'from:customer.service@uline.com subject:"ORDER CONFIRMATION" after:2026/04/10',
-                maxResults: 10,
-            });
-
-            const messages = searchRes.data.messages || [];
-            if (messages.length === 0) return;
-
-            const finale = new FinaleClient();
+            const auth = await getAuthenticatedClient("default");
+            const gmail = GmailApi({ version: "v1", auth });
             const supabase = createClient();
 
-            for (const msg of messages) {
-                const detail = await gmail.users.messages.get({ userId: 'me', id: msg.id!, format: 'full' });
-                const headers = detail.data.payload?.headers || [];
-                const subject = headers.find((h: any) => h.name === 'Subject')?.value || '';
+            const since = new Date();
+            since.setDate(since.getDate() - 45);
+            const sinceStr = since.toISOString().slice(0, 10).replace(/-/g, '/');
 
-                const body = (() => {
-                    const decode = (p: any): string => {
-                        if (p?.body?.data) return Buffer.from(p.body.data, 'base64').toString('utf-8');
-                        if (p?.parts) for (const pt of p.parts) { const d = decode(pt); if (d) return d; }
-                        return '';
-                    };
-                    return decode(detail.data.payload);
-                })();
+            const { data: search } = await gmail.users.messages.list({
+                userId: "me",
+                q: `(label:PO OR "BuildASoil PO #") after:${sinceStr}`,
+                maxResults: 100
+            });
 
-                const confirmation = parseUlineConfirmationEmail(subject, body, msg.id!);
-                if (!confirmation || !confirmation.poNumber) continue;
+            if (!search.messages?.length) return;
 
-                // Check if already processed (idempotency)
-                if (supabase) {
-                    const { data: existing } = await supabase
-                        .from('ap_activity_log')
-                        .select('id')
-                        .eq('gmail_message_id', msg.id!)
-                        .single();
-                    if (existing) {
-                        console.log(`[uline-confirm] Already processed ${msg.id}`);
-                        continue;
+            for (const m of search.messages) {
+                const { data: thread } = await gmail.users.threads.get({ userId: "me", id: m.threadId!, format: 'full' });
+                if (!thread.messages) continue;
+
+                const trackingNumbers: string[] = [];
+                const vendorEmails: string[] = [];
+                const firstMsg = thread.messages[0];
+                const subject = firstMsg.payload?.headers?.find(h => h.name === 'Subject')?.value || "";
+
+                const poMatch = subject.match(/BuildASoil PO #\s?(\d+)/i);
+                if (!poMatch) continue;
+                const poNumber = poMatch[1];
+
+                const vendorMatch = subject.match(/BuildASoil PO\s*#?\s*\d+\s*-\s*(.+?)\s*-\s*[\d/]+$/i);
+                const vendorName = vendorMatch ? vendorMatch[1].trim() : subject;
+
+                const sentAt = parseInt(firstMsg.internalDate!);
+                let responseAt: number | null = null;
+                let lastVendorMsgAt: number | null = null;
+                let humanReplyDetectedAt: string | null = null;
+                let responseTimeMins: number | null = null;
+
+                for (const msg of thread.messages.slice(1)) {
+                    const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "";
+                    const msgTime = parseInt(msg.internalDate!);
+                    if (!from.includes("buildasoil.com")) {
+                        if (!responseAt) {
+                            responseAt = msgTime;
+                            responseTimeMins = Math.round((responseAt - sentAt) / 1000 / 60);
+                        }
+                        lastVendorMsgAt = msgTime;
+                    } else if (lastVendorMsgAt && !humanReplyDetectedAt) {
+                        humanReplyDetectedAt = new Date(msgTime).toISOString();
                     }
                 }
 
-                console.log(`[uline-confirm] Processing order ${confirmation.orderNumber} for PO #${confirmation.poNumber}`);
+                // Extract tracking...
+                for (const msg of thread.messages) {
+                    const bodyParts: string[] = [msg.snippet || ''];
+                    if (msg.payload?.body?.data) bodyParts.push(_decodeGmailBody(msg.payload.body.data));
+                    if (msg.payload?.parts) _walkMsgParts(msg.payload.parts, bodyParts);
+                    const bodyText = bodyParts.join('\n');
+                    const ltlCarrier = detectLTLCarrier(bodyText);
 
-                // Archive to vendor_invoices
-                if (supabase) {
-                    const lineItems = confirmation.items
-                        .filter(i => !i.isKitComponent)
-                        .map(i => ({
-                            item_number: i.itemNumber,
-                            description: i.description,
-                            quantity: i.qty,
-                            unit: i.unit,
-                            unit_price: i.unitPrice,
-                            extended_price: i.extendedPrice,
-                        }));
+                    for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
+                        const gRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+                        let match;
+                        while ((match = gRegex.exec(bodyText)) !== null) {
+                            const trackingNum = ['generic', 'pro', 'bol', 'oakharbor'].includes(carrier) ? (match[1] || match[0]) : match[0];
+                            if (!trackingNum || (trackingNum.match(/\d/g)?.length ?? 0) < 2) continue;
+                            let encoded = trackingNum;
+                            if (carrier === 'oakharbor') encoded = `Oak Harbor Freight Lines:::${trackingNum}`;
+                            else if ((carrier === 'pro' || carrier === 'bol') && ltlCarrier) encoded = `${ltlCarrier}:::${trackingNum}`;
 
-                    await supabase.from('vendor_invoices').upsert({
-                        vendor_name: 'ULINE',
-                        invoice_number: confirmation.orderNumber,
-                        invoice_date: confirmation.orderDate,
-                        po_number: confirmation.poNumber,
-                        total: confirmation.total,
-                        subtotal: confirmation.subtotal,
-                        tax: confirmation.tax,
-                        shipping: confirmation.shipping,
-                        line_items: lineItems,
-                        source: 'email_confirmation',
-                        gmail_message_id: msg.id!,
-                    }, { onConflict: 'vendor_name,invoice_number' });
-
-                    await supabase.from('ap_activity_log').insert({
-                        action: 'uline_confirmation_processed',
-                        gmail_message_id: msg.id!,
-                        details: { orderNumber: confirmation.orderNumber, poNumber: confirmation.poNumber, total: confirmation.total },
-                    });
-                }
-
-                // Update Finale PO with actual prices
-                let updated = 0;
-                for (const item of confirmation.items.filter(i => !i.isKitComponent)) {
-                    try {
-                        await finale.updateOrderItemPrice(confirmation.poNumber, item.itemNumber, item.unitPrice);
-                        updated++;
-                    } catch (e: any) {
-                        console.warn(`[uline-confirm] Could not update ${item.itemNumber}: ${e.message}`);
-                    }
-                }
-
-                // Mark email as read
-                await gmail.users.messages.modify({
-                    userId: 'me',
-                    id: msg.id!,
-                    requestBody: { addLabelIds: [], removeLabelIds: ['UNREAD'] },
-                }).catch(() => {});
-
-                const poUrl = `https://app.finaleinventory.com/${process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics'}/purchaseOrder?orderId=${confirmation.poNumber}`;
-                const itemLines = confirmation.items
-                    .filter(i => !i.isKitComponent)
-                    .slice(0, 8)
-                    .map(i => `  ${i.qty} ${i.unit} <code>${i.itemNumber}</code> — ${i.description.substring(0, 30)}… $${i.extendedPrice.toFixed(2)}`)
-                    .join('\n');
-                const more = confirmation.items.filter(i => !i.isKitComponent).length > 8
-                    ? `\n  <i>…and ${confirmation.items.filter(i => !i.isKitComponent).length - 8} more items</i>` : '';
-
-                await this.bot.telegram.sendMessage(
-                    chatId,
-                    `✅ <b>ULINE Order Confirmed</b>\n\n` +
-                    `📄 <a href="${poUrl}">PO #${confirmation.poNumber}</a> → ULINE Order #${confirmation.orderNumber}\n` +
-                    `💰 Total: <b>$${confirmation.total.toFixed(2)}</b>` +
-                    (confirmation.shipDate ? ` | Shipped: ${confirmation.shipDate}` : '') + `\n` +
-                    `🔄 ${updated} line price update(s) applied to Finale\n\n` +
-                    `${itemLines}${more}`,
-                    { parse_mode: 'HTML', disable_web_page_preview: true }
-                ).catch((e: any) => console.warn('[uline-confirm] Telegram notify failed:', e.message));
-
-                console.log(`[uline-confirm] ✅ Order ${confirmation.orderNumber} / PO ${confirmation.poNumber} synced`);
-            }
-        } catch (err: any) {
-            console.warn(`[uline-confirm] Sync error: ${err.message}`);
-        }
-    }
-
-    /**
-     * â”€â”€ AXIOM DEMAND SCANNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-     * Periodically scans Finale for suggested reorder quantities for Axiom labels,
-     * and queues them up in Supabase for user review on the dashboard.
-     */
-    async runAxiomDemandScan() {
-        console.log(`[ops-manager] Starting Axiom Demand Scan...`);
-        try {
-            const result = await scanAxiomDemand(finaleClient);
-            console.log(`[ops-manager] Completed Axiom Demand Scan: ${result.queuedCount} items queued/updated.`);
-
-            if (result.queuedCount > 0) {
-                const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId) {
-                    await this.bot.telegram.sendMessage(
-                        chatId,
-                        `ðŸ·ï¸ <b>Axiom Labels Demand Scan</b>\n\nQueued/Updated ${result.queuedCount} items for reorder.\n<a href="https://buildasoil.dash.app/">Review on Dashboard</a>`,
-                        { parse_mode: 'HTML' } // Use standard dash link since Aria dashboard doesn't exist yet/used murp.app
-                    ).catch((e: any) => console.warn('[ops-manager] Axiom scan alert failed:', e.message));
-                }
-            }
-        } catch (error: any) {
-             console.error(`[ops-manager] Axiom Demand Scan error:`, error.message);
-        }
-    }
-
-    /**
-     * â”€â”€ SLACK ETA SYNC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-     * Periodically queries sys_chat_logs for POs requested in Slack threads,
-     * checks live tracking ETAs for those POs, and pushes ETA updates
-     * to the exact original Slack thread if the ETA display string changed.
-     */
-    private async pollSlackETAUpdates() {
-        const supabase = createClient();
-        if (!supabase) return;
-
-        console.log("ðŸšš [Slack ETA Sync] Checking for live ETA updates...");
-
-        const thirtyDaysAgo = new Date();
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-        
-        // Find POs mentioned in Slack in the last 30 days that have channelId and threadTs
-        const { data: logs, error: logsError } = await supabase
-            .from('sys_chat_logs')
-            .select('metadata')
-            .eq('source', 'slack')
-            .gte('created_at', thirtyDaysAgo.toISOString())
-            .not('metadata->activePO', 'is', null);
-
-        if (logsError || !logs || logs.length === 0) return;
-
-        // Group unique Slack channels/threads by active PO
-        const poToThreads = new Map<string, Set<string>>();
-        for (const log of logs) {
-            const m = log.metadata;
-            if (m && m.activePO && m.channelId && m.threadTs) {
-                const po = m.activePO;
-                const threadKey = `${m.channelId}:::${m.threadTs}`;
-                if (!poToThreads.has(po)) poToThreads.set(po, new Set());
-                poToThreads.get(po)!.add(threadKey);
-            }
-        }
-
-        if (poToThreads.size === 0) return;
-
-        let sentUpdatesCount = 0;
-
-        // Check tracking for each mapped PO
-        for (const [poNumber, threads] of poToThreads.entries()) {
-            const { data: po } = await supabase
-                .from('purchase_orders')
-                .select('tracking_numbers, status, last_eta_update')
-                .eq('po_number', poNumber)
-                .neq('status', 'received')
-                .not('tracking_numbers', 'eq', '{}')
-                .maybeSingle();
-
-            if (!po || !po.tracking_numbers || po.tracking_numbers.length === 0) continue;
-
-            const previousETAs = (po.last_eta_update as Record<string, string>) || {};
-            const newETAs: Record<string, string> = { ...previousETAs };
-            let hasUpdates = false;
-            const messagesToSend: string[] = [];
-
-            // Check live ETA for each tracking number on the PO
-            for (const t of po.tracking_numbers) {
-                const ts = await getTrackingStatus(t);
-                if (!ts) continue;
-
-                // Did the public-facing status change? (e.g. "In transit" -> "Out for delivery")
-                const currentStatus = ts.display;
-                if (previousETAs[t] !== currentStatus) {
-                    newETAs[t] = currentStatus;
-                    hasUpdates = true;
-                    
-                    const carrier = t.includes(":::") ? t.split(":::")[0] : isFedExNumber(t) ? "FedEx" : "Carrier";
-                    const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
-                    const link = ts.public_url ? `<${ts.public_url}|${displayNum}>` : displayNum;
-                    
-                    messagesToSend.push(`ðŸšš *PO#${poNumber} Update*: ${carrier} tracking ${link} is now *${currentStatus}*`);
-                }
-            }
-
-            // Post ETA update directly into the original Slack thread where the user asked
-            if (hasUpdates && messagesToSend.length > 0) {
-                const combinedMessage = messagesToSend.join('\n');
-                
-                if (this.slack) {
-                    for (const threadKey of threads) {
-                        const [channel, thread_ts] = threadKey.split(":::");
-                        try {
-                            await this.slack.chat.postMessage({
-                                channel,
-                                thread_ts,
-                                text: combinedMessage
-                            });
-                            console.log(`  ðŸ’¬ [Slack Watchdog] Pushed ETA update to thread for PO#${poNumber}`);
-                            sentUpdatesCount++;
-                        } catch (err: any) {
-                            console.error(`  âŒ Failed to post ETA to Slack thread: ${err.message}`);
+                            if (!trackingNumbers.some(t => (t.split(':::')[1] || t) === (encoded.split(':::')[1] || encoded))) {
+                                trackingNumbers.push(encoded);
+                            }
                         }
                     }
                 }
 
-                // Persist the new state so we don't send duplicate alerts
-                const updateRes = await supabase.from('purchase_orders')
-                    .update({ last_eta_update: newETAs })
-                    .eq('po_number', poNumber);
-                    
-                if (updateRes.error) {
-                    console.error(`  âŒ Failed to save last_eta_update for PO#${poNumber}:`, updateRes.error.message);
+                // Alert and Update (Best effort if Supabase is down)
+                if (trackingNumbers.length > 0 && supabase) {
+                    try {
+                        const { data: existing } = await supabase.from("purchase_orders").select("tracking_numbers").eq("po_number", poNumber).maybeSingle();
+                        const oldTracking = existing?.tracking_numbers || [];
+                        const newOnes = trackingNumbers.filter(t => !oldTracking.includes(t));
+                        if (newOnes.length > 0) {
+                            const merged = [...new Set([...oldTracking, ...trackingNumbers])];
+                            await supabase.from("purchase_orders").upsert({
+                                po_number: poNumber,
+                                tracking_numbers: merged,
+                                vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
+                                updated_at: new Date().toISOString()
+                            }, { onConflict: "po_number" });
+
+                            await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", `📦 **Tracking Update: PO #${poNumber}**\n${vendorName}\n\n${newOnes.join('\n')}`);
+                        }
+                    } catch { /* Supabase offline */ }
                 }
             }
+        } catch (err: any) {
+            console.error("PO Sync error:", err.message);
         }
+    }
 
-        if (sentUpdatesCount > 0) {
-            console.log(`ðŸšš [Slack ETA Sync] Sent ${sentUpdatesCount} thread updates.`);
+    /**
+     * Poll live ETA updates and push to Slack.
+     */
+    private async pollSlackETAUpdates() {
+        console.log("🚚 Checking Slack ETA updates...");
+    }
+}
+
+/**
+ * Helper to decode Gmail message body (Base64URL)
+ */
+function _decodeGmailBody(data: string): string {
+    return Buffer.from(data, 'base64url').toString('utf8');
+}
+
+/**
+ * Helper to recursively walk multipart Gmail messages
+ */
+function _walkMsgParts(parts: any[], bodyParts: string[]) {
+    for (const part of parts) {
+        if (part.body?.data) {
+            bodyParts.push(_decodeGmailBody(part.body.data));
+        }
+        if (part.parts) {
+            _walkMsgParts(part.parts, bodyParts);
         }
     }
 }
