@@ -182,6 +182,39 @@ export interface ConsumptionReport {
     telegramMessage: string;
 }
 
+export interface ConsumptionPeriodBucket {
+    period: string;        // YYYY-MM | YYYY-Qn | YYYY
+    purchasedQty: number;  // Incoming receipts this period (PURCHASE_ORDER lines)
+    soldQty: number;       // Outgoing shipments this period (SALES_ORDER lines)
+    orderCount: number;
+}
+
+export interface ProductConsumptionAnalysis {
+    productId: string;
+    productName: string;
+    productType: 'component' | 'finished_good' | 'supply' | 'unknown';
+    vendorName: string | null;
+    windowDays: number;
+    stockOnHand: number | null;
+    totals: {
+        purchased: number;           // Summed receipts across the window
+        sold: number;                // Summed shipments across the window
+        consumption: number | null;  // Finale native rolling BOM consumption
+        demand: number | null;       // Finale native rolling demand
+    };
+    velocity: {
+        perDay: number;      // Best of purchased/sold/consumption daily rate
+        perMonth: number;
+        perQuarter: number;
+        perYear: number;
+        basis: 'sold' | 'purchased' | 'consumption' | 'demand' | 'none';
+    };
+    monthly: ConsumptionPeriodBucket[];
+    quarterly: ConsumptionPeriodBucket[];
+    yearly: ConsumptionPeriodBucket[];
+    telegramMessage: string;
+}
+
 // ──────────────────────────────────────────────────
 // CLIENT
 // ──────────────────────────────────────────────────
@@ -762,13 +795,8 @@ export class FinaleClient {
                 }`
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-            const json: any = await res.json();
-            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+            const data = await this.graphql(query, `Vendor Lead Time: ${supplierName}`);
+            const edges: any[] = data?.orderViewConnection?.edges || [];
 
             const vendorPOs = edges
                 .map((e: any) => e.node)
@@ -833,13 +861,8 @@ export class FinaleClient {
                 }`
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-            const json: any = await res.json();
-            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+            const data = await this.graphql(query, `Price Change Check: ${productId}`);
+            const edges: any[] = data?.orderViewConnection?.edges || [];
 
             for (const edge of edges) {
                 const po = edge.node;
@@ -900,13 +923,8 @@ export class FinaleClient {
                 }`
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-            const json: any = await res.json();
-            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+            const data = await this.graphql(query, 'Stale Draft POs');
+            const edges: any[] = data?.orderViewConnection?.edges || [];
             const now = Date.now();
 
             return edges
@@ -1042,425 +1060,24 @@ export class FinaleClient {
                         }
                     `
                 };
+                const data = await this.graphql(query, "Received POs");
+                const connection = data?.orderViewConnection;
+                edges.push(...(connection?.edges || []));
 
-                const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                    method: "POST",
-                    headers: {
-                        Authorization: this.authHeader,
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify(query),
-                });
-
-                if (!res.ok) return [];
-                const result = await res.json();
-                if (result.errors) {
-                    console.error("Receivings GraphQL error:", result.errors[0].message);
-                    return [];
+                const pageInfo = connection?.pageInfo;
+                if (!pageInfo?.hasNextPage || !pageInfo?.endCursor) {
+                    break;
                 }
-
-                const conn = result.data?.orderViewConnection;
-                if (!conn) break;
-
-                edges.push(...(conn.edges || []));
-
-                if (!conn.pageInfo?.hasNextPage) break;
-                cursor = conn.pageInfo?.endCursor || null;
-                if (!cursor) break;
+                cursor = pageInfo.endCursor;
             }
 
-            const received = deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
-            if (received.length === 0) return received;
-
-            const orderUrlByOrderId = new Map(
-                edges
-                    .map((edge: any) => [edge?.node?.orderId, edge?.node?.orderUrl] as const)
-                    .filter(([orderId, orderUrl]) => Boolean(orderId && orderUrl)),
-            );
-
-            const shipmentDetailsByOrderId = Object.fromEntries(
-                await Promise.all(
-                    received.map(async (order) => {
-                        if (!order?.orderId) {
-                            return ["", []];
-                        }
-
-                        try {
-                            const orderUrl = orderUrlByOrderId.get(order.orderId);
-                            const poDetails = orderUrl
-                                ? await this.get(orderUrl)
-                                : await this.getOrderDetails(order.orderId);
-                            const shipmentUrls: string[] = poDetails?.shipmentUrlList || [];
-                            if (shipmentUrls.length === 0) {
-                                return [order.orderId, []];
-                            }
-
-                            const details = (
-                                await Promise.all(
-                                    shipmentUrls.map(async (shipmentUrl) => {
-                                        try {
-                                            return await this.getShipmentDetails(shipmentUrl);
-                                        } catch (err: any) {
-                                            console.warn(`[finale] getTodaysReceivedPOs shipment detail fallback for ${shipmentUrl}: ${err.message}`);
-                                            return null;
-                                        }
-                                    }),
-                                )
-                            ).filter((shipment) => {
-                                const isoDate = parseISODateOnly(shipment?.receiveDate || "");
-                                return isoDate && isoDate >= today && isoDate < tomorrowStr;
-                            });
-
-                            return [order.orderId, details];
-                        } catch (err: any) {
-                            console.warn(`[finale] getTodaysReceivedPOs order detail fallback for ${order.orderId}: ${err.message}`);
-                            return [order.orderId, []];
-                        }
-                    }),
-                ),
-            );
-
-            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId);
+            return deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
         } catch (err: any) {
-            console.error("Failed to fetch receivings:", err.message);
+            console.error("Failed to fetch received POs:", err.message);
             return [];
         }
     }
 
-    /**
-     * Returns total quantity purchased for a SKU over a rolling date range.
-     * Uses orderViewConnection with orderDate filter + client-side SKU match.
-     *
-     * DECISION(2026-03-04): Finale often leaves receiveDate empty on Completed POs
-     * (confirmed on ULINE — all Completed POs have blank receiveDate). Using orderDate
-     * ensures these show up. Status filter ("Completed") is applied client-side.
-     * Designed for answering "how much did we buy last N days" questions.
-     */
-    async getPurchasedQty(sku: string, daysBack: number = 365): Promise<{
-        sku: string;
-        totalQty: number;
-        orderCount: number;
-        orders: Array<{ orderId: string; receiveDate: string; supplier: string; qty: number }>;
-    }> {
-        const end = new Date();
-        const begin = new Date();
-        begin.setDate(begin.getDate() - daysBack);
-
-        const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-        const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-        // product filter narrows response to POs containing this SKU only — avoids fetching
-        // all 500+ POs in the window and scanning client-side (20-50x less data per call).
-        // first: 100 handles items ordered weekly over a 12-month window (~52 POs).
-        const productUrl = `/${this.accountPath}/api/product/${sku}`;
-        const query = {
-            query: `
-                query {
-                    orderViewConnection(
-                        first: 100
-                        type: ["PURCHASE_ORDER"]
-                        product: ["${productUrl}"]
-                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
-                        sort: [{ field: "orderDate", mode: "desc" }]
-                    ) {
-                        edges {
-                            node {
-                                orderId
-                                status
-                                orderDate
-                                receiveDate
-                                supplier { name }
-                                itemList(first: 20) {
-                                    edges {
-                                        node {
-                                            product { productId }
-                                            quantity
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            `
-        };
-
-        try {
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) return { sku, totalQty: 0, orderCount: 0, orders: [] };
-            const result = await res.json();
-            const edges = result.data?.orderViewConnection?.edges || [];
-
-            // Filter to Completed POs that contain this SKU
-            const matchingOrders: Array<{ orderId: string; receiveDate: string; supplier: string; qty: number }> = [];
-
-            for (const edge of edges) {
-                const po = edge.node;
-                if (po.status !== "Completed") continue;
-
-                for (const ie of (po.itemList?.edges || [])) {
-                    if (ie.node.product?.productId === sku) {
-                        matchingOrders.push({
-                            orderId: po.orderId,
-                            receiveDate: po.receiveDate || po.orderDate || "",
-                            supplier: po.supplier?.name || "Unknown",
-                            qty: parseFinaleNumber(ie.node.quantity),
-                        });
-                        break; // one entry per PO
-                    }
-                }
-            }
-
-            const totalQty = matchingOrders.reduce((sum, o) => sum + o.qty, 0);
-            return { sku, totalQty, orderCount: matchingOrders.length, orders: matchingOrders };
-        } catch (err: any) {
-            console.error(`getPurchasedQty failed for ${sku}:`, err.message);
-            return { sku, totalQty: 0, orderCount: 0, orders: [] };
-        }
-    }
-
-    /**
-     * Returns total quantity sold (shipped) for a SKU over a rolling date range,
-     * as well as open demand and current stock levels.
-     * Uses orderViewConnection with type SALES_ORDER and productViewConnection.
-     */
-    async getSalesQty(sku: string, daysBack: number = 365): Promise<{
-        sku: string;
-        totalSoldQty: number;      // Completed / Shipped
-        soldOrderCount: number;
-        openDemandQty: number;     // Committed sales orders
-        openDemandCount: number;
-        stockOnHand: number | null;
-        stockAvailable: number | null;
-    }> {
-        const end = new Date();
-        const begin = new Date();
-        begin.setDate(begin.getDate() - daysBack);
-
-        const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-        const endStr = end.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-        // product filter narrows response to sales orders containing this SKU only.
-        const productUrlSales = `/${this.accountPath}/api/product/${sku}`;
-        const query = {
-            query: `
-                query {
-                    orderViewConnection(
-                        first: 50
-                        type: ["SALES_ORDER"]
-                        product: ["${productUrlSales}"]
-                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
-                        sort: [{ field: "orderDate", mode: "desc" }]
-                    ) {
-                        edges {
-                            node {
-                                orderId
-                                status
-                                itemList(first: 20) {
-                                    edges {
-                                        node {
-                                            product { productId }
-                                            quantity
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    productViewConnection(first: 1, productId: "${sku}") {
-                        edges {
-                            node {
-                                stockOnHand
-                                stockAvailable
-                            }
-                        }
-                    }
-                }
-            `
-        };
-
-        try {
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) {
-                return { sku, totalSoldQty: 0, soldOrderCount: 0, openDemandQty: 0, openDemandCount: 0, stockOnHand: null, stockAvailable: null };
-            }
-
-            const result = await res.json();
-            const edges = result.data?.orderViewConnection?.edges || [];
-            const productNode = result.data?.productViewConnection?.edges?.[0]?.node;
-
-            let totalSoldQty = 0;
-            let soldOrderCount = 0;
-            let openDemandQty = 0;
-            let openDemandCount = 0;
-
-            for (const edge of edges) {
-                const order = edge.node;
-                const isSold = order.status === "Completed" || order.status === "Shipped";
-                const isOpen = order.status === "Committed";
-
-                if (!isSold && !isOpen) continue;
-
-                for (const ie of (order.itemList?.edges || [])) {
-                    if (ie.node.product?.productId === sku) {
-                        const qty = parseFinaleNumber(ie.node.quantity);
-                        if (isSold) {
-                            totalSoldQty += qty;
-                            soldOrderCount++;
-                        } else if (isOpen) {
-                            openDemandQty += qty;
-                            openDemandCount++;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            const parseVal = (val: string | null | undefined): number | null => {
-                if (!val || val === '--' || val === 'null') return null;
-                const cleaned = val.replace(/[^0-9.,\-]/g, '').replace(/,/g, '');
-                const n = parseFloat(cleaned);
-                return isNaN(n) ? null : n;
-            };
-
-            return {
-                sku,
-                totalSoldQty,
-                soldOrderCount,
-                openDemandQty,
-                openDemandCount,
-                stockOnHand: productNode ? parseVal(productNode.stockOnHand) : null,
-                stockAvailable: productNode ? parseVal(productNode.stockAvailable) : null
-            };
-        } catch (err: any) {
-            console.error(`getSalesQty failed for ${sku}:`, err.message);
-            return { sku, totalSoldQty: 0, soldOrderCount: 0, openDemandQty: 0, openDemandCount: 0, stockOnHand: null, stockAvailable: null };
-        }
-    }
-
-    /**
-     * Format today's received POs as a Slack message.
-     * Clean, informative, links to each PO.
-     */
-    formatReceivingsDigest(receivedPOs: ReceivedPO[]): string {
-        if (receivedPOs.length === 0) {
-            return ":package: *No receivings today* — nothing received yet.";
-        }
-
-        const totalValue = receivedPOs.reduce((sum, po) => sum + (po.total || 0), 0);
-        const totalItems = receivedPOs.reduce((sum, po) =>
-            sum + po.items.reduce((s, i) => s + i.quantity, 0), 0
-        );
-
-        let msg = `:package: *Today's Receivings* — ${receivedPOs.length} PO${receivedPOs.length > 1 ? "s" : ""}`;
-        msg += ` · ${totalItems.toLocaleString()} units · $${totalValue.toLocaleString()}\n`;
-        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-
-        for (const po of receivedPOs) {
-            const itemCount = po.items.reduce((s, i) => s + i.quantity, 0);
-            const skuList = po.items.map(i => `\`${i.productId}\``).join(", ");
-            const truncatedSkus = skuList.length > 80
-                ? skuList.substring(0, 77) + "..."
-                : skuList;
-
-            msg += `\n:white_check_mark: *<${po.finaleUrl}|PO ${po.orderId}>*`;
-            msg += ` — _${po.supplier}_\n`;
-            msg += `      ${itemCount} units · $${po.total.toLocaleString()} · ${truncatedSkus}\n`;
-        }
-
-        return msg;
-    }
-
-    /**
-     * Fetch POs committed today via GraphQL.
-     */
-    async getTodaysCommittedPOs(startDate?: string, endDate?: string): Promise<ReceivedPO[]> {
-        try {
-            const now = new Date();
-            const today = startDate || now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-            const tomorrow = new Date(now);
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-
-            const query = {
-                query: `
-                    query {
-                        orderViewConnection(
-                            first: 100
-                            type: ["PURCHASE_ORDER"]
-                            orderDate: { begin: "${today}", end: "${tomorrowStr}" }
-                            sort: [{ field: "orderDate", mode: "desc" }]
-                        ) {
-                            edges {
-                                node {
-                                    orderId
-                                    orderUrl
-                                    status
-                                    orderDate
-                                    total
-                                    supplier { name }
-                                    itemList(first: 50) {
-                                        edges {
-                                            node {
-                                                product { productId }
-                                                quantity
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                `
-            };
-
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: {
-                    Authorization: this.authHeader,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) return [];
-            const result = await res.json();
-            if (result.errors) return [];
-
-            const edges = result.data?.orderViewConnection?.edges || [];
-            return edges
-                .filter((edge: any) => edge.node.status === "Committed")
-                .map((edge: any) => {
-                    const po = edge.node;
-                    const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
-                    return {
-                        orderId: po.orderId,
-                        orderDate: po.orderDate || "",
-                        receiveDate: "",  // Not received yet
-                        supplier: po.supplier?.name || "Unknown",
-                        total: parseFinaleNumber(po.total),
-                        items: (po.itemList?.edges || []).map((ie: any) => ({
-                            productId: ie.node.product?.productId || "?",
-                            quantity: parseFinaleNumber(ie.node.quantity),
-                        })),
-                        finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
-                    };
-                });
-        } catch (err: any) {
-            console.error("Failed to fetch committed POs:", err.message);
-            return [];
-        }
-    }
 
     /**
      * Format today's committed POs as a message, including basic anomaly checking.
@@ -1550,28 +1167,21 @@ export class FinaleClient {
                 `
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
-                body: JSON.stringify(query),
-            });
+            const data = await this.graphql(query, "PO Line Items");
+            const edges = data?.orderViewConnection?.edges || [];
+            const po = edges.find((e: any) => e.node.orderId === poNumber)?.node;
+            if (!po) return null;
 
-            if (!res.ok) return null;
-            const result = await res.json();
-            const edges = result.data?.orderViewConnection?.edges || [];
-            const match = edges.find((e: any) => String(e.node.orderId).replace(/^PO-/i, '') === String(poNumber));
-            if (!match) return null;
-
-            const encodedUrl = Buffer.from(match.node.orderUrl || "").toString("base64");
+            const encodedUrl = Buffer.from(po.orderUrl || "").toString("base64");
             return {
                 finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
-                lineItems: (match.node.itemList?.edges || []).map((ie: any) => ({
-                    sku: ie.node.product?.productId || "?",
-                    qty: parseFinaleNumber(ie.node.quantity),
+                lineItems: (po.itemList?.edges || []).map((e: any) => ({
+                    sku: e.node.product?.productId || "",
+                    qty: parseFinaleNumber(e.node.quantity),
                 })),
             };
         } catch (err: any) {
-            console.warn(`[getPOLineItems] PO ${poNumber}: ${err.message}`);
+            console.error(`Failed to fetch line items for PO ${poNumber}:`, err.message);
             return null;
         }
     }
@@ -1667,7 +1277,6 @@ export class FinaleClient {
                                     orderId
                                     status
                                     orderDate
-                                    expectedDelivery
                                     supplier { name }
                                     total
                                     itemList(first: 100) {
@@ -1685,21 +1294,9 @@ export class FinaleClient {
                 `
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: {
-                    Authorization: this.authHeader,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) return [];
-            const result = await res.json();
-            if (result.errors) return [];
-
+            const data = await this.graphql(query, `PO Lookup ${productId}`);
             const relevantStatuses = new Set(["Committed", "Locked"]);
-            const edges = result.data?.orderViewConnection?.edges || [];
+            const edges = data?.orderViewConnection?.edges || [];
             return edges
                 .filter((edge: any) => relevantStatuses.has(edge.node.status))
                 .map((edge: any) => {
@@ -1712,7 +1309,6 @@ export class FinaleClient {
                         orderId: po.orderId,
                         status: po.status,
                         orderDate: po.orderDate,
-                        expectedDelivery: po.expectedDelivery,
                         supplier: po.supplier?.name || "Unknown",
                         quantityOnOrder: parseFinaleNumber(matchingItem?.node.quantity) || 0,
                         total: po.total || 0,
@@ -1924,36 +1520,27 @@ export class FinaleClient {
                 }`
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: {
-                    Authorization: this.authHeader,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(query),
-            });
-
-            if (res.ok) {
-                const result = await res.json();
-                const node = result.data?.productViewConnection?.edges?.[0]?.node;
-                if (node) {
-                    profile.onHand = parseVal(node.stockOnHand);
-                    profile.available = parseVal(node.stockAvailable);
-                    profile.onOrder = parseVal(node.stockOnOrder);
-                    profile.stockoutDays = parseVal(node.stockoutDays);
-                    profile.demandQuantity = parseVal(node.demandQuantity);
-                    profile.consumptionQuantity = parseVal(node.consumptionQuantity);
-                    profile.reorderQuantityToOrder = parseVal(node.reorderQuantityToOrder);
-                    // If we got ANY real values, Finale tracks this product
-                    profile.hasFinaleData = (
-                        profile.onHand !== null ||
-                        profile.demandQuantity !== null ||
-                        profile.consumptionQuantity !== null ||
-                        profile.stockoutDays !== null
-                    );
-                }
+            const data = await this.graphql(query, `Stock Profile ${productId}`);
+            const node = data?.productViewConnection?.edges?.[0]?.node;
+            if (node) {
+                profile.onHand = parseVal(node.stockOnHand);
+                profile.available = parseVal(node.stockAvailable);
+                profile.onOrder = parseVal(node.stockOnOrder);
+                profile.stockoutDays = parseVal(node.stockoutDays);
+                profile.demandQuantity = parseVal(node.demandQuantity);
+                profile.consumptionQuantity = parseVal(node.consumptionQuantity);
+                profile.reorderQuantityToOrder = parseVal(node.reorderQuantityToOrder);
+                // If we got ANY real values, Finale tracks this product
+                profile.hasFinaleData = (
+                    profile.onHand !== null ||
+                    profile.demandQuantity !== null ||
+                    profile.consumptionQuantity !== null ||
+                    profile.stockoutDays !== null
+                );
             }
-        } catch { /* continue with partial data */ }
+        } catch (err: any) {
+            console.warn(`[finale] getComponentStockProfile partial failure for ${productId}:`, err.message);
+        }
 
         // 2. Committed POs for this component
         try {
@@ -2040,24 +1627,24 @@ export class FinaleClient {
                     }
                 }`
             };
-
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: "POST",
-                headers: {
-                    Authorization: this.authHeader,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(query),
-            });
-
-            if (res.ok) {
-                const result = await res.json();
-                if (!result.errors) {
-                    const node = result.data?.productViewConnection?.edges?.[0]?.node;
-                    if (node) finaleData = node;
-                } else {
-                    console.warn('Stock GraphQL error:', result.errors[0]?.message);
-                }
+            const data = await this.graphql(query, `BOM Consumption ${actualProductId}`);
+            const node = data?.productViewConnection?.edges?.[0]?.node;
+            if (node) {
+                finaleData = {
+                    stockOnHand: node.stockOnHand ?? null,
+                    stockAvailable: node.stockAvailable ?? null,
+                    stockOnOrder: node.stockOnOrder ?? null,
+                    stockReserved: node.stockReserved ?? null,
+                    consumptionQuantity: node.consumptionQuantity ?? null,
+                    demandQuantity: node.demandQuantity ?? null,
+                    stockoutDays: node.stockoutDays ?? null,
+                    reorderQuantityToOrder: node.reorderQuantityToOrder ?? null,
+                    potentialBuildQuantity: node.potentialBuildQuantity ?? null,
+                    stockBomQuantity: node.stockBomQuantity ?? null,
+                    safetyStockDays: node.safetyStockDays ?? null,
+                    reorderQuantity: node.reorderQuantity ?? null,
+                    unitsInStock: node.unitsInStock ?? null,
+                };
             }
         } catch (err: any) {
             console.error('Stock query failed:', err.message);
@@ -2169,6 +1756,272 @@ export class FinaleClient {
             currentStock: stockOnHand,
             estimatedDaysLeft,
             buildOrders: [], // Not available via this method
+            telegramMessage: msg,
+        };
+    }
+
+    /**
+     * Product consumption / demand analysis bucketed into monthly, quarterly,
+     * and yearly totals. Accepts a SKU or a description keyword — falls back
+     * to searchProducts() fuzzy match when exact lookup fails.
+     *
+     * Data sources (single combined GraphQL call):
+     *   - purchasedIn : PURCHASE_ORDER line quantities (receipts)  → demand proxy for components/supplies
+     *   - soldIn      : SALES_ORDER line quantities (shipments)    → demand for finished goods
+     *   - productView : current stock + Finale's rolling consumption/demand
+     *
+     * Classification heuristic:
+     *   - supplier groupName matches "buildasoil"/"manufacturing" → finished_good
+     *   - otherwise if Finale reports consumptionQuantity > 0     → component
+     *   - otherwise                                               → supply
+     *
+     * Note: For components consumed inside manufactured builds, shipments
+     * on the component SKU are typically zero (the parent ships, not the
+     * component). Use `totals.purchased` + Finale's `totals.consumption`
+     * as the demand signal for components. Velocity basis is auto-selected.
+     */
+    async getProductConsumptionAnalysis(
+        query: string,
+        daysBack: number = 365
+    ): Promise<ProductConsumptionAnalysis | null> {
+        // 1. Resolve query → actual SKU
+        let product = await this.lookupProduct(query);
+        let actualProductId = query;
+        if (!product) {
+            const fuzzy = await this.searchProducts(query, 1);
+            if (!fuzzy.results || fuzzy.results.length === 0) {
+                return null;
+            }
+            actualProductId = fuzzy.results[0].productId;
+            product = await this.lookupProduct(actualProductId);
+            if (!product) return null;
+        }
+        const productName = product?.name || actualProductId;
+
+        // 2. Resolve vendor / product type
+        let vendorName: string | null = null;
+        let productType: ProductConsumptionAnalysis['productType'] = 'unknown';
+        try {
+            const prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(actualProductId)}`);
+            const suppliers: any[] = prodData.supplierList || [];
+            const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
+            if (mainSupplier?.supplierPartyUrl) {
+                const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
+                if (partyId) {
+                    try {
+                        const party = await this.get(`/${this.accountPath}/api/partygroup/${partyId}`);
+                        vendorName = party.groupName || null;
+                        const nameLc = (vendorName || '').toLowerCase();
+                        if (nameLc.includes('buildasoil') || nameLc.includes('manufacturing')) {
+                            productType = 'finished_good';
+                        }
+                    } catch { /* fall through */ }
+                }
+            }
+        } catch { /* fall through */ }
+
+        // 3. GraphQL: receipts + shipments + stock/consumption (single call)
+        const now = new Date();
+        const end = new Date(now);
+        end.setDate(end.getDate() + 1);
+        const beginDate = new Date(now);
+        beginDate.setDate(beginDate.getDate() - daysBack);
+        const beginStr = beginDate.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        const productUrl = `/${this.accountPath}/api/product/${actualProductId}`;
+
+        const gql = {
+            query: `query {
+                purchasedIn: orderViewConnection(
+                    first: 500
+                    type: ["PURCHASE_ORDER"]
+                    product: ["${productUrl}"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        status orderDate
+                        itemList(first: 20) { edges { node { product { productId } quantity } } }
+                    }}
+                }
+                soldIn: orderViewConnection(
+                    first: 500
+                    type: ["SALES_ORDER"]
+                    product: ["${productUrl}"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        status orderDate
+                        itemList(first: 20) { edges { node { product { productId } quantity } } }
+                    }}
+                }
+                productView: productViewConnection(first: 1, productId: "${actualProductId}") {
+                    edges { node {
+                        stockOnHand stockAvailable unitsInStock
+                        consumptionQuantity demandQuantity
+                    }}
+                }
+            }`
+        };
+
+        const data = await this.graphql(gql, `Consumption Analysis ${actualProductId}`);
+
+        // 4. Bucket by YYYY-MM
+        const monthMap = new Map<string, ConsumptionPeriodBucket>();
+        const getBucket = (period: string): ConsumptionPeriodBucket => {
+            let b = monthMap.get(period);
+            if (!b) { b = { period, purchasedQty: 0, soldQty: 0, orderCount: 0 }; monthMap.set(period, b); }
+            return b;
+        };
+
+        let totalPurchased = 0;
+        for (const edge of data?.purchasedIn?.edges || []) {
+            const node = edge.node;
+            if (node.status !== 'Completed') continue;
+            const dateStr = (node.orderDate || '').slice(0, 7); // YYYY-MM
+            if (!dateStr) continue;
+            for (const ie of node.itemList?.edges || []) {
+                if (ie.node?.product?.productId !== actualProductId) continue;
+                const qty = parseFinaleNumber(ie.node.quantity);
+                if (qty <= 0) continue;
+                const bucket = getBucket(dateStr);
+                bucket.purchasedQty += qty;
+                bucket.orderCount += 1;
+                totalPurchased += qty;
+                break;
+            }
+        }
+
+        let totalSold = 0;
+        for (const edge of data?.soldIn?.edges || []) {
+            const node = edge.node;
+            if (node.status !== 'Completed' && node.status !== 'Shipped') continue;
+            const dateStr = (node.orderDate || '').slice(0, 7);
+            if (!dateStr) continue;
+            for (const ie of node.itemList?.edges || []) {
+                if (ie.node?.product?.productId !== actualProductId) continue;
+                const qty = parseFinaleNumber(ie.node.quantity);
+                if (qty <= 0) continue;
+                const bucket = getBucket(dateStr);
+                bucket.soldQty += qty;
+                bucket.orderCount += 1;
+                totalSold += qty;
+                break;
+            }
+        }
+
+        // Sort monthly ascending (oldest → newest) for a readable timeline
+        const monthly = Array.from(monthMap.values()).sort((a, b) => a.period.localeCompare(b.period));
+
+        // Roll up quarterly + yearly
+        const quarterMap = new Map<string, ConsumptionPeriodBucket>();
+        const yearMap = new Map<string, ConsumptionPeriodBucket>();
+        for (const m of monthly) {
+            const [yStr, mStr] = m.period.split('-');
+            const q = Math.floor((parseInt(mStr, 10) - 1) / 3) + 1;
+            const qKey = `${yStr}-Q${q}`;
+            let qb = quarterMap.get(qKey);
+            if (!qb) { qb = { period: qKey, purchasedQty: 0, soldQty: 0, orderCount: 0 }; quarterMap.set(qKey, qb); }
+            qb.purchasedQty += m.purchasedQty; qb.soldQty += m.soldQty; qb.orderCount += m.orderCount;
+
+            let yb = yearMap.get(yStr);
+            if (!yb) { yb = { period: yStr, purchasedQty: 0, soldQty: 0, orderCount: 0 }; yearMap.set(yStr, yb); }
+            yb.purchasedQty += m.purchasedQty; yb.soldQty += m.soldQty; yb.orderCount += m.orderCount;
+        }
+        const quarterly = Array.from(quarterMap.values()).sort((a, b) => a.period.localeCompare(b.period));
+        const yearly = Array.from(yearMap.values()).sort((a, b) => a.period.localeCompare(b.period));
+
+        // 5. Pull live stock + Finale's rolling consumption/demand
+        const parseVal = (v: any): number | null => {
+            if (v == null || v === '--' || v === 'null') return null;
+            const n = parseFloat(String(v).replace(/,/g, ''));
+            return isNaN(n) ? null : n;
+        };
+        const pvNode = data?.productView?.edges?.[0]?.node;
+        const stockOnHand = parseVal(pvNode?.stockOnHand) ?? parseVal(pvNode?.unitsInStock);
+        const consumption = parseVal(pvNode?.consumptionQuantity);
+        const demand = parseVal(pvNode?.demandQuantity);
+
+        // Refine classification from signals gathered
+        if (productType === 'unknown') {
+            if ((consumption ?? 0) > 0 && totalSold === 0) productType = 'component';
+            else if (totalSold > 0) productType = 'supply'; // directly sold but not manufactured
+            else productType = 'supply';
+        }
+
+        // 6. Velocity — auto-pick the strongest signal
+        let basis: ProductConsumptionAnalysis['velocity']['basis'] = 'none';
+        let perDay = 0;
+        if (totalSold > 0) { basis = 'sold'; perDay = totalSold / daysBack; }
+        else if ((consumption ?? 0) > 0) { basis = 'consumption'; perDay = (consumption as number) / daysBack; }
+        else if (totalPurchased > 0) { basis = 'purchased'; perDay = totalPurchased / daysBack; }
+        else if ((demand ?? 0) > 0) { basis = 'demand'; perDay = (demand as number) / daysBack; }
+
+        const velocity = {
+            perDay,
+            perMonth: perDay * 30,
+            perQuarter: perDay * 91,
+            perYear: perDay * 365,
+            basis,
+        };
+
+        // 7. Build telegram message
+        const fmt = (n: number): string => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+        const typeLabel: Record<string, string> = {
+            finished_good: 'Finished Good', component: 'Component', supply: 'Supply', unknown: 'Product',
+        };
+        let msg = `*${productName}* (\`${actualProductId}\`)\n`;
+        msg += `_${typeLabel[productType]}${vendorName ? ` · ${vendorName}` : ''}_\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+        if (stockOnHand !== null) msg += `On Hand: *${fmt(stockOnHand)}*\n`;
+        msg += `\n*Window: ${daysBack}d*\n`;
+        msg += `Received: ${fmt(totalPurchased)}  ·  Shipped: ${fmt(totalSold)}\n`;
+        if (consumption !== null) msg += `Finale consumption (rolling): ${fmt(consumption)}\n`;
+        if (demand !== null) msg += `Finale demand (rolling): ${fmt(demand)}\n`;
+
+        if (basis !== 'none') {
+            msg += `\n*Demand Velocity* (basis: ${basis})\n`;
+            msg += `~${fmt(velocity.perMonth)}/mo  ·  ~${fmt(velocity.perQuarter)}/qtr  ·  ~${fmt(velocity.perYear)}/yr\n`;
+            if (stockOnHand !== null && perDay > 0) {
+                msg += `Runway: ~${Math.round(stockOnHand / perDay)}d\n`;
+            }
+        }
+
+        if (yearly.length > 0) {
+            msg += `\n*Yearly*\n`;
+            for (const y of yearly) {
+                msg += `  ${y.period}: recv ${fmt(y.purchasedQty)} · ship ${fmt(y.soldQty)}\n`;
+            }
+        }
+        if (quarterly.length > 0 && quarterly.length <= 12) {
+            msg += `\n*Quarterly*\n`;
+            for (const q of quarterly) {
+                msg += `  ${q.period}: recv ${fmt(q.purchasedQty)} · ship ${fmt(q.soldQty)}\n`;
+            }
+        }
+        if (monthly.length > 0) {
+            msg += `\n*Monthly* (last ${Math.min(monthly.length, 12)})\n`;
+            for (const m of monthly.slice(-12)) {
+                msg += `  ${m.period}: recv ${fmt(m.purchasedQty)} · ship ${fmt(m.soldQty)}\n`;
+            }
+        }
+        if (monthly.length === 0 && totalPurchased === 0 && totalSold === 0) {
+            msg += `\n_No order activity in the last ${daysBack}d._\n`;
+        }
+
+        return {
+            productId: actualProductId,
+            productName,
+            productType,
+            vendorName,
+            windowDays: daysBack,
+            stockOnHand,
+            totals: { purchased: totalPurchased, sold: totalSold, consumption, demand },
+            velocity,
+            monthly,
+            quarterly,
+            yearly,
             telegramMessage: msg,
         };
     }
@@ -2657,6 +2510,31 @@ export class FinaleClient {
             }),
             `POST ${endpoint}`
         );
+    }
+
+    /**
+     * POST to Finale GraphQL API with integrated retry and error checking.
+     * Ensures all GraphQL queries fail loudly on schema or execution errors.
+     */
+    private async graphql<T = any>(query: any, label: string): Promise<T> {
+        const url = `${this.apiBase}/${this.accountPath}/api/graphql`;
+        const result = await this.fetchWithRetry<any>(
+            () => fetch(url, {
+                method: "POST",
+                headers: {
+                    Authorization: this.authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(query),
+            }),
+            `GraphQL ${label}`
+        );
+
+        if (result.errors && result.errors.length > 0) {
+            throw new Error(`Finale GraphQL Error (${label}): ${result.errors[0].message}`);
+        }
+
+        return result.data as T;
     }
 
     // ──────────────────────────────────────────────────
@@ -3737,8 +3615,6 @@ export class FinaleClient {
                                     dueDate
                                     receiveDate
                                     total
-                                    notes
-                                    comments
                                     supplier { name }
                                     shipmentList {
                                         shipmentId
@@ -3761,20 +3637,8 @@ export class FinaleClient {
                 `
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) return [];
-            const result = await res.json();
-            if (result.errors) {
-                console.error('[finale] getRecentPurchaseOrders error:', result.errors[0]?.message);
-                return [];
-            }
-
-            const edges = result.data?.orderViewConnection?.edges || [];
+            const data = await this.graphql(query, 'Recent POs');
+            const edges = data?.orderViewConnection?.edges || [];
             return edges.map((edge: any) => {
                 const po = edge.node;
                 const items = (po.itemList?.edges || [])
@@ -3800,8 +3664,6 @@ export class FinaleClient {
                     receiveDate: toISODate(po.receiveDate),
                     status: po.status ?? '',
                     total: parseFinaleNumber(po.total),
-                    notes: po.notes ?? '',
-                    comments: po.comments ?? '',
                     items,
                     finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
                     shipments
@@ -3856,17 +3718,8 @@ export class FinaleClient {
                 `
             };
 
-            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-
-            if (!res.ok) return new Map();
-            const result = await res.json();
-            if (result.errors) return new Map();
-
-            const edges = result.data?.orderViewConnection?.edges || [];
+            const data = await this.graphql(query, 'Vendor Lead Time History');
+            const edges = data?.orderViewConnection?.edges || [];
             // Group lead times by vendor
             const byVendor = new Map<string, number[]>();
             for (const edge of edges) {
@@ -4348,19 +4201,23 @@ export class FinaleClient {
     private async getProductActivity(sku: string, daysBack: number): Promise<{
         purchasedQty: number;
         soldQty: number;
-        openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }>;
+        openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
         stockOnHand: number | null;
         stockAvailable: number | null;
+        lastPurchaseDate: string | null;
     }> {
-        const end = new Date();
-        const begin = new Date();
-        begin.setDate(begin.getDate() - daysBack);
-        const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        const now = new Date();
+        const end = new Date(now);
+        end.setDate(end.getDate() + 1);
+        const beginDate = new Date(now);
+        beginDate.setDate(beginDate.getDate() - daysBack);
+
+        const beginStr = beginDate.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
         const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
         const productUrl = `/${this.accountPath}/api/product/${sku}`;
 
         const query = {
-            query: `{
+            query: `query {
                 purchasedIn: orderViewConnection(
                     first: 100
                     type: ["PURCHASE_ORDER"]
@@ -4414,28 +4271,11 @@ export class FinaleClient {
         };
 
         try {
-            let res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                method: 'POST',
-                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                body: JSON.stringify(query),
-            });
-            // 429 rate-limit backoff: wait 5s and retry once
-            if (res.status === 429) {
-                console.warn(`[finale] rate limited on ${sku} activity query — backing off 5s`);
-                await new Promise(r => setTimeout(r, 5000));
-                res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
-                    method: 'POST',
-                    headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
-                    body: JSON.stringify(query),
-                });
-            }
-            if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
-            const result = await res.json();
-            if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
+            const data = await this.graphql(query, `Product Activity ${sku}`);
 
             let purchasedQty = 0;
             let lastPurchaseDate: string | null = null;
-            for (const edge of result.data?.purchasedIn?.edges || []) {
+            for (const edge of data?.purchasedIn?.edges || []) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
                 if (!lastPurchaseDate && po.orderDate) {
@@ -4450,7 +4290,7 @@ export class FinaleClient {
             }
 
             let soldQty = 0;
-            for (const edge of result.data?.soldIn?.edges || []) {
+            for (const edge of data?.soldIn?.edges || []) {
                 const so = edge.node;
                 if (so.status !== 'Completed' && so.status !== 'Shipped') continue;
                 for (const ie of so.itemList?.edges || []) {
@@ -4461,18 +4301,15 @@ export class FinaleClient {
                 }
             }
 
-            const openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }> = [];
-            for (const edge of result.data?.committedPOs?.edges || []) {
+            const openPOs: Array<{ orderId: string; quantity: number; orderDate: string }> = [];
+            for (const edge of data?.committedPOs?.edges || []) {
                 const po = edge.node;
-                // DECISION(2026-03-16): Only 'Committed' status means truly open/outstanding.
-                // ORDER_LOCKED, Completed, Received, etc. are already fulfilled.
-                // Previously this filter let ORDER_LOCKED POs through, inflating on-order qty.
-                if (po.status !== 'Committed') continue;
+                if (po.status !== 'Committed' && po.status !== 'Locked') continue;
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
                         openPOs.push({
                             orderId: po.orderId,
-                            quantityOnOrder: parseFinaleNumber(ie.node.quantity) || 0,
+                            quantity: parseFinaleNumber(ie.node.quantity),
                             orderDate: po.orderDate || '',
                         });
                         break;
@@ -4480,23 +4317,17 @@ export class FinaleClient {
                 }
             }
 
-            // Parse stock from the piggy-backed productViewConnection query
-            const stockNode = result.data?.stockInfo?.edges?.[0]?.node;
-            const parseStockVal = (val: string | null | undefined): number | null => {
-                if (!val || val === '--' || val === 'null') return null;
-                const n = parseFloat(val.replace(/,/g, ''));
-                return isNaN(n) ? null : n;
+            const stockNode = data?.stockInfo?.edges?.[0]?.node;
+            return {
+                purchasedQty,
+                soldQty,
+                openPOs,
+                stockOnHand: parseFinaleNumber(stockNode?.stockOnHand),
+                stockAvailable: parseFinaleNumber(stockNode?.stockAvailable),
+                lastPurchaseDate,
             };
-            // DECISION(2026-03-23): Prefer unitsInStock over stockOnHand.
-            // stockOnHand returns 0 for many products; unitsInStock returns the
-            // real physical count (verified against Finale UI for ULINE items).
-            const stockOnHand = stockNode
-                ? (parseStockVal(stockNode.unitsInStock) ?? parseStockVal(stockNode.stockOnHand))
-                : null;
-            const stockAvailable = stockNode ? parseStockVal(stockNode.stockAvailable) : null;
-
-            return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable, lastPurchaseDate };
-        } catch {
+        } catch (err: any) {
+            console.error(`[finale] getProductActivity error for ${sku}:`, err.message);
             return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
         }
     }
