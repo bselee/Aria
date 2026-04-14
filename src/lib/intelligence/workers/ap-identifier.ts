@@ -224,6 +224,50 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         return subject.split("-")[0]?.trim() || "Unknown Vendor";
     }
 
+    private normalizeDocumentNumber(value: string | null | undefined): string | null {
+        if (!value) return null;
+        const normalized = value.replace(/\D/g, "");
+        return normalized.length > 0 ? normalized : null;
+    }
+
+    private hasExactNumberSetMatch(expected: string[], actual: string[]): boolean {
+        if (expected.length === 0 || actual.length === 0 || expected.length !== actual.length) {
+            return false;
+        }
+
+        const sortedExpected = [...expected].sort();
+        const sortedActual = [...actual].sort();
+        return sortedExpected.every((value, index) => value === sortedActual[index]);
+    }
+
+    private isFedExInvoiceEmail(
+        from: string,
+        subject: string,
+        snippet: string,
+        pdfFilenames: string[],
+    ): boolean {
+        if (!/fedex/i.test(from)) return false;
+
+        return (
+            /\binvoice\b/i.test(subject)
+            || /\binvoice\b/i.test(snippet)
+            || pdfFilenames.some((filename) => /\b(invoice|bill)\b/i.test(filename))
+        );
+    }
+
+    private async extractAAACoverSheetInvoiceNumbers(buffer: Buffer): Promise<string[]> {
+        const { extractPDF } = await import("../../pdf/extractor");
+        const extraction = await extractPDF(buffer);
+        const firstPageText = extraction.pages[0]?.text || extraction.rawText || "";
+        const sectionMatch = firstPageText.match(/\bPRO\b([\s\S]*?)\bSHIPMENT INFORMATION\b/i);
+        const searchText = sectionMatch?.[1] || firstPageText;
+        const matches = [...searchText.matchAll(/\b\d{6,10}\b/g)]
+            .map((match) => this.normalizeDocumentNumber(match[0]))
+            .filter((value): value is string => Boolean(value));
+
+        return [...new Set(matches)];
+    }
+
     private async queueStatementCandidates(
         emailRow: any,
         gmail: any,
@@ -352,10 +396,16 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 const sourceInbox = m.source_inbox || "ap";
                 const gmail = await getGmailClient(sourceInbox);
 
-                // Lock row
-                await supabase.from('email_inbox_queue')
-                    .update({ processed_by_ap: true })
-                    .eq('id', m.id);
+                // H1 FIX(2026-04-14): Lock moved to end-of-iteration in `finally` below.
+                // Previously we set processed_by_ap=true at the START of the loop, which
+                // meant any uncaught exception (or transient Gmail fetch failure) between
+                // here and the ap_inbox_queue insert left the email marked "done" but
+                // never queued downstream — an orphan. Now we default handled=true so
+                // every explicit decision branch (blocklist, statement, human, queued)
+                // preserves prior behavior, but uncaught errors set handled=false so the
+                // next poll retries.
+                let handled = true;
+                try {
 
                 const subject = m.subject || "No Subject";
                 const from = m.from_email || "Unknown Sender";
@@ -429,6 +479,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         break;
                     }
                     console.error(`   ❌ Failed to fetch message payload for ${m.gmail_message_id}`);
+                    handled = false;
                     continue;
                 }
                 const payload = msg.data.payload;
@@ -457,12 +508,16 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 // Subject signals for non-invoice PO emails
                 const isReadyNotification = /\*\*READY\*\*/i.test(subject);
                 const isOrderAck = /acknowledgement|order\s*confirm/i.test(subject);
+                const isFedExInvoice = this.isFedExInvoiceEmail(from, subject, snippet, pdfFilenames);
 
                 let intent: string;
                 if (hasInvoicePdf && !isNonInvoicePdf) {
                     // Override: PDF filename clearly indicates an invoice document
                     intent = "INVOICE";
                     console.log(`     -> Forced INVOICE (PDF filename match: ${pdfFilenames.join(', ')})`);
+                } else if (isFedExInvoice && hasPdfAttachment && !isNonInvoicePdf) {
+                    intent = "INVOICE";
+                    console.log(`     -> Forced INVOICE (FedEx invoice pattern)`);
                 } else if (isReadyNotification || isOrderAck) {
                     // DECISION(2026-03-19): "PO READY" notifications and order acks
                     // are vendor confirmations, not invoices. Skip without LLM call.
@@ -525,17 +580,6 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 m, gmail, supabase, multiInvVendor.label,
                             );
                             if (handled.status === "handled") {
-                                // Successfully split — label as processed and archive
-                                try {
-                                    await gmail.users.messages.modify({
-                                        userId: "me",
-                                        id: m.gmail_message_id,
-                                        requestBody: {
-                                            addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
-                                            removeLabelIds: ["INBOX", "UNREAD"]
-                                        }
-                                    });
-                                } catch (e) { /* ignore */ }
                                 continue;
                             }
                             if (handled.status === "needs_review") {
@@ -653,6 +697,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     }
                 };
                 walkParts(payload?.parts || []);
+                const expectedForwardCount = pdfParts.length;
 
                 let attachmentIndex = 0;
                 for (const part of pdfParts) {
@@ -670,6 +715,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                             if (existing) {
                                 console.log(`     ⚠️ Already queued ${capturedFilename}, skipping...`);
+                                processedAnyPDF = true;
                                 attachmentIndex++;
                                 continue;
                             }
@@ -808,6 +854,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 status: queueStatus,
                                 source_inbox: sourceInbox,
                                 pdf_content_hash: pdfHash,
+                                extracted_json: {
+                                    source_gmail_message_id: m.gmail_message_id,
+                                    completion_mode: "forward_success",
+                                    expected_forward_count: expectedForwardCount,
+                                    pdf_attachment_index: attachmentIndex,
+                                    pdf_attachment_count: expectedForwardCount,
+                                },
                             });
 
                             if (insertError) {
@@ -830,18 +883,8 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 }
 
                 if (processedAnyPDF) {
-                    try {
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: m.gmail_message_id,
-                            requestBody: {
-                                addLabelIds: [(await getLabels(sourceInbox)).invoiceFwd],
-                                removeLabelIds: ["INBOX", "UNREAD"]  // Decoupled! We mark as read IMMEDIATELY upon successful queuing
-                            }
-                        });
-                    } catch (e) { /* ignore */ }
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    const logNote = `Queued for Bill.com forward (${pdfNames})`;
+                    const logNote = `Queued for Bill.com forward (${pdfNames}); awaiting send verification before archiving source email`;
                     await this.logActivity(supabase, from, subject, intent, logNote, {
                         reasonCode: "queued_for_billcom",
                         sourceInbox,
@@ -849,7 +892,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         attachments: pdfNames,
                         queueStatus: "PENDING_FORWARD",
                     });
-                } else {
+                } else if (pdfParts.length === 0) {
                     console.log(`     ⚠️ No PDF found on ${intent}. Leaving unread for human check.`);
                     const policy = getAPMissingPdfPolicy(sourceInbox, intent);
                     await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
@@ -865,6 +908,23 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
+                } else {
+                    console.log(`     ⚠️ Invoice PDFs were detected but not fully queued. Leaving unread for retry.`);
+                    await this.logActivity(supabase, from, subject, intent, "Invoice PDFs detected but queueing was incomplete; leaving unread in inbox", {
+                        reasonCode: "incomplete_queue",
+                        sourceInbox,
+                        gmailMessageId: m.gmail_message_id,
+                        expectedForwardCount,
+                    });
+                }
+
+                } catch (err: any) {
+                    handled = false;
+                    throw err;
+                } finally {
+                    await supabase.from('email_inbox_queue')
+                        .update({ processed_by_ap: handled })
+                        .eq('id', m.id);
                 }
             }
         } catch (err: any) {
@@ -1471,12 +1531,57 @@ If no invoice number is found, use null.`,
             return { status: "fallthrough", reason: "no_invoice_pages" };
         }
 
+        const splitInvoiceNumbers = [...new Set(
+            splitResult.invoices
+                .map((invoice) => this.normalizeDocumentNumber(invoice.invoiceNumber))
+                .filter((value): value is string => Boolean(value)),
+        )];
+
+        if (vendorLabel === "AAA Cooper") {
+            if (splitInvoiceNumbers.length !== splitResult.invoices.length) {
+                const reason = "AAA split is missing one or more invoice numbers";
+                await this.logActivity(
+                    supabase,
+                    from,
+                    subject,
+                    "MULTI_INVOICE_STATEMENT",
+                    `${vendorLabel} statement held for review: ${reason}`,
+                    {
+                        vendor: vendorLabel,
+                        sourceFilenames: attachments.map((attachment) => attachment.filename),
+                        splitInvoiceNumbers,
+                    },
+                );
+                return { status: "needs_review", reason };
+            }
+
+            const coverSheetInvoiceNumbers = await this.extractAAACoverSheetInvoiceNumbers(attachments[0].pdfBuffer);
+            if (!this.hasExactNumberSetMatch(coverSheetInvoiceNumbers, splitInvoiceNumbers)) {
+                const reason = "AAA cover sheet invoice list does not match the split invoices";
+                await this.logActivity(
+                    supabase,
+                    from,
+                    subject,
+                    "MULTI_INVOICE_STATEMENT",
+                    `${vendorLabel} statement held for review: ${reason}`,
+                    {
+                        vendor: vendorLabel,
+                        coverSheetInvoiceNumbers,
+                        splitInvoiceNumbers,
+                        sourceFilenames: attachments.map((attachment) => attachment.filename),
+                    },
+                );
+                return { status: "needs_review", reason };
+            }
+        }
+
         console.log(`     📋 Found ${splitResult.invoices.length} invoice(s); discarded ${splitResult.discardedCount} paperwork page(s): ${splitResult.invoices.map((page) => page.invoiceNumber || `page${page.page}`).join(", ")}`);
 
         const { PDFDocument } = await import("pdf-lib");
         const attachmentLookup = new Map(attachments.map((attachment) => [attachment.attachmentId, attachment]));
         const sourcePdfs = new Map<string, any>();
         let queuedCount = 0;
+        const expectedForwardCount = splitInvoiceNumbers.length || splitResult.invoices.length;
 
         for (const invoice of splitResult.invoices) {
             const attachment = invoice.attachmentId ? attachmentLookup.get(invoice.attachmentId) : undefined;
@@ -1537,6 +1642,15 @@ If no invoice number is found, use null.`,
                 pdf_filename: invoiceFilename,
                 status: "PENDING_FORWARD",
                 source_inbox: emailRow.source_inbox || "ap",
+                extracted_json: {
+                    source_gmail_message_id: msgId,
+                    completion_mode: "forward_success",
+                    expected_forward_count: expectedForwardCount,
+                    vendor_label: vendorLabel,
+                    statement_verification: {
+                        split_invoice_numbers: splitInvoiceNumbers,
+                    },
+                },
             });
 
             if (insertError) {
@@ -1565,6 +1679,10 @@ If no invoice number is found, use null.`,
                 diagnostics: splitResult.diagnostics,
             },
         );
+
+        if (queuedCount < expectedForwardCount) {
+            return { status: "needs_review", reason: "incomplete_queue" };
+        }
 
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (chatId && this.bot) {
