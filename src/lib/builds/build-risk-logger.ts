@@ -58,7 +58,7 @@ export async function saveBuildRiskSnapshot(report: BuildRiskReport): Promise<vo
       components,
       unrecognized_skus: report.unrecognizedSkus,
     });
-  } catch {
-    // Never block the analysis result due to logging failure
+  } catch (err: any) {
+    console.error('❌ saveBuildRiskSnapshot failed:', err.message);
   }
 }

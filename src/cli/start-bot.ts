@@ -1167,7 +1167,6 @@ bot.on('text', async (ctx) => {
     }
 
     const ops = new OpsManager(bot);
-    ops.start();
 
     // Start Slack Watchdog in-process BEFORE botDeps construction
     // so deps.watchdog captures the live instance, not null.
