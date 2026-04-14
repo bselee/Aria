@@ -136,6 +136,31 @@ export class OpsManager {
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
+
+        // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
+        // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
+        this.hydrateSeenCompletedBuildIds();
+    }
+
+    private async hydrateSeenCompletedBuildIds() {
+        try {
+            const supabase = createClient();
+            if (!supabase) return;
+            const { data } = await supabase
+                .from('build_completions')
+                .select('build_id')
+                .gte('created_at', new Date(Date.now() - 90 * 86400000).toISOString());
+            if (data) {
+                for (const row of data) {
+                    this.seenCompletedBuildIds.add(row.build_id);
+                }
+                if (this.seenCompletedBuildIds.size > 0) {
+                    console.log(`🔨 Hydrated ${this.seenCompletedBuildIds.size} seen build IDs from build_completions`);
+                }
+            }
+        } catch {
+            // Non-critical — dedup set starts empty on fresh boot
+        }
     }
 
     /**
@@ -456,10 +481,119 @@ export class OpsManager {
 
     /**
      * Poll Finale for newly completed production builds.
+     * Detects completed BOM production orders, writes to build_completions for the
+     * dashboard BuildSchedulePanel, creates ✅-completed events on the MFG calendar,
+     * and notifies Will via Telegram.
      */
     async pollBuildCompletions() {
         console.log("🔨 Checking for build completions...");
-        // Placeholder
+        try {
+            const [finale, supabase, calendar, parser] = await Promise.all([
+                Promise.resolve(new FinaleClient()),
+                Promise.resolve(createClient()),
+                Promise.resolve(new CalendarClient()),
+                Promise.resolve(new BuildParser()),
+            ]);
+
+            const since = new Date(Date.now() - 14 * 86400000);
+            const completed = await finale.getRecentlyCompletedBuilds(since);
+
+            if (completed.length === 0) {
+                console.log("🔨 No completed builds found.");
+                return;
+            }
+
+            const events = await calendar.getAllUpcomingBuilds(30);
+            const parsedBuilds = await parser.extractBuildPlan(events);
+            const accountPath = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+
+            let notified = 0;
+
+            for (const build of completed) {
+                if (this.seenCompletedBuildIds.has(build.buildId)) continue;
+                this.seenCompletedBuildIds.add(build.buildId);
+                notified++;
+
+                let calendarEventId: string | null = null;
+
+                // Create ✅-completed MFG calendar event
+                try {
+                    const matched = parsedBuilds.find(p => p.sku === build.sku);
+                    const completedAt = new Date(build.completedAt);
+                    const buildDate = completedAt.toISOString().split('T')[0];
+                    const timeStr = completedAt.toLocaleTimeString('en-US', {
+                        hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver',
+                    });
+                    const scheduledQty = matched?.quantity ?? null;
+
+                    let title: string;
+                    if (scheduledQty && scheduledQty !== build.quantity) {
+                        const diff = build.quantity - scheduledQty;
+                        const sign = diff > 0 ? '+' : '';
+                        title = `✅ ${build.sku} ×${build.quantity}/${scheduledQty} (${sign}${diff})`;
+                    } else {
+                        title = `✅ ${build.sku} ×${build.quantity}`;
+                    }
+
+                    const descLines: string[] = [`Build Complete · ${timeStr}`];
+                    if (scheduledQty && scheduledQty !== build.quantity) {
+                        const pct = Math.round((build.quantity / scheduledQty) * 100);
+                        descLines.push(`Scheduled: ${scheduledQty} · Actual: ${build.quantity} (${pct}%)`);
+                    }
+                    const buildUrlBuf = Buffer.from(build.buildUrl || `/${accountPath}/api/workeffort/${build.buildId}`);
+                    const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?build/detail/${buildUrlBuf.toString('base64')}`;
+                    descLines.push(`→ <a href="${finaleUrl}">Build #${build.buildId}</a>`);
+
+                    calendarEventId = await calendar.createEvent(CALENDAR_IDS.MFG, {
+                        title,
+                        description: descLines.join('\n'),
+                        date: buildDate,
+                    });
+                    console.log(`🔨 Created MFG calendar event ${calendarEventId} for build ${build.buildId}`);
+                } catch (calErr: any) {
+                    console.warn(`⚠️ MFG calendar write failed for build ${build.buildId}: ${calErr.message}`);
+                }
+
+                // Upsert into build_completions for the dashboard
+                if (supabase) {
+                    try {
+                        await supabase.from('build_completions').upsert(
+                            {
+                                build_id: build.buildId,
+                                sku: build.sku,
+                                quantity: build.quantity,
+                                completed_at: build.completedAt,
+                                calendar_event_id: calendarEventId,
+                                calendar_id: calendarEventId ? CALENDAR_IDS.MFG : null,
+                            },
+                            { onConflict: 'build_id' }
+                        );
+                    } catch (dbErr: any) {
+                        console.warn(`⚠️ Failed to upsert build_completions ${build.buildId}: ${dbErr.message}`);
+                    }
+                }
+
+                // Notify Will via Telegram
+                const completedAt = new Date(build.completedAt);
+                const dateStr = completedAt.toLocaleDateString('en-US', {
+                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
+                });
+                const timeStr = completedAt.toLocaleTimeString('en-US', {
+                    hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver',
+                });
+                const msg =
+                    `🏭 **Build Completed**\n\n` +
+                    `SKU: *${build.sku}*\n` +
+                    `Qty: *${build.quantity}*\n` +
+                    `Completed: ${dateStr} at ${timeStr}\n` +
+                    `Build #: ${build.buildId}`;
+                await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
+            }
+
+            console.log(`🔨 Build completion check done — ${notified} new, ${completed.length} total in window.`);
+        } catch (err: any) {
+            console.error("🔨 pollBuildCompletions error:", err.message);
+        }
     }
 
     /**
