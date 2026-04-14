@@ -142,6 +142,23 @@ export function getAriaTools(opts: {
             },
         }),
 
+        product_consumption_analysis: tool({
+            description: "Analyze consumption/demand for any product (component, supply, or finished good) bucketed into monthly, quarterly, and yearly totals. Accepts a SKU OR a description keyword (fuzzy matches). Returns receipts, shipments, Finale's rolling consumption/demand, velocity (per-month/qtr/yr), and a period-by-period timeline. Use when the user asks 'how much do we use', 'monthly/quarterly/yearly usage', 'annual demand', 'consumption trend', or 'how fast are we burning through X'.",
+            inputSchema: z.object({
+                query: z.string().describe('SKU or description keyword (e.g. "KM106", "kelp meal", "boxes 12x12")'),
+                days: z.number().optional().describe('Window size in days — default 365. Use 730 for 2yr trend, 90 for recent.'),
+            }),
+            execute: async ({ query, days }) => {
+                try {
+                    const result = await finale.getProductConsumptionAnalysis(query, days || 365);
+                    if (!result) return `No product found matching "${query}".`;
+                    return result.telegramMessage;
+                } catch (err: any) {
+                    return `Consumption analysis failed for "${query}": ${err.message}`;
+                }
+            },
+        }),
+
         build_risk_analysis: tool({
             description: "Run advanced 30-day build risk analysis to predict stockouts for upcoming production. Explodes BOMs against the manufacturing calendar and current stock. Use when the user asks for 'build risk', 'what are we short on', 'stockouts', or '/buildrisk'.",
             inputSchema: z.object({}),
