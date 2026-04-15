@@ -14,19 +14,30 @@ type Build = {
   designation: "SOIL" | "MFG";
 };
 
-type ComponentRisk = {
+type SnapshotComponent = {
   componentSku: string;
+  totalRequiredQty: number;
+  onHand: number | null;
+  onOrder: number | null;
   stockoutDays: number | null;
-  incomingPOs: any[];
+  demandQuantity: number | null;
+  consumptionQuantity: number | null;
+  leadTimeDays: number | null;
+  incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string }>;
   usedIn: string[];
+  designations: string[];
   riskLevel: "CRITICAL" | "WARNING" | "WATCH" | "OK";
+  earliestBuildDate: string;
+  hasFinaleData: boolean;
+  vendorName: string | null;
+  vendorPartyId: string | null;
 };
 
 type Snapshot = {
   id: string;
   generated_at: string;
   builds: Build[];
-  components: Record<string, ComponentRisk>;
+  components: Record<string, SnapshotComponent>;
 };
 
 type Completion = {
@@ -263,7 +274,7 @@ export default function BuildSchedulePanel() {
     : [];
 
   // Group into unified timeline by date
-  const timelineMap = new Map<string, { builds: Build[]; stockouts: ComponentRisk[] }>();
+  const timelineMap = new Map<string, { builds: Build[]; stockouts: SnapshotComponent[] }>();
   function getDayEntry(dateStr: string) {
     if (!timelineMap.has(dateStr)) timelineMap.set(dateStr, { builds: [], stockouts: [] });
     return timelineMap.get(dateStr)!;
@@ -596,17 +607,13 @@ function OracleForecastSection({ snapshot }: { snapshot: Snapshot | null }) {
 // ── Snapshot → BuildRiskReport adapter ─────────────────────────────────────
 
 function snapshotDataToReport(snapshot: Snapshot) {
-  // Convert plain-object snapshot (no Sets/Maps) to BuildRiskReport shape
   const builds = snapshot.builds.map((b: Build) => ({
     ...b,
     designations: new Set([b.designation]),
   }));
-  const components = new Map<string, any>(
-    Object.entries(snapshot.components ?? {}).map(([sku, comp]: [string, any]) => [
-      sku,
-      { ...comp, usedIn: new Set(comp.usedIn ?? []), designations: new Set() },
-    ]),
+  const components = new Map<string, SnapshotComponent>(
+    Object.entries(snapshot.components ?? {}),
   );
-  const fgVelocity = new Map<string, any>();
+  const fgVelocity = new Map<string, { dailyRate: number; stockOnHand: number | null; daysOfFinishedStock: number | null; openDemandQty: number }>();
   return { builds, components, fgVelocity };
 }

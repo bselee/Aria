@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeBuildDemandOracle } from './build-demand-oracle';
+import { computeBuildDemandOracle, computeOracleStatus } from './build-demand-oracle';
 import type { BuildRiskReport } from './build-risk';
 
 const makeReport = (overrides: Partial<BuildRiskReport> = {}): BuildRiskReport => ({
@@ -109,5 +109,32 @@ describe('build-demand-oracle', () => {
     // dailyRate=2, qtyPerFg=20/10=2 → 2*7*2 = 28 per week
     expect(comp?.weeklyNeedW158).toBe(28);
     expect(comp?.weeklyNeedW1912).toBe(28);
+  });
+
+  describe('computeOracleStatus', () => {
+    it('returns ORDER NOW when totalSupply < wk14Need', () => {
+      // onHand=5, incomingPO=0, wk14Need=20 → supply=5 < 20
+      expect(computeOracleStatus(5, 0, 20, 20, 20)).toBe('ORDER NOW');
+    });
+
+    it('returns REORDER SOON when wk1-4 covered but wk5-8 shortfall', () => {
+      // onHand=20, incomingPO=0, wk14Need=20 (covered), wk58Need=30, wk912Need=30
+      // supplyAfterWk4 = 20-20 = 0 < 30
+      expect(computeOracleStatus(20, 0, 20, 30, 30)).toBe('REORDER SOON');
+    });
+
+    it('returns REORDER SOON when wk1-8 covered but wk9-12 shortfall', () => {
+      // onHand=50, incomingPO=0, wk14Need=20, wk58Need=30, wk912Need=40
+      // supplyAfterWk4 = 50-20 = 30 ≥ 30 ✓
+      // supplyAfterWk8 = 30-30 = 0 < 40
+      expect(computeOracleStatus(50, 0, 20, 30, 40)).toBe('REORDER SOON');
+    });
+
+    it('returns COVERED when supply covers through week 12', () => {
+      // onHand=100, incomingPO=0, wk14Need=20, wk58Need=30, wk912Need=40
+      // supplyAfterWk4 = 100-20 = 80 ≥ 30 ✓
+      // supplyAfterWk8 = 80-30 = 50 ≥ 40 ✓
+      expect(computeOracleStatus(100, 0, 20, 30, 40)).toBe('COVERED');
+    });
   });
 });
