@@ -1347,6 +1347,15 @@ export class FinaleClient {
                                             }
                                         }
                                     }
+                                    shipmentList(first: 50) {
+                                        edges {
+                                            node {
+                                                shipmentId
+                                                receiveDate
+                                                quantity
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1365,15 +1374,22 @@ export class FinaleClient {
                     const matchingItem = items.find(
                         (item: any) => item.node.product?.productId === productId
                     );
+                    const originalQty = parseFinaleNumber(matchingItem?.node.quantity) || 0;
+                    const receivedQty = (po.shipmentList?.edges || [])
+                        .filter((s: any) => s.node.receiveDate)
+                        .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.node.quantity || 0), 0);
+                    const remainingQty = originalQty - receivedQty;
+                    if (remainingQty <= 0) return null;
                     return {
                         orderId: po.orderId,
                         status: po.status,
                         orderDate: po.orderDate,
                         supplier: po.supplier?.name || "Unknown",
-                        quantityOnOrder: parseFinaleNumber(matchingItem?.node.quantity) || 0,
+                        quantityOnOrder: remainingQty,
                         total: po.total || 0,
                     };
-                });
+                })
+                .filter(Boolean) as POInfo[];
         } catch (err: any) {
             console.error("PO lookup error:", err.message);
             return [];
