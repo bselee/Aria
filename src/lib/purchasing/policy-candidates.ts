@@ -26,10 +26,6 @@ export function buildPurchasingCandidate(
     item: PurchasingItem,
     context: PurchasingCandidateContext = {},
 ): PurchasingCandidate {
-    // FIX(2026-04-14): When Finale tracks demandVelocity (direct sales + BOM consumption),
-    // use it as the primary direct demand signal. Only fall back to salesVelocity when
-    // demandVelocity is untracked (0). Previously always used salesVelocity, which missed
-    // demand that Finale captured in demandVelocity (e.g., direct customer orders).
     const knownDemand = Math.max(item.demandVelocity, 0);
     const directDemand = context.directDemand ?? (knownDemand > 0 ? knownDemand : Math.max(item.salesVelocity, 0));
     const bomDemand = context.bomDemand ?? Math.max(knownDemand - directDemand, 0);
