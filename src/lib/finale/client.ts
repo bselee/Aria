@@ -17,6 +17,8 @@
  * the product is manufactured (has a BOM), not purchased.
  */
 
+import { createClient } from '@/lib/supabase';
+
 // ──────────────────────────────────────────────────
 // TYPES
 // ──────────────────────────────────────────────────
@@ -638,6 +640,30 @@ export class FinaleClient {
     static snapToIncrement(quantity: number, incrementQty: number | null): number {
         if (!incrementQty || incrementQty <= 1) return quantity;
         return Math.max(incrementQty, Math.ceil(quantity / incrementQty) * incrementQty);
+    }
+
+    /**
+     * Look up a vendor's case multiplier from the `vendor_case_multipliers` Supabase table.
+     * Used to convert per-unit suggested quantities to per-case quantities for vendors
+     * that sell by the case (e.g., Teraganix EM102×12, EM108×12).
+     *
+     * @param supabase   - Supabase client instance
+     * @param sku        - Product SKU to match
+     * @param vendorName - Vendor name for pattern matching
+     * @returns Case multiplier (1 if no match or supabase is null)
+     */
+    async getCaseMultiplier(supabase: any, sku: string, vendorName: string): Promise<number> {
+        if (!supabase) return 1;
+        const vendorLower = vendorName.toLowerCase();
+        const { data } = await supabase
+            .from('vendor_case_multipliers')
+            .select('multiplier')
+            .or(`vendor_pattern.ilike.%${vendorLower}%,vendor_pattern.ilike.%${vendorLower.split(' ')[0]}%`)
+            .or(`sku_pattern.eq.${sku},sku_pattern.is.null`)
+            .order('sku_pattern', { ascending: false })
+            .limit(1);
+        if (data?.length) return Number(data[0].multiplier) || 1;
+        return 1;
     }
 
     /**
@@ -4406,9 +4432,10 @@ export class FinaleClient {
      *
      * @param daysBack  Lookback window for velocity calculation (default: 90 days)
      */
-    async getPurchasingIntelligence(daysBack = 365, vendorFilter?: string | null): Promise<PurchasingGroup[]> {
+    async getPurchasingIntelligence(daysBack = 365, vendorFilter?: string | null, supabase?: any): Promise<PurchasingGroup[]> {
         const PAGE_SIZE = 500;
         const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
+        const _supabase = supabase ?? (() => { try { return createClient(); } catch { return null; } })();
 
         // ── Step 1: Page productViewConnection — presence signal only ──
         // Two signals qualify a product as "actively moving":
@@ -4639,6 +4666,10 @@ export class FinaleClient {
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
                     const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
                     const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+                    const caseMultiplier = await this.getCaseMultiplier(_supabase, sku, party.groupName);
+                    const finalSuggestedQty = caseMultiplier > 1
+                        ? Math.ceil(suggestedQty * caseMultiplier)
+                        : suggestedQty;
 
                     // Bulk delivery detection for facility routing
                     const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
@@ -4666,7 +4697,7 @@ export class FinaleClient {
                         })),
                         urgency,
                         explanation,
-                        suggestedQty,
+                        suggestedQty: finalSuggestedQty,
                         orderIncrementQty,
                         isBulkDelivery,
                         finaleReorderQty: candidate.finaleReorderQty,

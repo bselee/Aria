@@ -361,3 +361,78 @@ describe("FinaleClient receivings pagination", () => {
         expect(graphqlBodies[1]).toContain('after: "cursor-1"');
     });
 });
+
+function createMockSupabase(rows: Array<{ vendor_pattern: string; sku_pattern: string | null; multiplier: number }>) {
+    return {
+        from: (_table: string) => ({
+            select: (_columns: string) => ({
+                or: (_vendorFilter: string) => ({
+                    or: (_skuFilter: string) => ({
+                        order: (_field: string, _options?: object) => ({
+                            limit: (_n: number) => ({
+                                then: (resolve: (value: unknown) => void) => {
+                                    resolve({ data: rows, error: null });
+                                },
+                            }),
+                        }),
+                    }),
+                }),
+            }),
+        }),
+    };
+}
+
+describe('getCaseMultiplier', () => {
+    const originalEnv = {
+        FINALE_API_KEY: process.env.FINALE_API_KEY,
+        FINALE_API_SECRET: process.env.FINALE_API_SECRET,
+        FINALE_ACCOUNT_PATH: process.env.FINALE_ACCOUNT_PATH,
+        FINALE_BASE_URL: process.env.FINALE_BASE_URL,
+    };
+
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+    });
+
+    afterEach(() => {
+        process.env.FINALE_API_KEY = originalEnv.FINALE_API_KEY;
+        process.env.FINALE_API_SECRET = originalEnv.FINALE_API_SECRET;
+        process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
+        process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
+    });
+
+    it('returns multiplier from vendor_case_multipliers for matching SKU', async () => {
+        const supabase = createMockSupabase([
+            { vendor_pattern: 'teraganix', sku_pattern: 'EM102', multiplier: 12 }
+        ]);
+        const client = new FinaleClient();
+        const result = await client.getCaseMultiplier(supabase, 'EM102', 'Teraganix');
+        expect(result).toBe(12);
+    });
+
+    it('returns multiplier for wildcard SKU pattern', async () => {
+        const supabase = createMockSupabase([
+            { vendor_pattern: 'teraganix', sku_pattern: null, multiplier: 4 }
+        ]);
+        const client = new FinaleClient();
+        const result = await client.getCaseMultiplier(supabase, 'ANYSKU', 'Teraganix');
+        expect(result).toBe(4);
+    });
+
+    it('returns 1 when no match', async () => {
+        const client = new FinaleClient();
+        const result = await client.getCaseMultiplier(null, 'SKU123', 'Unknown');
+        expect(result).toBe(1);
+    });
+
+    it('returns 1 when supabase returns empty data', async () => {
+        const supabase = createMockSupabase([]);
+        const client = new FinaleClient();
+        const result = await client.getCaseMultiplier(supabase, 'SKU123', 'Unknown');
+        expect(result).toBe(1);
+    });
+});
