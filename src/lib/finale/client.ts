@@ -4559,9 +4559,9 @@ export class FinaleClient {
                         ? `${rawLeadTime}d (Finale)`
                         : '14d default';
 
-                    // DECISION(2026-03-16): Use GraphQL stock from getProductActivity().
-                    const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
-                    const stockOnHand = activity.stockOnHand ?? restStock;
+                    const stockOnHand: number | null = activity.stockOnHand
+                        ?? (prodData.quantityOnHand != null ? parseFinaleNumber(prodData.quantityOnHand) : null)
+                        ?? (prodData.stockLevel != null ? parseFinaleNumber(prodData.stockLevel) : null);
 
                     // Open PO supply
                     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
@@ -4587,8 +4587,24 @@ export class FinaleClient {
                         purchaseVelocity,
                         consumptionQty: candidate.finaleConsumptionQty,
                     });
+                    // FIX(2026-04-14): Trigger fallback when demand signal is near-zero but purchase
+                    // history shows real velocity. Previously only triggered when demand was STRICTLY 0,
+                    // which missed BOM-driven components where demandVelocity is a trickle but
+                    // purchaseVelocity (BOM consumption) is the actual signal.
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
+                    if ((dailyRate === 0 || dailyRate < purchaseVelocity * 0.5) && purchaseVelocity > 0) {
+                        let daysSinceLastPurchase = 999;
+                        if (activity.lastPurchaseDate) {
+                            const lp = new Date(activity.lastPurchaseDate);
+                            daysSinceLastPurchase = (Date.now() - lp.getTime()) / (1000 * 60 * 60 * 24);
+                        }
+
+                        if (daysSinceLastPurchase <= 180 || activity.openPOs.length > 0) {
+                            dailyRate = purchaseVelocity;
+                            rateSource = "receipts";
+                        }
+                    }
 
                     if (dailyRate === 0) continue; // no actual movement within windows
 
@@ -4600,31 +4616,38 @@ export class FinaleClient {
                             ? `${daysBack}d sales`
                             : `${daysBack}d receipts`;
 
-                    const effectiveStock = stockOnHand ?? 0;
-                    if (effectiveStock === 0 && stockOnHand === null) {
-                        console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku}, skipping`);
-                        continue;
-                    }
-
-                    const runwayDays = effectiveStock / dailyRate;
-                    const adjustedRunwayDays = (effectiveStock + stockOnOrder) / dailyRate;
+                    const runwayDays: number | null = stockOnHand !== null && dailyRate > 0
+                        ? stockOnHand / dailyRate
+                        : null;
+                    const adjustedRunwayDays: number | null = stockOnHand !== null && dailyRate > 0
+                        ? (stockOnHand + stockOnOrder) / dailyRate
+                        : null;
 
                     // Step 6: urgency based on ADJUSTED runway (on-hand + on-order)
                     // DECISION(2026-03-09): Changed from raw runwayDays to adjustedRunwayDays.
                     // Previously used on-hand only, which caused items with active POs
                     // (In Transit) to falsely flag as CRIT even when incoming supply covers demand.
-                    const urgency: PurchasingItem['urgency'] =
-                        adjustedRunwayDays < leadTimeDays ? 'critical'
+                    // FIX(2026-04-14): null runway means we have no stock data — treat as
+                    // unknown, not as zero stock. These items should not auto-escalate to CRITICAL.
+                    let urgency: PurchasingItem['urgency'] = 'ok';
+                    if (adjustedRunwayDays !== null) {
+                        urgency = adjustedRunwayDays < leadTimeDays ? 'critical'
                             : adjustedRunwayDays < leadTimeDays + 30 ? 'warning'
                                 : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
                                     : 'ok';
+                    } else if (stockOnHand === null && dailyRate > 0) {
+                        // We have velocity but no stock data — be conservative
+                        urgency = 'warning';
+                    }
                     const parts: string[] = [
                         `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
-                        `${Math.round(effectiveStock)} in stock → ${Math.round(runwayDays)}d`,
+                        stockOnHand !== null
+                            ? `${Math.round(stockOnHand)} in stock → ${Math.round(runwayDays!)}d`
+                            : 'stock unknown',
                         `Lead ${leadTimeDays}d`,
                     ];
                     if (stockOnOrder > 0) {
-                        parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
+                        parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${adjustedRunwayDays !== null ? Math.round(adjustedRunwayDays) + 'd adjusted' : 'stock unknown'}`);
                     }
                     const urgencyNote = urgency === 'critical' ? 'order now, already short'
                         : urgency === 'warning' ? 'order soon'
@@ -4636,8 +4659,11 @@ export class FinaleClient {
                     // DECISION(2026-03-04): Formerly hard-coded round-to-50. Now respects
                     // the product's "Std reorder in qty of" field from Finale.
                     // If no increment configured, raw quantity passes through unchanged.
+                    // FIX(2026-04-14): Apply minimumOrderQty (pack size floor) before snapping
+                    // to increment. Items below the vendor minimum can't actually be ordered.
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
-                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
+                    const minOrderQty = this.parseFinaleNum(prodData.minimumOrderQuantity);
+                    const rawSuggestedQty = Math.max(minOrderQty ?? 1, dailyRate * (leadTimeDays + 60), 1);
                     const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
 
                     // Bulk delivery detection for facility routing
