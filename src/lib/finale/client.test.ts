@@ -436,3 +436,124 @@ describe('getCaseMultiplier', () => {
         expect(result).toBe(1);
     });
 });
+
+describe('getProductActivity remainingQty', () => {
+    const originalEnv = {
+        FINALE_API_KEY: process.env.FINALE_API_KEY,
+        FINALE_API_SECRET: process.env.FINALE_API_SECRET,
+        FINALE_ACCOUNT_PATH: process.env.FINALE_ACCOUNT_PATH,
+        FINALE_BASE_URL: process.env.FINALE_BASE_URL,
+    };
+
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    afterEach(() => {
+        process.env.FINALE_API_KEY = originalEnv.FINALE_API_KEY;
+        process.env.FINALE_API_SECRET = originalEnv.FINALE_API_SECRET;
+        process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
+        process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
+    });
+
+    it('subtracts received qty from open PO quantity', async () => {
+        const mockData = {
+            committedPOs: {
+                edges: [{
+                    node: {
+                        orderId: '124624',
+                        status: 'Committed',
+                        orderDate: '2026-01-01',
+                        itemList: { edges: [{ node: { product: { productId: 'SKU123' }, quantity: 100 } }] },
+                        shipmentList: { edges: [{ node: { shipmentId: 'S1', receiveDate: '2026-01-15', quantity: 80 } }] }
+                    }
+                }]
+            },
+            purchasedIn: { edges: [] },
+            soldIn: { edges: [] },
+            stockInfo: { edges: [{ node: { unitsInStock: 50 } }] }
+        };
+
+        vi.mocked(global.fetch).mockResolvedValueOnce(
+            new Response(JSON.stringify({ data: mockData }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            })
+        );
+
+        const client = new FinaleClient();
+        const result = await client.getProductActivity('SKU123', 365);
+
+        expect(result.openPOs).toHaveLength(1);
+        expect(result.openPOs[0].orderId).toBe('124624');
+        expect(result.openPOs[0].quantity).toBe(20);
+    });
+
+    it('excludes fully received POs (remainingQty <= 0)', async () => {
+        const mockData = {
+            committedPOs: {
+                edges: [{
+                    node: {
+                        orderId: '124625',
+                        status: 'Committed',
+                        orderDate: '2026-01-01',
+                        itemList: { edges: [{ node: { product: { productId: 'SKU123' }, quantity: 100 } }] },
+                        shipmentList: { edges: [{ node: { shipmentId: 'S1', receiveDate: '2026-01-15', quantity: 100 } }] }
+                    }
+                }]
+            },
+            purchasedIn: { edges: [] },
+            soldIn: { edges: [] },
+            stockInfo: { edges: [{ node: { unitsInStock: 50 } }] }
+        };
+
+        vi.mocked(global.fetch).mockResolvedValueOnce(
+            new Response(JSON.stringify({ data: mockData }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            })
+        );
+
+        const client = new FinaleClient();
+        const result = await client.getProductActivity('SKU123', 365);
+
+        expect(result.openPOs).toHaveLength(0);
+    });
+
+    it('skips POs without receiveDate (not yet received)', async () => {
+        const mockData = {
+            committedPOs: {
+                edges: [{
+                    node: {
+                        orderId: '124626',
+                        status: 'Committed',
+                        orderDate: '2026-01-01',
+                        itemList: { edges: [{ node: { product: { productId: 'SKU123' }, quantity: 100 } }] },
+                        shipmentList: { edges: [{ node: { shipmentId: 'S1', receiveDate: null, quantity: 0 } }] }
+                    }
+                }]
+            },
+            purchasedIn: { edges: [] },
+            soldIn: { edges: [] },
+            stockInfo: { edges: [{ node: { unitsInStock: 50 } }] }
+        };
+
+        vi.mocked(global.fetch).mockResolvedValueOnce(
+            new Response(JSON.stringify({ data: mockData }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            })
+        );
+
+        const client = new FinaleClient();
+        const result = await client.getProductActivity('SKU123', 365);
+
+        expect(result.openPOs).toHaveLength(1);
+        expect(result.openPOs[0].quantity).toBe(100);
+    });
+});

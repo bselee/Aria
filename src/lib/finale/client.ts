@@ -4344,6 +4344,9 @@ export class FinaleClient {
                         itemList(first: 20) {
                             edges { node { product { productId } quantity } }
                         }
+                        shipmentList(first: 50) {
+                            edges { node { shipmentId receiveDate quantity } }
+                        }
                     }}
                 }
                 stockInfo: productViewConnection(first: 1, productId: "${sku}") {
@@ -4393,9 +4396,15 @@ export class FinaleClient {
                 if (po.status !== 'Committed' && po.status !== 'Locked') continue;
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
+                        const originalQty = parseFinaleNumber(ie.node.quantity);
+                        const receivedQty = (po.shipmentList?.edges || [])
+                            .filter((s: any) => s.node.receiveDate)
+                            .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.node.quantity || 0), 0);
+                        const remainingQty = originalQty - receivedQty;
+                        if (remainingQty <= 0) break;
                         openPOs.push({
                             orderId: po.orderId,
-                            quantity: parseFinaleNumber(ie.node.quantity),
+                            quantity: remainingQty,
                             orderDate: po.orderDate || '',
                         });
                         break;
