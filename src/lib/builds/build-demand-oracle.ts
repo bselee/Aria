@@ -170,12 +170,44 @@ export function computeBuildDemandOracle(
 ): BuildDemandOracle {
     const vendorGroups = new Map<string, OracleVendorGroup>();
 
-    // ── Step 1: Build a BOM explosion cache for 30-day need computation ──
-    // Since report.components has totalRequiredQty but not per-FG breakdown,
-    // we need to track per-FG demand. We reconstruct from the aggregated data.
-    // 
-    // For simplicity: use componentDemand's usedIn set + earliestBuildDate as proxy.
-    // A more accurate implementation would store per-FG breakdown in build-risk.ts.
+    // ── Step 1: Derive per-FG build quantities and component qty-per-FG ratios ──
+    const fgBuildQty = new Map<string, number>();
+    for (const build of report.builds) {
+        fgBuildQty.set(build.sku, (fgBuildQty.get(build.sku) ?? 0) + build.quantity);
+    }
+
+    /**
+     * Chain FG velocity → component demand for weeks 5-12.
+     * dailyRate (units FG/day) * 7 (days/week) * (componentQtyPerFg) = units component/week.
+     * Falls back to flatBaseline when no velocity data exists for an FG.
+     */
+    const chainVelocity = (
+        comp: ComponentDemand,
+        flatBaseline: number,
+    ): { w58: number; w912: number } => {
+        let w58 = 0, w912 = 0;
+        for (const fgSku of comp.usedIn) {
+            const fgVel = report.fgVelocity.get(fgSku);
+            const totalFgQty = fgBuildQty.get(fgSku) ?? 0;
+            if (totalFgQty === 0) continue;
+            // component qty per unit of finished good (derived from BOM explosion totals)
+            const qtyPerFg = comp.totalRequiredQty / totalFgQty;
+            if (fgVel && fgVel.dailyRate > 0) {
+                // fgVel.dailyRate = units FG sold per day
+                const weeklyComponentDemand = fgVel.dailyRate * 7 * qtyPerFg;
+                w58 += weeklyComponentDemand;
+                w912 += weeklyComponentDemand;
+            } else {
+                // No velocity data — use flat baseline for this FG
+                w58 += flatBaseline;
+                w912 += flatBaseline;
+            }
+        }
+        if (comp.usedIn.size === 0 || (w58 === 0 && w912 === 0)) {
+            return { w58: flatBaseline, w912: flatBaseline };
+        }
+        return { w58, w912 };
+    };
 
     // ── Step 2: For each component, compute oracle metrics ──
     const allComponents: OracleComponent[] = [];
@@ -207,13 +239,12 @@ export function computeBuildDemandOracle(
         // Blocks FGs
         const blocksFGs = thirtyDayNeed > effectiveOnHand ? usedInArray : [];
 
-        // Weekly projections (monthly baseline × 4 for each 4-week window)
-        // Wk 1-4: use 30-day need as baseline (confirmed builds)
-        const weeklyNeedW149 = thirtyDayNeed;  // 4 weeks = 1 month baseline
-        // Wk 5-8: repeat monthly baseline (no velocity modifier yet — assume flat)
-        const weeklyNeedW158 = thirtyDayNeed;
-        // Wk 9-12: repeat monthly baseline
-        const weeklyNeedW1912 = thirtyDayNeed;
+        // Weekly projections — wk 1-4 uses confirmed build need (thirtyDayNeed)
+        // wk 5-12 chains FG sales velocity → component demand
+        const weeklyNeedW149 = thirtyDayNeed;
+        const { w58, w912 } = chainVelocity(comp, thirtyDayNeed);
+        const weeklyNeedW158 = w58;
+        const weeklyNeedW1912 = w912;
 
         // Oracle status
         const oracleStatus = computeOracleStatus(
