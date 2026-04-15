@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase";
 import { Calendar, AlertTriangle, CheckCircle2, ChevronDown, ShoppingCart, TrendingUp } from "lucide-react";
-import { computeBuildDemandOracle, isOracleEnabled, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
+import { computeBuildDemandOracle, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
 
 type Build = {
   sku: string;
@@ -439,10 +439,10 @@ export default function BuildSchedulePanel() {
       )}
 
       {/* ── Build Demand Oracle: Orders Needed Now ── */}
-      {isOracleEnabled() && <BuildDemandSection snapshot={snapshot} />}
+      <BuildDemandSection snapshot={snapshot} />
 
       {/* ── Build Demand Oracle: 12-Week Forecast ── */}
-      {isOracleEnabled() && <OracleForecastSection snapshot={snapshot} />}
+      <OracleForecastSection snapshot={snapshot} />
     </div>
   );
 }
@@ -452,11 +452,15 @@ export default function BuildSchedulePanel() {
 function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
   const [collapsed, setCollapsed] = useState(false);
 
-  const oracle = useMemo<BuildDemandOracle | null>(() => {
-    if (!snapshot) return null;
-    // Build a minimal BuildRiskReport from snapshot data
-    const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
-    return computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+  const [oracle, setOracle] = useState<BuildDemandOracle | null>(null);
+  useEffect(() => {
+    if (!snapshot) { setOracle(null); return; }
+    setOracle(null);
+    (async () => {
+      const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
+      const result = computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+      setOracle(result);
+    })();
   }, [snapshot]);
 
   if (!oracle || oracle.ordersNeededNow.length === 0) return null;
@@ -513,10 +517,15 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
 function OracleForecastSection({ snapshot }: { snapshot: Snapshot | null }) {
   const [collapsed, setCollapsed] = useState(false);
 
-  const oracle = useMemo<BuildDemandOracle | null>(() => {
-    if (!snapshot) return null;
-    const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
-    return computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+  const [oracle, setOracle] = useState<BuildDemandOracle | null>(null);
+  useEffect(() => {
+    if (!snapshot) { setOracle(null); return; }
+    setOracle(null);
+    (async () => {
+      const { builds, components, fgVelocity } = snapshotDataToReport(snapshot);
+      const result = computeBuildDemandOracle({ builds, components, fgVelocity } as any);
+      setOracle(result);
+    })();
   }, [snapshot]);
 
   if (!oracle || oracle.twelveWeekForecast.length === 0) return null;
