@@ -138,7 +138,7 @@ function computeAvgDailyConsumption(comp: ComponentDemand, thirtyDayNeed: number
  * - REORDER SOON: covers weeks 1-4 but shows gap in weeks 5-8
  * - COVERED: onHand + POs cover through week 12 at projected rate
  */
-function computeOracleStatus(
+export function computeOracleStatus(
     onHand: number | null,
     incomingPOQty: number,
     wk14Need: number,
