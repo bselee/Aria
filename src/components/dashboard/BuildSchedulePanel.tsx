@@ -510,6 +510,9 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
                             vendorPartyId: group.vendorPartyId,
+                            // componentSku from build-risk BOM explosion is the same productId
+                            // that Finale accepts in createDraftPurchaseOrder (verified across all
+                            // existing call sites: order-uline, watchdog, ap-identifier, axiom).
                             items: group.components.map(c => ({
                               productId: c.componentSku,
                               quantity: c.orderQty,

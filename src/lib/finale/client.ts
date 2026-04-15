@@ -490,14 +490,15 @@ const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
 const PARTY_CACHE_MAX = 200;
 
 // Component vendor resolution cache — SKU → { vendorName, vendorPartyId, ts }
-// 4h TTL matches LeadTimeService cache policy.
-const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
+// 4h TTL matches LeadTimeService cache policy. Moved to instance field on FinaleClient
+// (2026-04-15) to avoid leaking across test suites that create multiple instances.
 const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
 
 export class FinaleClient {
     private authHeader: string;
     private apiBase: string;
     private accountPath: string;
+    private _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
 
     constructor() {
         const apiKey = process.env.FINALE_API_KEY || "";
@@ -1240,7 +1241,7 @@ export class FinaleClient {
         // Separate cached (fresh) vs uncached/expired SKUs
         const uncachedSkus: string[] = [];
         for (const sku of skus) {
-            const cached = _vendorCache.get(sku);
+            const cached = this._vendorCache.get(sku);
             if (cached && now - cached.ts < VENDOR_CACHE_TTL) {
                 results.set(sku, { vendorName: cached.vendorName, vendorPartyId: cached.vendorPartyId });
             } else {
@@ -1254,17 +1255,17 @@ export class FinaleClient {
                     try {
                         const product = await this.lookupProduct(sku);
                         if (!product || product.suppliers.length === 0) {
-                            _vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
+                            this._vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
                             results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
                             return;
                         }
                         const main = product.suppliers.find(s => s.role === 'MAIN') ?? product.suppliers[0];
                         const partyId = main.partyUrl.split('/').pop() ?? null;
                         const vendorName = main.name || 'Unknown Vendor';
-                        _vendorCache.set(sku, { vendorName, vendorPartyId: partyId, ts: now });
+                        this._vendorCache.set(sku, { vendorName, vendorPartyId: partyId, ts: now });
                         results.set(sku, { vendorName, vendorPartyId: partyId });
                     } catch {
-                        _vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
+                        this._vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
                         results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
                     }
                 }),
