@@ -489,6 +489,11 @@ const _partyCacheShared = new Map<string, { groupName: string; isManufactured: b
 const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
 const PARTY_CACHE_MAX = 200;
 
+// Component vendor resolution cache — SKU → { vendorName, vendorPartyId, ts }
+// 4h TTL matches LeadTimeService cache policy.
+const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
+const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
 export class FinaleClient {
     private authHeader: string;
     private apiBase: string;
@@ -1221,36 +1226,50 @@ export class FinaleClient {
 
     /**
      * Batch-resolve vendor name + partyId for an array of component SKUs.
-     * Calls lookupProduct() per SKU (suppliers already resolved via parseProductDetail).
+     * Uses a 4h TTL module-level cache to avoid re-fetching vendor info on every snapshot run.
+     * Skips already-cached SKUs. Fetches missing/expired SKUs in parallel via lookupProduct().
      * Extracts MAIN supplier's partyUrl → partyId + groupName.
-     * Returns sku → { vendorName, vendorPartyId }.
      * Unresolvable SKUs produce { vendorName: 'Unknown Vendor', vendorPartyId: null }.
      */
     async lookupComponentVendorBatch(
         skus: string[],
     ): Promise<Map<string, { vendorName: string; vendorPartyId: string | null }>> {
         const results = new Map<string, { vendorName: string; vendorPartyId: string | null }>();
+        const now = Date.now();
 
-        await Promise.allSettled(
-            skus.map(async (sku) => {
-                try {
-                    const product = await this.lookupProduct(sku);
-                    if (!product || product.suppliers.length === 0) {
+        // Separate cached (fresh) vs uncached/expired SKUs
+        const uncachedSkus: string[] = [];
+        for (const sku of skus) {
+            const cached = _vendorCache.get(sku);
+            if (cached && now - cached.ts < VENDOR_CACHE_TTL) {
+                results.set(sku, { vendorName: cached.vendorName, vendorPartyId: cached.vendorPartyId });
+            } else {
+                uncachedSkus.push(sku);
+            }
+        }
+
+        if (uncachedSkus.length > 0) {
+            await Promise.allSettled(
+                uncachedSkus.map(async (sku) => {
+                    try {
+                        const product = await this.lookupProduct(sku);
+                        if (!product || product.suppliers.length === 0) {
+                            _vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
+                            results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
+                            return;
+                        }
+                        const main = product.suppliers.find(s => s.role === 'MAIN') ?? product.suppliers[0];
+                        const partyId = main.partyUrl.split('/').pop() ?? null;
+                        const vendorName = main.name || 'Unknown Vendor';
+                        _vendorCache.set(sku, { vendorName, vendorPartyId: partyId, ts: now });
+                        results.set(sku, { vendorName, vendorPartyId: partyId });
+                    } catch {
+                        _vendorCache.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null, ts: now });
                         results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
-                        return;
                     }
-                    const main = product.suppliers.find(s => s.role === 'MAIN') ?? product.suppliers[0];
-                    const partyId = main.partyUrl.split('/').pop() ?? null;
-                    const vendorName = main.name || 'Unknown Vendor';
-                    results.set(sku, {
-                        vendorName,
-                        vendorPartyId: partyId,
-                    });
-                } catch {
-                    results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
-                }
-            }),
-        );
+                }),
+            );
+        }
 
         return results;
     }
