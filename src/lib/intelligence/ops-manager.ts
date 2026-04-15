@@ -421,11 +421,6 @@ export class OpsManager {
         console.log("📦 Running Daily Build Risk Analysis...");
         try {
             const results = await runBuildRiskAnalysis();
-            const report = `📦 **Build Risk Report**\n\n${results.telegramMessage}`;
-            await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", report, { parse_mode: "Markdown" });
-            if (this.slack) {
-                await this.slack.chat.postMessage({ channel: this.slackChannel, text: results.slackMessage, mrkdwn: true });
-            }
             const { saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
             await saveBuildRiskSnapshot(results);
         } catch (err: any) {
