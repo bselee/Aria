@@ -501,6 +501,35 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
                 <span className="text-[10px] font-mono text-amber-500">
                   {group.components.reduce((s, c) => s + c.orderQty, 0).toLocaleString()} units to order
                 </span>
+                {group.vendorPartyId !== null && (
+                  <button
+                    onClick={async () => {
+                      try {
+                        const res = await fetch('/api/dashboard/purchasing', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            vendorPartyId: group.vendorPartyId,
+                            items: group.components.map(c => ({
+                              productId: c.componentSku,
+                              quantity: c.orderQty,
+                              unitPrice: 0,
+                            })),
+                            memo: `Build Demand Oracle — ${new Date().toLocaleDateString()}`,
+                          }),
+                        });
+                        const data = await res.json();
+                        if (data.error) throw new Error(data.error);
+                        window.open(data.finaleUrl, '_blank');
+                      } catch (err: any) {
+                        alert(`Failed to create PO: ${err.message}`);
+                      }
+                    }}
+                    className="text-[10px] px-2 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded border border-amber-500/30"
+                  >
+                    + PO
+                  </button>
+                )}
               </div>
               <div className="space-y-1.5">
                 {group.components.map(comp => (
