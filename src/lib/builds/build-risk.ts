@@ -39,6 +39,8 @@ export interface ComponentDemand {
     riskLevel: 'CRITICAL' | 'WARNING' | 'WATCH' | 'OK';
     earliestBuildDate: string;
     hasFinaleData: boolean;
+    vendorName: string | null;       // Primary supplier name (resolved from partygroup)
+    vendorPartyId: string | null;     // Primary supplier partyId (for PO routing)
 }
 
 export interface UnrecognizedSku {
@@ -244,6 +246,8 @@ export async function runBuildRiskAnalysis(
                         riskLevel: 'OK',
                         hasFinaleData: false,
                         earliestBuildDate: earliestDate,
+                        vendorName: null,
+                        vendorPartyId: null,
                     });
                 }
                 const demand = componentDemandTracker.get(sku)!;
@@ -279,6 +283,10 @@ export async function runBuildRiskAnalysis(
     log(`📦 Running stock verification (5x parallel)...`);
     const demandEntries = Array.from(componentDemandTracker.values());
 
+    // Batch-resolve vendor info for all component SKUs before parallel stock verification
+    const allSkus = demandEntries.map(d => d.componentSku);
+    const vendorMap = await finale.lookupComponentVendorBatch(allSkus);
+
     const tasks = demandEntries.map(demand => async () => {
         const profile = await finale.getComponentStockProfile(demand.componentSku);
         demand.onHand = profile.onHand;
@@ -291,6 +299,13 @@ export async function runBuildRiskAnalysis(
         demand.hasFinaleData = profile.hasFinaleData;
         const isCraft = Array.from(demand.usedIn).some(fg => fg.toUpperCase().startsWith('CRAFT'));
         demand.riskLevel = classifyRisk(demand, isCraft);
+
+        // Attach vendor resolution (already resolved above)
+        const resolved = vendorMap.get(demand.componentSku);
+        if (resolved) {
+            demand.vendorName = resolved.vendorName;
+            demand.vendorPartyId = resolved.vendorPartyId;
+        }
     });
 
     await runWithConcurrency(tasks, 5, (completed, total) => {

@@ -69,28 +69,16 @@ export interface BuildDemandOracle {
 }
 
 // ──────────────────────────────────────────────────
-// VENDOR RESOLUTION (placeholder — needs batch lookup)
+// VENDOR RESOLUTION
+// ComponentDemand.vendorName is populated by build-risk.ts via lookupComponentVendorBatch().
+// Oracle reads it directly — no separate cache needed.
 // ──────────────────────────────────────────────────
 
-/**
- * Gate: set to true once batch vendor lookup is wired.
- * Until then, all components show as "Unknown Vendor" — the PO routing
- * in "Orders Needed Now" won't work, so the banner is hidden.
- */
-export const ORACLE_ENABLED = false;
-
-export function isOracleEnabled(): boolean {
-    return ORACLE_ENABLED;
-}
-
-/**
- * Placeholder vendor resolver. Returns "Unknown Vendor" until we wire up a batch
- * Finale lookup to get supplier info for each component SKU.
- *
- * TODO: wire up `finale.lookupProduct(sku).supplier` batch to resolve real vendor names.
- */
-function resolveVendorName(_sku: string): { vendorName: string; vendorPartyId: string | null } {
-    return { vendorName: 'Unknown Vendor', vendorPartyId: null };
+function resolveVendorName(comp: ComponentDemand): { vendorName: string; vendorPartyId: string | null } {
+    return {
+        vendorName: comp.vendorName ?? 'Unknown Vendor',
+        vendorPartyId: comp.vendorPartyId ?? null,
+    };
 }
 
 // ──────────────────────────────────────────────────
@@ -261,7 +249,7 @@ export function computeBuildDemandOracle(
         allComponents.push(oracleComp);
 
         // Group by vendor
-        const vendor = resolveVendorName(_compSku);
+        const vendor = resolveVendorName(comp);
         if (!vendorGroups.has(vendor.vendorName)) {
             vendorGroups.set(vendor.vendorName, {
                 vendorName: vendor.vendorName,

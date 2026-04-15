@@ -1220,6 +1220,42 @@ export class FinaleClient {
     }
 
     /**
+     * Batch-resolve vendor name + partyId for an array of component SKUs.
+     * Calls lookupProduct() per SKU (suppliers already resolved via parseProductDetail).
+     * Extracts MAIN supplier's partyUrl → partyId + groupName.
+     * Returns sku → { vendorName, vendorPartyId }.
+     * Unresolvable SKUs produce { vendorName: 'Unknown Vendor', vendorPartyId: null }.
+     */
+    async lookupComponentVendorBatch(
+        skus: string[],
+    ): Promise<Map<string, { vendorName: string; vendorPartyId: string | null }>> {
+        const results = new Map<string, { vendorName: string; vendorPartyId: string | null }>();
+
+        await Promise.allSettled(
+            skus.map(async (sku) => {
+                try {
+                    const product = await this.lookupProduct(sku);
+                    if (!product || product.suppliers.length === 0) {
+                        results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
+                        return;
+                    }
+                    const main = product.suppliers.find(s => s.role === 'MAIN') ?? product.suppliers[0];
+                    const partyId = main.partyUrl.split('/').pop() ?? null;
+                    const vendorName = main.name || 'Unknown Vendor';
+                    results.set(sku, {
+                        vendorName,
+                        vendorPartyId: partyId,
+                    });
+                } catch {
+                    results.set(sku, { vendorName: 'Unknown Vendor', vendorPartyId: null });
+                }
+            }),
+        );
+
+        return results;
+    }
+
+    /**
      * Validate that a product SKU exists in Finale.
      * Tries direct REST endpoint first (fast), falls back to scanning the
      * full product list if the direct endpoint returns 404.
