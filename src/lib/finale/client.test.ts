@@ -361,3 +361,104 @@ describe("FinaleClient receivings pagination", () => {
         expect(graphqlBodies[1]).toContain('after: "cursor-1"');
     });
 });
+
+describe("findCommittedPOsForProduct remainingQty", () => {
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    it("excludes fully-received POs", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                orderViewConnection: {
+                    edges: [{
+                        node: {
+                            orderId: "PO-FULL",
+                            status: "Committed",
+                            orderDate: "2026-01-15",
+                            total: "500",
+                            supplier: { name: "Test Vendor" },
+                            itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
+                            shipmentList: {
+                                edges: [{
+                                    node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "100" }
+                                }]
+                            },
+                        },
+                    }],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const pos = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(pos).toHaveLength(0);
+    });
+
+    it("includes POs with remaining quantity", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                orderViewConnection: {
+                    edges: [{
+                        node: {
+                            orderId: "PO-PARTIAL",
+                            status: "Committed",
+                            orderDate: "2026-01-15",
+                            total: "500",
+                            supplier: { name: "Test Vendor" },
+                            itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
+                            shipmentList: {
+                                edges: [{
+                                    node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" }
+                                }]
+                            },
+                        },
+                    }],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const pos = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(pos).toHaveLength(1);
+        expect(pos[0]?.orderId).toBe("PO-PARTIAL");
+        expect(pos[0]?.quantityOnOrder).toBe(60);
+    });
+
+    it("skips POs with no receiveDate on shipments", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                orderViewConnection: {
+                    edges: [{
+                        node: {
+                            orderId: "PO-UNRECEIVED",
+                            status: "Committed",
+                            orderDate: "2026-01-15",
+                            total: "500",
+                            supplier: { name: "Test Vendor" },
+                            itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
+                            shipmentList: {
+                                edges: [{
+                                    node: { shipmentId: "sh-1", receiveDate: null, quantity: "0" }
+                                }]
+                            },
+                        },
+                    }],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const pos = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(pos).toHaveLength(1);
+        expect(pos[0]?.quantityOnOrder).toBe(100);
+    });
+});
