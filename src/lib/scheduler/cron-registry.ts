@@ -8,7 +8,6 @@
 
 export type CronCategory =
     | 'email'
-    | 'tracking'
     | 'purchasing'
     | 'reporting'
     | 'reconciliation'
@@ -224,7 +223,6 @@ export function getCategorySummary(): Record<CronCategory, number> {
 
 const CATEGORY_EMOJI: Record<CronCategory, string> = {
     email: 'EMAIL',
-    tracking: 'TRACKING',
     purchasing: 'PURCHASING',
     reporting: 'REPORTING',
     reconciliation: 'RECONCILIATION',

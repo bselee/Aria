@@ -15,7 +15,6 @@
  */
 
 import { createClient } from "../supabase";
-import { remember } from "./memory";
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -119,12 +118,6 @@ export async function recordFeedback(event: FeedbackEvent): Promise<void> {
     }
 }
 
-// ──────────────────────────────────────────────────
-// ACCURACY ANALYSIS
-// ──────────────────────────────────────────────────
-
-// ──────────────────────────────────────────────────
-// VENDOR RELIABILITY SCORING
 // ──────────────────────────────────────────────────
 // VENDOR RELIABILITY SCORING
 // ──────────────────────────────────────────────────
@@ -243,124 +236,6 @@ export async function getVendorReliability(
     } catch (err: any) {
         console.error(`❌ [Kaizen] getVendorReliability error: ${err.message}`);
         return null;
-    }
-}
-
-// ──────────────────────────────────────────────────
-// MEMORY SYNC — Push validated learnings to Pinecone
-// ──────────────────────────────────────────────────
-
-/**
- * Sync unsynced feedback events to Pinecone memory.
- * Only syncs events that have a clear learning signal:
- * - Corrections (accuracy_score = 0 or 1)
- * - High-confidence predictions
- * - Vendor reliability changes
- *
- * Batch processes up to 20 events per call to avoid overloading embeddings API.
- */
-export async function syncLearningsToMemory(): Promise<number> {
-    const db = createClient();
-    if (!db) return 0;
-
-    try {
-        const { data: events, error } = await db
-            .from("feedback_events")
-            .select("*")
-            .eq("synced_to_memory", false)
-            .not("accuracy_score", "is", null)
-            .order("created_at", { ascending: true })
-            .limit(20);
-
-        if (error) throw error;
-        if (!events || events.length === 0) return 0;
-
-        let synced = 0;
-
-        for (const event of events) {
-            const learning = buildLearningStatement(event);
-            if (!learning) continue;
-
-            try {
-                await remember({
-                    category: "decision",
-                    content: learning,
-                    relatedTo: event.subject_id || event.agent_source,
-                    source: "KaizenLoop",
-                    tags: ["kaizen", event.category, event.event_type],
-                    priority: event.accuracy_score !== null && event.accuracy_score < 0.5 ? "high" : "normal",
-                });
-
-                await db
-                    .from("feedback_events")
-                    .update({ synced_to_memory: true })
-                    .eq("id", event.id);
-
-                synced++;
-            } catch (memErr: any) {
-                console.warn(`⚠️ [Kaizen] Memory sync failed for event ${event.id}: ${memErr.message}`);
-            }
-        }
-
-        if (synced > 0) {
-            console.log(`🧠 [Kaizen] Synced ${synced} learnings to Pinecone memory`);
-        }
-
-        return synced;
-    } catch (err: any) {
-        console.error(`❌ [Kaizen] syncLearningsToMemory error: ${err.message}`);
-        return 0;
-    }
-}
-
-/**
- * Convert a feedback event into a natural language learning statement
- * suitable for vector memory storage.
- */
-function buildLearningStatement(event: any): string | null {
-    const score = event.accuracy_score;
-    const type = event.event_type;
-    const subject = event.subject_id || "unknown";
-
-    switch (event.category) {
-        case "correction":
-            if (event.user_action === "rejected") {
-                return `LEARNED: For ${subject}, Aria's ${type} was rejected by Will. ` +
-                    `Original prediction: ${JSON.stringify(event.prediction)}. ` +
-                    `Correct action: ${JSON.stringify(event.actual_outcome)}. ` +
-                    `Avoid this mistake pattern in the future.`;
-            }
-            if (event.user_action === "approved") {
-                return `CONFIRMED: For ${subject}, Aria's ${type} was approved. ` +
-                    `Prediction was correct: ${JSON.stringify(event.prediction)}.`;
-            }
-            return null;
-
-        case "prediction":
-            if (score !== null && score < 0.5) {
-                return `INACCURATE PREDICTION: ${type} for ${subject} scored ${score}. ` +
-                    `Predicted: ${JSON.stringify(event.prediction)}. ` +
-                    `Actual: ${JSON.stringify(event.actual_outcome)}. ` +
-                    `Need to recalibrate this prediction type.`;
-            }
-            if (score !== null && score >= 0.9) {
-                return `ACCURATE PREDICTION: ${type} for ${subject} scored ${score}. ` +
-                    `Prediction model is working well for this pattern.`;
-            }
-            return null;
-
-        case "vendor_reliability":
-            return `VENDOR UPDATE: ${subject} — ${type}. ` +
-                `Score: ${score !== null ? Math.round(score * 100) : "N/A"}%. ` +
-                `Details: ${JSON.stringify(event.actual_outcome)}.`;
-
-        case "error_pattern":
-            return `ERROR PATTERN: Agent ${event.agent_source} had ${type}. ` +
-                `Resolution: ${event.user_action || "auto"}. ` +
-                `Context: ${JSON.stringify(event.context_data)}.`;
-
-        default:
-            return null;
     }
 }
 
