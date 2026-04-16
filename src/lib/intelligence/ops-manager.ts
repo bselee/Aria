@@ -2,7 +2,7 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import { getLocalDb } from "../storage/local-db";
-import cron from "node-cron";
+import cron, { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
@@ -86,6 +86,7 @@ export const cronLastRun = getAllCronRunStatuses();
 
 export class OpsManager {
     private bot: Telegraf;
+    private scheduledTasks: ScheduledTask[] = [];
     private slack: WebClient | null;
     private slackChannel: string;
     private apIdentifier: APIdentifierAgent;
@@ -265,12 +266,24 @@ export class OpsManager {
         highConfTracking: any[] | undefined,
         poLifecycleData: any
     ): Promise<string> {
-        let desc = `<b>PO #${po.orderId}</b>\n`;
-        desc += `Vendor: ${po.vendorName}\n`;
-        desc += `Status: ${po.status}\n`;
-        desc += `Total: $${po.total?.toFixed(2) || '0.00'}\n\n`;
+        const accountPath = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
+        const rawOrderUrl = po.orderUrl || `/${accountPath}/api/order/${po.orderId}`;
+        const encodedUrl = Buffer.from(rawOrderUrl).toString("base64");
+        const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
 
-        desc += `<b>Timeline:</b>\n`;
+        let desc = `<b><a href="${finaleUrl}">PO #${po.orderId}</a></b>\n`;
+        desc += `Vendor: ${po.vendorName}\n`;
+
+        if (po.items && po.items.length > 0) {
+            desc += `\n<b>Items:</b>\n`;
+            for (const item of po.items) {
+                desc += `- ${item.productId}: ${item.quantity}\n`;
+            }
+        }
+
+        desc += `\nStatus: ${po.status}\n`;
+
+        desc += `\n<b>Timeline:</b>\n`;
         desc += `Order Date: ${po.orderDate}\n`;
         desc += `Expected: ${expectedDate} (${leadProvenance})\n`;
         if (latestETA) desc += `Live ETA: ${new Date(latestETA).toLocaleDateString()}\n`;
@@ -288,13 +301,6 @@ export class OpsManager {
             }
         }
 
-        if (po.items && po.items.length > 0) {
-            desc += `\n<b>Items:</b>\n`;
-            for (const item of po.items) {
-                desc += `- ${item.productId}: ${item.quantity}\n`;
-            }
-        }
-
         if (po.notes) desc += `\n<b>Internal Notes:</b>\n${po.notes}\n`;
 
         return desc;
@@ -305,93 +311,100 @@ export class OpsManager {
      */
     registerJobs() {
         const TZ = { timezone: "America/Denver" };
+        this.scheduledTasks = [];
+
+        const schedule = (expression: string, task: () => void) => {
+            const scheduledTask = cron.schedule(expression, task, TZ);
+            this.scheduledTasks.push(scheduledTask);
+            return scheduledTask;
+        };
 
         // AP polling every 15 minutes
-        cron.schedule("*/15 * * * *", () => {
+        schedule("*/15 * * * *", () => {
             this.safeRun("APPolling", () => this.pollAPInbox());
-        }, TZ);
+        });
 
         // Build risk analysis at 7:30 AM weekdays
-        cron.schedule("30 7 * * 1-5", () => {
+        schedule("30 7 * * 1-5", () => {
             this.safeRun("BuildRisk", () => this.runDailyBuildRisk());
-        }, TZ);
+        });
 
-        // Daily summary at 8:00 AM
-        cron.schedule("0 8 * * *", () => {
+        // Daily summary at 8:00 AM weekdays (Mon-Fri only)
+        schedule("0 8 * * 1-5", () => {
             this.safeRun("DailySummary", () => this.sendDailySummary());
-        }, TZ);
+        });
 
         // Weekly summary at 8:01 AM Fridays
-        cron.schedule("1 8 * * 5", () => {
+        schedule("1 8 * * 5", () => {
             this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
-        }, TZ);
+        });
 
         // Nightshift enqueue at 6:00 PM weekdays
-        cron.schedule("0 18 * * 1-5", () => {
+        schedule("0 18 * * 1-5", () => {
             this.safeRun("NightshiftEnqueue", () => this.enqueueNightshiftWork());
-        }, TZ);
+        });
 
         // Housekeeping at 9:00 PM
-        cron.schedule("0 21 * * *", () => {
+        schedule("0 21 * * *", () => {
             this.safeRun("Housekeeping", () => runHousekeeping());
-        }, TZ);
+        });
 
         // Dashboard stat indexing every hour
-        cron.schedule("5 * * * *", () => {
+        schedule("5 * * * *", () => {
             this.safeRun("StatIndexing", () => this.indexOperationsContext());
-        }, TZ);
+        });
 
         // Slack Tracking ETA Sync every 2 hours
-        cron.schedule("0 */2 * * *", () => {
+        schedule("0 */2 * * *", () => {
             this.safeRun("SlackETASync", () => this.pollSlackETAUpdates());
-        }, TZ);
+        });
 
         // PO Sync every 30 minutes
-        cron.schedule("*/30 * * * *", () => {
+        schedule("*/30 * * * *", () => {
             this.safeRun("POSync", () => this.syncPOConversations());
-        }, TZ);
+        });
 
         // PO-First AP Sweep every 4 hours
-        cron.schedule("30 */4 * * *", () => {
+        schedule("30 */4 * * *", () => {
             this.safeRun("POSweep", () => runPOSweep(60, false));
-        }, TZ);
+        });
 
         // VENDOR RECONCILIATIONS
-        cron.schedule("0 1 * * 1-5", () => {
+        schedule("0 1 * * 1-5", () => {
             this.safeRun("ReconcileAxiom", () => this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts"));
-        }, TZ);
+        });
 
-        cron.schedule("30 1 * * 1-5", () => {
+        schedule("30 1 * * 1-5", () => {
             this.safeRun("ReconcileFedEx", () => this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts"));
-        }, TZ);
+        });
 
-        cron.schedule("0 2 * * 1-5", () => {
+        schedule("0 2 * * 1-5", () => {
             this.safeRun("ReconcileTeraGanix", () => this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts"));
-        }, TZ);
+        });
 
-        cron.schedule("0 3 * * 1-5", () => {
+        schedule("0 3 * * 1-5", () => {
             this.safeRun("ReconcileULINE", () => this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts"));
-        }, TZ);
+        });
 
         // ULINE Order Confirmation Sync every 15 minutes
-        cron.schedule("*/15 * * * *", () => {
+        schedule("*/15 * * * *", () => {
             this.safeRun("UlineConfirmationSync", () => this.runUlineConfirmationSync());
-        }, TZ);
+        });
 
         // Build Completion Watcher every 30 minutes
-        cron.schedule("*/30 * * * *", () => {
+        schedule("*/30 * * * *", () => {
             this.safeRun("BuildCompletionWatcher", () => this.pollBuildCompletions());
-        }, TZ);
+        });
 
         // PO Receiving Watcher every 30 minutes
-        cron.schedule("*/30 * * * *", () => {
+        schedule("*/30 * * * *", () => {
             this.safeRun("POReceivingWatcher", () => this.pollPOReceivings());
-        }, TZ);
+        });
 
         // Purchasing Calendar Sync every 4 hours
-        cron.schedule("0 */4 * * *", () => {
+        schedule("0 */4 * * *", () => {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
-        }, TZ);
+        });
 
         console.log("✅ OpsManager background jobs registered.");
     }
@@ -421,11 +434,6 @@ export class OpsManager {
         console.log("📦 Running Daily Build Risk Analysis...");
         try {
             const results = await runBuildRiskAnalysis();
-            const report = `📦 **Build Risk Report**\n\n${results.telegramMessage}`;
-            await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", report, { parse_mode: "Markdown" });
-            if (this.slack) {
-                await this.slack.chat.postMessage({ channel: this.slackChannel, text: results.slackMessage, mrkdwn: true });
-            }
             const { saveBuildRiskSnapshot } = await import('../builds/build-risk-logger');
             await saveBuildRiskSnapshot(results);
         } catch (err: any) {
@@ -573,21 +581,7 @@ export class OpsManager {
                     }
                 }
 
-                // Notify Will via Telegram
-                const completedAt = new Date(build.completedAt);
-                const dateStr = completedAt.toLocaleDateString('en-US', {
-                    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Denver',
-                });
-                const timeStr = completedAt.toLocaleTimeString('en-US', {
-                    hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver',
-                });
-                const msg =
-                    `🏭 **Build Completed**\n\n` +
-                    `SKU: *${build.sku}*\n` +
-                    `Qty: *${build.quantity}*\n` +
-                    `Completed: ${dateStr} at ${timeStr}\n` +
-                    `Build #: ${build.buildId}`;
-                await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
+                // Build completion logged to database only — Telegram notifications disabled
             }
 
             console.log(`🔨 Build completion check done — ${notified} new, ${completed.length} total in window.`);
@@ -783,14 +777,31 @@ export class OpsManager {
 
     /**
      * Send daily summary report to Telegram.
+     * Schedule: Mon-Fri only (no weekends).
+     * - Monday: light, meaningful review of previous week
+     * - Tuesday-Thursday: standard daily ops summary
+     * - Friday: weekly wrap-up summary (WeeklySummary fires 1 min later for detailed version)
      */
     async sendDailySummary() {
-        console.log("📊 Preparing Daily PO Summary...");
-        // LLM generation logic...
+        const dow = new Date().toLocaleString('en-US', { weekday: 'long', timeZone: 'America/Denver' });
+        const isMonday = dow === 'Monday';
+        const isFriday = dow === 'Friday';
+
+        if (isMonday) {
+            console.log("📊 Preparing Monday Previous-Week Review...");
+            // Monday: light review of last week — key outcomes, open items carried forward
+        } else if (isFriday) {
+            console.log("📊 Preparing Friday Weekly Wrap...");
+            // Friday: summarize the week's activity, flag anything unresolved heading into weekend
+        } else {
+            console.log("📊 Preparing Daily PO Summary...");
+            // Tue-Thu: standard operational summary
+        }
     }
 
     /**
-     * Send weekly summary report to Telegram.
+     * Send weekly summary report to Telegram (8:01 AM Fridays).
+     * Detailed trend analysis — complements the Friday daily summary.
      */
     async sendWeeklySummary() {
         console.log("📊 Preparing Weekly Summary...");
