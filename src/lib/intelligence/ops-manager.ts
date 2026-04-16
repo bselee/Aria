@@ -16,13 +16,11 @@ import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
-import { processQueuedStatementRun } from "../statements/service";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
 import { FinaleClient, finaleClient } from "../finale/client";
-import FirecrawlApp from "@mendable/firecrawl-js";
-import { generateSelfReview, syncLearningsToMemory, runHousekeeping } from "./feedback-loop";
+import { runHousekeeping } from "./feedback-loop";
 import {
     TRACKING_PATTERNS,
     getTrackingStatus,
@@ -33,8 +31,6 @@ import {
     type TrackingStatus,
     type TrackingCategory,
 } from '../carriers/tracking-service';
-import { scanAxiomDemand } from "../purchasing/axiom-scanner";
-import { parseUlineConfirmationEmail, type UlineOrderConfirmation } from "../purchasing/uline-confirmation";
 import {
     RECEIVED_CALENDAR_RETENTION_DAYS,
     RECEIVED_DASHBOARD_RETENTION_DAYS,
@@ -51,7 +47,7 @@ import { syncRecommendationFeedbackForPurchaseOrders } from "../purchasing/recom
 import { withAdvisoryLock } from "../purchasing/advisory-lock";
 import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp, getVendorThankYou, getVendorClarifyRequest } from "../purchasing/derive-po-lifecycle";
 import { VendorCommsAgent } from "./vendor-comms-agent";
-import { enqueueEmailClassification, generateMorningHandoff } from "./nightshift-agent";
+import { enqueueEmailClassification } from "./nightshift-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
 import {
@@ -354,11 +350,6 @@ export class OpsManager {
             this.safeRun("StatIndexing", () => this.indexOperationsContext());
         });
 
-        // Slack Tracking ETA Sync every 2 hours
-        schedule("0 */2 * * *", () => {
-            this.safeRun("SlackETASync", () => this.pollSlackETAUpdates());
-        });
-
         // PO Sync every 30 minutes
         schedule("*/30 * * * *", () => {
             this.safeRun("POSync", () => this.syncPOConversations());
@@ -384,11 +375,6 @@ export class OpsManager {
 
         schedule("0 3 * * 1-5", () => {
             this.safeRun("ReconcileULINE", () => this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts"));
-        });
-
-        // ULINE Order Confirmation Sync every 15 minutes
-        schedule("*/15 * * * *", () => {
-            this.safeRun("UlineConfirmationSync", () => this.runUlineConfirmationSync());
         });
 
         // Build Completion Watcher every 30 minutes
@@ -477,14 +463,6 @@ export class OpsManager {
         } catch (err: any) {
             console.error(`${vendorName} reconciliation failed:`, err.message);
         }
-    }
-
-    /**
-     * Sync ULINE order confirmations from Gmail.
-     */
-    async runUlineConfirmationSync() {
-        console.log("🔄 Syncing ULINE order confirmations...");
-        // Placeholder for the actual sync logic
     }
 
     /**
@@ -769,13 +747,6 @@ export class OpsManager {
     }
 
     /**
-     * Refresh a single PO calendar event.
-     */
-    async refreshCalendarForPO(poNumber: string) {
-        // Implementation logic...
-    }
-
-    /**
      * Send daily summary report to Telegram.
      * Schedule: Mon-Fri only (no weekends).
      * - Monday: light, meaningful review of previous week
@@ -783,19 +754,17 @@ export class OpsManager {
      * - Friday: weekly wrap-up summary (WeeklySummary fires 1 min later for detailed version)
      */
     async sendDailySummary() {
+        // STUB: Daily summary not yet implemented
         const dow = new Date().toLocaleString('en-US', { weekday: 'long', timeZone: 'America/Denver' });
         const isMonday = dow === 'Monday';
         const isFriday = dow === 'Friday';
 
         if (isMonday) {
-            console.log("📊 Preparing Monday Previous-Week Review...");
-            // Monday: light review of last week — key outcomes, open items carried forward
+            console.log("📊 [STUB] Preparing Monday Previous-Week Review...");
         } else if (isFriday) {
-            console.log("📊 Preparing Friday Weekly Wrap...");
-            // Friday: summarize the week's activity, flag anything unresolved heading into weekend
+            console.log("📊 [STUB] Preparing Friday Weekly Wrap...");
         } else {
-            console.log("📊 Preparing Daily PO Summary...");
-            // Tue-Thu: standard operational summary
+            console.log("📊 [STUB] Preparing Daily PO Summary...");
         }
     }
 
@@ -804,7 +773,8 @@ export class OpsManager {
      * Detailed trend analysis — complements the Friday daily summary.
      */
     async sendWeeklySummary() {
-        console.log("📊 Preparing Weekly Summary...");
+        // STUB: Weekly summary not yet implemented
+        console.log("📊 [STUB] Preparing Weekly Summary...");
     }
 
     /**
@@ -913,13 +883,6 @@ export class OpsManager {
         } catch (err: any) {
             console.error("PO Sync error:", err.message);
         }
-    }
-
-    /**
-     * Poll live ETA updates and push to Slack.
-     */
-    private async pollSlackETAUpdates() {
-        console.log("🚚 Checking Slack ETA updates...");
     }
 }
 

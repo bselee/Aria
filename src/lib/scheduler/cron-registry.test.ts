@@ -19,7 +19,7 @@ import {
 
 describe('CRON_JOBS definitions', () => {
     it('contains the full current runtime schedule', () => {
-        expect(CRON_JOBS.length).toBe(18);
+        expect(CRON_JOBS.length).toBe(16);
     });
 
     it('has unique job names', () => {
@@ -55,14 +55,12 @@ describe('CRON_JOBS definitions', () => {
             'NightshiftEnqueue',
             'Housekeeping',
             'StatIndexing',
-            'SlackETASync',
             'POSync',
             'POSweep',
             'ReconcileAxiom',
             'ReconcileFedEx',
             'ReconcileTeraGanix',
             'ReconcileULINE',
-            'UlineConfirmationSync',
             'BuildCompletionWatcher',
             'POReceivingWatcher',
             'PurchasingCalendarSync',
@@ -153,7 +151,7 @@ describe('formatting', () => {
     });
 
     it('shows error status for failed runs', () => {
-        recordCronRun('SlackETASync', 999, 'error', 'API timeout');
+        recordCronRun('NightshiftEnqueue', 999, 'error', 'API timeout');
         const report = formatCronStatusReport();
         expect(report).toContain('❌');
         expect(report).toContain('API timeout');
