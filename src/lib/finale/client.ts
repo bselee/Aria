@@ -496,10 +496,13 @@ const PARTY_CACHE_MAX = 200;
 const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
 const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
 
+type ReceiptRemainingByProduct = Map<string, number>;
+
 export class FinaleClient {
     private authHeader: string;
     private apiBase: string;
     private accountPath: string;
+    private poReceiptRemainingCache = new Map<string, ReceiptRemainingByProduct>();
 
     constructor() {
         const apiKey = process.env.FINALE_API_KEY || "";
@@ -654,15 +657,44 @@ export class FinaleClient {
      */
     async getCaseMultiplier(supabase: any, sku: string, vendorName: string): Promise<number> {
         if (!supabase) return 1;
-        const vendorLower = vendorName.toLowerCase();
+
+        const normalizedVendor = vendorName.trim().toLowerCase();
+        const vendorTokens = Array.from(
+            new Set(
+                normalizedVendor
+                    .split(/\s+/)
+                    .map(token => token.trim())
+                    .filter(Boolean),
+            ),
+        );
+        const normalizedSku = sku.trim().toUpperCase();
         const { data } = await supabase
             .from('vendor_case_multipliers')
-            .select('multiplier')
-            .or(`vendor_pattern.ilike.%${vendorLower}%,vendor_pattern.ilike.%${vendorLower.split(' ')[0]}%`)
-            .or(`sku_pattern.eq.${sku},sku_pattern.is.null`)
-            .order('sku_pattern', { ascending: false })
-            .limit(1);
-        if (data?.length) return Number(data[0].multiplier) || 1;
+            .select('vendor_pattern, sku_pattern, multiplier');
+        if (!Array.isArray(data) || data.length === 0) return 1;
+
+        // This is a tiny reference table, so client-side precedence is safer than
+        // relying on raw PostgREST OR strings and NULL ordering quirks.
+        const matches = data.filter((row: { vendor_pattern?: string | null; sku_pattern?: string | null }) => {
+            const vendorPattern = String(row.vendor_pattern || '').trim().toLowerCase();
+            if (!vendorPattern) return false;
+            const vendorMatches =
+                vendorPattern === normalizedVendor ||
+                normalizedVendor.includes(vendorPattern) ||
+                vendorTokens.includes(vendorPattern);
+            if (!vendorMatches) return false;
+
+            const rowSku = row.sku_pattern ? String(row.sku_pattern).trim().toUpperCase() : null;
+            return rowSku === null || rowSku === normalizedSku;
+        });
+
+        const exactMatch = matches.find((row: { sku_pattern?: string | null }) =>
+            row.sku_pattern != null && String(row.sku_pattern).trim().toUpperCase() === normalizedSku,
+        );
+        if (exactMatch) return Number(exactMatch.multiplier) || 1;
+
+        const wildcardMatch = matches.find((row: { sku_pattern?: string | null }) => row.sku_pattern == null);
+        if (wildcardMatch) return Number(wildcardMatch.multiplier) || 1;
         return 1;
     }
 
@@ -1392,20 +1424,12 @@ export class FinaleClient {
             const data = await this.graphql(query, `PO Lookup ${productId}`);
             const relevantStatuses = new Set(["Committed", "Locked"]);
             const edges = data?.orderViewConnection?.edges || [];
-            return edges
+            const mapped = edges
                 .filter((edge: any) => relevantStatuses.has(edge.node.status))
-                .map((edge: any) => {
+                .map(async (edge: any) => {
                     const po = edge.node;
-                    const items = po.itemList?.edges || [];
-                    const matchingItem = items.find(
-                        (item: any) => item.node.product?.productId === productId
-                    );
-                    const originalQty = parseFinaleNumber(matchingItem?.node.quantity) || 0;
-                    const receivedQty = (po.shipmentList?.edges || [])
-                        .filter((s: any) => s.node.receiveDate)
-                        .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.node.quantity || 0), 0);
-                    const remainingQty = originalQty - receivedQty;
-                    if (remainingQty <= 0) return null;
+                    const remainingQty = await this.getRemainingQtyForProductOnPO(po, productId);
+                    if (remainingQty == null || remainingQty <= 0) return null;
                     return {
                         orderId: po.orderId,
                         status: po.status,
@@ -1414,8 +1438,9 @@ export class FinaleClient {
                         quantityOnOrder: remainingQty,
                         total: po.total || 0,
                     };
-                })
-                .filter(Boolean) as POInfo[];
+                });
+            const resolved = await Promise.all(mapped);
+            return resolved.filter(Boolean) as POInfo[];
         } catch (err: any) {
             console.error("PO lookup error:", err.message);
             return [];
@@ -2637,6 +2662,124 @@ export class FinaleClient {
         }
 
         return result.data as T;
+    }
+
+    private getSummaryLineQuantity(
+        poNode: any,
+        productId: string,
+    ): { originalQty: number; productLineCount: number; hasReceivedShipments: boolean; receivedQty: number } {
+        const itemEdges = poNode?.itemList?.edges || [];
+        const productEdges = itemEdges.filter((edge: any) => edge?.node?.product?.productId);
+        const originalQty = productEdges
+            .filter((edge: any) => edge.node.product?.productId === productId)
+            .reduce((sum: number, edge: any) => sum + (parseFinaleNumber(edge.node.quantity) || 0), 0);
+        const shipmentEdges = (poNode?.shipmentList?.edges || []).filter((edge: any) => edge?.node?.receiveDate);
+        const receivedQty = shipmentEdges.reduce(
+            (sum: number, edge: any) => sum + (parseFinaleNumber(edge?.node?.quantity) || 0),
+            0,
+        );
+        return {
+            originalQty,
+            productLineCount: productEdges.length,
+            hasReceivedShipments: shipmentEdges.length > 0,
+            receivedQty,
+        };
+    }
+
+    private extractOrderLineId(item: any): string | null {
+        const raw = item?.id ?? item?.lineId ?? item?.orderItemId ?? item?.orderLineId ?? null;
+        const normalized = raw == null ? "" : String(raw).trim();
+        return normalized || null;
+    }
+
+    private extractReceivingEventLineId(event: any): string | null {
+        const raw = event?.lineId ?? event?.poLineId ?? event?.orderItemId ?? event?.orderLineId ?? null;
+        const normalized = raw == null ? "" : String(raw).trim();
+        return normalized || null;
+    }
+
+    private buildOriginalQtyByProduct(items: any[]): ReceiptRemainingByProduct {
+        const originalByProduct: ReceiptRemainingByProduct = new Map();
+        for (const item of items) {
+            const productId = this.normalizeOrderLineProductId(item);
+            if (!productId) continue;
+            const qty = parseFinaleNumber(item?.quantity) || 0;
+            originalByProduct.set(productId, (originalByProduct.get(productId) || 0) + qty);
+        }
+        return originalByProduct;
+    }
+
+    private async getReceivingEventsForOrder(orderId: string): Promise<any[]> {
+        try {
+            const data = await this.get(`/${this.accountPath}/api/receiving?orderId=${encodeURIComponent(orderId)}`);
+            return Array.isArray(data) ? data : [];
+        } catch (err: any) {
+            console.warn(`[finale] receiving log unavailable for PO ${orderId}: ${err.message}`);
+            return [];
+        }
+    }
+
+    private async getRemainingQtyByProductForOrder(orderId: string): Promise<ReceiptRemainingByProduct> {
+        const cached = this.poReceiptRemainingCache.get(orderId);
+        if (cached) return cached;
+
+        const poDetails = await this.getOrderDetails(orderId);
+        const orderItems = (poDetails?.orderItemList || []).filter((item: any) => {
+            const productId = this.normalizeOrderLineProductId(item);
+            return !!productId && (parseFinaleNumber(item?.quantity) || 0) > 0;
+        });
+
+        const originalByProduct = this.buildOriginalQtyByProduct(orderItems);
+        if (orderItems.length === 0) {
+            this.poReceiptRemainingCache.set(orderId, originalByProduct);
+            return originalByProduct;
+        }
+
+        const lineMeta = orderItems
+            .map((item: any) => ({
+                lineId: this.extractOrderLineId(item),
+                productId: this.normalizeOrderLineProductId(item),
+                orderedQty: parseFinaleNumber(item?.quantity) || 0,
+            }))
+            .filter((item: { lineId: string | null; productId: string; orderedQty: number }) => item.productId);
+
+        if (lineMeta.some((item: { lineId: string | null }) => !item.lineId)) {
+            console.warn(`[finale] PO ${orderId} has multi-line items without stable line ids; using ordered qty fallback`);
+            this.poReceiptRemainingCache.set(orderId, originalByProduct);
+            return originalByProduct;
+        }
+
+        const receivedByLine = new Map<string, number>();
+        const receivingEvents = await this.getReceivingEventsForOrder(orderId);
+        for (const event of receivingEvents) {
+            const lineId = this.extractReceivingEventLineId(event);
+            if (!lineId) continue;
+            const qty = parseFinaleNumber(event?.qty ?? event?.quantity ?? event?.receivedQuantity) || 0;
+            receivedByLine.set(lineId, (receivedByLine.get(lineId) || 0) + qty);
+        }
+
+        const remainingByProduct: ReceiptRemainingByProduct = new Map();
+        for (const item of lineMeta) {
+            const receivedQty = receivedByLine.get(item.lineId!) || 0;
+            const remainingQty = Math.max(0, item.orderedQty - receivedQty);
+            remainingByProduct.set(item.productId, (remainingByProduct.get(item.productId) || 0) + remainingQty);
+        }
+
+        this.poReceiptRemainingCache.set(orderId, remainingByProduct);
+        return remainingByProduct;
+    }
+
+    private async getRemainingQtyForProductOnPO(poNode: any, productId: string): Promise<number | null> {
+        const { originalQty, productLineCount, hasReceivedShipments, receivedQty } = this.getSummaryLineQuantity(poNode, productId);
+        if (originalQty <= 0) return null;
+        if (!hasReceivedShipments) return originalQty;
+        if (productLineCount <= 1) return Math.max(0, originalQty - receivedQty);
+
+        const remainingByProduct = await this.getRemainingQtyByProductForOrder(poNode.orderId);
+        if (remainingByProduct.has(productId)) {
+            return remainingByProduct.get(productId) || 0;
+        }
+        return originalQty;
     }
 
     // ──────────────────────────────────────────────────
@@ -4410,22 +4553,13 @@ export class FinaleClient {
             for (const edge of data?.committedPOs?.edges || []) {
                 const po = edge.node;
                 if (po.status !== 'Committed' && po.status !== 'Locked') continue;
-                for (const ie of po.itemList?.edges || []) {
-                    if (ie.node.product?.productId === sku) {
-                        const originalQty = parseFinaleNumber(ie.node.quantity);
-                        const receivedQty = (po.shipmentList?.edges || [])
-                            .filter((s: any) => s.node.receiveDate)
-                            .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.node.quantity || 0), 0);
-                        const remainingQty = originalQty - receivedQty;
-                        if (remainingQty <= 0) break;
-                        openPOs.push({
-                            orderId: po.orderId,
-                            quantity: remainingQty,
-                            orderDate: po.orderDate || '',
-                        });
-                        break;
-                    }
-                }
+                const remainingQty = await this.getRemainingQtyForProductOnPO(po, sku);
+                if (remainingQty == null || remainingQty <= 0) continue;
+                openPOs.push({
+                    orderId: po.orderId,
+                    quantity: remainingQty,
+                    orderDate: po.orderDate || '',
+                });
             }
 
                 const stockNode = data?.stockInfo?.edges?.[0]?.node;

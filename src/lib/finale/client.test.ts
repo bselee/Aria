@@ -365,18 +365,9 @@ describe("FinaleClient receivings pagination", () => {
 function createMockSupabase(rows: Array<{ vendor_pattern: string; sku_pattern: string | null; multiplier: number }>) {
     return {
         from: (_table: string) => ({
-            select: (_columns: string) => ({
-                or: (_vendorFilter: string) => ({
-                    or: (_skuFilter: string) => ({
-                        order: (_field: string, _options?: object) => ({
-                            limit: (_n: number) => ({
-                                then: (resolve: (value: unknown) => void) => {
-                                    resolve({ data: rows, error: null });
-                                },
-                            }),
-                        }),
-                    }),
-                }),
+            select: async (_columns: string) => ({
+                data: rows,
+                error: null,
             }),
         }),
     };
@@ -421,6 +412,16 @@ describe('getCaseMultiplier', () => {
         const client = new FinaleClient();
         const result = await client.getCaseMultiplier(supabase, 'ANYSKU', 'Teraganix');
         expect(result).toBe(4);
+    });
+
+    it('prefers exact SKU match over wildcard vendor rule', async () => {
+        const supabase = createMockSupabase([
+            { vendor_pattern: 'teraganix', sku_pattern: null, multiplier: 4 },
+            { vendor_pattern: 'teraganix', sku_pattern: 'EM102', multiplier: 12 },
+        ]);
+        const client = new FinaleClient();
+        const result = await client.getCaseMultiplier(supabase, 'EM102', 'Teraganix');
+        expect(result).toBe(12);
     });
 
     it('returns 1 when no match', async () => {
@@ -556,6 +557,64 @@ describe('getProductActivity remainingQty', () => {
         expect(result.openPOs).toHaveLength(1);
         expect(result.openPOs[0].quantity).toBe(100);
     });
+
+    it('uses line-aware receipts for multi-line POs instead of subtracting total shipment qty from the target line', async () => {
+        const mockData = {
+            committedPOs: {
+                edges: [{
+                    node: {
+                        orderId: '124627',
+                        status: 'Committed',
+                        orderDate: '2026-01-01',
+                        itemList: {
+                            edges: [
+                                { node: { product: { productId: 'SKU123' }, quantity: 100 } },
+                                { node: { product: { productId: 'OTHER' }, quantity: 80 } },
+                            ],
+                        },
+                        shipmentList: { edges: [{ node: { shipmentId: 'S1', receiveDate: '2026-01-15', quantity: 80 } }] }
+                    }
+                }]
+            },
+            purchasedIn: { edges: [] },
+            soldIn: { edges: [] },
+            stockInfo: { edges: [{ node: { unitsInStock: 50 } }] }
+        };
+
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ data: mockData }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                })
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({
+                    orderId: '124627',
+                    orderItemList: [
+                        { id: 'line-target', productId: 'SKU123', quantity: 100 },
+                        { id: 'line-other', productId: 'OTHER', quantity: 80 },
+                    ],
+                }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                })
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify([
+                    { lineId: 'line-other', qty: 80, date: '2026-01-15' }
+                ]), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                })
+            );
+
+        const client = new FinaleClient();
+        const result = await client.getProductActivity('SKU123', 365);
+
+        expect(result.openPOs).toHaveLength(1);
+        expect(result.openPOs[0].quantity).toBe(100);
+    });
 });
 
 describe("findCommittedPOsForProduct remainingQty", () => {
@@ -670,5 +729,125 @@ describe("findCommittedPOsForProduct remainingQty", () => {
 
         expect(pos).toHaveLength(1);
         expect(pos[0]?.quantityOnOrder).toBe(100);
+    });
+
+    it("uses line-aware receipts for multi-line POs", async () => {
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                data: {
+                    orderViewConnection: {
+                        edges: [{
+                            node: {
+                                orderId: "PO-MULTI",
+                                status: "Committed",
+                                orderDate: "2026-01-15",
+                                total: "500",
+                                supplier: { name: "Test Vendor" },
+                                itemList: {
+                                    edges: [
+                                        { node: { product: { productId: "SKU-001" }, quantity: "100" } },
+                                        { node: { product: { productId: "SKU-OTHER" }, quantity: "40" } },
+                                    ],
+                                },
+                                shipmentList: {
+                                    edges: [{
+                                        node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" }
+                                    }]
+                                },
+                            },
+                        }],
+                    },
+                },
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({
+                orderId: "PO-MULTI",
+                orderItemList: [
+                    { id: "line-target", productId: "SKU-001", quantity: 100 },
+                    { id: "line-other", productId: "SKU-OTHER", quantity: 40 },
+                ],
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse([
+                { lineId: "line-other", qty: 40, date: "2026-02-01T10:00:00Z" }
+            ]) as any);
+
+        const client = new FinaleClient();
+        const pos = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(pos).toHaveLength(1);
+        expect(pos[0]?.quantityOnOrder).toBe(100);
+    });
+
+    it("memoizes multi-line receipt lookups per PO", async () => {
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                data: {
+                    orderViewConnection: {
+                        edges: [{
+                            node: {
+                                orderId: "PO-CACHED",
+                                status: "Committed",
+                                orderDate: "2026-01-15",
+                                total: "500",
+                                supplier: { name: "Test Vendor" },
+                                itemList: {
+                                    edges: [
+                                        { node: { product: { productId: "SKU-001" }, quantity: "100" } },
+                                        { node: { product: { productId: "SKU-OTHER" }, quantity: "40" } },
+                                    ],
+                                },
+                                shipmentList: {
+                                    edges: [{
+                                        node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" }
+                                    }]
+                                },
+                            },
+                        }],
+                    },
+                },
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({
+                orderId: "PO-CACHED",
+                orderItemList: [
+                    { id: "line-target", productId: "SKU-001", quantity: 100 },
+                    { id: "line-other", productId: "SKU-OTHER", quantity: 40 },
+                ],
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse([
+                { lineId: "line-other", qty: 40, date: "2026-02-01T10:00:00Z" }
+            ]) as any)
+            .mockResolvedValueOnce(jsonResponse({
+                data: {
+                    orderViewConnection: {
+                        edges: [{
+                            node: {
+                                orderId: "PO-CACHED",
+                                status: "Committed",
+                                orderDate: "2026-01-15",
+                                total: "500",
+                                supplier: { name: "Test Vendor" },
+                                itemList: {
+                                    edges: [
+                                        { node: { product: { productId: "SKU-001" }, quantity: "100" } },
+                                        { node: { product: { productId: "SKU-OTHER" }, quantity: "40" } },
+                                    ],
+                                },
+                                shipmentList: {
+                                    edges: [{
+                                        node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" }
+                                    }]
+                                },
+                            },
+                        }],
+                    },
+                },
+            }) as any);
+
+        const client = new FinaleClient();
+        const first = await client.findCommittedPOsForProduct("SKU-001");
+        const second = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(first[0]?.quantityOnOrder).toBe(100);
+        expect(second[0]?.quantityOnOrder).toBe(100);
+        expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(4);
     });
 });
