@@ -16,29 +16,21 @@
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
+import { pathToFileURL } from "url";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@supabase/supabase-js";
 import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
 import { upsertVendorInvoice } from "../lib/storage/vendor-invoices";
+import {
+    fetchAAACooperStatements,
+    parseReconcileAAAArgs,
+    type StatementAttachment,
+    type StatementEmail,
+} from "./reconcile-aaa-targeting";
 
 const BILL_COM_EMAIL = "buildasoilap@bill.com";
-const AAA_SENDER_PATTERN = /aaa\s*cooper/i;
-
-interface StatementAttachment {
-    attachmentId: string;
-    filename: string;
-    pdfBuffer: Buffer;
-}
-
-interface StatementEmail {
-    messageId: string;
-    subject: string;
-    from: string;
-    date: string;
-    attachments: StatementAttachment[];
-}
 
 interface ExtractedInvoice {
     pageNumber: number;
@@ -47,105 +39,6 @@ interface ExtractedInvoice {
     amount: number | null;
     pdfBuffer: Buffer;
     filename: string;
-}
-
-function parseArgs() {
-    const args = process.argv.slice(2);
-    return {
-        dryRun: args.includes("--dry-run"),
-        scrapeOnly: args.includes("--scrape-only"),
-        limit: (() => {
-            const idx = args.indexOf("--limit");
-            return idx >= 0 && args[idx + 1] ? parseInt(args[idx + 1], 10) : 5;
-        })(),
-    };
-}
-
-async function fetchAAACooperStatements(): Promise<StatementEmail[]> {
-    const auth = await getAuthenticatedClient("ap");
-    const gmail = GmailApi({ version: "v1", auth });
-
-    console.log("Searching ap@buildasoil.com for AAA Cooper statements...");
-
-    const res = await gmail.users.messages.list({
-        userId: "me",
-        q: "from:aaacooper.com after:2026/01/01",
-        maxResults: 20,
-    });
-
-    const msgs = res.data.messages || [];
-    if (msgs.length === 0) {
-        console.log("   No AAA Cooper statements found.");
-        return [];
-    }
-
-    console.log(`   Found ${msgs.length} AAA Cooper email(s); fetching attachments...`);
-
-    const statements: StatementEmail[] = [];
-
-    for (const msgRef of msgs) {
-        const msg = await gmail.users.messages.get({
-            userId: "me",
-            id: msgRef.id!,
-            format: "full",
-        });
-
-        const headers = msg.data.payload?.headers || [];
-        const subject = headers.find((h: any) => h.name === "Subject")?.value || "";
-        const from = headers.find((h: any) => h.name === "From")?.value || "";
-        const date = headers.find((h: any) => h.name === "Date")?.value || "";
-
-        if (!subject || !AAA_SENDER_PATTERN.test(from)) continue;
-
-        const attachments: StatementAttachment[] = [];
-        const walk = (parts: any[]) => {
-            for (const part of parts || []) {
-                if (part.filename?.toLowerCase().endsWith(".pdf") && part.body?.attachmentId) {
-                    attachments.push({
-                        attachmentId: part.body.attachmentId,
-                        filename: part.filename || "statement.pdf",
-                        pdfBuffer: Buffer.alloc(0),
-                    });
-                }
-                if (part.parts) walk(part.parts);
-            }
-        };
-        walk(msg.data.payload?.parts || []);
-
-        if (attachments.length === 0) continue;
-
-        const hydratedAttachments: StatementAttachment[] = [];
-        for (const attachment of attachments) {
-            try {
-                const attachRes = await gmail.users.messages.attachments.get({
-                    userId: "me",
-                    messageId: msgRef.id!,
-                    id: attachment.attachmentId,
-                });
-                const data = attachRes.data.data;
-                if (!data) continue;
-
-                hydratedAttachments.push({
-                    ...attachment,
-                    pdfBuffer: Buffer.from(data, "base64url"),
-                });
-            } catch (err: any) {
-                console.warn(`   Failed to download ${attachment.filename}: ${err.message}`);
-            }
-        }
-
-        if (hydratedAttachments.length === 0) continue;
-
-        statements.push({
-            messageId: msgRef.id!,
-            subject,
-            from,
-            date,
-            attachments: hydratedAttachments,
-        });
-    }
-
-    return statements;
 }
 
 async function buildInvoicesFromSplitResult(
@@ -255,22 +148,32 @@ async function archiveInvoice(
 }
 
 async function main() {
-    const { dryRun, scrapeOnly, limit } = parseArgs();
+    const { dryRun, scrapeOnly, limit, messageId, inboxOnly } = parseReconcileAAAArgs(process.argv.slice(2));
 
     console.log("\n=== AAA Cooper Invoice Extraction & Forwarding ===");
     if (dryRun) console.log("   DRY RUN — no emails will be sent\n");
     if (scrapeOnly) console.log("   SCRAPE ONLY — analyzing pages, not queueing\n");
+    if (messageId) console.log(`   EXACT MESSAGE — targeting Gmail id ${messageId}\n`);
+    if (inboxOnly) console.log("   INBOX ONLY — non-inbox AAA Cooper mail will be ignored\n");
 
-    const statements = await fetchAAACooperStatements();
+    const auth = await getAuthenticatedClient("ap");
+    const gmail = GmailApi({ version: "v1", auth });
+
+    console.log(messageId
+        ? `Fetching exact AAA Cooper statement ${messageId} from ap@buildasoil.com...`
+        : "Searching ap@buildasoil.com for AAA Cooper statements...");
+
+    const statements = await fetchAAACooperStatements(gmail as any, { messageId, inboxOnly });
     if (statements.length === 0) {
         console.log("\nNo AAA Cooper statements to process.");
         return;
     }
 
-    console.log(`\nProcessing up to ${limit} statement email(s)...\n`);
+    console.log(messageId
+        ? `   Found exact target; fetching attachments complete.`
+        : `   Found ${statements.length} AAA Cooper email(s); fetching attachments...`);
+    console.log(`\nProcessing up to ${messageId ? 1 : limit} statement email(s)...\n`);
 
-    const auth = await getAuthenticatedClient("ap");
-    const gmail = GmailApi({ version: "v1", auth });
     const supabase = createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -280,7 +183,7 @@ async function main() {
     let totalPagesDiscarded = 0;
     let heldForReview = 0;
 
-    for (const stmt of statements.slice(0, limit)) {
+    for (const stmt of statements.slice(0, messageId ? 1 : limit)) {
         console.log(`\n=== Statement: "${stmt.subject}" ===`);
         console.log(`    Attachments: ${stmt.attachments.map((attachment) => attachment.filename).join(", ")}`);
 
@@ -345,7 +248,10 @@ async function main() {
     console.log(`Held for review: ${heldForReview}`);
 }
 
-main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-});
+const invokedPath = process.argv[1];
+if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
+    main().catch((err) => {
+        console.error("Fatal error:", err);
+        process.exit(1);
+    });
+}

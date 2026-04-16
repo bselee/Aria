@@ -39,6 +39,7 @@
     "ai": "^6.0.104",
     "ai-sdk-ollama": "^3.8.2",
     "axios": "^1.13.5",
+    "better-sqlite3": "^12.9.0",
     "chokidar": "^5.0.0",
     "dotenv": "^17.3.1",
     "elevenlabs": "^1.59.0",

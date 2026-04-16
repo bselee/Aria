@@ -17,10 +17,18 @@ interface OpsHealthSnapshot {
 
 interface OpsHealthDecision {
     degraded: boolean;
-    shouldAlert: boolean;
     shouldRestart: boolean;
     reasons: string[];
 }
+
+const RESTART_WORTHY_STALE_CRONS = new Set([
+    "APPolling",
+    "POSync",
+    "UlineConfirmationSync",
+    "BuildCompletionWatcher",
+    "POReceivingWatcher",
+    "StatIndexing",
+]);
 
 function json(data: unknown, status = 200) {
     return new Response(JSON.stringify(data, null, 2), {
@@ -83,12 +91,18 @@ function buildOpsHealthDecision(snapshot: OpsHealthSnapshot): OpsHealthDecision 
         reasons.push("pending_ops_exceptions");
     }
 
-    let shouldRestart = reasons.some((reason) =>
-        reason.startsWith("stale_cron:")
-        || reason === "bot_heartbeat_stale"
-        || reason === "ap_processing_stuck"
-        || reason === "nightshift_processing_stuck"
-    );
+    let shouldRestart = reasons.some((reason) => {
+        if (reason === "bot_heartbeat_stale" || reason === "ap_processing_stuck" || reason === "nightshift_processing_stuck") {
+            return true;
+        }
+
+        if (!reason.startsWith("stale_cron:")) {
+            return false;
+        }
+
+        const taskName = reason.slice("stale_cron:".length);
+        return RESTART_WORTHY_STALE_CRONS.has(taskName);
+    });
 
     if (!isSupabaseProjectReady(projectStatus)) {
         shouldRestart = false;
@@ -96,7 +110,6 @@ function buildOpsHealthDecision(snapshot: OpsHealthSnapshot): OpsHealthDecision 
 
     return {
         degraded: reasons.length > 0,
-        shouldAlert: reasons.length > 0,
         shouldRestart,
         reasons,
     };
@@ -232,12 +245,17 @@ Deno.serve(async () => {
     }
 
     const supabase = createClient(supabaseUrl, serviceRoleKey);
-    const summary = await fetchOpsHealthSummary(supabase);
+    let summary;
+    try {
+        summary = await fetchOpsHealthSummary(supabase);
+    } catch (err) {
+        return json({ error: "health_summary_query_failed", detail: String(err) }, 500);
+    }
     if (!summary) {
         return json({ degraded: false, reason: "no_health_summary" });
     }
 
-    const projectStatus = Deno.env.get("SUPABASE_PROJECT_STATUS") || "ACTIVE";
+    const projectStatus = Deno.env.get("SUPABASE_PROJECT_STATUS") ?? "ACTIVE";
     const decision = buildOpsHealthDecision({
         projectStatus,
         staleCrons: summary.stale_crons || [],
@@ -264,7 +282,7 @@ Deno.serve(async () => {
 
     let telegramSent = false;
     let slackSent = false;
-    if (!recentlyAlerted && decision.shouldAlert) {
+    if (!recentlyAlerted && decision.degraded) {
         const message = buildAlertMessage(decision, summary);
         try {
             [telegramSent, slackSent] = await Promise.all([
