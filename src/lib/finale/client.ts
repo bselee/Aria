@@ -2803,6 +2803,56 @@ export class FinaleClient {
         }
     }
 
+    async findRecentPurchaseOrdersForVendor(
+        partyId: string,
+        daysBack: number = 14,
+    ): Promise<Array<{ orderId: string; status: string; orderDate: string; finaleUrl: string }>> {
+        try {
+            const now = new Date();
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - daysBack);
+            const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const endStr = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: 50
+                        type: ["PURCHASE_ORDER"]
+                        status: ["Created", "Committed", "Completed", "Locked"]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            orderId orderUrl status orderDate
+                            supplier { partyUrl name }
+                        }}
+                    }
+                }`,
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            return edges
+                .map(edge => edge.node)
+                .filter(po => (po.supplier?.partyUrl?.split("/").pop() || "") === partyId)
+                .map(po => ({
+                    orderId: po.orderId,
+                    status: po.status || "",
+                    orderDate: po.orderDate || "",
+                    finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/purchaseOrder?orderId=${po.orderId}`,
+                }));
+        } catch (err: any) {
+            console.warn("[finale] findRecentPurchaseOrdersForVendor failed:", err.message);
+            return [];
+        }
+    }
+
     /**
      * Add a fee/charge adjustment to a PO's orderAdjustmentList.
      * This uses Finale's native fee system and automatically affects landed cost per unit.

@@ -63,6 +63,12 @@ type CommitReview = {
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
+type UlineFlowResult = UlineOrderResult & {
+    draftPO?: POResult;
+    draftResolution?: { action: "reuse_existing_draft" | "create_new_draft" | "review_required" };
+    preOrderVerification?: { verified: boolean };
+    poRepairsApplied?: { addedSkus: number; raisedQuantities: number; extraDraftLines: number };
+};
 type FocusFilter = "today" | "week" | "all";
 
 // ── constants ──────────────────────────────────────────────────────────────
@@ -118,7 +124,7 @@ export default function PurchasingPanel() {
 
     // ULINE direct ordering
     const [ulineOrdering, setUlineOrdering] = useState(false);
-    const [ulineResult, setUlineResult] = useState<UlineOrderResult | null>(null);
+    const [ulineResult, setUlineResult] = useState<UlineFlowResult | null>(null);
 
     // collapse + resize
     const [isCollapsed, setIsCollapsed] = useState(false);
@@ -423,7 +429,6 @@ export default function PurchasingPanel() {
 
     async function handleOrderOnUline(group: PurchasingGroup) {
         const pid = group.vendorPartyId;
-        const draftPO = createdPOs[pid]?.orderId;
         const items = group.items
             .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canUseDirectOrdering(group.vendorName, i.reorderMethod))
             .map(i => ({
@@ -437,14 +442,21 @@ export default function PurchasingPanel() {
         setUlineOrdering(true);
         setUlineResult(null);
         try {
-            const res = await fetch('/api/dashboard/purchasing/uline-order', {
+            const res = await fetch('/api/dashboard/purchasing/uline-flow', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items, draftPO }),
+                body: JSON.stringify({
+                    vendorName: group.vendorName,
+                    vendorPartyId: pid,
+                    items,
+                }),
             });
-            const result: UlineOrderResult = await res.json();
+            const result: UlineFlowResult = await res.json();
             setUlineResult(result);
-            if (result.success) await load(true);
+            if (result.draftPO) {
+                setCreatedPOs(p => ({ ...p, [pid]: result.draftPO! }));
+            }
+            if (result.success || result.draftPO) await load(true);
         } catch (e: any) {
             setUlineResult({ success: false, itemsAdded: 0, message: e.message });
         } finally {
@@ -787,29 +799,30 @@ export default function PurchasingPanel() {
                                                             </div>
                                                         ) : (
                                                             <>
-                                                                <button
-                                                                    onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
-                                                                    disabled={anyCreating}
-                                                                    className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
-                                                                        ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
-                                                                        : "bg-transparent text-zinc-600 border-zinc-800"
-                                                                        }`}
-                                                                >
-                                                                    {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
-                                                                    {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
-                                                                </button>
-                                                                {/* ULINE: Order Now button — fires items directly to ULINE cart */}
+                                                                {(!isUlineVendor(group.vendorName) || directOrderBlocked) && (
+                                                                    <button
+                                                                        onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
+                                                                        disabled={anyCreating}
+                                                                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
+                                                                            ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
+                                                                            : "bg-transparent text-zinc-600 border-zinc-800"
+                                                                            }`}
+                                                                    >
+                                                                        {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
+                                                                        {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
+                                                                    </button>
+                                                                )}
                                                                 {isUlineVendor(group.vendorName) && selectedCount > 0 && !directOrderBlocked && (
                                                                     <button
                                                                         onClick={() => handleOrderOnUline(group)}
                                                                         disabled={ulineOrdering}
                                                                         className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-700/80 hover:bg-amber-600 text-amber-100 border-amber-600 transition-colors disabled:opacity-40 shrink-0"
-                                                                        title="Add selected items to ULINE cart via Quick Order"
+                                                                        title="Create or reuse the safe ULINE draft PO, verify it, then add to the ULINE cart"
                                                                     >
                                                                         {ulineOrdering
                                                                             ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
                                                                             : <ShoppingCart className="w-2.5 h-2.5" />}
-                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                        {ulineOrdering ? 'Flowing…' : 'Create PO + ULINE'}
                                                                     </button>
                                                                 )}
                                                                 {isUlineVendor(group.vendorName) && selectedCount > 0 && directOrderBlocked && (
@@ -868,10 +881,12 @@ export default function PurchasingPanel() {
                                                             </div>
                                                         ) : selectedCount > 0 ? (
                                                             <div className="flex items-center gap-1.5">
-                                                                <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
-                                                                    className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
-                                                                    {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
-                                                                </button>
+                                                                {(!isUlineVendor(group.vendorName) || directOrderBlocked) && (
+                                                                    <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
+                                                                        className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
+                                                                        {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
+                                                                    </button>
+                                                                )}
                                                                 {isUlineVendor(group.vendorName) && !directOrderBlocked && (
                                                                     <button
                                                                         onClick={() => handleOrderOnUline(group)}
@@ -881,7 +896,7 @@ export default function PurchasingPanel() {
                                                                         {ulineOrdering
                                                                             ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
                                                                             : <ShoppingCart className="w-2.5 h-2.5" />}
-                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                        {ulineOrdering ? 'Flowing…' : 'Create PO + ULINE'}
                                                                     </button>
                                                                 )}
                                                                 {isUlineVendor(group.vendorName) && directOrderBlocked && (
@@ -1060,7 +1075,28 @@ export default function PurchasingPanel() {
                                         : 'bg-rose-900/20 border-rose-800/40 text-rose-400'
                                 }`}>
                                     <span>{ulineResult.success ? '✅' : '⚠️'}</span>
-                                    <span className="flex-1">{ulineResult.message}</span>
+                                    <div className="flex-1">
+                                        <div>{ulineResult.message}</div>
+                                        {(ulineResult.draftPO || ulineResult.draftResolution || ulineResult.poRepairsApplied) && (
+                                            <div className="mt-1 text-[10px] text-zinc-400 flex flex-wrap gap-x-3 gap-y-1">
+                                                {ulineResult.draftPO && <span>PO #{ulineResult.draftPO.orderId}</span>}
+                                                {ulineResult.draftResolution && (
+                                                    <span>
+                                                        {ulineResult.draftResolution.action === "reuse_existing_draft"
+                                                            ? "reused draft"
+                                                            : ulineResult.draftResolution.action === "create_new_draft"
+                                                                ? "created draft"
+                                                                : "review required"}
+                                                    </span>
+                                                )}
+                                                {ulineResult.poRepairsApplied && (
+                                                    <span>
+                                                        +{ulineResult.poRepairsApplied.addedSkus} add / ↑{ulineResult.poRepairsApplied.raisedQuantities} qty
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
                                     <button
                                         onClick={() => setUlineResult(null)}
                                         className="text-zinc-500 hover:text-zinc-300 transition-colors"

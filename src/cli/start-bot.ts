@@ -1478,6 +1478,16 @@ bot.on('text', async (ctx) => {
             return;
         }
 
+        if (preCheck.reason === 'review_required') {
+            await ctx.reply(
+                `⚠️ <b>ULINE Review Required</b>\n\n` +
+                `${preCheck.reviewReason || 'A non-draft ULINE PO is blocking safe automation.'}\n` +
+                `Review Finale before creating or reusing a draft for ordering.`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
         const manifest = preCheck.manifest;
         const itemLines = manifest.items
             .slice(0, 15)

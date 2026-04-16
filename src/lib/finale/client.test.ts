@@ -293,6 +293,86 @@ describe("FinaleClient draft PO creation guardrails", () => {
     });
 });
 
+describe("FinaleClient recent vendor PO lookup", () => {
+    const originalEnv = {
+        FINALE_API_KEY: process.env.FINALE_API_KEY,
+        FINALE_API_SECRET: process.env.FINALE_API_SECRET,
+        FINALE_ACCOUNT_PATH: process.env.FINALE_ACCOUNT_PATH,
+        FINALE_BASE_URL: process.env.FINALE_BASE_URL,
+    };
+
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    afterEach(() => {
+        process.env.FINALE_API_KEY = originalEnv.FINALE_API_KEY;
+        process.env.FINALE_API_SECRET = originalEnv.FINALE_API_SECRET;
+        process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
+        process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
+    });
+
+    it("returns recent purchase orders for a vendor across draft and committed statuses", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                orderViewConnection: {
+                    edges: [
+                        {
+                            node: {
+                                orderId: "124500",
+                                orderUrl: "/buildasoil/api/order/124500",
+                                status: "Draft",
+                                orderDate: "2026-04-11",
+                                supplier: {
+                                    partyUrl: "/buildasoil/api/partygroup/party-uline",
+                                    name: "ULINE",
+                                },
+                            },
+                        },
+                        {
+                            node: {
+                                orderId: "124490",
+                                orderUrl: "/buildasoil/api/order/124490",
+                                status: "Committed",
+                                orderDate: "2026-04-10",
+                                supplier: {
+                                    partyUrl: "/buildasoil/api/partygroup/party-uline",
+                                    name: "ULINE",
+                                },
+                            },
+                        },
+                        {
+                            node: {
+                                orderId: "999999",
+                                orderUrl: "/buildasoil/api/order/999999",
+                                status: "Draft",
+                                orderDate: "2026-04-09",
+                                supplier: {
+                                    partyUrl: "/buildasoil/api/partygroup/other-vendor",
+                                    name: "Other",
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const result = await client.findRecentPurchaseOrdersForVendor("party-uline", 14);
+
+        expect(result).toEqual([
+            expect.objectContaining({ orderId: "124500", status: "Draft" }),
+            expect.objectContaining({ orderId: "124490", status: "Committed" }),
+        ]);
+    });
+});
+
 describe("FinaleClient receivings pagination", () => {
     beforeEach(() => {
         process.env.FINALE_API_KEY = "key";
