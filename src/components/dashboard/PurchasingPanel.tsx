@@ -65,9 +65,9 @@ type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
 type UlineFlowResult = UlineOrderResult & {
     draftPO?: POResult;
-    draftResolution?: { action: "reuse_existing_draft" | "create_new_draft" | "review_required" };
-    preOrderVerification?: { verified: boolean };
-    poRepairsApplied?: { addedSkus: number; raisedQuantities: number; extraDraftLines: number };
+    blockingPO?: { orderId: string; status: string; orderDate: string };
+    duplicateWarnings?: string[];
+    verification?: { verified: boolean; missingItems: any[]; quantityRaises: any[] };
 };
 type FocusFilter = "today" | "week" | "all";
 
@@ -1077,23 +1077,15 @@ export default function PurchasingPanel() {
                                     <span>{ulineResult.success ? '✅' : '⚠️'}</span>
                                     <div className="flex-1">
                                         <div>{ulineResult.message}</div>
-                                        {(ulineResult.draftPO || ulineResult.draftResolution || ulineResult.poRepairsApplied) && (
+                                        {(ulineResult.draftPO || ulineResult.blockingPO || ulineResult.duplicateWarnings?.length) && (
                                             <div className="mt-1 text-[10px] text-zinc-400 flex flex-wrap gap-x-3 gap-y-1">
                                                 {ulineResult.draftPO && <span>PO #{ulineResult.draftPO.orderId}</span>}
-                                                {ulineResult.draftResolution && (
-                                                    <span>
-                                                        {ulineResult.draftResolution.action === "reuse_existing_draft"
-                                                            ? "reused draft"
-                                                            : ulineResult.draftResolution.action === "create_new_draft"
-                                                                ? "created draft"
-                                                                : "review required"}
-                                                    </span>
+                                                {ulineResult.blockingPO && (
+                                                    <span>blocked by #{ulineResult.blockingPO.orderId} ({ulineResult.blockingPO.status})</span>
                                                 )}
-                                                {ulineResult.poRepairsApplied && (
-                                                    <span>
-                                                        +{ulineResult.poRepairsApplied.addedSkus} add / ↑{ulineResult.poRepairsApplied.raisedQuantities} qty
-                                                    </span>
-                                                )}
+                                                {ulineResult.duplicateWarnings?.map((w, i) => (
+                                                    <span key={i}>{w}</span>
+                                                ))}
                                             </div>
                                         )}
                                     </div>

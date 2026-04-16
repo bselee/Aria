@@ -585,7 +585,7 @@ export async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderM
 
     const [activeDrafts, recentOrders] = await Promise.all([
         finale.findActiveDraftPOsForVendor(vendorPartyId).catch(() => []),
-        finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 14).catch(() => []),
+        finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 7).catch(() => []),
     ]);
     const resolution = resolveUlineDraftResolution({ activeDrafts, recentOrders });
     if (resolution.action === 'review_required') {

@@ -5,7 +5,6 @@ import { scrapeBasautoPurchasingData } from "@/lib/purchasing/basauto-purchases"
 import {
     aggregateUlineDemand,
     buildDraftVerification,
-    resolveUlineDraftResolution,
 } from "@/lib/purchasing/uline-flow";
 import { runUlineOrder } from "@/lib/purchasing/uline-order-service";
 import { loadPendingUlineRequestDemand } from "@/lib/purchasing/uline-request-demand";
@@ -47,24 +46,33 @@ export async function POST(req: NextRequest) {
             );
         }
 
-        const finaleDemand = items.map(item => ({
-            sku: item.productId,
-            description: item.productId,
-            requiredQty: item.quantity,
-        }));
+        const finaleDemand = items
+            .filter(item => parseQty(item.quantity) > 0)
+            .map(item => ({
+                sku: item.productId,
+                description: item.productId,
+                requiredQty: parseQty(item.quantity),
+            }));
 
-        const [basautoData, requestDemand] = await Promise.all([
-            scrapeBasautoPurchasingData({ includeRequests: false }),
-            loadPendingUlineRequestDemand(),
-        ]);
+        // ── Stage 1: Gather supplemental demand ──────────────────────────────
+        let basautoDemand: typeof finaleDemand = [];
+        try {
+            const basautoData = await scrapeBasautoPurchasingData({ includeRequests: false });
+            const vendorNorm = normalizeVendorLabel(vendorName || "ULINE");
+            basautoDemand = Object.entries(basautoData.purchases || {})
+                .filter(([vendor]) => normalizeVendorLabel(vendor) === vendorNorm)
+                .flatMap(([, vendorItems]) => vendorItems
+                    .filter(item => parseQty(item.recommendedReorderQty || item.remaining) > 0)
+                    .map(item => ({
+                        sku: item.sku,
+                        description: item.description || item.sku,
+                        requiredQty: parseQty(item.recommendedReorderQty || item.remaining),
+                    })));
+        } catch (err: any) {
+            console.warn("[uline-flow] basauto scrape failed (continuing without):", err.message);
+        }
 
-        const basautoDemand = Object.entries(basautoData.purchases || {})
-            .filter(([vendor]) => normalizeVendorLabel(vendor).includes(normalizeVendorLabel(vendorName || "ULINE")))
-            .flatMap(([, vendorItems]) => vendorItems.map(item => ({
-                sku: item.sku,
-                description: item.description || item.sku,
-                requiredQty: item.recommendedReorderQty || item.remaining || 0,
-            })));
+        const requestDemand = await loadPendingUlineRequestDemand().catch(() => []);
 
         const aggregatedDemand = aggregateUlineDemand([
             { source: "finale", items: finaleDemand },
@@ -72,41 +80,33 @@ export async function POST(req: NextRequest) {
             { source: "basauto", items: basautoDemand },
         ]);
 
+        if (aggregatedDemand.length === 0) {
+            return NextResponse.json(
+                { success: false, message: "No items with positive quantity after aggregation" },
+                { status: 400 },
+            );
+        }
+
+        // ── Stage 2: 7-day blocking check ────────────────────────────────────
+        // ONE decision point: if a committed/completed ULINE PO exists in 7 days, halt.
+        // Draft reuse is handled internally by createDraftPurchaseOrder.
         const finale = new FinaleClient();
-        const [activeDrafts, recentOrders] = await Promise.all([
-            finale.findActiveDraftPOsForVendor(vendorPartyId),
-            finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 14),
-        ]);
-
-        const draftResolution = resolveUlineDraftResolution({
-            activeDrafts,
-            recentOrders,
-        });
-
-        if (draftResolution.action === "review_required") {
+        const recentOrders = await finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 7);
+        const blockingPO = recentOrders.find(po => po.status !== "Draft");
+        if (blockingPO) {
             return NextResponse.json(
                 {
                     success: false,
-                    message: draftResolution.reason,
-                    draftResolution,
+                    message: `ULINE PO #${blockingPO.orderId} (${blockingPO.status}) exists from ${blockingPO.orderDate}. Review before creating a new order.`,
+                    blockingPO,
                     aggregatedDemand,
                 },
                 { status: 409 },
             );
         }
 
+        // ── Stage 3: Create or reuse draft (Finale owns this decision) ───────
         const unitPriceBySku = new Map(items.map(item => [item.productId.trim().toUpperCase(), item.unitPrice ?? 0]));
-        let beforeOrderDetails: any | null = null;
-        if (draftResolution.action === "reuse_existing_draft") {
-            beforeOrderDetails = await finale.getOrderDetails(draftResolution.draftPO.orderId);
-            for (const line of beforeOrderDetails.orderItemList || []) {
-                const sku = getLineProductId(line).toUpperCase();
-                if (!unitPriceBySku.has(sku) && Number(line.unitPrice || 0) > 0) {
-                    unitPriceBySku.set(sku, Number(line.unitPrice));
-                }
-            }
-        }
-
         const draftResult = await finale.createDraftPurchaseOrder(
             vendorPartyId,
             aggregatedDemand.map(item => ({
@@ -114,61 +114,44 @@ export async function POST(req: NextRequest) {
                 quantity: item.requiredQty,
                 unitPrice: unitPriceBySku.get(item.sku) ?? 0,
             })),
-            "ULINE Friday dashboard flow — verify and order",
+            "ULINE Friday dashboard flow",
         );
 
+        // ── Stage 4: Verify draft contents match demand ──────────────────────
         const draftDetails = await finale.getOrderDetails(draftResult.orderId);
-        const preOrderVerification = buildDraftVerification(aggregatedDemand, draftDetails.orderItemList || []);
-        const beforeVerification = beforeOrderDetails
-            ? buildDraftVerification(aggregatedDemand, beforeOrderDetails.orderItemList || [])
-            : null;
+        const verification = buildDraftVerification(aggregatedDemand, draftDetails.orderItemList || []);
 
-        const poRepairsApplied = {
-            addedSkus: beforeVerification?.missingItems.length ?? (draftResolution.action === "create_new_draft" ? aggregatedDemand.length : 0),
-            raisedQuantities: beforeVerification?.quantityRaises.length ?? 0,
-            extraDraftLines: preOrderVerification.extraDraftLines.length,
-        };
+        // ── Stage 5: Fill ULINE cart ─────────────────────────────────────────
+        const orderItems = aggregatedDemand
+            .map(item => {
+                const line = (draftDetails.orderItemList || []).find(
+                    (c: any) => getLineProductId(c).toUpperCase() === item.sku,
+                );
+                const qty = parseQty(line?.quantity);
+                if (qty <= 0) return null;
+                return {
+                    productId: item.sku,
+                    quantity: qty,
+                    unitPrice: Number(line?.unitPrice ?? unitPriceBySku.get(item.sku) ?? 0),
+                };
+            })
+            .filter(Boolean) as Array<{ productId: string; quantity: number; unitPrice: number }>;
 
-        if (!preOrderVerification.verified) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Draft PO failed ULINE verification after repair.",
-                    draftResolution,
-                    draftPO: { orderId: draftResult.orderId, finaleUrl: draftResult.finaleUrl },
-                    aggregatedDemand,
-                    poRepairsApplied,
-                    preOrderVerification,
-                },
-                { status: 409 },
-            );
-        }
-
-        const orderItems = aggregatedDemand.map(item => {
-            const line = (draftDetails.orderItemList || []).find((candidate: any) => getLineProductId(candidate).toUpperCase() === item.sku);
-            return {
-                productId: item.sku,
-                quantity: parseQty(line?.quantity),
-                unitPrice: Number(line?.unitPrice ?? unitPriceBySku.get(item.sku) ?? 0),
-            };
-        });
-
-        const cartVerification = await runUlineOrder({
+        const cartResult = await runUlineOrder({
             items: orderItems,
             draftPO: draftResult.orderId,
         });
 
         return NextResponse.json({
-            success: cartVerification.success,
-            message: cartVerification.message,
-            draftResolution,
+            success: cartResult.success,
+            message: cartResult.message,
             draftPO: { orderId: draftResult.orderId, finaleUrl: draftResult.finaleUrl },
+            duplicateWarnings: draftResult.duplicateWarnings,
             aggregatedDemand,
-            poRepairsApplied,
-            preOrderVerification,
-            cartVerification,
+            verification,
+            cartVerification: cartResult,
             priceSyncSummary: {
-                priceUpdatesApplied: cartVerification.priceUpdatesApplied ?? 0,
+                priceUpdatesApplied: cartResult.priceUpdatesApplied ?? 0,
             },
         });
     } catch (err: any) {

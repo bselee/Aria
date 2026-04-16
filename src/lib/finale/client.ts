@@ -2805,7 +2805,7 @@ export class FinaleClient {
 
     async findRecentPurchaseOrdersForVendor(
         partyId: string,
-        daysBack: number = 14,
+        daysBack: number = 7,
     ): Promise<Array<{ orderId: string; status: string; orderDate: string; finaleUrl: string }>> {
         try {
             const now = new Date();

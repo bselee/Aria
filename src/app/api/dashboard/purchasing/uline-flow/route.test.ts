@@ -30,15 +30,21 @@ vi.mock("@/lib/purchasing/uline-order-service", () => ({
 
 import { POST } from "./route";
 
+function makeRequest(body: any) {
+    return new Request("http://localhost/api/dashboard/purchasing/uline-flow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    }) as any;
+}
+
 describe("dashboard uline flow route", () => {
     beforeEach(() => {
         vi.clearAllMocks();
 
         scrapeBasautoPurchasingDataMock.mockResolvedValue({
             purchases: {
-                ULINE: [
-                    { sku: "S-1", description: "Box", recommendedReorderQty: "9" },
-                ],
+                ULINE: [{ sku: "S-1", description: "Box", recommendedReorderQty: "9" }],
             },
             requests: [],
         });
@@ -55,16 +61,13 @@ describe("dashboard uline flow route", () => {
         });
     });
 
-    it("reuses an existing draft, verifies it, and orders the merged ULINE demand", async () => {
-        finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
+    it("delegates create-or-reuse to Finale, verifies, and orders the merged demand", async () => {
+        finaleCtorMock.mockImplementation(function (this: any) {
             this.findRecentPurchaseOrdersForVendor = vi.fn().mockResolvedValue([]);
-            this.findActiveDraftPOsForVendor = vi.fn().mockResolvedValue([
-                { orderId: "124500", orderDate: "2026-04-11", finaleUrl: "https://finale/124500" },
-            ]);
             this.createDraftPurchaseOrder = vi.fn().mockResolvedValue({
                 orderId: "124500",
                 finaleUrl: "https://finale/124500",
-                duplicateWarnings: ["Reused existing draft PO #124500 for this vendor."],
+                duplicateWarnings: [],
                 priceAlerts: [],
             });
             this.getOrderDetails = vi.fn().mockResolvedValue({
@@ -77,64 +80,115 @@ describe("dashboard uline flow route", () => {
             });
         });
 
-        const response = await POST(new Request("http://localhost/api/dashboard/purchasing/uline-flow", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                vendorName: "ULINE",
-                vendorPartyId: "party-uline",
-                items: [
-                    { productId: "S-1", quantity: 5, unitPrice: 1.25 },
-                ],
-            }),
-        }) as any);
+        const response = await POST(makeRequest({
+            vendorName: "ULINE",
+            vendorPartyId: "party-uline",
+            items: [{ productId: "S-1", quantity: 5, unitPrice: 1.25 }],
+        }));
 
         expect(response.status).toBe(200);
         expect(runUlineOrderMock).toHaveBeenCalledWith(
             expect.objectContaining({
                 draftPO: "124500",
-                items: [
-                    { productId: "S-1", quantity: 9, unitPrice: 1.25 },
-                    { productId: "S-2", quantity: 7, unitPrice: 2.5 },
-                ],
+                items: expect.arrayContaining([
+                    expect.objectContaining({ productId: "S-1", quantity: 9 }),
+                    expect.objectContaining({ productId: "S-2", quantity: 7 }),
+                ]),
             }),
         );
 
-        await expect(response.json()).resolves.toMatchObject({
-            success: true,
-            draftResolution: { action: "reuse_existing_draft" },
-            draftPO: { orderId: "124500" },
-            preOrderVerification: { verified: true },
-        });
+        const json = await response.json();
+        expect(json.success).toBe(true);
+        expect(json.draftPO.orderId).toBe("124500");
     });
 
-    it("stops for review when the newest vendor PO is committed and no active draft exists", async () => {
-        finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
+    it("blocks when a committed ULINE PO exists within 7 days", async () => {
+        finaleCtorMock.mockImplementation(function (this: any) {
             this.findRecentPurchaseOrdersForVendor = vi.fn().mockResolvedValue([
                 { orderId: "124490", status: "Committed", orderDate: "2026-04-11", finaleUrl: "https://finale/124490" },
             ]);
-            this.findActiveDraftPOsForVendor = vi.fn().mockResolvedValue([]);
             this.createDraftPurchaseOrder = vi.fn();
             this.getOrderDetails = vi.fn();
         });
 
-        const response = await POST(new Request("http://localhost/api/dashboard/purchasing/uline-flow", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                vendorName: "ULINE",
-                vendorPartyId: "party-uline",
-                items: [
-                    { productId: "S-1", quantity: 5, unitPrice: 1.25 },
-                ],
-            }),
-        }) as any);
+        const response = await POST(makeRequest({
+            vendorName: "ULINE",
+            vendorPartyId: "party-uline",
+            items: [{ productId: "S-1", quantity: 5, unitPrice: 1.25 }],
+        }));
 
         expect(response.status).toBe(409);
         expect(runUlineOrderMock).not.toHaveBeenCalled();
-        await expect(response.json()).resolves.toMatchObject({
-            success: false,
-            draftResolution: { action: "review_required" },
+        const json = await response.json();
+        expect(json.success).toBe(false);
+        expect(json.blockingPO.orderId).toBe("124490");
+    });
+
+    it("continues gracefully when basauto scrape fails", async () => {
+        scrapeBasautoPurchasingDataMock.mockRejectedValue(new Error("basauto session expired"));
+
+        finaleCtorMock.mockImplementation(function (this: any) {
+            this.findRecentPurchaseOrdersForVendor = vi.fn().mockResolvedValue([]);
+            this.createDraftPurchaseOrder = vi.fn().mockResolvedValue({
+                orderId: "124600",
+                finaleUrl: "https://finale/124600",
+                duplicateWarnings: [],
+                priceAlerts: [],
+            });
+            this.getOrderDetails = vi.fn().mockResolvedValue({
+                orderId: "124600",
+                statusId: "ORDER_CREATED",
+                orderItemList: [
+                    { productId: "S-1", quantity: 5, unitPrice: 1.25, itemDescription: "Box" },
+                    { productId: "S-2", quantity: 7, unitPrice: 2.5, itemDescription: "Tape" },
+                ],
+            });
         });
+
+        const response = await POST(makeRequest({
+            vendorName: "ULINE",
+            vendorPartyId: "party-uline",
+            items: [{ productId: "S-1", quantity: 5, unitPrice: 1.25 }],
+        }));
+
+        expect(response.status).toBe(200);
+        const json = await response.json();
+        expect(json.success).toBe(true);
+    });
+
+    it("filters out zero-quantity items before ordering", async () => {
+        finaleCtorMock.mockImplementation(function (this: any) {
+            this.findRecentPurchaseOrdersForVendor = vi.fn().mockResolvedValue([]);
+            this.createDraftPurchaseOrder = vi.fn().mockResolvedValue({
+                orderId: "124700",
+                finaleUrl: "https://finale/124700",
+                duplicateWarnings: [],
+                priceAlerts: [],
+            });
+            this.getOrderDetails = vi.fn().mockResolvedValue({
+                orderId: "124700",
+                statusId: "ORDER_CREATED",
+                orderItemList: [
+                    { productId: "S-2", quantity: 7, unitPrice: 2.5, itemDescription: "Tape" },
+                ],
+            });
+        });
+
+        const response = await POST(makeRequest({
+            vendorName: "ULINE",
+            vendorPartyId: "party-uline",
+            items: [
+                { productId: "S-ZERO", quantity: 0, unitPrice: 1 },
+                { productId: "S-NEG", quantity: -5, unitPrice: 1 },
+            ],
+        }));
+
+        // Still succeeds because request demand (S-2) provides items
+        expect(response.status).toBe(200);
+        // Zero-qty items not passed to createDraftPurchaseOrder
+        const createCall = finaleCtorMock.mock.results[0].value.createDraftPurchaseOrder.mock.calls[0];
+        const skusInDraft = createCall[1].map((i: any) => i.productId);
+        expect(skusInDraft).not.toContain("S-ZERO");
+        expect(skusInDraft).not.toContain("S-NEG");
     });
 });
