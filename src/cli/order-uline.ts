@@ -103,7 +103,6 @@ function parseArgs() {
     const args = process.argv.slice(2);
     return {
         dryRun: args.includes('--dry-run'),
-        useGrid: args.includes('--grid'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
         autoReorder: args.includes('--auto-reorder'),
         createPO: args.includes('--create-po'),
@@ -1215,18 +1214,27 @@ async function main() {
     }
 
     // Phase 2: Place on ULINE
-    let result: string;
+    let cartResult: UlineCartFillResult;
     if (args.useGrid) {
-        result = await placeViaQuickOrderGrid(finalItems);
+        const msg = await placeViaQuickOrderGrid(finalItems);
+        cartResult = { message: msg, verification: { status: 'unverified', matchedModels: [], missingModels: [], quantityMismatches: [], unexpectedModels: [] }, observedRows: [], errorText: undefined };
     } else {
-        result = (await placeViaQuickOrderPaste(finale, finalItems, { autonomous: false })).message;
+        cartResult = await placeViaQuickOrderPaste(finale, finalItems, {
+            autonomous: false,
+            draftPO: manifests[0]?.sourcePO || null,
+        });
     }
+    const priceSyncMsg = cartResult && 'priceUpdatesApplied' in cartResult && cartResult.priceUpdatesApplied > 0
+        ? ` | 💰 ${(cartResult as any).priceUpdatesApplied} price update(s) synced to Finale`
+        : '';
+    const cartLinkMsg = cartResult.cartUrl ? ` | 📧 Cart emailed` : '';
 
     console.log('╔══════════════════════════════════════════════════╗');
     console.log('║     DONE — Items Added to ULINE Cart            ║');
     console.log('╠══════════════════════════════════════════════════╣');
-    console.log(`║   ${result.padEnd(46)}║`);
+    console.log(`║   ${cartResult.message.padEnd(46)}║`);
     console.log(`║   Source POs: ${manifests.map(m => m.sourcePO).join(', ').padEnd(34)}║`);
+    console.log(`║   Status: ${cartResult.verification.status.padEnd(42)}║`);
     console.log('╠══════════════════════════════════════════════════╣');
     console.log('║   ⚠️  REVIEW YOUR CART BEFORE CHECKOUT!          ║');
     console.log('║   This was a FAUX ORDER — nothing was submitted. ║');
