@@ -251,6 +251,11 @@ function parseTableLines(lines: string[], pageNumber: number): TableData {
  * we split by pdf-lib (physical page extraction).
  */
 function splitIntoPages(text: string, pageCount: number): PageContent[] {
+    const markerPages = splitIntoPagesFromOCRMarkers(text);
+    if (markerPages.length >= Math.max(1, Math.ceil(pageCount * 0.8))) {
+        return markerPages;
+    }
+
     const pages = text.split("\x0C"); // Form feed = page break
 
     // If form feed splitting worked, use it
@@ -276,6 +281,24 @@ function splitIntoPages(text: string, pageCount: number): PageContent[] {
         });
     }
     return result;
+}
+
+function splitIntoPagesFromOCRMarkers(text: string): PageContent[] {
+    const markerRegex = /==Start of OCR for page\s+(\d+)==\s*([\s\S]*?)\s*==End of OCR for page\s+\1==/gi;
+    const pages: PageContent[] = [];
+
+    for (const match of text.matchAll(markerRegex)) {
+        const pageNumber = Number(match[1]);
+        const pageText = (match[2] || "").trim();
+
+        pages.push({
+            pageNumber: Number.isFinite(pageNumber) ? pageNumber : pages.length + 1,
+            text: pageText,
+            hasTable: pageText.split(/\s{2,}/).length > 10,
+        });
+    }
+
+    return pages;
 }
 
 /**

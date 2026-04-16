@@ -8,6 +8,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase';
+import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,7 @@ export type InvoiceQueueItem = {
     processedAt: string;
     dollarImpact: number | null;
     balanceWarning: string | null;
+    metadata: Record<string, unknown> | null;
 };
 
 export type InvoiceQueueStats = {
@@ -181,6 +183,12 @@ export async function GET(req: NextRequest) {
         let totalDollarImpact = 0;
 
         const invoices: InvoiceQueueItem[] = rows.flatMap(row => {
+            // Filter dropship vendors — they get forwarded to Bill.com directly,
+            // never need AP review and should never appear in the queue.
+            const vendorLower = (row.vendor_name ?? '').toLowerCase();
+            if (KNOWN_DROPSHIP_KEYWORDS.some(kw => vendorLower.includes(kw.toLowerCase()))) {
+                return [];
+            }
             const invNum: string = row.invoice_number ?? '';
             const matchedLog = logByInvoiceNum.get(invNum) ?? null;
             const reviewedAction = (matchedLog?.reviewed_action ?? "").toLowerCase();
@@ -193,16 +201,27 @@ export async function GET(req: NextRequest) {
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
             const balanceWarning = extractBalanceWarning(matchedLog?.metadata ?? null);
 
+            const hasActivityLog = !!matchedLog?.id;
+            // Items with no activity log can't be acted on — demote to unmatched
+            const resolvedStatus = hasActivityLog ? status : (status === 'needs_approval' ? 'unmatched' : status);
+
+            // Filter items that can't be acted on (no activityLogId for needs_approval)
+            if (resolvedStatus === 'needs_approval' && !hasActivityLog) {
+                return [];
+            }
+
             const processedAt: string = row.created_at ?? new Date().toISOString();
+
+            // Only count stats for items that actually appear in the queue
             if (new Date(processedAt) >= todayStart) totalToday++;
-            if (status === 'auto_approved') autoApproved++;
-            if (status === 'needs_approval') needsApproval++;
-            if (status === 'unmatched') unmatched++;
+            if (resolvedStatus === 'auto_approved') autoApproved++;
+            if (resolvedStatus === 'needs_approval') needsApproval++;
+            if (resolvedStatus === 'unmatched') unmatched++;
             if (dollarImpact !== null) totalDollarImpact += dollarImpact;
 
             return [{
                 id: String(row.id),
-                activityLogId: matchedLog?.id ? String(matchedLog.id) : null,
+                activityLogId: hasActivityLog ? String(matchedLog.id) : null,
                 invoiceNumber: invNum,
                 vendorName: row.vendor_name ?? 'Unknown',
                 total: Number(row.total ?? 0),
@@ -211,11 +230,12 @@ export async function GET(req: NextRequest) {
                 tax: row.tax !== null ? Number(row.tax) : null,
                 tariff: row.tariff !== null ? Number(row.tariff) : null,
                 labor: row.labor !== null ? Number(row.labor) : null,
-                status,
+                status: resolvedStatus,
                 poNumber: row.po_number ?? null,
                 processedAt,
                 dollarImpact,
                 balanceWarning,
+                metadata: hasActivityLog ? (matchedLog?.metadata ?? null) : null,
             }];
         });
 
