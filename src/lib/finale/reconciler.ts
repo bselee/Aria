@@ -265,12 +265,17 @@ export async function approvePendingReconciliation(id: string): Promise<{
     try {
         const sbPre = createClient();
         if (sbPre) {
+            const identity = buildReconciliationIdentityMetadata({
+                invoiceNumber: entry.result.invoiceNumber,
+                vendorName: entry.result.vendorName,
+                orderId: entry.result.orderId,
+            });
             const { data: pendingLog } = await sbPre.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
                 action_taken: "Pending — applying approved changes to Finale...",
-                metadata: { invoiceNumber: entry.result.invoiceNumber, orderId: entry.result.orderId, status: "pending", approvalId: id },
+                metadata: { ...identity, status: "pending", approvalId: id },
             }).select("id").single();
             pendingLogId = pendingLog?.id ?? null;
         }
@@ -453,8 +458,11 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
                 intent: "RECONCILIATION",
                 action_taken: "Rejected via Telegram — no changes applied",
                 metadata: {
-                    invoiceNumber: entry.result.invoiceNumber,
-                    orderId: entry.result.orderId,
+                    ...buildReconciliationIdentityMetadata({
+                        invoiceNumber: entry.result.invoiceNumber,
+                        vendorName: entry.result.vendorName,
+                        orderId: entry.result.orderId,
+                    }),
                     approvalId: id,
                     verdict: "rejected",
                 },
@@ -556,15 +564,41 @@ async function checkDuplicateReconciliation(
         const supabase = createClient();
         if (!supabase) return { isDuplicate: false };
 
-        const invoiceDate = invoice.date ? new Date(invoice.date) : new Date();
+        const identity = buildReconciliationIdentityMetadata({
+            invoiceNumber: invoice.invoiceNumber,
+            vendorName: invoice.vendorName,
+            orderId,
+        });
+
+        const formatDuplicate = (entry: any) => {
+            const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", {
+                month: "2-digit",
+                day: "2-digit",
+                year: "numeric",
+            });
+            return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+        };
+
+        const { data: canonicalMatch, error: canonicalErr } = await supabase
+            .from("ap_activity_log")
+            .select("created_at, action_taken, metadata")
+            .eq("intent", "RECONCILIATION")
+            .filter("metadata->>reconciliationKey", "eq", identity.reconciliationKey)
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+        if (!canonicalErr && canonicalMatch && canonicalMatch.length > 0) {
+            return formatDuplicate(canonicalMatch[0]);
+        }
 
         // 1. Fuzzy Vendor Name, Exact Invoice Number
-        const vendorPattern = `%${invoice.vendorName.trim()}%`;
+        const vendorPattern = `%${String(invoice.vendorName || "").trim()}%`;
         const { data: exactMatch, error: exactErr } = await supabase
             .from("ap_activity_log")
             .select("created_at, action_taken, metadata")
             .eq("intent", "RECONCILIATION")
             .filter("metadata->>invoiceNumber", "eq", invoice.invoiceNumber)
+            .filter("metadata->>orderId", "eq", orderId)
             .ilike("metadata->>vendorName", vendorPattern)
             .order("created_at", { ascending: false })
             .limit(1);
@@ -576,12 +610,10 @@ async function checkDuplicateReconciliation(
             // Fuzzy $1 tolerance if there's a difference
             if (metaTotal !== null && invoice.total !== null) {
                  if (Math.abs(metaTotal - invoice.total) <= 1.0) {
-                     const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
-                     return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+                     return formatDuplicate(entry);
                  }
             } else {
-                 const processedAt = new Date(entry.created_at).toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
-                 return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
+                 return formatDuplicate(entry);
             }
         }
 
@@ -724,6 +756,34 @@ export interface TrackingUpdate {
     trackingNumbers: string[];
     shipDate?: string;
     carrierName?: string;
+}
+
+function normalizeReconciliationToken(value: string | null | undefined): string {
+    return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+}
+
+export function buildReconciliationIdentityMetadata(input: {
+    invoiceNumber: string | null | undefined;
+    vendorName: string | null | undefined;
+    orderId: string | null | undefined;
+}) {
+    const normalizedVendorName = normalizeReconciliationToken(input.vendorName);
+    const normalizedInvoiceNumber = normalizeReconciliationToken(input.invoiceNumber);
+    const normalizedOrderId = normalizeReconciliationToken(input.orderId);
+
+    return {
+        invoiceNumber: input.invoiceNumber ?? null,
+        vendorName: input.vendorName ?? null,
+        orderId: input.orderId ?? null,
+        normalizedVendorName,
+        normalizedInvoiceNumber,
+        normalizedOrderId,
+        reconciliationKey: `${normalizedVendorName}::${normalizedInvoiceNumber}::${normalizedOrderId}`,
+    };
 }
 
 // ──────────────────────────────────────────────────
@@ -2084,11 +2144,15 @@ export function buildAuditMetadata(
     applyResult: { applied: string[]; skipped: string[]; errors: string[] },
     trigger: "auto" | "telegram" | "manual"
 ) {
-    return {
-        trigger,
+    const identity = buildReconciliationIdentityMetadata({
         invoiceNumber: result.invoiceNumber,
-        orderId: result.orderId,
         vendorName: result.vendorName,
+        orderId: result.orderId,
+    });
+
+    return {
+        ...identity,
+        trigger,
         total: result.invoiceTotal,
         verdict: result.overallVerdict,
         totalDollarImpact: result.totalDollarImpact,
