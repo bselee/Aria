@@ -39,14 +39,14 @@ export async function POST(req: NextRequest) {
     try {
         const { vendorName, vendorPartyId, items } = await req.json() as FlowRequest;
 
-        if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
+        if (!vendorPartyId) {
             return NextResponse.json(
-                { success: false, message: "vendorPartyId and non-empty items are required" },
+                { success: false, message: "vendorPartyId is required" },
                 { status: 400 },
             );
         }
 
-        const finaleDemand = items
+        const finaleDemand = (items || [])
             .filter(item => parseQty(item.quantity) > 0)
             .map(item => ({
                 sku: item.productId,
@@ -62,11 +62,12 @@ export async function POST(req: NextRequest) {
             basautoDemand = Object.entries(basautoData.purchases || {})
                 .filter(([vendor]) => normalizeVendorLabel(vendor) === vendorNorm)
                 .flatMap(([, vendorItems]) => vendorItems
-                    .filter(item => parseQty(item.recommendedReorderQty || item.remaining) > 0)
+                    .filter(item => item.sku)
                     .map(item => ({
                         sku: item.sku,
                         description: item.description || item.sku,
-                        requiredQty: parseQty(item.recommendedReorderQty || item.remaining),
+                        // basauto may not have quantities — presence means needed, default to 1
+                        requiredQty: parseQty(item.recommendedReorderQty || item.remaining) || 1,
                     })));
         } catch (err: any) {
             console.warn("[uline-flow] basauto scrape failed (continuing without):", err.message);
@@ -106,7 +107,7 @@ export async function POST(req: NextRequest) {
         }
 
         // ── Stage 3: Create or reuse draft (Finale owns this decision) ───────
-        const unitPriceBySku = new Map(items.map(item => [item.productId.trim().toUpperCase(), item.unitPrice ?? 0]));
+        const unitPriceBySku = new Map((items || []).map(item => [item.productId.trim().toUpperCase(), item.unitPrice ?? 0]));
         const draftResult = await finale.createDraftPurchaseOrder(
             vendorPartyId,
             aggregatedDemand.map(item => ({
