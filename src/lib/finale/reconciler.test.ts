@@ -10,13 +10,23 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { createClientMock } = vi.hoisted(() => ({
+    createClientMock: vi.fn(),
+}));
+
 import {
     validateInvoiceBalance,
     normalizeLineTotal,
     reconcileFees,
     reconcileInvoiceToPO,
+    buildAuditMetadata,
 } from "./reconciler";
 import type { InvoiceData } from "../pdf/invoice-parser";
+
+vi.mock("../supabase", () => ({
+    createClient: createClientMock,
+}));
 
 vi.mock("../intelligence/vendor-memory", () => ({
     getVendorPattern: vi.fn().mockResolvedValue(null),
@@ -325,6 +335,7 @@ describe("reconcileFees", () => {
 describe("reconcileInvoiceToPO guardrails", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        createClientMock.mockReturnValue(null);
     });
 
     it("auto-approves freight-only truckload charges when product pricing is unchanged", async () => {
@@ -392,5 +403,94 @@ describe("reconcileInvoiceToPO guardrails", () => {
 
         expect(result.overallVerdict).toBe("needs_approval");
         expect(result.priceChanges[0]?.verdict).toBe("needs_approval");
+    });
+
+    it("does not treat the same invoice as a duplicate when it was previously logged against a different PO", async () => {
+        const canonicalLimitMock = vi.fn().mockResolvedValue({
+            data: [],
+            error: null,
+        });
+        const canonicalOrderMock = vi.fn(() => ({ limit: canonicalLimitMock }));
+        const fallbackLimitMock = vi.fn().mockResolvedValue({
+            data: [],
+            error: null,
+        });
+        const fallbackOrderMock = vi.fn(() => ({ limit: fallbackLimitMock }));
+        const fallbackIlikeMock = vi.fn(() => ({ order: fallbackOrderMock }));
+        const fallbackFilterOrderIdMock = vi.fn(() => ({ ilike: fallbackIlikeMock }));
+        const eqMock = vi.fn(() => ({
+            filter: vi.fn((field: string) => {
+                if (field === "metadata->>reconciliationKey") {
+                    return { order: canonicalOrderMock };
+                }
+                return { filter: fallbackFilterOrderIdMock };
+            }),
+        }));
+        const selectMock = vi.fn(() => ({ eq: eqMock }));
+
+        createClientMock.mockReturnValue({
+            from: vi.fn(() => ({
+                select: selectMock,
+            })),
+        });
+
+        const invoice = makeInvoice({
+            invoiceNumber: "INV-1001",
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            lineItems: [
+                { sku: "SKU-1", description: "Organic Compost", qty: 10, unitPrice: 50, total: 500 },
+            ],
+            subtotal: 500,
+            total: 500,
+            amountDue: 500,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [
+                    { productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Organic Compost" },
+                ],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+
+        expect(result.overallVerdict).not.toBe("duplicate");
+    });
+
+    it("includes a canonical reconciliation key in audit metadata", () => {
+        const metadata = buildAuditMetadata(
+            {
+                orderId: "PO-001",
+                invoiceNumber: "INV-1001",
+                vendorName: "Acme Soil LLC",
+                invoiceTotal: 500,
+                priceChanges: [],
+                feeChanges: [],
+                trackingUpdate: null,
+                overallVerdict: "auto_approve",
+                summary: "ok",
+                totalDollarImpact: 0,
+                autoApplicable: true,
+                warnings: [],
+            } as any,
+            { applied: [], skipped: [], errors: [] },
+            "auto",
+        );
+
+        expect(metadata).toEqual(expect.objectContaining({
+            reconciliationKey: "acme_soil_llc::inv_1001::po_001",
+            orderId: "PO-001",
+            invoiceNumber: "INV-1001",
+            vendorName: "Acme Soil LLC",
+        }));
     });
 });

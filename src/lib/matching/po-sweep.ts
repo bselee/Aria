@@ -7,7 +7,7 @@
 
 import { createClient } from "../supabase";
 import { FinaleClient } from "../finale/client";
-import { reconcileInvoiceToPO, applyReconciliation } from "../finale/reconciler";
+import { reconcileInvoiceToPO, applyReconciliation, buildReconciliationIdentityMetadata } from "../finale/reconciler";
 import Fuse from "fuse.js";
 
 export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false) {
@@ -144,6 +144,11 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
                         if (result.overallVerdict === "auto_approve") {
                             const applyResult = await applyReconciliation(result, finale);
                             console.log(`     ↳ Applied ${applyResult.applied.length} change(s) to Finale`);
+                            const identity = buildReconciliationIdentityMetadata({
+                                invoiceNumber: match.invoice_number,
+                                vendorName: match.vendor_name,
+                                orderId: po.orderId,
+                            });
                             
                             // Log it so we don't repeat
                             await supabase.from("ap_activity_log").insert({
@@ -151,16 +156,21 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
                                 email_subject: `PO-Sweep: Invoice ${match.invoice_number} → PO ${po.orderId}`,
                                 intent: "RECONCILIATION",
                                 action_taken: `Auto-applied: ${applyResult.applied.length} changes`,
-                                metadata: { invoiceNumber: match.invoice_number, orderId: po.orderId }
+                                metadata: identity,
                             });
                         } else if (result.overallVerdict === "needs_approval") {
                             console.log(`     ↳ Flagged for human review. Telegram approval not automatically sent from this sweep yet, please review PO manually.`);
+                            const identity = buildReconciliationIdentityMetadata({
+                                invoiceNumber: match.invoice_number,
+                                vendorName: match.vendor_name,
+                                orderId: po.orderId,
+                            });
                             await supabase.from("ap_activity_log").insert({
                                 email_from: match.vendor_name,
                                 email_subject: `PO-Sweep: Invoice ${match.invoice_number} → PO ${po.orderId}`,
                                 intent: "RECONCILIATION",
                                 action_taken: `Flagged for review: ${result.overallVerdict}`,
-                                metadata: { invoiceNumber: match.invoice_number, orderId: po.orderId }
+                                metadata: identity,
                             });
                         }
                     } catch (err: any) {
