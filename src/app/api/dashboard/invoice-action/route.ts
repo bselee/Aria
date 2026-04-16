@@ -34,7 +34,7 @@ export async function POST(req: Request) {
 
         console.log(`[Invoice Action] Forwarding manual upload ${filename} to Bill.com...`);
         // Forward to Bill.com
-        await apAgent.forwardToBillCom(gmail, subjectString, filename, bufferBase64);
+        await apAgent.forwardToBillCom(gmail, subjectString, filename, buffer);
 
         // Process invoice in background — OCR + Finale reconciliation can take 30-60s.
         // Results arrive via Telegram (approval buttons or auto-apply summary).

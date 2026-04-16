@@ -128,32 +128,27 @@ function BuildRow({ b, risk, completed }: { b: Build; risk: string; completed?: 
 
   return (
     <div className="px-4 py-2.5 border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors">
-      <div className="flex items-center gap-3">
-        {/* Color-coded dot: emerald=done, rose=critical, amber=warning, blue=watch, zinc=ok */}
-        <span className={`w-2 h-2 rounded-full shrink-0 ${dot}`} />
-        <div className="min-w-0 flex-1 flex items-center justify-between">
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{b.sku}</span>
-            <span className="text-[10px] font-mono px-1 border border-zinc-700 bg-zinc-800 text-zinc-400 rounded shrink-0">{b.designation}</span>
-          </div>
-          <div className="flex items-center gap-3 shrink-0">
-            {completed && (
-              <span className="text-[10px] font-mono text-emerald-400">
-                ✓ {fmtCompletedAt(completed.completed_at)}
-              </span>
-            )}
-            {/* Scheduled vs Actual fulfillment badge */}
-            {completed && (
-              <FulfillmentBadge scheduledQty={b.quantity} actualQty={completed.quantity} />
-            )}
-            {showRisk && (
-              <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
-            )}
-            {/* Show scheduled qty when not yet completed, actual qty when done */}
-            {!completed && (
-              <span className="text-sm font-mono text-emerald-400">×{b.quantity.toLocaleString()}</span>
-            )}
-          </div>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className={`w-2 h-2 rounded-full shrink-0 mt-0.5 ${dot}`} />
+          <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{b.sku}</span>
+          <span className="text-[10px] font-mono px-1 border border-zinc-700 bg-zinc-800 text-zinc-400 rounded shrink-0">{b.designation}</span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {!completed && (
+            <span className="text-sm font-mono text-emerald-400">×{b.quantity.toLocaleString()}</span>
+          )}
+          {completed && (
+            <FulfillmentBadge scheduledQty={b.quantity} actualQty={completed.quantity} />
+          )}
+          {showRisk && (
+            <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
+          )}
+          {completed && (
+            <span className="text-[10px] font-mono text-emerald-400">
+              ✓ {fmtCompletedAt(completed.completed_at)}
+            </span>
+          )}
         </div>
       </div>
       {desc && (
@@ -166,15 +161,15 @@ function BuildRow({ b, risk, completed }: { b: Build; risk: string; completed?: 
 function CompletionRow({ c, noCalEvent }: { c: Completion; noCalEvent?: boolean }) {
   return (
     <div className="px-4 py-2.5 border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors">
-      <div className="flex items-center gap-3">
-        <span className="w-2 h-2 rounded-full shrink-0 bg-emerald-500" />
-        <div className="min-w-0 flex-1 flex items-center justify-between">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-2 h-2 rounded-full shrink-0 mt-0.5 bg-emerald-500" />
           <span className="text-sm font-mono font-semibold text-zinc-200 truncate">{c.sku}</span>
-          <div className="flex items-center gap-3 shrink-0">
-            <span className="text-[10px] font-mono text-emerald-400">✓ {fmtCompletedAt(c.completed_at)}</span>
-            <span className="text-sm font-mono text-zinc-400">×{c.quantity.toLocaleString()}</span>
-            {noCalEvent && <span className="text-[10px] font-mono text-zinc-600 italic">no cal event</span>}
-          </div>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="text-[10px] font-mono text-emerald-400">✓ {fmtCompletedAt(c.completed_at)}</span>
+          <span className="text-sm font-mono text-zinc-400">×{c.quantity.toLocaleString()}</span>
+          {noCalEvent && <span className="text-[10px] font-mono text-zinc-600 italic">no cal event</span>}
         </div>
       </div>
     </div>

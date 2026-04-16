@@ -2,7 +2,7 @@
 
 import React from "react";
 import { useEffect, useState, useCallback } from "react";
-import { Receipt, ChevronDown, Check, X, AlertCircle } from "lucide-react";
+import { Receipt, ChevronDown, ChevronRight, Check, X, AlertCircle, Loader2 } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
 
 /** Threshold in days: pending items older than this are considered stale */
@@ -35,6 +35,108 @@ const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean
 
 function statusCfg(status: string) {
   return STATUS_CFG[status as StatusKey] ?? { dot: "bg-zinc-600", label: status.toUpperCase(), pulse: false };
+}
+
+// ── Reconciliation Detail (copied from ActivityFeed.tsx) ──────────────────────
+
+function fmtDollars(n: number): string {
+    return "$" + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function ReconciliationDetail({ metadata }: { metadata: Record<string, unknown> | null }) {
+    if (!metadata) return null;
+
+    const priceChanges = (metadata.priceChanges as any[]) || [];
+    const feeChanges = (metadata.feeChanges as any[]) || [];
+    const tracking = metadata.tracking as any;
+    const totalImpact = (metadata.totalDollarImpact ?? metadata.totalImpact ?? 0) as number;
+    const verdict = metadata.verdict as string | undefined;
+
+    const meaningfulPrices = priceChanges.filter(
+        (pc: any) => pc.verdict !== "no_change" && pc.verdict !== "no_match"
+    );
+
+    if (meaningfulPrices.length === 0 && feeChanges.length === 0 && !tracking) {
+        return null;
+    }
+
+    return (
+        <div className="mt-3 space-y-2 font-mono text-xs border-t border-zinc-700/40 pt-2">
+            {verdict && (
+                <div className="flex items-center gap-1.5">
+                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${verdict === "auto_approve" ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
+                            : verdict === "needs_approval" ? "text-amber-400 bg-amber-500/10 border-amber-500/20"
+                                : verdict === "rejected" ? "text-rose-400 bg-rose-500/10 border-rose-500/20"
+                                    : "text-zinc-400 bg-zinc-700/20 border-zinc-700/30"
+                        }`}>
+                        {verdict.replace(/_/g, " ")}
+                    </span>
+                    <span className="text-zinc-500">
+                        Impact: <span className={totalImpact > 0 ? "text-amber-400" : "text-zinc-400"}>{fmtDollars(totalImpact)}</span>
+                    </span>
+                </div>
+            )}
+
+            {meaningfulPrices.length > 0 && (
+                <div>
+                    <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-1">Price Changes</div>
+                    <div className="space-y-0.5">
+                        {meaningfulPrices.map((pc: any, i: number) => (
+                            <div key={i} className="flex items-center gap-2">
+                                <span className={`text-[10px] ${pc.verdict === "auto_approve" ? "text-emerald-500" : pc.verdict === "rejected" ? "text-rose-500" : "text-amber-500"}`}>
+                                    {pc.verdict === "auto_approve" ? "✅" : pc.verdict === "rejected" ? "🚨" : "⚠️"}
+                                </span>
+                                <span className="text-zinc-300 truncate max-w-[120px]" title={pc.description || pc.productId}>
+                                    {pc.description || pc.productId}
+                                </span>
+                                <span className="text-zinc-600">{fmtDollars(pc.from ?? 0)}</span>
+                                <span className="text-zinc-600">→</span>
+                                <span className="text-zinc-200">{fmtDollars(pc.to ?? 0)}</span>
+                                <span className={`text-[10px] ${(pc.pct ?? 0) > 0 ? "text-rose-400" : "text-emerald-400"}`}>
+                                    {(pc.pct ?? 0) > 0 ? "+" : ""}{(pc.pct ?? 0).toFixed(1)}%
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {feeChanges.length > 0 && (
+                <div>
+                    <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-1">Fee / Charge Updates</div>
+                    <div className="space-y-0.5">
+                        {feeChanges.map((fc: any, i: number) => (
+                            <div key={i} className="flex items-center gap-2">
+                                <span className={`text-[10px] ${fc.verdict === "auto_approve" ? "text-emerald-500" : "text-amber-500"}`}>
+                                    {fc.verdict === "auto_approve" ? "✅" : "⚠️"}
+                                </span>
+                                <span className="text-zinc-300 truncate max-w-[120px]">{fc.description || fc.type}</span>
+                                {(fc.from ?? 0) > 0 && (
+                                    <>
+                                        <span className="text-zinc-600">{fmtDollars(fc.from)}</span>
+                                        <span className="text-zinc-600">→</span>
+                                    </>
+                                )}
+                                <span className="text-zinc-200">{fmtDollars(fc.to ?? 0)}</span>
+                                {(fc.from ?? 0) === 0 && <span className="text-[10px] text-blue-400 uppercase">New</span>}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {tracking && (
+                <div>
+                    <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-1">Tracking</div>
+                    {tracking.trackingNumbers?.length > 0 && (
+                        <div className="text-zinc-300">🚚 {tracking.trackingNumbers.join(", ")}</div>
+                    )}
+                    {tracking.shipDate && <div className="text-zinc-400">📅 Ship date: {tracking.shipDate}</div>}
+                    {tracking.carrier && <div className="text-zinc-400">📦 Carrier: {tracking.carrier}</div>}
+                </div>
+            )}
+        </div>
+    );
 }
 
 // ── Guidance ──────────────────────────────────────────────────────────────────
@@ -81,10 +183,13 @@ export default function InvoiceQueuePanel() {
   const [loading, setLoading] = useState(true);
   const [actingOn, setActingOn] = useState<string | null>(null);
   const [bulkDismissing, setBulkDismissing] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
   // Handle approve/dismiss actions
   const handleAction = useCallback(async (id: string, action: "approve" | "dismiss") => {
     setActingOn(id);
+    setToast(null);
     try {
       const res = await fetch("/api/dashboard/reconciliation-action", {
         method: "POST",
@@ -93,13 +198,17 @@ export default function InvoiceQueuePanel() {
       });
       const data = await res.json();
       if (!res.ok) {
-        console.error("Action failed:", data.error);
+        setToast({ message: data.error || "Action failed", type: "error" });
+      } else {
+        setToast({ message: data.message || `${action} applied`, type: "success" });
+        setExpandedId(null);
       }
     } catch (err) {
-      console.error("Action error:", err);
+      setToast({ message: "Network error", type: "error" });
     } finally {
       setActingOn(null);
-      fetchData(true); // bust cache and refresh
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
     }
   }, []);
 
@@ -251,6 +360,16 @@ export default function InvoiceQueuePanel() {
             </div>
           )}
 
+          {/* Toast notification */}
+          {toast && (
+            <div className={`mx-4 my-2 px-3 py-2 rounded-md text-xs font-mono border animate-in fade-in slide-in-from-top-1 ${toast.type === "success"
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+              }`}>
+              {toast.message}
+            </div>
+          )}
+
           {/* Skeleton loading */}
           {loading && (
             <div className="px-4 py-2 space-y-2.5">
@@ -288,77 +407,99 @@ export default function InvoiceQueuePanel() {
           {/* Fresh pending invoices — highlighted row */}
           {freshPending.map(inv => {
             const cfg = statusCfg(inv.status);
+            const isExpanded = expandedId === inv.id;
+            const hasDetail = inv.metadata && (
+              ((inv.metadata as any).priceChanges?.length > 0) ||
+              ((inv.metadata as any).feeChanges?.length > 0) ||
+              (inv.metadata as any).tracking
+            );
             return (
               <div
                 key={inv.id}
-                className="flex items-start gap-2.5 px-4 py-2 border-b border-amber-500/10 bg-amber-500/5 border-l-2"
+                className="border-b border-amber-500/10 bg-amber-500/5 border-l-2"
                 style={{ borderLeftColor: "var(--dash-accent-pending)" }}
               >
-                <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
-                      {inv.vendorName}
-                    </span>
-                    {inv.invoiceNumber && (
-                      <span className="text-[10px] font-mono text-zinc-500 shrink-0">
-                        #{inv.invoiceNumber}
+                <div className="flex items-start gap-2.5 px-4 py-2">
+                  <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
+                        {inv.vendorName}
                       </span>
-                    )}
-                    {inv.poNumber && (
-                      <span className="text-xs font-mono text-blue-400 shrink-0">
-                        → PO {inv.poNumber}
-                      </span>
-                    )}
-                    {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
-                      <span
-                        className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
-                        title={inv.balanceWarning ?? undefined}
-                      >
-                        {inv.dollarImpact >= 0 ? "+" : ""}${Math.abs(inv.dollarImpact).toFixed(2)}
-                        {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
-                      </span>
-                    )}
-                    <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
-                      {timeAgo(inv.processedAt)}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1">
-                    {(() => {
-                      const g = pendingGuidance(inv);
-                      return (
-                        <span className={`text-[10px] font-mono truncate ${g.suggestion === "dismiss" ? "text-zinc-500" :
-                            g.suggestion === "approve" ? "text-emerald-400/70" :
-                              "text-amber-300/70"
-                          }`}>
-                          {g.suggestion === "approve" ? "✓ " : g.suggestion === "dismiss" ? "⊘ " : "⚠ "}
-                          {g.text}
+                      {inv.invoiceNumber && (
+                        <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                          #{inv.invoiceNumber}
                         </span>
-                      );
-                    })()}
-                    <div className="flex-1" />
-                    {inv.activityLogId && (
-                      <>
-                        <button
-                          onClick={() => handleAction(inv.activityLogId!, "approve")}
-                          disabled={actingOn === inv.activityLogId}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                      )}
+                      {inv.poNumber && (
+                        <span className="text-xs font-mono text-blue-400 shrink-0">
+                          → PO {inv.poNumber}
+                        </span>
+                      )}
+                      {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
+                        <span
+                          className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
+                          title={inv.balanceWarning ?? undefined}
                         >
-                          <Check className="w-3 h-3" />
-                          {actingOn === inv.activityLogId ? "..." : "Approve"}
-                        </button>
+                          {inv.dollarImpact >= 0 ? "+" : ""}${Math.abs(inv.dollarImpact).toFixed(2)}
+                          {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
+                        </span>
+                      )}
+                      <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
+                        {timeAgo(inv.processedAt)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1">
+                      {(() => {
+                        const g = pendingGuidance(inv);
+                        return (
+                          <span className={`text-[10px] font-mono truncate ${g.suggestion === "dismiss" ? "text-zinc-500" :
+                              g.suggestion === "approve" ? "text-emerald-400/70" :
+                                "text-amber-300/70"
+                            }`}>
+                            {g.suggestion === "approve" ? "✓ " : g.suggestion === "dismiss" ? "⊘ " : "⚠ "}
+                            {g.text}
+                          </span>
+                        );
+                      })()}
+                      <div className="flex-1" />
+                      {hasDetail && (
                         <button
-                          onClick={() => handleAction(inv.activityLogId!, "dismiss")}
-                          disabled={actingOn === inv.activityLogId}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                          onClick={() => setExpandedId(isExpanded ? null : inv.id)}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50 transition-colors"
                         >
-                          <X className="w-3 h-3" />
-                          Dismiss
+                          {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                          {isExpanded ? "Hide" : "Details"}
                         </button>
-                      </>
-                    )}
+                      )}
+                      {inv.activityLogId && (
+                        <>
+                          <button
+                            onClick={() => handleAction(inv.activityLogId!, "approve")}
+                            disabled={actingOn === inv.activityLogId}
+                            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                          >
+                            {actingOn === inv.activityLogId ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                            {actingOn === inv.activityLogId ? "..." : "Approve"}
+                          </button>
+                          <button
+                            onClick={() => handleAction(inv.activityLogId!, "dismiss")}
+                            disabled={actingOn === inv.activityLogId}
+                            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                          >
+                            <X className="w-3 h-3" />
+                            Dismiss
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
+                {isExpanded && inv.metadata && (
+                  <div className="px-4 pb-3">
+                    <ReconciliationDetail metadata={inv.metadata as Record<string, unknown>} />
+                  </div>
+                )}
               </div>
             );
           })}

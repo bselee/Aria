@@ -10,7 +10,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, ExternalLink, Package } from "lucide-react";
+import { Calendar, RefreshCw, ChevronDown, AlertTriangle, CheckCircle2, Clock, Package } from "lucide-react";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS } from "@/lib/purchasing/calendar-lifecycle";
 import type { POCompletionState } from "@/lib/purchasing/po-completion-state";
 
@@ -311,9 +311,19 @@ export default function PurchasingCalendarPanel() {
                                             {recentlyReceived.map(po => (
                                                 <div key={po.orderId} className="flex items-center gap-2 text-[10px] text-zinc-600 font-mono">
                                                     <CheckCircle2 className="h-2.5 w-2.5 text-emerald-600/50 shrink-0" />
-                                                    <span className="truncate">
-                                                        #{po.orderId} {po.vendorName} â€” rcvd {shortDate(po.receiveDate)}
-                                                    </span>
+                                                    <div className="flex items-center gap-1.5 truncate">
+                                                        <a
+                                                            href={po.finaleUrl}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="hover:underline text-zinc-500"
+                                                        >
+                                                            #{po.orderId}
+                                                        </a>
+                                                        <span>
+                                                            {po.vendorName} — rcvd {shortDate(po.receiveDate)}
+                                                        </span>
+                                                    </div>
                                                 </div>
                                             ))}
                                         </div>
@@ -458,110 +468,76 @@ function PORow({
                     )}
                 </div>
 
-                {/* Content */}
-                <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                        <a
-                            href={po.finaleUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className={`text-[11px] font-mono font-medium hover:underline ${
-                                variant === "overdue" ? "text-red-300" :
-                                    variant === "today" ? "text-blue-300" :
-                                        "text-zinc-300"
-                            }`}
-                        >
-                            #{po.orderId}
-                        </a>
-                        <span className="text-[10px] text-zinc-500 truncate">
-                            {po.vendorName}
-                        </span>
-                        {/* Finale link icon */}
-                        <a
-                            href={po.finaleUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                            <ExternalLink className="h-2.5 w-2.5 text-zinc-600 hover:text-zinc-400" />
-                        </a>
-                    </div>
-
-                    {/* Items summary */}
-                    <div className="text-[10px] text-zinc-500 font-mono mt-0.5 truncate">
-                        {topSkus}{more} Â· {itemCount.toLocaleString()} units
-                    </div>
-
-                    {needsAPFollowUp && (
-                        <div className="mt-1 text-[10px] font-mono text-emerald-300/80">
-                            {followUpLabel(po.completionState)}
-                        </div>
-                    )}
-
-                    {/* Overdue info */}
-                    {variant === "overdue" && (
-                        <div className="flex items-center gap-2 mt-1">
-                            <span className="text-[10px] font-mono text-red-400/80">
-                                Expected {shortDate(po.expectedDate)} Â· {daysOverdue}d overdue
+                {/* Main row: vendor+po left, items right */}
+                <div className="flex items-start justify-between gap-2 flex-1 min-w-0">
+                    <div className="flex-1 min-w-0">
+                        {/* PO link + ETA — top row */}
+                        <div className="flex items-center gap-2">
+                            <a
+                                href={po.finaleUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[11px] font-mono font-medium text-zinc-300 hover:underline"
+                            >
+                                #{po.orderId}
+                            </a>
+                            <span className="text-[10px] font-mono text-zinc-500 truncate">
+                                {po.vendorName}
                             </span>
-                            {!hasTracking && (
-                                <span className="text-[10px] font-mono text-amber-400/70 px-1 py-0.5 bg-amber-500/10 rounded border border-amber-500/20">
-                                    âš  NO TRACKING â€” INVESTIGATE
-                                </span>
-                            )}
-                            {hasTracking && revisedEtaDate && (
-                                <span className="text-[10px] font-mono text-amber-300/80 px-1 py-0.5 bg-amber-500/10 rounded border border-amber-500/20">
-                                    Est. arrival ~{revisedEtaDate}
-                                </span>
-                            )}
                         </div>
-                    )}
-
-                    {/* Tracking links */}
-                    {hasTracking && (
-                        <div className="flex flex-wrap gap-1 mt-1">
-                            {displayShipments.slice(0, 3).map((entry, idx) => {
-                                const t = entry.tracking;
-                                const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
-                                const short = displayNum.length > 14 ? `â€¦${displayNum.slice(-10)}` : displayNum;
-                                return (
-                                    <a
-                                        key={idx}
-                                        href={entry.url}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="text-[9px] font-mono text-cyan-400/70 hover:text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 rounded px-1 py-0.5 hover:bg-cyan-500/20 transition-colors"
-                                        title={entry.status || undefined}
-                                    >
-                                        ðŸ“¦ {short}
-                                    </a>
-                                );
-                            })}
-                            {displayShipments.length > 3 && (
-                                <span className="text-[9px] font-mono text-zinc-500">
-                                    +{displayShipments.length - 3} more
+                        <div className="flex items-center gap-2 mt-0.5">
+                            {variant === "overdue" ? (
+                                <span className="text-[10px] font-mono text-red-400/80">
+                                    Expected {shortDate(po.expectedDate)} · {daysOverdue}d late
                                 </span>
-                            )}
-                        </div>
-                    )}
-
-                    {/* Lead time provenance for today/upcoming */}
-                    {variant !== "overdue" && (
-                        <div className="text-[9px] text-zinc-600 font-mono mt-0.5">
-                            ETA: {shortDate(po.expectedDate)} ({po.leadProvenance})
-                            {po.shipments?.[0]?.status_display && (
-                                <span className="ml-1 text-cyan-400/60">· {po.shipments[0].status_display}</span>
+                            ) : (
+                                <span className="text-[10px] font-mono text-zinc-500">
+                                    ETA {shortDate(po.expectedDate)}
+                                </span>
                             )}
                             {!hasTracking && (
-                                <span className="ml-1 text-amber-500/50">Â· no tracking yet</span>
+                                <span className="text-[9px] font-mono text-amber-500/70">
+                                    no tracking
+                                </span>
+                            )}
+                            {hasTracking && (
+                                <div className="flex flex-wrap gap-1">
+                                    {displayShipments.slice(0, 3).map((entry, idx) => {
+                                        const t = entry.tracking;
+                                        const displayNum = t.includes(":::") ? t.split(":::")[1] : t;
+                                        const short = displayNum.length > 14 ? `…${displayNum.slice(-10)}` : displayNum;
+                                        return (
+                                            <a
+                                                key={idx}
+                                                href={entry.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="text-[9px] font-mono text-cyan-400/70 hover:text-cyan-300"
+                                                title={entry.status || undefined}
+                                            >
+                                                {short}
+                                            </a>
+                                        );
+                                    })}
+                                </div>
                             )}
                         </div>
-                    )}
-                </div>
+                        {needsAPFollowUp && (
+                            <div className="text-[10px] font-mono text-emerald-400/80 mt-0.5">
+                                {followUpLabel(po.completionState)}
+                            </div>
+                        )}
+                    </div>
 
-                {/* Dollar amount */}
-                <div className="text-[10px] font-mono text-zinc-500 shrink-0">
-                    ${po.total.toLocaleString()}
+                    {/* Items — top right */}
+                    <div className="text-right shrink-0">
+                        <div className="text-[10px] font-mono text-zinc-400">
+                            {topSkus}{more}
+                        </div>
+                        <div className="text-[9px] font-mono text-zinc-600 mt-0.5">
+                            {itemCount.toLocaleString()} units
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
