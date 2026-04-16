@@ -399,19 +399,39 @@ async function normalizeIntake(intake: StatementIntakeRecord): Promise<Normalize
     return mapParsedStatement(parsed, intake);
 }
 
-async function fetchArchivedInvoices(intake: StatementIntakeRecord): Promise<ArchivedVendorInvoice[]> {
+const LOOKBACK_DAYS = 180;
+
+function canonicalVendorName(name: string): string {
+    const lower = name.trim().toLowerCase();
+    if (/aaa\s*cooper/i.test(lower)) return "AAA COOPER";
+    if (/\bfedex\b/i.test(lower)) return "FedEx";
+    if (/uline/i.test(lower)) return "ULINE";
+    if (/axiom.{0,10}print/i.test(lower)) return "Axiom Print";
+    if (/tera.{0,10}ganx/i.test(lower)) return "TeraGanix";
+    if (/sustainable.{0,10}village/i.test(lower)) return "Sustainable Village";
+    return name.trim();
+}
+
+export async function fetchArchivedInvoices(intake: StatementIntakeRecord): Promise<ArchivedVendorInvoice[]> {
     const supabase = createClient();
     if (!supabase) throw new Error("Supabase not configured");
+
+    const canonical = canonicalVendorName(intake.vendorName);
+    const effectiveEnd = intake.periodEnd ?? intake.statementDate ?? new Date().toISOString().split("T")[0];
+    const effectiveStart = intake.periodStart ?? (() => {
+        const d = new Date(effectiveEnd);
+        d.setDate(d.getDate() - LOOKBACK_DAYS);
+        return d.toISOString().split("T")[0];
+    })();
 
     let query = supabase
         .from("vendor_invoices")
         .select("id, vendor_name, invoice_number, invoice_date, po_number, total")
-        .ilike("vendor_name", `%${intake.vendorName}%`)
+        .ilike("vendor_name", `%${canonical}%`)
+        .gte("invoice_date", effectiveStart)
+        .lte("invoice_date", effectiveEnd)
         .order("invoice_date", { ascending: false })
         .limit(500);
-
-    if (intake.periodStart) query = query.gte("invoice_date", intake.periodStart);
-    if (intake.periodEnd) query = query.lte("invoice_date", intake.periodEnd);
 
     const { data, error } = await query;
     if (error) throw new Error(`Vendor invoice lookup failed: ${error.message}`);
