@@ -82,25 +82,95 @@ function Test-AriaBotOnline {
     return $true
 }
 
+function Invoke-OpsControlLease {
+    try {
+        Set-Location $ProjectDir
+        $json = & node --import tsx src/cli/ops-control.ts lease --consumer watchdog --targets watchdog,all 2>$null | Out-String
+        $json = $json.Trim()
+        if (-not $json -or $json -eq "null") {
+            return $null
+        }
+        return $json | ConvertFrom-Json
+    } catch {
+        Write-Log "WARN: Failed to lease ops control request: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Complete-OpsControlRequest {
+    param(
+        [string]$RequestId,
+        [string]$Result
+    )
+
+    try {
+        Set-Location $ProjectDir
+        & node --import tsx src/cli/ops-control.ts complete --id $RequestId --consumer watchdog --result $Result 2>$null | Out-Null
+    } catch {
+        Write-Log "WARN: Failed to complete ops control request $RequestId: $($_.Exception.Message)"
+    }
+}
+
+function Fail-OpsControlRequest {
+    param(
+        [string]$RequestId,
+        [string]$ErrorMessage
+    )
+
+    try {
+        Set-Location $ProjectDir
+        & node --import tsx src/cli/ops-control.ts fail --id $RequestId --consumer watchdog --error $ErrorMessage 2>$null | Out-Null
+    } catch {
+        Write-Log "WARN: Failed to fail ops control request $RequestId: $($_.Exception.Message)"
+    }
+}
+
+function Restart-AriaBot {
+    param(
+        [string]$Reason
+    )
+
+    Set-Location $ProjectDir
+
+    if (Test-AriaBotOnline) {
+        Write-Log "CRITICAL: Restarting aria-bot. Reason: $Reason"
+        $restartOutput = & pm2 restart aria-bot 2>&1 | Out-String
+        Write-Log "PM2 restart output: $restartOutput"
+    }
+    else {
+        Write-Log "CRITICAL: aria-bot is NOT running. Starting... Reason: $Reason"
+        $restartOutput = & pm2 start $EcosystemCfg --only aria-bot 2>&1 | Out-String
+        Write-Log "PM2 start output: $restartOutput"
+    }
+
+    & pm2 save 2>&1 | Out-Null
+
+    $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $msg = [char]0xD83D + [char]0xDEA8 + " <b>Watchdog Action - Bot Restarted</b>" + [char]10 + [char]10
+    $msg += "aria-bot was restarted by the watchdog." + [char]10
+    $msg += "Time: $now" + [char]10
+    $msg += "Reason: $Reason" + [char]10 + [char]10
+    $msg += "Check logs: pm2 logs aria-bot --lines 20"
+    Send-TelegramAlert $msg
+}
+
 # -- Main watchdog logic --
 try {
+    $controlRequest = Invoke-OpsControlLease
+    if ($controlRequest) {
+        if ($controlRequest.command -eq "restart_bot") {
+            Restart-AriaBot "Supabase control plane requested restart: $($controlRequest.reason)"
+            Complete-OpsControlRequest -RequestId $controlRequest.id -Result "watchdog_restart_completed"
+        }
+        else {
+            Fail-OpsControlRequest -RequestId $controlRequest.id -ErrorMessage "unsupported_watchdog_command:$($controlRequest.command)"
+        }
+    }
+
     $isOnline = Test-AriaBotOnline
 
     if (-not $isOnline) {
-        Write-Log "CRITICAL: aria-bot is NOT running. Restarting..."
-
-        Set-Location $ProjectDir
-        $restartOutput = & pm2 start $EcosystemCfg --only aria-bot 2>&1 | Out-String
-        Write-Log "PM2 start output: $restartOutput"
-        & pm2 save 2>&1 | Out-Null
-
-        $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        $msg = [char]0xD83D + [char]0xDEA8 + " <b>Watchdog Alert - Bot Restarted</b>" + [char]10 + [char]10
-        $msg += "aria-bot was <b>not running</b> and has been restarted by the watchdog." + [char]10
-        $msg += "Time: $now" + [char]10
-        $msg += "Reason: Process missing or stopped in PM2" + [char]10 + [char]10
-        $msg += "Check logs: pm2 logs aria-bot --lines 20"
-        Send-TelegramAlert $msg
+        Restart-AriaBot "Process missing or stopped in PM2"
     }
     else {
         # Bot is online - only log hourly heartbeat (when minute 0-4)

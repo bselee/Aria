@@ -32,6 +32,7 @@ import { SlackWatchdog } from '../lib/slack/watchdog';
 import { APAgent } from '../lib/intelligence/ap-agent';
 import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import { initSandboxWatcher } from '../lib/intelligence/sandbox-watcher';
+import { startBotControlPlane } from '../lib/ops/bot-control-plane';
 import {
     approvePendingReconciliation,
     rejectPendingReconciliation,
@@ -1167,6 +1168,8 @@ bot.on('text', async (ctx) => {
     }
 
     const ops = new OpsManager(bot);
+    ops.registerJobs();
+    console.log('[boot] OpsManager cron jobs registered.');
 
     // Start Slack Watchdog in-process BEFORE botDeps construction
     // so deps.watchdog captures the live instance, not null.
@@ -1208,6 +1211,7 @@ bot.on('text', async (ctx) => {
         botStartTime: BOT_START_TIME,
     };
     registerAllCommands(bot, botDeps);
+    startBotControlPlane(ops);
 
 
     console.log('Ã°Å¸â€œâ€¦ Cron schedules registered:');
@@ -1266,16 +1270,17 @@ bot.on('text', async (ctx) => {
     // a Telegram alert so Will can investigate or restart.
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000; // 30 min
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
-        { name: 'Supervisor', maxStaleMin: 15 },
-        { name: 'EmailIngestionDefault', maxStaleMin: 15 },
-        { name: 'APIdentifierAgent', maxStaleMin: 35 },
-        { name: 'APForwarderAgent', maxStaleMin: 35 },
+        { name: 'APPolling', maxStaleMin: 20 },
+        { name: 'POSync', maxStaleMin: 65 },
+        { name: 'BuildCompletionWatcher', maxStaleMin: 65 },
+        { name: 'POReceivingWatcher', maxStaleMin: 65 },
     ];
     let lastCronWatchdogAlert = 0;
     setInterval(async () => {
         try {
             const { createClient } = await import('../lib/supabase');
             const supabase = createClient();
+            if (!supabase) return;
             const cutoff = new Date(Date.now() - 35 * 60 * 1000).toISOString(); // 35 min ago
             const { data } = await supabase.from('cron_runs')
                 .select('task_name, started_at')
