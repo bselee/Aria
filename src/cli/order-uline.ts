@@ -1198,7 +1198,7 @@ async function main() {
     }
 
     console.log(`   Items to order: ${finalItems.length}`);
-    console.log(`   Method: ${args.useGrid ? 'Grid (individual fields)' : 'Paste Items (bulk textarea)'}\n`);
+    console.log(`   Method: Paste Items (bulk textarea)\n`);
 
     if (args.dryRun) {
         console.log('   ✅ Dry run complete. Run without --dry-run to place faux order.\n');
@@ -1210,6 +1210,8 @@ async function main() {
             console.log(`   ${item.ulineModel}, ${item.quantity}`);
         }
         console.log('   ─────────────────────────────────────────');
+        console.log('\n   📝 After cart fill, verified prices will sync back to Finale PO.');
+        console.log('   🛒 Cart verification status will be shown.\n');
         return;
     }
 
@@ -1235,6 +1237,8 @@ async function main() {
     console.log(`║   ${cartResult.message.padEnd(46)}║`);
     console.log(`║   Source POs: ${manifests.map(m => m.sourcePO).join(', ').padEnd(34)}║`);
     console.log(`║   Status: ${cartResult.verification.status.padEnd(42)}║`);
+    if (priceSyncMsg) console.log(`║   ${priceSyncMsg.padEnd(48)}║`);
+    if (cartLinkMsg) console.log(`║   ${cartLinkMsg.padEnd(48)}║`);
     console.log('╠══════════════════════════════════════════════════╣');
     console.log('║   ⚠️  REVIEW YOUR CART BEFORE CHECKOUT!          ║');
     console.log('║   This was a FAUX ORDER — nothing was submitted. ║');
