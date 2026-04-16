@@ -474,7 +474,7 @@ export function buildVendorProfiles(poRecords: POEmailRecord[]): VendorProfile[]
             respondedCount,
             vendorReplyCount,
             buyerAcknowledgedVendorReplyCount,
-            averageResponseHours: null, // TODO(will)[2026-03-15]: Calculate from thread timestamps
+            averageResponseHours: null, // Not yet implemented — response time calculation deferred
             communicationPattern,
             buyerAcknowledgementPattern,
             recentPOs: sorted.slice(0, 5),

@@ -123,102 +123,8 @@ export async function recordFeedback(event: FeedbackEvent): Promise<void> {
 // ACCURACY ANALYSIS
 // ──────────────────────────────────────────────────
 
-/**
- * Compute accuracy metrics for a given category/agent over a time period.
- * Compares current period to previous period of same length for trend detection.
- *
- * @param category  Filter by feedback category (optional — all if omitted)
- * @param agentSource  Filter by agent (optional)
- * @param days  Number of days to analyze (default 7)
- */
-export async function analyzeAccuracy(
-    category?: FeedbackCategory,
-    agentSource?: string,
-    days: number = 7
-): Promise<AccuracyMetrics[]> {
-    const db = createClient();
-    if (!db) return [];
-
-    try {
-        const now = new Date();
-        const periodStart = new Date(now.getTime() - days * 86400000);
-        const prevPeriodStart = new Date(periodStart.getTime() - days * 86400000);
-
-        // Current period
-        let currentQuery = db
-            .from("feedback_events")
-            .select("category, accuracy_score")
-            .gte("created_at", periodStart.toISOString())
-            .not("accuracy_score", "is", null);
-
-        if (category) currentQuery = currentQuery.eq("category", category);
-        if (agentSource) currentQuery = currentQuery.eq("agent_source", agentSource);
-
-        const { data: currentData, error: currentError } = await currentQuery;
-        if (currentError) throw currentError;
-
-        // Previous period (for trend)
-        let prevQuery = db
-            .from("feedback_events")
-            .select("category, accuracy_score")
-            .gte("created_at", prevPeriodStart.toISOString())
-            .lt("created_at", periodStart.toISOString())
-            .not("accuracy_score", "is", null);
-
-        if (category) prevQuery = prevQuery.eq("category", category);
-        if (agentSource) prevQuery = prevQuery.eq("agent_source", agentSource);
-
-        const { data: prevData } = await prevQuery;
-
-        // Group by category
-        const grouped = new Map<string, { scores: number[]; prevScores: number[] }>();
-
-        for (const row of (currentData || [])) {
-            const cat = row.category;
-            if (!grouped.has(cat)) grouped.set(cat, { scores: [], prevScores: [] });
-            grouped.get(cat)!.scores.push(Number(row.accuracy_score));
-        }
-
-        for (const row of (prevData || [])) {
-            const cat = row.category;
-            if (!grouped.has(cat)) grouped.set(cat, { scores: [], prevScores: [] });
-            grouped.get(cat)!.prevScores.push(Number(row.accuracy_score));
-        }
-
-        const results: AccuracyMetrics[] = [];
-
-        for (const [cat, data] of grouped) {
-            const avg = data.scores.length > 0
-                ? data.scores.reduce((a, b) => a + b, 0) / data.scores.length
-                : 0;
-            const prevAvg = data.prevScores.length > 0
-                ? data.prevScores.reduce((a, b) => a + b, 0) / data.prevScores.length
-                : null;
-
-            let trend: "improving" | "stable" | "declining" = "stable";
-            if (prevAvg !== null) {
-                const diff = avg - prevAvg;
-                if (diff > 0.05) trend = "improving";
-                else if (diff < -0.05) trend = "declining";
-            }
-
-            results.push({
-                category: cat,
-                totalEvents: data.scores.length + data.prevScores.length,
-                scoredEvents: data.scores.length,
-                averageAccuracy: Math.round(avg * 100) / 100,
-                trend,
-                previousPeriodAccuracy: prevAvg !== null ? Math.round(prevAvg * 100) / 100 : null,
-            });
-        }
-
-        return results;
-    } catch (err: any) {
-        console.error(`❌ [Kaizen] analyzeAccuracy error: ${err.message}`);
-        return [];
-    }
-}
-
+// ──────────────────────────────────────────────────
+// VENDOR RELIABILITY SCORING
 // ──────────────────────────────────────────────────
 // VENDOR RELIABILITY SCORING
 // ──────────────────────────────────────────────────
@@ -476,10 +382,7 @@ export async function generateSelfReview(days: number = 7): Promise<string> {
     try {
         const since = new Date(Date.now() - days * 86400000).toISOString();
 
-        // 1. Accuracy metrics by category
-        const accuracy = await analyzeAccuracy(undefined, undefined, days);
-
-        // 2. Engagement stats
+        // 1. Engagement stats
         const { data: engagementData } = await db
             .from("feedback_events")
             .select("event_type, user_action")
@@ -509,25 +412,8 @@ export async function generateSelfReview(days: number = 7): Promise<string> {
             .eq("category", "error_pattern")
             .gte("created_at", since);
 
-        // 5. Drift detection
-        const driftAlerts = await detectDrift(days);
-
         // Build the report
         let report = `📊 <b>ARIA KAIZEN REPORT</b> — Past ${days} Days\n\n`;
-
-        // Accuracy section
-        report += `🎯 <b>Accuracy</b>\n`;
-        if (accuracy.length === 0) {
-            report += `  <i>No scored predictions yet — learning in progress</i>\n`;
-        } else {
-            for (const m of accuracy) {
-                const arrow = m.trend === "improving" ? "⬆️" : m.trend === "declining" ? "⬇️" : "➡️";
-                const pct = Math.round(m.averageAccuracy * 100);
-                const prevPct = m.previousPeriodAccuracy !== null ? Math.round(m.previousPeriodAccuracy * 100) : null;
-                const prevStr = prevPct !== null ? ` (was ${prevPct}%)` : "";
-                report += `  ${arrow} ${m.category}: <b>${pct}%</b> (${m.scoredEvents} events)${prevStr}\n`;
-            }
-        }
 
         // Engagement section
         report += `\n📬 <b>Engagement</b>\n`;
@@ -563,14 +449,6 @@ export async function generateSelfReview(days: number = 7): Promise<string> {
             }
         }
 
-        // Drift alerts
-        if (driftAlerts.length > 0) {
-            report += `\n⚠️ <b>Drift Detected</b>\n`;
-            for (const alert of driftAlerts) {
-                report += `  ${alert}\n`;
-            }
-        }
-
         // Learning summary
         const { count: learningSyncCount } = await db
             .from("feedback_events")
@@ -587,136 +465,6 @@ export async function generateSelfReview(days: number = 7): Promise<string> {
         console.error(`❌ [Kaizen] generateSelfReview error: ${err.message}`);
         return `⚠️ Self-review generation failed: ${err.message}`;
     }
-}
-
-// ──────────────────────────────────────────────────
-// DRIFT DETECTION
-// ──────────────────────────────────────────────────
-
-/**
- * Detect accuracy drift — when a domain's accuracy is dropping significantly.
- * Returns human-readable alert strings for any domain below threshold.
- *
- * @param windowDays  Comparison window (current vs. previous period)
- */
-export async function detectDrift(windowDays: number = 7): Promise<string[]> {
-    const alerts: string[] = [];
-    const DRIFT_THRESHOLD = 0.60;  // Alert if accuracy drops below 60%
-    const SIGNIFICANT_DROP = 0.15; // Alert if accuracy drops >15 points
-
-    try {
-        const metrics = await analyzeAccuracy(undefined, undefined, windowDays);
-
-        for (const m of metrics) {
-            if (m.averageAccuracy < DRIFT_THRESHOLD && m.scoredEvents >= 3) {
-                alerts.push(
-                    `📉 ${m.category} accuracy at ${Math.round(m.averageAccuracy * 100)}% ` +
-                    `(${m.scoredEvents} events) — below ${DRIFT_THRESHOLD * 100}% threshold`
-                );
-            }
-
-            if (m.previousPeriodAccuracy !== null && m.scoredEvents >= 3) {
-                const drop = m.previousPeriodAccuracy - m.averageAccuracy;
-                if (drop > SIGNIFICANT_DROP) {
-                    alerts.push(
-                        `📉 ${m.category} dropped ${Math.round(drop * 100)} points ` +
-                        `(${Math.round(m.previousPeriodAccuracy * 100)}% → ${Math.round(m.averageAccuracy * 100)}%)`
-                    );
-                }
-            }
-        }
-    } catch (err: any) {
-        console.error(`❌ [Kaizen] detectDrift error: ${err.message}`);
-    }
-
-    return alerts;
-}
-
-// ──────────────────────────────────────────────────
-// THRESHOLD ADJUSTMENT PROPOSALS
-// ──────────────────────────────────────────────────
-
-/**
- * Analyze feedback patterns and propose threshold adjustments.
- * E.g., if reconciliation auto-approvals at 3-4% range are always approved,
- * suggest raising the auto-approve threshold.
- *
- * Returns human-readable proposals. Does NOT auto-apply.
- */
-export async function proposeThresholdAdjustments(): Promise<string[]> {
-    const db = createClient();
-    if (!db) return [];
-
-    const proposals: string[] = [];
-
-    try {
-        // Check reconciliation approval patterns
-        const { data: reconData } = await db
-            .from("feedback_events")
-            .select("prediction, user_action")
-            .eq("category", "correction")
-            .ilike("event_type", "%reconcil%")
-            .gte("created_at", new Date(Date.now() - 30 * 86400000).toISOString());
-
-        if (reconData && reconData.length >= 5) {
-            const approved = reconData.filter(e => e.user_action === "approved");
-            const rejected = reconData.filter(e => e.user_action === "rejected");
-
-            if (approved.length > 0 && rejected.length === 0) {
-                proposals.push(
-                    `🔧 Reconciler: ${approved.length} approvals, 0 rejections in 30 days. ` +
-                    `Consider raising auto-approve threshold for faster processing.`
-                );
-            }
-
-            if (rejected.length > 0) {
-                const rejectionReasons = rejected
-                    .map(e => e.prediction?.reason || "unknown")
-                    .filter(Boolean);
-
-                const uniqueReasons = [...new Set(rejectionReasons)];
-                if (uniqueReasons.length > 0) {
-                    proposals.push(
-                        `🔧 Reconciler: ${rejected.length} rejection(s). ` +
-                        `Common reasons: ${uniqueReasons.join(", ")}. ` +
-                        `Consider adding specific handling for these patterns.`
-                    );
-                }
-            }
-        }
-
-        // Check alert engagement — are we sending too many alerts that get ignored?
-        const { data: alertData } = await db
-            .from("feedback_events")
-            .select("event_type, user_action")
-            .eq("category", "engagement")
-            .gte("created_at", new Date(Date.now() - 30 * 86400000).toISOString());
-
-        if (alertData && alertData.length >= 10) {
-            const byType = new Map<string, { engaged: number; ignored: number }>();
-            for (const e of alertData) {
-                const key = e.event_type;
-                if (!byType.has(key)) byType.set(key, { engaged: 0, ignored: 0 });
-                const stats = byType.get(key)!;
-                if (e.user_action === "engaged") stats.engaged++;
-                else if (e.user_action === "ignored") stats.ignored++;
-            }
-
-            for (const [type, stats] of byType) {
-                const total = stats.engaged + stats.ignored;
-                if (total >= 5 && stats.ignored / total > 0.7) {
-                    proposals.push(
-                        `📉 Alert "${type}" is ignored ${Math.round(stats.ignored / total * 100)}% of the time ` +
-                        `(${stats.ignored}/${total}). Consider reducing frequency or removing.`
-                    );
-                }
-            }
-        }
-    } catch (err: any) {
-        console.error(`❌ [Kaizen] proposeThresholdAdjustments error: ${err.message}`);
-    }
-
-    return proposals;
 }
 
 // ──────────────────────────────────────────────────

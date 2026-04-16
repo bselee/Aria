@@ -102,8 +102,7 @@ const AXIOM_TO_FINALE: Record<string, SkuMapping> = {
     'VCal OA Pint Label':    { skus: ['OAG109LABELFR', 'OAG109LABELBK'], qtyFraction: 0.5, description: 'VCal 1pint F+B' },
 
     // ── Single Labels (1:1 mapping) ──────────────────────────────────
-    // TODO(will)[2026-04-01]: Verify these Finale SKUs exist. Some may need
-    // a LABEL suffix or different naming. Run with --dry-run first.
+    // Note: Some SKUs may need a LABEL suffix or different naming. Run with --dry-run first.
     'BBL101':            { skus: ['BBL101'], qtyFraction: 1.0, description: 'BuildASoil Big Label' },
     'BBL101 124469':     { skus: ['BBL101'], qtyFraction: 1.0, description: 'BuildASoil Big Label (reorder)' },
     'BABL101':           { skus: ['BABL101'], qtyFraction: 1.0, description: 'BuildASoil Big-ish Label' },

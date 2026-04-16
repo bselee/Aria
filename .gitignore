@@ -27,6 +27,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 output.log
+output*.txt
 
 # ─── PM2 ──────────────────────────────────────────
 .pm2/
@@ -48,12 +49,17 @@ tmp_*
 test-*.ts
 test_*.ts
 probe-*.ts
+probe-*.js
 debug-*.ts
+debug-*.js
 force-*.ts
 reply-slack.ts
 scripts/scratch/
 typecheck_output.txt
 check_logs.ts
+uline-*.csv
+uline-*.json
+uline-output.txt
 
 # ─── Worktrees ────────────────────────────────────
 .worktrees/
