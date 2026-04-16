@@ -96,12 +96,28 @@ describe("APAgent processInvoiceBuffer", () => {
     });
 
     it("passes extracted tables into parseInvoice for PO recovery", async () => {
+        parseInvoiceMock.mockResolvedValue({
+            documentType: "invoice",
+            invoiceNumber: "1000930",
+            poNumber: "124547",
+            vendorName: "Coats Agri Aloe, Inc.",
+            invoiceDate: "2026-03-26",
+            lineItems: [{ description: "line", qty: 1, unitPrice: 1, total: 1 }],
+            subtotal: 1,
+            total: 1,
+            amountDue: 1,
+            confidence: "medium",
+        });
+
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
         (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Coats Agri Aloe, Inc.");
         (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
         (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
-        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue(undefined);
+        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue({
+            success: true,
+            verdict: "auto_approve",
+        });
 
         const supabase = {
             from: vi.fn((table: string) => ({
@@ -114,7 +130,7 @@ describe("APAgent processInvoiceBuffer", () => {
             })),
         };
 
-        await agent.processInvoiceBuffer(
+        const result = await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
             "coats.pdf",
             "Coats invoice",
@@ -126,6 +142,13 @@ describe("APAgent processInvoiceBuffer", () => {
             "P.O. Number 124547\nInvoice #1000930",
             [["P.O. Number | Terms", "124547 | Net 30"]],
         );
+        expect(result).toEqual(expect.objectContaining({
+            success: true,
+            state: "reconciled",
+            matchedPO: true,
+            invoiceNumber: "1000930",
+            poNumber: "124547",
+        }));
     });
 
     it("retries suspicious first-pass OCR and logs first-pass telemetry without overwriting it", async () => {
@@ -176,7 +199,10 @@ describe("APAgent processInvoiceBuffer", () => {
         (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Coats Agri Aloe, Inc.");
         (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
         (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
-        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue(undefined);
+        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue({
+            success: true,
+            verdict: "auto_approve",
+        });
 
         await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
@@ -252,9 +278,12 @@ describe("APAgent processInvoiceBuffer", () => {
         (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Coats Agri Aloe, Inc.");
         (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
         (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
-        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue(undefined);
+        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue({
+            success: true,
+            verdict: "auto_approve",
+        });
 
-        await agent.processInvoiceBuffer(
+        const result = await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
             "coats-retry-continue.pdf",
             "Coats invoice",
@@ -272,6 +301,13 @@ describe("APAgent processInvoiceBuffer", () => {
             "PO# on invoice",
         );
         expect(inserts.documents.some((row) => row.status === "ocr_failed")).toBe(false);
+        expect(result).toEqual(expect.objectContaining({
+            success: true,
+            state: "reconciled",
+            matchedPO: true,
+            invoiceNumber: "1000930",
+            poNumber: "124547",
+        }));
     });
 
     it("does not retry a low-confidence parse when core reconciliation signals are already present", async () => {
@@ -309,7 +345,10 @@ describe("APAgent processInvoiceBuffer", () => {
         (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Coats Agri Aloe, Inc.");
         (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
         (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
-        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue(undefined);
+        (agent as any).reconcileAndUpdate = vi.fn().mockResolvedValue({
+            success: true,
+            verdict: "auto_approve",
+        });
 
         await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
@@ -327,5 +366,56 @@ describe("APAgent processInvoiceBuffer", () => {
             false,
             "PO# on invoice",
         );
+    });
+
+    it("returns an unmatched outcome when no Finale PO can be resolved", async () => {
+        getOrderDetailsMock.mockRejectedValue(new Error("missing"));
+        parseInvoiceMock.mockResolvedValue({
+            documentType: "invoice",
+            invoiceNumber: "200200",
+            poNumber: "999999",
+            vendorName: "Unknown Vendor",
+            invoiceDate: "2026-03-26",
+            lineItems: [{ description: "line", qty: 1, unitPrice: 10, total: 10 }],
+            subtotal: 10,
+            total: 10,
+            amountDue: 10,
+            confidence: "medium",
+        });
+
+        const supabase = {
+            from: vi.fn((table: string) => ({
+                insert: vi.fn(() => ({
+                    select: vi.fn(() => ({
+                        single: vi.fn().mockResolvedValue({ data: { id: `${table}-1` } }),
+                    })),
+                })),
+                upsert: vi.fn().mockResolvedValue(undefined),
+            })),
+        };
+
+        const bot = { telegram: { sendMessage: sendMessageMock } } as any;
+        const agent = new APAgent(bot);
+        (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Unknown Vendor");
+        (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
+        (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
+        (agent as any).reconcileAndUpdate = vi.fn();
+
+        const result = await agent.processInvoiceBuffer(
+            Buffer.from("pdf"),
+            "unknown-vendor.pdf",
+            "Unknown Vendor invoice",
+            "billing@unknown.example",
+            supabase,
+        );
+
+        expect((agent as any).reconcileAndUpdate).not.toHaveBeenCalled();
+        expect(result).toEqual(expect.objectContaining({
+            success: false,
+            state: "unmatched",
+            matchedPO: false,
+            invoiceNumber: "200200",
+            poNumber: null,
+        }));
     });
 });

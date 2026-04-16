@@ -12,6 +12,7 @@ const {
     getPreClassificationMock,
     pdfDocumentLoadMock,
     pdfDocumentCreateMock,
+    extractPDFMock,
 } = vi.hoisted(() => ({
     gmailFactoryMock: vi.fn(),
     getAuthenticatedClientMock: vi.fn(),
@@ -24,6 +25,7 @@ const {
     getPreClassificationMock: vi.fn(),
     pdfDocumentLoadMock: vi.fn(),
     pdfDocumentCreateMock: vi.fn(),
+    extractPDFMock: vi.fn(),
 }));
 
 vi.mock("@googleapis/gmail", () => ({
@@ -102,6 +104,10 @@ vi.mock("pdf-lib", () => ({
     },
 }));
 
+vi.mock("../../pdf/extractor", () => ({
+    extractPDF: extractPDFMock,
+}));
+
 import { APIdentifierAgent } from "./ap-identifier";
 
 describe("APIdentifierAgent AAA Cooper handling", () => {
@@ -112,6 +118,15 @@ describe("APIdentifierAgent AAA Cooper handling", () => {
         unifiedObjectGenerationMock.mockResolvedValue({ intent: "STATEMENT" });
         queueStatementEmailIntakeMock.mockResolvedValue("intake-1");
         queueStatementMetadataOnlyMock.mockResolvedValue("meta-1");
+        extractPDFMock.mockResolvedValue({
+            rawText: "",
+            pages: [{ pageNumber: 1, text: "", hasTable: false }],
+            tables: [],
+            metadata: { pageCount: 1, fileSize: 0 },
+            hasImages: false,
+            ocrStrategy: "test",
+            ocrDurationMs: 1,
+        });
     });
 
     it("returns needs_review so callers can leave the email unread", async () => {
@@ -194,6 +209,15 @@ describe("APIdentifierAgent AAA Cooper handling", () => {
             addPage: addPageMock,
             save: saveMock,
         });
+        extractPDFMock.mockResolvedValue({
+            rawText: "PRO\n64471581\n64471582\nSHIPMENT INFORMATION",
+            pages: [{ pageNumber: 1, text: "PRO\n64471581\n64471582\nSHIPMENT INFORMATION", hasTable: false }],
+            tables: [],
+            metadata: { pageCount: 1, fileSize: 0 },
+            hasImages: false,
+            ocrStrategy: "test",
+            ocrDurationMs: 1,
+        });
 
         splitAAACooperStatementAttachmentsMock.mockResolvedValue({
             status: "split_ready",
@@ -230,19 +254,16 @@ describe("APIdentifierAgent AAA Cooper handling", () => {
             },
         };
 
+        const apQueueSelectChain = {
+            eq: vi.fn(() => apQueueSelectChain),
+            gte: vi.fn(() => apQueueSelectChain),
+            maybeSingle: maybeSingleMock,
+        };
         const supabase = {
             from: vi.fn((table: string) => {
                 if (table === "ap_inbox_queue") {
                     return {
-                        select: vi.fn(() => ({
-                            eq: vi.fn(() => ({
-                                eq: vi.fn(() => ({
-                                    gte: vi.fn(() => ({
-                                        maybeSingle: maybeSingleMock,
-                                    })),
-                                })),
-                            })),
-                        })),
+                        select: vi.fn(() => apQueueSelectChain),
                         insert: insertMock,
                     };
                 }
@@ -376,5 +397,249 @@ describe("APIdentifierAgent AAA Cooper handling", () => {
                 }),
             }),
         );
+    });
+});
+
+describe("APIdentifierAgent single-pipeline invoice handling", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        getAuthenticatedClientMock.mockResolvedValue({});
+        getPreClassificationMock.mockResolvedValue(null);
+        unifiedObjectGenerationMock.mockResolvedValue({ intent: "HUMAN_INTERACTION" });
+        extractPDFMock.mockResolvedValue({
+            rawText: "INVOICE",
+            pages: [{ pageNumber: 1, text: "INVOICE", hasTable: false }],
+            tables: [],
+            metadata: { pageCount: 1, fileSize: 0 },
+            hasImages: false,
+            ocrStrategy: "test",
+            ocrDurationMs: 1,
+        });
+    });
+
+    it("queues FedEx PDF invoices without relying on LLM classification and leaves Gmail state unchanged until forward success", async () => {
+        const queueRows = [
+            {
+                id: "row-fedex-1",
+                subject: "Your FedEx invoice is ready",
+                from_email: "billing@fedex.com",
+                body_snippet: "Please see attached invoice PDF.",
+                body_text: "Please see attached invoice PDF.",
+                gmail_message_id: "gmail-fedex-1",
+                source_inbox: "ap",
+                pdf_filenames: ["fedex-bill-1001.pdf"],
+            },
+        ];
+
+        const modifyMock = vi.fn();
+        const attachmentGetMock = vi.fn().mockResolvedValue({
+            data: { data: Buffer.from("fedex-pdf").toString("base64url") },
+        });
+        const gmail = {
+            users: {
+                labels: {
+                    list: vi.fn().mockResolvedValue({ data: { labels: [] } }),
+                    create: vi.fn(),
+                },
+                messages: {
+                    get: vi.fn().mockResolvedValue({
+                        data: {
+                            payload: {
+                                parts: [
+                                    { filename: "fedex-bill-1001.pdf", body: { attachmentId: "att-fedex-1" } },
+                                ],
+                            },
+                        },
+                    }),
+                    modify: modifyMock,
+                    attachments: {
+                        get: attachmentGetMock,
+                    },
+                },
+            },
+        };
+        gmailFactoryMock.mockReturnValue(gmail);
+
+        const insertMock = vi.fn().mockResolvedValue({ error: null });
+        const maybeSingleMock = vi.fn().mockResolvedValue({ data: null });
+        const apQueueSelectChain = {
+            eq: vi.fn(() => apQueueSelectChain),
+            gte: vi.fn(() => apQueueSelectChain),
+            maybeSingle: maybeSingleMock,
+        };
+        const supabase = {
+            from: vi.fn((table: string) => {
+                if (table === "email_inbox_queue") {
+                    return {
+                        select: vi.fn(() => ({
+                            eq: vi.fn(() => ({
+                                limit: vi.fn().mockResolvedValue({
+                                    data: queueRows,
+                                    error: null,
+                                }),
+                            })),
+                        })),
+                        update: vi.fn(() => ({
+                            eq: vi.fn().mockResolvedValue({}),
+                        })),
+                    };
+                }
+                if (table === "ap_inbox_queue") {
+                    return {
+                        select: vi.fn(() => apQueueSelectChain),
+                        insert: insertMock,
+                    };
+                }
+                return {
+                    insert: vi.fn().mockResolvedValue({}),
+                };
+            }),
+            storage: {
+                from: vi.fn(() => ({
+                    upload: vi.fn().mockResolvedValue({ error: null }),
+                })),
+            },
+        };
+        createClientMock.mockReturnValue(supabase);
+
+        const agent = new APIdentifierAgent();
+        await agent.identifyAndQueue();
+
+        expect(unifiedObjectGenerationMock).not.toHaveBeenCalled();
+        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({
+            email_from: "billing@fedex.com",
+            pdf_filename: "fedex-bill-1001.pdf",
+            status: "PENDING_FORWARD",
+            extracted_json: expect.objectContaining({
+                source_gmail_message_id: "gmail-fedex-1",
+                completion_mode: "forward_success",
+            }),
+        }));
+        expect(modifyMock).not.toHaveBeenCalled();
+    });
+
+    it("leaves AAA Cooper unread when the cover sheet does not match the split invoices", async () => {
+        getPreClassificationMock.mockResolvedValue({ classification: "STATEMENT", handler: "test", confidence: 0.95 });
+        const queueRows = [
+            {
+                id: "row-aaa-mismatch",
+                subject: "Transportation Statement",
+                from_email: "billing@aaacooper.com",
+                body_snippet: "statement attached",
+                body_text: "statement attached",
+                gmail_message_id: "msg-aaa-mismatch",
+                source_inbox: "ap",
+                pdf_filenames: ["ACT_STMD_001.pdf"],
+            },
+        ];
+        const modifyMock = vi.fn();
+        const gmail = {
+            users: {
+                labels: {
+                    list: vi.fn().mockResolvedValue({
+                        data: {
+                            labels: [
+                                { id: "lbl-1", name: "Invoice Forward" },
+                                { id: "lbl-2", name: "Statements" },
+                            ],
+                        },
+                    }),
+                    create: vi.fn(),
+                },
+                messages: {
+                    get: vi.fn().mockResolvedValue({
+                        data: {
+                            payload: {
+                                parts: [
+                                    { filename: "ACT_STMD_001.pdf", body: { attachmentId: "att-1" } },
+                                ],
+                            },
+                        },
+                    }),
+                    modify: modifyMock,
+                    attachments: {
+                        get: vi.fn().mockResolvedValue({
+                            data: { data: Buffer.from("pdf-1").toString("base64url") },
+                        }),
+                    },
+                },
+            },
+        };
+        gmailFactoryMock.mockReturnValue(gmail);
+        extractPDFMock.mockResolvedValue({
+            rawText: "PRO\n64471588\nSHIPMENT INFORMATION",
+            pages: [{ pageNumber: 1, text: "PRO\n64471588\nSHIPMENT INFORMATION", hasTable: false }],
+            tables: [],
+            metadata: { pageCount: 1, fileSize: 0 },
+            hasImages: false,
+            ocrStrategy: "test",
+            ocrDurationMs: 1,
+        });
+
+        splitAAACooperStatementAttachmentsMock.mockResolvedValue({
+            status: "split_ready",
+            invoices: [
+                { attachmentId: "att-1", attachmentName: "ACT_STMD_001.pdf", page: 2, invoiceNumber: "64471577", amount: 446.51 },
+            ],
+            discardedCount: 1,
+            diagnostics: {
+                passUsed: 1,
+                extractionStrategy: "google/gemini-2.5-flash",
+                processedAttachmentCount: 1,
+                processedAttachmentIds: ["att-1"],
+            },
+        });
+
+        const insertMock = vi.fn().mockResolvedValue({ error: null });
+        const supabase = {
+            from: vi.fn((table: string) => {
+                if (table === "email_inbox_queue") {
+                    return {
+                        select: vi.fn(() => ({
+                            eq: vi.fn(() => ({
+                                limit: vi.fn().mockResolvedValue({
+                                    data: queueRows,
+                                    error: null,
+                                }),
+                            })),
+                        })),
+                        update: vi.fn(() => ({
+                            eq: vi.fn().mockResolvedValue({}),
+                        })),
+                    };
+                }
+                if (table === "ap_inbox_queue") {
+                    return {
+                        insert: insertMock,
+                    };
+                }
+                return {
+                    insert: vi.fn().mockResolvedValue({}),
+                };
+            }),
+            storage: {
+                from: vi.fn(() => ({
+                    upload: vi.fn().mockResolvedValue({ error: null }),
+                })),
+            },
+        };
+        createClientMock.mockReturnValue(supabase);
+
+        const agent = new APIdentifierAgent();
+        await agent.identifyAndQueue();
+
+        expect(modifyMock).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+                requestBody: expect.objectContaining({
+                    removeLabelIds: expect.arrayContaining(["UNREAD"]),
+                }),
+            }),
+        );
+        expect(applyMessageLabelPolicyMock).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+                removeLabels: expect.arrayContaining(["UNREAD"]),
+            }),
+        );
+        expect(insertMock).not.toHaveBeenCalled();
     });
 });

@@ -1,6 +1,9 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
+import type { Telegraf } from "telegraf";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
+import { applyMessageLabelPolicy } from "../gmail-policy";
+import { APAgent } from "../ap-agent";
 
 /**
  * @file ap-forwarder.ts
@@ -22,6 +25,17 @@ import { createClient } from "../../supabase";
  *          clearer pipeline semantics.
  */
 export class APForwarderAgent {
+    private invoiceProcessor: APAgent;
+
+    constructor(bot?: Telegraf) {
+        const fallbackBot = bot ?? ({
+            telegram: {
+                sendMessage: async () => undefined,
+            },
+        } as any);
+        this.invoiceProcessor = new APAgent(fallbackBot);
+    }
+
     private async logActivity(supabase: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
         if (!supabase) return;
         try {
@@ -35,6 +49,73 @@ export class APForwarderAgent {
         } catch (e: any) {
             console.error("   ❌ Failed to log activity:", e.message);
         }
+    }
+
+    private getSourceMessageId(item: any): string | null {
+        const sourceMessageId = item.extracted_json?.source_gmail_message_id;
+        if (sourceMessageId) return sourceMessageId;
+
+        const messageId = item.message_id as string | undefined;
+        if (!messageId) return null;
+
+        return messageId.split("_split_")[0].split("_")[0] || null;
+    }
+
+    private getExpectedForwardCount(item: any): number {
+        const expected = Number(item.extracted_json?.expected_forward_count);
+        return Number.isFinite(expected) && expected > 0 ? expected : 1;
+    }
+
+    private async verifySentMessage(gmail: any, sentMessageId: string): Promise<void> {
+        const sentMessage = await gmail.users.messages.get({
+            userId: "me",
+            id: sentMessageId,
+            format: "metadata",
+        });
+        const labelIds: string[] = sentMessage.data.labelIds || [];
+        if (!labelIds.includes("SENT")) {
+            throw new Error(`Gmail did not confirm SENT state for ${sentMessageId}`);
+        }
+    }
+
+    private isQueueItemComplete(relatedItem: any): boolean {
+        return relatedItem.status === "FORWARDED"
+            && relatedItem.extracted_json?.processing_success === true;
+    }
+
+    private async finalizeSourceEmailIfReady(
+        supabase: any,
+        gmail: any,
+        item: any,
+    ): Promise<void> {
+        const sourceMessageId = this.getSourceMessageId(item);
+        if (!sourceMessageId) return;
+
+        const expectedForwardCount = this.getExpectedForwardCount(item);
+        const { data: relatedItems, error } = await supabase
+            .from("ap_inbox_queue")
+            .select("message_id, status, extracted_json")
+            .like("message_id", `${sourceMessageId}%`);
+
+        if (error || !relatedItems) {
+            throw new Error(`Failed to load related queue items: ${error?.message || "unknown error"}`);
+        }
+
+        const forwardedCount = relatedItems.filter((relatedItem: any) => this.isQueueItemComplete(relatedItem)).length;
+        const allForwarded = relatedItems.length >= expectedForwardCount
+            && forwardedCount >= expectedForwardCount
+            && relatedItems.every((relatedItem: any) => this.isQueueItemComplete(relatedItem));
+
+        if (!allForwarded) {
+            return;
+        }
+
+        await applyMessageLabelPolicy({
+            gmail,
+            gmailMessageId: sourceMessageId,
+            addLabels: ["Invoice Forward"],
+            removeLabels: ["INBOX", "UNREAD"],
+        });
     }
 
     async processPendingForwards() {
@@ -67,9 +148,11 @@ export class APForwarderAgent {
                 console.warn("   ⚠️ Missing 'ap' token, falling back to 'default'...");
                 auth = await getAuthenticatedClient("default");
             }
-            const gmail = GmailApi({ version: "v1", auth });
+                const gmail = GmailApi({ version: "v1", auth });
 
             for (const item of queueItems) {
+                let sentMessageId: string | null = null;
+                const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
                 try {
                     // Try to lock the row by updating status to PROCESSING_FORWARD
                     const { error: lockError } = await supabase
@@ -121,39 +204,110 @@ export class APForwarderAgent {
                         `--${boundary}--`
                     ].join("\r\n");
 
-                    await gmail.users.messages.send({
+                    const sendResult = await gmail.users.messages.send({
                         userId: "me",
                         requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") }
                     });
+                    sentMessageId = sendResult.data.id || null;
+                    if (!sentMessageId) {
+                        throw new Error(`Gmail send did not return a sent message id for ${item.id}`);
+                    }
+                    await this.verifySentMessage(gmail, sentMessageId);
 
-                    // Update status to FORWARDED (sent to Bill.com)
+                    const sendExtractedJson = {
+                        ...(item.extracted_json || {}),
+                        billcom_sent_message_id: sentMessageId,
+                        billcom_sent_at: new Date().toISOString(),
+                    };
+                    const processingResult = await this.invoiceProcessor.processInvoiceBuffer(
+                        buffer,
+                        item.pdf_filename,
+                        item.email_subject,
+                        item.email_from,
+                        supabase,
+                        false,
+                        sourceMessageId,
+                        item.pdf_path,
+                    );
+                    const extractedJson = {
+                        ...sendExtractedJson,
+                        processing_success: processingResult.success,
+                        processing_state: processingResult.state,
+                        processing_error: processingResult.error || null,
+                        reconciliation_verdict: processingResult.reconciliationVerdict || null,
+                        matched_po: processingResult.matchedPO,
+                        matched_po_number: processingResult.poNumber || null,
+                        processed_invoice_number: processingResult.invoiceNumber || null,
+                    };
+                    const finalStatus = processingResult.success ? "FORWARDED" : "ERROR_PROCESSING";
                     await supabase
                         .from('ap_inbox_queue')
-                        .update({ status: 'FORWARDED' })
+                        .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
+
+                    if (processingResult.success) {
+                        await this.finalizeSourceEmailIfReady(
+                            supabase,
+                            gmail,
+                            {
+                                ...item,
+                                extracted_json: extractedJson,
+                            },
+                        );
+                    }
 
                     await this.logActivity(
                         supabase,
                         item.email_from,
                         item.email_subject,
                         item.intent || 'INVOICE',
-                        `Forwarded to Bill.com: ${item.pdf_filename}`
+                        processingResult.success
+                            ? `Forwarded to Bill.com + processed invoice: ${item.pdf_filename}`
+                            : `Forwarded to Bill.com but invoice processing needs review: ${item.pdf_filename}`,
+                        {
+                            sentMessageId,
+                            sourceMessageId,
+                            processingState: processingResult.state,
+                            processingError: processingResult.error || null,
+                            reconciliationVerdict: processingResult.reconciliationVerdict || null,
+                        },
                     );
 
-                    console.log(`   ✅ Successfully forwarded ${item.pdf_filename}`);
+                    if (processingResult.success) {
+                        console.log(`   ✅ Successfully forwarded and processed ${item.pdf_filename}`);
+                    } else {
+                        console.warn(`   ⚠️ Forwarded ${item.pdf_filename}, but downstream invoice processing needs review`);
+                    }
 
                 } catch (err: any) {
                     console.error(`   ❌ Forwarding failed for ${item.id}:`, err.message);
+                    const failureStatus = sentMessageId ? 'ERROR_PROCESSING' : 'ERROR_FORWARDING';
+                    const failureJson = sentMessageId
+                        ? {
+                            ...(item.extracted_json || {}),
+                            billcom_sent_message_id: sentMessageId,
+                            billcom_sent_at: new Date().toISOString(),
+                            processing_success: false,
+                            processing_state: 'processing_error',
+                            processing_error: err.message,
+                        }
+                        : undefined;
                     await supabase
                         .from('ap_inbox_queue')
-                        .update({ status: 'ERROR_FORWARDING' })
+                        .update(
+                            failureJson
+                                ? { status: failureStatus, extracted_json: failureJson }
+                                : { status: failureStatus }
+                        )
                         .eq('id', item.id);
                     await this.logActivity(
                         supabase,
                         item.email_from,
                         item.email_subject,
                         item.intent || 'INVOICE',
-                        `Error forwarding to Bill.com: ${err.message}`
+                        sentMessageId
+                            ? `Error after Bill.com forward: ${err.message}`
+                            : `Error forwarding to Bill.com: ${err.message}`
                     );
                 }
             }

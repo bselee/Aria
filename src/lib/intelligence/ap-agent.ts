@@ -21,6 +21,7 @@ import {
     enqueueForDashboardReview,
     updatePendingApprovalMessageId,
     buildAuditMetadata,
+    buildReconciliationIdentityMetadata,
     buildReconciliationReport,
     validateInvoiceBalance,
 } from "../finale/reconciler";
@@ -429,7 +430,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 });
                                 const base64Data = attachment.data.data;
                                 if (base64Data) {
-                                    const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+                                    const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, Buffer.from(base64Data, "base64url"));
                                     if (forwarded) forwardedAny = true;
                                     console.log(`     ${forwarded ? '✅' : '❌'} Bill.com forward: ${part.filename}`);
 
@@ -460,9 +461,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 console.log(`     📄 No PDF — generating fallback from email body...`);
                                 try {
                                     const pdfBuf = await this.generatePDF(emailText, `Dropship Invoice — ${routingRule.label}`);
-                                    const pdfBase64 = pdfBuf.toString('base64');
                                     const fakeFilename = `dropship_${routingRule.label.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.pdf`;
-                                    const forwarded = await this.forwardToBillCom(gmail, subject, fakeFilename, pdfBase64);
+                                    const forwarded = await this.forwardToBillCom(gmail, subject, fakeFilename, pdfBuf);
                                     if (forwarded) forwardedAny = true;
                                     console.log(`     ${forwarded ? '✅' : '❌'} Bill.com forward (generated PDF)`);
                                 } catch (genErr: any) {
@@ -623,7 +623,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             processedAnyPDF = true;
 
                             // 1. Upload PDF to Supabase Storage BEFORE forwarding
-                            const buffer = Buffer.from(base64Data, "base64");
+                            // Gmail API returns base64url encoding (URL-safe), not standard base64
+                            const buffer = Buffer.from(base64Data, "base64url");
                             let pdfStoragePath: string | null = null;
                             if (supabase) {
                                 try {
@@ -645,7 +646,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                             // 2. Forward strictly to buildasoilap@bill.com IMMEDIATELY
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
-                            const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, base64Data);
+                            const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, buffer);
                             if (!forwarded) {
                                 // Critical: Bill.com never received the invoice — alert Will immediately
                                 try {
@@ -766,15 +767,21 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         }
     }
 
-    public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, base64Data: string): Promise<boolean> {
+    public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, pdfBuffer: Buffer): Promise<boolean> {
         console.log(`     -> Forwarding ${filename} to buildasoilap@bill.com`);
+
+        if (!pdfBuffer.length) {
+            console.error("     ❌ No PDF data to forward (empty buffer)");
+            return false;
+        }
+
+        // Re-encode as standard base64 with RFC 2045 line chunks (76 chars)
+        const pdfBase64 = pdfBuffer.toString("base64");
+        const chunkedPdfBase64 = pdfBase64.match(/.{1,76}/g)?.join("\r\n") || pdfBase64;
+
         const boundary = "b_aria_forwarded_bill_" + Math.random().toString(36).substring(2);
 
-        // Convert Gmail's base64url to standard base64 and wrap at 76 chars per RFC 2045
-        const standardBase64 = base64Data.replace(/-/g, "+").replace(/_/g, "/");
-        const chunkedBase64 = standardBase64.match(/.{1,76}/g)?.join("\r\n") || standardBase64;
-
-        const mimeMessage = [
+        const mimeParts = [
             `To: buildasoilap@bill.com`,
             `Subject: Fwd: ${originalSubject}`,
             `MIME-Version: 1.0`,
@@ -790,15 +797,18 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             `Content-Transfer-Encoding: base64`,
             `Content-Disposition: attachment; filename="${filename}"`,
             ``,
-            chunkedBase64,
-            `--${boundary}--`
-        ].join("\r\n");
+            chunkedPdfBase64,
+            `--${boundary}--`,
+        ];
+
+        // Use latin1 so binary PDF bytes are preserved correctly through Buffer round-trip
+        const mimeBuffer = Buffer.from(mimeParts.join("\r\n"), "latin1");
 
         try {
             await gmail.users.messages.send({
                 userId: "me",
                 requestBody: {
-                    raw: Buffer.from(mimeMessage).toString("base64url")
+                    raw: mimeBuffer.toString("base64url"),
                 }
             });
             return true;
@@ -809,6 +819,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string, pdfStoragePath: string | null = null) {
+        const outcome = {
+            success: false,
+            state: "processing_error" as "reconciled" | "unmatched" | "skipped_low_confidence" | "skipped_zero_line_items" | "processing_error",
+            matchedPO: false,
+            invoiceNumber: null as string | null,
+            poNumber: null as string | null,
+            vendorName: null as string | null,
+            reconciliationVerdict: null as string | null,
+            error: null as string | null,
+        };
         try {
             // 1. Extract + parse
             let extracted = await extractPDF(buffer);
@@ -816,6 +836,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 extracted.rawText,
                 extracted.tables?.map(t => [t.headers.join(" | "), ...t.rows.map(r => r.join(" | "))])
             );
+            outcome.invoiceNumber = invoiceData.invoiceNumber || null;
+            outcome.poNumber = invoiceData.poNumber || null;
+            outcome.vendorName = invoiceData.vendorName || null;
             const firstPassSnapshot = {
                 strategy: extracted.ocrStrategy || null,
                 confidence: invoiceData.confidence || null,
@@ -886,6 +909,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             // 1a. Vendor Alias Resolution (Tier 2 update)
             invoiceData.vendorName = await this.resolveVendorAlias(supabase, invoiceData.vendorName);
+            outcome.vendorName = invoiceData.vendorName || null;
 
             // 1b. Vendor pattern check — consult stored handling rules before proceeding.
             // Non-blocking: if Pinecone is down, processing continues normally.
@@ -936,7 +960,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     { parse_mode: "Markdown" }
                 );
                 await this.logActivity(supabase, from, subject, "INVOICE", `Low-confidence parse — reconciliation skipped for ${filename}`);
-                return;
+                outcome.state = "skipped_low_confidence";
+                outcome.error = `Low-confidence parse for ${filename}`;
+                return outcome;
             }
 
             if (invoiceData.confidence === "low") {
@@ -968,7 +994,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     `Invoice parsed with 0 line items — possible OCR failure (${filename})`,
                     { invoiceNumber: invoiceData.invoiceNumber, vendorName: invoiceData.vendorName, filename }
                 );
-                return;
+                outcome.state = "skipped_zero_line_items";
+                outcome.error = `0 line items extracted for ${filename}`;
+                return outcome;
             }
 
             // 2. Find matching PO — Finale direct, no Supabase middle layer
@@ -1095,6 +1123,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             }
 
             const matched = !!finalePONumber;
+            outcome.matchedPO = matched;
+            outcome.poNumber = finalePONumber || null;
             console.log(`     → PO match: ${matched ? finalePONumber + " (" + matchSource + ")" : "none"}`);
 
             // 3. Save to DB — audit trail and daily recap source
@@ -1226,11 +1256,21 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // or via subject-line extraction — both require Will's confirmation before any Finale writes.
             forceApproval = forceApproval || matchSource.includes("REQUIRES APPROVAL");
             if (matched && finalePONumber) {
-                await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval, matchSource);
+                const reconciliationOutcome = await this.reconcileAndUpdate(invoiceData, finalePONumber, supabase, forceApproval, matchSource);
+                outcome.success = reconciliationOutcome.success;
+                outcome.state = reconciliationOutcome.success ? "reconciled" : "processing_error";
+                outcome.reconciliationVerdict = reconciliationOutcome.verdict;
+                outcome.error = reconciliationOutcome.error ?? null;
+                return outcome;
             }
+
+            outcome.state = "unmatched";
+            outcome.error = "No Finale PO match found";
+            return outcome;
 
         } catch (err: any) {
             console.error(`   Error processing buffer for ${filename}:`, err.message);
+            outcome.error = err.message;
             // Alert Will — something in the pipeline failed after bill.com forward
             const chatId = process.env.TELEGRAM_CHAT_ID || "";
             try {
@@ -1249,6 +1289,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     metadata: { filename, error: err.message, stage: "processInvoiceBuffer" },
                 });
             } catch { /* swallow */ }
+            return outcome;
         }
     }
 
@@ -1335,7 +1376,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         supabase: any,
         forceApproval = false,   // true when PO matched via vendor+date fallback — require human sign-off
         matchStrategy?: string   // M4: Which strategy matched this invoice to PO
-    ): Promise<void> {
+    ): Promise<{ success: boolean; verdict: string; error?: string | null }> {
         try {
             const finaleClient = new FinaleClient();
 
@@ -1441,6 +1482,27 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 });
             };
 
+            // Kaizen: record reconciliation verdict (Pillar 3 — Prediction Accuracy)
+            recordFeedback({
+                category: "prediction",
+                eventType: `reconciliation_${result.overallVerdict}`,
+                agentSource: "ap_agent",
+                subjectType: "po",
+                subjectId: orderId,
+                prediction: {
+                    verdict: result.overallVerdict,
+                    totalImpact: result.totalDollarImpact,
+                    priceChanges: result.priceChanges.length,
+                    feeChanges: result.feeChanges.length,
+                },
+                accuracyScore: result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change" ? 1.0 : 0.5,
+                contextData: {
+                    vendor: result.vendorName,
+                    invoice: result.invoiceNumber,
+                    forceApproval,
+                },
+            }).catch(() => { /* non-blocking */ });
+
             if (result.overallVerdict === "auto_approve") {
                 // Safe to auto-apply
                 if (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate) {
@@ -1449,12 +1511,17 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     // checkDuplicateReconciliation() still finds this entry and stops re-processing.
                     let pendingLogId: string | null = null;
                     try {
+                        const identity = buildReconciliationIdentityMetadata({
+                            invoiceNumber: result.invoiceNumber,
+                            vendorName: result.vendorName,
+                            orderId: result.orderId,
+                        });
                         const { data: pendingLog } = await supabase.from("ap_activity_log").insert({
                             email_from: result.vendorName,
                             email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                             intent: "RECONCILIATION",
                             action_taken: "Pending — applying to Finale...",
-                            metadata: { invoiceNumber: result.invoiceNumber, orderId: result.orderId, status: "pending" },
+                            metadata: { ...identity, status: "pending" },
                         }).select("id").single();
                         pendingLogId = pendingLog?.id ?? null;
                     } catch { /* proceed — Finale write is still safe, just loses idempotency guard */ }
@@ -1466,6 +1533,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     }
                     if (applyResult.errors.length > 0) {
                         console.error(`   ❌ ${applyResult.errors.length} error(s) applying to Finale:`, applyResult.errors);
+                        return {
+                            success: false,
+                            verdict: result.overallVerdict,
+                            error: applyResult.errors.join("; "),
+                        };
                     }
 
                     // Update the pending entry to "applied" with full audit data,
@@ -1508,6 +1580,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }
                 writeReconciliationMemory("auto_approve");
                 await this.sendReconciliationNotification(result);
+                return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "needs_approval") {
                 // Enqueue for dashboard review instead of Telegram approval
@@ -1518,17 +1591,20 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     process.env.TELEGRAM_CHAT_ID!,
                     `🔍 Invoice #${result.invoiceNumber} (${result.vendorName}) changes outside guardrails — enqueued for dashboard review\n\n${result.summary}\n\nCheck the AP / Invoices panel to approve or dismiss.`
                 );
+                return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "rejected") {
                 // Magnitude error — alert but do NOT apply
                 writeReconciliationMemory("rejected");
                 await this.sendReconciliationNotification(result);
+                return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "duplicate") {
                 // Already reconciled — alert Will but do NOT re-apply
                 console.log(`   🔁 Duplicate: Invoice #${result.invoiceNumber} already reconciled against PO ${orderId}`);
                 writeReconciliationMemory("duplicate");
                 await this.sendReconciliationNotification(result);
+                return { success: true, verdict: result.overallVerdict };
 
             } else {
                 // no_change — log so checkDuplicateReconciliation fires on re-processing
@@ -1537,28 +1613,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     await this.logReconciliation(supabase, result, { applied: [], skipped: [], errors: [] });
                 }
                 await this.sendReconciliationNotification(result);
+                return { success: true, verdict: result.overallVerdict };
             }
-
-            // Kaizen: record reconciliation verdict (Pillar 3 — Prediction Accuracy)
-            recordFeedback({
-                category: "prediction",
-                eventType: `reconciliation_${result.overallVerdict}`,
-                agentSource: "ap_agent",
-                subjectType: "po",
-                subjectId: orderId,
-                prediction: {
-                    verdict: result.overallVerdict,
-                    totalImpact: result.totalDollarImpact,
-                    priceChanges: result.priceChanges.length,
-                    feeChanges: result.feeChanges.length,
-                },
-                accuracyScore: result.overallVerdict === "auto_approve" || result.overallVerdict === "no_change" ? 1.0 : 0.5,
-                contextData: {
-                    vendor: result.vendorName,
-                    invoice: result.invoiceNumber,
-                    forceApproval,
-                },
-            }).catch(() => { /* non-blocking */ });
 
         } catch (err: any) {
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
@@ -1579,6 +1635,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     { invoiceNumber: invoice.invoiceNumber, orderId, error: err.message }
                 );
             } catch { /* swallow */ }
+            return { success: false, verdict: "error", error: err.message };
         }
     }
 
