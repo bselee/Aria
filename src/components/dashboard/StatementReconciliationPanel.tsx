@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { FileSearch, RefreshCw } from "lucide-react";
+import { FileSearch, RefreshCw, ChevronDown } from "lucide-react";
 
 type QueueItem = {
     id: string;
@@ -45,6 +45,12 @@ export default function StatementReconciliationPanel() {
     const [runs, setRuns] = useState<RunItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [acting, setActing] = useState<string | null>(null);
+    const [isCollapsed, setIsCollapsed] = useState(false);
+    useEffect(() => {
+      const s = localStorage.getItem("aria-dash-stmtrecon-collapsed");
+      if (s === "true") setIsCollapsed(true);
+    }, []);
+    useEffect(() => { localStorage.setItem("aria-dash-stmtrecon-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
     const fetchData = useCallback(async () => {
         try {
@@ -92,77 +98,87 @@ export default function StatementReconciliationPanel() {
                 >
                     refresh
                 </button>
-            </div>
-
-            <div className="px-4 py-3 border-b border-zinc-800/60 flex items-center gap-2">
                 <button
-                    onClick={() => launch({ action: "run_fedex_download" }, "fedex")}
-                    disabled={acting !== null}
-                    className="px-2 py-1 rounded border border-zinc-700 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                    onClick={() => setIsCollapsed(!isCollapsed)}
+                    className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors"
                 >
-                    {acting === "fedex" ? "launching..." : "FedEx Request"}
+                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "" : "rotate-180"}`} />
                 </button>
-                <span className="text-[10px] font-mono text-zinc-500">
-                    dashboard-only launch, background processing
-                </span>
             </div>
 
-            <div className="px-4 py-3">
-                <div className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-2">
-                    Suggested Queue
-                </div>
-                {loading ? (
-                    <div className="text-xs text-zinc-500">loading...</div>
-                ) : queue.length === 0 ? (
-                    <div className="text-xs text-zinc-500">no queued statements</div>
-                ) : (
-                    <div className="space-y-2">
-                        {queue.slice(0, 6).map((item) => (
-                            <div key={item.id} className="flex items-center gap-2 text-xs">
-                                <div className="min-w-0 flex-1">
-                                    <div className="text-zinc-200 truncate">{item.vendorName}</div>
-                                    <div className="text-zinc-500 font-mono">
-                                        {item.sourceType} · {item.status} · {timeAgo(item.discoveredAt)}
+            {!isCollapsed && (
+                <>
+                    <div className="px-4 py-3 border-b border-zinc-800/60 flex items-center gap-2">
+                        <button
+                            onClick={() => launch({ action: "run_fedex_download" }, "fedex")}
+                            disabled={acting !== null}
+                            className="px-2 py-1 rounded border border-zinc-700 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                        >
+                            {acting === "fedex" ? "launching..." : "FedEx Request"}
+                        </button>
+                        <span className="text-[10px] font-mono text-zinc-500">
+                            dashboard-only launch, background processing
+                        </span>
+                    </div>
+
+                    <div className="px-4 py-3">
+                        <div className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-2">
+                            Suggested Queue
+                        </div>
+                        {loading ? (
+                            <div className="text-xs text-zinc-500">loading...</div>
+                        ) : queue.length === 0 ? (
+                            <div className="text-xs text-zinc-500">no queued statements</div>
+                        ) : (
+                            <div className="space-y-2">
+                                {queue.slice(0, 6).map((item) => (
+                                    <div key={item.id} className="flex items-center gap-2 text-xs">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="text-zinc-200 truncate">{item.vendorName}</div>
+                                            <div className="text-zinc-500 font-mono">
+                                                {item.sourceType} · {item.status} · {timeAgo(item.discoveredAt)}
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={() => launch({ action: "run_existing_intake", intakeId: item.id }, item.id)}
+                                            disabled={acting !== null}
+                                            className="px-2 py-1 rounded border border-zinc-700 text-[10px] font-mono text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                                        >
+                                            {acting === item.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : "run"}
+                                        </button>
                                     </div>
-                                </div>
-                                <button
-                                    onClick={() => launch({ action: "run_existing_intake", intakeId: item.id }, item.id)}
-                                    disabled={acting !== null}
-                                    className="px-2 py-1 rounded border border-zinc-700 text-[10px] font-mono text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
-                                >
-                                    {acting === item.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : "run"}
-                                </button>
+                                ))}
                             </div>
-                        ))}
+                        )}
                     </div>
-                )}
-            </div>
 
-            <div className="px-4 py-3 border-t border-zinc-800/60">
-                <div className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-2">
-                    Recent Runs
-                </div>
-                {runs.length === 0 ? (
-                    <div className="text-xs text-zinc-500">no runs yet</div>
-                ) : (
-                    <div className="space-y-2">
-                        {runs.slice(0, 5).map((run) => (
-                            <div key={run.id} className="text-xs">
-                                <div className="flex items-center justify-between gap-2">
-                                    <span className="text-zinc-200 truncate">{run.vendorName}</span>
-                                    <span className="text-zinc-500 font-mono">{run.runStatus}</span>
-                                </div>
-                                <div className="text-zinc-500 font-mono">
-                                    m:{run.matchedCount} miss:{run.missingCount} diff:{run.mismatchCount} review:{run.needsReviewCount + run.duplicateCount}
-                                </div>
-                                {run.lastError ? (
-                                    <div className="text-[10px] text-rose-300">{run.lastError}</div>
-                                ) : null}
+                    <div className="px-4 py-3 border-t border-zinc-800/60">
+                        <div className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-2">
+                            Recent Runs
+                        </div>
+                        {runs.length === 0 ? (
+                            <div className="text-xs text-zinc-500">no runs yet</div>
+                        ) : (
+                            <div className="space-y-2">
+                                {runs.slice(0, 5).map((run) => (
+                                    <div key={run.id} className="text-xs">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <span className="text-zinc-200 truncate">{run.vendorName}</span>
+                                            <span className="text-zinc-500 font-mono">{run.runStatus}</span>
+                                        </div>
+                                        <div className="text-zinc-500 font-mono">
+                                            m:{run.matchedCount} miss:{run.missingCount} diff:{run.mismatchCount} review:{run.needsReviewCount + run.duplicateCount}
+                                        </div>
+                                        {run.lastError ? (
+                                            <div className="text-[10px] text-rose-300">{run.lastError}</div>
+                                        ) : null}
+                                    </div>
+                                ))}
                             </div>
-                        ))}
+                        )}
                     </div>
-                )}
-            </div>
+                </>
+            )}
         </div>
     );
 }
