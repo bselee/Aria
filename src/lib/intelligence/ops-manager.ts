@@ -8,6 +8,7 @@ import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
 import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
+import { OversightAgent } from "./oversight-agent";
 import { runBuildRiskAnalysis } from "../builds/build-risk";
 import { leadTimeService } from "../builds/lead-time-service";
 import { APIdentifierAgent } from "./workers/ap-identifier";
@@ -92,6 +93,8 @@ export class OpsManager {
     private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
+    private oversightAgent: OversightAgent;
+    private agentName = "ops-manager";
     // In-memory dedup for build completion alerts.
     // Hydrated from Supabase on startup to prevent duplicate alerts after restart.
     private seenCompletedBuildIds = new Set<string>();
@@ -133,6 +136,9 @@ export class OpsManager {
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
+
+        // Initialize OversightAgent for heartbeat monitoring
+        this.oversightAgent = new OversightAgent();
 
         // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
         // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
@@ -205,6 +211,9 @@ export class OpsManager {
                     }
                 } catch { /* non-critical */ }
             }
+
+            // Register heartbeat on success
+            await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastSuccess: new Date() });
         } catch (error: any) {
             const durationMs = Math.round(performance.now() - startTime);
             recordCronRun(taskName, durationMs, 'error', error.message);
@@ -227,6 +236,8 @@ export class OpsManager {
             console.error(`❌ Cron Task Failed: ${taskName}`, error.message);
             // Escalate to Supervisor
             this.supervisor.reportAgentException(taskName, error);
+            // Register heartbeat on error
+            await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastError: String(error) });
         }
     }
 
@@ -300,6 +311,25 @@ export class OpsManager {
         if (po.notes) desc += `\n<b>Internal Notes:</b>\n${po.notes}\n`;
 
         return desc;
+    }
+
+    /**
+     * Start OpsManager and all background cron jobs.
+     */
+    async start(): Promise<void> {
+        await this.oversightAgent?.start();
+        this.registerJobs();
+    }
+
+    /**
+     * Stop OpsManager and all background cron jobs.
+     */
+    async stop(): Promise<void> {
+        await this.oversightAgent?.stop();
+        for (const task of this.scheduledTasks) {
+            task.stop();
+        }
+        this.scheduledTasks = [];
     }
 
     /**
