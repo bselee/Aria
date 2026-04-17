@@ -16,6 +16,7 @@ import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
+import { EmailOverwatchAgent } from "./email-overwatch-agent";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -91,6 +92,7 @@ export class OpsManager {
     private apForwarder: APForwarderAgent;
     private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
+    private emailOverwatch: EmailOverwatchAgent;
     private supervisor: SupervisorAgent;
     // In-memory dedup for build completion alerts.
     // Hydrated from Supabase on startup to prevent duplicate alerts after restart.
@@ -132,6 +134,7 @@ export class OpsManager {
         this.apForwarder = new APForwarderAgent(bot);
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
+        this.emailOverwatch = new EmailOverwatchAgent("default");
         this.supervisor = new SupervisorAgent(bot);
 
         // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
@@ -318,6 +321,18 @@ export class OpsManager {
         // AP polling every 15 minutes
         schedule("*/15 * * * *", () => {
             this.safeRun("APPolling", () => this.pollAPInbox());
+        });
+
+        schedule("3,18,33,48 * * * *", () => {
+            this.safeRun("DefaultInboxIngestion", () => this.emailIngestionDefault.run());
+        });
+
+        schedule("6,21,36,51 * * * *", () => {
+            this.safeRun("EmailOverwatchProcessing", () => this.emailOverwatch.processInboxQueue());
+        });
+
+        schedule("11,41 * * * *", () => {
+            this.safeRun("EmailOverwatchReminderSweep", () => this.emailOverwatch.runReminderSweep());
         });
 
         // Build risk analysis at 7:30 AM weekdays

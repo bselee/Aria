@@ -19,7 +19,7 @@ import {
 
 describe('CRON_JOBS definitions', () => {
     it('contains the full current runtime schedule', () => {
-        expect(CRON_JOBS.length).toBe(16);
+        expect(CRON_JOBS.length).toBe(19);
     });
 
     it('has unique job names', () => {
@@ -49,6 +49,9 @@ describe('CRON_JOBS definitions', () => {
     it('includes all task names scheduled by OpsManager.registerJobs', () => {
         const expectedTasks = [
             'APPolling',
+            'DefaultInboxIngestion',
+            'EmailOverwatchProcessing',
+            'EmailOverwatchReminderSweep',
             'BuildRisk',
             'DailySummary',
             'WeeklySummary',

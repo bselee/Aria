@@ -113,6 +113,48 @@ export class VendorCommsAgent {
     }
 
     /**
+     * Create a follow-up draft instead of sending immediately.
+     * Used by the bill.selee inbox overwatch flow while the policy remains draft-only.
+     */
+    async createFollowUpDraft(
+        context: VendorCommContext,
+        followUpCount: number,
+        mode: "reply" | "eta_request" = "reply",
+    ): Promise<{ draftId: string }> {
+        const sentDateStr = context.sentAt.toLocaleDateString('en-US', {
+            month: 'short', day: 'numeric', year: 'numeric',
+            timeZone: 'America/Denver',
+        });
+
+        const body = mode === "eta_request"
+            ? this.getEtaRequestBody(context.poNumber)
+            : this.getFollowUpBody(context.poNumber, sentDateStr, followUpCount);
+
+        const rawEmail = buildFollowUpEmail({
+            to: context.vendorEmail,
+            subject: `Re: ${context.subject}`,
+            inReplyTo: context.messageId,
+            references: context.messageId,
+            body,
+        });
+
+        const draftRes = await this.gmail.users.drafts.create({
+            userId: 'me',
+            requestBody: {
+                message: {
+                    raw: Buffer.from(rawEmail).toString('base64url'),
+                    threadId: context.threadId,
+                }
+            }
+        });
+
+        console.log(`[vendor-comms] Created ${mode} draft #${followUpCount} for ${context.vendorEmail} on PO #${context.poNumber}`);
+        return {
+            draftId: draftRes.data.id,
+        };
+    }
+
+    /**
      * Send a follow-up email (L1 or L2 based on count).
      */
     async sendFollowUp(context: VendorCommContext, followUpCount: number): Promise<void> {
@@ -201,5 +243,15 @@ export class VendorCommsAgent {
             return L2_TEMPLATES[(count - 2) % L2_TEMPLATES.length];
         }
         return L1_TEMPLATES[count % L1_TEMPLATES.length];
+    }
+
+    private getEtaRequestBody(poNumber: string): string {
+        const ETA_TEMPLATES = [
+            `Hi,\n\nJust checking in on PO #${poNumber}. Do you have an ETA for this order yet?\n\nThanks!`,
+            `Hi,\n\nThanks for confirming receipt of PO #${poNumber}. Can you share an ETA when you have it?\n\nThanks!`,
+            `Hi,\n\nWanted to follow up on PO #${poNumber}. Please send over the expected ship timing when you can.\n\nThanks!`,
+        ];
+
+        return ETA_TEMPLATES[Math.floor(Math.random() * ETA_TEMPLATES.length)];
     }
 }

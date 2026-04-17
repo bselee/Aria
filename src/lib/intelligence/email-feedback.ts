@@ -16,6 +16,27 @@ interface FollowUpEvent extends EmailBaseEvent {
     reason: string;
 }
 
+interface OverwatchArchiveEvent extends EmailBaseEvent {
+    intent: string;
+    reason: string;
+    state: string;
+}
+
+interface OverwatchDraftEvent extends EmailBaseEvent {
+    poNumber: string;
+    vendorName: string;
+    draftId: string;
+    followUpCount: number;
+    mode: "reply" | "eta_request";
+}
+
+interface OverwatchHoldEvent extends EmailBaseEvent {
+    state: string;
+    reason: string;
+    poNumber?: string | null;
+    downstreamStatus?: string | null;
+}
+
 interface DefaultInboxInvoiceEvent {
     gmailMessageId: string;
     fromEmail: string;
@@ -90,6 +111,78 @@ export async function recordDefaultInboxInvoiceOutcome(event: DefaultInboxInvoic
         contextData: {
             fromEmail: event.fromEmail,
             subject: event.subject,
+        },
+    });
+}
+
+export async function recordOverwatchArchive(event: OverwatchArchiveEvent): Promise<void> {
+    await recordFeedback({
+        category: "outcome",
+        eventType: "email_overwatch_archived",
+        agentSource: "email-overwatch-agent",
+        subjectType: "message",
+        subjectId: event.gmailMessageId,
+        prediction: {
+            intent: event.intent,
+            state: event.state,
+        },
+        actualOutcome: {
+            fromEmail: event.fromEmail,
+            subject: event.subject,
+            archived: true,
+        },
+        contextData: {
+            threadId: event.threadId ?? null,
+            reason: event.reason,
+            inbox: "default",
+        },
+    });
+}
+
+export async function recordOverwatchDraftCreated(event: OverwatchDraftEvent): Promise<void> {
+    await recordFeedback({
+        category: "prediction",
+        eventType: "email_overwatch_follow_up_draft",
+        agentSource: "email-overwatch-agent",
+        subjectType: "po",
+        subjectId: event.poNumber,
+        prediction: {
+            draftId: event.draftId,
+            followUpCount: event.followUpCount,
+            mode: event.mode,
+            threadId: event.threadId ?? null,
+        },
+        actualOutcome: {
+            vendorName: event.vendorName,
+            fromEmail: event.fromEmail,
+            subject: event.subject,
+        },
+        contextData: {
+            gmailMessageId: event.gmailMessageId,
+            inbox: "default",
+        },
+    });
+}
+
+export async function recordOverwatchHeld(event: OverwatchHoldEvent): Promise<void> {
+    await recordFeedback({
+        category: "correction",
+        eventType: "email_overwatch_human_review_required",
+        agentSource: "email-overwatch-agent",
+        subjectType: event.poNumber ? "po" : "message",
+        subjectId: event.poNumber || event.gmailMessageId,
+        prediction: {
+            state: event.state,
+            threadId: event.threadId ?? null,
+        },
+        actualOutcome: {
+            fromEmail: event.fromEmail,
+            subject: event.subject,
+            downstreamStatus: event.downstreamStatus || null,
+        },
+        contextData: {
+            reason: event.reason,
+            inbox: "default",
         },
     });
 }
