@@ -146,22 +146,61 @@ export class EmailOverwatchAgent {
                         state: "closed_confident",
                     });
                 } else if (intent === "INLINE_INVOICE") {
-                    await enqueueDefaultInboxInvoice(
-                        row.gmail_message_id,
-                        row.from_email || "",
-                        row.subject || "",
-                        row.body_text || row.body_snippet || "",
-                    );
-                    await this.upsertThreadState({
-                        thread_id: row.thread_id || row.gmail_message_id,
-                        gmail_message_id: row.gmail_message_id,
-                        source_inbox: this.tokenIdentifier,
-                        intent,
-                        state: "paid_invoice_routed_waiting_for_reconcile",
-                        confidence: 0.95,
-                        uncertain_reason: null,
-                        downstream_status: "queued_for_nightshift",
-                    });
+                    const invoiceHandling = await this.resolveDefaultInboxInvoiceHandling(row);
+                    if (invoiceHandling.kind === "paid") {
+                        await enqueueDefaultInboxInvoice(
+                            row.gmail_message_id,
+                            row.from_email || "",
+                            row.subject || "",
+                            row.body_text || row.body_snippet || "",
+                        );
+                        await this.upsertThreadState({
+                            thread_id: row.thread_id || row.gmail_message_id,
+                            gmail_message_id: row.gmail_message_id,
+                            source_inbox: this.tokenIdentifier,
+                            intent,
+                            state: "paid_invoice_routed_waiting_for_reconcile",
+                            confidence: 0.95,
+                            uncertain_reason: null,
+                            downstream_status: "queued_for_nightshift",
+                        });
+                    } else {
+                        if (invoiceHandling.status === "duplicate_in_ap") {
+                            await this.archiveMessage(row.gmail_message_id);
+                        }
+                        await this.upsertThreadState({
+                            thread_id: row.thread_id || row.gmail_message_id,
+                            gmail_message_id: row.gmail_message_id,
+                            source_inbox: this.tokenIdentifier,
+                            intent,
+                            state: invoiceHandling.status === "duplicate_in_ap" ? "closed_confident" : "human_review_required",
+                            confidence: invoiceHandling.status === "duplicate_in_ap" ? 0.92 : 0.78,
+                            uncertain_reason: invoiceHandling.status === "duplicate_in_ap" ? null : invoiceHandling.reason,
+                            downstream_status: invoiceHandling.status,
+                            resolved_at: invoiceHandling.status === "duplicate_in_ap" ? new Date().toISOString() : null,
+                        });
+                        if (invoiceHandling.status === "duplicate_in_ap") {
+                            await recordOverwatchArchive({
+                                gmailMessageId: row.gmail_message_id,
+                                threadId: row.thread_id || row.gmail_message_id,
+                                fromEmail: row.from_email || "",
+                                subject: row.subject || "",
+                                intent,
+                                reason: "invoice_duplicate_owned_by_ap",
+                                state: "closed_confident",
+                            });
+                        } else {
+                            await recordOverwatchHeld({
+                                gmailMessageId: row.gmail_message_id,
+                                threadId: row.thread_id || row.gmail_message_id,
+                                fromEmail: row.from_email || "",
+                                subject: row.subject || "",
+                                state: "human_review_required",
+                                reason: invoiceHandling.reason,
+                                downstreamStatus: invoiceHandling.status,
+                            });
+                        }
+                    }
                 } else {
                     await this.upsertThreadState({
                         thread_id: row.thread_id || row.gmail_message_id,
@@ -193,6 +232,32 @@ export class EmailOverwatchAgent {
                 console.error(`[email-overwatch] Failed processing ${row.gmail_message_id}:`, err?.message ?? err);
             }
         }
+    }
+
+    private async resolveDefaultInboxInvoiceHandling(
+        row: QueueRow,
+    ): Promise<
+        | { kind: "paid" }
+        | { kind: "hold"; reason: "invoice_already_in_ap" | "payable_invoice_needs_ap_review"; status: "duplicate_in_ap" | "not_found_in_ap" }
+    > {
+        if (this.isClearlyPaidInvoice(row)) {
+            return { kind: "paid" };
+        }
+
+        const duplicateInAp = await this.findAPDuplicate(row);
+        if (duplicateInAp) {
+            return {
+                kind: "hold",
+                reason: "invoice_already_in_ap",
+                status: "duplicate_in_ap",
+            };
+        }
+
+        return {
+            kind: "hold",
+            reason: "payable_invoice_needs_ap_review",
+            status: "not_found_in_ap",
+        };
     }
 
     async runReminderSweep(): Promise<void> {
@@ -244,6 +309,58 @@ export class EmailOverwatchAgent {
         const hasMoney = /\$\s*\d[\d,]*(?:\.\d{2})?/.test(text) || /\b\d[\d,]*\.\d{2}\b/.test(text);
         const hasInvoiceSignals = /\b(total|invoice|freight|subtotal|amount due|paid|charges?)\b/i.test(text);
         return hasPO && hasMoney && hasInvoiceSignals;
+    }
+
+    private isClearlyPaidInvoice(row: QueueRow): boolean {
+        const haystack = `${row.subject || ""}\n${row.body_text || row.body_snippet || ""}`.toLowerCase();
+        const paidSignals = [
+            "paid invoice",
+            "payment confirmation",
+            "receipt",
+            "credit card charged",
+            "already paid",
+        ];
+        const payableSignals = [
+            "amount due",
+            "payment request",
+            "please pay",
+            "balance due",
+            "due upon receipt",
+            "remit",
+        ];
+
+        return paidSignals.some((signal) => haystack.includes(signal))
+            && !payableSignals.some((signal) => haystack.includes(signal));
+    }
+
+    private async findAPDuplicate(row: QueueRow): Promise<boolean> {
+        const supabase = createClient();
+        if (!supabase) return false;
+
+        const rfcMessageId = (row as any).rfc_message_id || null;
+        if (rfcMessageId) {
+            const { data } = await supabase
+                .from("email_inbox_queue")
+                .select("gmail_message_id")
+                .eq("source_inbox", "ap")
+                .eq("rfc_message_id", rfcMessageId)
+                .maybeSingle();
+            if (data) return true;
+        }
+
+        const subject = row.subject || "";
+        const fromEmail = row.from_email || "";
+        if (!subject || !fromEmail) return false;
+
+        const { data } = await supabase
+            .from("email_inbox_queue")
+            .select("gmail_message_id")
+            .eq("source_inbox", "ap")
+            .eq("from_email", fromEmail)
+            .eq("subject", subject)
+            .maybeSingle();
+
+        return !!data;
     }
 
     private async verifyDownstreamInvoices(): Promise<void> {

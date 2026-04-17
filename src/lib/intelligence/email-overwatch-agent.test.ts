@@ -88,17 +88,25 @@ vi.mock("../supabase", () => ({
     createClient: vi.fn(() => ({
         from: (table: string) => {
             if (table === "email_inbox_queue") {
-                return {
-                    select: () => ({
-                        eq: (_column: string, processed: unknown) => ({
-                            eq: (_column2: string, _source: unknown) => ({
-                                limit: async () => ({
-                                    data: queueState.messages.filter((row) => row.processed_by_overwatch === processed),
-                                    error: null,
-                                }),
-                            }),
-                        }),
+                const filterRows = (filters: Array<{ column: string; value: unknown }>) =>
+                    queueState.messages.filter((row) =>
+                        filters.every((filter) => row[filter.column as keyof typeof row] === filter.value),
+                    );
+
+                const buildSelectChain = (filters: Array<{ column: string; value: unknown }> = []) => ({
+                    eq: (column: string, value: unknown) => buildSelectChain([...filters, { column, value }]),
+                    limit: async () => ({
+                        data: filterRows(filters),
+                        error: null,
                     }),
+                    maybeSingle: async () => ({
+                        data: filterRows(filters)[0] || null,
+                        error: null,
+                    }),
+                });
+
+                return {
+                    select: () => buildSelectChain(),
                     update: (values: Record<string, unknown>) => ({
                         eq: async (column: string, value: unknown) => {
                             queueState.updates.push({ values, column, value });
@@ -435,5 +443,92 @@ describe("EmailOverwatchAgent", () => {
             eta_text: "next week",
         });
         expect(threadState.rows[0].next_follow_up_at).toBeTruthy();
+    });
+
+    it("archives the bill.selee copy when the same payable invoice already exists in AP", async () => {
+        queueState.messages = [
+            {
+                id: 10,
+                gmail_message_id: "gmail-bill-payable-1",
+                rfc_message_id: "<invoice-1@example.com>",
+                thread_id: "thread-bill-payable-1",
+                from_email: "orders@autopot-usa.com",
+                subject: "Invoice APUS-243466",
+                body_snippet: "Invoice APUS-243466 amount due $482.11",
+                body_text: "Invoice APUS-243466 amount due $482.11 due upon receipt",
+                has_pdf: true,
+                processed_by_overwatch: false,
+                source_inbox: "default",
+            },
+            {
+                id: 11,
+                gmail_message_id: "gmail-ap-copy-1",
+                rfc_message_id: "<invoice-1@example.com>",
+                thread_id: "thread-ap-copy-1",
+                from_email: "orders@autopot-usa.com",
+                subject: "Invoice APUS-243466",
+                body_snippet: "Invoice APUS-243466 amount due $482.11",
+                body_text: "Invoice APUS-243466 amount due $482.11 due upon receipt",
+                has_pdf: true,
+                processed_by_overwatch: false,
+                source_inbox: "ap",
+            },
+        ];
+        unifiedObjectGenerationMock.mockResolvedValue({
+            intent: "INLINE_INVOICE",
+            reasoning: "invoice needs payment",
+        });
+
+        await new EmailOverwatchAgent("default").processInboxQueue();
+
+        expect(enqueueDefaultInboxInvoiceMock).not.toHaveBeenCalled();
+        expect(gmailDraftCreateMock).not.toHaveBeenCalled();
+        expect(gmailModifyMock).toHaveBeenCalledWith({
+            userId: "me",
+            id: "gmail-bill-payable-1",
+            requestBody: {
+                removeLabelIds: ["INBOX", "UNREAD"],
+            },
+        });
+        expect(threadState.rows[0]).toMatchObject({
+            thread_id: "thread-bill-payable-1",
+            state: "closed_confident",
+            uncertain_reason: null,
+            downstream_status: "duplicate_in_ap",
+        });
+    });
+
+    it("holds payable invoices in bill.selee when they are not found in AP", async () => {
+        queueState.messages = [
+            {
+                id: 12,
+                gmail_message_id: "gmail-bill-payable-2",
+                rfc_message_id: "<invoice-2@example.com>",
+                thread_id: "thread-bill-payable-2",
+                from_email: "orders@autopot-usa.com",
+                subject: "Invoice APUS-243467",
+                body_snippet: "Invoice APUS-243467 amount due $300.00",
+                body_text: "Invoice APUS-243467 amount due $300.00 due upon receipt",
+                has_pdf: true,
+                processed_by_overwatch: false,
+                source_inbox: "default",
+            },
+        ];
+        unifiedObjectGenerationMock.mockResolvedValue({
+            intent: "INLINE_INVOICE",
+            reasoning: "invoice needs payment",
+        });
+
+        await new EmailOverwatchAgent("default").processInboxQueue();
+
+        expect(enqueueDefaultInboxInvoiceMock).not.toHaveBeenCalled();
+        expect(gmailDraftCreateMock).not.toHaveBeenCalled();
+        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(threadState.rows[0]).toMatchObject({
+            thread_id: "thread-bill-payable-2",
+            state: "human_review_required",
+            uncertain_reason: "payable_invoice_needs_ap_review",
+            downstream_status: "not_found_in_ap",
+        });
     });
 });
