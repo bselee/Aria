@@ -48,6 +48,7 @@ import { withAdvisoryLock } from "../purchasing/advisory-lock";
 import { derivePOLifecycleState, shouldRequestTrackingFollowUp, getFollowUpTemplate, getFollowUpTemplateL2, shouldUseL2FollowUp, getVendorThankYou, getVendorClarifyRequest } from "../purchasing/derive-po-lifecycle";
 import { VendorCommsAgent } from "./vendor-comms-agent";
 import { enqueueEmailClassification } from "./nightshift-agent";
+import { OversightAgent } from "./oversight-agent";
 import { runPOSweep } from "../matching/po-sweep";
 import { buildDailyFinaleSlices } from "./ops-summary-slices";
 import {
@@ -92,6 +93,7 @@ export class OpsManager {
     private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
+    private oversightAgent: OversightAgent;
     // In-memory dedup for build completion alerts.
     // Hydrated from Supabase on startup to prevent duplicate alerts after restart.
     private seenCompletedBuildIds = new Set<string>();
@@ -133,6 +135,7 @@ export class OpsManager {
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
+        this.oversightAgent = new OversightAgent();
 
         // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
         // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
@@ -205,6 +208,8 @@ export class OpsManager {
                     }
                 } catch { /* non-critical */ }
             }
+
+            await this.oversightAgent.registerHeartbeat(taskName, null, { lastSuccess: new Date() });
         } catch (error: any) {
             const durationMs = Math.round(performance.now() - startTime);
             recordCronRun(taskName, durationMs, 'error', error.message);
@@ -227,6 +232,8 @@ export class OpsManager {
             console.error(`❌ Cron Task Failed: ${taskName}`, error.message);
             // Escalate to Supervisor
             this.supervisor.reportAgentException(taskName, error);
+
+            await this.oversightAgent.registerHeartbeat(taskName, null, { lastError: String(error) });
         }
     }
 
@@ -393,6 +400,14 @@ export class OpsManager {
         });
 
         console.log("✅ OpsManager background jobs registered.");
+    }
+
+    start() {
+        this.oversightAgent.start();
+    }
+
+    stop() {
+        this.oversightAgent.stop();
     }
 
     /**
