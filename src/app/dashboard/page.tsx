@@ -89,7 +89,7 @@ type ColumnId = "left" | "midLeft" | "midRight" | "right";
 type LayoutState = Record<ColumnId, string[]>;
 
 const DEFAULT_LAYOUT: LayoutState = {
-    left: ["oversight", "build-risk", "receivings"],
+    left: ["build-risk", "receivings"],
     // DECISION(2026-03-25): Removed axiom-queue from dashboard — Axiom ordering
     // is now fully autonomous (like ULINE). No manual review needed.
     midLeft: ["invoice-queue", "statement-reconciliation", "active-purchases", "tracking-board"],
