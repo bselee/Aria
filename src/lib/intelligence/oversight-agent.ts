@@ -1,4 +1,5 @@
 import { createClient } from '@/lib/supabase';
+import { randomUUID } from 'crypto';
 
 export type AgentStatus = 'HEALTHY' | 'DEGRADED' | 'DOWN' | 'UNKNOWN';
 
@@ -32,7 +33,14 @@ export class OversightAgent {
     const supabase = createClient();
     if (!supabase) return;
 
+    const { data: existing } = await supabase
+      .from('agent_heartbeats')
+      .select('id')
+      .eq('agent_name', agentName)
+      .maybeSingle();
+
     await supabase.from('agent_heartbeats').upsert({
+      id: existing?.id ?? randomUUID(),
       agent_name: agentName,
       last_heartbeat_at: new Date().toISOString(),
       status: 'HEALTHY',
