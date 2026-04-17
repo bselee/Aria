@@ -204,3 +204,5 @@ export function OversightPanel() {
     </div>
   );
 }
+
+export default OversightPanel;
