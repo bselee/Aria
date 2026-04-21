@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useEffect, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase";
 import { Heart, Clock, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
@@ -7,10 +8,9 @@ import { Heart, Clock, AlertTriangle, CheckCircle2, XCircle } from "lucide-react
 type AgentHeartbeat = {
   id: string;
   agent_name: string;
-  last_heartbeat_at: string;
-  status: "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
-  current_task: string | null;
-  metrics: Record<string, any>;
+  heartbeat_at: string;
+  status: "healthy" | "degraded" | "starting" | "stopped";
+  metadata: Record<string, any>;
 };
 
 type Skill = {
@@ -27,10 +27,10 @@ type Skill = {
 };
 
 const STATUS_CONFIG = {
-  HEALTHY: { color: "text-emerald-400", bg: "bg-emerald-500/10 border-emerald-500/20", dot: "bg-emerald-500", label: "Healthy", icon: CheckCircle2 },
-  DEGRADED: { color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20", dot: "bg-amber-400", label: "Degraded", icon: AlertTriangle },
-  DOWN: { color: "text-rose-400", bg: "bg-rose-500/10 border-rose-500/20", dot: "bg-rose-500", label: "Down", icon: XCircle },
-  UNKNOWN: { color: "text-zinc-500", bg: "bg-zinc-700/20 border-zinc-700/30", dot: "bg-zinc-500", label: "Unknown", icon: Clock },
+  healthy: { color: "text-emerald-400", bg: "bg-emerald-500/10 border-emerald-500/20", dot: "bg-emerald-500", label: "Healthy", icon: CheckCircle2 },
+  degraded: { color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20", dot: "bg-amber-400", label: "Degraded", icon: AlertTriangle },
+  starting: { color: "text-sky-400", bg: "bg-sky-500/10 border-sky-500/20", dot: "bg-sky-500", label: "Starting", icon: Clock },
+  stopped: { color: "text-rose-400", bg: "bg-rose-500/10 border-rose-500/20", dot: "bg-rose-500", label: "Stopped", icon: XCircle },
 };
 
 function timeAgo(iso: string): string {
@@ -45,6 +45,7 @@ function timeAgo(iso: string): string {
 function AgentStatusCard({ agent }: { agent: AgentHeartbeat }) {
   const cfg = STATUS_CONFIG[agent.status];
   const Icon = cfg.icon;
+  const currentTask = agent.metadata?.currentTask as string | undefined;
 
   return (
     <div className={`p-3 rounded-lg border ${cfg.bg}`}>
@@ -54,18 +55,18 @@ function AgentStatusCard({ agent }: { agent: AgentHeartbeat }) {
           <span className="text-sm font-semibold text-zinc-200">{agent.agent_name}</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className={`w-2 h-2 rounded-full ${cfg.dot} ${agent.status === "HEALTHY" ? "" : agent.status === "DOWN" ? "animate-pulse" : ""}`} />
+          <span className={`w-2 h-2 rounded-full ${cfg.dot} ${agent.status === "healthy" ? "" : agent.status === "stopped" ? "animate-pulse" : ""}`} />
           <span className={`text-[10px] font-mono uppercase tracking-wider ${cfg.color}`}>{cfg.label}</span>
         </div>
       </div>
-      {agent.current_task && (
+      {currentTask && (
         <div className="text-xs text-zinc-500 font-mono truncate mb-1">
-          {agent.current_task}
+          {currentTask}
         </div>
       )}
       <div className="text-[10px] text-zinc-600 font-mono flex items-center gap-1">
         <Icon className="w-3 h-3" />
-        {timeAgo(agent.last_heartbeat_at)}
+        {timeAgo(agent.heartbeat_at)}
       </div>
     </div>
   );
@@ -150,7 +151,7 @@ export function OversightPanel() {
       supabase
         .from("agent_heartbeats")
         .select("*")
-        .order("last_heartbeat_at", { ascending: false }),
+        .order("heartbeat_at", { ascending: false }),
       supabase
         .from("skills")
         .select("*")

@@ -1,15 +1,10 @@
 /**
- * @file    skill-crystallizer.ts
- * @purpose Converts agent execution traces into reusable, reviewable skills.
- *          Crystallized skills are stored in the `skills` table and can be
- *          approved/rejected by a supervisor before being matched to future tasks.
- * @author  Will / Antigravity
- * @created 2026-04-17
+ * @file skill-crystallizer.ts
+ * @purpose Stores reviewable skills against the real `skills` schema and tracks
+ *          shadow runs plus invocation confidence.
  */
 
 import { createClient } from "@/lib/supabase";
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SkillStep {
     order: number;
@@ -21,35 +16,44 @@ export interface SkillStep {
 }
 
 export interface CrystallizeRequest {
+    name: string;
+    description: string;
+    trigger: string;
     agentName: string;
-    taskType: string;
-    inputSummary: string;
-    outputSummary: string;
-    executionTrace: SkillStep[];
+    steps: SkillStep[];
 }
 
 export interface Skill {
     id: string;
+    name: string;
+    description: string;
+    trigger: string;
     agent_name: string;
-    task_type: string;
-    input_summary: string;
-    output_summary: string;
-    execution_trace: SkillStep[];
+    steps: SkillStep[];
+    confidence: number;
+    times_invoked: number;
+    times_succeeded: number;
     review_status: "pending" | "approved" | "rejected";
     rejection_feedback?: string | null;
     archived: boolean;
     created_at: string;
-    approved_at?: string | null;
+    updated_at?: string | null;
 }
 
-// ── Keyword matching ──────────────────────────────────────────────────────────
+export interface ShadowRunRequest {
+    skillId: string;
+    agentName: string;
+    taskType: string;
+    inputSummary: string;
+    outputSummary: string;
+}
 
 function tokenize(text: string): string[] {
     return text
         .toLowerCase()
         .replace(/[^a-z0-9\s]/g, " ")
         .split(/\s+/)
-        .filter((t) => t.length > 2);
+        .filter((token) => token.length > 2);
 }
 
 function keywordScore(trigger: string, skill: Skill): number {
@@ -57,20 +61,23 @@ function keywordScore(trigger: string, skill: Skill): number {
     if (triggerTokens.size === 0) return 0;
 
     const skillTokens = new Set([
-        ...tokenize(skill.task_type),
-        ...tokenize(skill.input_summary),
-        ...tokenize(skill.output_summary),
+        ...tokenize(skill.name),
+        ...tokenize(skill.description),
+        ...tokenize(skill.trigger),
     ]);
 
     let overlap = 0;
-    for (const tok of triggerTokens) {
-        if (skillTokens.has(tok)) overlap++;
+    for (const token of triggerTokens) {
+        if (skillTokens.has(token)) overlap++;
     }
 
     return overlap / triggerTokens.size;
 }
 
-// ── SkillCrystallizer ─────────────────────────────────────────────────────────
+function nextConfidence(timesInvoked: number, timesSucceeded: number): number {
+    if (timesInvoked <= 0) return 0;
+    return Number((timesSucceeded / timesInvoked).toFixed(4));
+}
 
 export class SkillCrystallizer {
     async crystallize(request: CrystallizeRequest): Promise<string> {
@@ -79,13 +86,14 @@ export class SkillCrystallizer {
         const { data, error } = await supabase
             .from("skills")
             .insert({
+                name: request.name,
+                description: request.description,
+                trigger: request.trigger,
                 agent_name: request.agentName,
-                task_type: request.taskType,
-                input_summary: request.inputSummary,
-                output_summary: request.outputSummary,
-                execution_trace: request.executionTrace,
+                steps: request.steps,
                 review_status: "pending",
                 archived: false,
+                created_by: "auto",
             })
             .select("id")
             .single();
@@ -117,7 +125,7 @@ export class SkillCrystallizer {
             .from("skills")
             .update({
                 review_status: "approved",
-                approved_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
             })
             .eq("id", skillId);
 
@@ -132,10 +140,57 @@ export class SkillCrystallizer {
             .update({
                 review_status: "rejected",
                 rejection_feedback: feedback,
+                archived: true,
+                updated_at: new Date().toISOString(),
             })
             .eq("id", skillId);
 
         if (error) throw new Error(`SkillCrystallizer.rejectSkill failed: ${error.message}`);
+    }
+
+    async recordInvocation(skillId: string, success: boolean): Promise<void> {
+        const supabase = createClient();
+        const { data, error } = await supabase
+            .from("skills")
+            .select("times_invoked,times_succeeded")
+            .eq("id", skillId)
+            .single();
+
+        if (error) throw new Error(`SkillCrystallizer.recordInvocation failed: ${error.message}`);
+
+        const timesInvoked = Number(data?.times_invoked ?? 0) + 1;
+        const timesSucceeded = Number(data?.times_succeeded ?? 0) + (success ? 1 : 0);
+        const confidence = nextConfidence(timesInvoked, timesSucceeded);
+
+        const { error: updateError } = await supabase
+            .from("skills")
+            .update({
+                times_invoked: timesInvoked,
+                times_succeeded: timesSucceeded,
+                confidence,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", skillId);
+
+        if (updateError) throw new Error(`SkillCrystallizer.recordInvocation update failed: ${updateError.message}`);
+    }
+
+    async recordShadowRun(request: ShadowRunRequest): Promise<void> {
+        const supabase = createClient();
+
+        const { error } = await supabase
+            .from("task_history")
+            .insert({
+                agent_name: request.agentName,
+                task_type: request.taskType,
+                input_summary: request.inputSummary,
+                output_summary: request.outputSummary,
+                status: "shadow",
+                skill_id: request.skillId,
+                created_at: new Date().toISOString(),
+            });
+
+        if (error) throw new Error(`SkillCrystallizer.recordShadowRun failed: ${error.message}`);
     }
 
     async findMatchingSkill(trigger: string): Promise<Skill | null> {

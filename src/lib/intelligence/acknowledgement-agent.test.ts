@@ -230,7 +230,7 @@ describe("AcknowledgementAgent", () => {
         expect(recordHumanFollowUpRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into Follow Up instead of auto-replying", async () => {
+    it("forces multi-turn conversation threads into human review without adding a follow-up label", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -250,13 +250,7 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailModifyMock).toHaveBeenCalledWith({
-            userId: "me",
-            id: "gmail-2",
-            requestBody: {
-                addLabelIds: ["follow-up-label"],
-            },
-        });
+        expect(gmailModifyMock).not.toHaveBeenCalled();
         expect(recordHumanFollowUpRequiredMock).toHaveBeenCalledWith({
             gmailMessageId: "gmail-2",
             threadId: "thread-2",

@@ -63,6 +63,8 @@ import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
 import { listShipmentsForPurchaseOrders, upsertShipmentEvidence } from "../tracking/shipment-intelligence";
+import { runEmailPollingCycle } from "./email-polling-cycle";
+import { memoryLayerManager } from "./memory-layer-manager";
 
 const execAsync = promisify(exec);
 
@@ -139,6 +141,7 @@ export class OpsManager {
 
         // Initialize OversightAgent for heartbeat monitoring
         this.oversightAgent = new OversightAgent();
+        this.registerOversightRecoveries();
 
         // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
         // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
@@ -166,6 +169,44 @@ export class OpsManager {
         }
     }
 
+    private registerOversightRecoveries() {
+        const runEmailRecovery = async () => {
+            await this.pollAPInbox();
+            return true;
+        };
+
+        this.oversightAgent.registerRecovery("ops-manager", {
+            controlCommand: "restart_bot",
+        });
+        this.oversightAgent.registerRecovery("default-email-pipeline", {
+            retry: runEmailRecovery,
+            controlCommand: "run_ap_poll_now",
+        });
+        this.oversightAgent.registerRecovery("default-acknowledgement", {
+            retry: runEmailRecovery,
+            controlCommand: "run_ap_poll_now",
+        });
+        this.oversightAgent.registerRecovery("ap-email-pipeline", {
+            retry: runEmailRecovery,
+            controlCommand: "run_ap_poll_now",
+        });
+        this.oversightAgent.registerRecovery("ap-identifier", {
+            retry: runEmailRecovery,
+            controlCommand: "run_ap_poll_now",
+        });
+        this.oversightAgent.registerRecovery("ap-forwarder", {
+            retry: runEmailRecovery,
+            controlCommand: "run_ap_poll_now",
+        });
+        this.oversightAgent.registerRecovery("nightshift-agent", {
+            retry: async () => {
+                await enqueueEmailClassification();
+                return true;
+            },
+            controlCommand: "run_nightshift_now",
+        });
+    }
+
     /**
      * Safely executes a scheduled task with duration tracking, DB audit logging,
      * and crash escalation. Every run is recorded to cron_runs for observability.
@@ -179,6 +220,7 @@ export class OpsManager {
     private async safeRun(taskName: string, task: () => Promise<any> | any) {
         const startTime = performance.now();
         let cronRunId: number | null = null;
+        const startedAtIso = new Date().toISOString();
 
         // Record start in cron_runs (fire-and-forget — don't block the task)
         try {
@@ -214,6 +256,15 @@ export class OpsManager {
 
             // Register heartbeat on success
             await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastSuccess: new Date() });
+            await memoryLayerManager.archiveSession(`cron:${taskName}:${startedAtIso}`, {
+                sessionId: `cron:${taskName}:${startedAtIso}`,
+                agentName: this.agentName,
+                taskType: taskName,
+                inputSummary: `Scheduled task ${taskName}`,
+                outputSummary: `Completed in ${durationMs}ms`,
+                status: "success",
+                createdAt: startedAtIso,
+            });
         } catch (error: any) {
             const durationMs = Math.round(performance.now() - startTime);
             recordCronRun(taskName, durationMs, 'error', error.message);
@@ -238,6 +289,15 @@ export class OpsManager {
             this.supervisor.reportAgentException(taskName, error);
             // Register heartbeat on error
             await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastError: String(error) });
+            await memoryLayerManager.archiveSession(`cron:${taskName}:${startedAtIso}`, {
+                sessionId: `cron:${taskName}:${startedAtIso}`,
+                agentName: this.agentName,
+                taskType: taskName,
+                inputSummary: `Scheduled task ${taskName}`,
+                outputSummary: String(error?.message || error),
+                status: "failure",
+                createdAt: startedAtIso,
+            });
         }
     }
 
@@ -431,9 +491,14 @@ export class OpsManager {
     async pollAPInbox() {
         console.log("📡 Polling AP Inbox...");
         try {
-            await this.emailIngestionAP.run();
-            await this.apIdentifier.identifyAndQueue();
-            await this.apForwarder.processPendingForwards();
+            await runEmailPollingCycle({
+                emailIngestionDefault: this.emailIngestionDefault,
+                acknowledgementAgent: this.ackAgent,
+                emailIngestionAP: this.emailIngestionAP,
+                apIdentifier: this.apIdentifier,
+                apForwarder: this.apForwarder,
+                onStageSuccess: (stage: string) => this.oversightAgent.registerHeartbeat(stage, stage, { source: "email-polling-cycle" }),
+            });
         } catch (err: any) {
             console.error("AP Polling error:", err.message);
         }
@@ -464,6 +529,7 @@ export class OpsManager {
         console.log("🌙 Enqueuing work for Nightshift...");
         try {
             await enqueueEmailClassification();
+            await this.oversightAgent.registerHeartbeat("nightshift-agent", "enqueue-nightshift-work", { source: "ops-manager" });
         } catch (err: any) {
             console.error("Nightshift Enqueue error:", err.message);
         }
