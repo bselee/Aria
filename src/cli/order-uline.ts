@@ -49,6 +49,7 @@ import {
 import {
     launchUlineSession,
     openUlinePasteItemsPage,
+    clearUlineCart,
     emailUlineCart,
 } from '../lib/purchasing/uline-session';
 import { buildVendorDraftPlans } from '../lib/purchasing/vendor-draft-plans';
@@ -126,7 +127,8 @@ async function gatherFromPO(finale: FinaleClient, orderId: string): Promise<Orde
 
     const items: OrderLineItem[] = [];
     for (const item of (po.orderItemList || [])) {
-        const finaleId = item.productUrl?.split('/').pop() || item.productId || '';
+        // Use productId (SKU like "S-1665") first, fall back to URL-based ID
+        const finaleId = item.productId || item.productUrl?.split('/').pop() || '';
         if (!finaleId || (item.quantity ?? 0) <= 0) continue;
 
         items.push(convertFinaleItemToUlineOrder({
@@ -606,12 +608,9 @@ export async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderM
  */
 async function scrapeOrderConfirmation(): Promise<{ orderNumber: string; orderDate: string } | null> {
     console.log('\n   🔍 Scraping ULINE order confirmation...');
-    console.log('   ⚠️  Chrome must be closed for this step\n');
 
     const session = await launchUlineSession({ headless: false });
-    const { context } = session;
-
-    const page = context.pages()[0] || await context.newPage();
+    const { page } = session;
 
     try {
         await page.goto('https://www.uline.com/MyAccount/OrderHistory', {
@@ -649,7 +648,7 @@ async function scrapeOrderConfirmation(): Promise<{ orderNumber: string; orderDa
 
         return order;
     } finally {
-        await context.close();
+        await session.close();
     }
 }
 
@@ -749,86 +748,62 @@ async function placeViaQuickOrderPaste(
 ): Promise<UlineCartFillResult> {
     const autonomous = opts?.autonomous ?? false;
     console.log('\n   🌐 Launching browser (Paste Items method)...');
-    if (!autonomous) console.log('   ⚠️  Chrome must be closed for this step\n');
 
     const session = await launchUlineSession({ headless: false });
-    const { context } = session;
-
-    const page = context.pages()[0] || await context.newPage();
+    const { page } = session;
 
     try {
+        // Clear existing cart first
+        console.log('   🗑️  Clearing existing cart...');
+        await clearUlineCart(page);
+
         // Navigate to Quick Order page
         await openUlinePasteItemsPage(page);
         console.log('   ✅ Paste Items Page loaded\n');
 
-        // Format items: "ModelNumber, Quantity" per line
-        const pasteLines = items.map(item => `${item.ulineModel}, ${item.quantity}`);
+        // Format items: "ModelNumber\tQuantity" per line (tab-separated for ULINE paste)
+        const pasteLines = items.map(item => `${item.ulineModel}\t${item.quantity}`);
         const pasteText = pasteLines.join('\n');
 
         console.log('   📋 Pasting order manifest:');
         console.log('   ┌────────────────────────────────────────┐');
         for (const line of pasteLines) {
-            console.log(`   │  ${line.padEnd(38)}│`);
+            console.log(`   │  ${line.replace('\t', ', ').padEnd(38)}│`);
         }
         console.log('   └────────────────────────────────────────┘\n');
 
-        // Fill the textarea
+        // Fill the textarea using Playwright's fill (triggers proper input events)
         await page.fill('#txtPaste', pasteText);
         await page.waitForTimeout(500);
 
-        // Click "Add to Cart"
-        // DECISION(2026-03-16): ULINE's Paste Items Page uses a variety of button types.
-        // We try multiple selectors and fallback strategies. If all fail, we leave
-        // the page open for manual click rather than crashing.
+        // Click "Add to Cart" using Playwright click
         const beforeRows = await scrapeObservedUlineCartRows(page);
-        let addClicked = false;
-
-        // Strategy 1: broad CSS selector search
-        const selectors = [
-            '#btnAddPastedItemsToCart',
-            '#btnAddToCart',
-            'input[type="submit"][value*="Add"]',
-            'input[type="button"][value*="Add"]',
-            'button:has-text("Add to Cart")',
-            'input[value*="Add to Cart"]',
-            'a:has-text("Add to Cart")',
-            'input[value*="Add Items"]',
-            'button:has-text("Add Items")',
-        ];
-        for (const sel of selectors) {
-            const btn = await page.$(sel);
-            if (btn && await btn.isVisible().catch(() => false)) {
-                await btn.click();
-                addClicked = true;
-                break;
+        const addClicked = await page.locator('#btnAddPastedItemsToCart').isVisible().catch(() => false);
+        if (addClicked) {
+            await page.locator('#btnAddPastedItemsToCart').click();
+        } else {
+            // Fallback: find any button with "Add" in it
+            const fallbackBtn = page.locator('button, input[type="submit"], input[type="button"]').filter({ hasText: /add.*cart/i }).first();
+            if (await fallbackBtn.isVisible().catch(() => false)) {
+                await fallbackBtn.click();
             }
-        }
-
-        // Strategy 2: Playwright role-based search
-        if (!addClicked) {
-            try {
-                const roleBtn = page.getByRole('button', { name: /add/i }).first();
-                if (await roleBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-                    await roleBtn.click();
-                    addClicked = true;
-                }
-            } catch { /* not found */ }
         }
 
         let errorText = '';
         let cartUrl: string | null = null;
         if (addClicked) {
-            console.log('   🛒 Clicked "Add to Cart" — items should be in your ULINE cart now!');
+            console.log('   🛒 Add to Cart clicked — loading...');
+            await page.waitForTimeout(5_000);
 
-            // Wait a moment for the cart to update
-            await page.waitForTimeout(3_000);
+            // Check current URL — ULINE redirects to cart after adding
+            const currentUrl = page.url();
+            console.log(`   📍 ${currentUrl}`);
 
-            // Email the cart to the user so they can load it in any browser (1Password workaround)
-            const cartEmail = process.env.ULINE_EMAIL || 'bill.selee@buildasoil.com';
-            cartUrl = await emailUlineCart(page, cartEmail);
-
-            // Check if there are any error messages
-            errorText = await page.$eval('.error, .errorMessage, .alert-danger', el => el.textContent?.trim() || '').catch(() => '');
+            // Check for error messages
+            errorText = await page.evaluate(() => {
+                const el = document.querySelector('.error, .errorMessage, .alert-danger');
+                return el?.textContent?.trim() || '';
+            });
             if (errorText) {
                 console.log(`   ⚠️  ULINE error: ${errorText}`);
             }
@@ -943,12 +918,9 @@ async function placeViaQuickOrderPaste(
  */
 async function placeViaQuickOrderGrid(items: OrderLineItem[]): Promise<string> {
     console.log('\n   🌐 Launching browser (Grid method)...');
-    console.log('   ⚠️  Chrome must be closed for this step\n');
 
     const session = await launchUlineSession({ headless: false });
-    const { context } = session;
-
-    const page = context.pages()[0] || await context.newPage();
+    const { page } = session;
 
     try {
         await page.goto(QUICK_ORDER_URL, { waitUntil: 'load', timeout: 30_000 });

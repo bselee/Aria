@@ -1269,11 +1269,14 @@ bot.on('text', async (ctx) => {
     // 30 min. If a critical agent hasn't run in 2× its expected interval, sends
     // a Telegram alert so Will can investigate or restart.
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000; // 30 min
+    // Only monitor high-frequency "always running" crons. Once-daily crons
+    // (DailySummary, BuildRisk, etc.) legitimately go 20+ hours between runs
+    // and should NOT trigger stale alerts.
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
-        { name: 'APPolling', maxStaleMin: 20 },
-        { name: 'POSync', maxStaleMin: 65 },
-        { name: 'BuildCompletionWatcher', maxStaleMin: 65 },
-        { name: 'POReceivingWatcher', maxStaleMin: 65 },
+        { name: 'APPolling', maxStaleMin: 25 },
+        { name: 'POSync', maxStaleMin: 45 },
+        { name: 'BuildCompletionWatcher', maxStaleMin: 45 },
+        { name: 'POReceivingWatcher', maxStaleMin: 45 },
     ];
     let lastCronWatchdogAlert = 0;
     setInterval(async () => {
@@ -1281,24 +1284,39 @@ bot.on('text', async (ctx) => {
             const { createClient } = await import('../lib/supabase');
             const supabase = createClient();
             if (!supabase) return;
-            const cutoff = new Date(Date.now() - 35 * 60 * 1000).toISOString(); // 35 min ago
+
+            // Query with the widest threshold so all crons are covered
+            const maxCutoffMin = Math.max(...CRITICAL_CRONS.map(c => c.maxStaleMin));
+            const cutoff = new Date(Date.now() - maxCutoffMin * 60 * 1000).toISOString();
             const { data } = await supabase.from('cron_runs')
                 .select('task_name, started_at')
                 .in('task_name', CRITICAL_CRONS.map(c => c.name))
                 .gte('started_at', cutoff)
                 .order('started_at', { ascending: false });
 
-            const recentTasks = new Set((data || []).map(r => r.task_name));
-            const stale = CRITICAL_CRONS.filter(c => !recentTasks.has(c.name));
+            // Check each cron against its own threshold
+            const lastRunByTask = new Map<string, string>();
+            for (const row of (data || [])) {
+                if (!lastRunByTask.has(row.task_name)) {
+                    lastRunByTask.set(row.task_name, row.started_at);
+                }
+            }
+            const now = Date.now();
+            const stale = CRITICAL_CRONS.filter(c => {
+                const lastRun = lastRunByTask.get(c.name);
+                if (!lastRun) return true;
+                const ageMin = (now - new Date(lastRun).getTime()) / 60000;
+                return ageMin > c.maxStaleMin;
+            });
 
             if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId) {
-                    const names = stale.map(s => s.name).join(', ');
+                    const names = stale.map(s => `${s.name} (>${s.maxStaleMin}m)`).join(', ');
                     await bot.telegram.sendMessage(
                         chatId,
                         `🚨 <b>Cron Watchdog Alert</b>\n\n` +
-                        `These agents haven't run in 35+ min:\n<code>${names}</code>\n\n` +
+                        `Stale crons:\n<code>${names}</code>\n\n` +
                         `Possible node-cron heartbeat death. Consider <code>pm2 restart aria-bot</code>.`,
                         { parse_mode: 'HTML' }
                     ).catch(() => {});
