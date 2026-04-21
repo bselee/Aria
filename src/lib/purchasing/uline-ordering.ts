@@ -188,9 +188,11 @@ export function convertFinaleItemToUlineOrder(input: ConvertFinaleItemInput): Co
         );
     }
 
-    if (roundedVendorQty > 50) {
+// ULINE sells in bulk cases/boxes of 100-1000+ units — high quantities are normal
+    // for boxes, bags, tape, etc. Only flag if > 5000 units (would exceed 10+ pallets).
+    if (roundedVendorQty > 5000) {
         guardrailWarnings.push(
-            `📦 HIGH VENDOR QUANTITY GUARDRAIL: ${input.finaleSku} requested ${roundedVendorQty} vendor units. Are you sure you are ordering boxes and not individually?`,
+            `📦 HIGH VENDOR QUANTITY GUARDRAIL: ${input.finaleSku} requested ${roundedVendorQty} vendor units. Verify this is correct.`,
         );
     }
 

@@ -1,65 +1,84 @@
-import { chromium, type BrowserContext, type Page } from "playwright";
-import os from "os";
+import { type BrowserContext, type Page, chromium } from "playwright";
+import fs from "fs";
 import path from "path";
 
 const QUICK_ORDER_URL = "https://www.uline.com/Ordering/QuickOrder";
-const CHROME_PROFILE = path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data");
-
-export interface UlineSession {
-    context: BrowserContext;
-    close: () => Promise<void>;
-}
 
 export interface LaunchUlineSessionOptions {
     headless: boolean;
 }
 
+/**
+ * Launch a raw Playwright browser with ULINE cookie injection.
+ * Works regardless of whether Chrome is open.
+ *
+ * Auth: Cookie injection from .uline-session.json — logs into your ULINE account.
+ */
 export async function launchUlineSession(opts: LaunchUlineSessionOptions): Promise<UlineSession> {
-    try {
-        const context = await chromium.launchPersistentContext(
-            CHROME_PROFILE,
-            {
-                headless: opts.headless,
-                channel: "chrome",
-                acceptDownloads: true,
-                viewport: { width: 1280, height: 900 },
-                args: ["--profile-directory=Default", "--disable-blink-features=AutomationControlled"],
-            },
-        );
-        return {
-            context,
-            close: async () => {
-                await context.close();
-            },
-        };
-    } catch {
-        const browser = await chromium.launch({
-            headless: opts.headless,
-            channel: "chrome",
-            args: ["--disable-blink-features=AutomationControlled"],
-        });
-        const context = await browser.newContext({
-            viewport: { width: 1280, height: 900 },
-        });
-        return {
-            context,
-            close: async () => {
-                await context.close();
-                await browser.close();
-            },
-        };
+    const browser = await chromium.launch({
+        headless: opts.headless,
+        args: ["--disable-blink-features=AutomationControlled"],
+    });
+    const context = await browser.newContext();
+    const page = context.pages()[0] || await context.newPage();
+
+    const SESSION_FILE = path.resolve(process.cwd(), ".uline-session.json");
+    if (fs.existsSync(SESSION_FILE)) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
+            const cookies = raw
+                .filter((c: any) => c.domain?.includes("uline"))
+                .map((c: any) => {
+                    const ss = c.sameSite === "Lax" ? "Lax" : c.sameSite === "Strict" ? "Strict" : "None";
+                    return {
+                        name: c.name,
+                        value: c.value,
+                        domain: c.domain,
+                        path: c.path || "/",
+                        expires: c.expires > 0 ? c.expires : undefined,
+                        httpOnly: c.httpOnly ?? false,
+                        secure: ss === "None" ? true : (c.secure ?? false),
+                        sameSite: ss as "Lax" | "Strict" | "None",
+                    };
+                });
+            await context.addCookies(cookies);
+            console.log(`   Injected ${cookies.length} ULINE cookies`);
+        } catch (err) {
+            console.warn(`   ⚠️  Failed to load cookies: ${(err as Error).message}`);
+        }
+    } else {
+        console.log(`   ⚠️  No session file — will attempt credential login`);
     }
+
+    return {
+        context,
+        page,
+        close: async () => {
+            try { await browser.close(); } catch { /* best effort */ }
+        },
+    };
 }
 
 export async function openUlineQuickOrder(page: Page): Promise<"ready" | "login"> {
-    await page.goto(QUICK_ORDER_URL, { waitUntil: "load", timeout: 30_000 });
+    await page.goto(QUICK_ORDER_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(3_000);
 
-    const landed = await Promise.race([
-        page.waitForSelector("text=Paste Items Page", { timeout: 15_000 }).then(() => "ready" as const).catch(() => null),
-        page.waitForSelector("text=Catalog Quick Order", { timeout: 15_000 }).then(() => "ready" as const).catch(() => null),
-        page.waitForSelector("#txtEmail", { timeout: 15_000 }).then(() => "login" as const).catch(() => null),
-        page.waitForTimeout(15_000).then(() => "unknown" as const),
-    ]);
+    const detect = async (): Promise<"ready" | "login" | "unknown"> => {
+        return page.evaluate(() => {
+            if (document.querySelector("#txtPaste") || document.querySelector("#txtItem0")) return "ready";
+            if (document.querySelector("#txtEmail") || document.querySelector("#txtPassword")) return "login";
+            const body = (document.body.textContent || "").toLowerCase();
+            if (body.includes("paste items") || body.includes("quick order") || body.includes("catalog quick order")) return "ready";
+            return "unknown";
+        });
+    };
+
+    let landed = await detect();
+
+    if (landed === "unknown") {
+        await page.waitForTimeout(5_000);
+        landed = await detect();
+    }
 
     if (landed === "unknown") {
         throw new Error("Could not detect ULINE Quick Order page");
@@ -75,7 +94,11 @@ export async function openUlineQuickOrder(page: Page): Promise<"ready" | "login"
         await page.fill("#txtEmail", email);
         await page.fill("#txtPassword", password);
         await page.click("#btnSignIn");
-        await page.waitForSelector("text=Paste Items Page", { timeout: 120_000 });
+        for (let i = 0; i < 20; i++) {
+            await page.waitForTimeout(3_000);
+            const state = await detect();
+            if (state === "ready") break;
+        }
     }
 
     return landed;
@@ -83,12 +106,86 @@ export async function openUlineQuickOrder(page: Page): Promise<"ready" | "login"
 
 export async function openUlinePasteItemsPage(page: Page): Promise<void> {
     await openUlineQuickOrder(page);
-    await page.click("text=Paste Items Page");
+    await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll("a"));
+        const pasteLink = links.find(a => a.textContent?.includes("Paste Items"));
+        if (pasteLink) pasteLink.click();
+    });
     await page.waitForSelector("#txtPaste", { timeout: 10_000 });
 }
 
+export async function clearUlineCart(page: Page): Promise<void> {
+    await page.goto("https://www.uline.com/Product/ViewCart/UpdateFromQuickOrder", {
+        waitUntil: "load",
+        timeout: 30_000,
+    });
+
+    // Try multiple clear strategies in sequence
+    let cleared = false;
+
+    // Strategy 1: Call DeleteCart() directly (bypasses the confirmation dialog link)
+    const deleted = await page.evaluate(() => {
+        if (typeof DeleteCart === "function") {
+            DeleteCart();
+            return true;
+        }
+        return false;
+    });
+
+    if (deleted) {
+        // Wait for cart to actually clear — URL will change or content will change
+        await page.waitForTimeout(5_000);
+
+        // Navigate to cart page fresh to confirm
+        await page.goto("https://www.uline.com/Product/ViewCart/UpdateFromQuickOrder", {
+            waitUntil: "load",
+            timeout: 30_000,
+        });
+        await page.waitForTimeout(2_000);
+
+        // Check if cart is actually clear by looking for items
+        const stillHasItems = await page.evaluate(() => {
+            const body = document.body.textContent || "";
+            // "Your Cart is Empty" or "0 items" means cleared
+            return !(body.includes("cart is empty") || body.includes("0 items"));
+        });
+
+        if (!stillHasItems) {
+            console.log("   🗑️  Cart cleared");
+            return;
+        }
+
+        // Items still there — try clicking the link directly as fallback
+        cleared = await page.evaluate(() => {
+            const links = Array.from(document.querySelectorAll("a"));
+            const emptyLink = links.find(a =>
+                /empty\s*cart/i.test(a.textContent || "") &&
+                a.href.includes("DeleteCart()")
+            );
+            if (emptyLink) { (emptyLink as HTMLElement).click(); return true; }
+            return false;
+        });
+
+        if (cleared) {
+            await page.waitForTimeout(5_000);
+        }
+    }
+
+    // Final check — verify cart is empty or confirm it was already empty
+    const finalCheck = await page.evaluate(() => {
+        const body = document.body.textContent || "";
+        return !(body.includes("cart is empty") || body.includes("0 items") || !body.includes("SUBTOTAL"));
+    });
+
+    if (finalCheck) {
+        console.log("   🗑️  Cart cleared");
+    } else {
+        console.log("   🗑️  Cart already empty");
+    }
+}
+
 export async function emailUlineCart(page: Page, email: string): Promise<string | null> {
-    const CART_URL = "https://www.uline.com/Ordering/ViewCart";
+    const CART_URL = "https://www.uline.com/Product/ViewCart/UpdateFromQuickOrder";
     await page.goto(CART_URL, { waitUntil: "load", timeout: 30_000 });
     await page.waitForSelector("text=Shopping Cart", { timeout: 15_000 }).catch(() => {});
 
@@ -215,20 +312,6 @@ export interface UlinePendingOrder {
     }>;
 }
 
-function extractTextFromHtml(html: string): string {
-    return html
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
 export async function scrapeUlinePendingOrders(page: Page): Promise<UlinePendingOrder[]> {
     const ORDER_STATUS_URL = 'https://www.uline.com/Orders/OrderStatus';
     try {
@@ -247,15 +330,14 @@ export async function scrapeUlinePendingOrders(page: Page): Promise<UlinePending
         let currentOrder: Partial<UlinePendingOrder> | null = null;
         for (const row of rows) {
             const text = row.text;
-            
+
             const orderMatch = text.match(/(?:ORDER\s*#|Order\s*Number)[:\s]*(\d+)/i);
             const poMatch = text.match(/PO\s*#?\s*(\d+)/i);
-            const statusMatch = text.match(/(?:STATUS|Status)[:\s]*([\w\s]+?)(?:\s{2,}|$)/i);
             const totalMatch = text.match(/\$\s*([\d,]+\.\d{2})/g);
             const dateMatch = text.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/);
             const itemMatch = text.match(/^(\d+)\s+(?:EA|RL|CT)\s+([A-Z]\-\d+[A-Z]?)\s+(.+?)\s+[\d\.]+\s+[\d\.]+$/);
 
-            if (orderMatch && !statusMatch) {
+            if (orderMatch) {
                 if (currentOrder?.orderNumber) orders.push(currentOrder as UlinePendingOrder);
                 currentOrder = {
                     orderNumber: orderMatch[1],
@@ -274,7 +356,7 @@ export async function scrapeUlinePendingOrders(page: Page): Promise<UlinePending
                 const extPrice = totalMatch && totalMatch.length > 0
                     ? Number(totalMatch[totalMatch.length - 1].replace(/[^\d.]/g, ''))
                     : null;
-                currentOrder.items.push({
+                currentOrder.items!.push({
                     model,
                     description: desc,
                     qty,
@@ -295,18 +377,5 @@ export async function scrapeUlinePendingOrders(page: Page): Promise<UlinePending
 }
 
 export async function getUlineSessionForScraping(headless: boolean = true) {
-    let session: UlineSession;
-    let browser: any;
-    try {
-        session = await launchUlineSession({ headless });
-    } catch {
-        browser = await chromium.launch({
-            headless,
-            channel: 'chrome',
-            args: ['--disable-blink-features=AutomationControlled'],
-        });
-        const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-        session = { context: ctx, close: async () => { await ctx.close(); await browser.close(); } };
-    }
-    return session;
+    return launchUlineSession({ headless });
 }

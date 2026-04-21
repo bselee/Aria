@@ -9,15 +9,21 @@ import {
 
 function parseCurrency(value: string | null | undefined): number | null {
     if (!value) return null;
-    const match = value.replace(/,/g, "").match(/\$?(-?\d+(?:\.\d{1,2})?)/);
+    const cleaned = value.replace(/,/g, "");
+    const match = cleaned.match(/\$?(-?\d+(?:\.\d{1,2})?)/);
     if (!match) return null;
     const parsed = Number(match[1]);
     return Number.isFinite(parsed) ? parsed : null;
 }
 
 function extractUlineModel(text: string): string | null {
-    const match = text.match(/\b[A-Z]{1,3}-\d{3,6}[A-Z]?\b/);
-    return match ? match[0] : null;
+    // H- prefix models (e.g. H-255BL): no word boundary before H, use lookahead for space
+    // S- prefix models (e.g. S-1665, S-4796): word boundary works since S is surrounded by word chars
+    const hMatch = text.match(/(?<![A-Z])H-\d{3,6}[A-Z]{0,2}(?!\d)/);
+    const sMatch = text.match(/\bS-[A-Z]?\d{3,6}[A-Z]?\b/);
+    if (hMatch) return hMatch[0];
+    if (sMatch) return sMatch[0];
+    return null;
 }
 
 function normalizeModel(model: string): string {
@@ -25,13 +31,14 @@ function normalizeModel(model: string): string {
 }
 
 export async function scrapeObservedUlineCartRows(page: Page): Promise<ObservedUlineCartRow[]> {
-    const rows = await page.locator("tr, .cartRow, .itemRow, .orderRow").evaluateAll((elements) => {
-        return elements.map((element) => {
+    const rows: Array<{ text: string; quantityValue: string }> = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("tr")).map(element => {
             const text = (element.textContent || "").replace(/\s+/g, " ").trim();
             const inputs = Array.from(element.querySelectorAll("input")) as HTMLInputElement[];
             const quantityInput = inputs.find(input =>
-                /qty|quantity/i.test(input.name || "")
-                || /qty|quantity/i.test(input.id || ""),
+                /ItemQty/i.test(input.name || "")
+                    || /qty/i.test(input.id || "")
+                    || /qty/i.test(input.name || ""),
             );
             return {
                 text,
