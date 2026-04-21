@@ -24,7 +24,6 @@ interface OpsHealthDecision {
 const RESTART_WORTHY_STALE_CRONS = new Set([
     "APPolling",
     "POSync",
-    "UlineConfirmationSync",
     "BuildCompletionWatcher",
     "POReceivingWatcher",
     "StatIndexing",
@@ -274,7 +273,10 @@ Deno.serve(async () => {
     }
 
     const alertLookbackMinutes = Number(Deno.env.get("OPS_ALERT_LOOKBACK_MINUTES") || "60");
-    const alertKey = `ops-health:${decision.reasons.slice().sort().join("|") || "generic"}`;
+    // Use a stable key so changing reason sets don't bypass the dedup window.
+    // Previously, each unique combination of reasons generated a new key, causing
+    // repeated Telegram alerts as crons came and went from the stale list.
+    const alertKey = "ops-health:degraded";
     const recentlyAlerted = await hasRecentOpsAlert(supabase, {
         alertKey,
         lookbackMinutes: alertLookbackMinutes,

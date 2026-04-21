@@ -68,6 +68,8 @@ worktrees/
 # ─── Scraper browser profiles (auth cookies, never commit) ───
 .basauto-profile/
 .basauto-session.json
+.uline-profile/
+.uline-session.json
 chrome-profile/
 AppData/
 
