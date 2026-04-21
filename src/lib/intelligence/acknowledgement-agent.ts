@@ -418,8 +418,6 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     }
                 } else {
                     try {
-                        await this.addMessageLabels(gmail, gmailMessageId, ["Follow Up"]);
-                        console.log(`     🏷️ Added Follow Up label.`);
                         await recordHumanFollowUpRequired({
                             gmailMessageId,
                             threadId,
@@ -427,8 +425,8 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                             subject,
                             reason: humanReviewReason,
                         });
-                    } catch (labelErr: any) {
-                        console.error(`     ❌ Failed to add Follow Up label:`, labelErr.message);
+                    } catch (followUpErr: any) {
+                        console.error(`     ❌ Failed to record human follow-up signal:`, followUpErr.message);
                     }
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
                 }

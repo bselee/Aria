@@ -1266,6 +1266,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             outcome.state = "unmatched";
             outcome.error = "No Finale PO match found";
+            outcome.success = true;
             return outcome;
 
         } catch (err: any) {

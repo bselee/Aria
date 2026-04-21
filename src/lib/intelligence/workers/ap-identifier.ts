@@ -41,6 +41,7 @@ import {
     queueStatementMetadataOnly,
 } from "@/lib/statements/email-intake";
 import { splitAAACooperStatementAttachments } from "../aaa-cooper-splitter";
+import { pickPrimaryInvoicePage } from "./invoice-page-selector";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -268,6 +269,39 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         return [...new Set(matches)];
     }
 
+    private async selectPrimaryInvoicePageNumber(
+        buffer: Buffer,
+        extractedPages: Array<{ pageNumber: number; text: string; hasTable: boolean }> | undefined,
+        pageCount: number | undefined,
+    ): Promise<{ pageNumber: number | null; confidence: "none" | "weak" | "strong"; reason: string }> {
+        const initialSelection = pickPrimaryInvoicePage(extractedPages || []);
+        if (initialSelection.pageNumber || (pageCount ?? 1) <= 1) {
+            return initialSelection;
+        }
+
+        try {
+            const { extractPerPage } = await import("../../pdf/extractor");
+            const physicalPages = await extractPerPage(buffer);
+            return pickPrimaryInvoicePage(physicalPages);
+        } catch {
+            return initialSelection;
+        }
+    }
+
+    private async extractSinglePagePdf(buffer: Buffer, pageNumber: number): Promise<Buffer> {
+        const { PDFDocument } = await import("pdf-lib");
+        const sourcePdf = await PDFDocument.load(buffer);
+        const zeroBasedPage = pageNumber - 1;
+        if (zeroBasedPage < 0 || zeroBasedPage >= sourcePdf.getPageCount()) {
+            throw new Error(`invoice page ${pageNumber} out of range`);
+        }
+
+        const singlePagePdf = await PDFDocument.create();
+        const [copiedPage] = await singlePagePdf.copyPages(sourcePdf, [zeroBasedPage]);
+        singlePagePdf.addPage(copiedPage);
+        return Buffer.from(await singlePagePdf.save());
+    }
+
     private async queueStatementCandidates(
         emailRow: any,
         gmail: any,
@@ -365,6 +399,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             };
 
             // Read from central queue instead of making a direct Gmail API search
+            // Include emails that failed in ap_inbox_queue (ERROR_PROCESSING) — reset them for retry
             const { data: messages, error } = await supabase
                 .from('email_inbox_queue')
                 .select('*')
@@ -374,6 +409,76 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             if (error) throw error;
 
             if (!messages || messages.length === 0) {
+                // No unprocessed emails — check if any need retry via ap_inbox_queue ERROR_PROCESSING
+                const { data: retryMessages } = await supabase
+                    .from('email_inbox_queue')
+                    .select('id, gmail_message_id, from_email, source_inbox')
+                    .eq('processed_by_ap', true)
+                    .limit(10);
+
+                if (retryMessages && retryMessages.length > 0) {
+                    const msgIds = retryMessages.map((r: any) => r.gmail_message_id);
+                    const { data: errorItems } = await supabase
+                        .from('ap_inbox_queue')
+                        .select('message_id, extracted_json')
+                        .in('message_id', msgIds)
+                        .eq('status', 'ERROR_PROCESSING');
+
+                    if (errorItems && errorItems.length > 0) {
+                        const retryIds = retryMessages
+                            .filter((r: any) => errorItems.some((e: any) => e.message_id === r.gmail_message_id))
+                            .map((r: any) => r.id);
+
+                        if (retryIds.length > 0) {
+                            await supabase
+                                .from('email_inbox_queue')
+                                .update({ processed_by_ap: false })
+                                .in('id', retryIds);
+                            console.log(`   🔄 Reset ${retryIds.length} emails for retry (had ERROR_PROCESSING in ap_inbox_queue)`);
+                        }
+                    }
+
+                    const staleStatementRetryIds: string[] = [];
+                    for (const retryMessage of retryMessages) {
+                        const fromEmail = retryMessage.from_email || "";
+                        const sourceInbox = retryMessage.source_inbox || "ap";
+                        const isMultiInvoiceVendor = MULTI_INVOICE_STATEMENT_VENDORS.some((vendor) =>
+                            vendor.senderMatch.test(fromEmail),
+                        );
+                        if (!isMultiInvoiceVendor) continue;
+
+                        const { data: existingSplitQueue } = await supabase
+                            .from('ap_inbox_queue')
+                            .select('message_id')
+                            .contains('extracted_json', { source_gmail_message_id: retryMessage.gmail_message_id })
+                            .limit(1)
+                            .maybeSingle();
+                        if (existingSplitQueue) continue;
+
+                        try {
+                            const gmail = await getGmailClient(sourceInbox);
+                            const messageMeta = await gmail.users.messages.get({
+                                userId: "me",
+                                id: retryMessage.gmail_message_id,
+                                format: "metadata",
+                            });
+                            const labelIds: string[] = messageMeta.data.labelIds || [];
+                            if (labelIds.includes("UNREAD")) {
+                                staleStatementRetryIds.push(retryMessage.id);
+                            }
+                        } catch (metaErr: any) {
+                            console.warn(`   ⚠️ Failed to inspect stale statement ${retryMessage.gmail_message_id}: ${metaErr.message}`);
+                        }
+                    }
+
+                    if (staleStatementRetryIds.length > 0) {
+                        await supabase
+                            .from('email_inbox_queue')
+                            .update({ processed_by_ap: false })
+                            .in('id', staleStatementRetryIds);
+                        console.log(`   🔄 Reset ${staleStatementRetryIds.length} stale multi-invoice statement email(s) for retry`);
+                    }
+                }
                 return;
             }
 
@@ -576,14 +681,15 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                     if (multiInvVendor && m.gmail_message_id) {
                         try {
-                            const handled = await this.handleMultiInvoiceStatement(
+                            const statementHandling = await this.handleMultiInvoiceStatement(
                                 m, gmail, supabase, multiInvVendor.label,
                             );
-                            if (handled.status === "handled") {
+                            if (statementHandling.status === "handled") {
                                 continue;
                             }
-                            if (handled.status === "needs_review") {
+                            if (statementHandling.status === "needs_review") {
                                 console.log(`     ⚠️ ${multiInvVendor.label} statement needs review — leaving unread`);
+                                handled = false;
                                 continue;
                             }
                             // Fall through to normal STATEMENT handling if split failed
@@ -684,6 +790,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 // --- INVOICE QUEUEING (ap inbox only) ---
                 let processedAnyPDF = false;
+                let manualReviewReason: string | null = null;
 
                 const pdfParts: any[] = [];
                 const walkParts = (parts: any[]): void => {
@@ -789,10 +896,11 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             // This catches Toyota/TICF-style invoices that slip past
                             // the sender blocklist via a different sender address.
                             let pdfTextPreview = '';
+                            let extractedPdf: Awaited<ReturnType<typeof import("../../pdf/extractor")["extractPDF"]>> | null = null;
                             try {
                                 const { extractPDF } = await import('../../pdf/extractor');
-                                const extracted = await extractPDF(buffer);
-                                pdfTextPreview = extracted.rawText.slice(0, 2000);
+                                extractedPdf = await extractPDF(buffer);
+                                pdfTextPreview = extractedPdf.rawText.slice(0, 2000);
                             } catch {
                                 // PDF extraction failed — don't block, let it through
                                 console.warn(`     ⚠️ PDF text extraction failed for ${capturedFilename} — skipping content check`);
@@ -823,11 +931,76 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 }
                             }
 
+                            let queueBuffer = buffer;
+                            const queueMetadata: Record<string, unknown> = {};
+                            if (extractedPdf) {
+                                let pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                    buffer,
+                                    extractedPdf.pages,
+                                    extractedPdf.metadata?.pageCount,
+                                );
+
+                                const multiPagePacket = (extractedPdf.metadata?.pageCount ?? 1) > 1;
+                                const needsFedExOcrRetry = isFedExInvoice
+                                    && multiPagePacket
+                                    && extractedPdf.ocrStrategy === "pdf-parse"
+                                    && pageSelection.confidence !== "strong";
+
+                                if (needsFedExOcrRetry) {
+                                    try {
+                                        const { extractPDFWithLLM } = await import("../../pdf/extractor");
+                                        const retriedExtraction = await extractPDFWithLLM(buffer);
+                                        const retriedSelection = await this.selectPrimaryInvoicePageNumber(
+                                            buffer,
+                                            retriedExtraction.pages,
+                                            retriedExtraction.metadata?.pageCount,
+                                        );
+                                        queueMetadata.invoice_page_ocr_retry_used = true;
+                                        queueMetadata.invoice_page_ocr_retry_strategy = retriedExtraction.ocrStrategy ?? "unknown";
+                                        extractedPdf = retriedExtraction;
+                                        pageSelection = retriedSelection;
+                                    } catch (retryErr: any) {
+                                        queueMetadata.invoice_page_ocr_retry_used = true;
+                                        queueMetadata.invoice_page_ocr_retry_error = retryErr.message;
+                                    }
+                                }
+
+                                if (isFedExInvoice && multiPagePacket && pageSelection.confidence !== "strong") {
+                                    manualReviewReason = `Ambiguous FedEx invoice packet (${capturedFilename}) - unable to isolate a single invoice page`;
+                                    console.log(`     ⚠️ ${manualReviewReason}`);
+                                    await this.logActivity(supabase, from, subject, "AMBIGUOUS_INVOICE_PACKET", manualReviewReason, {
+                                        reasonCode: "ambiguous_invoice_packet",
+                                        sourceInbox,
+                                        gmailMessageId: m.gmail_message_id,
+                                        pdfFilename: capturedFilename,
+                                        invoicePageSelectionConfidence: pageSelection.confidence,
+                                        invoicePageSelectionReason: pageSelection.reason,
+                                        ocrRetryUsed: Boolean(queueMetadata.invoice_page_ocr_retry_used),
+                                        ocrRetryStrategy: queueMetadata.invoice_page_ocr_retry_strategy ?? null,
+                                    });
+                                    attachmentIndex++;
+                                    continue;
+                                }
+
+                                if (pageSelection.pageNumber) {
+                                    try {
+                                        queueBuffer = await this.extractSinglePagePdf(buffer, pageSelection.pageNumber);
+                                        queueMetadata.selected_invoice_page = pageSelection.pageNumber;
+                                        queueMetadata.invoice_page_selection_confidence = pageSelection.confidence;
+                                        queueMetadata.invoice_page_selection_reason = pageSelection.reason;
+                                        queueMetadata.forwarded_page_count = 1;
+                                        console.log(`     ✂️ Trimmed ${capturedFilename} to invoice page ${pageSelection.pageNumber}`);
+                                    } catch (pageErr: any) {
+                                        console.warn(`     ⚠️ Failed to trim ${capturedFilename} to invoice page: ${pageErr.message}`);
+                                    }
+                                }
+                            }
+
                             // Upload to Supabase Storage
                             const storagePath = `${m.gmail_message_id}/${Date.now()}_${capturedFilename}`;
                             const { error: uploadError } = await supabase.storage
                                 .from('ap_invoices')
-                                .upload(storagePath, buffer, {
+                                .upload(storagePath, queueBuffer, {
                                     contentType: 'application/pdf',
                                     upsert: true
                                 });
@@ -860,6 +1033,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                     expected_forward_count: expectedForwardCount,
                                     pdf_attachment_index: attachmentIndex,
                                     pdf_attachment_count: expectedForwardCount,
+                                    ...queueMetadata,
                                 },
                             });
 
@@ -909,9 +1083,12 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         });
                     } catch (e) { /* ignore */ }
                 } else {
-                    console.log(`     ⚠️ Invoice PDFs were detected but not fully queued. Leaving unread for retry.`);
-                    await this.logActivity(supabase, from, subject, intent, "Invoice PDFs detected but queueing was incomplete; leaving unread in inbox", {
-                        reasonCode: "incomplete_queue",
+                    const incompleteReason = manualReviewReason
+                        ? `${manualReviewReason}; leaving unread in inbox`
+                        : "Invoice PDFs detected but queueing was incomplete; leaving unread in inbox";
+                    console.log(`     ⚠️ ${incompleteReason}`);
+                    await this.logActivity(supabase, from, subject, intent, incompleteReason, {
+                        reasonCode: manualReviewReason ? "manual_review_required" : "incomplete_queue",
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
                         expectedForwardCount,

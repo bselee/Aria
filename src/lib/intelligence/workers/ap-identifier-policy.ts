@@ -19,7 +19,7 @@ export function getInvoiceInboxPolicy(sourceInbox: string): InvoiceInboxPolicy {
 
     return {
         queueForBillCom: false,
-        addLabels: ["Follow Up"],
+        addLabels: [],
         removeLabels: [],
         activityNote: `Invoice detected on ${sourceInbox} inbox - not forwarded to Bill.com; left visible for review`,
         reasonCode: "invoice_non_ap_inbox",
@@ -29,7 +29,7 @@ export function getInvoiceInboxPolicy(sourceInbox: string): InvoiceInboxPolicy {
 export function getAPHumanInteractionPolicy(sourceInbox: string): InvoiceInboxPolicy {
     return {
         queueForBillCom: false,
-        addLabels: ["Follow Up"],
+        addLabels: [],
         removeLabels: [],
         activityNote: `Human interaction detected on ${sourceInbox} inbox - left visible for manual AP review`,
         reasonCode: "human_interaction_manual_review",
@@ -39,7 +39,7 @@ export function getAPHumanInteractionPolicy(sourceInbox: string): InvoiceInboxPo
 export function getAPMissingPdfPolicy(sourceInbox: string, intent: string): InvoiceInboxPolicy {
     return {
         queueForBillCom: false,
-        addLabels: ["Follow Up"],
+        addLabels: [],
         removeLabels: [],
         activityNote: `No PDF attachment found on ${intent} in ${sourceInbox} inbox - left visible for manual review`,
         reasonCode: "missing_pdf_manual_review",

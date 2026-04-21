@@ -46,6 +46,7 @@ node --import tsx src/cli/reconcile-uline.ts --year 2025
 - **$0 items** (caps, jugs, lids) are bundled components — skip in reconciliation
 - **Close Chrome** before running — Playwright needs exclusive profile access
 - **DO NOT use injected cookies** — ULINE's grid won't render. Must use persistent Chrome profile.
+- **No Stagehand** — uses raw Playwright only. Stagehand's page abstraction doesn't expose `page.fill()`.
 
 ## SKU Mapping
 
