@@ -251,7 +251,7 @@ export default function ActivePurchasesPanel() {
                                     statusLabel = "Tracking Unavailable";
                                     statusColor = "text-orange-400 bg-orange-500/10 border-orange-500/30";
                                 } else if (po.lifecycleStage === 'ap_follow_up') {
-                                    statusLabel = "AP Follow-up";
+                                    statusLabel = "AP Review";
                                     statusColor = "text-purple-400 bg-purple-500/10 border-purple-500/30";
                                 } else if (po.lifecycleStage === 'moving_with_tracking') {
                                     statusLabel = po.lastMovementSummary ? `Moving — ${po.lastMovementSummary}` : "In Transit";

@@ -5,7 +5,7 @@ import { createClient } from "../supabase";
 import { z } from "zod";
 import { recall } from "./memory";
 import { applyMessageLabelPolicy } from "./gmail-policy";
-import { recordHumanFollowUpRequired, recordSimpleAutoReply } from "./email-feedback";
+import { recordHumanReviewRequired, recordSimpleAutoReply } from "./email-feedback";
 import { summarizeThreadCommunication } from "./po-correlator";
 
 /**
@@ -418,15 +418,15 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     }
                 } else {
                     try {
-                        await recordHumanFollowUpRequired({
+                        await recordHumanReviewRequired({
                             gmailMessageId,
                             threadId,
                             fromEmail: senderEmail,
                             subject,
                             reason: humanReviewReason,
                         });
-                    } catch (followUpErr: any) {
-                        console.error(`     ❌ Failed to record human follow-up signal:`, followUpErr.message);
+                    } catch (humanReviewErr: any) {
+                        console.error(`     ❌ Failed to record human review signal:`, humanReviewErr.message);
                     }
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
                 }

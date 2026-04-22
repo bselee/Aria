@@ -73,9 +73,9 @@ function daysDiff(from: string, to: string): number {
     return Math.round((b - a) / 86_400_000);
 }
 
-function followUpLabel(state: POCompletionState): string {
+function reviewStatusLabel(state: POCompletionState): string {
     if (state === "received_pending_invoice") return "Received - invoice still needed";
-    if (state === "received_pending_reconciliation") return "Received - AP follow-up still open";
+    if (state === "received_pending_reconciliation") return "Received - AP review still open";
     if (state === "exception") return "Received - exception needs review";
     return "Received";
 }
@@ -524,7 +524,7 @@ function PORow({
                         </div>
                         {needsAPFollowUp && (
                             <div className="text-[10px] font-mono text-emerald-400/80 mt-0.5">
-                                {followUpLabel(po.completionState)}
+                                {reviewStatusLabel(po.completionState)}
                             </div>
                         )}
                     </div>

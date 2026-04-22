@@ -569,7 +569,7 @@ function determineAction(
         }
 
         if (ageDays > 30) {
-            return `PO aging ${ageDays}+ days — follow up with ${po.supplier}`;
+            return `PO aging ${ageDays}+ days — check in with ${po.supplier}`;
         }
 
         return `On order — PO #${po.orderId} (${po.supplier})`;

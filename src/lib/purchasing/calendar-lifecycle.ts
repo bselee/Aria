@@ -286,7 +286,7 @@ export function derivePurchasingLifecycle(
             completionState,
             colorId: "11",
             prefixText: "LATE",
-            statusLabel: "Past Due - Needs Follow-up",
+            statusLabel: "Past Due - Needs Review",
             isReceived: false,
             isCancelled: false,
             isDeliveredAwaitingReceipt: false,

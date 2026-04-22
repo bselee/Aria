@@ -65,5 +65,6 @@ describe("calendar lifecycle", () => {
         const lifecycle = derivePurchasingLifecycle("completed", [], null, "2026-03-25", null);
         expect(lifecycle.isReceived).toBe(false);
         expect(lifecycle.calendarStatus).toBe("past_due");
+        expect(lifecycle.statusLabel).toBe("Past Due - Needs Review");
     });
 });
