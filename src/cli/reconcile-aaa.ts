@@ -59,17 +59,20 @@ async function buildInvoicesFromSplitResult(
             sourcePdfs.set(attachment.attachmentId, sourcePdf);
         }
 
-        const pageIdx = invoice.page - 1;
-        if (pageIdx < 0 || pageIdx >= sourcePdf.getPageCount()) continue;
+        const pageIndexes = (invoice.bundlePages?.length ? invoice.bundlePages : [invoice.page])
+            .map((pageNumber) => pageNumber - 1)
+            .filter((pageIdx) => pageIdx >= 0 && pageIdx < sourcePdf.getPageCount());
+        if (pageIndexes.length === 0) continue;
 
-        const singlePdf = await PDFDocument.create();
-        const [copiedPage] = await singlePdf.copyPages(sourcePdf, [pageIdx]);
-        singlePdf.addPage(copiedPage);
-        const pageBuffer = Buffer.from(await singlePdf.save());
+        const bundlePdf = await PDFDocument.create();
+        const copiedPages = await bundlePdf.copyPages(sourcePdf, pageIndexes);
+        for (const copiedPage of copiedPages) bundlePdf.addPage(copiedPage);
+        const pageBuffer = Buffer.from(await bundlePdf.save());
 
         const invoiceNumber = invoice.invoiceNumber || `unknown-${invoice.page}`;
         const safeNumber = invoiceNumber.replace(/[^a-zA-Z0-9-]/g, "_");
-        const filename = `Triple A Cooper ${safeNumber}.pdf`;
+        const safeDate = (invoice.date || "unknown-date").replace(/[^0-9-]/g, "_");
+        const filename = `Invoice_${safeNumber}_${safeDate}.pdf`;
 
         invoices.push({
             pageNumber: invoice.page,
@@ -233,7 +236,7 @@ async function main() {
                 await gmail.users.messages.modify({
                     userId: "me",
                     id: stmt.messageId,
-                    requestBody: { removeLabelIds: ["UNREAD"], addLabelIds: [] },
+                    requestBody: { removeLabelIds: ["INBOX", "UNREAD"], addLabelIds: [] },
                 });
             } catch {
                 // Best-effort Gmail cleanup.
