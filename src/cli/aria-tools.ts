@@ -280,7 +280,7 @@ export function getAriaTools(opts: {
         }),
 
         query_action_items: tool({
-            description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for follow-up. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
+            description: "Get documents that require action — unprocessed uploads, pending approvals, documents flagged for review. Use when Will asks 'what needs attention', 'pending items', 'action required', or 'what did you flag'.",
             inputSchema: z.object({
                 limit: z.number().optional().describe('Max results (default 10)'),
             }),

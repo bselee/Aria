@@ -12,7 +12,7 @@ interface AutoReplyEvent extends EmailBaseEvent {
     replyBody: string;
 }
 
-interface FollowUpEvent extends EmailBaseEvent {
+interface HumanReviewEvent extends EmailBaseEvent {
     reason: string;
 }
 
@@ -49,10 +49,10 @@ export async function recordSimpleAutoReply(event: AutoReplyEvent): Promise<void
     });
 }
 
-export async function recordHumanFollowUpRequired(event: FollowUpEvent): Promise<void> {
+export async function recordHumanReviewRequired(event: HumanReviewEvent): Promise<void> {
     await recordFeedback({
         category: "correction",
-        eventType: "email_follow_up_required",
+        eventType: "email_human_review_required",
         agentSource: "acknowledgement-agent",
         subjectType: "message",
         subjectId: event.gmailMessageId,

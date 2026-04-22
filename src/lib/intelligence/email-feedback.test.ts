@@ -10,7 +10,7 @@ vi.mock("./feedback-loop", () => ({
 
 import {
     recordDefaultInboxInvoiceOutcome,
-    recordHumanFollowUpRequired,
+    recordHumanReviewRequired,
     recordSimpleAutoReply,
 } from "./email-feedback";
 
@@ -50,8 +50,8 @@ describe("email feedback helpers", () => {
         });
     });
 
-    it("records a human handoff signal for Follow Up cases", async () => {
-        await recordHumanFollowUpRequired({
+    it("records a human handoff signal for manual review cases", async () => {
+        await recordHumanReviewRequired({
             gmailMessageId: "gmail-2",
             threadId: "thread-2",
             fromEmail: "vendor@example.com",
@@ -61,7 +61,7 @@ describe("email feedback helpers", () => {
 
         expect(recordFeedbackMock).toHaveBeenCalledWith({
             category: "correction",
-            eventType: "email_follow_up_required",
+            eventType: "email_human_review_required",
             agentSource: "acknowledgement-agent",
             subjectType: "message",
             subjectId: "gmail-2",

@@ -501,7 +501,7 @@ export function buildEmailBody(
                 <td width="100" style="padding:10px 10px;border-bottom:1px solid #f5edd8;font-family:${FONT};font-size:11px;color:#64748b;vertical-align:top;">${po?.supplier || '—'}</td>
             </tr>`;
         }).join('');
-        agingBlock = sect('Aging POs — Follow Up with Vendor', '#92400e', 'aging',
+        agingBlock = sect('Aging POs - Vendor Outreach', '#92400e', 'aging',
             `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:2px;">
                 <tr style="background:#fef9ec;">${colHdr('SKU', 75)}${colHdr('Product')}${colHdr('PO', 65)}${colHdr('Age', 50)}${colHdr('Tracking', 110)}${colHdr('Vendor', 100)}</tr>
             </table>
@@ -941,7 +941,7 @@ export function buildSlackBody(
 
     // ── Aging POs ──
     if (aging.length > 0) {
-        msg += `\n\n*Aging POs — Follow Up with Vendor*  _Purchasing / Logistics_`;
+        msg += `\n\n*Aging POs - Vendor Outreach*  _Purchasing / Logistics_`;
         for (const item of aging) {
             const po = item.openPOs[0];
             const age = po ? Math.floor((Date.now() - new Date(po.orderDate).getTime()) / 86_400_000) : 0;

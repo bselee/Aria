@@ -70,13 +70,13 @@ vi.mock("../gmail-policy", () => ({
 
 vi.mock("./ap-identifier-policy", () => ({
     getAPHumanInteractionPolicy: vi.fn(() => ({
-        addLabels: ["Follow Up"],
+        addLabels: [],
         removeLabels: [],
         activityNote: "Human interaction",
         reasonCode: "human",
     })),
     getAPMissingPdfPolicy: vi.fn(() => ({
-        addLabels: ["Follow Up"],
+        addLabels: [],
         removeLabels: [],
         activityNote: "Missing PDF",
         reasonCode: "missing_pdf",

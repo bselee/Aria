@@ -11,7 +11,7 @@ const {
     recallMock,
     enqueueDefaultInboxInvoiceMock,
     recordSimpleAutoReplyMock,
-    recordHumanFollowUpRequiredMock,
+    recordHumanReviewRequiredMock,
     queueState,
 } = vi.hoisted(() => ({
     gmailSendMock: vi.fn(),
@@ -24,7 +24,7 @@ const {
     recallMock: vi.fn(),
     enqueueDefaultInboxInvoiceMock: vi.fn(),
     recordSimpleAutoReplyMock: vi.fn(),
-    recordHumanFollowUpRequiredMock: vi.fn(),
+    recordHumanReviewRequiredMock: vi.fn(),
     queueState: {
         messages: [] as Array<Record<string, any>>,
         processedUpdates: [] as Array<Record<string, any>>,
@@ -68,7 +68,7 @@ vi.mock("./nightshift-agent", () => ({
 
 vi.mock("./email-feedback", () => ({
     recordSimpleAutoReply: recordSimpleAutoReplyMock,
-    recordHumanFollowUpRequired: recordHumanFollowUpRequiredMock,
+    recordHumanReviewRequired: recordHumanReviewRequiredMock,
 }));
 
 vi.mock("../supabase", () => ({
@@ -120,7 +120,7 @@ describe("AcknowledgementAgent", () => {
         recallMock.mockResolvedValue([]);
         enqueueDefaultInboxInvoiceMock.mockResolvedValue(undefined);
         recordSimpleAutoReplyMock.mockResolvedValue(undefined);
-        recordHumanFollowUpRequiredMock.mockResolvedValue(undefined);
+        recordHumanReviewRequiredMock.mockResolvedValue(undefined);
     });
 
     it("adds the Replied label and keeps a routine reply visible in inbox", async () => {
@@ -181,7 +181,7 @@ describe("AcknowledgementAgent", () => {
         expect(gmailSendMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
-        expect(recordHumanFollowUpRequiredMock).not.toHaveBeenCalled();
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
     it("does not send a second thank-you on vendor PO threads that already have a buildasoil reply", async () => {
@@ -227,10 +227,10 @@ describe("AcknowledgementAgent", () => {
         expect(gmailSendMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
-        expect(recordHumanFollowUpRequiredMock).not.toHaveBeenCalled();
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into human review without adding a follow-up label", async () => {
+    it("forces multi-turn conversation threads into human review without adding an extra label", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -251,7 +251,7 @@ describe("AcknowledgementAgent", () => {
 
         expect(gmailSendMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).not.toHaveBeenCalled();
-        expect(recordHumanFollowUpRequiredMock).toHaveBeenCalledWith({
+        expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith({
             gmailMessageId: "gmail-2",
             threadId: "thread-2",
             fromEmail: "vendor@example.com",

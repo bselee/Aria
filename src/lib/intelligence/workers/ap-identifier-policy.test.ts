@@ -16,7 +16,7 @@ describe("getInvoiceInboxPolicy", () => {
         });
     });
 
-    it("keeps default inbox invoices visible without adding a follow-up label", () => {
+    it("keeps default inbox invoices visible without adding an extra label", () => {
         expect(getInvoiceInboxPolicy("default")).toEqual({
             queueForBillCom: false,
             addLabels: [],
@@ -28,7 +28,7 @@ describe("getInvoiceInboxPolicy", () => {
 });
 
 describe("getAPHumanInteractionPolicy", () => {
-    it("keeps AP inbox human interactions visible without adding a follow-up label", () => {
+    it("keeps AP inbox human interactions visible without adding an extra label", () => {
         expect(getAPHumanInteractionPolicy("ap")).toEqual({
             queueForBillCom: false,
             addLabels: [],
@@ -40,7 +40,7 @@ describe("getAPHumanInteractionPolicy", () => {
 });
 
 describe("getAPMissingPdfPolicy", () => {
-    it("keeps AP invoice intents visible when the PDF is missing without adding a follow-up label", () => {
+    it("keeps AP invoice intents visible when the PDF is missing without adding an extra label", () => {
         expect(getAPMissingPdfPolicy("ap", "INVOICE")).toEqual({
             queueForBillCom: false,
             addLabels: [],
