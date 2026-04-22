@@ -84,6 +84,9 @@ describe("APForwarderAgent", () => {
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
         }));
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: vi.fn().mockResolvedValue({ error: null }),
+        }));
         const updateEqMock = vi.fn().mockResolvedValue({ error: null });
         const updateMock = vi.fn((payload: { status: string }) => {
             if (payload.status === "PROCESSING_FORWARD") {
@@ -100,7 +103,10 @@ describe("APForwarderAgent", () => {
                 {
                     message_id: "gmail-source-1_0",
                     status: "FORWARDED",
-                    extracted_json: { processing_success: true },
+                    extracted_json: {
+                        billcom_sent_message_id: "sent-msg-1",
+                        processing_success: true,
+                    },
                 },
             ],
             error: null,
@@ -117,6 +123,11 @@ describe("APForwarderAgent", () => {
                     return {
                         select: selectMock,
                         update: updateMock,
+                    };
+                }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
                     };
                 }
                 return {
@@ -195,6 +206,9 @@ describe("APForwarderAgent", () => {
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
         }));
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: vi.fn().mockResolvedValue({ error: null }),
+        }));
         const updateEqMock = vi.fn().mockResolvedValue({ error: null });
         const updateMock = vi.fn((payload: { status: string }) => {
             if (payload.status === "PROCESSING_FORWARD") {
@@ -211,7 +225,10 @@ describe("APForwarderAgent", () => {
                 {
                     message_id: "gmail-source-1_0",
                     status: "FORWARDED",
-                    extracted_json: { processing_success: true },
+                    extracted_json: {
+                        billcom_sent_message_id: "sent-msg-1",
+                        processing_success: true,
+                    },
                 },
                 { message_id: "gmail-source-1_1", status: "PENDING_FORWARD" },
             ],
@@ -229,6 +246,11 @@ describe("APForwarderAgent", () => {
                     return {
                         select: selectMock,
                         update: updateMock,
+                    };
+                }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
                     };
                 }
                 return {
@@ -255,7 +277,7 @@ describe("APForwarderAgent", () => {
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
     });
 
-    it("keeps the source email in the inbox when invoice processing fails after Bill.com send", async () => {
+    it("archives the source email and marks it processed when invoice processing fails after Bill.com send", async () => {
         processInvoiceBufferMock.mockResolvedValue({
             success: false,
             state: "processing_error",
@@ -292,6 +314,10 @@ describe("APForwarderAgent", () => {
         ];
 
         const updateCalls: Array<{ status: string; extracted_json?: Record<string, unknown> }> = [];
+        const emailQueueUpdateEqMock = vi.fn().mockResolvedValue({ error: null });
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: emailQueueUpdateEqMock,
+        }));
         const lockStatusEqMock = vi.fn().mockResolvedValue({ error: null });
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
@@ -310,7 +336,14 @@ describe("APForwarderAgent", () => {
         });
         const likeMock = vi.fn().mockResolvedValue({
             data: [
-                { message_id: "gmail-source-1_0", status: "ERROR_PROCESSING" },
+                {
+                    message_id: "gmail-source-1_0",
+                    status: "ERROR_PROCESSING",
+                    extracted_json: {
+                        billcom_sent_message_id: "sent-msg-1",
+                        processing_success: false,
+                    },
+                },
             ],
             error: null,
         });
@@ -326,6 +359,11 @@ describe("APForwarderAgent", () => {
                     return {
                         select: selectMock,
                         update: updateMock,
+                    };
+                }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
                     };
                 }
                 return {
@@ -350,7 +388,12 @@ describe("APForwarderAgent", () => {
 
         expect(sendMock).toHaveBeenCalledTimes(1);
         expect(processInvoiceBufferMock).toHaveBeenCalledTimes(1);
-        expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
+        expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: true });
+        expect(applyMessageLabelPolicyMock).toHaveBeenCalledWith(expect.objectContaining({
+            gmailMessageId: "gmail-source-1",
+            addLabels: ["Invoice Forward"],
+            removeLabels: ["INBOX", "UNREAD"],
+        }));
         expect(updateCalls).toContainEqual(expect.objectContaining({
             status: "ERROR_PROCESSING",
             extracted_json: expect.objectContaining({

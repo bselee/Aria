@@ -534,6 +534,89 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         expect(modifyMock).not.toHaveBeenCalled();
     });
 
+    it("archives Pioneer Propane invoices instead of queueing them to Bill.com even when the PDF filename looks invoice-like", async () => {
+        const queueRows = [
+            {
+                id: "row-pioneer-1",
+                subject: "Invoice 106745 from Pioneer Propanen Inc.",
+                from_email: "pioneerpropaneinc@gmail.com",
+                body_snippet: "Invoice attached",
+                body_text: "Invoice attached",
+                gmail_message_id: "gmail-pioneer-1",
+                source_inbox: "ap",
+                pdf_filenames: ["Inv_106745_from_Pioneer_Propane_Inc._2150885_53300.pdf"],
+            },
+        ];
+
+        const getMock = vi.fn();
+        const modifyMock = vi.fn().mockResolvedValue({});
+        const insertMock = vi.fn().mockResolvedValue({ error: null });
+        const updateMock = vi.fn(() => ({
+            eq: vi.fn().mockResolvedValue({}),
+        }));
+        const gmail = {
+            users: {
+                labels: {
+                    list: vi.fn().mockResolvedValue({ data: { labels: [] } }),
+                    create: vi.fn(),
+                },
+                messages: {
+                    get: getMock,
+                    modify: modifyMock,
+                    attachments: {
+                        get: vi.fn(),
+                    },
+                },
+            },
+        };
+        gmailFactoryMock.mockReturnValue(gmail);
+
+        const apQueueSelectChain = {
+            eq: vi.fn(() => apQueueSelectChain),
+            gte: vi.fn(() => apQueueSelectChain),
+            maybeSingle: vi.fn().mockResolvedValue({ data: null }),
+        };
+        const supabase = {
+            from: vi.fn((table: string) => {
+                if (table === "email_inbox_queue") {
+                    return {
+                        select: vi.fn(() => ({
+                            eq: vi.fn(() => ({
+                                limit: vi.fn().mockResolvedValue({
+                                    data: queueRows,
+                                    error: null,
+                                }),
+                            })),
+                        })),
+                        update: updateMock,
+                    };
+                }
+                if (table === "ap_inbox_queue") {
+                    return {
+                        select: vi.fn(() => apQueueSelectChain),
+                        insert: insertMock,
+                    };
+                }
+                return {
+                    insert: vi.fn().mockResolvedValue({}),
+                };
+            }),
+        };
+        createClientMock.mockReturnValue(supabase);
+
+        const agent = new APIdentifierAgent();
+        await agent.identifyAndQueue();
+
+        expect(getMock).not.toHaveBeenCalled();
+        expect(insertMock).not.toHaveBeenCalled();
+        expect(modifyMock).toHaveBeenCalledWith({
+            userId: "me",
+            id: "gmail-pioneer-1",
+            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+        });
+        expect(updateMock).toHaveBeenCalledWith({ processed_by_ap: true });
+    });
+
     it("trims mixed paperwork packets down to the primary invoice page before queueing", async () => {
         const queueRows = [
             {

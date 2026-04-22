@@ -64,6 +64,7 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@browserbasehq/stagehand": "^3.2.1",
     "@playwright/test": "^1.59.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^20",

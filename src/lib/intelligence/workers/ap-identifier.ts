@@ -55,6 +55,8 @@ const SENDER_BLOCKLIST: Array<{ type: 'domain' | 'contains' | 'exact'; value: st
     // Toyota Commercial Finance — lease autopay, PDF says "Do Not Pay"
     { type: 'contains', value: 'billtrust.com', label: 'Toyota/TICF (Autopay Lease)' },
     { type: 'contains', value: 'toyota', label: 'Toyota (Autopay Lease)' },
+    { type: 'contains', value: 'pioneer propane', label: 'Pioneer Propane (Autopay)' },
+    { type: 'contains', value: 'pioneerpropaneinc@gmail.com', label: 'Pioneer Propane (Autopay)' },
 
     // Bounce / NDR addresses — never invoices
     { type: 'contains', value: 'postmaster@', label: 'Postmaster (Bounce)' },
@@ -688,7 +690,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 continue;
                             }
                             if (statementHandling.status === "needs_review") {
-                                console.log(`     ⚠️ ${multiInvVendor.label} statement needs review — leaving unread`);
+                                console.log(`     ⚠️ ${multiInvVendor.label} statement needs review — ${statementHandling.reason}; leaving unread`);
                                 handled = false;
                                 continue;
                             }
@@ -1770,17 +1772,20 @@ If no invoice number is found, use null.`,
                 sourcePdfs.set(attachment.attachmentId, sourcePdf);
             }
 
-            const pageIdx = invoice.page - 1;
-            if (pageIdx < 0 || pageIdx >= sourcePdf.getPageCount()) continue;
-
             const invoiceNumber = invoice.invoiceNumber || `page${invoice.page}`;
             const safeInvoiceNumber = invoiceNumber.replace(/[^a-zA-Z0-9-]/g, "_");
-            const invoiceFilename = `${safeInvoiceNumber}.pdf`;
+            const safeDate = (invoice.date || "unknown-date").replace(/[^0-9-]/g, "_");
+            const invoiceFilename = `Invoice_${safeInvoiceNumber}_${safeDate}.pdf`;
 
-            const singlePdf = await PDFDocument.create();
-            const [copiedPage] = await singlePdf.copyPages(sourcePdf, [pageIdx]);
-            singlePdf.addPage(copiedPage);
-            const pageBuffer = Buffer.from(await singlePdf.save());
+            const pageIndexes = (invoice.bundlePages?.length ? invoice.bundlePages : [invoice.page])
+                .map((pageNumber) => pageNumber - 1)
+                .filter((pageIdx) => pageIdx >= 0 && pageIdx < sourcePdf.getPageCount());
+            if (pageIndexes.length === 0) continue;
+
+            const bundlePdf = await PDFDocument.create();
+            const copiedPages = await bundlePdf.copyPages(sourcePdf, pageIndexes);
+            for (const copiedPage of copiedPages) bundlePdf.addPage(copiedPage);
+            const pageBuffer = Buffer.from(await bundlePdf.save());
 
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
             const { data: existingInv } = await supabase

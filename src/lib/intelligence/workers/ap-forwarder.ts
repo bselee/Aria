@@ -78,9 +78,9 @@ export class APForwarderAgent {
         }
     }
 
-    private isQueueItemComplete(relatedItem: any): boolean {
-        return relatedItem.status === "FORWARDED"
-            && relatedItem.extracted_json?.processing_success === true;
+    private isQueueItemSentToBillCom(relatedItem: any): boolean {
+        const sentMessageId = relatedItem.extracted_json?.billcom_sent_message_id;
+        return typeof sentMessageId === "string" && sentMessageId.length > 0;
     }
 
     private async finalizeSourceEmailIfReady(
@@ -101,10 +101,10 @@ export class APForwarderAgent {
             throw new Error(`Failed to load related queue items: ${error?.message || "unknown error"}`);
         }
 
-        const forwardedCount = relatedItems.filter((relatedItem: any) => this.isQueueItemComplete(relatedItem)).length;
+        const forwardedCount = relatedItems.filter((relatedItem: any) => this.isQueueItemSentToBillCom(relatedItem)).length;
         const allForwarded = relatedItems.length >= expectedForwardCount
             && forwardedCount >= expectedForwardCount
-            && relatedItems.every((relatedItem: any) => this.isQueueItemComplete(relatedItem));
+            && relatedItems.every((relatedItem: any) => this.isQueueItemSentToBillCom(relatedItem));
 
         if (!allForwarded) {
             return;
@@ -152,6 +152,7 @@ export class APForwarderAgent {
 
             for (const item of queueItems) {
                 let sentMessageId: string | null = null;
+                let billComSendVerified = false;
                 const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
                 try {
                     // Try to lock the row by updating status to PROCESSING_FORWARD
@@ -213,6 +214,7 @@ export class APForwarderAgent {
                         throw new Error(`Gmail send did not return a sent message id for ${item.id}`);
                     }
                     await this.verifySentMessage(gmail, sentMessageId);
+                    billComSendVerified = true;
 
                     const sendExtractedJson = {
                         ...(item.extracted_json || {}),
@@ -245,26 +247,18 @@ export class APForwarderAgent {
                         .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
 
-                    const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
-                    if (!processingResult.success) {
-                        await supabase
-                            .from('email_inbox_queue')
-                            .update({ processed_by_ap: false })
-                            .eq('gmail_message_id', sourceMessageId);
-                    } else {
-                        await supabase
-                            .from('email_inbox_queue')
-                            .update({ processed_by_ap: true })
-                            .eq('gmail_message_id', sourceMessageId);
-                        await this.finalizeSourceEmailIfReady(
-                            supabase,
-                            gmail,
-                            {
-                                ...item,
-                                extracted_json: extractedJson,
-                            },
-                        );
-                    }
+                    await supabase
+                        .from('email_inbox_queue')
+                        .update({ processed_by_ap: true })
+                        .eq('gmail_message_id', sourceMessageId);
+                    await this.finalizeSourceEmailIfReady(
+                        supabase,
+                        gmail,
+                        {
+                            ...item,
+                            extracted_json: extractedJson,
+                        },
+                    );
 
                     await this.logActivity(
                         supabase,
@@ -291,8 +285,8 @@ export class APForwarderAgent {
 
                 } catch (err: any) {
                     console.error(`   ❌ Forwarding failed for ${item.id}:`, err.message);
-                    const failureStatus = sentMessageId ? 'ERROR_PROCESSING' : 'ERROR_FORWARDING';
-                    const failureJson = sentMessageId
+                    const failureStatus = billComSendVerified ? 'ERROR_PROCESSING' : 'ERROR_FORWARDING';
+                    const failureJson = billComSendVerified
                         ? {
                             ...(item.extracted_json || {}),
                             billcom_sent_message_id: sentMessageId,
@@ -310,19 +304,26 @@ export class APForwarderAgent {
                                 : { status: failureStatus }
                         )
                         .eq('id', item.id);
-                    if (sentMessageId) {
-                        const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
+                    if (billComSendVerified) {
                         await supabase
                             .from('email_inbox_queue')
-                            .update({ processed_by_ap: false })
+                            .update({ processed_by_ap: true })
                             .eq('gmail_message_id', sourceMessageId);
+                        await this.finalizeSourceEmailIfReady(
+                            supabase,
+                            gmail,
+                            {
+                                ...item,
+                                extracted_json: failureJson,
+                            },
+                        );
                     }
                     await this.logActivity(
                         supabase,
                         item.email_from,
                         item.email_subject,
                         item.intent || 'INVOICE',
-                        sentMessageId
+                        billComSendVerified
                             ? `Error after Bill.com forward: ${err.message}`
                             : `Error forwarding to Bill.com: ${err.message}`
                     );
