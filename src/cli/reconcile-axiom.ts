@@ -14,7 +14,7 @@
  *   node --import tsx src/cli/reconcile-axiom.ts --update-only  # Use existing JSON, skip API fetch
  *   node --import tsx src/cli/reconcile-axiom.ts --discover     # Screenshot + DOM dump for initial mapping
  *   node --import tsx src/cli/reconcile-axiom.ts --po 124500    # Single PO
- *   node --import tsx src/cli/reconcile-axiom.ts --dry-run      # Show diffs without saving
+ *   node --import tsx src/cli/reconcile-axiom.ts --live        # Live update (dry-run is default)
  *
  * PREREQ: Close Chrome before running (Playwright needs exclusive profile access).
  *
@@ -38,6 +38,8 @@ dotenv.config({ path: '.env.local' });
 import { chromium, type Page, type BrowserContext } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -180,7 +182,8 @@ function parseArgs() {
         discover: args.includes('--discover'),
         scrapeOnly: args.includes('--scrape-only'),
         updateOnly: args.includes('--update-only'),
-        dryRun: args.includes('--dry-run'),
+        dryRun: !args.includes('--live'),
+        live: args.includes('--live'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
     };
 }
@@ -894,6 +897,7 @@ async function reconcilePO(
     poId: string,
     invoices: AxiomInvoice[],
     dryRun: boolean,
+    run: ReconciliationRun,
 ): Promise<ReconcileResult> {
     const result: ReconcileResult = { po: poId, priceChanges: 0, freightAdded: 0, status: '', errors: [] };
 
@@ -958,6 +962,7 @@ async function reconcilePO(
                 console.log(`     ${fId}: $${item.unitPrice.toFixed(4)} → $${correctPrice.toFixed(4)}`);
                 if (!dryRun) item.unitPrice = correctPrice;
                 result.priceChanges++;
+                run.recordPriceChange(fId, item.unitPrice, correctPrice);
             }
         }
 
@@ -980,6 +985,7 @@ async function reconcilePO(
                     existingAdj.push({ amount: totalFreight, description: label, productPromoUrl: FREIGHT_PROMO });
                 }
                 result.freightAdded = totalFreight;
+                run.recordFreight(totalFreight * 100);
             }
         }
 
@@ -996,6 +1002,7 @@ async function reconcilePO(
         }
     } catch (err: any) {
         result.errors.push(err.message);
+        run.recordError(`reconcilePO(${poId})`, err instanceof Error ? err : new Error(String(err.message)));
     }
 
     return result;
@@ -1005,34 +1012,43 @@ async function reconcilePO(
 
 async function main() {
     const args = parseArgs();
-    console.log('╔══════════════════════════════════════════════════╗');
-    console.log('║  Axiom Print → Finale Invoice Reconciliation    ║');
-    console.log('║  (API-first approach)                           ║');
-    console.log('╚══════════════════════════════════════════════════╝');
+    let run: ReconciliationRun | null = null;
+    try {
+        run = await ReconciliationRun.start('Axiom', args.dryRun ? 'dry-run' : 'live', {
+            discover: args.discover,
+            scrapeOnly: args.scrapeOnly,
+            updateOnly: args.updateOnly,
+            singlePO: args.singlePO,
+        });
+        console.log('╔══════════════════════════════════════════════════╗');
+        console.log('║  Axiom Print → Finale Invoice Reconciliation    ║');
+        console.log('║  (API-first approach)                           ║');
+        console.log('╚══════════════════════════════════════════════════╝');
 
-    // Discovery mode — explore the page structure before writing scraper
-    if (args.discover) {
-        await discover();
-        return;
-    }
+        // Discovery mode — explore the page structure before writing scraper
+        if (args.discover) {
+            await discover();
+            await run.complete('Axiom discovery complete.');
+            return;
+        }
 
-    if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
+        if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
 
-    // Phase 1: Get order data
-    let invoices: AxiomInvoice[];
+        // Phase 1: Get order data
+        let invoices: AxiomInvoice[];
 
-    if (args.updateOnly && fs.existsSync(JSON_PATH)) {
-        invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
-        console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
-    } else if (args.updateOnly) {
-        console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
-        process.exit(1);
-    } else {
-        invoices = await fetchAll();
-    }
+        if (args.updateOnly && fs.existsSync(JSON_PATH)) {
+            invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
+            console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
+        } else if (args.updateOnly) {
+            console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
+            process.exit(1);
+        } else {
+            invoices = await fetchAll();
+        }
 
-    if (args.scrapeOnly) {
-        console.log('\n✅ Fetch complete. Use --update-only to reconcile without re-fetching.');
+        if (args.scrapeOnly) {
+            console.log('\n✅ Fetch complete. Use --update-only to reconcile without re-fetching.');
 
         // Print a summary of what we found
         console.log('\n📊 Invoice Summary:');
@@ -1081,6 +1097,7 @@ async function main() {
             for (const s of Array.from(unmapped)) console.log(`   - ${s}`);
         }
 
+        await run.complete('Axiom scrape complete.');
         return;
     }
 
@@ -1191,6 +1208,7 @@ async function main() {
         if (bestMatch) {
             matchedPairs.push({ invoice, po: bestMatch, matchType: 'sku' });
             usedPOs.add(bestMatch.orderId);
+            run.recordInvoiceFound();
         } else {
             pass1Unmatched.push(invoice);
         }
@@ -1219,6 +1237,7 @@ async function main() {
         if (bestMatch) {
             matchedPairs.push({ invoice, po: bestMatch, matchType: 'date' });
             usedPOs.add(bestMatch.orderId);
+            run.recordInvoiceFound();
         } else {
             unmatchedInvoices.push(invoice);
         }
@@ -1236,8 +1255,12 @@ async function main() {
     for (const { invoice, po, matchType } of matchedPairs) {
         const mtLabel = matchType === 'sku' ? '🔗 SKU' : '📅 date';
         console.log(`\n   ── PO ${po.orderId} ↔ ${invoice.invoiceNumber} (${mtLabel}) ──`);
-        const result = await reconcilePO(finale, get, post, po.orderId, [invoice], args.dryRun);
+        const result = await reconcilePO(finale, get, post, po.orderId, [invoice], args.dryRun, run);
         results.push(result);
+
+        if (result.priceChanges > 0 || result.freightAdded > 0) {
+            run.recordPoUpdated(po.orderId);
+        }
 
         const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';
         console.log(`   ${icon} ${result.priceChanges} price updates, $${result.freightAdded.toFixed(2)} freight | ${result.status}`);
@@ -1432,6 +1455,19 @@ async function main() {
     console.log(`║   Errors:       ${String(totalErrors).padEnd(4)}                           ║`);
     }
     console.log('╚══════════════════════════════════════════════════╝');
+
+        await run.complete('Axiom reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('Axiom reconciliation failed', error);
+        } else {
+            console.error('[Axiom] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
+    }
 }
 
 main().catch(err => {
