@@ -13,26 +13,32 @@ description: Reconcile FedEx billing against Finale POs — identify and add mis
 - Finale API credentials in `.env.local`
 - FedEx API credentials in `.env.local` (for Track API matching)
 
+> [!WARNING]
+> The FedEx Invoice Billing API does not exist — attempts to use it return 404. CSV download via Playwright is the only available fetch method (as of 2026-04-23).
+
 ## Quick Run
 
-1. **Report mode** (safe, read-only):
-```bash
-node --import tsx src/cli/reconcile-fedex.ts --report-only
-```
+> [!NOTE]
+> `--dry-run` is the **default** behavior — no changes are made to Finale. Use `--live` to write.
 
-2. **Dry run** (shows what would be updated):
-```bash
-node --import tsx src/cli/reconcile-fedex.ts --dry-run
-```
-
-3. **Live update** (adds freight to POs):
+1. **Dry run (default)** — parses CSV, shows matches, no Finale changes:
 ```bash
 node --import tsx src/cli/reconcile-fedex.ts
 ```
 
+2. **Live update** — adds freight to POs:
+```bash
+node --import tsx src/cli/reconcile-fedex.ts --live
+```
+
+3. **Report only** (read-only, skips PO lookups):
+```bash
+node --import tsx src/cli/reconcile-fedex.ts --report-only
+```
+
 4. **Specific CSV file**:
 ```bash
-node --import tsx src/cli/reconcile-fedex.ts --csv path/to/FEDEX_export.csv
+node --import tsx src/cli/reconcile-fedex.ts --csv path/to/FEDEX_export.csv --live
 ```
 
 ## How It Works

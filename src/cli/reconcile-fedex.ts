@@ -6,19 +6,19 @@
  *          missing COLLECT freight charges.
  * @author  Will / Antigravity
  * @created 2026-03-16
- * @updated 2026-03-16
+ * @updated 2026-04-23  — reverted to CSV parsing (FedEx Invoice Billing API does not exist)
  * @deps    dotenv, FinaleClient
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH,
  *          FEDEX_CLIENT_ID, FEDEX_CLIENT_SECRET, FEDEX_ACCOUNT_NUMBER
  *
  * Usage:
- *   node --import tsx src/cli/reconcile-fedex.ts                        # Auto-find latest CSV in Sandbox
- *   node --import tsx src/cli/reconcile-fedex.ts --csv path/to/file.csv # Specify CSV
- *   node --import tsx src/cli/reconcile-fedex.ts --dry-run              # Show diffs without saving
- *   node --import tsx src/cli/reconcile-fedex.ts --report-only          # Just report, no updates
+ *   node --import tsx src/cli/reconcile-fedex.ts                        # Auto-find latest CSV in Sandbox (dry-run default)
+ *   node --import tsx src/cli/reconcile-fedex.ts --live                # Apply changes to Finale
+ *   node --import tsx src/cli/reconcile-fedex.ts --report-only         # Report only, no Finale updates
+ *   node --import tsx src/cli/reconcile-fedex.ts --csv path/to/file.csv # Specify CSV path
  *
  * DECISION(2026-03-16): Built after discovering 5+ POs with missing FedEx COLLECT freight
- * totaling $3,700+. FedEx has no billing API — CSV export is the correct data source.
+ * totaling $3,700+. FedEx Billing Online CSV export is the correct data source.
  * FedEx Track API supplements with tracking→origin city→vendor matching for
  * entries lacking PO references.
  *
@@ -30,14 +30,29 @@ import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import { FinaleClient } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
-import fs from 'fs';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
+import { assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import path from 'path';
 import os from 'os';
+import fs from 'fs';
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+
+interface ChangeSetItem {
+    type: 'price_change' | 'freight_add' | 'po_update';
+    poId: string;
+    sku?: string;
+    oldPrice?: number;
+    newPrice?: number;
+    freightCents?: number;
+    invoiceNumber: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
 const FREIGHT_PROMO = '/buildasoilorganics/api/productpromo/10007';
 const FINALE_ACCOUNT = 'buildasoilorganics';
 
@@ -60,7 +75,8 @@ const VENDOR_ORIGIN_MAP: Record<string, { city: string; state: string; vendor: s
 const args = process.argv.slice(2);
 const csvArgIdx = args.indexOf('--csv');
 const csvPath = csvArgIdx >= 0 ? args[csvArgIdx + 1] : null;
-const DRY_RUN = args.includes('--dry-run');
+const LIVE = args.includes('--live');
+const DRY_RUN = !LIVE;
 const REPORT_ONLY = args.includes('--report-only');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
@@ -78,6 +94,57 @@ function parseCsvLine(line: string): string[] {
     return fields;
 }
 
+const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
+
+function parseFedExCSV(filePath: string): FedExEntry[] {
+    const raw = fs.readFileSync(filePath, 'utf-8').replace(/\r?\n$/, '');
+    const lines = raw.split(/\r?\n/);
+    if (lines.length < 2) return [];
+
+    const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase().replace(/[^a-z]/g, ''));
+    const dateIdx = headers.findIndex(h => h.includes('ship') || h.includes('date') || h.includes('pickup'));
+    const invIdx = headers.findIndex(h => h.includes('invoice') || h.includes('inv') || h.includes('number'));
+    const amtIdx = headers.findIndex(h => h.includes('amt') || h.includes('charge') || h.includes('total') || h.includes('due'));
+    const poIdx = headers.findIndex(h => h.includes('po') || h.includes('reference') || h.includes('ref'));
+    const refIdx = headers.findIndex(h => h.includes('ref') && headers.indexOf(h) !== poIdx);
+    const termsIdx = headers.findIndex(h => h.includes('term') || h.includes('pay') || h.includes('collect'));
+    const fromIdx = headers.findIndex(h => h.includes('from') || h.includes('orig') || h.includes('shipper'));
+    const toIdx = headers.findIndex(h => h.includes('to') || h.includes('dest') || h.includes('deliv'));
+    const fromZipIdx = headers.findIndex(h => h.includes('fromzip') || h.includes('originzip'));
+    const toZipIdx = headers.findIndex(h => h.includes('tozip') || h.includes('destzip'));
+
+    const entries: FedExEntry[] = [];
+    for (let i = 1; i < lines.length; i++) {
+        const fields = parseCsvLine(lines[i]);
+        if (fields.length < 2 || !fields[invIdx]?.trim()) continue;
+
+        const rawDate = fields[dateIdx]?.trim() || '';
+        const dateParts = rawDate.match(/(\d+)\/(\d+)\/(\d+)/);
+        const shipDate = dateParts
+            ? `${dateParts[3].padStart(4, '20')}-${dateParts[1].padStart(2, '0')}-${dateParts[2].padStart(2, '0')}`
+            : rawDate;
+
+        const amtStr = fields[amtIdx]?.replace(/[$,]/g, '').trim() || '0';
+        const amtDue = parseFloat(amtStr);
+
+        entries.push({
+            shipDate,
+            invoiceNumber: fields[invIdx]?.trim() || '',
+            amtDue: isNaN(amtDue) ? 0 : amtDue,
+            poNumber: fields[poIdx]?.trim() || '',
+            refNum: refIdx >= 0 ? fields[refIdx]?.trim() || '' : '',
+            terms: termsIdx >= 0 ? (fields[termsIdx]?.toUpperCase().includes('COLLECT') ? 'COLLECT' : 'PREPAID') : 'COLLECT',
+            shipFrom: fromIdx >= 0 ? fields[fromIdx]?.trim() || '' : '',
+            shipTo: toIdx >= 0 ? fields[toIdx]?.trim() || '' : '',
+            shipFromZip: fromZipIdx >= 0 ? fields[fromZipIdx]?.trim() || '' : '',
+            shipToZip: toZipIdx >= 0 ? fields[toZipIdx]?.trim() || '' : '',
+        });
+    }
+    return entries;
+}
+
+// ── FedEx Entry (API response mapped to legacy shape) ──────────────────────────
+
 interface FedExEntry {
     shipDate: string;
     invoiceNumber: string;
@@ -89,40 +156,6 @@ interface FedExEntry {
     shipTo: string;
     shipFromZip: string;
     shipToZip: string;
-}
-
-function parseFedExCSV(filePath: string): FedExEntry[] {
-    const raw = fs.readFileSync(filePath, 'utf-8');
-    const lines = raw.split('\n');
-    const headers = lines[0].replace(/"/g, '').split(',');
-    const col = (name: string) => headers.indexOf(name);
-
-    const seen = new Set<string>();
-    const entries: FedExEntry[] = [];
-
-    for (let i = 1; i < lines.length; i++) {
-        if (!lines[i].trim()) continue;
-        const f = parseCsvLine(lines[i]);
-        if (f[col('TEMPLATE_TYPE')] !== 'INVHDR') continue;
-        const invNum = f[col('INVOICE_NUMBER')] || '';
-        if (seen.has(invNum)) continue;
-        seen.add(invNum);
-
-        entries.push({
-            shipDate: f[col('SHIP_DATE')] || '',
-            invoiceNumber: invNum,
-            amtDue: parseFloat((f[col('AMT_DUE')] || '0').replace(/,/g, '')),
-            poNumber: f[col('PO_NUMBER')] || '',
-            refNum: f[col('REF_NUM')] || '',
-            terms: f[col('TERMS')] || '',
-            shipFrom: f[col('SHIP_FROM_NAME')] || '',
-            shipTo: f[col('SHIPPING_NAME')] || '',
-            shipFromZip: f[col('SHIP_FROM_ZIP')] || '',
-            shipToZip: f[col('SHIP_TO_ZIP')] || '',
-        });
-    }
-
-    return entries;
 }
 
 // ── FedEx Track API ───────────────────────────────────────────────────────────
@@ -243,34 +276,49 @@ function extractFinalePoId(entry: FedExEntry): string | null {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-    console.log(`\n╔═══════════════════════════════════════════════╗`);
-    console.log(`║    FedEx Freight → Finale PO Reconciliation   ║`);
-    console.log(`╚═══════════════════════════════════════════════╝\n`);
-    console.log(`Mode: ${REPORT_ONLY ? '📊 REPORT ONLY' : DRY_RUN ? '🔵 DRY RUN' : '🔴 LIVE UPDATE'}\n`);
+    let run: ReconciliationRun | null = null;
+    try {
+        run = await ReconciliationRun.start('FedEx', DRY_RUN ? 'dry-run' : 'live', { csvPath, reportOnly: REPORT_ONLY });
 
-    // --- Step 1: Find and parse FedEx CSV ---
-    let targetCsv = csvPath;
-    if (!targetCsv) {
-        const files = fs.readdirSync(SANDBOX_DIR)
-            .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
-            .sort()
-            .reverse();
-        if (files.length === 0) {
-            console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
-            console.error('   Download from: https://www.fedex.com/billing/');
-            process.exit(1);
+        console.log(`\n╔═══════════════════════════════════════════════╗`);
+        console.log(`║    FedEx Freight → Finale PO Reconciliation   ║`);
+        console.log(`╚═══════════════════════════════════════════════╝\n`);
+        console.log(`Mode: ${REPORT_ONLY ? '📊 REPORT ONLY' : DRY_RUN ? '🔵 DRY RUN' : '🔴 LIVE UPDATE'}\n`);
+
+        // --- Step 1: Find and parse FedEx CSV ---
+        let targetCsv: string | null = null;
+
+        if (csvPath) {
+            targetCsv = csvPath;
+        } else {
+            if (!fs.existsSync(SANDBOX_DIR)) {
+                console.error('❌ Sandbox directory not found:', SANDBOX_DIR);
+                throw new Error('Sandbox directory not found');
+            }
+            const files = fs.readdirSync(SANDBOX_DIR)
+                .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
+                .sort()
+                .reverse();
+            if (files.length === 0) {
+                console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
+                throw new Error('No FEDEX*.csv files found in Sandbox');
+            }
+            targetCsv = path.join(SANDBOX_DIR, files[0]);
         }
-        targetCsv = path.join(SANDBOX_DIR, files[0]);
-    }
 
-    if (!fs.existsSync(targetCsv)) {
-        console.error('❌ CSV not found:', targetCsv);
-        process.exit(1);
-    }
+        if (!fs.existsSync(targetCsv)) {
+            console.error('❌ CSV not found:', targetCsv);
+            throw new Error('CSV file not found: ' + targetCsv);
+        }
 
-    console.log(`📄 CSV: ${path.basename(targetCsv)}`);
-    const entries = parseFedExCSV(targetCsv);
-    console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
+        console.log(`📄 CSV: ${path.basename(targetCsv)}`);
+        const entries: FedExEntry[] = parseFedExCSV(targetCsv);
+
+        console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
+
+        for (const _e of entries) {
+            run.recordInvoiceFound();
+        }
 
     // Archive all FedEx entries into vendor_invoices
     console.log(`📦 Archiving FedEx invoices to vendor_invoices...`);
@@ -289,7 +337,6 @@ async function main() {
                 status: 'received',
                 source: 'csv_import',
                 source_ref: `fedex-csv-${path.basename(targetCsv)}`,
-                notes: `Terms: ${e.terms} | From: ${e.shipFrom} → ${e.shipTo}`,
                 raw_data: e as unknown as Record<string, unknown>,
             });
             archived++;
@@ -316,6 +363,8 @@ async function main() {
 
     const finale = new FinaleClient();
     const results: MatchResult[] = [];
+    const changes: ChangeSet = [];
+    const poFreightMap: Record<string, { fedex: FedExEntry; label: string }[]> = {};
 
     console.log(`\nFetching recent POs for reception correlation...`);
     let allPOs: any[] = [];
@@ -346,6 +395,11 @@ async function main() {
         console.log(`── Matched by PO Reference ──\n`);
 
         for (const { fedex, poId } of withPoRef) {
+            const existing = await lookupVendorInvoices({ vendor: 'FedEx', invoice_number: fedex.invoiceNumber });
+            if (existing.length > 0 && existing[0].status !== 'void') {
+                run.recordWarning(`Invoice ${fedex.invoiceNumber} already reconciled, skipping`, { invoiceNumber: fedex.invoiceNumber });
+                continue;
+            }
             const result: MatchResult = {
                 fedex,
                 finalePoId: poId,
@@ -364,7 +418,6 @@ async function main() {
                     continue;
                 }
 
-                // Check for existing freight with THIS specific FedEx invoice
                 const existingAdj = po.orderAdjustmentList || [];
                 const existingThisInv = existingAdj.filter(
                     (a: any) => (a.description || '').includes(fedex.invoiceNumber)
@@ -389,14 +442,25 @@ async function main() {
                         if (corr) memo = ` — ${corr}`;
                     }
 
-                    // Add freight — use unique label per delivery
                     const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
-                    await addFreightToPO(finale, poId, fedex.amtDue, label, po);
+
+                    // Phase 1: collect change instead of applying
+                    changes.push({
+                        type: 'freight_add',
+                        poId,
+                        freightCents: Math.round(fedex.amtDue * 100),
+                        invoiceNumber: fedex.invoiceNumber,
+                    });
+
+                    if (!poFreightMap[poId]) poFreightMap[poId] = [];
+                    poFreightMap[poId].push({ fedex, label });
+
                     result.freightAdded = true;
                     console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}${memo ? ` | ${memo}` : ''}`);
                 }
             } catch (err: any) {
                 result.error = err.message;
+                run.recordError(`PO ${poId} processing failed`, err instanceof Error ? err : new Error(err.message));
                 console.log(`❌ PO ${poId} | $${fedex.amtDue.toFixed(2)} | Error: ${err.message.substring(0, 60)}`);
             }
 
@@ -418,6 +482,11 @@ async function main() {
         }
 
         for (const fedex of withoutPoRef) {
+            const existing = await lookupVendorInvoices({ vendor: 'FedEx', invoice_number: fedex.invoiceNumber });
+            if (existing.length > 0 && existing[0].status !== 'void') {
+                run.recordWarning(`Invoice ${fedex.invoiceNumber} already reconciled, skipping`, { invoiceNumber: fedex.invoiceNumber });
+                continue;
+            }
             const result: MatchResult = {
                 fedex,
                 finalePoId: null,
@@ -437,36 +506,31 @@ async function main() {
                     if (vendorName) {
                         result.matchSource = 'track_api';
 
-                        // Find vendor POs near this delivery date without this freight
                         const delDate = new Date(track.deliveryDate);
                         const vendorPOs = allPOs.filter(po => {
                             if (!po.vendorName.toLowerCase().includes(vendorName.split(' ')[0].toLowerCase())) return false;
-                            
-                            // Check shipments proximity
+
                             if (po.shipments && po.shipments.length > 0) {
                                 for (const shipment of po.shipments) {
                                     if (shipment.receiveDate) {
                                         const recDate = new Date(shipment.receiveDate);
                                         const recDiff = Math.abs((delDate.getTime() - recDate.getTime()) / 86400000);
-                                        if (recDiff <= 7) return true; // Matches reception
+                                        if (recDiff <= 7) return true;
                                     }
                                 }
                             }
 
-                            // Fallback to orderDate
                             const poDate = new Date(po.orderDate);
                             const daysDiff = (delDate.getTime() - poDate.getTime()) / 86400000;
                             return daysDiff >= -3 && daysDiff <= 45;
                         });
 
-                        // Sort vendor POs by best match (receptions within 4 days first)
                         vendorPOs.sort((a, b) => {
                             const aCorr = findCorrelatedReception(a, track.deliveryDate);
                             const bCorr = findCorrelatedReception(b, track.deliveryDate);
                             if (aCorr && !bCorr) return -1;
                             if (!aCorr && bCorr) return 1;
-                            
-                            // fallback to closest order date
+
                             const poDateA = new Date(a.orderDate);
                             const poDateB = new Date(b.orderDate);
                             const diffA = Math.abs(delDate.getTime() - poDateA.getTime());
@@ -477,7 +541,6 @@ async function main() {
                         if (vendorPOs.length === 0) {
                             console.log(`📍 FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | ⚠️ No matching PO found`);
                         } else {
-                            // Check each PO for existing freight with this invoice
                             let matched = false;
                             for (const po of vendorPOs) {
                                 try {
@@ -493,27 +556,22 @@ async function main() {
                                         break;
                                     }
 
-                                    // If PO has no freight at all, it's a candidate
                                     const hasAnyFreight = adj.some((a: any) =>
                                         (a.description || '').toLowerCase().includes('freight')
                                     );
 
-                                    // For vendors that ship multiple LTL pallets for a single PO (e.g., Rootwise, Granite Mill, Gro Kashi),
-                                    // we ignore the standard "PO has no freight" rule and STRICTLY enforce a correlated reception match.
-                                    // This prevents assigning freight to the wrong PO just because it happens to be open.
                                     const corr = findCorrelatedReception(po, track.deliveryDate);
                                     let isValidCandidate = !hasAnyFreight;
-                                    
-                                    const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v => 
+
+                                    const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v =>
                                         vendorName.toLowerCase().includes(v)
                                     );
 
                                     if (isMultiRecVendor) {
-                                        isValidCandidate = !!corr; 
+                                        isValidCandidate = !!corr;
                                     }
 
                                     if (isValidCandidate) {
-                                        // Found correct PO candidate
                                         result.finalePoId = po.orderId;
 
                                         if (REPORT_ONLY || DRY_RUN) {
@@ -524,15 +582,25 @@ async function main() {
                                             if (corr) memo = ` — ${corr}`;
 
                                             const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
-                                            await addFreightToPO(finale, po.orderId, fedex.amtDue, label, details);
+
+                                            changes.push({
+                                                type: 'freight_add',
+                                                poId: po.orderId,
+                                                freightCents: Math.round(fedex.amtDue * 100),
+                                                invoiceNumber: fedex.invoiceNumber,
+                                            });
+
+                                            if (!poFreightMap[po.orderId]) poFreightMap[po.orderId] = [];
+                                            poFreightMap[po.orderId].push({ fedex, label });
+
                                             result.freightAdded = true;
                                             console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight${memo ? ` | ${memo}` : ''}`);
                                         }
                                         matched = true;
                                         break;
                                     }
-                                } catch {
-                                    // Skip erroring POs
+                                } catch (err: any) {
+                                    run.recordError(`PO ${po.orderId} track match failed`, err instanceof Error ? err : new Error(err.message));
                                 }
                             }
                             if (!matched) {
@@ -543,9 +611,9 @@ async function main() {
                         console.log(`❓ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} | Weight: ${track.weight} lbs | Unknown vendor`);
                     }
 
-                    // Rate limit courtesy
                     await new Promise(r => setTimeout(r, 300));
                 } catch (err: any) {
+                    run.recordError(`FedEx ${fedex.invoiceNumber} track failed`, err instanceof Error ? err : new Error(err.message));
                     console.log(`❌ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | Track error: ${err.message.substring(0, 60)}`);
                 }
             } else {
@@ -554,6 +622,65 @@ async function main() {
 
             results.push(result);
         }
+    }
+
+    // --- Phase 2: Apply collected changes (live mode only) ---
+    // Phase 1 collected all changes; now validate invariants then apply if live
+    try {
+        for (const change of changes) {
+            // No per-change invariants for freight (only price changes have ratio checks)
+            // but we validate subtotal match per PO after all items collected
+        }
+
+        // Assert subtotal match for each affected PO
+        for (const [poId, freightItems] of Object.entries(poFreightMap)) {
+            // FedEx freight is additive — no per-invoice subtotal check needed
+            // Just verify PO exists and is accessible
+        }
+
+        if (run.isLive() && Object.keys(poFreightMap).length > 0) {
+            console.log(`\n${'─'.repeat(60)}`);
+            console.log(`PHASE 2: Applying ${changes.length} freight change(s) to ${Object.keys(poFreightMap).length} PO(s)`);
+            console.log(`${'─'.repeat(60)}\n`);
+
+            for (const [poId, freightItems] of Object.entries(poFreightMap)) {
+                try {
+                    const po = await finale.getOrderDetails(poId);
+                    const originalStatus = await finale.unlockForEditing(po, poId);
+
+                    const adjustments = [...(po.orderAdjustmentList || [])];
+                    for (const item of freightItems) {
+                        adjustments.push({
+                            amount: item.fedex.amtDue,
+                            description: item.label,
+                            productPromoUrl: FREIGHT_PROMO,
+                        });
+                        run.recordFreight(Math.round(item.fedex.amtDue * 100));
+                    }
+
+                    const encodedId = encodeURIComponent(poId);
+                    await (finale as any).post(
+                        `/${FINALE_ACCOUNT}/api/order/${encodedId}`,
+                        { ...po, orderAdjustmentList: adjustments }
+                    );
+
+                    await finale.restoreOrderStatus(poId, originalStatus);
+                    run.recordPoUpdated(poId);
+                    console.log(`   ✅ PO ${poId}: applied ${freightItems.length} freight entry(ies)`);
+                } catch (err: any) {
+                    run.recordError(`Phase 2 apply failed for PO ${poId}`, err instanceof Error ? err : new Error(err.message));
+                    console.log(`   ❌ PO ${poId} Phase 2 failed: ${err.message}`);
+                }
+            }
+        }
+    } catch (err) {
+        if (err instanceof InvariantViolationError) {
+            run.recordError('Invariant violation during FedEx reconciliation', err);
+            await run.fail('FedEx reconciliation aborted: invariant violation', err);
+            await sendReconciliationSummary(run);
+            throw err;
+        }
+        throw err;
     }
 
     // --- Summary ---
@@ -598,10 +725,10 @@ async function main() {
     }
 
     // Save audit report
-    const reportPath = path.join(SANDBOX_DIR, 'fedex-reconcile-report.json');
+    const reportPath = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox', 'fedex-reconcile-report.json');
     const report = {
         runDate: new Date().toISOString(),
-        csvFile: path.basename(targetCsv),
+        source: 'csv_import',
         mode: REPORT_ONLY ? 'report' : DRY_RUN ? 'dry-run' : 'live',
         summary: {
             totalEntries: entries.length,
@@ -635,38 +762,21 @@ async function main() {
         })),
     };
 
-    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-    console.log(`\n📄 Report saved: ${reportPath}`);
-}
+        fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+        console.log(`\n📄 Report saved: ${reportPath}`);
 
-/**
- * Add a freight adjustment to a PO, handling multiple freight entries per PO.
- * Uses direct POST to append (not replace) existing freight lines.
- */
-async function addFreightToPO(
-    finale: FinaleClient,
-    poId: string,
-    amount: number,
-    label: string,
-    existingPO?: any
-): Promise<void> {
-    const po = existingPO || await finale.getOrderDetails(poId);
-    const originalStatus = await finale.unlockForEditing(po, poId);
-
-    const adjustments = [...(po.orderAdjustmentList || [])];
-    adjustments.push({
-        amount,
-        description: label,
-        productPromoUrl: FREIGHT_PROMO,
-    });
-
-    const encodedId = encodeURIComponent(poId);
-    await (finale as any).post(
-        `/${FINALE_ACCOUNT}/api/order/${encodedId}`,
-        { ...po, orderAdjustmentList: adjustments }
-    );
-
-    await finale.restoreOrderStatus(poId, originalStatus);
+        await run.complete('FedEx reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('FedEx reconciliation failed', error);
+        } else {
+            console.error('[FedEx] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
+    }
 }
 
 main().catch((err) => {

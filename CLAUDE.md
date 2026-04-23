@@ -149,6 +149,10 @@ Calendar auth is a **separate OAuth flow** from Gmail — it uses `GOOGLE_CLIENT
 | `src/lib/intelligence/pinecone.ts` | Pinecone vector store for operational context + deduplication state (index: `gravity-memory`, 1024d, namespace: `aria-memory`) |
 | `src/lib/intelligence/vendor-memory.ts` | Vendor document handling patterns in Pinecone (namespace: `vendor-memory`). Stores how each vendor sends docs. `seedKnownVendorPatterns()` called on boot. |
 | `src/lib/intelligence/dropship-store.ts` | In-memory store (48h TTL) for unmatched invoices pending dropship forwarding. Bot's `dropship_fwd_*` callbacks retrieve from here. Lost on restart. |
+| `src/lib/reconciliation/run-tracker.ts` | In-memory ReconciliationRun tracker — single Supabase upsert on complete/fail |
+| `src/lib/reconciliation/notifier.ts` | Telegram summary sender for reconciliation runs |
+| `src/lib/reconciliation/invariants.ts` | Hard-stop sanity checks: subtotal match, price reasonableness |
+| `src/lib/fedex/billing.ts` | FedEx Invoice Billing API client (spike — API does not exist, see note) |
 | `src/lib/intelligence/nightshift-agent.ts` | Overnight local LLM email pre-classifier. `enqueueEmailClassification()` → `nightshift_queue` table. `runNightshiftLoop()` uses Ollama qwen2.5:1.5b, escalates to Claude Haiku on low confidence. `getPreClassification()` called by ap-identifier before paid Sonnet classify. |
 | `src/lib/intelligence/sandbox-watcher.ts` | Watches `~/OneDrive/Desktop/Sandbox/` for dropped files. PDFs → AP pipeline, TXT → LLM Q&A, CSV/XLSX → summarize, images → Supabase Storage. Processed files move to `processed/`, responses to `responses/`. |
 | `src/lib/intelligence/po-correlator.ts` | Cross-inbox correlation: reads outgoing PO emails from `bill.selee@buildasoil.com` (label:PO), correlates with incoming invoices, builds vendor communication profiles (saved to `vendor_profiles` table) |
@@ -190,7 +194,7 @@ Vendor-specific reconcilers match external invoices to Finale POs, apply correct
 | Vendor | Script | Fetch Method | Key Challenge |
 |--------|--------|-------------|---------------|
 | ULINE | `reconcile-uline.ts` | Playwright persistent Chrome | Bot detection; box→unit UOM conversion |
-| FedEx | `reconcile-fedex.ts` | CSV download + Track API | Origin city → vendor name mapping |
+| FedEx | `reconcile-fedex.ts` | CSV download (Billing API spike — endpoint does not exist) | Origin city → vendor name mapping; FedEx billing API verified non-functional (2026-04-23) |
 | TeraGanix | `reconcile-teraganix.ts` | Gmail email parse (Shopify) | Case multipliers (e.g. EM102×12) |
 | Axiom Print | `reconcile-axiom.ts` | REST API (newapi.axiomprint.com) | Split invoices; 2-pass date+SKU matching |
 
@@ -198,21 +202,21 @@ Supporting scripts: `fetch-fedex-csv.ts` (Playwright-driven FedEx Billing CSV do
 
 **Playwright persistent Chrome:** ULINE and FedEx scripts require closing Chrome before running. They attach to Will's real Chrome profile (`launchPersistentContext`) to reuse existing session cookies — Playwright-driven login triggers bot detection and fails.
 
-**CLI flags (consistent across all reconcilers):** `--dry-run` (preview only), `--scrape-only` (fetch without updating Finale), `--update-only` (skip scrape, use cached data), `--report-only` (FedEx), `--po <id>` (target a specific PO).
+**CLI flags (consistent across all reconcilers):** `--dry-run` (default — preview only), `--live` (write to Finale), `--scrape-only` (fetch without updating Finale), `--update-only` (skip scrape, use cached data), `--report-only` (FedEx), `--po <id>` (target a specific PO).
 
 ```bash
 # ULINE
-node --import tsx src/cli/reconcile-uline.ts [--dry-run | --scrape-only | --update-only]
+node --import tsx src/cli/reconcile-uline.ts [--scrape-only | --update-only | --live]
 
 # FedEx — download CSV first, then reconcile
 node --import tsx src/cli/fetch-fedex-csv.ts
-node --import tsx src/cli/reconcile-fedex.ts [--dry-run | --report-only]
+node --import tsx src/cli/reconcile-fedex.ts [--report-only | --live]
 
 # TeraGanix (reads Gmail automatically)
-node --import tsx src/cli/reconcile-teraganix.ts [--dry-run]
+node --import tsx src/cli/reconcile-teraganix.ts [--live]
 
 # Axiom Print
-node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts [--scrape-only | --update-only | --dry-run]
+node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts [--scrape-only | --update-only | --live]
 node --import tsx src/cli/axiom-merge-split-invoices.ts  # one-time split invoice merge
 ```
 

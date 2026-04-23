@@ -22,7 +22,9 @@ interface RunRecord {
 export class ReconciliationRun {
     private record: RunRecord;
     private supabase = createClient();
-
+    private constructor(record: RunRecord) {
+        this.record = record;
+    }
     static async start(
         vendor: string,
         mode: 'dry-run' | 'live',
@@ -84,7 +86,7 @@ export class ReconciliationRun {
         this.record.pos_updated++;
     }
 
-    recordPriceChange(sku: string, _oldPrice: number, _newPrice: number): void {
+    recordPriceChange(_sku: string, _oldPrice: number, _newPrice: number): void {
         this.record.price_changes++;
     }
 

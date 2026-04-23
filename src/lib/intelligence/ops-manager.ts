@@ -482,7 +482,41 @@ export class OpsManager {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
         });
 
+        // Missing Reconciliation Watchdog at 9 AM weekdays
+        schedule("0 9 * * 1-5", () => {
+            this.safeRun("MissingReconciliationWatchdog", () => this.checkMissingReconciliationRuns());
+        });
+
         console.log("✅ OpsManager background jobs registered.");
+    }
+
+    /**
+     * Watchdog: alert if any vendor hasn't had a successful reconciliation run in 24h.
+     */
+    async checkMissingReconciliationRuns(): Promise<void> {
+        const VENDORS = ['ULINE', 'FedEx', 'TeraGanix', 'Axiom', 'AAA'];
+        const ONE_DAY_AGO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const sb = createClient();
+        if (!sb) return;
+
+        for (const vendor of VENDORS) {
+            const { data } = await sb
+                .from('reconciliation_runs')
+                .select('id, status, started_at')
+                .eq('vendor', vendor)
+                .gte('started_at', ONE_DAY_AGO)
+                .in('status', ['success', 'partial'])
+                .order('started_at', { ascending: false })
+                .limit(1);
+
+            if (!data || data.length === 0) {
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || "",
+                    `⚠️ No successful ${vendor} reconciliation run in the last 24h. ` +
+                    `Last run may have failed or not run. Check reconciliation_runs table.`
+                );
+            }
+        }
     }
 
     /**

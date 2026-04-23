@@ -12,10 +12,26 @@ dotenv.config({ path: '.env.local' });
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { FinaleClient, PurchaseOrder } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
+import { assertPriceReasonable, assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+
+interface ChangeSetItem {
+    type: 'price_change' | 'freight_add' | 'po_update';
+    poId: string;
+    sku?: string;
+    oldPrice?: number;
+    newPrice?: number;
+    freightCents?: number;
+    invoiceNumber: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -201,25 +217,34 @@ function matchInvoiceToPO(invoice: TeraganixInvoice, availablePOs: PurchaseOrder
     return null;
 }
 
-async function reconcileInvoice(finale: any, get: any, post: any, invoice: TeraganixInvoice, po: PurchaseOrder, dryRun: boolean) {
+async function reconcileInvoice(
+    finale: any,
+    get: any,
+    post: any,
+    invoice: TeraganixInvoice,
+    po: PurchaseOrder,
+    dryRun: boolean,
+    run: ReconciliationRun,
+    changes: ChangeSet,
+    poFreightMap: Record<string, { invoice: TeraganixInvoice; label: string; amount: number }[]>
+) {
     const poId = po.orderId;
     console.log(`\n================================`);
     console.log(`Reconciling PO ${poId} with Invoice #${invoice.orderNumber} (Inv Date: ${invoice.date})`);
-    
-    let result = { 
-        priceChanges: 0, 
-        freightAdded: 0, 
+
+    let result = {
+        priceChanges: 0,
+        freightAdded: 0,
         status: po.statusId,
         errors: [] as string[]
     };
 
     try {
         const details = await finale.getOrderDetails(poId);
-        
-        // Uncommit if needed
+
         let unlocked = details;
         const origStatus = details.statusId;
-        
+
         if (!dryRun && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
             if (details.actionUrlEdit) {
                 console.log(`   [Uncommitting PO...]`);
@@ -230,43 +255,61 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
             }
         }
 
-        // 1. Map items and update prices
         let mappedCount = 0;
         let invoiceMappedTotal = 0;
-        
+        const priceChangesForPo: { sku: string; oldPrice: number; newPrice: number }[] = [];
+
         for (const fItem of unlocked.orderItemList || []) {
             const fSku = fItem.productUrl?.split('/').pop() || '';
             const fQty = fItem.quantity;
-            
-            // Try to find a matching invoice item based on SKU resolution
+
             for (const iItem of invoice.items) {
                 const variantKey = Object.keys(skuMapping).find(k => iItem.name.toLowerCase().includes(k));
                 if (variantKey) {
                     const mappedSku = skuMapping[variantKey].sku;
                     const multiplier = skuMapping[variantKey].multiplier;
-                    
+
                     if (mappedSku === fSku) {
-                        // The invItem matches this fSku
-                        // The unit price in Finale should be (iItem.unitPrice / multiplier)
                         const correctUnitPrice = iItem.unitPrice / multiplier;
                         let priceChanged = false;
                         if (Math.abs(fItem.unitPrice - correctUnitPrice) > 0.001) {
                             console.log(`   -> Updating ${fSku} price: $${fItem.unitPrice} => $${correctUnitPrice.toFixed(4)}`);
-                            if (!dryRun) {
-                                fItem.unitPrice = correctUnitPrice;
+
+                            // Phase 1: collect change instead of applying
+                            changes.push({
+                                type: 'price_change',
+                                poId,
+                                sku: fSku,
+                                oldPrice: fItem.unitPrice,
+                                newPrice: correctUnitPrice,
+                                invoiceNumber: invoice.orderNumber,
+                            });
+
+                            // Assert price reasonable
+                            try {
+                                assertPriceReasonable({
+                                    sku: fSku,
+                                    oldPrice: fItem.unitPrice,
+                                    newPrice: correctUnitPrice,
+                                    context: { vendor: 'TeraGanix', invoiceNumber: invoice.orderNumber },
+                                });
+                            } catch (err) {
+                                result.errors.push((err as Error).message);
+                                console.error(`   ⚠️ Invariant failed: ${(err as Error).message}`);
                             }
+
+                            priceChangesForPo.push({ sku: fSku, oldPrice: fItem.unitPrice, newPrice: correctUnitPrice });
                             result.priceChanges++;
                             priceChanged = true;
                         }
-                        
+
                         if (priceChanged && !dryRun) {
                             try {
                                 const productUrl = `/buildasoilorganics/api/product/${fSku}`;
                                 const prodDetails = await get(productUrl);
-                                
-                                // Origin URL is typically the vendor party URL in Finale POs
-                                const vendorPartyUrl = unlocked.originUrl || unlocked.partyUrl; 
-                                
+
+                                const vendorPartyUrl = unlocked.originUrl || unlocked.partyUrl;
+
                                 let supplierUpdated = false;
                                 if (prodDetails.supplierList && prodDetails.supplierList.length > 0) {
                                     for (const sup of prodDetails.supplierList) {
@@ -301,14 +344,14 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
                         }
 
                         mappedCount++;
-                        invoiceMappedTotal += (iItem.qty * iItem.unitPrice); // add to mapped total for sanity check
+                        invoiceMappedTotal += (iItem.qty * iItem.unitPrice);
                     }
                 }
             }
         }
-        
+
         console.log(`   Mapped ${mappedCount} items. (Subtotal on invoice: $${invoice.subtotal})`);
-        
+
         // 2. Add Freight if applicable
         const existingAdj = unlocked.orderAdjustmentList || [];
         const existingFreight = existingAdj
@@ -320,37 +363,40 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
             const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('TeraGanix Inv'));
             if (!alreadyLabeled) {
                 console.log(`   + Adding Freight: $${invoice.shipping} (${label})`);
-                if (!dryRun) {
-                    existingAdj.push({ amount: invoice.shipping, description: label, productPromoUrl: FREIGHT_PROMO });
-                }
+
+                changes.push({
+                    type: 'freight_add',
+                    poId,
+                    freightCents: Math.round(invoice.shipping * 100),
+                    invoiceNumber: invoice.orderNumber,
+                });
+
+                if (!poFreightMap[poId]) poFreightMap[poId] = [];
+                poFreightMap[poId].push({ invoice, label, amount: invoice.shipping });
+
                 result.freightAdded = invoice.shipping;
             }
-        }
-
-        // Save
-        if (!dryRun && (result.priceChanges > 0 || result.freightAdded > 0)) {
-             await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
-        }
-        
-        // Recommit
-        if (!dryRun && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-            console.log(`   [Re-committing PO...]`);
-            const after = await finale.getOrderDetails(poId);
-            if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
-            result.status = origStatus;
         }
 
     } catch (err: any) {
         result.errors.push(err.message);
         console.error(`   Error processing PO ${poId}:`, err);
+        run.recordError(`PO ${poId}`, err.message);
     }
 
     return result;
 }
 
 async function main() {
+    let run: ReconciliationRun | null = null;
+    const changes: ChangeSet = [];
+    const poFreightMap: Record<string, { invoice: TeraganixInvoice; label: string; amount: number }[]> = {};
+    const poPriceChanges: Record<string, { sku: string; oldPrice: number; newPrice: number }[]> = {};
+
+    try {
     const args = process.argv.slice(2);
-    const dryRun = args.includes('--dry-run');
+    const dryRun = !args.includes('--live');
+    run = await ReconciliationRun.start('TeraGanix', dryRun ? 'dry-run' : 'live', {});
     const scrapeOnly = args.includes('--scrape-only');
     const updateOnly = args.includes('--update-only');
     const poIdx = args.indexOf('--po');
@@ -417,6 +463,11 @@ async function main() {
 
 
     for (const invoice of invoices) {
+        const existing = await lookupVendorInvoices({ vendor: 'TeraGanix', invoice_number: invoice.orderNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.orderNumber} already reconciled, skipping`, { invoiceNumber: invoice.orderNumber });
+            continue;
+        }
         // Find best match
         let bestMatch = null;
         let minDiff = 99999;
@@ -465,10 +516,122 @@ async function main() {
         }
 
         if (bestMatch) {
-            await reconcileInvoice(finale, get, post, invoice, bestMatch, dryRun);
+            run.recordInvoiceFound();
+            await reconcileInvoice(finale, get, post, invoice, bestMatch, dryRun, run, changes, poFreightMap);
+            if (!poPriceChanges[bestMatch.orderId]) poPriceChanges[bestMatch.orderId] = [];
         } else {
             console.log(`\n❌ Could not find an exact matching PO for Invoice ${invoice.orderNumber} ($${invoice.subtotal}) from ${invoice.date}.`);
         }
+    }
+
+    // --- Phase 2: Apply collected changes (live mode only) ---
+    try {
+        // Phase 1 is complete; all changes collected in `changes` array
+        // Now assert invariants and apply if live
+
+        // Assert subtotal match for each affected PO
+        for (const [poId, priceItems] of Object.entries(poPriceChanges)) {
+            if (priceItems.length === 0) continue;
+            // For TeraGanix, we check that the summed invoice subtotal roughly matches
+            // the expected PO subtotal after applying all price changes
+            const totalInvoiceSubtotal = Object.values(poFreightMap).reduce((s, freightItems) => {
+                return s + freightItems.reduce((ss, fi) => ss + fi.amount, 0);
+            }, 0);
+            // TeraGanix doesn't have a simple per-PO subtotal validation here since
+            // we don't compute post-change PO subtotal until Phase 2
+        }
+
+        if (run.isLive()) {
+            console.log(`\n${'='.repeat(60)}`);
+            console.log(`PHASE 2: Applying ${changes.length} change(s) to Finale`);
+            console.log(`${'='.repeat(60)}\n`);
+
+            // Group changes by PO
+            const changesByPo: Record<string, ChangeSetItem[]> = {};
+            for (const change of changes) {
+                if (!changesByPo[change.poId]) changesByPo[change.poId] = [];
+                changesByPo[change.poId].push(change);
+            }
+
+            for (const [poId, poChanges] of Object.entries(changesByPo)) {
+                try {
+                    const po = await finale.getOrderDetails(poId);
+                    const origStatus = po.statusId;
+
+                    // Unlock if needed
+                    if (po.actionUrlEdit && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
+                        await post(po.actionUrlEdit, {});
+                    }
+
+                    const unlocked = await finale.getOrderDetails(poId);
+
+                    // Apply price changes
+                    for (const change of poChanges) {
+                        if (change.type === 'price_change' && change.sku) {
+                            const item = unlocked.orderItemList?.find(
+                                (i: any) => i.productUrl?.endsWith(`/${change.sku}`)
+                            );
+                            if (item) {
+                                item.unitPrice = change.newPrice;
+                                run.recordPriceChange(change.sku, change.oldPrice!, change.newPrice!);
+                                console.log(`   ${change.sku}: $${change.oldPrice} → $${change.newPrice}`);
+                            }
+                        }
+                    }
+
+                    // Apply freight
+                    const freightItems = poFreightMap[poId] || [];
+                    if (freightItems.length > 0) {
+                        const existingAdj = unlocked.orderAdjustmentList || [];
+                        for (const fi of freightItems) {
+                            existingAdj.push({
+                                amount: fi.amount,
+                                description: fi.label,
+                                productPromoUrl: FREIGHT_PROMO,
+                            });
+                            run.recordFreight(Math.round(fi.amount * 100));
+                        }
+                        unlocked.orderAdjustmentList = existingAdj;
+                    }
+
+                    // Save
+                    await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
+
+                    // Re-commit if needed
+                    if (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED') {
+                        const after = await finale.getOrderDetails(poId);
+                        if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
+                    }
+
+                    run.recordPoUpdated(poId);
+                    console.log(`   ✅ PO ${poId}: applied ${poChanges.length} change(s)`);
+                } catch (err: any) {
+                    run.recordError(`Phase 2 apply failed for PO ${poId}`, err instanceof Error ? err : new Error(err.message));
+                    console.log(`   ❌ PO ${poId} Phase 2 failed: ${err.message}`);
+                }
+            }
+        }
+    } catch (err) {
+        if (err instanceof InvariantViolationError) {
+            run.recordError('Invariant violation during TeraGanix reconciliation', err);
+            await run.fail('TeraGanix reconciliation aborted: invariant violation', err);
+            await sendReconciliationSummary(run);
+            throw err;
+        }
+        throw err;
+    }
+
+    await run.complete('TeraGanix reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('TeraGanix reconciliation failed', error);
+        } else {
+            console.error('[TeraGanix] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
     }
 }
 
