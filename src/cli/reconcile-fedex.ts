@@ -30,7 +30,7 @@ import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import { FinaleClient } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import fs from 'fs';
@@ -357,6 +357,11 @@ async function main() {
         console.log(`── Matched by PO Reference ──\n`);
 
         for (const { fedex, poId } of withPoRef) {
+            const existing = await lookupVendorInvoices({ vendor: 'FedEx', invoice_number: fedex.invoiceNumber });
+            if (existing.length > 0 && existing[0].status !== 'void') {
+                run.recordWarning(`Invoice ${fedex.invoiceNumber} already reconciled, skipping`, { invoiceNumber: fedex.invoiceNumber });
+                continue;
+            }
             const result: MatchResult = {
                 fedex,
                 finalePoId: poId,
@@ -432,6 +437,11 @@ async function main() {
         }
 
         for (const fedex of withoutPoRef) {
+            const existing = await lookupVendorInvoices({ vendor: 'FedEx', invoice_number: fedex.invoiceNumber });
+            if (existing.length > 0 && existing[0].status !== 'void') {
+                run.recordWarning(`Invoice ${fedex.invoiceNumber} already reconciled, skipping`, { invoiceNumber: fedex.invoiceNumber });
+                continue;
+            }
             const result: MatchResult = {
                 fedex,
                 finalePoId: null,

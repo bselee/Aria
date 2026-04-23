@@ -12,7 +12,7 @@ dotenv.config({ path: '.env.local' });
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { FinaleClient, PurchaseOrder } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import fs from 'fs';
@@ -425,6 +425,11 @@ async function main() {
 
 
     for (const invoice of invoices) {
+        const existing = await lookupVendorInvoices({ vendor: 'TeraGanix', invoice_number: invoice.orderNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.orderNumber} already reconciled, skipping`, { invoiceNumber: invoice.orderNumber });
+            continue;
+        }
         // Find best match
         let bestMatch = null;
         let minDiff = 99999;

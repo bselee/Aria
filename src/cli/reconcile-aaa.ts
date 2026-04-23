@@ -22,7 +22,7 @@ import { createClient } from "@supabase/supabase-js";
 import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
-import { upsertVendorInvoice } from "../lib/storage/vendor-invoices";
+import { upsertVendorInvoice, lookupVendorInvoices } from "../lib/storage/vendor-invoices";
 import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
 import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
 import {
@@ -220,6 +220,11 @@ async function main() {
 
             const invoices = await buildInvoicesFromSplitResult(stmt.attachments, splitResult);
             for (const invoice of invoices) {
+                const existing = await lookupVendorInvoices({ vendor: 'AAA COOPER', invoice_number: invoice.invoiceNumber || `split-${stmt.messageId}-page-${invoice.pageNumber}` });
+                if (existing.length > 0 && existing[0].status !== 'void') {
+                    run.recordWarning(`Invoice ${invoice.invoiceNumber} already reconciled, skipping`, { invoiceNumber: invoice.invoiceNumber });
+                    continue;
+                }
                 run.recordInvoiceFound();
                 const amountStr = invoice.amount ? ` $${invoice.amount.toFixed(2)}` : "";
                 console.log(`    ${invoice.filename}${amountStr}`);
