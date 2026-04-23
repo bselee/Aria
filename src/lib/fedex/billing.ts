@@ -1,3 +1,32 @@
+/**
+ * @fileoverview FedEx Invoice Billing API client.
+ *
+ * ⚠️  VERIFICATION FAILED (2026-04-23): The FedEx Invoice Billing REST API endpoint
+ * (https://apis.fedex.com/track/v1/invoices and all alternative paths) returns
+ * HTTP 404 "The resource you requested is no longer available." This was confirmed
+ * by probing the following endpoints with valid OAuth credentials:
+ *   - /track/v1/invoices         → 404
+ *   - /track/v1/invoicedetails   → 404
+ *   - /billing/v1/invoices       → 404
+ *   - /billing-services/invoicehistory → 404
+ *   - /billing/invoicehistory    → 404
+ *   - /invoicing/v1/invoices     → 404
+ *   - /freight/lcl/v1/invoices   → 404
+ *
+ * A 2025 Reddit thread (r/FedEx) confirms: "no API available that exposes the
+ * invoice values on any packages" — FedEx has no public billing invoice API.
+ *
+ * CORRECT APPROACH: Use the FedEx Billing Center CSV export (Playwright-driven
+ * download from fedex.com/billing) or the Sandbox drop approach. See
+ * `src/cli/fetch-fedex-csv.ts` and `fedex-acquisition.ts` for the working
+ * (Playwright+Chrome) implementation. The `getFedExInvoices()` function in this
+ * file CANNOT WORK until FedEx releases a billing invoice API.
+ *
+ * The FedEx Track API (POST /track/v1/trackingnumbers) IS functional and is used
+ * by `reconcile-fedex.ts` for origin-city → vendor matching. Only the billing
+ * invoice fetch is broken.
+ */
+
 export interface FedExInvoice {
     invoiceNumber: string;
     invoiceDate: string;
