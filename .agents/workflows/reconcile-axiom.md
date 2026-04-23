@@ -14,24 +14,27 @@ description: Reconcile Axiom Print invoices against Finale POs — update pricin
 
 ## Quick Run
 
-1. **Fetch invoice data only** (safe, API-only):
+> [!NOTE]
+> `--dry-run` is the **default** behavior — no changes are made to Finale. Use `--live` to write.
+
+1. **Dry run (default)** — fetch + reconcile with cached data, no Finale changes:
+```bash
+node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts
+```
+
+2. **Full pipeline + live update** (fetch + reconcile + write to Finale):
+```bash
+node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts --live
+```
+
+3. **Fetch invoice data only** (safe, API-only):
 ```bash
 node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts --scrape-only
 ```
 
-2. **Dry run** (shows what would update — uses cached data):
+4. **Use cached data + live update** (skip API fetch, write to Finale):
 ```bash
-node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts --update-only --dry-run
-```
-
-3. **Live update** (applies changes to Finale):
-```bash
-node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts --update-only
-```
-
-4. **Full pipeline** (fetch + reconcile):
-```bash
-node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts
+node --dns-result-order=ipv4first --import tsx src/cli/reconcile-axiom.ts --update-only --live
 ```
 
 > [!IMPORTANT]
