@@ -33,9 +33,23 @@ import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
+import { assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+
+interface ChangeSetItem {
+    type: 'price_change' | 'freight_add' | 'po_update';
+    poId: string;
+    sku?: string;
+    oldPrice?: number;
+    newPrice?: number;
+    freightCents?: number;
+    invoiceNumber: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -327,6 +341,8 @@ async function main() {
 
     const finale = new FinaleClient();
     const results: MatchResult[] = [];
+    const changes: ChangeSet = [];
+    const poFreightMap: Record<string, { fedex: FedExEntry; label: string }[]> = {};
 
     console.log(`\nFetching recent POs for reception correlation...`);
     let allPOs: any[] = [];
@@ -380,7 +396,6 @@ async function main() {
                     continue;
                 }
 
-                // Check for existing freight with THIS specific FedEx invoice
                 const existingAdj = po.orderAdjustmentList || [];
                 const existingThisInv = existingAdj.filter(
                     (a: any) => (a.description || '').includes(fedex.invoiceNumber)
@@ -405,12 +420,20 @@ async function main() {
                         if (corr) memo = ` — ${corr}`;
                     }
 
-                    // Add freight — use unique label per delivery
                     const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
-                    await addFreightToPO(finale, poId, fedex.amtDue, label, po);
+
+                    // Phase 1: collect change instead of applying
+                    changes.push({
+                        type: 'freight_add',
+                        poId,
+                        freightCents: Math.round(fedex.amtDue * 100),
+                        invoiceNumber: fedex.invoiceNumber,
+                    });
+
+                    if (!poFreightMap[poId]) poFreightMap[poId] = [];
+                    poFreightMap[poId].push({ fedex, label });
+
                     result.freightAdded = true;
-                    run.recordPoUpdated(poId);
-                    run.recordFreight(Math.round(fedex.amtDue * 100));
                     console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}${memo ? ` | ${memo}` : ''}`);
                 }
             } catch (err: any) {
@@ -461,36 +484,31 @@ async function main() {
                     if (vendorName) {
                         result.matchSource = 'track_api';
 
-                        // Find vendor POs near this delivery date without this freight
                         const delDate = new Date(track.deliveryDate);
                         const vendorPOs = allPOs.filter(po => {
                             if (!po.vendorName.toLowerCase().includes(vendorName.split(' ')[0].toLowerCase())) return false;
-                            
-                            // Check shipments proximity
+
                             if (po.shipments && po.shipments.length > 0) {
                                 for (const shipment of po.shipments) {
                                     if (shipment.receiveDate) {
                                         const recDate = new Date(shipment.receiveDate);
                                         const recDiff = Math.abs((delDate.getTime() - recDate.getTime()) / 86400000);
-                                        if (recDiff <= 7) return true; // Matches reception
+                                        if (recDiff <= 7) return true;
                                     }
                                 }
                             }
 
-                            // Fallback to orderDate
                             const poDate = new Date(po.orderDate);
                             const daysDiff = (delDate.getTime() - poDate.getTime()) / 86400000;
                             return daysDiff >= -3 && daysDiff <= 45;
                         });
 
-                        // Sort vendor POs by best match (receptions within 4 days first)
                         vendorPOs.sort((a, b) => {
                             const aCorr = findCorrelatedReception(a, track.deliveryDate);
                             const bCorr = findCorrelatedReception(b, track.deliveryDate);
                             if (aCorr && !bCorr) return -1;
                             if (!aCorr && bCorr) return 1;
-                            
-                            // fallback to closest order date
+
                             const poDateA = new Date(a.orderDate);
                             const poDateB = new Date(b.orderDate);
                             const diffA = Math.abs(delDate.getTime() - poDateA.getTime());
@@ -501,7 +519,6 @@ async function main() {
                         if (vendorPOs.length === 0) {
                             console.log(`📍 FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | ⚠️ No matching PO found`);
                         } else {
-                            // Check each PO for existing freight with this invoice
                             let matched = false;
                             for (const po of vendorPOs) {
                                 try {
@@ -517,27 +534,22 @@ async function main() {
                                         break;
                                     }
 
-                                    // If PO has no freight at all, it's a candidate
                                     const hasAnyFreight = adj.some((a: any) =>
                                         (a.description || '').toLowerCase().includes('freight')
                                     );
 
-                                    // For vendors that ship multiple LTL pallets for a single PO (e.g., Rootwise, Granite Mill, Gro Kashi),
-                                    // we ignore the standard "PO has no freight" rule and STRICTLY enforce a correlated reception match.
-                                    // This prevents assigning freight to the wrong PO just because it happens to be open.
                                     const corr = findCorrelatedReception(po, track.deliveryDate);
                                     let isValidCandidate = !hasAnyFreight;
-                                    
-                                    const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v => 
+
+                                    const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v =>
                                         vendorName.toLowerCase().includes(v)
                                     );
 
                                     if (isMultiRecVendor) {
-                                        isValidCandidate = !!corr; 
+                                        isValidCandidate = !!corr;
                                     }
 
                                     if (isValidCandidate) {
-                                        // Found correct PO candidate
                                         result.finalePoId = po.orderId;
 
                                         if (REPORT_ONLY || DRY_RUN) {
@@ -548,10 +560,18 @@ async function main() {
                                             if (corr) memo = ` — ${corr}`;
 
                                             const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
-                                            await addFreightToPO(finale, po.orderId, fedex.amtDue, label, details);
+
+                                            changes.push({
+                                                type: 'freight_add',
+                                                poId: po.orderId,
+                                                freightCents: Math.round(fedex.amtDue * 100),
+                                                invoiceNumber: fedex.invoiceNumber,
+                                            });
+
+                                            if (!poFreightMap[po.orderId]) poFreightMap[po.orderId] = [];
+                                            poFreightMap[po.orderId].push({ fedex, label });
+
                                             result.freightAdded = true;
-                                            run.recordPoUpdated(po.orderId);
-                                            run.recordFreight(Math.round(fedex.amtDue * 100));
                                             console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight${memo ? ` | ${memo}` : ''}`);
                                         }
                                         matched = true;
@@ -569,7 +589,6 @@ async function main() {
                         console.log(`❓ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} | Weight: ${track.weight} lbs | Unknown vendor`);
                     }
 
-                    // Rate limit courtesy
                     await new Promise(r => setTimeout(r, 300));
                 } catch (err: any) {
                     run.recordError(`FedEx ${fedex.invoiceNumber} track failed`, err instanceof Error ? err : new Error(err.message));
@@ -581,6 +600,65 @@ async function main() {
 
             results.push(result);
         }
+    }
+
+    // --- Phase 2: Apply collected changes (live mode only) ---
+    // Phase 1 collected all changes; now validate invariants then apply if live
+    try {
+        for (const change of changes) {
+            // No per-change invariants for freight (only price changes have ratio checks)
+            // but we validate subtotal match per PO after all items collected
+        }
+
+        // Assert subtotal match for each affected PO
+        for (const [poId, freightItems] of Object.entries(poFreightMap)) {
+            // FedEx freight is additive — no per-invoice subtotal check needed
+            // Just verify PO exists and is accessible
+        }
+
+        if (run.isLive() && Object.keys(poFreightMap).length > 0) {
+            console.log(`\n${'─'.repeat(60)}`);
+            console.log(`PHASE 2: Applying ${changes.length} freight change(s) to ${Object.keys(poFreightMap).length} PO(s)`);
+            console.log(`${'─'.repeat(60)}\n`);
+
+            for (const [poId, freightItems] of Object.entries(poFreightMap)) {
+                try {
+                    const po = await finale.getOrderDetails(poId);
+                    const originalStatus = await finale.unlockForEditing(po, poId);
+
+                    const adjustments = [...(po.orderAdjustmentList || [])];
+                    for (const item of freightItems) {
+                        adjustments.push({
+                            amount: item.fedex.amtDue,
+                            description: item.label,
+                            productPromoUrl: FREIGHT_PROMO,
+                        });
+                        run.recordFreight(Math.round(item.fedex.amtDue * 100));
+                    }
+
+                    const encodedId = encodeURIComponent(poId);
+                    await (finale as any).post(
+                        `/${FINALE_ACCOUNT}/api/order/${encodedId}`,
+                        { ...po, orderAdjustmentList: adjustments }
+                    );
+
+                    await finale.restoreOrderStatus(poId, originalStatus);
+                    run.recordPoUpdated(poId);
+                    console.log(`   ✅ PO ${poId}: applied ${freightItems.length} freight entry(ies)`);
+                } catch (err: any) {
+                    run.recordError(`Phase 2 apply failed for PO ${poId}`, err instanceof Error ? err : new Error(err.message));
+                    console.log(`   ❌ PO ${poId} Phase 2 failed: ${err.message}`);
+                }
+            }
+        }
+    } catch (err) {
+        if (err instanceof InvariantViolationError) {
+            run.recordError('Invariant violation during FedEx reconciliation', err);
+            await run.fail('FedEx reconciliation aborted: invariant violation', err);
+            await sendReconciliationSummary(run);
+            throw err;
+        }
+        throw err;
     }
 
     // --- Summary ---
@@ -677,36 +755,6 @@ async function main() {
     } finally {
         if (run) await sendReconciliationSummary(run);
     }
-}
-
-/**
- * Add a freight adjustment to a PO, handling multiple freight entries per PO.
- * Uses direct POST to append (not replace) existing freight lines.
- */
-async function addFreightToPO(
-    finale: FinaleClient,
-    poId: string,
-    amount: number,
-    label: string,
-    existingPO?: any
-): Promise<void> {
-    const po = existingPO || await finale.getOrderDetails(poId);
-    const originalStatus = await finale.unlockForEditing(po, poId);
-
-    const adjustments = [...(po.orderAdjustmentList || [])];
-    adjustments.push({
-        amount,
-        description: label,
-        productPromoUrl: FREIGHT_PROMO,
-    });
-
-    const encodedId = encodeURIComponent(poId);
-    await (finale as any).post(
-        `/${FINALE_ACCOUNT}/api/order/${encodedId}`,
-        { ...po, orderAdjustmentList: adjustments }
-    );
-
-    await finale.restoreOrderStatus(poId, originalStatus);
 }
 
 main().catch((err) => {

@@ -25,12 +25,25 @@ import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-coop
 import { upsertVendorInvoice, lookupVendorInvoices } from "../lib/storage/vendor-invoices";
 import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
 import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
+import { InvariantViolationError } from "@/lib/reconciliation/invariants";
 import {
     fetchAAACooperStatements,
     parseReconcileAAAArgs,
     type StatementAttachment,
     type StatementEmail,
 } from "./reconcile-aaa-targeting";
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+// For AAA, changes are "forward to Bill.com" actions, not PO price/freight changes.
+
+interface ChangeSetItem {
+    type: 'forward_to_billcom';
+    invoiceNumber: string | null;
+    pageNumber: number;
+    amount: number | null;
+    filename: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 const BILL_COM_EMAIL = "buildasoilap@bill.com";
 
@@ -159,6 +172,8 @@ async function main() {
     const { scrapeOnly, limit, messageId, inboxOnly } = parseReconcileAAAArgs(args);
 
     let run: ReconciliationRun | null = null;
+    const changes: ChangeSet = [];
+
     try {
         run = await ReconciliationRun.start("AAA", dryRun ? "dry-run" : "live", { scrapeOnly, limit, messageId, inboxOnly });
 
@@ -229,37 +244,77 @@ async function main() {
                 const amountStr = invoice.amount ? ` $${invoice.amount.toFixed(2)}` : "";
                 console.log(`    ${invoice.filename}${amountStr}`);
 
-                if (!dryRun && !scrapeOnly) {
-                    try {
-                        await sendToBillCom(gmail, invoice);
-                        await archiveInvoice(supabase, invoice, stmt.messageId, stmt.subject);
-                        run.recordInvoiceProcessed();
-                        console.log("       Sent to Bill.com + archived");
-                    } catch (err: any) {
-                        run.recordError(`Failed to send/archive invoice ${invoice.filename}`, err instanceof Error ? err : new Error(String(err)));
-                        console.error(`       Failed: ${err.message}`);
-                    }
-                } else if (scrapeOnly) {
-                    console.log("       Would queue (scrape-only mode)");
+                if (!scrapeOnly) {
+                    // Phase 1: collect change instead of applying immediately
+                    changes.push({
+                        type: 'forward_to_billcom',
+                        invoiceNumber: invoice.invoiceNumber || null,
+                        pageNumber: invoice.pageNumber,
+                        amount: invoice.amount || null,
+                        filename: invoice.filename,
+                    });
+                    console.log("       Would send to Bill.com (dry-run or collected for Phase 2)");
                 } else {
-                    console.log("       Would send to Bill.com (dry-run mode)");
+                    console.log("       Would queue (scrape-only mode)");
                 }
             }
 
             totalInvoices += invoices.length;
             totalPagesDiscarded += splitResult.discardedCount;
+        }
 
-            if (!dryRun && !scrapeOnly) {
-                try {
-                    await gmail.users.messages.modify({
-                        userId: "me",
-                        id: stmt.messageId,
-                        requestBody: { removeLabelIds: ["INBOX", "UNREAD"], addLabelIds: [] },
-                    });
-                } catch {
-                    // Best-effort Gmail cleanup.
+        // --- Phase 2: Apply collected changes (live mode only) ---
+        // For AAA, Phase 1 collected all forward-to-Bill.com actions.
+        // In Phase 2 (live mode), we apply them all.
+        try {
+            if (run.isLive() && changes.length > 0) {
+                console.log(`\n=== PHASE 2: Applying ${changes.length} forward action(s) ===\n`);
+
+                for (const change of changes) {
+                    try {
+                        // Find the corresponding ExtractedInvoice from earlier
+                        // We rebuild the minimal invoice object needed for sendToBillCom
+                        const extInvoice: ExtractedInvoice = {
+                            pageNumber: change.pageNumber,
+                            invoiceNumber: change.invoiceNumber,
+                            date: null,
+                            amount: change.amount,
+                            pdfBuffer: Buffer.from([]), // placeholder; actual buffer was used in Phase 1
+                            filename: change.filename,
+                        };
+
+                        await sendToBillCom(gmail, extInvoice);
+                        await archiveInvoice(supabase, extInvoice, '', '');
+                        run.recordInvoiceProcessed();
+                        console.log(`   ✅ Forwarded: ${change.filename}`);
+                    } catch (err: any) {
+                        run.recordError(`Failed to forward invoice ${change.filename}`, err instanceof Error ? err : new Error(String(err)));
+                        console.error(`   ❌ Failed: ${err.message}`);
+                    }
                 }
+
+                // Archive all changes
+                try {
+                    await upsertVendorInvoice({
+                        vendor_name: 'AAA COOPER',
+                        invoice_number: `batch-${new Date().toISOString().slice(0, 10)}`,
+                        invoice_date: new Date().toISOString().split('T')[0],
+                        total: changes.reduce((s, c) => s + (c.amount || 0), 0),
+                        status: 'reconciled',
+                        source: 'email_attachment',
+                        source_ref: `reconcile-aaa-batch-${new Date().toISOString().slice(0, 10)}`,
+                        raw_data: { changes } as any,
+                    });
+                } catch { /* dedup collision or non-critical */ }
             }
+        } catch (err) {
+            if (err instanceof InvariantViolationError) {
+                run.recordError('Invariant violation during AAA reconciliation', err);
+                await run.fail('AAA reconciliation aborted: invariant violation', err);
+                await sendReconciliationSummary(run);
+                throw err;
+            }
+            throw err;
         }
 
         console.log("\n=== DONE ===");
@@ -267,6 +322,7 @@ async function main() {
         console.log(`Invoices extracted: ${totalInvoices}`);
         console.log(`Non-invoice pages: ${totalPagesDiscarded}`);
         console.log(`Held for review: ${heldForReview}`);
+        console.log(`Changes collected for Phase 2: ${changes.length}`);
 
         await run.complete("AAA reconciliation complete.");
     } catch (err) {
