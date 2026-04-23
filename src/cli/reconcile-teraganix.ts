@@ -13,6 +13,8 @@ import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { FinaleClient, PurchaseOrder } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -201,7 +203,7 @@ function matchInvoiceToPO(invoice: TeraganixInvoice, availablePOs: PurchaseOrder
     return null;
 }
 
-async function reconcileInvoice(finale: any, get: any, post: any, invoice: TeraganixInvoice, po: PurchaseOrder, dryRun: boolean) {
+async function reconcileInvoice(finale: any, get: any, post: any, invoice: TeraganixInvoice, po: PurchaseOrder, dryRun: boolean, run: ReconciliationRun) {
     const poId = po.orderId;
     console.log(`\n================================`);
     console.log(`Reconciling PO ${poId} with Invoice #${invoice.orderNumber} (Inv Date: ${invoice.date})`);
@@ -257,6 +259,7 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
                             }
                             result.priceChanges++;
                             priceChanged = true;
+                            run.recordPriceChange(fSku, fItem.unitPrice, correctUnitPrice);
                         }
                         
                         if (priceChanged && !dryRun) {
@@ -324,6 +327,7 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
                     existingAdj.push({ amount: invoice.shipping, description: label, productPromoUrl: FREIGHT_PROMO });
                 }
                 result.freightAdded = invoice.shipping;
+                run.recordFreight(Math.round(invoice.shipping * 100));
             }
         }
 
@@ -343,14 +347,18 @@ async function reconcileInvoice(finale: any, get: any, post: any, invoice: Terag
     } catch (err: any) {
         result.errors.push(err.message);
         console.error(`   Error processing PO ${poId}:`, err);
+        run.recordError(`PO ${poId}`, err.message);
     }
 
     return result;
 }
 
 async function main() {
+    let run: ReconciliationRun | null = null;
+    try {
     const args = process.argv.slice(2);
-    const dryRun = args.includes('--dry-run');
+    const dryRun = !args.includes('--live');
+    run = await ReconciliationRun.start('TeraGanix', dryRun ? 'dry-run' : 'live', {});
     const scrapeOnly = args.includes('--scrape-only');
     const updateOnly = args.includes('--update-only');
     const poIdx = args.indexOf('--po');
@@ -465,10 +473,24 @@ async function main() {
         }
 
         if (bestMatch) {
-            await reconcileInvoice(finale, get, post, invoice, bestMatch, dryRun);
+            run.recordInvoiceFound();
+            await reconcileInvoice(finale, get, post, invoice, bestMatch, dryRun, run);
+            run.recordPoUpdated(bestMatch.orderId);
         } else {
             console.log(`\n❌ Could not find an exact matching PO for Invoice ${invoice.orderNumber} ($${invoice.subtotal}) from ${invoice.date}.`);
         }
+    }
+    await run.complete('TeraGanix reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('TeraGanix reconciliation failed', error);
+        } else {
+            console.error('[TeraGanix] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
     }
 }
 
