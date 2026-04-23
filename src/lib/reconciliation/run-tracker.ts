@@ -21,6 +21,11 @@ interface RunRecord {
 
 export class ReconciliationRun {
     private record: RunRecord;
+    private supabase = createClient();
+
+    private constructor(record: RunRecord) {
+        this.record = record;
+    }
 
     static async start(
         vendor: string,
