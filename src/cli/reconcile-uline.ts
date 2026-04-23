@@ -33,9 +33,23 @@ import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor
 import { BrowserManager } from '../lib/scraping/browser-manager';
 import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
+import { assertPriceReasonable, assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+
+interface ChangeSetItem {
+    type: 'price_change' | 'freight_add' | 'po_update';
+    poId: string;
+    sku?: string;
+    oldPrice?: number;
+    newPrice?: number;
+    freightCents?: number;
+    invoiceNumber: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -341,14 +355,13 @@ async function reconcilePO(
     invoices: UlineInvoice[],
     dryRun: boolean,
     forceSupplier: boolean,
-    run?: ReconciliationRun | null,
+    run: ReconciliationRun | undefined,
+    changes: ChangeSet,
+    poFreightMap: Record<string, { invNums: string[]; totalFreight: number; totalTax: number }>,
+    poPriceChanges: Record<string, { sku: string; oldPrice: number; newPrice: number; ulineSku: string }[]>,
 ): Promise<ReconcileResult> {
     const result: ReconcileResult = { po: poId, priceChanges: 0, freightAdded: 0, taxAdded: 0, status: '', errors: [] };
 
-    // Merge ULINE items across all invoices for this PO
-    // DECISION(2026-03-16): Must track qty alongside price for UOM conversion.
-    // ULINE sells by case/box, Finale tracks individual units.
-    // Example: S-1665 poly bags — ULINE sells 1 box ($103), Finale has 500 bags ($0.206 each)
     const ulineItemMap: Record<string, { unitPrice: number; ulineSku: string; qty: number }> = {};
     let totalFreight = 0;
     let totalTax = 0;
@@ -358,7 +371,7 @@ async function reconcilePO(
     for (const inv of invoices) {
         const existing = await lookupVendorInvoices({ vendor: 'ULINE', invoice_number: inv.invoiceNumber });
         if (existing.length > 0 && existing[0].status !== 'void') {
-            run.recordWarning(`Invoice ${inv.invoiceNumber} already reconciled, skipping`, { invoiceNumber: inv.invoiceNumber });
+            run?.recordWarning(`Invoice ${inv.invoiceNumber} already reconciled, skipping`, { invoiceNumber: inv.invoiceNumber });
             continue;
         }
         invNums.push(inv.invoiceNumber);
@@ -368,7 +381,6 @@ async function reconcilePO(
         for (const item of inv.items) {
             if (item.unitPrice <= 0) continue;
             const fId = toFinaleId(item.itemNumber);
-            // If same SKU appears on multiple invoices, sum the qty
             if (ulineItemMap[fId]) {
                 ulineItemMap[fId].qty += item.qtyOrdered;
             } else {
@@ -382,21 +394,14 @@ async function reconcilePO(
         const origStatus = po.statusId;
         result.status = origStatus;
 
-        if (!dryRun && po.actionUrlEdit && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-            await post(po.actionUrlEdit, {});
-        }
-
         const unlocked = dryRun ? po : await finale.getOrderDetails(poId);
 
-        // Update prices — UOM-AWARE
+        // Phase 1: collect price changes without modifying PO
         for (const item of unlocked.orderItemList || []) {
             const fId = item.productUrl?.split('/').pop() || '';
             const uItem = ulineItemMap[fId];
             if (!uItem) continue;
 
-            // DECISION(2026-03-16): Detect UOM conversion by comparing quantities.
-            // If Finale qty > ULINE qty, Finale tracks individual units within a case/box.
-            // The correct Finale unit price = ULINE price / (finaleQty / ulineQty)
             let correctPrice = uItem.unitPrice;
             const finaleQty = item.quantity;
             const ulineQty = uItem.qty;
@@ -408,27 +413,74 @@ async function reconcilePO(
                 correctPrice = uItem.unitPrice / factor;
                 if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                     console.log(`     ${fId}: $${item.unitPrice.toFixed(4)} → $${correctPrice.toFixed(4)} (ULINE $${uItem.unitPrice} ÷ ${factor} UOM factor)`);
-                    if (!dryRun) item.unitPrice = correctPrice;
+
+                    // Phase 1: collect change
+                    changes.push({
+                        type: 'price_change',
+                        poId,
+                        sku: fId,
+                        oldPrice: item.unitPrice,
+                        newPrice: correctPrice,
+                        invoiceNumber: invNums.join('+'),
+                    });
+
+                    if (!poPriceChanges[poId]) poPriceChanges[poId] = [];
+                    poPriceChanges[poId].push({ sku: fId, oldPrice: item.unitPrice, newPrice: correctPrice, ulineSku: uItem.ulineSku });
+
+                    // Assert price reasonable
+                    try {
+                        assertPriceReasonable({
+                            sku: fId,
+                            oldPrice: item.unitPrice,
+                            newPrice: correctPrice,
+                            context: { vendor: 'ULINE', invoiceNumber: invNums.join('+') },
+                        });
+                    } catch (err) {
+                        result.errors.push((err as Error).message);
+                        console.error(`     ⚠️ Invariant failed: ${(err as Error).message}`);
+                    }
+
                     priceChanged = true;
                     result.priceChanges++;
-                    run?.recordPriceChange(fId, item.unitPrice, correctPrice);
                 }
             } else if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                 console.log(`     ${fId}: $${item.unitPrice} → $${correctPrice}`);
-                if (!dryRun) item.unitPrice = correctPrice;
+
+                changes.push({
+                    type: 'price_change',
+                    poId,
+                    sku: fId,
+                    oldPrice: item.unitPrice,
+                    newPrice: correctPrice,
+                    invoiceNumber: invNums.join('+'),
+                });
+
+                if (!poPriceChanges[poId]) poPriceChanges[poId] = [];
+                poPriceChanges[poId].push({ sku: fId, oldPrice: item.unitPrice, newPrice: correctPrice, ulineSku: uItem.ulineSku });
+
+                try {
+                    assertPriceReasonable({
+                        sku: fId,
+                        oldPrice: item.unitPrice,
+                        newPrice: correctPrice,
+                        context: { vendor: 'ULINE', invoiceNumber: invNums.join('+') },
+                    });
+                } catch (err) {
+                    result.errors.push((err as Error).message);
+                    console.error(`     ⚠️ Invariant failed: ${(err as Error).message}`);
+                }
+
                 priceChanged = true;
                 result.priceChanges++;
-                run?.recordPriceChange(fId, item.unitPrice, correctPrice);
             }
 
-            if ((priceChanged || forceSupplier) && !dryRun) {
+            if (priceChanged && (forceSupplier || dryRun)) {
                 try {
                     const productUrl = `/buildasoilorganics/api/product/${fId}`;
                     const prodDetails = await get(productUrl);
-                    
-                    // Origin URL is typically the vendor party URL in Finale POs
-                    const vendorPartyUrl = unlocked.originUrl || unlocked.partyUrl; 
-                    
+
+                    const vendorPartyUrl = unlocked.originUrl || unlocked.partyUrl;
+
                     let supplierUpdated = false;
                     if (prodDetails.supplierList && prodDetails.supplierList.length > 0) {
                         for (const sup of prodDetails.supplierList) {
@@ -453,7 +505,7 @@ async function reconcilePO(
                         }
                     }
 
-                    if (supplierUpdated) {
+                    if (supplierUpdated && !dryRun) {
                         await post(productUrl, prodDetails);
                         console.log(`       [Global supplier price updated to $${correctPrice.toFixed(4)}]`);
                     }
@@ -463,61 +515,29 @@ async function reconcilePO(
             }
         }
 
-        // Sanity check: verify Finale subtotal matches ULINE subtotal
-        const finaleSubtotal = (unlocked.orderItemList || []).reduce((s: number, i: any) => {
-            const fId = i.productUrl?.split('/').pop() || '';
-            const uItem = ulineItemMap[fId];
-            if (!uItem) return s + i.quantity * i.unitPrice;
-            // Use the price we're about to set
-            const finaleQty = i.quantity;
-            const ulineQty = uItem.qty;
-            const price = (ulineQty > 0 && finaleQty !== ulineQty)
-                ? uItem.unitPrice / (finaleQty / ulineQty)
-                : uItem.unitPrice;
-            return s + finaleQty * price;
-        }, 0);
-
-        if (Math.abs(finaleSubtotal - ulineSubtotal) > 10) {
-            console.log(`     ⚠️  SUBTOTAL MISMATCH: Finale=$${finaleSubtotal.toFixed(2)} vs ULINE=$${ulineSubtotal.toFixed(2)} — SKIPPING`);
-            result.errors.push(`Subtotal mismatch: Finale=$${finaleSubtotal.toFixed(2)} vs ULINE=$${ulineSubtotal.toFixed(2)}`);
-            // Re-commit without changes
-            if (!dryRun && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-                const after = await finale.getOrderDetails(poId);
-                if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
-            }
-            return result;
-        }
-
-        // Check freight — avoid duplicates
+        // Phase 1: collect freight
         const existingAdj = unlocked.orderAdjustmentList || [];
         const existingFreight = existingAdj
             .filter((a: any) => a.productPromoUrl === FREIGHT_PROMO)
             .reduce((s: number, a: any) => s + a.amount, 0);
 
         if (totalFreight > 0 && Math.abs(existingFreight - totalFreight) > 0.01) {
-            // Only add if significantly different
             const label = `Freight - ULINE Inv ${invNums.join('+')}`;
             const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('ULINE Inv'));
             if (!alreadyLabeled) {
                 console.log(`     + Freight: $${totalFreight} (${label})`);
-                if (!dryRun) {
-                    existingAdj.push({ amount: totalFreight, description: label, productPromoUrl: FREIGHT_PROMO });
-                }
+
+                changes.push({
+                    type: 'freight_add',
+                    poId,
+                    freightCents: Math.round(totalFreight * 100),
+                    invoiceNumber: invNums.join('+'),
+                });
+
+                if (!poFreightMap[poId]) poFreightMap[poId] = { invNums, totalFreight, totalTax };
+
                 result.freightAdded = totalFreight;
-                run?.recordFreight(totalFreight * 100);
             }
-        }
-
-        // Save
-        if (!dryRun && (result.priceChanges > 0 || result.freightAdded > 0)) {
-            await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
-        }
-
-        // Re-commit
-        if (!dryRun && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-            const after = await finale.getOrderDetails(poId);
-            if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
-            result.status = (await finale.getOrderDetails(poId)).statusId;
         }
     } catch (err: any) {
         result.errors.push(err.message);
@@ -532,6 +552,9 @@ async function reconcilePO(
 async function main() {
     const args = parseArgs();
     let run: ReconciliationRun | null = null;
+    const changes: ChangeSet = [];
+    const poFreightMap: Record<string, { invNums: string[]; totalFreight: number; totalTax: number }> = {};
+    const poPriceChanges: Record<string, { sku: string; oldPrice: number; newPrice: number; ulineSku: string }[]> = {};
 
     try {
         console.log('╔══════════════════════════════════════════════════╗');
@@ -594,7 +617,7 @@ async function main() {
         for (let i = 0; i < poIds.length; i++) {
             const poId = poIds[i];
             console.log(`   [${i + 1}/${poIds.length}] PO ${poId}...`);
-            const result = await reconcilePO(finale, get, post, poId, byPO[poId], args.dryRun, args.forceSupplier, run);
+            const result = await reconcilePO(finale, get, post, poId, byPO[poId], args.dryRun, args.forceSupplier, run, changes, poFreightMap, poPriceChanges);
             results.push(result);
 
             if (result.priceChanges > 0 || result.freightAdded > 0) {
@@ -603,6 +626,86 @@ async function main() {
 
             const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';
             console.log(`   ${icon} ${result.priceChanges} prices, $${result.freightAdded} freight | ${result.status}\n`);
+        }
+
+        // --- Phase 2: Apply collected changes (live mode only) ---
+        try {
+            if (run.isLive() && changes.length > 0) {
+                console.log(`\n${'='.repeat(60)}`);
+                console.log(`PHASE 2: Applying ${changes.length} change(s) to ${Object.keys(poPriceChanges).length} PO(s)`);
+                console.log(`${'='.repeat(60)}\n`);
+
+                // Group changes by PO
+                const changesByPo: Record<string, ChangeSetItem[]> = {};
+                for (const change of changes) {
+                    if (!changesByPo[change.poId]) changesByPo[change.poId] = [];
+                    changesByPo[change.poId].push(change);
+                }
+
+                for (const [poId, poChanges] of Object.entries(changesByPo)) {
+                    try {
+                        const po = await finale.getOrderDetails(poId);
+                        const origStatus = po.statusId;
+
+                        // Unlock if needed
+                        if (po.actionUrlEdit && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
+                            await post(po.actionUrlEdit, {});
+                        }
+
+                        const unlocked = await finale.getOrderDetails(poId);
+
+                        // Apply price changes
+                        for (const change of poChanges) {
+                            if (change.type === 'price_change' && change.sku) {
+                                const item = unlocked.orderItemList?.find(
+                                    (i: any) => i.productUrl?.endsWith(`/${change.sku}`)
+                                );
+                                if (item) {
+                                    item.unitPrice = change.newPrice;
+                                    run.recordPriceChange(change.sku, change.oldPrice!, change.newPrice!);
+                                    console.log(`   ${change.sku}: $${change.oldPrice} → $${change.newPrice}`);
+                                }
+                            }
+                        }
+
+                        // Apply freight
+                        const freightInfo = poFreightMap[poId];
+                        if (freightInfo) {
+                            const existingAdj = unlocked.orderAdjustmentList || [];
+                            existingAdj.push({
+                                amount: freightInfo.totalFreight,
+                                description: `Freight - ULINE Inv ${freightInfo.invNums.join('+')}`,
+                                productPromoUrl: FREIGHT_PROMO,
+                            });
+                            unlocked.orderAdjustmentList = existingAdj;
+                            run.recordFreight(Math.round(freightInfo.totalFreight * 100));
+                        }
+
+                        // Save
+                        await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
+
+                        // Re-commit if needed
+                        if (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED') {
+                            const after = await finale.getOrderDetails(poId);
+                            if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
+                        }
+
+                        run.recordPoUpdated(poId);
+                        console.log(`   ✅ PO ${poId}: applied ${poChanges.length} change(s)`);
+                    } catch (err: any) {
+                        run.recordError(`Phase 2 apply failed for PO ${poId}`, err instanceof Error ? err : new Error(err.message));
+                        console.log(`   ❌ PO ${poId} Phase 2 failed: ${err.message}`);
+                    }
+                }
+            }
+        } catch (err) {
+            if (err instanceof InvariantViolationError) {
+                run.recordError('Invariant violation during ULINE reconciliation', err);
+                await run.fail('ULINE reconciliation aborted: invariant violation', err);
+                await sendReconciliationSummary(run);
+                throw err;
+            }
+            throw err;
         }
 
         // Summary
