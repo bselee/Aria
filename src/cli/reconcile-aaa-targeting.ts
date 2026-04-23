@@ -1,6 +1,9 @@
 const AAA_SENDER_PATTERN = /aaa\s*cooper/i;
 const AAA_QUERY = "from:aaacooper.com after:2026/01/01";
 
+import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
+import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
+
 export interface StatementAttachment {
     attachmentId: string;
     filename: string;
@@ -38,7 +41,7 @@ export interface GmailLike {
 
 export function parseReconcileAAAArgs(args: string[]): ReconcileAAAArgs {
     return {
-        dryRun: args.includes("--dry-run"),
+        dryRun: !args.includes("--live"),
         scrapeOnly: args.includes("--scrape-only"),
         limit: (() => {
             const idx = args.indexOf("--limit");

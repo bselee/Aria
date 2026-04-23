@@ -14,7 +14,7 @@
  *   node --import tsx src/cli/reconcile-axiom.ts --update-only  # Use existing JSON, skip API fetch
  *   node --import tsx src/cli/reconcile-axiom.ts --discover     # Screenshot + DOM dump for initial mapping
  *   node --import tsx src/cli/reconcile-axiom.ts --po 124500    # Single PO
- *   node --import tsx src/cli/reconcile-axiom.ts --dry-run      # Show diffs without saving
+ *   node --import tsx src/cli/reconcile-axiom.ts --live        # Live update (dry-run is default)
  *
  * PREREQ: Close Chrome before running (Playwright needs exclusive profile access).
  *
@@ -37,10 +37,26 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page, type BrowserContext } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
+import { assertPriceReasonable, assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+
+// ── ChangeSet Types ────────────────────────────────────────────────────────────
+
+interface ChangeSetItem {
+    type: 'price_change' | 'freight_add' | 'po_update';
+    poId: string;
+    sku?: string;
+    oldPrice?: number;
+    newPrice?: number;
+    freightCents?: number;
+    invoiceNumber: string;
+}
+type ChangeSet = ChangeSetItem[];
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -180,7 +196,8 @@ function parseArgs() {
         discover: args.includes('--discover'),
         scrapeOnly: args.includes('--scrape-only'),
         updateOnly: args.includes('--update-only'),
-        dryRun: args.includes('--dry-run'),
+        dryRun: !args.includes('--live'),
+        live: args.includes('--live'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
     };
 }
@@ -894,13 +911,12 @@ async function reconcilePO(
     poId: string,
     invoices: AxiomInvoice[],
     dryRun: boolean,
+    run: ReconciliationRun,
+    changes: ChangeSet,
+    poFreightMap: Record<string, { invNums: string[]; totalFreight: number }>
 ): Promise<ReconcileResult> {
     const result: ReconcileResult = { po: poId, priceChanges: 0, freightAdded: 0, status: '', errors: [] };
 
-    // Merge Axiom items across all invoices for this PO
-    // DECISION(2026-03-17): For front/back label pairs, the total price
-    // from Axiom covers both labels. We split qty equally but keep
-    // the same per-label unit price: unitPrice = est.price / est.quantity.
     const axiomItemMap: Record<string, { unitPrice: number; qty: number; jobName: string }> = {};
     let totalFreight = 0;
     const invNums: string[] = [];
@@ -939,15 +955,8 @@ async function reconcilePO(
         const origStatus = po.statusId;
         result.status = origStatus;
 
-        // Unlock PO for editing if needed
-        if (!dryRun && po.actionUrlEdit && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-            await post(po.actionUrlEdit, {});
-        }
-
-        const unlocked = dryRun ? po : await finale.getOrderDetails(poId);
-
-        // Update prices — stickers/labels typically don't need UOM conversion
-        for (const item of unlocked.orderItemList || []) {
+        // Collect price changes
+        for (const item of po.orderItemList || []) {
             const fId = item.productUrl?.split('/').pop() || '';
             const aItem = axiomItemMap[fId];
             if (!aItem) continue;
@@ -956,46 +965,61 @@ async function reconcilePO(
 
             if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                 console.log(`     ${fId}: $${item.unitPrice.toFixed(4)} → $${correctPrice.toFixed(4)}`);
-                if (!dryRun) item.unitPrice = correctPrice;
+
+                // Phase 1: collect change instead of applying
+                changes.push({
+                    type: 'price_change',
+                    poId,
+                    sku: fId,
+                    oldPrice: item.unitPrice,
+                    newPrice: correctPrice,
+                    invoiceNumber: invNums.join('+'),
+                });
+
+                // Assert price reasonable
+                try {
+                    assertPriceReasonable({
+                        sku: fId,
+                        oldPrice: item.unitPrice,
+                        newPrice: correctPrice,
+                        context: { vendor: 'Axiom Print', invoiceNumber: invNums.join('+') },
+                    });
+                } catch (err) {
+                    result.errors.push((err as Error).message);
+                    console.error(`     ⚠️ Invariant failed: ${(err as Error).message}`);
+                }
+
                 result.priceChanges++;
             }
         }
 
-        // Check freight — avoid duplicates
-        const existingAdj = unlocked.orderAdjustmentList || [];
-        // any: Finale API adjustment objects have variable shape
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // Collect freight
+        const existingAdj = po.orderAdjustmentList || [];
         const existingFreight = existingAdj
             .filter((a: any) => a.productPromoUrl === FREIGHT_PROMO)
             .reduce((s: number, a: any) => s + a.amount, 0);
 
         if (totalFreight > 0 && Math.abs(existingFreight - totalFreight) > 0.01) {
             const label = `Freight - Axiom Print ${invNums.join('+')}`;
-            // any: Finale API adjustment objects have variable shape
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('Axiom Print'));
             if (!alreadyLabeled) {
                 console.log(`     + Freight: $${totalFreight} (${label})`);
-                if (!dryRun) {
-                    existingAdj.push({ amount: totalFreight, description: label, productPromoUrl: FREIGHT_PROMO });
-                }
+
+                changes.push({
+                    type: 'freight_add',
+                    poId,
+                    freightCents: Math.round(totalFreight * 100),
+                    invoiceNumber: invNums.join('+'),
+                });
+
+                if (!poFreightMap[poId]) poFreightMap[poId] = { invNums, totalFreight };
+
                 result.freightAdded = totalFreight;
             }
         }
-
-        // Save
-        if (!dryRun && (result.priceChanges > 0 || result.freightAdded > 0)) {
-            await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
-        }
-
-        // Re-commit
-        if (!dryRun && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
-            const after = await finale.getOrderDetails(poId);
-            if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
-            result.status = (await finale.getOrderDetails(poId)).statusId;
-        }
     } catch (err: any) {
         result.errors.push(err.message);
+        run.recordError(`reconcilePO(${poId})`, err instanceof Error ? err : new Error(String(err.message)));
     }
 
     return result;
@@ -1005,34 +1029,46 @@ async function reconcilePO(
 
 async function main() {
     const args = parseArgs();
-    console.log('╔══════════════════════════════════════════════════╗');
-    console.log('║  Axiom Print → Finale Invoice Reconciliation    ║');
-    console.log('║  (API-first approach)                           ║');
-    console.log('╚══════════════════════════════════════════════════╝');
+    let run: ReconciliationRun | null = null;
+    const changes: ChangeSet = [];
+    const poFreightMap: Record<string, { invNums: string[]; totalFreight: number }> = {};
 
-    // Discovery mode — explore the page structure before writing scraper
-    if (args.discover) {
-        await discover();
-        return;
-    }
+    try {
+        run = await ReconciliationRun.start('Axiom', args.dryRun ? 'dry-run' : 'live', {
+            discover: args.discover,
+            scrapeOnly: args.scrapeOnly,
+            updateOnly: args.updateOnly,
+            singlePO: args.singlePO,
+        });
+        console.log('╔══════════════════════════════════════════════════╗');
+        console.log('║  Axiom Print → Finale Invoice Reconciliation    ║');
+        console.log('║  (API-first approach)                           ║');
+        console.log('╚══════════════════════════════════════════════════╝');
 
-    if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
+        // Discovery mode — explore the page structure before writing scraper
+        if (args.discover) {
+            await discover();
+            await run.complete('Axiom discovery complete.');
+            return;
+        }
 
-    // Phase 1: Get order data
-    let invoices: AxiomInvoice[];
+        if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
 
-    if (args.updateOnly && fs.existsSync(JSON_PATH)) {
-        invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
-        console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
-    } else if (args.updateOnly) {
-        console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
-        process.exit(1);
-    } else {
-        invoices = await fetchAll();
-    }
+        // Phase 1: Get order data
+        let invoices: AxiomInvoice[];
 
-    if (args.scrapeOnly) {
-        console.log('\n✅ Fetch complete. Use --update-only to reconcile without re-fetching.');
+        if (args.updateOnly && fs.existsSync(JSON_PATH)) {
+            invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
+            console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
+        } else if (args.updateOnly) {
+            console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
+            process.exit(1);
+        } else {
+            invoices = await fetchAll();
+        }
+
+        if (args.scrapeOnly) {
+            console.log('\n✅ Fetch complete. Use --update-only to reconcile without re-fetching.');
 
         // Print a summary of what we found
         console.log('\n📊 Invoice Summary:');
@@ -1081,6 +1117,7 @@ async function main() {
             for (const s of Array.from(unmapped)) console.log(`   - ${s}`);
         }
 
+        await run.complete('Axiom scrape complete.');
         return;
     }
 
@@ -1156,6 +1193,11 @@ async function main() {
     // --- Pass 1: Strict matching (date + SKU overlap) ---
     const pass1Unmatched: AxiomInvoice[] = [];
     for (const invoice of sortedInvoices) {
+        const existing = await lookupVendorInvoices({ vendor: 'Axiom Print', invoice_number: invoice.invoiceNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.invoiceNumber} already reconciled, skipping`, { invoiceNumber: invoice.invoiceNumber });
+            continue;
+        }
         const invDate = new Date(invoice.orderDate).getTime();
         let bestMatch: any = null;
         let minDiff = 99999;
@@ -1191,6 +1233,7 @@ async function main() {
         if (bestMatch) {
             matchedPairs.push({ invoice, po: bestMatch, matchType: 'sku' });
             usedPOs.add(bestMatch.orderId);
+            run.recordInvoiceFound();
         } else {
             pass1Unmatched.push(invoice);
         }
@@ -1200,6 +1243,11 @@ async function main() {
     // If an invoice is near an unused PO but had no SKU overlap, match by date alone.
     // This handles cases where the PO has different product IDs or missing line items.
     for (const invoice of pass1Unmatched) {
+        const existing = await lookupVendorInvoices({ vendor: 'Axiom Print', invoice_number: invoice.invoiceNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.invoiceNumber} already reconciled, skipping`, { invoiceNumber: invoice.invoiceNumber });
+            continue;
+        }
         const invDate = new Date(invoice.orderDate).getTime();
         let bestMatch: any = null;
         let minDiff = 99999;
@@ -1219,6 +1267,7 @@ async function main() {
         if (bestMatch) {
             matchedPairs.push({ invoice, po: bestMatch, matchType: 'date' });
             usedPOs.add(bestMatch.orderId);
+            run.recordInvoiceFound();
         } else {
             unmatchedInvoices.push(invoice);
         }
@@ -1231,13 +1280,17 @@ async function main() {
     const dateMatches = matchedPairs.filter(m => m.matchType === 'date').length;
     console.log(`\n   📊 Matching: ${skuMatches} strict (SKU+date), ${dateMatches} date-only, ${unmatchedInvoices.length} unmatched\n`);
 
-    // 2c. Reconcile matched POs
+    // 2c. Reconcile matched POs (Phase 1: collect all changes)
     const results: ReconcileResult[] = [];
     for (const { invoice, po, matchType } of matchedPairs) {
         const mtLabel = matchType === 'sku' ? '🔗 SKU' : '📅 date';
         console.log(`\n   ── PO ${po.orderId} ↔ ${invoice.invoiceNumber} (${mtLabel}) ──`);
-        const result = await reconcilePO(finale, get, post, po.orderId, [invoice], args.dryRun);
+        const result = await reconcilePO(finale, get, post, po.orderId, [invoice], args.dryRun, run, changes, poFreightMap);
         results.push(result);
+
+        if (result.priceChanges > 0 || result.freightAdded > 0) {
+            run.recordPoUpdated(po.orderId);
+        }
 
         const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';
         console.log(`   ${icon} ${result.priceChanges} price updates, $${result.freightAdded.toFixed(2)} freight | ${result.status}`);
@@ -1275,6 +1328,86 @@ async function main() {
                 });
             } catch { /* dedup collision or non-critical */ }
         }
+    }
+
+    // --- Phase 2: Apply collected changes (live mode only) ---
+    try {
+        if (run.isLive() && changes.length > 0) {
+            console.log(`\n${'='.repeat(60)}`);
+            console.log(`PHASE 2: Applying ${changes.length} change(s) to ${Object.keys(poFreightMap).length + Object.keys(results).length} PO(s)`);
+            console.log(`${'='.repeat(60)}\n`);
+
+            // Group changes by PO
+            const changesByPo: Record<string, ChangeSetItem[]> = {};
+            for (const change of changes) {
+                if (!changesByPo[change.poId]) changesByPo[change.poId] = [];
+                changesByPo[change.poId].push(change);
+            }
+
+            for (const [poId, poChanges] of Object.entries(changesByPo)) {
+                try {
+                    const po = await finale.getOrderDetails(poId);
+                    const origStatus = po.statusId;
+
+                    // Unlock if needed
+                    if (po.actionUrlEdit && (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED')) {
+                        await post(po.actionUrlEdit, {});
+                    }
+
+                    const unlocked = await finale.getOrderDetails(poId);
+
+                    // Apply price changes
+                    for (const change of poChanges) {
+                        if (change.type === 'price_change' && change.sku) {
+                            const item = unlocked.orderItemList?.find(
+                                (i: any) => i.productUrl?.endsWith(`/${change.sku}`)
+                            );
+                            if (item) {
+                                item.unitPrice = change.newPrice;
+                                run.recordPriceChange(change.sku, change.oldPrice!, change.newPrice!);
+                                console.log(`   ${change.sku}: $${change.oldPrice} → $${change.newPrice}`);
+                            }
+                        }
+                    }
+
+                    // Apply freight
+                    const freightInfo = poFreightMap[poId];
+                    if (freightInfo) {
+                        const existingAdj = unlocked.orderAdjustmentList || [];
+                        existingAdj.push({
+                            amount: freightInfo.totalFreight,
+                            description: `Freight - Axiom Print ${freightInfo.invNums.join('+')}`,
+                            productPromoUrl: FREIGHT_PROMO,
+                        });
+                        unlocked.orderAdjustmentList = existingAdj;
+                        run.recordFreight(Math.round(freightInfo.totalFreight * 100));
+                    }
+
+                    // Save
+                    await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
+
+                    // Re-commit if needed
+                    if (origStatus === 'ORDER_LOCKED' || origStatus === 'ORDER_COMPLETED') {
+                        const after = await finale.getOrderDetails(poId);
+                        if (after.actionUrlComplete) await post(after.actionUrlComplete, {});
+                    }
+
+                    run.recordPoUpdated(poId);
+                    console.log(`   ✅ PO ${poId}: applied ${poChanges.length} change(s)`);
+                } catch (err: any) {
+                    run.recordError(`Phase 2 apply failed for PO ${poId}`, err instanceof Error ? err : new Error(err.message));
+                    console.log(`   ❌ PO ${poId} Phase 2 failed: ${err.message}`);
+                }
+            }
+        }
+    } catch (err) {
+        if (err instanceof InvariantViolationError) {
+            run.recordError('Invariant violation during Axiom reconciliation', err);
+            await run.fail('Axiom reconciliation aborted: invariant violation', err);
+            await sendReconciliationSummary(run);
+            throw err;
+        }
+        throw err;
     }
 
     // 2d. Create draft POs for unmatched invoices
@@ -1432,6 +1565,19 @@ async function main() {
     console.log(`║   Errors:       ${String(totalErrors).padEnd(4)}                           ║`);
     }
     console.log('╚══════════════════════════════════════════════════╝');
+
+        await run.complete('Axiom reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('Axiom reconciliation failed', error);
+        } else {
+            console.error('[Axiom] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
+    }
 }
 
 main().catch(err => {

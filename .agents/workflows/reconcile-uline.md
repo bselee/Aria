@@ -11,11 +11,11 @@ description: Scrape ULINE invoice detail pages and reconcile line items against 
 ```bash
 # ⚠️ Close Chrome first — Playwright needs exclusive profile access
 
-# Full pipeline: scrape + update all current-year POs
+# Default: dry run (preview only, no Finale changes)
 node --import tsx src/cli/reconcile-uline.ts
 
-# Preview changes without modifying Finale
-node --import tsx src/cli/reconcile-uline.ts --dry-run
+# Live update: write changes to Finale
+node --import tsx src/cli/reconcile-uline.ts --live
 
 # Just scrape (no Finale updates)
 node --import tsx src/cli/reconcile-uline.ts --scrape-only
