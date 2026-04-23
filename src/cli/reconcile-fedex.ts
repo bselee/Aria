@@ -12,9 +12,9 @@
  *          FEDEX_CLIENT_ID, FEDEX_CLIENT_SECRET, FEDEX_ACCOUNT_NUMBER
  *
  * Usage:
- *   node --import tsx src/cli/reconcile-fedex.ts                        # Auto-find latest CSV in Sandbox
+ *   node --import tsx src/cli/reconcile-fedex.ts                        # Auto-find latest CSV in Sandbox (dry-run default)
  *   node --import tsx src/cli/reconcile-fedex.ts --csv path/to/file.csv # Specify CSV
- *   node --import tsx src/cli/reconcile-fedex.ts --dry-run              # Show diffs without saving
+ *   node --import tsx src/cli/reconcile-fedex.ts --live                 # Apply changes to Finale
  *   node --import tsx src/cli/reconcile-fedex.ts --report-only          # Just report, no updates
  *
  * DECISION(2026-03-16): Built after discovering 5+ POs with missing FedEx COLLECT freight
@@ -31,6 +31,8 @@ dotenv.config({ path: '.env.local' });
 
 import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -60,7 +62,8 @@ const VENDOR_ORIGIN_MAP: Record<string, { city: string; state: string; vendor: s
 const args = process.argv.slice(2);
 const csvArgIdx = args.indexOf('--csv');
 const csvPath = csvArgIdx >= 0 ? args[csvArgIdx + 1] : null;
-const DRY_RUN = args.includes('--dry-run');
+const LIVE = args.includes('--live');
+const DRY_RUN = !LIVE;
 const REPORT_ONLY = args.includes('--report-only');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
@@ -243,34 +246,42 @@ function extractFinalePoId(entry: FedExEntry): string | null {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-    console.log(`\n╔═══════════════════════════════════════════════╗`);
-    console.log(`║    FedEx Freight → Finale PO Reconciliation   ║`);
-    console.log(`╚═══════════════════════════════════════════════╝\n`);
-    console.log(`Mode: ${REPORT_ONLY ? '📊 REPORT ONLY' : DRY_RUN ? '🔵 DRY RUN' : '🔴 LIVE UPDATE'}\n`);
+    let run: ReconciliationRun | null = null;
+    try {
+        run = await ReconciliationRun.start('FedEx', DRY_RUN ? 'dry-run' : 'live', { csvPath, reportOnly: REPORT_ONLY });
 
-    // --- Step 1: Find and parse FedEx CSV ---
-    let targetCsv = csvPath;
-    if (!targetCsv) {
-        const files = fs.readdirSync(SANDBOX_DIR)
-            .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
-            .sort()
-            .reverse();
-        if (files.length === 0) {
-            console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
-            console.error('   Download from: https://www.fedex.com/billing/');
+        console.log(`\n╔═══════════════════════════════════════════════╗`);
+        console.log(`║    FedEx Freight → Finale PO Reconciliation   ║`);
+        console.log(`╚═══════════════════════════════════════════════╝\n`);
+        console.log(`Mode: ${REPORT_ONLY ? '📊 REPORT ONLY' : DRY_RUN ? '🔵 DRY RUN' : '🔴 LIVE UPDATE'}\n`);
+
+        // --- Step 1: Find and parse FedEx CSV ---
+        let targetCsv = csvPath;
+        if (!targetCsv) {
+            const files = fs.readdirSync(SANDBOX_DIR)
+                .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
+                .sort()
+                .reverse();
+            if (files.length === 0) {
+                console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
+                console.error('   Download from: https://www.fedex.com/billing/');
+                process.exit(1);
+            }
+            targetCsv = path.join(SANDBOX_DIR, files[0]);
+        }
+
+        if (!fs.existsSync(targetCsv)) {
+            console.error('❌ CSV not found:', targetCsv);
             process.exit(1);
         }
-        targetCsv = path.join(SANDBOX_DIR, files[0]);
-    }
 
-    if (!fs.existsSync(targetCsv)) {
-        console.error('❌ CSV not found:', targetCsv);
-        process.exit(1);
-    }
+        console.log(`📄 CSV: ${path.basename(targetCsv)}`);
+        const entries = parseFedExCSV(targetCsv);
+        console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
 
-    console.log(`📄 CSV: ${path.basename(targetCsv)}`);
-    const entries = parseFedExCSV(targetCsv);
-    console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
+        for (const _e of entries) {
+            run.recordInvoiceFound();
+        }
 
     // Archive all FedEx entries into vendor_invoices
     console.log(`📦 Archiving FedEx invoices to vendor_invoices...`);
@@ -393,10 +404,13 @@ async function main() {
                     const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
                     await addFreightToPO(finale, poId, fedex.amtDue, label, po);
                     result.freightAdded = true;
+                    run.recordPoUpdated(poId);
+                    run.recordFreight(Math.round(fedex.amtDue * 100));
                     console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}${memo ? ` | ${memo}` : ''}`);
                 }
             } catch (err: any) {
                 result.error = err.message;
+                run.recordError(`PO ${poId} processing failed`, err instanceof Error ? err : new Error(err.message));
                 console.log(`❌ PO ${poId} | $${fedex.amtDue.toFixed(2)} | Error: ${err.message.substring(0, 60)}`);
             }
 
@@ -526,13 +540,15 @@ async function main() {
                                             const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
                                             await addFreightToPO(finale, po.orderId, fedex.amtDue, label, details);
                                             result.freightAdded = true;
+                                            run.recordPoUpdated(po.orderId);
+                                            run.recordFreight(Math.round(fedex.amtDue * 100));
                                             console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight${memo ? ` | ${memo}` : ''}`);
                                         }
                                         matched = true;
                                         break;
                                     }
-                                } catch {
-                                    // Skip erroring POs
+                                } catch (err: any) {
+                                    run.recordError(`PO ${po.orderId} track match failed`, err instanceof Error ? err : new Error(err.message));
                                 }
                             }
                             if (!matched) {
@@ -546,6 +562,7 @@ async function main() {
                     // Rate limit courtesy
                     await new Promise(r => setTimeout(r, 300));
                 } catch (err: any) {
+                    run.recordError(`FedEx ${fedex.invoiceNumber} track failed`, err instanceof Error ? err : new Error(err.message));
                     console.log(`❌ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | Track error: ${err.message.substring(0, 60)}`);
                 }
             } else {
@@ -635,8 +652,21 @@ async function main() {
         })),
     };
 
-    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-    console.log(`\n📄 Report saved: ${reportPath}`);
+        fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+        console.log(`\n📄 Report saved: ${reportPath}`);
+
+        await run.complete('FedEx reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('FedEx reconciliation failed', error);
+        } else {
+            console.error('[FedEx] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
+    }
 }
 
 /**
