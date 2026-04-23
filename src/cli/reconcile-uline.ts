@@ -29,7 +29,7 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { BrowserManager } from '../lib/scraping/browser-manager';
 import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
@@ -356,6 +356,11 @@ async function reconcilePO(
     const invNums: string[] = [];
 
     for (const inv of invoices) {
+        const existing = await lookupVendorInvoices({ vendor: 'ULINE', invoice_number: inv.invoiceNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${inv.invoiceNumber} already reconciled, skipping`, { invoiceNumber: inv.invoiceNumber });
+            continue;
+        }
         invNums.push(inv.invoiceNumber);
         totalFreight += inv.shipping;
         totalTax += inv.tax;

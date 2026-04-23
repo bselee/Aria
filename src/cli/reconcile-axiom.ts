@@ -37,7 +37,7 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page, type BrowserContext } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
-import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
+import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
 import * as fs from 'fs';
@@ -1173,6 +1173,11 @@ async function main() {
     // --- Pass 1: Strict matching (date + SKU overlap) ---
     const pass1Unmatched: AxiomInvoice[] = [];
     for (const invoice of sortedInvoices) {
+        const existing = await lookupVendorInvoices({ vendor: 'Axiom Print', invoice_number: invoice.invoiceNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.invoiceNumber} already reconciled, skipping`, { invoiceNumber: invoice.invoiceNumber });
+            continue;
+        }
         const invDate = new Date(invoice.orderDate).getTime();
         let bestMatch: any = null;
         let minDiff = 99999;
@@ -1218,6 +1223,11 @@ async function main() {
     // If an invoice is near an unused PO but had no SKU overlap, match by date alone.
     // This handles cases where the PO has different product IDs or missing line items.
     for (const invoice of pass1Unmatched) {
+        const existing = await lookupVendorInvoices({ vendor: 'Axiom Print', invoice_number: invoice.invoiceNumber });
+        if (existing.length > 0 && existing[0].status !== 'void') {
+            run.recordWarning(`Invoice ${invoice.invoiceNumber} already reconciled, skipping`, { invoiceNumber: invoice.invoiceNumber });
+            continue;
+        }
         const invDate = new Date(invoice.orderDate).getTime();
         let bestMatch: any = null;
         let minDiff = 99999;
