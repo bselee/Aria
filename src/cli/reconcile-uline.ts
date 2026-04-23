@@ -13,7 +13,8 @@
  *   node --import tsx src/cli/reconcile-uline.ts --update-only  # Use existing JSON, skip scrape
  *   node --import tsx src/cli/reconcile-uline.ts --po 124426    # Single PO
  *   node --import tsx src/cli/reconcile-uline.ts --year 2025    # Different year filter
- *   node --import tsx src/cli/reconcile-uline.ts --dry-run      # Show diffs without saving
+ *   node --import tsx src/cli/reconcile-uline.ts --dry-run      # Dry run (default — no writes)
+ *   node --import tsx src/cli/reconcile-uline.ts --live         # Live run (writes to Finale)
  *
  * PREREQ: Close Chrome before running (Playwright needs exclusive profile access).
  *         User must have logged into uline.com in their regular Chrome browser.
@@ -30,6 +31,8 @@ import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
 import { upsertVendorInvoice } from '../lib/storage/vendor-invoices';
 import { BrowserManager } from '../lib/scraping/browser-manager';
+import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
+import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -116,7 +119,8 @@ function parseArgs() {
     return {
         scrapeOnly: args.includes('--scrape-only'),
         updateOnly: args.includes('--update-only'),
-        dryRun: args.includes('--dry-run'),
+        dryRun: !args.includes('--live'),
+        live: args.includes('--live'),
         forceSupplier: args.includes('--force-supplier'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
         year: args.includes('--year') ? parseInt(args[args.indexOf('--year') + 1]) : new Date().getFullYear(),
@@ -209,7 +213,7 @@ async function scrapeInvoiceDetail(page: Page): Promise<UlineInvoice | null> {
     }
 }
 
-async function scrapeAll(): Promise<UlineInvoice[]> {
+async function scrapeAll(run?: ReconciliationRun | null): Promise<UlineInvoice[]> {
     console.log('\n📋 Phase 1: Scraping ULINE Invoice Details');
     console.log('   ⚠️  Chrome must be closed for this step\n');
 
@@ -261,6 +265,7 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
             const detail = await scrapeInvoiceDetail(page);
             if (detail) {
                 invoices.push(detail);
+                run?.recordInvoiceFound();
                 const itemCount = detail.items.filter(it => it.unitPrice > 0).length;
                 process.stdout.write(` PO#${detail.poNumber} | ${itemCount} items | $${detail.total}\n`);
             } else {
@@ -304,6 +309,7 @@ async function scrapeAll(): Promise<UlineInvoice[]> {
                     raw_data: inv as unknown as Record<string, unknown>,
                 });
                 archived++;
+                run?.recordInvoiceProcessed();
             } catch (err: any) {
                 console.warn(`   ⚠️ Archive failed for ${inv.invoiceNumber}: ${err.message}`);
             }
@@ -335,6 +341,7 @@ async function reconcilePO(
     invoices: UlineInvoice[],
     dryRun: boolean,
     forceSupplier: boolean,
+    run?: ReconciliationRun | null,
 ): Promise<ReconcileResult> {
     const result: ReconcileResult = { po: poId, priceChanges: 0, freightAdded: 0, taxAdded: 0, status: '', errors: [] };
 
@@ -399,12 +406,14 @@ async function reconcilePO(
                     if (!dryRun) item.unitPrice = correctPrice;
                     priceChanged = true;
                     result.priceChanges++;
+                    run?.recordPriceChange(fId, item.unitPrice, correctPrice);
                 }
             } else if (Math.abs(item.unitPrice - correctPrice) > 0.001) {
                 console.log(`     ${fId}: $${item.unitPrice} → $${correctPrice}`);
                 if (!dryRun) item.unitPrice = correctPrice;
                 priceChanged = true;
                 result.priceChanges++;
+                run?.recordPriceChange(fId, item.unitPrice, correctPrice);
             }
 
             if ((priceChanged || forceSupplier) && !dryRun) {
@@ -490,6 +499,7 @@ async function reconcilePO(
                     existingAdj.push({ amount: totalFreight, description: label, productPromoUrl: FREIGHT_PROMO });
                 }
                 result.freightAdded = totalFreight;
+                run?.recordFreight(totalFreight * 100);
             }
         }
 
@@ -506,6 +516,7 @@ async function reconcilePO(
         }
     } catch (err: any) {
         result.errors.push(err.message);
+        run?.recordError(`reconcilePO(${poId})`, err instanceof Error ? err : new Error(String(err)));
     }
 
     return result;
@@ -515,78 +526,106 @@ async function reconcilePO(
 
 async function main() {
     const args = parseArgs();
-    console.log('╔══════════════════════════════════════════════════╗');
-    console.log('║   ULINE → Finale Invoice Reconciliation Tool    ║');
-    console.log('╚══════════════════════════════════════════════════╝');
+    let run: ReconciliationRun | null = null;
 
-    if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
+    try {
+        console.log('╔══════════════════════════════════════════════════╗');
+        console.log('║   ULINE → Finale Invoice Reconciliation Tool    ║');
+        console.log('╚══════════════════════════════════════════════════╝');
 
-    // Phase 1: Get invoice data
-    let invoices: UlineInvoice[];
+        if (args.dryRun) console.log('   🔍 DRY RUN — no changes will be saved\n');
 
-    if (args.updateOnly && fs.existsSync(JSON_PATH)) {
-        invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
-        console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
-    } else if (args.updateOnly) {
-        console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
-        process.exit(1);
-    } else {
-        invoices = await scrapeAll();
-    }
+        run = await ReconciliationRun.start('ULINE', args.live ? 'live' : 'dry-run', {
+            scrapeOnly: args.scrapeOnly,
+            updateOnly: args.updateOnly,
+            singlePO: args.singlePO,
+            year: args.year,
+        });
 
-    if (args.scrapeOnly) {
-        console.log('\n✅ Scrape complete. Use --update-only to reconcile without re-scraping.');
-        return;
-    }
+        // Phase 1: Get invoice data
+        let invoices: UlineInvoice[];
 
-    // Phase 2: Group invoices by PO and reconcile
-    console.log('\n💰 Phase 2: Reconciling Prices & Freight\n');
-
-    const byPO: Record<string, UlineInvoice[]> = {};
-    for (const inv of invoices) {
-        if (!/^\d{5,6}$/.test(inv.poNumber)) continue;
-        // Year filter
-        const parts = inv.invoiceDate?.split('/');
-        if (parts?.length >= 3) {
-            const yr = parseInt(parts[2]);
-            if (args.year && yr !== args.year) continue;
+        if (args.updateOnly && fs.existsSync(JSON_PATH)) {
+            invoices = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
+            console.log(`\n📋 Using cached data: ${invoices.length} invoices from ${JSON_PATH}`);
+        } else if (args.updateOnly) {
+            console.error('❌ --update-only specified but no cached data found. Run without --update-only first.');
+            process.exit(1);
+        } else {
+            invoices = await scrapeAll(run);
         }
-        if (args.singlePO && inv.poNumber !== args.singlePO) continue;
-        if (!byPO[inv.poNumber]) byPO[inv.poNumber] = [];
-        byPO[inv.poNumber].push(inv);
+
+        if (args.scrapeOnly) {
+            console.log('\n✅ Scrape complete. Use --update-only to reconcile without re-scraping.');
+            await run.complete('ULINE scrape complete.');
+            return;
+        }
+
+        // Phase 2: Group invoices by PO and reconcile
+        console.log('\n💰 Phase 2: Reconciling Prices & Freight\n');
+
+        const byPO: Record<string, UlineInvoice[]> = {};
+        for (const inv of invoices) {
+            if (!/^\d{5,6}$/.test(inv.poNumber)) continue;
+            // Year filter
+            const parts = inv.invoiceDate?.split('/');
+            if (parts?.length >= 3) {
+                const yr = parseInt(parts[2]);
+                if (args.year && yr !== args.year) continue;
+            }
+            if (args.singlePO && inv.poNumber !== args.singlePO) continue;
+            if (!byPO[inv.poNumber]) byPO[inv.poNumber] = [];
+            byPO[inv.poNumber].push(inv);
+        }
+
+        const poIds = Object.keys(byPO).sort();
+        console.log(`   ${poIds.length} POs to process (year=${args.year}${args.singlePO ? `, PO=${args.singlePO}` : ''})\n`);
+
+        const finale = new FinaleClient();
+        const get = (finale as any).get.bind(finale);
+        const post = (finale as any).post.bind(finale);
+        const results: ReconcileResult[] = [];
+
+        for (let i = 0; i < poIds.length; i++) {
+            const poId = poIds[i];
+            console.log(`   [${i + 1}/${poIds.length}] PO ${poId}...`);
+            const result = await reconcilePO(finale, get, post, poId, byPO[poId], args.dryRun, args.forceSupplier, run);
+            results.push(result);
+
+            if (result.priceChanges > 0 || result.freightAdded > 0) {
+                run.recordPoUpdated(poId);
+            }
+
+            const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';
+            console.log(`   ${icon} ${result.priceChanges} prices, $${result.freightAdded} freight | ${result.status}\n`);
+        }
+
+        // Summary
+        const totalPrices = results.reduce((s, r) => s + r.priceChanges, 0);
+        const totalFreight = results.filter(r => r.freightAdded > 0).length;
+        const errors = results.filter(r => r.errors.length > 0);
+
+        console.log('╔══════════════════════════════════════════════════╗');
+        console.log(`║   DONE${args.dryRun ? ' (DRY RUN)' : ''}                                     ║`);
+        console.log('╠══════════════════════════════════════════════════╣');
+        console.log(`║   POs processed:    ${String(poIds.length).padEnd(28)}║`);
+        console.log(`║   Prices updated:   ${String(totalPrices).padEnd(28)}║`);
+        console.log(`║   Freight added:    ${String(totalFreight).padEnd(28)}║`);
+        console.log(`║   Errors:           ${String(errors.length).padEnd(28)}║`);
+        console.log('╚══════════════════════════════════════════════════╝');
+
+        await run.complete('ULINE reconciliation complete.');
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail('ULINE reconciliation failed', error);
+        } else {
+            console.error('[ULINE] Fatal error before run could be created:', error.message);
+        }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
     }
-
-    const poIds = Object.keys(byPO).sort();
-    console.log(`   ${poIds.length} POs to process (year=${args.year}${args.singlePO ? `, PO=${args.singlePO}` : ''})\n`);
-
-    const finale = new FinaleClient();
-    const get = (finale as any).get.bind(finale);
-    const post = (finale as any).post.bind(finale);
-    const results: ReconcileResult[] = [];
-
-    for (let i = 0; i < poIds.length; i++) {
-        const poId = poIds[i];
-        console.log(`   [${i + 1}/${poIds.length}] PO ${poId}...`);
-        const result = await reconcilePO(finale, get, post, poId, byPO[poId], args.dryRun, args.forceSupplier);
-        results.push(result);
-
-        const icon = result.errors.length > 0 ? '❌' : result.priceChanges > 0 || result.freightAdded > 0 ? '✅' : '⏭️';
-        console.log(`   ${icon} ${result.priceChanges} prices, $${result.freightAdded} freight | ${result.status}\n`);
-    }
-
-    // Summary
-    const totalPrices = results.reduce((s, r) => s + r.priceChanges, 0);
-    const totalFreight = results.filter(r => r.freightAdded > 0).length;
-    const errors = results.filter(r => r.errors.length > 0);
-
-    console.log('╔══════════════════════════════════════════════════╗');
-    console.log(`║   DONE${args.dryRun ? ' (DRY RUN)' : ''}                                     ║`);
-    console.log('╠══════════════════════════════════════════════════╣');
-    console.log(`║   POs processed:    ${String(poIds.length).padEnd(28)}║`);
-    console.log(`║   Prices updated:   ${String(totalPrices).padEnd(28)}║`);
-    console.log(`║   Freight added:    ${String(totalFreight).padEnd(28)}║`);
-    console.log(`║   Errors:           ${String(errors.length).padEnd(28)}║`);
-    console.log('╚══════════════════════════════════════════════════╝');
 }
 
 main().catch(err => {
