@@ -5,8 +5,8 @@
  *          through the shared OCR-first splitter, and forwards only confidently
  *          identified invoice pages to Bill.com.
  *
- * @usage   node --import tsx src/cli/reconcile-aaa.ts
- *          node --import tsx src/cli/reconcile-aaa.ts --dry-run
+ * @usage   node --import tsx src/cli/reconcile-aaa.ts          # dry-run by default
+ *          node --import tsx src/cli/reconcile-aaa.ts --live   # actually send emails
  *          node --import tsx src/cli/reconcile-aaa.ts --scrape-only
  *          node --import tsx src/cli/reconcile-aaa.ts --limit 3
  *
@@ -23,6 +23,8 @@ import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
 import { upsertVendorInvoice } from "../lib/storage/vendor-invoices";
+import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
+import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
 import {
     fetchAAACooperStatements,
     parseReconcileAAAArgs,
@@ -151,104 +153,128 @@ async function archiveInvoice(
 }
 
 async function main() {
-    const { dryRun, scrapeOnly, limit, messageId, inboxOnly } = parseReconcileAAAArgs(process.argv.slice(2));
+    const args = process.argv.slice(2);
+    const isLive = args.includes("--live");
+    const dryRun = !isLive;
+    const { scrapeOnly, limit, messageId, inboxOnly } = parseReconcileAAAArgs(args);
 
-    console.log("\n=== AAA Cooper Invoice Extraction & Forwarding ===");
-    if (dryRun) console.log("   DRY RUN — no emails will be sent\n");
-    if (scrapeOnly) console.log("   SCRAPE ONLY — analyzing pages, not queueing\n");
-    if (messageId) console.log(`   EXACT MESSAGE — targeting Gmail id ${messageId}\n`);
-    if (inboxOnly) console.log("   INBOX ONLY — non-inbox AAA Cooper mail will be ignored\n");
+    let run: ReconciliationRun | null = null;
+    try {
+        run = await ReconciliationRun.start("AAA", dryRun ? "dry-run" : "live", { scrapeOnly, limit, messageId, inboxOnly });
 
-    const auth = await getAuthenticatedClient("ap");
-    const gmail = GmailApi({ version: "v1", auth });
+        console.log("\n=== AAA Cooper Invoice Extraction & Forwarding ===");
+        if (dryRun) console.log("   DRY RUN — no emails will be sent\n");
+        if (scrapeOnly) console.log("   SCRAPE ONLY — analyzing pages, not queueing\n");
+        if (messageId) console.log(`   EXACT MESSAGE — targeting Gmail id ${messageId}\n`);
+        if (inboxOnly) console.log("   INBOX ONLY — non-inbox AAA Cooper mail will be ignored\n");
 
-    console.log(messageId
-        ? `Fetching exact AAA Cooper statement ${messageId} from ap@buildasoil.com...`
-        : "Searching ap@buildasoil.com for AAA Cooper statements...");
+        const auth = await getAuthenticatedClient("ap");
+        const gmail = GmailApi({ version: "v1", auth });
 
-    const statements = await fetchAAACooperStatements(gmail as any, { messageId, inboxOnly });
-    if (statements.length === 0) {
-        console.log("\nNo AAA Cooper statements to process.");
-        return;
-    }
+        console.log(messageId
+            ? `Fetching exact AAA Cooper statement ${messageId} from ap@buildasoil.com...`
+            : "Searching ap@buildasoil.com for AAA Cooper statements...");
 
-    console.log(messageId
-        ? `   Found exact target; fetching attachments complete.`
-        : `   Found ${statements.length} AAA Cooper email(s); fetching attachments...`);
-    console.log(`\nProcessing up to ${messageId ? 1 : limit} statement email(s)...\n`);
-
-    const supabase = createClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    );
-
-    let totalInvoices = 0;
-    let totalPagesDiscarded = 0;
-    let heldForReview = 0;
-
-    for (const stmt of statements.slice(0, messageId ? 1 : limit)) {
-        console.log(`\n=== Statement: "${stmt.subject}" ===`);
-        console.log(`    Attachments: ${stmt.attachments.map((attachment) => attachment.filename).join(", ")}`);
-
-        const splitResult = await splitAAACooperStatementAttachments({
-            attachments: stmt.attachments,
-        });
-
-        if (splitResult.status === "needs_review") {
-            heldForReview++;
-            console.log(`    Held for review: ${splitResult.diagnostics.weakReason || "OCR confidence too weak"}`);
-            continue;
+        const statements = await fetchAAACooperStatements(gmail as any, { messageId, inboxOnly });
+        if (statements.length === 0) {
+            console.log("\nNo AAA Cooper statements to process.");
+            await run.complete("AAA reconciliation complete — no statements found.");
+            return;
         }
 
-        if (splitResult.status !== "split_ready" || splitResult.invoices.length === 0) {
-            console.log("    Skipping — no invoices found");
+        console.log(messageId
+            ? `   Found exact target; fetching attachments complete.`
+            : `   Found ${statements.length} AAA Cooper email(s); fetching attachments...`);
+        console.log(`\nProcessing up to ${messageId ? 1 : limit} statement email(s)...\n`);
+
+        const supabase = createClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        );
+
+        let totalInvoices = 0;
+        let totalPagesDiscarded = 0;
+        let heldForReview = 0;
+
+        for (const stmt of statements.slice(0, messageId ? 1 : limit)) {
+            console.log(`\n=== Statement: "${stmt.subject}" ===`);
+            console.log(`    Attachments: ${stmt.attachments.map((attachment) => attachment.filename).join(", ")}`);
+
+            const splitResult = await splitAAACooperStatementAttachments({
+                attachments: stmt.attachments,
+            });
+
+            if (splitResult.status === "needs_review") {
+                heldForReview++;
+                console.log(`    Held for review: ${splitResult.diagnostics.weakReason || "OCR confidence too weak"}`);
+                continue;
+            }
+
+            if (splitResult.status !== "split_ready" || splitResult.invoices.length === 0) {
+                console.log("    Skipping — no invoices found");
+                totalPagesDiscarded += splitResult.discardedCount;
+                continue;
+            }
+
+            console.log(`    ${splitResult.invoices.length} invoice(s), ${splitResult.discardedCount} discarded page(s)`);
+
+            const invoices = await buildInvoicesFromSplitResult(stmt.attachments, splitResult);
+            for (const invoice of invoices) {
+                run.recordInvoiceFound();
+                const amountStr = invoice.amount ? ` $${invoice.amount.toFixed(2)}` : "";
+                console.log(`    ${invoice.filename}${amountStr}`);
+
+                if (!dryRun && !scrapeOnly) {
+                    try {
+                        await sendToBillCom(gmail, invoice);
+                        await archiveInvoice(supabase, invoice, stmt.messageId, stmt.subject);
+                        run.recordInvoiceProcessed();
+                        console.log("       Sent to Bill.com + archived");
+                    } catch (err: any) {
+                        run.recordError(`Failed to send/archive invoice ${invoice.filename}`, err instanceof Error ? err : new Error(String(err)));
+                        console.error(`       Failed: ${err.message}`);
+                    }
+                } else if (scrapeOnly) {
+                    console.log("       Would queue (scrape-only mode)");
+                } else {
+                    console.log("       Would send to Bill.com (dry-run mode)");
+                }
+            }
+
+            totalInvoices += invoices.length;
             totalPagesDiscarded += splitResult.discardedCount;
-            continue;
-        }
-
-        console.log(`    ${splitResult.invoices.length} invoice(s), ${splitResult.discardedCount} discarded page(s)`);
-
-        const invoices = await buildInvoicesFromSplitResult(stmt.attachments, splitResult);
-        for (const invoice of invoices) {
-            const amountStr = invoice.amount ? ` $${invoice.amount.toFixed(2)}` : "";
-            console.log(`    ${invoice.filename}${amountStr}`);
 
             if (!dryRun && !scrapeOnly) {
                 try {
-                    await sendToBillCom(gmail, invoice);
-                    await archiveInvoice(supabase, invoice, stmt.messageId, stmt.subject);
-                    console.log("       Sent to Bill.com + archived");
-                } catch (err: any) {
-                    console.error(`       Failed: ${err.message}`);
+                    await gmail.users.messages.modify({
+                        userId: "me",
+                        id: stmt.messageId,
+                        requestBody: { removeLabelIds: ["INBOX", "UNREAD"], addLabelIds: [] },
+                    });
+                } catch {
+                    // Best-effort Gmail cleanup.
                 }
-            } else if (scrapeOnly) {
-                console.log("       Would queue (scrape-only mode)");
-            } else {
-                console.log("       Would send to Bill.com (dry-run mode)");
             }
         }
 
-        totalInvoices += invoices.length;
-        totalPagesDiscarded += splitResult.discardedCount;
+        console.log("\n=== DONE ===");
+        console.log(`Statements: ${statements.length}`);
+        console.log(`Invoices extracted: ${totalInvoices}`);
+        console.log(`Non-invoice pages: ${totalPagesDiscarded}`);
+        console.log(`Held for review: ${heldForReview}`);
 
-        if (!dryRun && !scrapeOnly) {
-            try {
-                await gmail.users.messages.modify({
-                    userId: "me",
-                    id: stmt.messageId,
-                    requestBody: { removeLabelIds: ["INBOX", "UNREAD"], addLabelIds: [] },
-                });
-            } catch {
-                // Best-effort Gmail cleanup.
-            }
+        await run.complete("AAA reconciliation complete.");
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (run) {
+            await run.fail("AAA reconciliation failed", error);
+        } else {
+            console.error("[AAA] Fatal error before run could be created:", error.message);
         }
+        throw err;
+    } finally {
+        if (run) await sendReconciliationSummary(run);
     }
-
-    console.log("\n=== DONE ===");
-    console.log(`Statements: ${statements.length}`);
-    console.log(`Invoices extracted: ${totalInvoices}`);
-    console.log(`Non-invoice pages: ${totalPagesDiscarded}`);
-    console.log(`Held for review: ${heldForReview}`);
 }
 
 const invokedPath = process.argv[1];
