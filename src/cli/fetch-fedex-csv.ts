@@ -6,6 +6,10 @@
  *          for dashboard/manual visibility.
  */
 
+// DEPRECATED: replaced by FedEx Invoice API in src/lib/fedex/billing.ts.
+// Do not delete this file. Kept for one release cycle as fallback.
+// reconcile-fedex.ts no longer depends on this file.
+
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
