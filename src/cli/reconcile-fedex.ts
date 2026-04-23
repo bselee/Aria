@@ -1,23 +1,24 @@
 /**
  * @file    reconcile-fedex.ts
- * @purpose Reconcile FedEx billing against Finale POs — identify and add missing freight charges.
- *          Fetches FedEx invoices via the FedEx Invoice Billing API (last 30 days), matches entries
- *          to Finale POs by PO reference, uses FedEx Track API to resolve unmatched COLLECT entries
- *          by origin city, and adds missing COLLECT freight charges.
+ * @purpose Reconcile FedEx billing CSV against Finale POs — identify and add missing freight charges.
+ *          Parses FedEx Billing Online CSV exports, matches entries to Finale POs by PO reference,
+ *          uses FedEx Track API to resolve unmatched COLLECT entries by origin city, and adds
+ *          missing COLLECT freight charges.
  * @author  Will / Antigravity
  * @created 2026-03-16
- * @updated 2026-04-23  — replaced CSV scraping with FedEx Invoice Billing API
+ * @updated 2026-04-23  — reverted to CSV parsing (FedEx Invoice Billing API does not exist)
  * @deps    dotenv, FinaleClient
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH,
  *          FEDEX_CLIENT_ID, FEDEX_CLIENT_SECRET, FEDEX_ACCOUNT_NUMBER
  *
  * Usage:
- *   node --import tsx src/cli/reconcile-fedex.ts       # Fetch last 30 days, dry-run
- *   node --import tsx src/cli/reconcile-fedex.ts --live # Apply changes to Finale
- *   node --import tsx src/cli/reconcile-fedex.ts --report-only  # Report only, no updates
+ *   node --import tsx src/cli/reconcile-fedex.ts                        # Auto-find latest CSV in Sandbox (dry-run default)
+ *   node --import tsx src/cli/reconcile-fedex.ts --live                # Apply changes to Finale
+ *   node --import tsx src/cli/reconcile-fedex.ts --report-only         # Report only, no Finale updates
+ *   node --import tsx src/cli/reconcile-fedex.ts --csv path/to/file.csv # Specify CSV path
  *
  * DECISION(2026-03-16): Built after discovering 5+ POs with missing FedEx COLLECT freight
- * totaling $3,700+. FedEx Invoice Billing API is the correct data source.
+ * totaling $3,700+. FedEx Billing Online CSV export is the correct data source.
  * FedEx Track API supplements with tracking→origin city→vendor matching for
  * entries lacking PO references.
  *
@@ -33,7 +34,6 @@ import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import { assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
-import { getFedExInvoices, FedExInvoice } from '@/lib/fedex/billing';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
@@ -73,9 +73,75 @@ const VENDOR_ORIGIN_MAP: Record<string, { city: string; state: string; vendor: s
 // ── CLI Args ──────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
+const csvArgIdx = args.indexOf('--csv');
+const csvPath = csvArgIdx >= 0 ? args[csvArgIdx + 1] : null;
 const LIVE = args.includes('--live');
 const DRY_RUN = !LIVE;
 const REPORT_ONLY = args.includes('--report-only');
+
+// ── CSV Parser ────────────────────────────────────────────────────────────────
+
+function parseCsvLine(line: string): string[] {
+    const fields: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (const ch of line) {
+        if (ch === '"') inQuotes = !inQuotes;
+        else if (ch === ',' && !inQuotes) { fields.push(current.trim()); current = ''; }
+        else current += ch;
+    }
+    fields.push(current.trim());
+    return fields;
+}
+
+const SANDBOX_DIR = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox');
+
+function parseFedExCSV(filePath: string): FedExEntry[] {
+    const raw = fs.readFileSync(filePath, 'utf-8').replace(/\r?\n$/, '');
+    const lines = raw.split(/\r?\n/);
+    if (lines.length < 2) return [];
+
+    const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase().replace(/[^a-z]/g, ''));
+    const dateIdx = headers.findIndex(h => h.includes('ship') || h.includes('date') || h.includes('pickup'));
+    const invIdx = headers.findIndex(h => h.includes('invoice') || h.includes('inv') || h.includes('number'));
+    const amtIdx = headers.findIndex(h => h.includes('amt') || h.includes('charge') || h.includes('total') || h.includes('due'));
+    const poIdx = headers.findIndex(h => h.includes('po') || h.includes('reference') || h.includes('ref'));
+    const refIdx = headers.findIndex(h => h.includes('ref') && headers.indexOf(h) !== poIdx);
+    const termsIdx = headers.findIndex(h => h.includes('term') || h.includes('pay') || h.includes('collect'));
+    const fromIdx = headers.findIndex(h => h.includes('from') || h.includes('orig') || h.includes('shipper'));
+    const toIdx = headers.findIndex(h => h.includes('to') || h.includes('dest') || h.includes('deliv'));
+    const fromZipIdx = headers.findIndex(h => h.includes('fromzip') || h.includes('originzip'));
+    const toZipIdx = headers.findIndex(h => h.includes('tozip') || h.includes('destzip'));
+
+    const entries: FedExEntry[] = [];
+    for (let i = 1; i < lines.length; i++) {
+        const fields = parseCsvLine(lines[i]);
+        if (fields.length < 2 || !fields[invIdx]?.trim()) continue;
+
+        const rawDate = fields[dateIdx]?.trim() || '';
+        const dateParts = rawDate.match(/(\d+)\/(\d+)\/(\d+)/);
+        const shipDate = dateParts
+            ? `${dateParts[3].padStart(4, '20')}-${dateParts[1].padStart(2, '0')}-${dateParts[2].padStart(2, '0')}`
+            : rawDate;
+
+        const amtStr = fields[amtIdx]?.replace(/[$,]/g, '').trim() || '0';
+        const amtDue = parseFloat(amtStr);
+
+        entries.push({
+            shipDate,
+            invoiceNumber: fields[invIdx]?.trim() || '',
+            amtDue: isNaN(amtDue) ? 0 : amtDue,
+            poNumber: fields[poIdx]?.trim() || '',
+            refNum: refIdx >= 0 ? fields[refIdx]?.trim() || '' : '',
+            terms: termsIdx >= 0 ? (fields[termsIdx]?.toUpperCase().includes('COLLECT') ? 'COLLECT' : 'PREPAID') : 'COLLECT',
+            shipFrom: fromIdx >= 0 ? fields[fromIdx]?.trim() || '' : '',
+            shipTo: toIdx >= 0 ? fields[toIdx]?.trim() || '' : '',
+            shipFromZip: fromZipIdx >= 0 ? fields[fromZipIdx]?.trim() || '' : '',
+            shipToZip: toZipIdx >= 0 ? fields[toZipIdx]?.trim() || '' : '',
+        });
+    }
+    return entries;
+}
 
 // ── FedEx Entry (API response mapped to legacy shape) ──────────────────────────
 
@@ -212,30 +278,41 @@ function extractFinalePoId(entry: FedExEntry): string | null {
 async function main() {
     let run: ReconciliationRun | null = null;
     try {
-        run = await ReconciliationRun.start('FedEx', DRY_RUN ? 'dry-run' : 'live', { reportOnly: REPORT_ONLY });
+        run = await ReconciliationRun.start('FedEx', DRY_RUN ? 'dry-run' : 'live', { csvPath, reportOnly: REPORT_ONLY });
 
         console.log(`\n╔═══════════════════════════════════════════════╗`);
         console.log(`║    FedEx Freight → Finale PO Reconciliation   ║`);
         console.log(`╚═══════════════════════════════════════════════╝\n`);
         console.log(`Mode: ${REPORT_ONLY ? '📊 REPORT ONLY' : DRY_RUN ? '🔵 DRY RUN' : '🔴 LIVE UPDATE'}\n`);
 
-        // --- Step 1: Fetch FedEx invoices from API ---
-        console.log(`📡 Fetching FedEx invoices from billing API...`);
-        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        const apiInvoices = await getFedExInvoices({ from: thirtyDaysAgo, to: new Date() });
+        // --- Step 1: Find and parse FedEx CSV ---
+        let targetCsv: string | null = null;
 
-        const entries: FedExEntry[] = apiInvoices.map((inv: FedExInvoice) => ({
-            shipDate: inv.invoiceDate,
-            invoiceNumber: inv.invoiceNumber,
-            amtDue: inv.totalAmount,
-            poNumber: inv.poNumber || '',
-            refNum: '',
-            terms: 'COLLECT',
-            shipFrom: inv.originCity || '',
-            shipTo: '',
-            shipFromZip: '',
-            shipToZip: '',
-        }));
+        if (csvPath) {
+            targetCsv = csvPath;
+        } else {
+            if (!fs.existsSync(SANDBOX_DIR)) {
+                console.error('❌ Sandbox directory not found:', SANDBOX_DIR);
+                throw new Error('Sandbox directory not found');
+            }
+            const files = fs.readdirSync(SANDBOX_DIR)
+                .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
+                .sort()
+                .reverse();
+            if (files.length === 0) {
+                console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
+                throw new Error('No FEDEX*.csv files found in Sandbox');
+            }
+            targetCsv = path.join(SANDBOX_DIR, files[0]);
+        }
+
+        if (!fs.existsSync(targetCsv)) {
+            console.error('❌ CSV not found:', targetCsv);
+            throw new Error('CSV file not found: ' + targetCsv);
+        }
+
+        console.log(`📄 CSV: ${path.basename(targetCsv)}`);
+        const entries: FedExEntry[] = parseFedExCSV(targetCsv);
 
         console.log(`📦 Total unique FedEx invoices: ${entries.length}\n`);
 
@@ -258,9 +335,8 @@ async function main() {
                 freight: e.amtDue,
                 po_number: extractFinalePoId(e) || null,
                 status: 'received',
-                source: 'fedex_api',
-                source_ref: `fedex-api-${e.invoiceNumber}`,
-                notes: `Origin: ${e.shipFrom} | Trackers: ${apiInvoices.find(i => i.invoiceNumber === e.invoiceNumber)?.trackingNumbers.join(', ') || 'none'}`,
+                source: 'csv_import',
+                source_ref: `fedex-csv-${path.basename(targetCsv)}`,
                 raw_data: e as unknown as Record<string, unknown>,
             });
             archived++;
@@ -652,7 +728,7 @@ async function main() {
     const reportPath = path.join(os.homedir(), 'OneDrive', 'Desktop', 'Sandbox', 'fedex-reconcile-report.json');
     const report = {
         runDate: new Date().toISOString(),
-        source: 'fedex_api',
+        source: 'csv_import',
         mode: REPORT_ONLY ? 'report' : DRY_RUN ? 'dry-run' : 'live',
         summary: {
             totalEntries: entries.length,
