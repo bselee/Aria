@@ -50,12 +50,20 @@ These are working in production today; the plan **must not break them**.
 | `ops_health_summary` VIEW | `20260415` + `20260416` fix | Single-row health roll-up |
 | `email_inbox_queue` / `ap_inbox_queue` / `nightshift_queue` | `20260305` / `20260324` | Domain processing pipelines |
 | `ap_pending_approvals` | (existing, hydrated at `reconciler.ts:127-194`) | Reconciler approvals **already persisted**; in-memory Map is just a cache |
-| `pending_dropships` | `20260310_create_pending_dropships.sql` | Already persisted, 48h TTL |
-| `copilot_action_sessions` | (existing) | PO send confirmations, already persisted |
+| `copilot_action_sessions` | (existing) | Durable pending-action sessions: PO send confirms, dropship forward approvals, reconcile approvals — survives pm2 restart |
 
-**Correction to CLAUDE.md:** the "in-memory state lost on pm2 restart" warning is stale.
-Reconciler, dropship store, and PO sender all persist to Supabase and rehydrate on boot. This
-plan focuses on **unification**, not adding persistence. Update CLAUDE.md as part of phase 1.
+**Dropship note:** the `pending_dropships` table in `20260310_create_pending_dropships.sql`
+exists but **no code writes to it**. The dropship store was refactored: deterministic dropships
+(matching a `routingRules` entry in `ap-agent.ts:60-86`) are forwarded directly with no human
+in the loop, and the no-match dropship case that does need Will's approval flows through
+`copilot_action_sessions`. The orphan `pending_dropships` table can be dropped in a future
+cleanup migration but is out of scope for this plan.
+
+**Correction to CLAUDE.md:** the "in-memory state lost on pm2 restart" warning for the
+reconciler and PO sender is stale — both persist to Supabase and rehydrate on boot. The
+dropship-store warning is also stale: the in-memory `pendingDropships` Map referenced in
+CLAUDE.md no longer exists; durable dropship-approval state lives in `copilot_action_sessions`.
+This plan focuses on **unification**, not adding persistence. Update CLAUDE.md as part of phase 1.
 
 ## 3. Design — Hub-and-Spoke
 
@@ -120,8 +128,7 @@ Only spokes whose rows can plausibly require human attention or dashboard surfac
 `task_id UUID NULL REFERENCES agent_task(id)`:
 
 - `ap_pending_approvals`        — every row → hub row (always needs Will)
-- `pending_dropships`           — every row → hub row (always needs Will)
-- `copilot_action_sessions`     — every PO-send confirm → hub row
+- `copilot_action_sessions`     — every row → hub row (PO-send confirms, dropship-forward approvals, reconcile approvals — every action_type that lands here needs Will)
 - `ops_agent_exceptions`        — every row → hub row (Supervisor-resolved ones close fast)
 - `ops_control_requests`        — every row → hub row (runbook command tracking)
 - `cron_runs`                   — **failures only** → hub row (success path is high-volume noise)
@@ -139,7 +146,7 @@ This keeps control flow visible and testable.
 |---|---|---|
 | `safeRun()` failure path | `src/lib/intelligence/ops-manager.ts:270-300` | After `cron_runs` update + `ops_agent_exceptions` insert, call `agentTask.upsertFromSource('cron_runs', cronRunId, …)` |
 | `storePendingApproval()` | `src/lib/finale/reconciler.ts:60-101` | After Supabase insert, call `agentTask.upsertFromSource('ap_pending_approvals', dbId, { status: 'NEEDS_APPROVAL', requires_approval: true, … })` |
-| `storePendingDropship()` | `src/lib/intelligence/dropship-store.ts` | Same pattern |
+| Dropship-forward approval (no-match invoice) | call site that inserts into `copilot_action_sessions` with `actionType='dropship_forward'` | Same pattern, source_table=`copilot_action_sessions` |
 | `storePendingPOSend()` | `src/lib/purchasing/po-sender.ts:118-146` | Same pattern |
 | `OversightAgent.escalate()` | `src/lib/intelligence/oversight-agent.ts` | After `ops_control_requests` insert |
 | `SupervisorAgent.supervise()` | `src/lib/intelligence/supervisor-agent.ts:101-147` | Update hub row's `status`/`approval_decision` when classifying |
@@ -158,8 +165,8 @@ today, then **also** write `agent_task.approval_decision` + `approval_decided_by
 | # | Phase | Files | Est. LOC | Rollback | Success criterion |
 |---|---|---|---|---|---|
 | **0** | Fix duplicate `agent_heartbeats` migration | `supabase/migrations/20260417_create_agent_heartbeats.sql` (convert to ALTER no-op against the 0415 schema) | ~30 | Revert file | `supabase db reset` produces 0415 schema regardless of migration order |
-| **1** | Hub schema + dashboard `/tasks` page + read-only display | `supabase/migrations/20260428_create_agent_task.sql` (CREATE TABLE + indexes + one-time backfill from existing pending rows in 4 spokes), `src/lib/intelligence/agent-task.ts` (new module), `src/app/api/dashboard/tasks/route.ts`, `src/app/dashboard/tasks/page.tsx`, `src/components/dashboard/TasksPanel.tsx` | ~600 | Drop table, delete page | Will sees one URL with every pending approval, dropship, exception, control request, recent cron failure |
-| **2** | Wire spoke writers (`safeRun` failure, reconciler, dropship-store, copilot/po-send, oversight escalate, supervisor classify). Add `task_id` FK columns to spoke tables. | `supabase/migrations/20260429_add_task_id_to_spokes.sql`, edits to 6 files in §3.4 | ~450 | `HUB_TASKS_ENABLED=false`; FK column nullable | After 24h, every new spoke row has a matching hub row; dashboard list updates without backfill |
+| **1** | Hub schema + dashboard `/tasks` page + read-only display | `supabase/migrations/20260428_create_agent_task.sql` (CREATE TABLE + indexes + one-time backfill from existing pending rows in 3 spokes), `src/lib/intelligence/agent-task.ts` (new module), `src/app/api/dashboard/tasks/route.ts`, `src/app/dashboard/tasks/page.tsx`, `src/components/dashboard/TasksPanel.tsx` | ~600 | Drop table, delete page | Will sees one URL with every pending approval, dropship-forward action, exception, control request, recent cron failure |
+| **2** | Wire spoke writers (`safeRun` failure, reconciler, copilot_action_sessions writers, po-send, oversight escalate, supervisor classify). Add `task_id` FK columns to spoke tables. | `supabase/migrations/20260429_add_task_id_to_spokes.sql`, edits to 5 call-sites in §3.4 | ~450 | `HUB_TASKS_ENABLED=false`; FK column nullable | After 24h, every new spoke row has a matching hub row; dashboard list updates without backfill |
 | **3** | Repurpose `task_history` as ledger. Add `task_id` + `event_type` columns. Wire `agentTask.appendEvent()` at every status transition. | `supabase/migrations/20260430_extend_task_history.sql`, `src/lib/intelligence/agent-task.ts` (appendEvent) | ~250 | Columns nullable; old writers untouched | Every hub row has ≥1 ledger row by completion; dashboard shows event timeline |
 | **4** | Skill registry sync on boot. Scan `.agents/skills/*.md` + `.agents/workflows/*.md`, content-hash-gated upsert into `skills`, embed via Pinecone (`gravity-memory` index, namespace `aria-memory`). | `src/lib/skills/loader.ts` (new), edit `src/cli/start-bot.ts` boot sequence | ~250 | `SKILL_SYNC_ENABLED=false` | `SELECT count(*) FROM skills WHERE created_by='auto'` matches markdown file count after boot; re-boot is no-op (hash unchanged) |
 | **5** | Skill injection at runtime. Hybrid: keyword/agent_name filter, then Pinecone embedding lookup if >5 matches. Inject top-3 skills' `description` + `steps` into task context. | `src/lib/skills/resolver.ts` (new), call sites in `safeRun()` and bot tool handlers | ~250 | `SKILL_INJECTION_ENABLED=false` | `times_invoked` increments on real runs; success rate tracked per skill |
@@ -180,8 +187,7 @@ today, then **also** write `agent_task.approval_decision` + `approval_decided_by
    it (real bug — fresh DB resets currently produce a divergent schema if migration order shifts).
 2. New migration `20260428_create_agent_task.sql` — CREATE TABLE + indexes + one-time backfill
    that inserts hub rows for every currently-pending row in `ap_pending_approvals`,
-   `pending_dropships`, `copilot_action_sessions`, `ops_agent_exceptions`, plus
-   `cron_runs` failures from the last 24h.
+   `copilot_action_sessions`, `ops_agent_exceptions`, plus `cron_runs` failures from the last 24h.
 3. New module `src/lib/intelligence/agent-task.ts` — `upsertFromSource()`, `appendEvent()`,
    `decideApproval()`, `complete()`, `fail()`. No call-sites wired yet.
 4. New API route `/api/dashboard/tasks` — list with filters (status, owner, type).
@@ -214,8 +220,9 @@ End-to-end checks per phase:
 - **Phase 0:** `npx supabase db reset --local && npm run typecheck:cli`. Confirm
   `\d agent_heartbeats` shows the 0415 column shape.
 - **Phase 1:** `node _run_migration.js supabase/migrations/20260428_create_agent_task.sql`.
-  Then: `SELECT count(*) FROM agent_task` ≈ sum of pending rows in 4 spokes. Open
-  `http://localhost:3000/dashboard/tasks`, confirm rows render with correct status badges.
+  Then: `SELECT count(*) FROM agent_task` ≈ sum of pending rows in 3 spokes + last-24h cron
+  failures. Open `http://localhost:3000/dashboard/tasks`, confirm rows render with correct
+  status badges.
 - **Phase 2:** Trigger a known-failing cron via `ops_control_requests` insert with
   `command='run_ap_poll_now'` against an invalid token. New row appears in `agent_task` with
   `type='cron_failure'`, `status='FAILED'`. Approve a real reconciler discrepancy via Telegram —
@@ -250,7 +257,7 @@ Edited:
 - `supabase/migrations/20260417_create_agent_heartbeats.sql` (convert to ALTER no-op)
 - `src/lib/intelligence/ops-manager.ts` — `safeRun()` failure path emits hub row
 - `src/lib/finale/reconciler.ts` — `storePendingApproval()` emits hub row
-- `src/lib/intelligence/dropship-store.ts` — `storePendingDropship()` emits hub row
+- copilot_action_sessions writers (`actionType` in {`po_send`, `dropship_forward`, `reconcile_approve`, …}) — emit hub row at insert
 - `src/lib/purchasing/po-sender.ts` — `storePendingPOSend()` emits hub row
 - `src/lib/intelligence/oversight-agent.ts` — `escalate()` emits hub row
 - `src/lib/intelligence/supervisor-agent.ts` — `supervise()` updates hub row's status
