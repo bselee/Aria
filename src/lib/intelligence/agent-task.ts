@@ -13,6 +13,8 @@
  */
 
 import { createClient } from "@/lib/supabase";
+import { inputHash } from "./agent-task-hash";
+import { closesWhenFor, type ClosurePredicate } from "./agent-task-closure";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -24,7 +26,8 @@ export type AgentTaskType =
     | "agent_exception"
     | "control_command"
     | "manual"
-    | "code_change";
+    | "code_change"
+    | "stuck_source";
 
 export type AgentTaskStatus =
     | "PENDING"
@@ -147,6 +150,149 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
     return data?.id ?? null;
 }
 
+// ── incrementOrCreate (phase 2.5 hygiene) ────────────────────────────────────
+
+export type IncrementOrCreateArgs = UpsertFromSourceArgs;
+
+/**
+ * Dedup-aware sibling of `upsertFromSource`. Phase-2 spoke writers should call
+ * this. If an OPEN row with the same `(source_table, source_id, input_hash)`
+ * already exists, increment its `dedup_count` instead of inserting. Otherwise
+ * insert a fresh row with `closes_when` populated from `closesWhenFor()`.
+ *
+ * If the bumped row reaches `dedup_count > 5` AND is older than 1h, also emits
+ * a `stuck_source` meta-task so Will sees one investigation prompt instead of
+ * N duplicates.
+ *
+ * Throws if Supabase is unavailable (caller must guard with try/catch where
+ * appropriate). The throw is intentional: spoke writers that previously called
+ * `upsertFromSource` (which returned null on failure) wrap their hub writes in
+ * try/catch already, so this is API-compatible.
+ */
+export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<AgentTask> {
+    if (!hubEnabled()) {
+        throw new Error("incrementOrCreate: HUB_TASKS_ENABLED is off");
+    }
+    const supabase = createClient();
+    if (!supabase) throw new Error("incrementOrCreate: supabase client unavailable");
+
+    const inputs = args.inputs ?? {};
+    const hash = inputHash(inputs);
+
+    const { data: existing } = await supabase
+        .from("agent_task")
+        .select("id, dedup_count, created_at")
+        .eq("source_table", args.sourceTable)
+        .eq("source_id", args.sourceId)
+        .eq("input_hash", hash)
+        .in("status", ["PENDING", "NEEDS_APPROVAL", "RUNNING", "CLAIMED"])
+        .maybeSingle();
+
+    if (existing) {
+        const newDedupCount = (existing.dedup_count ?? 1) + 1;
+        const { data: updated, error: updErr } = await supabase
+            .from("agent_task")
+            .update({
+                dedup_count: newDedupCount,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", existing.id)
+            .select()
+            .single();
+        if (updErr) throw updErr;
+
+        // Stuck-source guard: 6th+ duplicate AND original >1h old → meta-task.
+        const ageMs = Date.now() - new Date(existing.created_at).getTime();
+        if (newDedupCount > 5 && ageMs > 3600_000) {
+            await emitStuckSourceMetaTask(supabase, args, existing.id, newDedupCount);
+        }
+        return updated as AgentTask;
+    }
+
+    const closesWhen: ClosurePredicate = closesWhenFor({
+        type: args.type,
+        sourceTable: args.sourceTable,
+        inputs,
+    });
+
+    const { data: created, error: insErr } = await supabase
+        .from("agent_task")
+        .insert({
+            type: args.type,
+            source_table: args.sourceTable,
+            source_id: args.sourceId,
+            goal: args.goal,
+            status: args.status ?? "PENDING",
+            owner: args.owner ?? "aria",
+            priority: args.priority ?? 2,
+            requires_approval: args.requiresApproval ?? false,
+            inputs,
+            input_hash: hash,
+            closes_when: closesWhen,
+            parent_task_id: args.parentTaskId ?? null,
+            deadline_at: isoOrNull(args.deadlineAt ?? null),
+            max_retries: args.maxRetries ?? 0,
+            dedup_count: 1,
+        })
+        .select()
+        .single();
+    if (insErr) throw insErr;
+    return created as AgentTask;
+}
+
+async function emitStuckSourceMetaTask(
+    supabase: NonNullable<ReturnType<typeof createClient>>,
+    originalArgs: IncrementOrCreateArgs,
+    originalTaskId: string,
+    dedupCount: number,
+): Promise<void> {
+    const metaInputs = {
+        stuck_source_table: originalArgs.sourceTable,
+        stuck_source_id: originalArgs.sourceId,
+        observed_dedup_count: dedupCount,
+    };
+    const metaHash = inputHash({
+        stuck_source_table: metaInputs.stuck_source_table,
+        stuck_source_id: metaInputs.stuck_source_id,
+    });
+
+    const { data: existingMeta } = await supabase
+        .from("agent_task")
+        .select("id, dedup_count")
+        .eq("type", "stuck_source")
+        .eq("input_hash", metaHash)
+        .in("status", ["PENDING", "NEEDS_APPROVAL", "RUNNING", "CLAIMED"])
+        .maybeSingle();
+
+    if (existingMeta) {
+        await supabase
+            .from("agent_task")
+            .update({
+                dedup_count: dedupCount,
+                inputs: metaInputs,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", existingMeta.id);
+        return;
+    }
+
+    await supabase.from("agent_task").insert({
+        type: "stuck_source",
+        source_table: null,
+        source_id: null,
+        parent_task_id: originalTaskId,
+        goal: `Investigate: ${originalArgs.sourceTable}/${originalArgs.sourceId} keeps firing without closure (${dedupCount}× and counting)`,
+        status: "PENDING",
+        owner: "will",
+        priority: 0,
+        requires_approval: false,
+        inputs: metaInputs,
+        input_hash: metaHash,
+        closes_when: { kind: "deadline", max_age_hours: 168 },
+        dedup_count: 1,
+    });
+}
+
 /**
  * Record a human's approval decision on a hub row. Phase 2 will call this
  * from the Telegram approve/reject callback handlers; phase 1 dashboard is
@@ -222,10 +368,15 @@ export async function fail(taskId: string, errorMessage: string): Promise<void> 
 }
 
 /**
- * Append a structured event to the task's `inputs.events` array. This is a
- * placeholder for phase 3, which will move events into a repurposed
- * task_history table. For now, the in-row events array gives us a quick way
- * to display a timeline in the dashboard without another schema change.
+ * Append a structured event to the task ledger (`task_history`). Phase 3 of
+ * the control plane: every state transition writes one row. The pattern miner
+ * (phase A1) and the dashboard timeline view read from here.
+ *
+ * `event_type` should be one of: created | claimed | running | needs_approval |
+ * approved | rejected | succeeded | failed | cancelled | expired |
+ * dedup_increment | skill_invoked | skill_succeeded | skill_failed.
+ *
+ * Best-effort: a ledger write failure must never block the spoke flow.
  */
 export async function appendEvent(
     taskId: string,
@@ -236,36 +387,37 @@ export async function appendEvent(
     const supabase = createClient();
     if (!supabase) return;
 
-    const { data: existing, error: readErr } = await supabase
-        .from("agent_task")
-        .select("inputs")
-        .eq("id", taskId)
-        .single();
+    // Status maps to the task_history.status CHECK constraint
+    // ('success'|'failure'|'shadow'). Map ledger event_type → bucket.
+    const statusBucket =
+        eventType === "succeeded" || eventType === "approved"
+            ? "success"
+            : eventType === "failed" || eventType === "rejected" || eventType === "cancelled" || eventType === "expired"
+            ? "failure"
+            : "shadow";
 
-    if (readErr || !existing) {
-        console.warn("[agent-task] appendEvent read failed:", readErr?.message);
-        return;
-    }
+    const inputSummary =
+        typeof payload.input_summary === "string"
+            ? (payload.input_summary as string)
+            : "";
+    const outputSummary =
+        typeof payload.output_summary === "string"
+            ? (payload.output_summary as string)
+            : "";
 
-    const events: Array<Record<string, unknown>> = Array.isArray(
-        (existing.inputs as Record<string, unknown>)?.events,
-    )
-        ? ((existing.inputs as Record<string, unknown>).events as Array<Record<string, unknown>>)
-        : [];
-
-    events.push({
+    const { error } = await supabase.from("task_history").insert({
+        task_id: taskId,
+        agent_name: typeof payload.agent_name === "string" ? payload.agent_name : "agent-task",
+        task_type: typeof payload.task_type === "string" ? payload.task_type : "resolution",
         event_type: eventType,
-        at: new Date().toISOString(),
-        ...payload,
+        status: statusBucket,
+        input_summary: inputSummary,
+        output_summary: outputSummary,
+        execution_trace: payload,
     });
 
-    const { error: updErr } = await supabase
-        .from("agent_task")
-        .update({ inputs: { ...(existing.inputs as object), events } })
-        .eq("id", taskId);
-
-    if (updErr) {
-        console.warn("[agent-task] appendEvent write failed:", updErr.message);
+    if (error) {
+        console.warn("[agent-task] appendEvent failed:", error.message);
     }
 }
 
