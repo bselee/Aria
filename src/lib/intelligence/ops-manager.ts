@@ -17,6 +17,7 @@ import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
+import * as agentTask from "./agent-task";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -282,6 +283,34 @@ export class OpsManager {
                         }).eq('id', cronRunId);
                     }
                 } catch { /* non-critical */ }
+
+                // Mirror to control-plane hub. Failure-only — successful runs do not
+                // generate hub rows by design (would drown out the actual work signal).
+                try {
+                    const taskId = await agentTask.upsertFromSource({
+                        sourceTable: 'cron_runs',
+                        sourceId: String(cronRunId),
+                        type: 'cron_failure',
+                        goal: `Cron ${taskName} failed: ${String(error?.message || error).slice(0, 120)}`,
+                        status: 'FAILED',
+                        owner: 'aria',
+                        priority: 1,
+                        inputs: {
+                            task_name: taskName,
+                            error_message: error?.message ?? String(error),
+                            duration_ms: durationMs,
+                            started_at: startedAtIso,
+                        },
+                    });
+                    if (taskId) {
+                        const supabase = createClient();
+                        if (supabase) {
+                            await supabase.from('cron_runs')
+                                .update({ task_id: taskId })
+                                .eq('id', cronRunId);
+                        }
+                    }
+                } catch { /* hub write is best-effort */ }
             }
 
             console.error(`❌ Cron Task Failed: ${taskName}`, error.message);

@@ -8,6 +8,7 @@
 
 import { createClient } from "../supabase";
 import { Telegraf } from "telegraf";
+import * as agentTask from "./agent-task";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 import { remember, recall, Memory } from "./memory";
@@ -91,6 +92,34 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
             console.log(`   Found ${exceptions.length} pending error(s) to evaluate.`);
 
             for (const rootCause of exceptions) {
+                // Mirror to control-plane hub. Idempotent via the partial unique index
+                // on (source_table, source_id) — safe to call on every supervise() pass.
+                // We do this at the TOP of the loop because nothing else creates the hub
+                // row for this exception (the reportAgentException call from ops-manager
+                // is currently a no-op; a future PR can wire it). This way the
+                // updateBySource calls in the three branches always find the hub row.
+                try {
+                    const taskId = await agentTask.upsertFromSource({
+                        sourceTable: 'ops_agent_exceptions',
+                        sourceId: String(rootCause.id),
+                        type: 'agent_exception',
+                        goal: `Agent ${rootCause.agent_name} raised an exception: ${String(rootCause.error_message ?? '(no message)').slice(0, 120)}`,
+                        status: 'PENDING',
+                        owner: 'aria',
+                        priority: 1,
+                        inputs: {
+                            agent_name: rootCause.agent_name,
+                            error_message: rootCause.error_message,
+                            context_data: rootCause.context_data,
+                        },
+                    });
+                    if (taskId && !rootCause.task_id) {
+                        await supabase.from('ops_agent_exceptions')
+                            .update({ task_id: taskId })
+                            .eq('id', rootCause.id);
+                    }
+                } catch { /* hub write is best-effort */ }
+
                 // Determine course of action
                 const remedy = await this.classifyErrorAndRemedy(
                     rootCause.agent_name,
@@ -105,6 +134,12 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                         .update({ status: 'escalated', resolution_notes: 'Pushed to Telegram' })
                         .eq('id', rootCause.id);
 
+                    // Mirror to control-plane hub: this exception now needs human attention.
+                    await agentTask.updateBySource('ops_agent_exceptions', String(rootCause.id), {
+                        status: 'NEEDS_APPROVAL',
+                        owner: 'will',
+                    });
+
                     // Remember this outcome so it learns
                     await remember({
                         category: "decision",
@@ -115,13 +150,19 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                     });
 
                 } else if (remedy === "RETRY") {
-                    // For now, retry just means we ignore it and let the next cron pick it up, 
-                    // assuming the original agent didn't successfully lock the queue row or API state 
+                    // For now, retry just means we ignore it and let the next cron pick it up,
+                    // assuming the original agent didn't successfully lock the queue row or API state
                     // and will organically try again automatically on next tick.
                     // If we need explicit requeuing, we read `rootCause.context_data` here.
                     await supabase.from('ops_agent_exceptions')
                         .update({ status: 'resolved', resolution_notes: 'Transient error, ignoring to allow organic retry.' })
                         .eq('id', rootCause.id);
+
+                    // Mirror to control-plane hub: classified as transient, expected to self-heal.
+                    await agentTask.updateBySource('ops_agent_exceptions', String(rootCause.id), {
+                        status: 'SUCCEEDED',
+                        outputs: { remedy: 'RETRY', resolution: 'transient — organic retry on next tick' },
+                    });
 
                     // Remember this outcome so it learns
                     await remember({
@@ -136,6 +177,12 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                     await supabase.from('ops_agent_exceptions')
                         .update({ status: 'ignored', resolution_notes: 'Noise pattern identified.' })
                         .eq('id', rootCause.id);
+
+                    // Mirror to control-plane hub: noise, close as cancelled.
+                    await agentTask.updateBySource('ops_agent_exceptions', String(rootCause.id), {
+                        status: 'CANCELLED',
+                        outputs: { remedy: 'IGNORE', resolution: 'noise pattern' },
+                    });
 
                     // Remember this outcome so it learns
                     await remember({

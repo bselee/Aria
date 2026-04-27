@@ -24,6 +24,8 @@
  *   See FEE_AUTO_APPROVE_BY_TYPE in RECONCILIATION_CONFIG for full mapping.
  */
 
+import * as agentTask from "../intelligence/agent-task";
+
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../supabase";
@@ -96,6 +98,39 @@ export async function storePendingApproval(result: ReconciliationResult, client:
         createdAt: Date.now(),
         status: "pending",
     });
+
+    // Mirror to control-plane hub. Best-effort: a hub-write failure must not
+    // block the AP pipeline (Will still gets the Telegram approval prompt; the
+    // dashboard just won't show this row until the next backfill).
+    try {
+        const taskId = await agentTask.upsertFromSource({
+            sourceTable: "ap_pending_approvals",
+            sourceId: dbId,
+            type: "approval",
+            goal: `Reconcile invoice ${result.invoiceNumber ?? "?"} from ${result.vendorName ?? "?"}`,
+            status: "NEEDS_APPROVAL",
+            owner: "will",
+            priority: 1,
+            requiresApproval: true,
+            inputs: {
+                invoice_number: result.invoiceNumber,
+                vendor_name: result.vendorName,
+                order_id: result.orderId,
+                verdict_type: result.overallVerdict,
+            },
+            deadlineAt: expiresAt,
+        });
+        if (taskId) {
+            const sb = createClient();
+            if (sb) {
+                await sb.from("ap_pending_approvals")
+                    .update({ task_id: taskId })
+                    .eq("id", dbId);
+            }
+        }
+    } catch (err: any) {
+        console.warn(`[reconciler] hub upsert failed: ${err.message}`);
+    }
 
     return dbId;
 }
@@ -297,6 +332,10 @@ export async function approvePendingReconciliation(id: string): Promise<{
         }
     } catch { /* non-blocking */ }
 
+    // Mirror decision to the control-plane hub. Covers Telegram callbacks AND
+    // text-command fallback in one place (both routes call this function).
+    await agentTask.decideApprovalBySource("ap_pending_approvals", id, "approve", "reconciler");
+
     // Optional: We can keep it in DB for audit trail, so omitting the delete!
 
     // Write RECONCILIATION entry to ap_activity_log for duplicate detection.
@@ -434,6 +473,9 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         const sb = createClient();
         if (sb) await sb.from("ap_pending_approvals").update({ status: "rejected", updated_at: new Date().toISOString() }).eq("id", id);
     } catch { /* non-blocking */ }
+
+    // Mirror decision to the control-plane hub.
+    await agentTask.decideApprovalBySource("ap_pending_approvals", id, "reject", "reconciler");
 
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
     // re-processing of the same invoice — rejections must be "sticky".

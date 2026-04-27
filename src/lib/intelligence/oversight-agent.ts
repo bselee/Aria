@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase";
 import type { OpsControlCommand } from "@/lib/ops/control-plane";
 import { createOpsControlRequest } from "@/lib/ops/control-plane-db";
+import * as agentTask from "./agent-task";
 
 export type AgentStatus = "healthy" | "degraded" | "starting" | "stopped";
 
@@ -229,12 +230,35 @@ export class OversightAgent {
     }
 
     try {
-      await createOpsControlRequest(supabase, {
+      const requestRow = await createOpsControlRequest(supabase, {
         command: "restart_bot",
         requestedBy: "oversight-agent",
         reason: `Escalation after failed recovery for ${agentName}`,
         payload: { agentName, actions },
       });
+
+      // Mirror to control-plane hub. Best-effort; never block the runbook.
+      try {
+        const taskId = await agentTask.upsertFromSource({
+          sourceTable: "ops_control_requests",
+          sourceId: String(requestRow.id),
+          type: "control_command",
+          goal: `Restart bot — escalation for ${agentName} after failed recovery`,
+          status: "PENDING",
+          owner: "aria",
+          priority: 0,
+          inputs: {
+            agent_name: agentName,
+            command: "restart_bot",
+            actions,
+          },
+        });
+        if (taskId) {
+          await supabase.from("ops_control_requests")
+            .update({ task_id: taskId })
+            .eq("id", requestRow.id);
+        }
+      } catch { /* hub write is best-effort */ }
     } catch (err: any) {
       console.error(`[Oversight] Failed to escalate ${agentName}: ${err.message}`);
     }
