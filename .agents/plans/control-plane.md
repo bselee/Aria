@@ -1,9 +1,19 @@
 # Aria Control Plane — Plan
 
-> Status: Proposed (2026-04-27). Branch: `claude/review-paperclip-control-plane-F9Qa4`.
+> Status: Phase 0 + Phase 1 **applied to live DB 2026-04-27**.
+> Branch: `claude/review-paperclip-control-plane-F9Qa4`.
 > Decision: Physical `agent_task` hub from PR #1; phases 0-3 ship as the accountability spine,
 > then phase 6 (thin GitHub coding-task adapter), then phases 4-5 (skill registry + injection)
 > once phase 6 has provided the second skill-consumer.
+>
+> **Migration apply log:**
+> - `20260417_create_agent_heartbeats.sql` (ALTER no-op, idempotent) — applied 2026-04-27
+>   via `node _run_migration.js`. `agent_heartbeats` retained the live 0415 shape
+>   (`heartbeat_at`, `metadata`, lowercase `status`). Verified: columns match the 0415
+>   schema, no schema drift.
+> - `20260428_create_agent_task.sql` (CREATE TABLE + 6 indexes + backfill) — applied
+>   2026-04-27. Verified: 24 columns, 6 indexes (incl. `uq_agent_task_source` partial
+>   unique gate), one-time backfill seeded 38 rows from existing pending spokes.
 
 ## 1. Context
 
