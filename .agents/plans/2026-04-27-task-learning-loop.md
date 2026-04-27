@@ -86,7 +86,10 @@ ALTER TABLE public.skills
   ADD COLUMN IF NOT EXISTS demotion_reason   TEXT,
   ADD COLUMN IF NOT EXISTS predicate_jsonb   JSONB,    -- match expression
   ADD COLUMN IF NOT EXISTS action_jsonb      JSONB,    -- side-effect spec
-  ADD COLUMN IF NOT EXISTS last_disagreement_at TIMESTAMPTZ;
+  ADD COLUMN IF NOT EXISTS last_disagreement_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS shadow_to_active_threshold INTEGER NOT NULL DEFAULT 20,
+  ADD COLUMN IF NOT EXISTS trained_on_schema_version TEXT,
+  ADD COLUMN IF NOT EXISTS trained_match_distribution JSONB;  -- for drift detection (vendor histogram, etc.)
 ```
 
 `predicate_jsonb` shape:
@@ -106,9 +109,22 @@ ALTER TABLE public.skills
 {
   "kind": "auto_approve",
   "side_effect": "reconciler.applyApproval",
-  "max_retries": 1
+  "max_retries": 1,
+  "override_kind": "rollback",
+  "verifier_kind": "finale_write_then_billcom_label"
 }
 ```
+
+`override_kind` controls how a Will-override at +1h-to-+24h actually un-does the auto-decision:
+- `rollback` — reversible side-effect (e.g., approval not yet propagated to Finale write).
+  Override calls the side-effect's reverse function.
+- `corrective_task` — irreversible (e.g., Finale write already landed and Bill.com forward
+  already sent). Override opens a new `agent_task` of `type='corrective'` with the original
+  task as `parent_task_id`, owner=`will`, priority=0. Will resolves the corrective action
+  manually. The auto-rule still records `will_overrode=true`.
+
+`verifier_kind` names the +24h outcome check (see §6.3). Rules whose action lacks a verifier
+(`verifier_kind: null`) cap at `active`, never reach `trusted`.
 
 JSONB matchers are deterministic (no LLM at runtime). Supported operators: `eq`, `lte`, `gte`,
 `ilike`, `regex`, `in`. Anything more expressive becomes a code-defined skill (existing
@@ -315,18 +331,26 @@ active   ──[Will: "Promote to trusted" button]──▶ trusted   ← gated
   observed from `task_history`).
 - `disagree_count` increments on each disagreement (Will overrides within 24h, OR `task_history`
   records the opposite decision in shadow mode).
-- `last_disagreement_at` (additional column on `skills`) records the most recent
-  `disagree_count` increment.
-- Promotion gate `shadow → active`: `accuracy_count - disagree_count >= 20`
+- `last_disagreement_at` records the most recent `disagree_count` increment.
+- Promotion gate `shadow → active`: `accuracy_count - disagree_count >= shadow_to_active_threshold`
   AND `last_disagreement_at IS NULL OR last_disagreement_at < NOW() - INTERVAL '14 days'`.
-  (This is "≥20 net agreements with a 14-day clean tail" — strictly stronger than literal
+  (This is "≥N net agreements with a 14-day clean tail" — strictly stronger than literal
   "consecutive" since a single old disagreement doesn't reset the counter, but the rule must
   be *currently* clean.)
+- `shadow_to_active_threshold` is **per-rule** (default 20). Set lower for high-cadence
+  patterns: AP=20 (≈3-4 weeks of vendor coverage), dropships=15 (faster signal), runbook
+  rules like control_command=5 (cadence is per-incident; 20 would mean 10 weeks). The miner
+  sets this when proposing the rule, based on observed historical cadence.
 - Demotion check runs at 8 AM daily. Threshold: `disagree_count` deltas in the trailing 7 days
-  ≥ 2 → demote. A 14-day cooldown after demotion blocks re-promotion (Risk #4 in §10).
+  ≥ 2 → demote. **Demotion resets `accuracy_count = 0` and `disagree_count = 0`** (otherwise a
+  rule at 30 + 2 demotes, then on day 15 still has 28 net and would auto-re-promote). A
+  14-day cooldown after demotion blocks re-promotion regardless (Risk #4 in §10).
 - Retirement: Will can retire any rule from `/dashboard/rules` (manual). A rule is also
   auto-retired after 90 days at `trust_level='shadow'` with no agreements (i.e., predicate
-  never matched real traffic — the pattern dried up).
+  never matched real traffic — the pattern dried up). **Retired rules block re-proposal of
+  the same predicate hash for 60 days** (matches the soft-delete cooldown in §5.1). Older
+  retirements unblock so seasonal patterns (year-end vendor surge, etc.) can be re-proposed
+  when the data reappears.
 
 ### 6.2 Per-state behavior
 
@@ -344,11 +368,18 @@ side-effect rolled back if reversible.
 
 ### 6.3 Outcome verification
 
-For each `auto_rule_decision`, a follow-up cron at +24h checks downstream state:
+For each `auto_rule_decision`, a follow-up cron at +24h checks downstream state via the
+verifier named in `action_jsonb.verifier_kind`. Verifier registry:
 
-- Reconciler-approved invoice: did the Finale write succeed? Did Bill.com receive it?
-- Dropship forward: did the email actually send (Gmail message ID exists)?
-- Control command: did the agent actually restart (heartbeat fresh after applied_at)?
+| `verifier_kind` | Check |
+|---|---|
+| `finale_write_then_billcom_label` | Reconciler-approved invoice — Finale `orderItem.unitPrice` write returned success in audit log AND Gmail message in `ap@buildasoil.com` outbox has `Bill.com Forwarded` label applied |
+| `gmail_send_with_label` | Dropship forward — Gmail message ID exists in sent items AND vendor-specific label applied (e.g., `Logan Labs (Dropship)`) |
+| `agent_heartbeat_fresh` | Control command — `agent_heartbeats.heartbeat_at > applied_at` AND `status='healthy'` |
+| `null` | No verifier available — rule capped at `active`, ineligible for `trusted` |
+
+Note: there is **no Bill.com receive/ack API** — the closest signal we have is the Gmail
+forward label. Verifiers are chosen for what's actually observable, not what would be ideal.
 
 Failure → `outcome_status='outcome_failure'`, immediate demotion, Telegram alert.
 
@@ -390,12 +421,13 @@ Set with rationale; tunable in code:
 
 | Knob | Default | Rationale | Where |
 |---|---|---|---|
-| Cluster size threshold | 5 | Prevents single-instance proposals | `pattern-miner.ts` `MIN_CLUSTER_SIZE` |
+| Cluster size threshold (launch) | **10** | 5 examples can be one weird vendor month. Code holds 5 as the floor for tuning down later if patterns are sparse; ship at 10. | `pattern-miner.ts` `MIN_CLUSTER_SIZE` (default 10, floor 5) |
 | Agreement rate threshold | 95% | High bar; one disagreement per 20 still passes | `pattern-miner.ts` `MIN_AGREEMENT_RATE` |
 | Span requirement for Haiku | 50 examples OR 30 days | Avoids burst patterns proposing | `pattern-miner.ts` `HAIKU_GATE` |
-| Shadow → active threshold | 20 consecutive agreements | ~3-4 weeks of vendor coverage at typical AP cadence | `auto-rule-engine.ts` `PROMOTE_AT` |
+| Shadow → active threshold | **per-rule, default 20** | AP=20 (≈3-4 weeks vendor coverage), dropships=15 (faster signal), control_command=5 (incident-driven, 20 = 10 weeks). Miner sets per-rule on proposal based on observed cadence; column on `skills` table. | `skills.shadow_to_active_threshold` |
 | Active → demotion | 2 disagreements / 7 days | Conservative; one bad week reverts | `auto-rule-engine.ts` `DEMOTE_AT` |
 | Override window | 24h | Matches existing reconciler pending TTL | `auto-rule-engine.ts` `OVERRIDE_WINDOW_H` |
+| Override semantics | per-rule, `override_kind ∈ {rollback, corrective_task}` | Some auto-actions can't be rolled back at +24h (Finale write + Bill.com forward already propagated). Rule sets which path applies. | `action_jsonb.override_kind` |
 | Weekly Haiku cost cap | $0.10 | Frugal default, ~10 candidates/week | `pattern-miner.ts` `WEEKLY_BUDGET_USD` |
 
 If any of these feel wrong, adjust in code — none change the architecture.
@@ -448,6 +480,31 @@ per call site.
 5. **"Stuck source" meta-task itself becomes a source of noise.** If the watchdog bug isn't
    fixed, every 5-min cron tick re-creates the meta-task. **Mitigation:** the meta-task has its
    own input_hash on `(stuck_source_table, stuck_source_id_pattern)`, so it dedups too.
+6. **Predicate operator drift.** `ilike: '%uline%'` matches `ULINE`, `ULINE-RTNS`,
+   `Uline-via-ProcessUS` — a rule fit on Q1 vendor variants could silently match new ones added
+   later. **Mitigation:** the miner stamps a `trained_match_distribution` on the rule (vendor
+   histogram + amount bucket histogram from training data). At each promotion gate, compute the
+   trailing 7-day match distribution and require Jaccard overlap ≥ 0.8 with the trained
+   distribution. Drift below threshold blocks promotion and Telegram-alerts Will.
+7. **Schema drift in `inputs` JSONB.** If a field is added to the `reconciliation_result` shape
+   (or any other source's input shape), a rule's predicate referencing the old shape could
+   silently never match (or worse, match wrongly because a new field's absence/null is treated
+   as falsy). **Mitigation:** every spoke writer stamps `inputs._schema_version` (string, e.g.
+   `"reconciler@v3"`); rule stores `trained_on_schema_version` at proposal time; a mismatch at
+   match time → predicate skipped, rule auto-demoted to shadow with `demotion_reason='schema_drift'`,
+   Telegram alert.
+8. **First-rule chicken-and-egg.** The miner needs ≥30 days of `task_history` resolved rows to
+   produce its first proposal, but phase 3 starts that table's clock at zero. **Mitigation:** the
+   A1 PR includes a one-shot import that backfills `task_history` from the existing 6+ months of
+   `ap_activity_log` decisions (resolved invoice approvals + dropship forwards), normalized into
+   the `(task_id=NULL, agent_name='ap-agent', task_type='resolution_summary', event_type='resolved',
+   execution_trace=…)` shape. Miner can run on day 1 of A1 with a real corpus.
+9. **Stuck-source era pollutes early observation.** Layer 1 hygiene collapses 38 → 1+meta on day
+   0; the miner reading `task_history` for the first 30 days of fresh data sees mostly the messy
+   pre-hygiene past if not constrained. **Mitigation:** `pattern_mine` only considers
+   `task_history` rows where `created_at > deployed_at(layer_1)` (the `agent_task` table's
+   `created_at` of its first non-backfill row). Don't try to learn from the bug-disguised-as-load
+   era.
 
 ## 11. Verification
 
@@ -486,13 +543,45 @@ per call site.
 - `src/components/dashboard/TasksPanel.tsx` — auto-handled chip + filter toggle
 - `.agents/plans/control-plane.md` — link to this spec, update phase ordering
 
-## 13. Open questions
+## 13. First-rule sequencing (decision)
+
+Ordered list of which auto-rules get wired first in A2. Decision is locked, not a question.
+
+### First: dropship-forward (lowest risk, pure observability win)
+
+Dropships are already 100% deterministic in `ap-agent.ts:60-86` — they auto-forward today
+with no human approval. Wrapping that path in a rule **changes nothing operationally**; it
+just makes the existing safe behavior observable + attributable through the rule engine
+(`auto_handled_by` lineage, audit ledger, demotion if a forward fails). Outcome verifier is
+clean (`gmail_send_with_label`). Failure mode is contained — an email goes wrong, no money
+moves. Pure observability win, zero new risk surface. Use `shadow_to_active_threshold=15`.
+
+### Second: ULINE small-invoice auto-approve (real value, real care needed)
+
+Higher-value, real downside risk. The reconciler already auto-approves at ≤3% diff. The rule
+pushes the gate to a tighter sub-zone: `vendor ilike '%uline%' AND amount <= $500 AND diff_pct
+<= 0.03`. Train ONLY on already-auto-approved historical decisions so the training data is
+pre-validated. Verifier is solid (`finale_write_then_billcom_label`). Use
+`shadow_to_active_threshold=20`.
+
+### NOT: control_command/restart_bot
+
+**Explicitly excluded.** Auto-restart can mask real bugs — if `aria-bot` crashes from a code
+error and a rule auto-restarts it 38 times, we lose the signal. Layer 1 hygiene already solves
+the visible problem: the `closes_when: agent_boot_after` predicate auto-resolves the
+watchdog's stale `restart_bot` tasks when a healthy heartbeat lands. No rule needed. Adding a
+rule on top is double-handling for no value, with negative downside.
+
+### Subsequent candidates (defer until first two have ≥30 days of clean operation)
+
+- TeraGanix invoice forwarding (Shopify-source, deterministic)
+- FedEx weekly billing reconcile alerts (failure-only dedup)
+- AP statement-classification archive (no money path, low risk)
+
+## 14. Open questions
 
 None blocking. Tunable post-implementation:
 
-- **First rule candidates.** Which spoke gets the first proposed rule? Strongest candidates by
-  current data: ULINE small-invoice auto-approval, dropship forwards via known routing rules,
-  control_command/restart_bot auto-execution.
 - **Should `/dashboard/rules` allow manual rule authoring** (Will writes a predicate by hand,
   skips the proposal phase)? Punt to A3.
 - **Multi-channel demotion alerts** (Slack #purchasing in addition to Telegram)? Punt — Telegram
