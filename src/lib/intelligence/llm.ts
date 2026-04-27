@@ -26,7 +26,6 @@
 import { google } from '@ai-sdk/google';
 import { openai, createOpenAI } from '@ai-sdk/openai';
 import { anthropic } from '@ai-sdk/anthropic';
-import { ollama } from 'ai-sdk-ollama';
 import { generateText, generateObject, ModelMessage } from 'ai';
 import { z } from 'zod';
 import { geminiLimiter } from './rate-limiter';
@@ -91,18 +90,6 @@ function getOpenRouterProvider(): ProviderEntry[] {
 // Chain: Gemini (free) → OpenRouter (cheap, curated) → OpenAI → Anthropic
 function getProviderChain(): ProviderEntry[] {
     const chain: ProviderEntry[] = [];
-
-    // DECISION(2026-03-25): Inject Ollama dynamically if requested via env.
-    // This solves the persistent runtime OOM issue by keeping the node unloaded
-    // during general ops, but allows testing specific models like Qwen 2.5 vs 3.4
-    // when explicitly requested.
-    if (process.env.USE_OLLAMA_MODEL) {
-        chain.push({
-            name: `Ollama (${process.env.USE_OLLAMA_MODEL})`,
-            model: () => ollama(process.env.USE_OLLAMA_MODEL!),
-            available: true,
-        });
-    }
 
     chain.push(
         {

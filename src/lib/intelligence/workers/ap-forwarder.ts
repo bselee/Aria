@@ -247,18 +247,25 @@ export class APForwarderAgent {
                         .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
 
-                    await supabase
-                        .from('email_inbox_queue')
-                        .update({ processed_by_ap: true })
-                        .eq('gmail_message_id', sourceMessageId);
-                    await this.finalizeSourceEmailIfReady(
-                        supabase,
-                        gmail,
-                        {
-                            ...item,
-                            extracted_json: extractedJson,
-                        },
-                    );
+                    if (!processingResult.success) {
+                        await supabase
+                            .from('email_inbox_queue')
+                            .update({ processed_by_ap: false })
+                            .eq('gmail_message_id', sourceMessageId);
+                    } else {
+                        await supabase
+                            .from('email_inbox_queue')
+                            .update({ processed_by_ap: true })
+                            .eq('gmail_message_id', sourceMessageId);
+                        await this.finalizeSourceEmailIfReady(
+                            supabase,
+                            gmail,
+                            {
+                                ...item,
+                                extracted_json: extractedJson,
+                            },
+                        );
+                    }
 
                     await this.logActivity(
                         supabase,

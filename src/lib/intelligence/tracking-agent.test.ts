@@ -140,7 +140,7 @@ describe("TrackingAgent", () => {
             sourceRef: "gmail-thirsty-earth",
         }));
         expect(result).toEqual([
-            { poNumber: "124503", trackingNumbers: ["8051904063"] },
+            { poNumber: "124503", trackingNumbers: ["8051904063"], statusCategory: null },
         ]);
     });
 
@@ -188,7 +188,7 @@ describe("TrackingAgent", () => {
             trackingNumber: "1Z22YV580360436423",
         }));
         expect(result).toEqual([
-            { poNumber: "23371057-DropshipPO", trackingNumbers: ["1Z22YV580360436423"] },
+            { poNumber: "23371057-DropshipPO", trackingNumbers: ["1Z22YV580360436423"], statusCategory: null },
         ]);
     });
 });

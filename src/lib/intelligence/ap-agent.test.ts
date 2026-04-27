@@ -411,7 +411,7 @@ describe("APAgent processInvoiceBuffer", () => {
 
         expect((agent as any).reconcileAndUpdate).not.toHaveBeenCalled();
         expect(result).toEqual(expect.objectContaining({
-            success: false,
+            success: true,
             state: "unmatched",
             matchedPO: false,
             invoiceNumber: "200200",

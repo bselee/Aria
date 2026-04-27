@@ -17,6 +17,8 @@ import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
+import * as agentTask from "./agent-task";
+import { closeFinishedTasks } from "./agent-task-closure";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -282,6 +284,34 @@ export class OpsManager {
                         }).eq('id', cronRunId);
                     }
                 } catch { /* non-critical */ }
+
+                // Mirror to control-plane hub. Failure-only — successful runs do not
+                // generate hub rows by design (would drown out the actual work signal).
+                // Phase 2.5: incrementOrCreate dedups identical-shape failures into
+                // dedup_count++ on the existing row instead of stacking new rows.
+                try {
+                    const task = await agentTask.incrementOrCreate({
+                        sourceTable: 'cron_runs',
+                        sourceId: String(cronRunId),
+                        type: 'cron_failure',
+                        goal: `Cron ${taskName} failed: ${String(error?.message || error).slice(0, 120)}`,
+                        status: 'FAILED',
+                        owner: 'aria',
+                        priority: 1,
+                        inputs: {
+                            task_name: taskName,
+                            error_message: error?.message ?? String(error),
+                            duration_ms: durationMs,
+                            started_at: startedAtIso,
+                        },
+                    });
+                    const supabase = createClient();
+                    if (supabase) {
+                        await supabase.from('cron_runs')
+                            .update({ task_id: task.id })
+                            .eq('id', cronRunId);
+                    }
+                } catch { /* hub write is best-effort */ }
             }
 
             console.error(`❌ Cron Task Failed: ${taskName}`, error.message);
@@ -485,6 +515,16 @@ export class OpsManager {
         // Missing Reconciliation Watchdog at 9 AM weekdays
         schedule("0 9 * * 1-5", () => {
             this.safeRun("MissingReconciliationWatchdog", () => this.checkMissingReconciliationRuns());
+        });
+
+        // Hygiene: close completed agent_task rows every 5 minutes
+        schedule("*/5 * * * *", () => {
+            this.safeRun("CloseFinishedTasks", async () => {
+                const closed = await closeFinishedTasks();
+                if (closed > 0) {
+                    console.log(`[OpsManager] closeFinishedTasks: closed ${closed} task(s)`);
+                }
+            });
         });
 
         console.log("✅ OpsManager background jobs registered.");
