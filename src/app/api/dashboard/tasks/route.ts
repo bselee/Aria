@@ -16,8 +16,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
-import type { AgentTask } from "@/lib/intelligence/agent-task";
+import { listTasks, type AgentTask } from "@/lib/intelligence/agent-task";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -64,50 +63,25 @@ export async function GET(req: NextRequest) {
         }
     }
 
-    const supabase = createClient();
-    if (!supabase) {
-        return NextResponse.json({ error: "Supabase not configured" }, { status: 503 });
-    }
-
     try {
-        let query = supabase
-            .from("agent_task")
-            .select("*")
-            .order("priority", { ascending: true })
-            .order("created_at", { ascending: false });
-
         const statusFilter = sp.get("status");
-        if (statusFilter) {
-            const list = statusFilter.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-            if (list.length > 0) query = query.in("status", list);
-        } else {
-            // Default: only open tasks (PENDING / CLAIMED / RUNNING / NEEDS_APPROVAL),
-            // plus FAILED in the last 24h (for recent cron failures to stay visible).
-            const open = OPEN_STATUSES;
-            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-            query = query.or(
-                `status.in.(${open.join(",")}),and(status.eq.FAILED,created_at.gte.${since})`,
-            );
-        }
+        const statusList = statusFilter
+            ? statusFilter.split(",").map(s => s.trim().toUpperCase()).filter(Boolean)
+            : undefined;
 
         const typeFilter = sp.get("type");
-        if (typeFilter) {
-            const list = typeFilter.split(",").map(s => s.trim()).filter(Boolean);
-            if (list.length > 0) query = query.in("type", list);
-        }
-
-        const ownerFilter = sp.get("owner");
-        if (ownerFilter) {
-            query = query.eq("owner", ownerFilter);
-        }
+        const typeList = typeFilter
+            ? typeFilter.split(",").map(s => s.trim()).filter(Boolean)
+            : undefined;
 
         const limit = Math.min(parseInt(sp.get("limit") ?? "200", 10) || 200, 500);
-        query = query.limit(limit);
-
-        const { data, error } = await query;
-        if (error) throw new Error(error.message);
-
-        const tasks = (data ?? []) as AgentTask[];
+        const tasks = await listTasks({
+            status: statusList,
+            type: typeList,
+            owner: sp.get("owner") ?? undefined,
+            limit,
+            includeRecentFailed: !statusFilter,
+        }) as AgentTask[];
 
         const counts = {
             total: tasks.length,

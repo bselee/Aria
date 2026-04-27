@@ -11,20 +11,32 @@ ALTER TABLE public.agent_task
     ADD COLUMN IF NOT EXISTS input_hash  TEXT,
     ADD COLUMN IF NOT EXISTS closes_when JSONB;
 
+ALTER TABLE public.agent_task
+    DROP CONSTRAINT IF EXISTS agent_task_type_check;
+
+ALTER TABLE public.agent_task
+    ADD CONSTRAINT agent_task_type_check
+    CHECK (type IN (
+        'cron_failure',
+        'approval',
+        'dropship_forward',
+        'po_send_confirm',
+        'agent_exception',
+        'control_command',
+        'manual',
+        'code_change',
+        'stuck_source'
+    ));
+
 CREATE INDEX IF NOT EXISTS idx_agent_task_input_hash
     ON public.agent_task (source_table, input_hash)
     WHERE status IN ('PENDING','NEEDS_APPROVAL','RUNNING','CLAIMED');
 
--- 2. Populate input_hash for every existing row using a SQL canonical form
---    (server-side sha256 over a sorted JSONB representation; the TS canonicalize
---    helper produces an identical hash for new rows)
+-- 2. Populate input_hash for every existing row using jsonb's canonical text form.
+--    The TypeScript helper hashes the same canonical JSON representation for new rows.
 UPDATE public.agent_task
 SET input_hash = encode(
-    digest(
-        (SELECT string_agg(key || ':' || value::text, ',' ORDER BY key)
-         FROM jsonb_each_text(inputs)),
-        'sha256'
-    ),
+    digest(inputs::text, 'sha256'),
     'hex'
 )
 WHERE input_hash IS NULL;
@@ -48,10 +60,12 @@ WHERE type IN ('approval','po_send_confirm','dropship_forward')
   AND source_table IS NOT NULL
   AND closes_when IS NULL;
 
--- everything else → 24h deadline
+-- stuck-source investigations expire after a week; other task types stay open until
+-- an explicit status transition resolves them.
 UPDATE public.agent_task
-SET closes_when = jsonb_build_object('kind','deadline','max_age_hours',24)
-WHERE closes_when IS NULL;
+SET closes_when = jsonb_build_object('kind','deadline','max_age_hours',168)
+WHERE type = 'stuck_source'
+  AND closes_when IS NULL;
 
 -- 4. Dedup: collapse open rows with same (source_table, source_id, input_hash).
 --    Keep the oldest row, increment its dedup_count to the group size, delete the rest.

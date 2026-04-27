@@ -1,8 +1,8 @@
 /**
  * @file    po-sender.ts
  * @purpose Commit draft POs in Finale and email them to vendors via bill.selee@buildasoil.com.
- *          Holds pending send state in-memory (24h TTL — same pattern as pendingApprovals).
- *          Lost on restart; PO draft still exists in Finale so Will can re-initiate.
+ *          Pending confirmation state is durably mirrored to `copilot_action_sessions`
+ *          and cached in-memory for fast same-process reads.
  */
 
 import { createClient } from '../supabase';
@@ -10,6 +10,7 @@ import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
+import * as agentTask from '../intelligence/agent-task';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -84,6 +85,37 @@ async function persistPendingPOSend(entry: PendingPOSend): Promise<void> {
     const db = createClient();
     if (!db) return;
     await db.from('copilot_action_sessions').upsert(serializePendingPOSend(entry));
+
+    try {
+        const taskId = await agentTask.upsertFromSource({
+            sourceTable: 'copilot_action_sessions',
+            sourceId: entry.id,
+            type: 'po_send_confirm',
+            goal: `Confirm and send PO #${entry.orderId} to ${entry.review.vendorName}`,
+            status: 'NEEDS_APPROVAL',
+            owner: 'will',
+            priority: 1,
+            requiresApproval: true,
+            inputs: {
+                action_type: 'po_send',
+                order_id: entry.orderId,
+                vendor_name: entry.review.vendorName,
+                vendor_party_id: entry.review.vendorPartyId,
+                channel: entry.channel,
+                has_vendor_email: Boolean(entry.vendorEmail),
+            },
+            deadlineAt: new Date(entry.expiresAt),
+        });
+
+        if (taskId) {
+            await db
+                .from('copilot_action_sessions')
+                .update({ task_id: taskId })
+                .eq('session_id', entry.id);
+        }
+    } catch (err: any) {
+        console.warn(`[po-sender] hub upsert failed for ${entry.id}: ${err.message}`);
+    }
 }
 
 async function loadPendingPOSend(id: string): Promise<PendingPOSend | undefined> {
@@ -109,6 +141,20 @@ async function updatePendingPOSendStatus(
         .from('copilot_action_sessions')
         .update({ status })
         .eq('session_id', id);
+
+    const hubStatus = status === 'confirmed'
+        ? 'SUCCEEDED'
+        : status === 'cancelled'
+        ? 'CANCELLED'
+        : 'EXPIRED';
+
+    try {
+        await agentTask.updateBySource('copilot_action_sessions', id, {
+            status: hubStatus,
+        });
+    } catch (err: any) {
+        console.warn(`[po-sender] hub status mirror failed for ${id}: ${err.message}`);
+    }
 }
 
 export function clearPendingPOSendCache(): void {
@@ -279,6 +325,12 @@ export async function commitAndSendPO(
     if (!pending) throw new Error('Pending PO send not found or expired — initiate a new Review & Send');
 
     const { orderId, review, vendorEmail } = pending;
+
+    try {
+        await agentTask.updateBySource('copilot_action_sessions', id, {
+            status: 'RUNNING',
+        });
+    } catch { /* best-effort */ }
 
     // 1. Commit in Finale
     const finale = new FinaleClient();

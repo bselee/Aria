@@ -1,10 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DraftPOReview } from "../finale/client";
 
-const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.hoisted(() => {
+const {
+    sessionRows,
+    commitDraftPOMock,
+    gmailSendMock,
+    createClientMock,
+    upsertFromSourceMock,
+    updateBySourceMock,
+} = vi.hoisted(() => {
     const sessionRows = new Map<string, any>();
     const commitDraftPOMock = vi.fn().mockResolvedValue(undefined);
     const gmailSendMock = vi.fn().mockResolvedValue({ data: { id: "gmail-1" } });
+    const upsertFromSourceMock = vi.fn().mockResolvedValue("task-1");
+    const updateBySourceMock = vi.fn().mockResolvedValue(undefined);
 
     const createClientMock = vi.fn(() => ({
         from(table: string) {
@@ -47,7 +56,14 @@ const { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock } = vi.h
         },
     }));
 
-    return { sessionRows, commitDraftPOMock, gmailSendMock, createClientMock };
+    return {
+        sessionRows,
+        commitDraftPOMock,
+        gmailSendMock,
+        createClientMock,
+        upsertFromSourceMock,
+        updateBySourceMock,
+    };
 });
 
 vi.mock("../supabase", () => ({
@@ -72,6 +88,11 @@ vi.mock("../finale/client", () => ({
     FinaleClient: class FinaleClient {
         commitDraftPO = commitDraftPOMock;
     },
+}));
+
+vi.mock("../intelligence/agent-task", () => ({
+    upsertFromSource: upsertFromSourceMock,
+    updateBySource: updateBySourceMock,
 }));
 
 import { executePOSendAction } from "./actions";
@@ -108,6 +129,8 @@ describe("PO send actions", () => {
         vi.clearAllMocks();
         commitDraftPOMock.mockResolvedValue(undefined);
         gmailSendMock.mockResolvedValue({ data: { id: "gmail-1" } });
+        upsertFromSourceMock.mockResolvedValue("task-1");
+        updateBySourceMock.mockResolvedValue(undefined);
         clearPendingPOSendCache();
     });
 
@@ -120,6 +143,22 @@ describe("PO send actions", () => {
 
         const restored = await getPendingPOSend(sendId);
         expect(restored?.orderId).toBe("PO-1001");
+    });
+
+    it("mirrors a pending PO send into the task hub and stores task_id on the spoke row", async () => {
+        const sendId = await storePendingPOSend("PO-1001", makeReview(), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
+
+        expect(upsertFromSourceMock).toHaveBeenCalledWith(expect.objectContaining({
+            sourceTable: "copilot_action_sessions",
+            sourceId: sendId,
+            type: "po_send_confirm",
+            status: "NEEDS_APPROVAL",
+            owner: "will",
+            requiresApproval: true,
+        }));
+        expect(sessionRows.get(sendId)?.task_id).toBe("task-1");
     });
 
     it("fails cleanly when the send session is expired", async () => {
@@ -137,6 +176,11 @@ describe("PO send actions", () => {
 
         expect(result.status).toBe("failed");
         expect(result.userMessage).toMatch(/expired|start a new review/i);
+        expect(updateBySourceMock).toHaveBeenCalledWith(
+            "copilot_action_sessions",
+            sendId,
+            expect.objectContaining({ status: "EXPIRED" }),
+        );
     });
 
     it("returns partial_success when Finale commit succeeds but email send fails", async () => {
@@ -153,5 +197,10 @@ describe("PO send actions", () => {
         expect(result.status).toBe("partial_success");
         expect(result.userMessage).toMatch(/committed/i);
         expect(result.userMessage).toMatch(/email/i);
+        expect(updateBySourceMock).toHaveBeenCalledWith(
+            "copilot_action_sessions",
+            sendId,
+            expect.objectContaining({ status: "SUCCEEDED" }),
+        );
     });
 });

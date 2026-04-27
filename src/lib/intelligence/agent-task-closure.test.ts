@@ -121,8 +121,8 @@ describe("closesWhenFor", () => {
         expect(r?.table).toBe("ap_pending_approvals");
     });
 
-    it("falls back to 24h deadline", () => {
-        expect(closesWhenFor({ type: "manual" })).toEqual({ kind: "deadline", max_age_hours: 24 });
+    it("does not auto-close unmapped task types", () => {
+        expect(closesWhenFor({ type: "manual" })).toBeNull();
     });
 });
 
@@ -131,7 +131,7 @@ import { closeFinishedTasks } from "./agent-task-closure";
 describe("closeFinishedTasks", () => {
     beforeEach(() => createClientMock.mockReset());
 
-    it("closes a deadline-expired task", async () => {
+    it("expires a deadline-expired task instead of marking it succeeded", async () => {
         const expired = {
             id: "expired-id",
             type: "manual",
@@ -169,12 +169,16 @@ describe("closeFinishedTasks", () => {
                     }),
                 }),
                 update: updateUpdate,
+                insert: vi.fn().mockResolvedValue({ error: null }),
             }),
         });
 
         const closed = await closeFinishedTasks();
         expect(closed).toBe(1);
         expect(updateUpdate).toHaveBeenCalledOnce();
+        expect(updateUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            status: "EXPIRED",
+        }));
     });
 
     it("returns 0 when no open tasks have closes_when", async () => {
@@ -185,6 +189,7 @@ describe("closeFinishedTasks", () => {
                         not: vi.fn().mockResolvedValue({ data: [], error: null }),
                     }),
                 }),
+                insert: vi.fn().mockResolvedValue({ error: null }),
             }),
         });
 

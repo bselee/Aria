@@ -2,7 +2,7 @@
  * @file    agent-task-hash.ts
  * @purpose Deterministic canonicalization + sha256 hashing for agent_task.input_hash.
  *          The TypeScript hash MUST equal the SQL hash produced by the 20260501
- *          migration's UPDATE statement (sorted key:value concatenation).
+ *          migration's UPDATE statement over canonical JSON.
  */
 import { createHash } from "node:crypto";
 
