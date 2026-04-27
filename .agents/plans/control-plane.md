@@ -1,7 +1,9 @@
 # Aria Control Plane — Plan
 
 > Status: Proposed (2026-04-27). Branch: `claude/review-paperclip-control-plane-F9Qa4`.
-> Decision: Physical `agent_task` hub from PR #1; GitHub coding-task adapter as final phase.
+> Decision: Physical `agent_task` hub from PR #1; phases 0-3 ship as the accountability spine,
+> then phase 6 (thin GitHub coding-task adapter), then phases 4-5 (skill registry + injection)
+> once phase 6 has provided the second skill-consumer.
 
 ## 1. Context
 
@@ -178,26 +180,43 @@ today, then **also** write `agent_task.approval_decision` + `approval_decided_by
 | **5** ⏸ | Skill injection at runtime. Hybrid: keyword/agent_name filter, then Pinecone embedding lookup if >5 matches. Inject top-3 skills' `description` + `steps` into task context. | `src/lib/skills/resolver.ts` (new), call sites in `safeRun()` and bot tool handlers | ~250 | `SKILL_INJECTION_ENABLED=false` | `times_invoked` increments on real runs; success rate tracked per skill |
 | **6** ⏸ | GitHub coding-task adapter. New `agent_task.type='code_change'`. Worker: open Issue → spawn Claude Code in worktree → open PR → webhook updates task status on PR review/merge. | `src/lib/intelligence/code-task-runner.ts`, `src/app/api/webhooks/github/route.ts` (extend), `.agents/workflows/code-task.md` | ~600 | Disable webhook subscription + `CODE_TASKS_ENABLED=false` | Manually filed `code_change` task produces a real PR; close-on-merge updates hub row |
 
-⏸ = **deferred.** Phases 0-3 are the committed roadmap (~1,300 LOC). Phases 4-6 are scaffolded
-but not scheduled.
+⏸ = **sequenced behind phases 0-3.** Phases 0-3 are the committed accountability spine
+(~1,300 LOC). Phase 6 is the next sequenced milestone (not indefinite). Phases 4-5 sequence
+behind phase 6 because phase 6 is what creates the second consumer that justifies them.
 
-**Deferral rationale (added 2026-04-27 per review):**
-- **Phase 4 + 5 (skill registry sync + injection)** wait until there is a real second consumer
-  beyond `start-bot.ts`. Today the skills table is read by `OversightPanel`; the live invocation
-  path is the cron handlers. Until ≥2 unrelated callers want runtime skill lookup, building the
-  loader is scaffolding for a problem we don't have. The `skills` table already exists and
-  `SkillCrystallizer` already populates it organically.
-- **Phase 6 (GitHub coding-task adapter)** waits until phases 0-3 have been live ≥30 days **and**
-  Will has manually wished for a code-change ticket ≥3 times in that window. When it does land,
-  it ships as a thin Claude Code + worktree + GitHub adapter — no Codex / Cursor / CLI / HTTP
-  multiplexer. The hub schema already absorbs `type='code_change'` without changes, so deferring
-  costs nothing architecturally.
+**Sequencing rationale (revised 2026-04-27 after Paperclip recalibration):**
 
-The "is Aria becoming Paperclip?" answer remains **no.** Aria is an ops bot whose hub is generic
-enough to file a code-change ticket eventually. If general-purpose coding-agent breadth becomes a
-real need, the right move is to use Paperclip itself, not rebuild it inside Aria.
+The Paperclip primitives worth keeping:
+- Heartbeat ledger — agents that go silent get noticed (already exists; phase 0 fixes its schema bug).
+- Ticket lifecycle (PENDING → CLAIMED → NEEDS_APPROVAL → SUCCEEDED/FAILED) — every unit of work
+  has state, owner, deadline (phase 1).
+- Agent handoff — Aria can hand a task to Claude Code, get it back, hand it to Will for approval,
+  all in one timeline (phase 6, thin).
+- Skills/workflows as runtime metadata — not just markdown that the supervisor never reads
+  (phases 4-5).
+- Run history with cost + decisions per run — auditable accountability (phase 3).
 
-**Committed roadmap:** ~1,300 LOC across 4 PRs (phases 0-3), ~3-4 weeks at 1 PR/week.
+What we explicitly do NOT chase: adapter breadth (Codex + Cursor + CLI + HTTP all on day one),
+multi-tenancy / org-chart ceremony, generic policy engine before there are 3+ rule consumers.
+
+- **Phase 6 (GitHub coding-task adapter) is the next milestone after phase 3.** Ship it minimum
+  viable: ONE adapter (Claude Code), ONE task type (`code_change`), ONE trigger (filed from
+  `/tasks` page or Telegram). Resist Codex / Cursor / CLI / HTTP in the same PR — that is where
+  Paperclip-style scope creep would actually hurt. The hub already absorbs `type='code_change'`
+  without schema change.
+- **Phase 4 (skill registry sync) and phase 5 (skill injection)** sequence after phase 6, because
+  phase 6 creates the second consumer beyond `start-bot.ts` that justifies the loader: the GitHub
+  adapter will want skills like "follow our PR conventions" or "always run typecheck:cli before
+  commit" injected into its task context. Today the `skills` table already exists and
+  `SkillCrystallizer` already populates it organically; a loader without two consumers is
+  scaffolding.
+
+The "is Aria becoming Paperclip?" answer remains **no.** Aria is an ops bot that adopts
+Paperclip's primitives selectively. If general-purpose coding-agent breadth ever becomes a real
+need, the right move is to use Paperclip itself, not rebuild it inside Aria.
+
+**Committed roadmap order:** phases 0 → 1 → 2 → 3 → 6 → 4 → 5. Phases 0-3 ~1,300 LOC; phase 6
+~600 LOC for the thin version; phases 4-5 ~500 LOC combined when phase 6 makes them necessary.
 
 **Dropped from scope** (per review, not contested):
 - Generic `task_policies` engine. Inline thresholds in `reconciler.ts` (3% / 10× / $500) stay as
