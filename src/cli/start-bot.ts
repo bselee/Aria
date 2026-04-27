@@ -54,6 +54,8 @@ import {
     handleTelegramText,
 } from '../lib/copilot/channels/telegram';
 import { handleTelegramPOSendCallback } from '../lib/copilot/channels/telegram-callbacks';
+import * as agentTask from '../lib/intelligence/agent-task';
+import { Markup as TgMarkup } from 'telegraf';
 import { getStartupHealth } from '../lib/copilot/smoke';
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -814,6 +816,147 @@ bot.on('text', async (ctx) => {
         await ctx.editMessageText(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text + '\n\n' + message
             : message);
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // /tasks  — unified Aria task queue (control-plane phase 2.5 surface)
+    // ──────────────────────────────────────────────────────────────────────
+    // Reads from agent_task. Mobile-first paginated list: 5 rows per page,
+    // sorted "blocking me first" (NEEDS_APPROVAL/owner=will → FAILED → PENDING),
+    // each row gets its own per-type action buttons. No bulk-approve.
+    //
+    // Spec: .agents/plans/control-plane.md §3.5; option A from prior design.
+    const TASKS_PAGE_SIZE = 5;
+    const TASK_STATUS_DOT: Record<string, string> = {
+        NEEDS_APPROVAL: '🟡',
+        FAILED: '🔴',
+        PENDING: '🟢',
+        RUNNING: '🟢',
+        CLAIMED: '🟢',
+    };
+
+    function renderTasksMessage(tasks: agentTask.AgentTask[], offset: number, totalOpen: number): { text: string; keyboard: any } {
+        if (tasks.length === 0) {
+            return {
+                text: '📋 Nothing waiting. ✨',
+                keyboard: TgMarkup.inlineKeyboard([[TgMarkup.button.callback('🔄 Refresh', 'tasks_page_0')]]),
+            };
+        }
+        const lines: string[] = [`📋 ${totalOpen} open task${totalOpen === 1 ? '' : 's'} — showing ${offset + 1}–${offset + tasks.length}`, ''];
+        const rows: any[][] = [];
+        tasks.forEach((t, idx) => {
+            const dot = TASK_STATUS_DOT[t.status] ?? '⚪';
+            const num = offset + idx + 1;
+            const goal = t.goal.length > 70 ? t.goal.slice(0, 67) + '...' : t.goal;
+            lines.push(`${dot} ${num}. ${goal}`);
+            if (t.type === 'approval' && t.requires_approval) {
+                rows.push([
+                    TgMarkup.button.callback(`✅ ${num} Approve`, `task_approve_${t.id}`),
+                    TgMarkup.button.callback(`❌ ${num} Reject`, `task_reject_${t.id}`),
+                ]);
+            } else if (t.type === 'cron_failure' || t.status === 'FAILED') {
+                rows.push([TgMarkup.button.callback(`✓ ${num} Dismiss`, `task_dismiss_${t.id}`)]);
+            } else {
+                rows.push([TgMarkup.button.callback(`✓ ${num} Done`, `task_dismiss_${t.id}`)]);
+            }
+        });
+        const navRow: any[] = [];
+        if (offset > 0) navRow.push(TgMarkup.button.callback('⏮ Prev', `tasks_page_${Math.max(0, offset - TASKS_PAGE_SIZE)}`));
+        if (offset + tasks.length < totalOpen) navRow.push(TgMarkup.button.callback('Next ⏭', `tasks_page_${offset + TASKS_PAGE_SIZE}`));
+        navRow.push(TgMarkup.button.callback('🔄', `tasks_page_${offset}`));
+        rows.push(navRow);
+        return { text: lines.join('\n'), keyboard: TgMarkup.inlineKeyboard(rows) };
+    }
+
+    async function fetchTasksPage(offset: number): Promise<{ tasks: agentTask.AgentTask[]; total: number }> {
+        try {
+            const res = await fetch(`http://127.0.0.1:${process.env.PORT ?? 3000}/api/dashboard/tasks?bust=1`);
+            if (!res.ok) return { tasks: [], total: 0 };
+            const json = await res.json();
+            const all: agentTask.AgentTask[] = json.tasks ?? [];
+            const rank = (t: agentTask.AgentTask) =>
+                (t.status === 'NEEDS_APPROVAL' && t.owner === 'will' ? 0 : t.status === 'NEEDS_APPROVAL' ? 1 : t.status === 'FAILED' ? 2 : 3) * 1000 +
+                (t.priority ?? 2);
+            const sorted = [...all].sort((a, b) => {
+                const r = rank(a) - rank(b);
+                if (r !== 0) return r;
+                return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+            });
+            return { tasks: sorted.slice(offset, offset + TASKS_PAGE_SIZE), total: sorted.length };
+        } catch {
+            return { tasks: [], total: 0 };
+        }
+    }
+
+    bot.command('tasks', async (ctx) => {
+        const { tasks, total } = await fetchTasksPage(0);
+        const { text, keyboard } = renderTasksMessage(tasks, 0, total);
+        await ctx.reply(text, keyboard);
+    });
+
+    bot.action(/^tasks_page_(\d+)$/, async (ctx) => {
+        const offset = parseInt(ctx.match[1], 10) || 0;
+        await ctx.answerCbQuery('Refreshing...');
+        const { tasks, total } = await fetchTasksPage(offset);
+        const { text, keyboard } = renderTasksMessage(tasks, offset, total);
+        try {
+            await ctx.editMessageText(text, keyboard);
+        } catch {
+            await ctx.reply(text, keyboard);
+        }
+    });
+
+    bot.action(/^task_approve_(.+)$/, async (ctx) => {
+        const taskId = ctx.match[1];
+        await ctx.answerCbQuery('Approving...');
+        try {
+            const task = await agentTask.getById(taskId);
+            if (!task) {
+                await ctx.reply('❓ Task not found.');
+                return;
+            }
+            if (task.source_table === 'ap_pending_approvals' && task.source_id) {
+                const result = await approvePendingReconciliation(task.source_id);
+                await ctx.reply(`${result.success ? '✅' : '⚠️'} ${result.message}`);
+            } else {
+                await agentTask.decideApproval(taskId, 'approve', 'will-telegram');
+                await ctx.reply('✅ Approved.');
+            }
+        } catch (err: any) {
+            await ctx.reply(`❌ Approve failed: ${err.message}`);
+        }
+    });
+
+    bot.action(/^task_reject_(.+)$/, async (ctx) => {
+        const taskId = ctx.match[1];
+        await ctx.answerCbQuery('Rejecting...');
+        try {
+            const task = await agentTask.getById(taskId);
+            if (!task) {
+                await ctx.reply('❓ Task not found.');
+                return;
+            }
+            if (task.source_table === 'ap_pending_approvals' && task.source_id) {
+                const message = await rejectPendingReconciliation(task.source_id);
+                await ctx.reply(`❌ ${message}`);
+            } else {
+                await agentTask.decideApproval(taskId, 'reject', 'will-telegram');
+                await ctx.reply('❌ Rejected.');
+            }
+        } catch (err: any) {
+            await ctx.reply(`❌ Reject failed: ${err.message}`);
+        }
+    });
+
+    bot.action(/^task_dismiss_(.+)$/, async (ctx) => {
+        const taskId = ctx.match[1];
+        await ctx.answerCbQuery('Dismissed');
+        try {
+            await agentTask.complete(taskId, { dismissed_by: 'will-telegram', dismissed_at: new Date().toISOString() });
+            await ctx.reply('✓ Dismissed.');
+        } catch (err: any) {
+            await ctx.reply(`❌ Dismiss failed: ${err.message}`);
+        }
     });
 
     // TEXT COMMAND FALLBACK for approvals Ã¢â‚¬â€ handles /approve_<id> and /reject_<id>

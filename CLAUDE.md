@@ -121,6 +121,12 @@ Aria has a unified ticket hub at `agent_task` (see `supabase/migrations/20260428
 
 **Phase 2 spoke writers** (`20260429_add_task_id_to_spokes.sql`): `ops-manager.safeRun()` failure path, `reconciler.storePendingApproval/approve/reject`, `oversight-agent.escalate`, and `supervisor-agent.supervise` (lazy-upserts hub row at top of each iteration since nothing else inserts to `ops_agent_exceptions` today). All hub writes are gated by `HUB_TASKS_ENABLED` env (default `true`; set to `false`/`0`/`off` for one-line rollback). All writes are best-effort — a hub failure never blocks the spoke insert. `copilot_action_sessions` writers are not wired (no production writer exists for that table; column added for forward compat).
 
+**Phase 2.5 hygiene** (`20260501_hygiene_backfill.sql`): adds `dedup_count`, `input_hash`, `closes_when` to `agent_task`. Spoke writers should call `agentTask.incrementOrCreate()` instead of `upsertFromSource()` — same args, but bumps `dedup_count` on identical-input repeats instead of creating new rows. `closeFinishedTasks()` cron runs every 5 min via OpsManager, evaluating `closes_when` predicates (kinds: `agent_boot_after`, `spoke_status`, `deadline`) and marking matching rows SUCCEEDED. Sixth-or-later duplicate of an open task >1h old emits a `stuck_source` meta-task surfacing the bug-disguised-as-load. One-time backfill collapses the existing 38 stale `restart_bot` rows to ~2.
+
+**Phase 3 ledger** (`20260502_extend_task_history_ledger.sql`): repurposes `task_history` as the unified event ledger. `agentTask.appendEvent(taskId, eventType, payload)` writes a row with the discriminator `event_type` (created | claimed | needs_approval | approved | rejected | succeeded | failed | dedup_increment | …). Pattern miner (phase A1) reads from this table.
+
+**Telegram `/tasks`** (in `start-bot.ts`): paginated 5-per-page list of open agent_task rows sorted "blocking me first" (NEEDS_APPROVAL/owner=will → FAILED → PENDING). Per-row inline buttons: `✅ Approve` / `❌ Reject` for approval-type rows route through reconciler; `✓ Dismiss` / `✓ Done` for everything else writes hub status directly. No bulk-approve in v1. Uses the dashboard API's sort + filter logic via `fetch /api/dashboard/tasks?bust=1`.
+
 ### Gmail Multi-Account Tokens
 `getAuthenticatedClient(slot)` in `src/lib/gmail/auth.ts` maps token slots to files:
 - `"ap"` → `ap-token.json` (ap@buildasoil.com — incoming invoices)
