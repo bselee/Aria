@@ -1,6 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
+import * as agentTask from "./agent-task";
 import { Telegraf, Markup } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { z } from "zod";
@@ -471,20 +472,59 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             }
                         }
 
-                        // Mark as read
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: m.id!,
-                            requestBody: {
-                                addLabelIds: [invoiceFwdLabelId],
-                                removeLabelIds: ["INBOX", "UNREAD"]
-                            }
-                        });
+                        // Mark as read ONLY if a Bill.com forward actually succeeded.
+                        // If every forward attempt failed (SMTP error, missing attachment data,
+                        // empty body, fallback PDF generation throw), leave the email in INBOX
+                        // so the next AP poll retries it AND surface the failure to Will via
+                        // the control-plane hub (/dashboard/tasks). Previous behavior marked
+                        // read unconditionally, silently swallowing failures.
                         const pdfNames = pdfPartsDropship.map((p: any) => p.filename).join(", ") || 'generated PDF';
-                        await this.logActivity(supabase, from, subject, "DROPSHIP",
-                            `${routingRule.label} — forwarded to Bill.com (${pdfNames}), no PO matching`,
-                            { attachments: pdfNames, dropship: true, vendor: routingRule.label });
-                        console.log(`     ✅ Dropship complete: forwarded, marked read, no PO matching`);
+                        if (forwardedAny) {
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.id!,
+                                requestBody: {
+                                    addLabelIds: [invoiceFwdLabelId],
+                                    removeLabelIds: ["INBOX", "UNREAD"]
+                                }
+                            });
+                            await this.logActivity(supabase, from, subject, "DROPSHIP",
+                                `${routingRule.label} — forwarded to Bill.com (${pdfNames}), no PO matching`,
+                                { attachments: pdfNames, dropship: true, vendor: routingRule.label });
+                            console.log(`     ✅ Dropship complete: forwarded, marked read, no PO matching`);
+                        } else {
+                            console.error(`     ❌ Dropship forward FAILED for ${routingRule.label} — leaving in INBOX for retry`);
+                            await this.logActivity(supabase, from, subject, "DROPSHIP_FAILED",
+                                `${routingRule.label} — Bill.com forward failed; email left in INBOX for retry`,
+                                { attachments: pdfNames, dropship: true, vendor: routingRule.label, forwarded_any: false, pdf_count: pdfPartsDropship.length });
+
+                            // Surface to Will via the control-plane hub. Idempotent on
+                            // (gmail_messages, message_id) — repeated poll cycles update the
+                            // same row instead of creating duplicates. Best-effort: a hub
+                            // failure must not block AP polling.
+                            try {
+                                await agentTask.upsertFromSource({
+                                    sourceTable: "gmail_messages",
+                                    sourceId: m.id!,
+                                    type: "dropship_forward",
+                                    goal: `Dropship forward to bill.com FAILED for ${routingRule.label} — email still in INBOX`,
+                                    status: "FAILED",
+                                    owner: "will",
+                                    priority: 1,
+                                    requiresApproval: true,
+                                    inputs: {
+                                        vendor: routingRule.label,
+                                        gmail_message_id: m.id,
+                                        from,
+                                        subject,
+                                        pdf_names: pdfNames,
+                                        pdf_count: pdfPartsDropship.length,
+                                    },
+                                });
+                            } catch (hubErr: any) {
+                                console.error(`     ⚠️ Failed to surface dropship failure to hub: ${hubErr.message}`);
+                            }
+                        }
                         continue;
                     }
                 }
