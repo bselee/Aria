@@ -277,7 +277,7 @@ describe("APForwarderAgent", () => {
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
     });
 
-    it("archives the source email and marks it processed when invoice processing fails after Bill.com send", async () => {
+    it("keeps the source email in the inbox and marks it retryable when invoice processing fails after Bill.com send", async () => {
         processInvoiceBufferMock.mockResolvedValue({
             success: false,
             state: "processing_error",
@@ -388,12 +388,8 @@ describe("APForwarderAgent", () => {
 
         expect(sendMock).toHaveBeenCalledTimes(1);
         expect(processInvoiceBufferMock).toHaveBeenCalledTimes(1);
-        expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: true });
-        expect(applyMessageLabelPolicyMock).toHaveBeenCalledWith(expect.objectContaining({
-            gmailMessageId: "gmail-source-1",
-            addLabels: ["Invoice Forward"],
-            removeLabels: ["INBOX", "UNREAD"],
-        }));
+        expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
+        expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: false });
         expect(updateCalls).toContainEqual(expect.objectContaining({
             status: "ERROR_PROCESSING",
             extracted_json: expect.objectContaining({

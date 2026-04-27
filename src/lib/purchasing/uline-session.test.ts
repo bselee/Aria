@@ -2,14 +2,12 @@ import os from "os";
 import path from "path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { launchPersistentContextMock, launchMock } = vi.hoisted(() => ({
-    launchPersistentContextMock: vi.fn(),
+const { launchMock } = vi.hoisted(() => ({
     launchMock: vi.fn(),
 }));
 
 vi.mock("playwright", () => ({
     chromium: {
-        launchPersistentContext: launchPersistentContextMock,
         launch: launchMock,
     },
 }));
@@ -21,43 +19,60 @@ describe("launchUlineSession", () => {
         vi.clearAllMocks();
         delete process.env.ULINE_EMAIL;
         delete process.env.ULINE_PASSWORD;
-
-        launchPersistentContextMock.mockResolvedValue({
-            close: vi.fn().mockResolvedValue(undefined),
-        });
     });
 
-    it("uses the Chrome user-data root with the Default profile selected", async () => {
+    it("launches chromium and creates a fresh browser context", async () => {
+        const newPage = vi.fn().mockResolvedValue({});
+        const newContext = vi.fn().mockResolvedValue({
+            pages: vi.fn().mockReturnValue([]),
+            newPage,
+            addCookies: vi.fn().mockResolvedValue(undefined),
+        });
+        const close = vi.fn().mockResolvedValue(undefined);
+        launchMock.mockResolvedValue({
+            newContext,
+            close,
+        });
+
         await launchUlineSession({ headless: false });
 
-        expect(launchPersistentContextMock).toHaveBeenCalledWith(
-            path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data"),
-            expect.objectContaining({
-                channel: "chrome",
-                args: expect.arrayContaining(["--profile-directory=Default"]),
-            }),
-        );
+        expect(launchMock).toHaveBeenCalledWith(expect.objectContaining({
+            headless: false,
+            args: expect.arrayContaining(["--disable-blink-features=AutomationControlled"]),
+        }));
+        expect(newContext).toHaveBeenCalledTimes(1);
+        expect(newPage).toHaveBeenCalledTimes(1);
+        expect(close).not.toHaveBeenCalled();
     });
 
-    it("still prefers the persistent Chrome profile even when credentials are configured", async () => {
+    it("still launches a fresh browser context even when credentials are configured", async () => {
         process.env.ULINE_EMAIL = "ops@example.com";
         process.env.ULINE_PASSWORD = "secret";
 
+        const newContext = vi.fn().mockResolvedValue({
+            pages: vi.fn().mockReturnValue([{}]),
+            newPage: vi.fn(),
+            addCookies: vi.fn().mockResolvedValue(undefined),
+        });
+        launchMock.mockResolvedValue({
+            newContext,
+            close: vi.fn().mockResolvedValue(undefined),
+        });
+
         await launchUlineSession({ headless: false });
 
-        expect(launchPersistentContextMock).toHaveBeenCalledTimes(1);
-        expect(launchMock).not.toHaveBeenCalled();
+        expect(launchMock).toHaveBeenCalledTimes(1);
+        expect(newContext).toHaveBeenCalledTimes(1);
     });
 
-    it("treats the catalog quick order page as ready even if login selectors fail first", async () => {
+    it("treats the catalog quick order page as ready after a retry when body text indicates success", async () => {
+        const evaluate = vi.fn()
+            .mockResolvedValueOnce("unknown")
+            .mockResolvedValueOnce("ready");
         const page = {
             goto: vi.fn().mockResolvedValue(undefined),
-            waitForSelector: vi.fn((selector: string) => {
-                if (selector === "text=Catalog Quick Order") return Promise.resolve({});
-                if (selector === "text=Paste Items Page") return new Promise(resolve => setTimeout(() => resolve({}), 25));
-                return Promise.reject(new Error(`missing ${selector}`));
-            }),
-            waitForTimeout: vi.fn(() => new Promise(resolve => setTimeout(resolve, 50))),
+            waitForTimeout: vi.fn(() => Promise.resolve(undefined)),
+            evaluate,
             fill: vi.fn(),
             click: vi.fn(),
         } as any;
@@ -65,5 +80,12 @@ describe("launchUlineSession", () => {
         const landed = await openUlineQuickOrder(page);
 
         expect(landed).toBe("ready");
+        expect(page.goto).toHaveBeenCalledWith(
+            "https://www.uline.com/Ordering/QuickOrder",
+            expect.objectContaining({
+                waitUntil: "domcontentloaded",
+            }),
+        );
+        expect(evaluate).toHaveBeenCalledTimes(2);
     });
 });

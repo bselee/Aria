@@ -111,8 +111,21 @@ Create separate profile dirs in .{vendor}-profile/ (always gitignored) that can 
 
 Shortcuts: use --headed and --login options during initial setup.
 
-### In-Memory State Warning ⚠️
-Both `reconciler.ts` (`pendingApprovals`, 24h TTL) and `dropship-store.ts` (`pendingDropships`, 48h TTL) use in-memory Maps. **`pm2 restart aria-bot` silently drops all pending Telegram approval requests and unmatched dropship invoices.** There is no persistence layer for these — intentionally ephemeral. Check for pending Telegram approvals before restarting during active invoice processing.
+### Pending Approvals (Persisted)
+`reconciler.ts` (`pendingApprovals`, 24h TTL) uses an in-memory Map **as a read cache**, but the durable copy lives in Supabase `ap_pending_approvals` (see `20260317_add_receiving_to_ap_activity_log.sql`) and rehydrates on boot at `reconciler.ts:127-194`. PO sends, PO reviews, and reconcile-approve confirmations live in `copilot_action_sessions` (`20260325_create_copilot_artifacts_and_sessions.sql`) — same pattern, durable + rehydrated. `pm2 restart aria-bot` is safe for both: the in-memory Map repopulates on the first read miss. TTL is enforced by the `expires_at` column.
+
+**Dropships** do NOT have a pending store. `ap-agent.ts:409-489` forwards dropship PDFs to `buildasoilap@bill.com` inline and marks the email read; there is nothing to lose on restart. The `pending_dropships` table exists in migrations but has no production writer (orphaned from an earlier refactor).
+
+### Control Plane: `/dashboard/tasks`
+Aria has a unified ticket hub at `agent_task` (see `supabase/migrations/20260428_create_agent_task.sql` and `.agents/plans/control-plane.md`). Every approval, dropship, exception, runbook command, and recent cron failure surfaces as one row with status, owner, priority, and approval gate. The dashboard view lives at `/dashboard/tasks` and the TypeScript surface is `src/lib/intelligence/agent-task.ts` (`upsertFromSource`, `updateBySource`, `decideApproval`, `decideApprovalBySource`, `complete`, `fail`, `appendEvent`, `getById`, `getBySource`).
+
+**Phase 2 spoke writers** (`20260429_add_task_id_to_spokes.sql`): `ops-manager.safeRun()` failure path, `reconciler.storePendingApproval/approve/reject`, `oversight-agent.escalate`, and `supervisor-agent.supervise` (lazy-upserts hub row at top of each iteration since nothing else inserts to `ops_agent_exceptions` today). All hub writes are gated by `HUB_TASKS_ENABLED` env (default `true`; set to `false`/`0`/`off` for one-line rollback). All writes are best-effort — a hub failure never blocks the spoke insert. `copilot_action_sessions` writers are not wired (no production writer exists for that table; column added for forward compat).
+
+**Phase 2.5 hygiene** (`20260501_hygiene_backfill.sql`): adds `dedup_count`, `input_hash`, `closes_when` to `agent_task`. Spoke writers should call `agentTask.incrementOrCreate()` instead of `upsertFromSource()` — same args, but bumps `dedup_count` on identical-input repeats instead of creating new rows. `closeFinishedTasks()` cron runs every 5 min via OpsManager, evaluating `closes_when` predicates (kinds: `agent_boot_after`, `spoke_status`, `deadline`) and marking matching rows SUCCEEDED. Sixth-or-later duplicate of an open task >1h old emits a `stuck_source` meta-task surfacing the bug-disguised-as-load. One-time backfill collapses the existing 38 stale `restart_bot` rows to ~2.
+
+**Phase 3 ledger** (`20260502_extend_task_history_ledger.sql`): repurposes `task_history` as the unified event ledger. `agentTask.appendEvent(taskId, eventType, payload)` writes a row with the discriminator `event_type` (created | claimed | needs_approval | approved | rejected | succeeded | failed | dedup_increment | …). Pattern miner (phase A1) reads from this table.
+
+**Telegram `/tasks`** (in `start-bot.ts`): paginated 5-per-page list of open agent_task rows sorted "blocking me first" (NEEDS_APPROVAL/owner=will → FAILED → PENDING). Per-row inline buttons: `✅ Approve` / `❌ Reject` for approval-type rows route through reconciler; `✓ Dismiss` / `✓ Done` for everything else writes hub status directly. No bulk-approve in v1. Uses the dashboard API's sort + filter logic via `fetch /api/dashboard/tasks?bust=1`.
 
 ### Gmail Multi-Account Tokens
 `getAuthenticatedClient(slot)` in `src/lib/gmail/auth.ts` maps token slots to files:
@@ -409,6 +422,7 @@ GITHUB_OWNER                  # GitHub repo owner
 GITHUB_REPO                   # GitHub repo name
 FIRECRAWL_API_KEY             # Vendor web enrichment
 PERPLEXITY_API_KEY            # Optional
+HUB_TASKS_ENABLED             # Optional (default: true). Set to "false"/"0"/"off" to disable all agent_task hub writes — one-line rollback for phase 2 control-plane wiring without redeploying. Reads (dashboard /tasks) keep working with whatever rows already exist.
 ```
 
 Google OAuth tokens are stored in `token.json` (bill.selee — default slot) and `ap-token.json` (ap@buildasoil.com — ap slot) and `calendar-token.json` (Calendar). Run `src/cli/gmail-auth.ts` or `src/cli/calendar-auth.ts` to generate them.

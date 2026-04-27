@@ -48,11 +48,40 @@ export async function createOpsControlRequest(
         payload?: Record<string, unknown>;
     },
 ): Promise<OpsControlRequestRow> {
+    const target = request.target ?? defaultTargetForCommand(request.command);
+
+    // Source-side dedup: if a pending/claimed request already exists for the
+    // same (command, target), reuse it. This stops the watchdog (and any
+    // future runbook caller) from stacking N identical rows when a single
+    // pending one already represents the intent. Centralizes the concern at
+    // the spawner instead of asking the agent_task hub to compensate.
+    //
+    // Dedup key is (command, target) deliberately — requestedBy / reason /
+    // payload may differ across emissions but the operation is the same.
+    // Different targets ARE genuinely distinct signals and DO get separate
+    // rows (e.g. restart_bot/watchdog vs restart_bot/aria-bot).
+    const { data: existing } = await supabase
+        .from("ops_control_requests")
+        .select("*")
+        .eq("command", request.command)
+        .eq("target", target)
+        .in("status", ["pending", "claimed"])
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+    if (existing) {
+        console.log(
+            `[ops-control] reusing pending control_request id=${existing.id} for ${request.command}/${target} (requested_by=${request.requestedBy})`,
+        );
+        return existing as OpsControlRequestRow;
+    }
+
     const { data, error } = await supabase
         .from("ops_control_requests")
         .insert({
             command: request.command,
-            target: request.target ?? defaultTargetForCommand(request.command),
+            target,
             requested_by: request.requestedBy,
             reason: request.reason ?? null,
             payload: request.payload ?? {},
