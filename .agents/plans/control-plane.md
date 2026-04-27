@@ -7,17 +7,12 @@
 > once phase 6 has provided the second skill-consumer.
 >
 > **Migration apply log:**
-> - `20260417_create_agent_heartbeats.sql` (ALTER no-op, idempotent) — applied 2026-04-27
->   via `node _run_migration.js`. `agent_heartbeats` retained the live 0415 shape
->   (`heartbeat_at`, `metadata`, lowercase `status`). Verified: columns match the 0415
->   schema, no schema drift.
-> - `20260428_create_agent_task.sql` (CREATE TABLE + 6 indexes + backfill) — applied
->   2026-04-27. Verified: 24 columns, 6 indexes (incl. `uq_agent_task_source` partial
->   unique gate), one-time backfill seeded 38 rows from existing pending spokes.
-> - `20260429_add_task_id_to_spokes.sql` (5 ADD COLUMN IF NOT EXISTS + indexes + backfill
->   UPDATE) — **pending apply on Will's machine.** Adds nullable `task_id` to
->   `ap_pending_approvals`, `copilot_action_sessions`, `ops_agent_exceptions`,
->   `ops_control_requests`, `cron_runs`, with reverse-FK backfill from `agent_task`.
+> - `20260417_create_agent_heartbeats.sql` — ✅ applied 2026-04-27. Live 0415 shape preserved.
+> - `20260428_create_agent_task.sql` — ✅ applied 2026-04-27. 24 cols, 6 indexes, 38 backfill rows.
+> - `20260429_add_task_id_to_spokes.sql` — ✅ applied 2026-04-27.
+> - `20260501_hygiene_backfill.sql` — 📦 committed in `fa9b2bb`, **awaiting apply** (destructive backfill: 38 → ~2 rows).
+> - `20260502_extend_task_history_ledger.sql` — 📦 committed in `4ec8c1f`, **awaiting apply** (additive).
+> - `20260503_create_email_context_log.sql` — ✅ applied 2026-04-27 (orthogonal Pinecone refactor).
 
 ## 1. Context
 

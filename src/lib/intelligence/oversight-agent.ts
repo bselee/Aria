@@ -238,8 +238,11 @@ export class OversightAgent {
       });
 
       // Mirror to control-plane hub. Best-effort; never block the runbook.
+      // Phase 2.5: incrementOrCreate dedups repeated escalations for the same
+      // agent into dedup_count++ instead of stacking rows. closesWhen fires
+      // the moment the agent's heartbeat goes healthy again.
       try {
-        const taskId = await agentTask.upsertFromSource({
+        const task = await agentTask.incrementOrCreate({
           sourceTable: "ops_control_requests",
           sourceId: String(requestRow.id),
           type: "control_command",
@@ -253,11 +256,9 @@ export class OversightAgent {
             actions,
           },
         });
-        if (taskId) {
-          await supabase.from("ops_control_requests")
-            .update({ task_id: taskId })
-            .eq("id", requestRow.id);
-        }
+        await supabase.from("ops_control_requests")
+          .update({ task_id: task.id })
+          .eq("id", requestRow.id);
       } catch { /* hub write is best-effort */ }
     } catch (err: any) {
       console.error(`[Oversight] Failed to escalate ${agentName}: ${err.message}`);

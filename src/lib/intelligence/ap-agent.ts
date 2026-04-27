@@ -499,11 +499,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 { attachments: pdfNames, dropship: true, vendor: routingRule.label, forwarded_any: false, pdf_count: pdfPartsDropship.length });
 
                             // Surface to Will via the control-plane hub. Idempotent on
-                            // (gmail_messages, message_id) — repeated poll cycles update the
-                            // same row instead of creating duplicates. Best-effort: a hub
-                            // failure must not block AP polling.
+                            // (gmail_messages, message_id) — repeated poll cycles dedup via
+                            // incrementOrCreate's dedup_count bump instead of creating new
+                            // rows. Best-effort: a hub failure must not block AP polling.
                             try {
-                                await agentTask.upsertFromSource({
+                                await agentTask.incrementOrCreate({
                                     sourceTable: "gmail_messages",
                                     sourceId: m.id!,
                                     type: "dropship_forward",
