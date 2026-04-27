@@ -84,6 +84,9 @@ describe("APForwarderAgent", () => {
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
         }));
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: vi.fn().mockResolvedValue({ error: null }),
+        }));
         const updateEqMock = vi.fn().mockResolvedValue({ error: null });
         const updateMock = vi.fn((payload: { status: string }) => {
             if (payload.status === "PROCESSING_FORWARD") {
@@ -117,6 +120,11 @@ describe("APForwarderAgent", () => {
                     return {
                         select: selectMock,
                         update: updateMock,
+                    };
+                }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
                     };
                 }
                 return {
@@ -195,6 +203,9 @@ describe("APForwarderAgent", () => {
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
         }));
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: vi.fn().mockResolvedValue({ error: null }),
+        }));
         const updateEqMock = vi.fn().mockResolvedValue({ error: null });
         const updateMock = vi.fn((payload: { status: string }) => {
             if (payload.status === "PROCESSING_FORWARD") {
@@ -231,6 +242,11 @@ describe("APForwarderAgent", () => {
                         update: updateMock,
                     };
                 }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
+                    };
+                }
                 return {
                     insert: vi.fn().mockResolvedValue({}),
                 };
@@ -255,7 +271,7 @@ describe("APForwarderAgent", () => {
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
     });
 
-    it("keeps the source email in the inbox when invoice processing fails after Bill.com send", async () => {
+    it("keeps the source email in the inbox and marks it retryable when invoice processing fails after Bill.com send", async () => {
         processInvoiceBufferMock.mockResolvedValue({
             success: false,
             state: "processing_error",
@@ -292,6 +308,10 @@ describe("APForwarderAgent", () => {
         ];
 
         const updateCalls: Array<{ status: string; extracted_json?: Record<string, unknown> }> = [];
+        const emailQueueUpdateEqMock = vi.fn().mockResolvedValue({ error: null });
+        const emailQueueUpdateMock = vi.fn(() => ({
+            eq: emailQueueUpdateEqMock,
+        }));
         const lockStatusEqMock = vi.fn().mockResolvedValue({ error: null });
         const lockIdEqMock = vi.fn(() => ({
             eq: lockStatusEqMock,
@@ -328,6 +348,11 @@ describe("APForwarderAgent", () => {
                         update: updateMock,
                     };
                 }
+                if (table === "email_inbox_queue") {
+                    return {
+                        update: emailQueueUpdateMock,
+                    };
+                }
                 return {
                     insert: vi.fn().mockResolvedValue({}),
                 };
@@ -351,6 +376,7 @@ describe("APForwarderAgent", () => {
         expect(sendMock).toHaveBeenCalledTimes(1);
         expect(processInvoiceBufferMock).toHaveBeenCalledTimes(1);
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
+        expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: false });
         expect(updateCalls).toContainEqual(expect.objectContaining({
             status: "ERROR_PROCESSING",
             extracted_json: expect.objectContaining({

@@ -245,7 +245,6 @@ export class APForwarderAgent {
                         .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
 
-                    const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
                     if (!processingResult.success) {
                         await supabase
                             .from('email_inbox_queue')
