@@ -9,14 +9,12 @@ import {
 describe("scrapeObservedUlineCartRows", () => {
     it("derives cart quantity from line total when description contains pack text", async () => {
         const page = {
-            locator: vi.fn().mockReturnValue({
-                evaluateAll: vi.fn().mockResolvedValue([
-                    {
-                        text: "S-13505B F-Style Jugs Bulk Pack - 32 oz, White 120/case $150.00 $300.00",
-                        quantityValue: "",
-                    },
-                ]),
-            }),
+            evaluate: vi.fn().mockResolvedValue([
+                {
+                    text: "S-13505B F-Style Jugs Bulk Pack - 32 oz, White 120/case $150.00 $300.00",
+                    quantityValue: "",
+                },
+            ]),
         } as any;
 
         const rows = await scrapeObservedUlineCartRows(page);
@@ -29,6 +27,7 @@ describe("scrapeObservedUlineCartRows", () => {
                 lineTotal: 300,
             },
         ]);
+        expect(page.evaluate).toHaveBeenCalledTimes(1);
     });
 });
 
