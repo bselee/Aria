@@ -98,8 +98,9 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                 // row for this exception (the reportAgentException call from ops-manager
                 // is currently a no-op; a future PR can wire it). This way the
                 // updateBySource calls in the three branches always find the hub row.
+                // Phase 2.5: incrementOrCreate dedups identical-shape exceptions.
                 try {
-                    const taskId = await agentTask.upsertFromSource({
+                    const task = await agentTask.incrementOrCreate({
                         sourceTable: 'ops_agent_exceptions',
                         sourceId: String(rootCause.id),
                         type: 'agent_exception',
@@ -113,9 +114,9 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                             context_data: rootCause.context_data,
                         },
                     });
-                    if (taskId && !rootCause.task_id) {
+                    if (!rootCause.task_id) {
                         await supabase.from('ops_agent_exceptions')
-                            .update({ task_id: taskId })
+                            .update({ task_id: task.id })
                             .eq('id', rootCause.id);
                     }
                 } catch { /* hub write is best-effort */ }

@@ -201,6 +201,14 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
             .single();
         if (updErr) throw updErr;
 
+        // Ledger: dedup increment is its own event_type so the pattern miner
+        // can distinguish "same thing fired again" from "new thing happened".
+        await appendEvent(existing.id, "dedup_increment", {
+            agent_name: "agent-task",
+            task_type: args.type,
+            output_summary: `dedup_count: ${newDedupCount}`,
+        }).catch(() => { /* best-effort ledger */ });
+
         // Stuck-source guard: 6th+ duplicate AND original >1h old → meta-task.
         const ageMs = Date.now() - new Date(existing.created_at).getTime();
         if (newDedupCount > 5 && ageMs > 3600_000) {
@@ -237,6 +245,14 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
         .select()
         .single();
     if (insErr) throw insErr;
+
+    // Ledger: every new hub row gets a 'created' event_type entry.
+    await appendEvent((created as AgentTask).id, "created", {
+        agent_name: "agent-task",
+        task_type: args.type,
+        input_summary: args.goal.slice(0, 200),
+    }).catch(() => { /* best-effort ledger */ });
+
     return created as AgentTask;
 }
 
@@ -321,7 +337,13 @@ export async function decideApproval(
 
     if (error) {
         console.warn("[agent-task] decideApproval failed:", error.message);
+        return;
     }
+
+    await appendEvent(taskId, decision === "approve" ? "approved" : "rejected", {
+        agent_name: decidedBy,
+        task_type: "approval",
+    }).catch(() => { /* best-effort ledger */ });
 }
 
 /** Mark a task SUCCEEDED with optional outputs. */
@@ -344,7 +366,13 @@ export async function complete(
 
     if (error) {
         console.warn("[agent-task] complete failed:", error.message);
+        return;
     }
+
+    await appendEvent(taskId, "succeeded", {
+        agent_name: typeof outputs.completed_by === "string" ? (outputs.completed_by as string) : "agent-task",
+        output_summary: typeof outputs.summary === "string" ? (outputs.summary as string) : "",
+    }).catch(() => { /* best-effort ledger */ });
 }
 
 /** Mark a task FAILED with an error message in outputs.error. */
@@ -364,7 +392,13 @@ export async function fail(taskId: string, errorMessage: string): Promise<void> 
 
     if (error) {
         console.warn("[agent-task] fail failed:", error.message);
+        return;
     }
+
+    await appendEvent(taskId, "failed", {
+        agent_name: "agent-task",
+        output_summary: errorMessage.slice(0, 200),
+    }).catch(() => { /* best-effort ledger */ });
 }
 
 /**
@@ -486,6 +520,28 @@ export async function updateBySource(
 
     if (error) {
         console.warn("[agent-task] updateBySource failed:", error.message);
+        return;
+    }
+
+    // Only emit a ledger row when the patch carried a status (state transition).
+    // Pure metadata updates (owner / priority / outputs) don't deserve a ledger.
+    if (patch.status) {
+        const { data: row } = await supabase
+            .from("agent_task")
+            .select("id")
+            .eq("source_table", sourceTable)
+            .eq("source_id", sourceId)
+            .maybeSingle();
+        if (row?.id) {
+            const eventType = patch.status.toLowerCase();
+            await appendEvent(row.id, eventType, {
+                agent_name: "agent-task",
+                task_type: "transition",
+                output_summary: typeof patch.outputs === "object" && patch.outputs && "remedy" in patch.outputs
+                    ? String((patch.outputs as { remedy: unknown }).remedy)
+                    : "",
+            }).catch(() => { /* best-effort ledger */ });
+        }
     }
 }
 
@@ -521,5 +577,20 @@ export async function decideApprovalBySource(
 
     if (error) {
         console.warn("[agent-task] decideApprovalBySource failed:", error.message);
+        return;
+    }
+
+    // Lookup the task id so the ledger row carries it. Best-effort.
+    const { data: row } = await supabase
+        .from("agent_task")
+        .select("id")
+        .eq("source_table", sourceTable)
+        .eq("source_id", sourceId)
+        .maybeSingle();
+    if (row?.id) {
+        await appendEvent(row.id, decision === "approve" ? "approved" : "rejected", {
+            agent_name: decidedBy,
+            task_type: "approval",
+        }).catch(() => { /* best-effort ledger */ });
     }
 }

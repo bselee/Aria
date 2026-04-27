@@ -287,8 +287,10 @@ export class OpsManager {
 
                 // Mirror to control-plane hub. Failure-only — successful runs do not
                 // generate hub rows by design (would drown out the actual work signal).
+                // Phase 2.5: incrementOrCreate dedups identical-shape failures into
+                // dedup_count++ on the existing row instead of stacking new rows.
                 try {
-                    const taskId = await agentTask.upsertFromSource({
+                    const task = await agentTask.incrementOrCreate({
                         sourceTable: 'cron_runs',
                         sourceId: String(cronRunId),
                         type: 'cron_failure',
@@ -303,13 +305,11 @@ export class OpsManager {
                             started_at: startedAtIso,
                         },
                     });
-                    if (taskId) {
-                        const supabase = createClient();
-                        if (supabase) {
-                            await supabase.from('cron_runs')
-                                .update({ task_id: taskId })
-                                .eq('id', cronRunId);
-                        }
+                    const supabase = createClient();
+                    if (supabase) {
+                        await supabase.from('cron_runs')
+                            .update({ task_id: task.id })
+                            .eq('id', cronRunId);
                     }
                 } catch { /* hub write is best-effort */ }
             }

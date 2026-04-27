@@ -101,9 +101,10 @@ export async function storePendingApproval(result: ReconciliationResult, client:
 
     // Mirror to control-plane hub. Best-effort: a hub-write failure must not
     // block the AP pipeline (Will still gets the Telegram approval prompt; the
-    // dashboard just won't show this row until the next backfill).
+    // dashboard just won't show this row until the next backfill). Phase 2.5:
+    // incrementOrCreate dedups identical approvals (rare for AP but consistent).
     try {
-        const taskId = await agentTask.upsertFromSource({
+        const task = await agentTask.incrementOrCreate({
             sourceTable: "ap_pending_approvals",
             sourceId: dbId,
             type: "approval",
@@ -120,13 +121,11 @@ export async function storePendingApproval(result: ReconciliationResult, client:
             },
             deadlineAt: expiresAt,
         });
-        if (taskId) {
-            const sb = createClient();
-            if (sb) {
-                await sb.from("ap_pending_approvals")
-                    .update({ task_id: taskId })
-                    .eq("id", dbId);
-            }
+        const sb = createClient();
+        if (sb) {
+            await sb.from("ap_pending_approvals")
+                .update({ task_id: task.id })
+                .eq("id", dbId);
         }
     } catch (err: any) {
         console.warn(`[reconciler] hub upsert failed: ${err.message}`);
