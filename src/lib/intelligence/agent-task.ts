@@ -68,6 +68,17 @@ export type AgentTask = {
     claimed_at: string | null;
     claimed_by: string | null;
     completed_at: string | null;
+    dedup_count?: number;
+    input_hash?: string | null;
+    closes_when?: ClosurePredicate | null;
+};
+
+export type ListTasksFilters = {
+    status?: string[];
+    type?: string[];
+    owner?: string;
+    limit?: number;
+    includeRecentFailed?: boolean;
 };
 
 export type UpsertFromSourceArgs = {
@@ -106,6 +117,33 @@ function hubEnabled(): boolean {
     return v !== "false" && v !== "0" && v !== "off" && v !== "no";
 }
 
+function eventTypeForStatus(status: AgentTaskStatus): string | null {
+    switch (status) {
+        case "PENDING":
+            return "created";
+        case "CLAIMED":
+            return "claimed";
+        case "RUNNING":
+            return "running";
+        case "NEEDS_APPROVAL":
+            return "needs_approval";
+        case "APPROVED":
+            return "approved";
+        case "REJECTED":
+            return "rejected";
+        case "SUCCEEDED":
+            return "succeeded";
+        case "FAILED":
+            return "failed";
+        case "EXPIRED":
+            return "expired";
+        case "CANCELLED":
+            return "cancelled";
+        default:
+            return null;
+    }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -121,6 +159,19 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
     if (!hubEnabled()) return null;
     const supabase = createClient();
     if (!supabase) return null;
+
+    let previousStatus: AgentTaskStatus | null = null;
+    try {
+        const { data: existing } = await supabase
+            .from("agent_task")
+            .select("id, status")
+            .eq("source_table", args.sourceTable)
+            .eq("source_id", args.sourceId)
+            .maybeSingle();
+        previousStatus = (existing?.status as AgentTaskStatus | undefined) ?? null;
+    } catch {
+        previousStatus = null;
+    }
 
     const row = {
         type: args.type,
@@ -147,7 +198,24 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
         console.warn("[agent-task] upsertFromSource failed:", error.message);
         return null;
     }
-    return data?.id ?? null;
+    const taskId = data?.id ?? null;
+    if (taskId) {
+        const nextStatus = row.status as AgentTaskStatus;
+        const eventType = previousStatus === null
+            ? "created"
+            : previousStatus !== nextStatus
+            ? eventTypeForStatus(nextStatus)
+            : null;
+        if (eventType) {
+            await appendEvent(taskId, eventType, {
+                task_type: args.type,
+                input_summary: args.goal,
+                output_summary: `${args.sourceTable}:${args.sourceId}`,
+                status: nextStatus,
+            });
+        }
+    }
+    return taskId;
 }
 
 // ── incrementOrCreate (phase 2.5 hygiene) ────────────────────────────────────
@@ -201,23 +269,21 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
             .single();
         if (updErr) throw updErr;
 
-        // Ledger: dedup increment is its own event_type so the pattern miner
-        // can distinguish "same thing fired again" from "new thing happened".
-        await appendEvent(existing.id, "dedup_increment", {
-            agent_name: "agent-task",
-            task_type: args.type,
-            output_summary: `dedup_count: ${newDedupCount}`,
-        }).catch(() => { /* best-effort ledger */ });
-
         // Stuck-source guard: 6th+ duplicate AND original >1h old → meta-task.
         const ageMs = Date.now() - new Date(existing.created_at).getTime();
         if (newDedupCount > 5 && ageMs > 3600_000) {
             await emitStuckSourceMetaTask(supabase, args, existing.id, newDedupCount);
         }
+        await appendEvent(existing.id, "dedup_increment", {
+            task_type: args.type,
+            input_summary: args.goal,
+            output_summary: `dedup_count=${newDedupCount}`,
+            dedup_count: newDedupCount,
+        });
         return updated as AgentTask;
     }
 
-    const closesWhen: ClosurePredicate = closesWhenFor({
+    const closesWhen: ClosurePredicate | null = closesWhenFor({
         type: args.type,
         sourceTable: args.sourceTable,
         inputs,
@@ -245,14 +311,14 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
         .select()
         .single();
     if (insErr) throw insErr;
-
-    // Ledger: every new hub row gets a 'created' event_type entry.
-    await appendEvent((created as AgentTask).id, "created", {
-        agent_name: "agent-task",
-        task_type: args.type,
-        input_summary: args.goal.slice(0, 200),
-    }).catch(() => { /* best-effort ledger */ });
-
+    if (created?.id) {
+        await appendEvent(created.id, "created", {
+            task_type: args.type,
+            input_summary: args.goal,
+            output_summary: `${args.sourceTable}:${args.sourceId}`,
+            status: args.status ?? "PENDING",
+        });
+    }
     return created as AgentTask;
 }
 
@@ -289,10 +355,15 @@ async function emitStuckSourceMetaTask(
                 updated_at: new Date().toISOString(),
             })
             .eq("id", existingMeta.id);
+        await appendEvent(existingMeta.id, "dedup_increment", {
+            task_type: "stuck_source",
+            output_summary: `dedup_count=${dedupCount}`,
+            dedup_count: dedupCount,
+        });
         return;
     }
 
-    await supabase.from("agent_task").insert({
+    const { data: createdMeta, error: metaErr } = await supabase.from("agent_task").insert({
         type: "stuck_source",
         source_table: null,
         source_id: null,
@@ -306,7 +377,16 @@ async function emitStuckSourceMetaTask(
         input_hash: metaHash,
         closes_when: { kind: "deadline", max_age_hours: 168 },
         dedup_count: 1,
-    });
+    }).select("id").single();
+    if (metaErr) throw metaErr;
+    if (createdMeta?.id) {
+        await appendEvent(createdMeta.id, "created", {
+            task_type: "stuck_source",
+            input_summary: `Investigate stuck source ${originalArgs.sourceTable}/${originalArgs.sourceId}`,
+            output_summary: `dedup_count=${dedupCount}`,
+            dedup_count: dedupCount,
+        });
+    }
 }
 
 /**
@@ -339,11 +419,11 @@ export async function decideApproval(
         console.warn("[agent-task] decideApproval failed:", error.message);
         return;
     }
-
     await appendEvent(taskId, decision === "approve" ? "approved" : "rejected", {
-        agent_name: decidedBy,
         task_type: "approval",
-    }).catch(() => { /* best-effort ledger */ });
+        output_summary: `${decision} by ${decidedBy}`,
+        decided_by: decidedBy,
+    });
 }
 
 /** Mark a task SUCCEEDED with optional outputs. */
@@ -368,11 +448,15 @@ export async function complete(
         console.warn("[agent-task] complete failed:", error.message);
         return;
     }
-
     await appendEvent(taskId, "succeeded", {
-        agent_name: typeof outputs.completed_by === "string" ? (outputs.completed_by as string) : "agent-task",
-        output_summary: typeof outputs.summary === "string" ? (outputs.summary as string) : "",
-    }).catch(() => { /* best-effort ledger */ });
+        task_type: "resolution",
+        output_summary: typeof outputs.summary === "string"
+            ? outputs.summary
+            : outputs.error
+            ? String(outputs.error)
+            : "completed",
+        ...outputs,
+    });
 }
 
 /** Mark a task FAILED with an error message in outputs.error. */
@@ -394,11 +478,11 @@ export async function fail(taskId: string, errorMessage: string): Promise<void> 
         console.warn("[agent-task] fail failed:", error.message);
         return;
     }
-
     await appendEvent(taskId, "failed", {
-        agent_name: "agent-task",
-        output_summary: errorMessage.slice(0, 200),
-    }).catch(() => { /* best-effort ledger */ });
+        task_type: "resolution",
+        output_summary: errorMessage,
+        error: errorMessage,
+    });
 }
 
 /**
@@ -495,6 +579,49 @@ export async function getBySource(
     return (data as AgentTask | null) ?? null;
 }
 
+export async function listTasks(filters: ListTasksFilters = {}): Promise<AgentTask[]> {
+    const supabase = createClient();
+    if (!supabase) {
+        throw new Error("Supabase not configured");
+    }
+
+    let query = supabase
+        .from("agent_task")
+        .select("*")
+        .order("priority", { ascending: true })
+        .order("created_at", { ascending: false });
+
+    if (filters.status?.length) {
+        query = query.in("status", filters.status);
+    } else {
+        const open = ["PENDING", "CLAIMED", "RUNNING", "NEEDS_APPROVAL"];
+        if (filters.includeRecentFailed !== false) {
+            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            query = query.or(
+                `status.in.(${open.join(",")}),and(status.eq.FAILED,created_at.gte.${since})`,
+            );
+        } else {
+            query = query.in("status", open);
+        }
+    }
+
+    if (filters.type?.length) {
+        query = query.in("type", filters.type);
+    }
+
+    if (filters.owner) {
+        query = query.eq("owner", filters.owner);
+    }
+
+    query = query.limit(Math.min(filters.limit ?? 200, 500));
+
+    const { data, error } = await query;
+    if (error) {
+        throw new Error(error.message);
+    }
+    return (data ?? []) as AgentTask[];
+}
+
 /**
  * Patch the hub row for a given spoke source. Used by SupervisorAgent and other
  * spoke writers that already have (sourceTable, sourceId) and want to update
@@ -523,24 +650,19 @@ export async function updateBySource(
         return;
     }
 
-    // Only emit a ledger row when the patch carried a status (state transition).
-    // Pure metadata updates (owner / priority / outputs) don't deserve a ledger.
     if (patch.status) {
-        const { data: row } = await supabase
-            .from("agent_task")
-            .select("id")
-            .eq("source_table", sourceTable)
-            .eq("source_id", sourceId)
-            .maybeSingle();
+        const row = await getBySource(sourceTable, sourceId);
         if (row?.id) {
-            const eventType = patch.status.toLowerCase();
-            await appendEvent(row.id, eventType, {
-                agent_name: "agent-task",
-                task_type: "transition",
-                output_summary: typeof patch.outputs === "object" && patch.outputs && "remedy" in patch.outputs
-                    ? String((patch.outputs as { remedy: unknown }).remedy)
-                    : "",
-            }).catch(() => { /* best-effort ledger */ });
+            const eventType = eventTypeForStatus(patch.status);
+            if (eventType) {
+                await appendEvent(row.id, eventType, {
+                    task_type: row.type,
+                    output_summary: typeof patch.outputs === "object" && patch.outputs && "remedy" in patch.outputs
+                        ? String((patch.outputs as { remedy: unknown }).remedy)
+                        : `${sourceTable}:${sourceId}`,
+                    status: patch.status,
+                });
+            }
         }
     }
 }
@@ -580,17 +702,12 @@ export async function decideApprovalBySource(
         return;
     }
 
-    // Lookup the task id so the ledger row carries it. Best-effort.
-    const { data: row } = await supabase
-        .from("agent_task")
-        .select("id")
-        .eq("source_table", sourceTable)
-        .eq("source_id", sourceId)
-        .maybeSingle();
+    const row = await getBySource(sourceTable, sourceId);
     if (row?.id) {
         await appendEvent(row.id, decision === "approve" ? "approved" : "rejected", {
-            agent_name: decidedBy,
-            task_type: "approval",
-        }).catch(() => { /* best-effort ledger */ });
+            task_type: row.type,
+            output_summary: `${decision} by ${decidedBy}`,
+            decided_by: decidedBy,
+        });
     }
 }

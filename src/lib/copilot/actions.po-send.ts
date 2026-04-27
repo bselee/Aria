@@ -6,8 +6,8 @@
  *          outcomes (throw, partial email failure, success) into the
  *          shared ActionResult shape so callers never need try/catch.
  *
- *          Session persistence: currently backed by in-memory po-sender store.
- *          Migration path: copilot_action_sessions table for restart-safe recovery.
+ *          Session persistence is backed by `copilot_action_sessions` with an
+ *          in-memory cache layered on top for same-process reuse.
  */
 
 import { getPendingPOSend, commitAndSendPO } from "../purchasing/po-sender";
@@ -45,7 +45,7 @@ export async function executePOSendAction(input: POSendActionInput): Promise<Act
     }
 
     // Guard: session must exist and be fresh
-    const pending = getPendingPOSend(sendId);
+    const pending = await getPendingPOSend(sendId);
     if (!pending) {
         return makeActionResult(
             "failed",

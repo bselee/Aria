@@ -869,40 +869,40 @@ bot.on('text', async (ctx) => {
     }
 
     async function fetchTasksPage(offset: number): Promise<{ tasks: agentTask.AgentTask[]; total: number }> {
-        try {
-            const res = await fetch(`http://127.0.0.1:${process.env.PORT ?? 3000}/api/dashboard/tasks?bust=1`);
-            if (!res.ok) return { tasks: [], total: 0 };
-            const json = await res.json();
-            const all: agentTask.AgentTask[] = json.tasks ?? [];
-            const rank = (t: agentTask.AgentTask) =>
-                (t.status === 'NEEDS_APPROVAL' && t.owner === 'will' ? 0 : t.status === 'NEEDS_APPROVAL' ? 1 : t.status === 'FAILED' ? 2 : 3) * 1000 +
-                (t.priority ?? 2);
-            const sorted = [...all].sort((a, b) => {
-                const r = rank(a) - rank(b);
-                if (r !== 0) return r;
-                return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-            });
-            return { tasks: sorted.slice(offset, offset + TASKS_PAGE_SIZE), total: sorted.length };
-        } catch {
-            return { tasks: [], total: 0 };
-        }
+        const all = await agentTask.listTasks({
+            limit: 500,
+            includeRecentFailed: true,
+        });
+        const rank = (t: agentTask.AgentTask) =>
+            (t.status === 'NEEDS_APPROVAL' && t.owner === 'will' ? 0 : t.status === 'NEEDS_APPROVAL' ? 1 : t.status === 'FAILED' ? 2 : 3) * 1000 +
+            (t.priority ?? 2);
+        const sorted = [...all].sort((a, b) => {
+            const r = rank(a) - rank(b);
+            if (r !== 0) return r;
+            return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+        });
+        return { tasks: sorted.slice(offset, offset + TASKS_PAGE_SIZE), total: sorted.length };
     }
 
     bot.command('tasks', async (ctx) => {
-        const { tasks, total } = await fetchTasksPage(0);
-        const { text, keyboard } = renderTasksMessage(tasks, 0, total);
-        await ctx.reply(text, keyboard);
+        try {
+            const { tasks, total } = await fetchTasksPage(0);
+            const { text, keyboard } = renderTasksMessage(tasks, 0, total);
+            await ctx.reply(text, keyboard);
+        } catch (err: any) {
+            await ctx.reply(`⚠️ Task queue unavailable: ${err.message ?? String(err)}`);
+        }
     });
 
     bot.action(/^tasks_page_(\d+)$/, async (ctx) => {
         const offset = parseInt(ctx.match[1], 10) || 0;
         await ctx.answerCbQuery('Refreshing...');
-        const { tasks, total } = await fetchTasksPage(offset);
-        const { text, keyboard } = renderTasksMessage(tasks, offset, total);
         try {
+            const { tasks, total } = await fetchTasksPage(offset);
+            const { text, keyboard } = renderTasksMessage(tasks, offset, total);
             await ctx.editMessageText(text, keyboard);
-        } catch {
-            await ctx.reply(text, keyboard);
+        } catch (err: any) {
+            await ctx.reply(`⚠️ Task queue unavailable: ${err.message ?? String(err)}`);
         }
     });
 

@@ -9,7 +9,7 @@
  *          Spec: .agents/plans/2026-04-27-task-learning-loop.md §4.2
  */
 import { createClient } from "@/lib/supabase";
-import type { AgentTask } from "./agent-task";
+import { appendEvent, type AgentTask } from "./agent-task";
 
 export type ClosurePredicate =
     | { kind: "agent_boot_after"; agent: string }
@@ -68,7 +68,7 @@ export function closesWhenFor(args: {
     type: string;
     sourceTable?: string;
     inputs?: Record<string, unknown>;
-}): ClosurePredicate {
+}): ClosurePredicate | null {
     if (args.type === "control_command" && args.inputs?.command === "restart_bot") {
         return { kind: "agent_boot_after", agent: "aria-bot" };
     }
@@ -82,7 +82,10 @@ export function closesWhenFor(args: {
             value_in: ["approved", "rejected", "completed", "sent", "done"],
         };
     }
-    return { kind: "deadline", max_age_hours: 24 };
+    if (args.type === "stuck_source") {
+        return { kind: "deadline", max_age_hours: 168 };
+    }
+    return null;
 }
 
 /**
@@ -104,15 +107,23 @@ export async function closeFinishedTasks(): Promise<number> {
     let closed = 0;
     for (const task of data as AgentTask[]) {
         if (await evaluateClosure(task)) {
+            const resolvedStatus = task.closes_when?.kind === "deadline" ? "EXPIRED" : "SUCCEEDED";
             const { error: upErr } = await supabase
                 .from("agent_task")
                 .update({
-                    status: "SUCCEEDED",
+                    status: resolvedStatus,
                     completed_at: new Date().toISOString(),
                     updated_at: new Date().toISOString(),
                 })
                 .eq("id", task.id);
-            if (!upErr) closed++;
+            if (!upErr) {
+                closed++;
+                await appendEvent(task.id, resolvedStatus === "EXPIRED" ? "expired" : "succeeded", {
+                    task_type: task.type,
+                    output_summary: `${task.goal} auto-closed`,
+                    closes_when: task.closes_when,
+                });
+            }
         }
     }
     return closed;

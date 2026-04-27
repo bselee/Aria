@@ -6,9 +6,9 @@
 -- both directions (and to let the dashboard "open the spoke" from a hub row), each
 -- spoke gains a nullable `task_id UUID REFERENCES agent_task(id) ON DELETE SET NULL`.
 --
--- Skipped: `copilot_action_sessions` — no production writers exist for that table
--- yet (see `.agents/plans/control-plane.md` §3.3). Adding the column anyway for
--- forward compat when the writers materialize.
+-- `copilot_action_sessions` is included because PO-send confirmation sessions are
+-- durable production spoke rows and now mirror into the hub like the other control
+-- plane surfaces.
 --
 -- All changes additive (ADD COLUMN IF NOT EXISTS, CREATE INDEX IF NOT EXISTS).
 -- One-time backfill UPDATE uses NOT EXISTS / IS NULL guards so re-running is safe.
@@ -105,4 +105,4 @@ COMMENT ON COLUMN public.ops_control_requests.task_id IS
 COMMENT ON COLUMN public.cron_runs.task_id IS
     'FK to agent_task hub row. Set ONLY for failures (status=error). Successful runs do not generate hub rows.';
 COMMENT ON COLUMN public.copilot_action_sessions.task_id IS
-    'FK to agent_task hub row. No production writers exist yet (see .agents/plans/control-plane.md §3.3). Column added for forward compat.';
+    'FK to agent_task hub row. Set by po-sender after mirroring pending PO-send confirmations into the agent_task hub.';
