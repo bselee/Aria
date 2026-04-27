@@ -18,6 +18,7 @@ import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import { SupervisorAgent } from "./supervisor-agent";
 import * as agentTask from "./agent-task";
+import { closeFinishedTasks } from "./agent-task-closure";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../google/calendar";
 import type { FullPO } from "../finale/client";
 import { BuildParser } from "./build-parser";
@@ -509,6 +510,16 @@ export class OpsManager {
         // Purchasing Calendar Sync every 4 hours
         schedule("0 */4 * * *", () => {
             this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
+        });
+
+        // Hygiene: close completed agent_task rows every 5 minutes
+        schedule("*/5 * * * *", () => {
+            this.safeRun("CloseFinishedTasks", async () => {
+                const closed = await closeFinishedTasks();
+                if (closed > 0) {
+                    console.log(`[OpsManager] closeFinishedTasks: closed ${closed} task(s)`);
+                }
+            });
         });
 
         console.log("✅ OpsManager background jobs registered.");
