@@ -90,6 +90,19 @@ function isoOrNull(d: string | Date | null | undefined): string | null {
     return d.toISOString();
 }
 
+/**
+ * Master kill-switch for all hub writes. Default ON. Set
+ * HUB_TASKS_ENABLED=false (or 0/off) to short-circuit every public function in
+ * this module — useful as a one-line rollback if phase 2 misbehaves in prod.
+ *
+ * Reads are NOT gated; the dashboard /tasks page keeps working with whatever
+ * rows already exist.
+ */
+function hubEnabled(): boolean {
+    const v = (process.env.HUB_TASKS_ENABLED ?? "true").toLowerCase();
+    return v !== "false" && v !== "0" && v !== "off" && v !== "no";
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -102,6 +115,7 @@ function isoOrNull(d: string | Date | null | undefined): string | null {
  * Returns the hub row id, or null if Supabase is unavailable (does not throw).
  */
 export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<string | null> {
+    if (!hubEnabled()) return null;
     const supabase = createClient();
     if (!supabase) return null;
 
@@ -143,6 +157,7 @@ export async function decideApproval(
     decision: "approve" | "reject",
     decidedBy: string,
 ): Promise<void> {
+    if (!hubEnabled()) return;
     const supabase = createClient();
     if (!supabase) return;
 
@@ -168,6 +183,7 @@ export async function complete(
     taskId: string,
     outputs: Record<string, unknown> = {},
 ): Promise<void> {
+    if (!hubEnabled()) return;
     const supabase = createClient();
     if (!supabase) return;
 
@@ -187,6 +203,7 @@ export async function complete(
 
 /** Mark a task FAILED with an error message in outputs.error. */
 export async function fail(taskId: string, errorMessage: string): Promise<void> {
+    if (!hubEnabled()) return;
     const supabase = createClient();
     if (!supabase) return;
 
@@ -215,6 +232,7 @@ export async function appendEvent(
     eventType: string,
     payload: Record<string, unknown> = {},
 ): Promise<void> {
+    if (!hubEnabled()) return;
     const supabase = createClient();
     if (!supabase) return;
 
@@ -289,4 +307,67 @@ export async function getBySource(
         return null;
     }
     return (data as AgentTask | null) ?? null;
+}
+
+/**
+ * Patch the hub row for a given spoke source. Used by SupervisorAgent and other
+ * spoke writers that already have (sourceTable, sourceId) and want to update
+ * the hub without doing a separate getBySource → update.
+ *
+ * No-op if no hub row exists for the source (i.e. the spoke row was created
+ * before HUB_TASKS_ENABLED was on).
+ */
+export async function updateBySource(
+    sourceTable: string,
+    sourceId: string,
+    patch: Partial<Pick<AgentTask, "status" | "owner" | "priority" | "outputs" | "approval_decision">>,
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { error } = await supabase
+        .from("agent_task")
+        .update(patch)
+        .eq("source_table", sourceTable)
+        .eq("source_id", sourceId);
+
+    if (error) {
+        console.warn("[agent-task] updateBySource failed:", error.message);
+    }
+}
+
+/**
+ * Convenience wrapper: record an approve/reject decision against the hub row
+ * identified by spoke (sourceTable, sourceId). Used by reconciler approve and
+ * reject paths so they don't have to look up the task_id first.
+ *
+ * No-op if no hub row exists for the source.
+ */
+export async function decideApprovalBySource(
+    sourceTable: string,
+    sourceId: string,
+    decision: "approve" | "reject",
+    decidedBy: string,
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const status: AgentTaskStatus = decision === "approve" ? "APPROVED" : "REJECTED";
+
+    const { error } = await supabase
+        .from("agent_task")
+        .update({
+            approval_decision: decision,
+            approval_decided_by: decidedBy,
+            approval_decided_at: new Date().toISOString(),
+            status,
+        })
+        .eq("source_table", sourceTable)
+        .eq("source_id", sourceId);
+
+    if (error) {
+        console.warn("[agent-task] decideApprovalBySource failed:", error.message);
+    }
 }

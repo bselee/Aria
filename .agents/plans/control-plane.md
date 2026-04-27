@@ -14,6 +14,10 @@
 > - `20260428_create_agent_task.sql` (CREATE TABLE + 6 indexes + backfill) — applied
 >   2026-04-27. Verified: 24 columns, 6 indexes (incl. `uq_agent_task_source` partial
 >   unique gate), one-time backfill seeded 38 rows from existing pending spokes.
+> - `20260429_add_task_id_to_spokes.sql` (5 ADD COLUMN IF NOT EXISTS + indexes + backfill
+>   UPDATE) — **pending apply on Will's machine.** Adds nullable `task_id` to
+>   `ap_pending_approvals`, `copilot_action_sessions`, `ops_agent_exceptions`,
+>   `ops_control_requests`, `cron_runs`, with reverse-FK backfill from `agent_task`.
 
 ## 1. Context
 
