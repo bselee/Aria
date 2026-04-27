@@ -50,20 +50,20 @@ These are working in production today; the plan **must not break them**.
 | `ops_health_summary` VIEW | `20260415` + `20260416` fix | Single-row health roll-up |
 | `email_inbox_queue` / `ap_inbox_queue` / `nightshift_queue` | `20260305` / `20260324` | Domain processing pipelines |
 | `ap_pending_approvals` | (existing, hydrated at `reconciler.ts:127-194`) | Reconciler approvals **already persisted**; in-memory Map is just a cache |
-| `copilot_action_sessions` | (existing) | Durable pending-action sessions: PO send confirms, dropship forward approvals, reconcile approvals — survives pm2 restart |
+| `copilot_action_sessions` | `20260325_create_copilot_artifacts_and_sessions.sql` | Durable pending-action sessions: PO send confirms, dropship-forward approvals, reconcile approvals. `action_type` ∈ `po_send` \| `po_review` \| `reconcile_approve` \| ...; replaces in-memory pendingDropships / pendingPOSends per `copilot/types.ts:55`. |
 
 **Dropship note:** the `pending_dropships` table in `20260310_create_pending_dropships.sql`
 exists but **no code writes to it**. The dropship store was refactored: deterministic dropships
-(matching a `routingRules` entry in `ap-agent.ts:60-86`) are forwarded directly with no human
-in the loop, and the no-match dropship case that does need Will's approval flows through
-`copilot_action_sessions`. The orphan `pending_dropships` table can be dropped in a future
-cleanup migration but is out of scope for this plan.
+matching a `routingRules` entry (`ap-agent.ts:60-86`) are forwarded inline to Bill.com with no
+human in the loop (`ap-agent.ts:409-489`); the no-match dropship case that does need Will's
+approval flows through `copilot_action_sessions`. The orphan `pending_dropships` table can be
+dropped in a future cleanup migration but is out of scope for this plan.
 
-**Correction to CLAUDE.md:** the "in-memory state lost on pm2 restart" warning for the
-reconciler and PO sender is stale — both persist to Supabase and rehydrate on boot. The
-dropship-store warning is also stale: the in-memory `pendingDropships` Map referenced in
-CLAUDE.md no longer exists; durable dropship-approval state lives in `copilot_action_sessions`.
-This plan focuses on **unification**, not adding persistence. Update CLAUDE.md as part of phase 1.
+**Correction to CLAUDE.md (applied in phase 1):** the "in-memory state lost on pm2 restart"
+warning for the reconciler and PO sender is stale — both persist to Supabase and rehydrate on
+boot. The dropship-store warning is also stale: the in-memory `pendingDropships` Map referenced
+in CLAUDE.md no longer exists; durable dropship-approval state lives in `copilot_action_sessions`.
+This plan focuses on **unification**, not adding persistence.
 
 ## 3. Design — Hub-and-Spoke
 
@@ -128,10 +128,17 @@ Only spokes whose rows can plausibly require human attention or dashboard surfac
 `task_id UUID NULL REFERENCES agent_task(id)`:
 
 - `ap_pending_approvals`        — every row → hub row (always needs Will)
-- `copilot_action_sessions`     — every row → hub row (PO-send confirms, dropship-forward approvals, reconcile approvals — every action_type that lands here needs Will)
+- `copilot_action_sessions`     — every pending row → hub row. `action_type` maps to hub `type`:
+  `reconcile_approve` → `approval`; `po_send` / `po_review` / fallback → `po_send_confirm`;
+  `dropship_forward` (when present) → `dropship_forward`. Every `action_type` that lands here
+  needs Will.
 - `ops_agent_exceptions`        — every row → hub row (Supervisor-resolved ones close fast)
 - `ops_control_requests`        — every row → hub row (runbook command tracking)
 - `cron_runs`                   — **failures only** → hub row (success path is high-volume noise)
+
+`pending_dropships` is **not** a spoke. It exists in migration only; no production writer. The
+dropship code path in `ap-agent.ts:409-489` forwards to Bill.com inline. If we ever reintroduce a
+pending-dropship-review flow it will be via `copilot_action_sessions` (already a spoke).
 
 High-volume domain queues (`email_inbox_queue`, `ap_inbox_queue`, `nightshift_queue`) do **not**
 get a `task_id` for happy-path rows. They only spawn a hub row when escalating to
@@ -146,8 +153,7 @@ This keeps control flow visible and testable.
 |---|---|---|
 | `safeRun()` failure path | `src/lib/intelligence/ops-manager.ts:270-300` | After `cron_runs` update + `ops_agent_exceptions` insert, call `agentTask.upsertFromSource('cron_runs', cronRunId, …)` |
 | `storePendingApproval()` | `src/lib/finale/reconciler.ts:60-101` | After Supabase insert, call `agentTask.upsertFromSource('ap_pending_approvals', dbId, { status: 'NEEDS_APPROVAL', requires_approval: true, … })` |
-| Dropship-forward approval (no-match invoice) | call site that inserts into `copilot_action_sessions` with `actionType='dropship_forward'` | Same pattern, source_table=`copilot_action_sessions` |
-| `storePendingPOSend()` | `src/lib/purchasing/po-sender.ts:118-146` | Same pattern |
+| `createSession()` (copilot) | `src/lib/copilot/actions.ts` and `src/lib/copilot/actions.po-send.ts` | After `copilot_action_sessions` insert, call `agentTask.upsertFromSource('copilot_action_sessions', sessionId, …)`. One call-site per `action_type` (`po_send`, `po_review`, `reconcile_approve`, future `dropship_forward`). Replaces the older standalone `storePendingPOSend` writer. |
 | `OversightAgent.escalate()` | `src/lib/intelligence/oversight-agent.ts` | After `ops_control_requests` insert |
 | `SupervisorAgent.supervise()` | `src/lib/intelligence/supervisor-agent.ts:101-147` | Update hub row's `status`/`approval_decision` when classifying |
 
@@ -168,16 +174,40 @@ today, then **also** write `agent_task.approval_decision` + `approval_decided_by
 | **1** | Hub schema + dashboard `/tasks` page + read-only display | `supabase/migrations/20260428_create_agent_task.sql` (CREATE TABLE + indexes + one-time backfill from existing pending rows in 3 spokes), `src/lib/intelligence/agent-task.ts` (new module), `src/app/api/dashboard/tasks/route.ts`, `src/app/dashboard/tasks/page.tsx`, `src/components/dashboard/TasksPanel.tsx` | ~600 | Drop table, delete page | Will sees one URL with every pending approval, dropship-forward action, exception, control request, recent cron failure |
 | **2** | Wire spoke writers (`safeRun` failure, reconciler, copilot_action_sessions writers, po-send, oversight escalate, supervisor classify). Add `task_id` FK columns to spoke tables. | `supabase/migrations/20260429_add_task_id_to_spokes.sql`, edits to 5 call-sites in §3.4 | ~450 | `HUB_TASKS_ENABLED=false`; FK column nullable | After 24h, every new spoke row has a matching hub row; dashboard list updates without backfill |
 | **3** | Repurpose `task_history` as ledger. Add `task_id` + `event_type` columns. Wire `agentTask.appendEvent()` at every status transition. | `supabase/migrations/20260430_extend_task_history.sql`, `src/lib/intelligence/agent-task.ts` (appendEvent) | ~250 | Columns nullable; old writers untouched | Every hub row has ≥1 ledger row by completion; dashboard shows event timeline |
-| **4** | Skill registry sync on boot. Scan `.agents/skills/*.md` + `.agents/workflows/*.md`, content-hash-gated upsert into `skills`, embed via Pinecone (`gravity-memory` index, namespace `aria-memory`). | `src/lib/skills/loader.ts` (new), edit `src/cli/start-bot.ts` boot sequence | ~250 | `SKILL_SYNC_ENABLED=false` | `SELECT count(*) FROM skills WHERE created_by='auto'` matches markdown file count after boot; re-boot is no-op (hash unchanged) |
-| **5** | Skill injection at runtime. Hybrid: keyword/agent_name filter, then Pinecone embedding lookup if >5 matches. Inject top-3 skills' `description` + `steps` into task context. | `src/lib/skills/resolver.ts` (new), call sites in `safeRun()` and bot tool handlers | ~250 | `SKILL_INJECTION_ENABLED=false` | `times_invoked` increments on real runs; success rate tracked per skill |
-| **6** | GitHub coding-task adapter. New `agent_task.type='code_change'`. Worker: open Issue → spawn Claude Code in worktree → open PR → webhook updates task status on PR review/merge. | `src/lib/intelligence/code-task-runner.ts`, `src/app/api/webhooks/github/route.ts` (extend), `.agents/workflows/code-task.md` | ~600 | Disable webhook subscription + `CODE_TASKS_ENABLED=false` | Manually filed `code_change` task produces a real PR; close-on-merge updates hub row |
+| **4** ⏸ | Skill registry sync on boot. Scan `.agents/skills/*.md` + `.agents/workflows/*.md`, content-hash-gated upsert into `skills`, embed via Pinecone (`gravity-memory` index, namespace `aria-memory`). | `src/lib/skills/loader.ts` (new), edit `src/cli/start-bot.ts` boot sequence | ~250 | `SKILL_SYNC_ENABLED=false` | `SELECT count(*) FROM skills WHERE created_by='auto'` matches markdown file count after boot; re-boot is no-op (hash unchanged) |
+| **5** ⏸ | Skill injection at runtime. Hybrid: keyword/agent_name filter, then Pinecone embedding lookup if >5 matches. Inject top-3 skills' `description` + `steps` into task context. | `src/lib/skills/resolver.ts` (new), call sites in `safeRun()` and bot tool handlers | ~250 | `SKILL_INJECTION_ENABLED=false` | `times_invoked` increments on real runs; success rate tracked per skill |
+| **6** ⏸ | GitHub coding-task adapter. New `agent_task.type='code_change'`. Worker: open Issue → spawn Claude Code in worktree → open PR → webhook updates task status on PR review/merge. | `src/lib/intelligence/code-task-runner.ts`, `src/app/api/webhooks/github/route.ts` (extend), `.agents/workflows/code-task.md` | ~600 | Disable webhook subscription + `CODE_TASKS_ENABLED=false` | Manually filed `code_change` task produces a real PR; close-on-merge updates hub row |
 
-**Estimated total:** ~2400 LOC, 6 PRs, ~6 weeks elapsed at 1 PR/week with review.
+⏸ = **deferred.** Phases 0-3 are the committed roadmap (~1,300 LOC). Phases 4-6 are scaffolded
+but not scheduled.
 
-**Dropped from scope** (per Plan agent's pushback, not contested):
+**Deferral rationale (added 2026-04-27 per review):**
+- **Phase 4 + 5 (skill registry sync + injection)** wait until there is a real second consumer
+  beyond `start-bot.ts`. Today the skills table is read by `OversightPanel`; the live invocation
+  path is the cron handlers. Until ≥2 unrelated callers want runtime skill lookup, building the
+  loader is scaffolding for a problem we don't have. The `skills` table already exists and
+  `SkillCrystallizer` already populates it organically.
+- **Phase 6 (GitHub coding-task adapter)** waits until phases 0-3 have been live ≥30 days **and**
+  Will has manually wished for a code-change ticket ≥3 times in that window. When it does land,
+  it ships as a thin Claude Code + worktree + GitHub adapter — no Codex / Cursor / CLI / HTTP
+  multiplexer. The hub schema already absorbs `type='code_change'` without changes, so deferring
+  costs nothing architecturally.
+
+The "is Aria becoming Paperclip?" answer remains **no.** Aria is an ops bot whose hub is generic
+enough to file a code-change ticket eventually. If general-purpose coding-agent breadth becomes a
+real need, the right move is to use Paperclip itself, not rebuild it inside Aria.
+
+**Committed roadmap:** ~1,300 LOC across 4 PRs (phases 0-3), ~3-4 weeks at 1 PR/week.
+
+**Dropped from scope** (per review, not contested):
 - Generic `task_policies` engine. Inline thresholds in `reconciler.ts` (3% / 10× / $500) stay as
   the only enforcement until ≥3 distinct call-sites need the same rule.
 - A 4th audit log (`agent_task_events`). Use `task_history` instead.
+
+**Acknowledged weak spots in current schema:**
+- `cost_cents` ships unused. Phase 2 spoke writers will set it from `outputs.cost_cents` only
+  where the call-site already tracks LLM/API spend (e.g. AP reconciler Claude calls). It stays
+  `0` everywhere else. Don't add a "cost tracker" abstraction.
 
 ## 5. Smallest First PR (Phase 0 + Phase 1)
 
@@ -257,13 +287,17 @@ Edited:
 - `supabase/migrations/20260417_create_agent_heartbeats.sql` (convert to ALTER no-op)
 - `src/lib/intelligence/ops-manager.ts` — `safeRun()` failure path emits hub row
 - `src/lib/finale/reconciler.ts` — `storePendingApproval()` emits hub row
-- copilot_action_sessions writers (`actionType` in {`po_send`, `dropship_forward`, `reconcile_approve`, …}) — emit hub row at insert
-- `src/lib/purchasing/po-sender.ts` — `storePendingPOSend()` emits hub row
+- `src/lib/copilot/actions.ts` and `src/lib/copilot/actions.po-send.ts` — every `copilot_action_sessions` insert emits hub row (covers `po_send`, `po_review`, `reconcile_approve`, future `dropship_forward`)
 - `src/lib/intelligence/oversight-agent.ts` — `escalate()` emits hub row
 - `src/lib/intelligence/supervisor-agent.ts` — `supervise()` updates hub row's status
-- `src/cli/start-bot.ts` — approve/reject callbacks update hub row; boot calls skill loader
-- `src/app/api/webhooks/github/route.ts` — extend for code-change PRs (phase 6)
+- `src/cli/start-bot.ts` — approve/reject callbacks update hub row (phase 2); boot calls skill loader (phase 4, deferred)
+- `src/app/api/webhooks/github/route.ts` — extend for code-change PRs (phase 6, deferred)
 - `CLAUDE.md` — remove stale in-memory warning; add `/dashboard/tasks` reference
+
+**Removed from earlier draft:** `src/lib/intelligence/dropship-store.ts` and `src/lib/purchasing/po-sender.ts` (`storePendingPOSend`).
+The dropship store does not exist; dropships flow inline through `ap-agent.ts`. PO-send state
+already routes through `copilot/actions.po-send.ts` writing to `copilot_action_sessions`, which
+is covered by the copilot writer above.
 
 ## 9. Open Questions for Will
 
