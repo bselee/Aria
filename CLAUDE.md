@@ -111,8 +111,13 @@ Create separate profile dirs in .{vendor}-profile/ (always gitignored) that can 
 
 Shortcuts: use --headed and --login options during initial setup.
 
-### In-Memory State Warning ⚠️
-Both `reconciler.ts` (`pendingApprovals`, 24h TTL) and `dropship-store.ts` (`pendingDropships`, 48h TTL) use in-memory Maps. **`pm2 restart aria-bot` silently drops all pending Telegram approval requests and unmatched dropship invoices.** There is no persistence layer for these — intentionally ephemeral. Check for pending Telegram approvals before restarting during active invoice processing.
+### Pending Approvals (Persisted)
+`reconciler.ts` (`pendingApprovals`, 24h TTL) uses an in-memory Map **as a read cache**, but the durable copy lives in Supabase `ap_pending_approvals` (see `20260317_add_receiving_to_ap_activity_log.sql`) and rehydrates on boot at `reconciler.ts:127-194`. PO sends, PO reviews, and reconcile-approve confirmations live in `copilot_action_sessions` (`20260325_create_copilot_artifacts_and_sessions.sql`) — same pattern, durable + rehydrated. `pm2 restart aria-bot` is safe for both: the in-memory Map repopulates on the first read miss. TTL is enforced by the `expires_at` column.
+
+**Dropships** do NOT have a pending store. `ap-agent.ts:409-489` forwards dropship PDFs to `buildasoilap@bill.com` inline and marks the email read; there is nothing to lose on restart. The `pending_dropships` table exists in migrations but has no production writer (orphaned from an earlier refactor).
+
+### Control Plane: `/dashboard/tasks`
+Aria has a unified ticket hub at `agent_task` (see `supabase/migrations/20260428_create_agent_task.sql` and `.agents/plans/control-plane.md`). Every approval, dropship, exception, runbook command, and recent cron failure surfaces as one row with status, owner, priority, and approval gate. The dashboard view lives at `/dashboard/tasks` and the TypeScript surface is `src/lib/intelligence/agent-task.ts` (`upsertFromSource`, `decideApproval`, `complete`, `fail`, `appendEvent`, `getById`, `getBySource`). Spoke writers are wired in phase 2 of the plan; phase 1 ships the schema + dashboard read.
 
 ### Gmail Multi-Account Tokens
 `getAuthenticatedClient(slot)` in `src/lib/gmail/auth.ts` maps token slots to files:
