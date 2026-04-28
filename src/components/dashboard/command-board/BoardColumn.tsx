@@ -47,11 +47,7 @@ function TaskCard({
     selected: boolean;
     onSelect: (id: string) => void;
 }) {
-    // `auto_handled_by` is not yet part of CommandBoardTaskCard, so consult
-    // the loose record form — the contract is that the field MAY be added
-    // server-side without a frontend release.
-    const autoHandledBy = (task as unknown as Record<string, unknown>)
-        .auto_handled_by;
+    const autoHandledBy = task.auto_handled_by;
     const dedup = task.dedup_count ?? 0;
 
     return (

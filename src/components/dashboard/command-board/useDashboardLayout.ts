@@ -30,6 +30,7 @@ export const ALL_PANEL_IDS = [
     "tracking-board",
     "purchasing-calendar",
     "oversight",
+    "recent-runs",
 ] as const;
 
 export type PanelId = (typeof ALL_PANEL_IDS)[number];
@@ -58,7 +59,7 @@ export const DEFAULT_LAYOUT: DashboardLayout = {
         "tracking-board",
     ],
     midRight: ["purchasing", "purchasing-calendar"],
-    right: ["activity", "build-schedule", "oversight"],
+    right: ["activity", "build-schedule", "oversight", "recent-runs"],
 };
 
 export const LAYOUT_STORAGE_KEY = "aria-dash-layout";

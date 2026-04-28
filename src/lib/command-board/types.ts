@@ -76,6 +76,7 @@ export type CommandBoardTaskCard = {
     age_seconds: number;
     parent_task_id: string | null;
     has_children: boolean;
+    auto_handled_by: string | null;
 };
 
 export type CommandBoardTaskEvent = {
