@@ -19,7 +19,7 @@ import {
 
 describe('CRON_JOBS definitions', () => {
     it('contains the full current runtime schedule', () => {
-        expect(CRON_JOBS.length).toBe(16);
+        expect(CRON_JOBS.length).toBe(18);
     });
 
     it('has unique job names', () => {
