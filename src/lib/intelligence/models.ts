@@ -83,9 +83,13 @@ export const OPENROUTER_CHAT_CHAIN = [
  * schemas in early 2026 — adjust this list when OpenRouter rotates them.
  */
 export const OPENROUTER_FREE_CHAIN = [
+    // DECISION(2026-04-28): Slugs verified live via OpenRouter /models endpoint.
+    // Earlier guess of qwen-2.5-72b / deepseek-v3-0324 returned "No endpoints
+    // found" — those tiers were rotated out. Update this list when hits come
+    // back as 404; OpenRouter rotates free tiers ~quarterly.
+    { name: 'OpenRouter Qwen3 80B (free)', slug: 'qwen/qwen3-next-80b-a3b-instruct:free' },
+    { name: 'OpenRouter Gemma 4 31B (free)', slug: 'google/gemma-4-31b-it:free' },
     { name: 'OpenRouter Llama 3.3 70B (free)', slug: 'meta-llama/llama-3.3-70b-instruct:free' },
-    { name: 'OpenRouter Qwen 2.5 72B (free)', slug: 'qwen/qwen-2.5-72b-instruct:free' },
-    { name: 'OpenRouter DeepSeek v3 (free)', slug: 'deepseek/deepseek-chat-v3-0324:free' },
 ] as const;
 
 /**
