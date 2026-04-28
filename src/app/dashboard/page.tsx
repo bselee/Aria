@@ -1,9 +1,11 @@
 /**
  * @file    page.tsx
- * @purpose ARIA Operations Dashboard — 4-column draggable layout with floating chat
+ * @purpose ARIA Operations Dashboard. Defaults to the new Command Board
+ *          shell. Set `NEXT_PUBLIC_COMMAND_BOARD_ENABLED=false` to fall back
+ *          to the legacy 4-column draggable panel wall (one-line rollback).
  * @author  Will
  * @created 2026-02-20
- * @updated 2026-03-25
+ * @updated 2026-04-28
  * @deps    @dnd-kit/core, @dnd-kit/sortable, dashboard panel components
  */
 "use client";
@@ -43,6 +45,18 @@ import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPa
 import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
 import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 import OversightPanel from "@/components/dashboard/OversightPanel";
+
+import CommandBoardShell from "@/components/dashboard/command-board/CommandBoardShell";
+import {
+    migrateDashboardLayout,
+    LAYOUT_STORAGE_KEY,
+    type DashboardLayout,
+} from "@/components/dashboard/command-board/useDashboardLayout";
+
+// Rollback flag: `NEXT_PUBLIC_COMMAND_BOARD_ENABLED=false` reverts to the
+// legacy panel-wall below. One env, one fallback.
+const COMMAND_BOARD_ENABLED =
+    (process.env.NEXT_PUBLIC_COMMAND_BOARD_ENABLED ?? "true") !== "false";
 
 
 // ── Column width defaults (px) ──────────────────────────────────────
@@ -86,16 +100,7 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
 // farRight + right off-screen on typical viewports. Build Schedule merged
 // with Purchasing into midRight. ChatMirror stays as floating widget.
 type ColumnId = "left" | "midLeft" | "midRight" | "right";
-type LayoutState = Record<ColumnId, string[]>;
-
-const DEFAULT_LAYOUT: LayoutState = {
-    left: ["build-risk", "receivings"],
-    // DECISION(2026-03-25): Removed axiom-queue from dashboard — Axiom ordering
-    // is now fully autonomous (like ULINE). No manual review needed.
-    midLeft: ["invoice-queue", "statement-reconciliation", "active-purchases", "tracking-board"],
-    midRight: ["purchasing", "purchasing-calendar"],
-    right: ["activity", "build-schedule"]
-};
+type LayoutState = DashboardLayout;
 
 // All ColumnIds for iteration during layout merge / restore
 const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "right"];
@@ -112,10 +117,19 @@ function Column({ id, items, children, style, className }: { id: string, items: 
 }
 
 export default function DashboardPage() {
+    // Command-board mode short-circuits the legacy panel wall.
+    if (COMMAND_BOARD_ENABLED) {
+        return <CommandBoardShell />;
+    }
+
+    return <LegacyDashboard />;
+}
+
+function LegacyDashboard() {
     const [leftW, setLeftW] = useState(DEFAULT_LEFT_W);
     const [midLeftW, setMidLeftW] = useState(DEFAULT_MIDLEFT_W);
     const [midRightW, setMidRightW] = useState(DEFAULT_MIDRIGHT_W);
-    const [layout, setLayout] = useState<LayoutState>(DEFAULT_LAYOUT);
+    const [layout, setLayout] = useState<LayoutState>(() => migrateDashboardLayout(null));
     const [activeId, setActiveId] = useState<string | null>(null);
     const [chatOpen, setChatOpen] = useState(false);
 
@@ -126,7 +140,7 @@ export default function DashboardPage() {
         const lw = localStorage.getItem("aria-dash-left-w");
         const mlw = localStorage.getItem("aria-dash-midleft-w");
         const mrw = localStorage.getItem("aria-dash-midright-w");
-        const ly = localStorage.getItem("aria-dash-layout");
+        const ly = localStorage.getItem(LAYOUT_STORAGE_KEY);
         const co = localStorage.getItem("aria-dash-chat-open");
 
         if (lw) setLeftW(Math.max(200, Math.min(600, parseInt(lw))));
@@ -135,73 +149,7 @@ export default function DashboardPage() {
         if (co === "true") setChatOpen(true);
         if (ly) {
             try {
-                const restored = JSON.parse(ly);
-
-                // DECISION(2026-03-09): Migrate old 3-col "mid" layouts.
-                if (restored.mid && !restored.midLeft) {
-                    const oldMid: string[] = restored.mid;
-                    restored.midLeft = oldMid.filter((id: string) =>
-                        DEFAULT_LAYOUT.midLeft.includes(id)
-                    );
-                    restored.midRight = oldMid.filter((id: string) =>
-                        DEFAULT_LAYOUT.midRight.includes(id)
-                    );
-                    const placed = new Set([...restored.midLeft, ...restored.midRight]);
-                    const overflow = oldMid.filter((id: string) => !placed.has(id));
-                    restored.right = [...(restored.right || []), ...overflow];
-                    delete restored.mid;
-                }
-                // DECISION(2026-03-25): Migrate old 5-col layout → 4-col.
-                // Move any panels from the retired farRight column into midRight.
-                if (restored.farRight) {
-                    const farRightPanels: string[] = restored.farRight;
-                    if (!restored.midRight) restored.midRight = [];
-                    for (const id of farRightPanels) {
-                        if (!restored.midRight.includes(id)) {
-                            restored.midRight.push(id);
-                        }
-                    }
-                    delete restored.farRight;
-                }
-                // Strip retired panels from all columns
-                const RETIRED_PANELS = new Set(["chat-mirror", "reorder", "axiom-queue"]);
-                for (const col of ALL_COLUMNS) {
-                    if (restored[col]) {
-                        restored[col] = (restored[col] as string[]).filter((id: string) => !RETIRED_PANELS.has(id));
-                    }
-                }
-                // Deduplicate: if a panel appears in multiple columns, keep
-                // only the first occurrence to avoid React key warnings.
-                const seen = new Set<string>();
-                for (const col of ALL_COLUMNS) {
-                    if (restored[col]) {
-                        restored[col] = (restored[col] as string[]).filter((id: string) => {
-                            if (seen.has(id)) return false;
-                            seen.add(id);
-                            return true;
-                        });
-                    }
-                }
-
-                // Validate all four columns exist before restoring
-                if (restored.left && restored.midLeft && restored.midRight && restored.right) {
-                    // Merge any panels that exist in DEFAULT_LAYOUT but are missing from
-                    // the saved layout (prevents new panels from being silently dropped
-                    // by stale localStorage saves).
-                    for (const col of ALL_COLUMNS) {
-                        const defaults = DEFAULT_LAYOUT[col];
-                        for (const id of defaults) {
-                            const inSaved = ALL_COLUMNS.some(c =>
-                                (restored[c] as string[])?.includes(id)
-                            );
-                            if (!inSaved) {
-                                if (!restored[col]) restored[col] = [];
-                                restored[col].push(id);
-                            }
-                        }
-                    }
-                    setLayout(restored);
-                }
+                setLayout(migrateDashboardLayout(JSON.parse(ly)));
             } catch { /* corrupt localStorage — use defaults */ }
         }
     }, []);
@@ -211,7 +159,7 @@ export default function DashboardPage() {
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midleft-w", String(midLeftW)); }, [midLeftW, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-midright-w", String(midRightW)); }, [midRightW, mounted]);
     useEffect(() => { if (mounted) localStorage.setItem("aria-dash-chat-open", String(chatOpen)); }, [chatOpen, mounted]);
-    useEffect(() => { if (mounted) localStorage.setItem("aria-dash-layout", JSON.stringify(layout)); }, [layout, mounted]);
+    useEffect(() => { if (mounted) localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layout)); }, [layout, mounted]);
 
     // ── Resize handlers ─────────────────────────────────────────────
     const startLeftResize = useCallback((e: React.MouseEvent) => {
