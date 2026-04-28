@@ -167,7 +167,33 @@ export function TaskDetailPanel({
                 },
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+            // Optimistic update: project the action onto the local detail so
+            // the action buttons disappear immediately. The full refetch a few
+            // lines down replaces this with the authoritative server state.
+            setDetail(prev => {
+                if (!prev) return prev;
+                if (action === "approve") return { ...prev, status: "APPROVED" };
+                if (action === "reject") return { ...prev, status: "REJECTED" };
+                if (action === "dismiss") return { ...prev, status: "SUCCEEDED", completed_at: new Date().toISOString() };
+                return prev;
+            });
+
             onActionComplete?.(selectedTaskId, action);
+
+            // Refetch the detail itself — onActionComplete only refreshes the
+            // shell's lanes. Without this the panel keeps the stale detail.
+            try {
+                const detailRes = await fx(
+                    `/api/command-board/tasks/${selectedTaskId}?bust=1`,
+                    { cache: "no-store" },
+                );
+                if (detailRes.ok) {
+                    setDetail(await detailRes.json() as CommandBoardTaskDetail);
+                }
+            } catch {
+                /* keep the optimistic projection if refetch fails */
+            }
         } catch (err) {
             setError(err instanceof Error ? err.message : String(err));
         } finally {

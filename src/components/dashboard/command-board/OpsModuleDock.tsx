@@ -30,6 +30,7 @@ const DOCK_TAB_IDS: PanelId[] = [
     "statement-reconciliation",
     "purchasing-calendar",
     "oversight",
+    "recent-runs",
     "activity",
 ];
 

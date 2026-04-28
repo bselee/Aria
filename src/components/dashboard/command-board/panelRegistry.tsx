@@ -12,6 +12,7 @@
 import React from "react";
 
 import ActivityFeed from "@/components/dashboard/ActivityFeed";
+import RecentRunsPanel from "./RecentRunsPanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import BuildRiskPanel from "@/components/dashboard/BuildRiskPanel";
 import BuildSchedulePanel from "@/components/dashboard/BuildSchedulePanel";
@@ -102,6 +103,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         label: "Oversight",
         short: "Oversight",
         render: () => <OversightPanel />,
+    },
+    {
+        id: "recent-runs",
+        label: "Recent Runs",
+        short: "Recent Runs",
+        render: () => <RecentRunsPanel />,
     },
 ];
 

@@ -108,12 +108,14 @@ export async function closeFinishedTasks(): Promise<number> {
     for (const task of data as AgentTask[]) {
         if (await evaluateClosure(task)) {
             const resolvedStatus = task.closes_when?.kind === "deadline" ? "EXPIRED" : "SUCCEEDED";
+            const autoHandledBy = `closure_cron:${task.closes_when?.kind ?? "unknown"}`;
             const { error: upErr } = await supabase
                 .from("agent_task")
                 .update({
                     status: resolvedStatus,
                     completed_at: new Date().toISOString(),
                     updated_at: new Date().toISOString(),
+                    auto_handled_by: autoHandledBy,
                 })
                 .eq("id", task.id);
             if (!upErr) {
@@ -122,6 +124,7 @@ export async function closeFinishedTasks(): Promise<number> {
                     task_type: task.type,
                     output_summary: `${task.goal} auto-closed`,
                     closes_when: task.closes_when,
+                    auto_handled_by: autoHandledBy,
                 });
             }
         }

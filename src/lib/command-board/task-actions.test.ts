@@ -9,7 +9,7 @@
  * @deps    vitest
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock the agent-task module so we can stub getById/decideApproval/complete
 vi.mock('../intelligence/agent-task', () => ({
@@ -194,5 +194,69 @@ describe('dismissTask', () => {
         const callArgs = vi.mocked(agentTask.complete).mock.calls[0];
         const payload = callArgs[1] as Record<string, unknown>;
         expect(payload.dismissed_by).toBe('will-dashboard');
+    });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Telegram bridge: dashboard actions notify the bot chat; telegram actions do not
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('Telegram bridge', () => {
+    const ORIGINAL_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+    const ORIGINAL_CHAT = process.env.TELEGRAM_CHAT_ID;
+
+    beforeEach(() => {
+        process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+        process.env.TELEGRAM_CHAT_ID = '12345';
+        // global.fetch — task-actions uses the runtime fetch, not an injected one
+        (globalThis as any).fetch = vi.fn(async () =>
+            new Response('{"ok":true}', { status: 200 }),
+        );
+    });
+
+    afterEach(() => {
+        process.env.TELEGRAM_BOT_TOKEN = ORIGINAL_TOKEN;
+        process.env.TELEGRAM_CHAT_ID = ORIGINAL_CHAT;
+    });
+
+    it('does NOT call telegram on will-telegram actor', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't1', source_table: null, source_id: null,
+        } as any);
+        vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
+        await approveTask('t1', 'will-telegram');
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
+    });
+
+    it('calls telegram once on will-dashboard actor (generic approve)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't1', source_table: null, source_id: null,
+        } as any);
+        vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
+        await approveTask('t1', 'will-dashboard');
+        expect((globalThis as any).fetch).toHaveBeenCalledTimes(1);
+        const [url, init] = (globalThis as any).fetch.mock.calls[0];
+        expect(url).toBe('https://api.telegram.org/bottest-token/sendMessage');
+        const body = JSON.parse(init.body);
+        expect(body.chat_id).toBe('12345');
+        expect(body.text).toContain('Approved via dashboard');
+        expect(body.text).toContain('✅ Approved.');
+    });
+
+    it('does NOT call telegram when token is missing', async () => {
+        delete process.env.TELEGRAM_BOT_TOKEN;
+        vi.mocked(agentTask.complete).mockResolvedValue(undefined);
+        await dismissTask('t9', 'will-dashboard');
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
+    });
+
+    it('swallows telegram failure without breaking the action', async () => {
+        (globalThis as any).fetch = vi.fn(async () => {
+            throw new Error('network');
+        });
+        vi.mocked(agentTask.complete).mockResolvedValue(undefined);
+        const r = await dismissTask('t9', 'will-dashboard');
+        expect(r.ok).toBe(true);
+        expect(r.replyText).toBe('✓ Dismissed.');
     });
 });

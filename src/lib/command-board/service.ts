@@ -95,6 +95,7 @@ function toCard(t: AgentTask, hasChildren: boolean): CommandBoardTaskCard {
         age_seconds: ageSeconds(t.created_at),
         parent_task_id: t.parent_task_id,
         has_children: hasChildren,
+        auto_handled_by: t.auto_handled_by ?? null,
     };
 }
 
