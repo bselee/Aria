@@ -192,6 +192,14 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'maintenance',
         weekdaysOnly: false,
     },
+    {
+        name: 'MigrationTripwire',
+        description: 'Self-heal Layer A: compares supabase/migrations/*.sql on disk to applied versions; surfaces drift as a tripwire_violation task',
+        schedule: '*/30 * * * *',
+        scheduleHuman: 'Every 30 minutes',
+        category: 'maintenance',
+        weekdaysOnly: false,
+    },
 ];
 
 const cronRunStatus = new Map<string, CronRunStatus>();
