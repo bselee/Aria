@@ -122,8 +122,11 @@ export async function getCommandBoardSummary(): Promise<CommandBoardSummary> {
     let stale = 0;
     const total = COMMAND_BOARD_HIERARCHY.length;
 
-    let recentSuccess = 0;
-    let recentError = 0;
+    let recentSuccess24h = 0;
+    let recentError24h = 0;
+    let cronHealthy = 0;
+    let cronError = 0;
+    let cronNeverRun = 0;
 
     if (supabase) {
         try {
@@ -137,17 +140,49 @@ export async function getCommandBoardSummary(): Promise<CommandBoardSummary> {
 
         try {
             const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-            const { data } = await supabase
+            const { data: recentRows } = await supabase
                 .from("cron_runs")
                 .select("status, started_at")
                 .gte("started_at", since)
                 .limit(1000);
-            for (const row of data ?? []) {
-                if (row?.status === "success") recentSuccess++;
-                else if (row?.status === "error") recentError++;
+            for (const row of recentRows ?? []) {
+                if (row?.status === "success") recentSuccess24h++;
+                else if (row?.status === "error") recentError24h++;
             }
         } catch {
             /* best-effort */
+        }
+
+        // Latest status per cron definition. Joins `CRON_JOBS` (the definition
+        // list) against `cron_runs` (the audit table). Each definition is
+        // categorized as healthy (latest run succeeded), error (latest run
+        // failed), or never-run (no row in cron_runs). Count always sums to
+        // CRON_JOBS.length so the dashboard chip is "X / Y healthy".
+        try {
+            const { data: latestRows } = await supabase
+                .from("cron_runs")
+                .select("task_name, status, started_at")
+                .order("started_at", { ascending: false })
+                .limit(2000);
+            const latestByName = new Map<string, "success" | "error">();
+            for (const row of latestRows ?? []) {
+                const name = (row as { task_name?: string }).task_name;
+                if (!name || latestByName.has(name)) continue;
+                const status = (row as { status?: string }).status;
+                if (status === "success" || status === "error") {
+                    latestByName.set(name, status);
+                }
+            }
+            for (const job of CRON_JOBS) {
+                const latest = latestByName.get(job.name);
+                if (latest === "success") cronHealthy++;
+                else if (latest === "error") cronError++;
+                else cronNeverRun++;
+            }
+        } catch {
+            // On query failure, default to never-run so the chip reads "0/N"
+            // (truthful: we don't know).
+            cronNeverRun = CRON_JOBS.length;
         }
 
         try {
@@ -159,12 +194,82 @@ export async function getCommandBoardSummary(): Promise<CommandBoardSummary> {
         } catch {
             /* best-effort */
         }
+    } else {
+        cronNeverRun = CRON_JOBS.length;
     }
 
     return {
         lanes,
         agents: { total, healthy, stale },
-        crons: { total: CRON_JOBS.length, recentSuccess, recentError },
+        crons: {
+            total: CRON_JOBS.length,
+            healthy: cronHealthy,
+            error: cronError,
+            neverRun: cronNeverRun,
+            recentSuccess24h,
+            recentError24h,
+        },
+    };
+}
+
+// ── Dashboard tasks compatibility wrapper ───────────────────────────────────
+//
+// The legacy /api/dashboard/tasks route was reading agent_task directly with
+// its own listTasks call + cache + counts. That made /dashboard/tasks and
+// /dashboard read independent data sources — they could disagree if one
+// query short-circuited or filtered differently.
+//
+// This helper centralises the filter logic so both routes share the same
+// task source. Returns the raw AgentTask shape the legacy /dashboard/tasks
+// page already expects (rows, not lane cards).
+
+export type DashboardTasksFilters = {
+    status?: string[];
+    type?: string[];
+    owner?: string;
+    limit?: number;
+    /** Whether to include FAILED tasks from the last 24h when no explicit status filter is given. */
+    includeRecentFailed?: boolean;
+};
+
+export type DashboardTasksResult = {
+    tasks: AgentTask[];
+    counts: {
+        total: number;
+        byStatus: Record<string, number>;
+        byType: Record<string, number>;
+        byOwner: Record<string, number>;
+    };
+    cachedAt: string;
+};
+
+export async function getDashboardTasks(
+    filters: DashboardTasksFilters = {},
+): Promise<DashboardTasksResult> {
+    const tasks = await listTasks({
+        status: filters.status,
+        type: filters.type,
+        owner: filters.owner,
+        limit: filters.limit,
+        includeRecentFailed: filters.includeRecentFailed,
+    });
+
+    const counts = {
+        total: tasks.length,
+        byStatus: {} as Record<string, number>,
+        byType: {} as Record<string, number>,
+        byOwner: {} as Record<string, number>,
+    };
+    for (const t of tasks) {
+        counts.byStatus[t.status] = (counts.byStatus[t.status] ?? 0) + 1;
+        counts.byType[t.type] = (counts.byType[t.type] ?? 0) + 1;
+        counts.byOwner[t.owner] = (counts.byOwner[t.owner] ?? 0) + 1;
+    }
+
+    return {
+        tasks,
+        counts,
+        cachedAt: new Date().toISOString(),
     };
 }
 

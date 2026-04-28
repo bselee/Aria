@@ -176,5 +176,20 @@ export type CommandBoardControlRequest = {
 export type CommandBoardSummary = {
     lanes: Record<CommandBoardLane, number>;
     agents: { total: number; healthy: number; stale: number };
-    crons: { total: number; recentSuccess: number; recentError: number };
+    /**
+     * Cron health summary — describes the registered cron *definitions* by
+     * latest run status, not raw run volume. `healthy` + `error` + `neverRun`
+     * always sums to `total` (= CRON_JOBS.length).
+     *
+     * `recentSuccess24h` is kept as informational secondary signal (run rate)
+     * but should not be rendered as the primary "X / Y" health chip.
+     */
+    crons: {
+        total: number;
+        healthy: number;
+        error: number;
+        neverRun: number;
+        recentSuccess24h: number;
+        recentError24h: number;
+    };
 };
