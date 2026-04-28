@@ -83,11 +83,14 @@ export const OPENROUTER_CHAT_CHAIN = [
  * schemas in early 2026 — adjust this list when OpenRouter rotates them.
  */
 export const OPENROUTER_FREE_CHAIN = [
-    // DECISION(2026-04-28): Slugs verified live via OpenRouter /models endpoint.
-    // Earlier guess of qwen-2.5-72b / deepseek-v3-0324 returned "No endpoints
-    // found" — those tiers were rotated out. Update this list when hits come
-    // back as 404; OpenRouter rotates free tiers ~quarterly.
+    // DECISION(2026-04-28): `openrouter/free` is OpenRouter's "Free Models
+    // Router" that auto-picks an available free model per call. Resilient to
+    // upstream rotations (no slug rot to chase). Hand-curated specifics
+    // remain as fallback in case the router itself has an outage.
+    { name: 'OpenRouter Free Router', slug: 'openrouter/free' },
+    { name: 'OpenRouter Nemotron 3 Super 120B (free)', slug: 'nvidia/nemotron-3-super-120b-a12b:free' },
     { name: 'OpenRouter Qwen3 80B (free)', slug: 'qwen/qwen3-next-80b-a3b-instruct:free' },
+    { name: 'OpenRouter MiniMax M2.5 (free)', slug: 'minimax/minimax-m2.5:free' },
     { name: 'OpenRouter Gemma 4 31B (free)', slug: 'google/gemma-4-31b-it:free' },
     { name: 'OpenRouter Llama 3.3 70B (free)', slug: 'meta-llama/llama-3.3-70b-instruct:free' },
 ] as const;

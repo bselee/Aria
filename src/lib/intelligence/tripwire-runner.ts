@@ -20,6 +20,10 @@ export async function applyTripwireResults(results: TripwireResult[]): Promise<v
     for (const r of results) {
         try {
             if (!r.ok) {
+                // input_hash MUST be stable across cron ticks for the same
+                // tripwire+detail. Excluding ranAt — it changes every run and
+                // would break the dedup lookup (causing the unique-index
+                // conflict on uq_agent_task_source).
                 await agentTask.incrementOrCreate({
                     type: "tripwire_violation",
                     sourceTable: "tripwires",
@@ -28,7 +32,7 @@ export async function applyTripwireResults(results: TripwireResult[]): Promise<v
                     owner: "aria",
                     priority: 1,
                     requiresApproval: false,
-                    inputs: { tripwire: r.tripwire, ranAt: r.ranAt, ...r.detail },
+                    inputs: { tripwire: r.tripwire, ...r.detail },
                 });
                 continue;
             }
