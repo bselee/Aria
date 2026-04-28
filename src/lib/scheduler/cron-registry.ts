@@ -175,6 +175,23 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'maintenance',
         weekdaysOnly: false,
     },
+    {
+        name: 'MissingReconciliationWatchdog',
+        description: 'Alerts if any vendor reconciliation has not run successfully in 24h',
+        schedule: '0 9 * * 1-5',
+        scheduleHuman: '9:00 AM weekdays',
+        timezone: 'America/Denver',
+        category: 'reconciliation',
+        weekdaysOnly: true,
+    },
+    {
+        name: 'CloseFinishedTasks',
+        description: 'Hygiene: closes finished agent_task rows whose closes_when predicate is satisfied',
+        schedule: '*/5 * * * *',
+        scheduleHuman: 'Every 5 minutes',
+        category: 'maintenance',
+        weekdaysOnly: false,
+    },
 ];
 
 const cronRunStatus = new Map<string, CronRunStatus>();
