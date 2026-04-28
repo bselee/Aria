@@ -112,6 +112,85 @@ describe("createOrAdvance", () => {
         expect(issue).toBeNull();
     });
 
+    it("recordHandoff updates current_handler and writes ledger event", async () => {
+        terminalAwaitValue = { error: null };
+        const { recordHandoff } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await recordHandoff("i1", "email-agent", "ap-agent", "Email classified as INVOICE");
+        expect(appliedPatch?.current_handler).toBe("ap-agent");
+    });
+
+    it("setBlocker transitions lifecycle to blocked + sets reason + next_action", async () => {
+        const { setBlocker } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await setBlocker("i1", "missing_receipt", "Wait for warehouse to confirm receipt");
+        expect(appliedPatch).toEqual(expect.objectContaining({
+            lifecycle_state: "blocked",
+            blocker_reason: "missing_receipt",
+            next_action: "Wait for warehouse to confirm receipt",
+            autonomy_state: "waiting",
+        }));
+    });
+
+    it("setBlocker uses needs_policy autonomy for human_approval_required", async () => {
+        const { setBlocker } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await setBlocker("i1", "human_approval_required", "Will to approve");
+        expect(appliedPatch?.autonomy_state).toBe("needs_policy");
+    });
+
+    it("clearBlocker resumes to working by default", async () => {
+        const { clearBlocker } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await clearBlocker("i1");
+        expect(appliedPatch).toEqual(expect.objectContaining({
+            lifecycle_state: "working",
+            blocker_reason: null,
+            autonomy_state: "working",
+        }));
+    });
+
+    it("complete sets lifecycle complete + completed_at", async () => {
+        const { complete } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await complete("i1", { resolution: "AP approved" });
+        expect(appliedPatch?.lifecycle_state).toBe("complete");
+        expect(appliedPatch?.autonomy_state).toBe("resolved");
+        expect(typeof appliedPatch?.completed_at).toBe("string");
+    });
+
+    it("linkTask updates agent_task.issue_id", async () => {
+        const { linkTask } = await import("./agent-issue");
+        let appliedPatch: any = null;
+        supabaseMock.update.mockImplementationOnce((p: any) => {
+            appliedPatch = p;
+            return supabaseMock;
+        });
+        await linkTask("task-id", "issue-id");
+        expect(supabaseMock.from).toHaveBeenCalledWith("agent_task");
+        expect(appliedPatch).toEqual({ issue_id: "issue-id" });
+    });
+
     it("preserves explicit blocked state — projection cannot revert it", async () => {
         // The existing issue was explicitly blocked by setBlocker().
         supabaseMock.maybeSingle.mockResolvedValueOnce({
