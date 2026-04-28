@@ -196,12 +196,22 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-    // Each test gets a fresh localStorage. jsdom provides one per env.
-    try {
-        window.localStorage.clear();
-    } catch {
-        /* ignore */
-    }
+    // Vitest's harness sometimes mounts an incomplete localStorage stub
+    // (--localstorage-file warning), causing bare `localStorage.getItem`
+    // calls inside legacy ops panels to throw "is not a function". Force a
+    // working in-memory shim on both `window` and the global so panels that
+    // read either reference work.
+    const store = new Map<string, string>();
+    const shim: Storage = {
+        get length() { return store.size; },
+        clear: () => store.clear(),
+        getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+        key: (i: number) => Array.from(store.keys())[i] ?? null,
+        removeItem: (k: string) => { store.delete(k); },
+        setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    };
+    Object.defineProperty(window, "localStorage", { value: shim, configurable: true });
+    Object.defineProperty(globalThis, "localStorage", { value: shim, configurable: true });
 });
 
 // ── Tests ───────────────────────────────────────────────────────────────────
