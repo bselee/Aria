@@ -220,3 +220,211 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
     }
     return created as AgentIssue;
 }
+
+export async function recordHandoff(
+    issueId: string,
+    fromHandler: string | null,
+    toHandler: string,
+    reason: string,
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { error } = await supabase
+        .from("agent_issue")
+        .update({ current_handler: toHandler, updated_at: new Date().toISOString() })
+        .eq("id", issueId);
+    if (error) {
+        console.warn("[agent-issue] recordHandoff failed:", error.message);
+        return;
+    }
+    await appendIssueEvent(issueId, "issue_handoff", {
+        task_type: "issue_lifecycle",
+        output_summary: `${fromHandler ?? "?"} → ${toHandler}: ${reason}`,
+        from_handler: fromHandler,
+        to_handler: toHandler,
+        reason,
+    });
+}
+
+export async function setBlocker(
+    issueId: string,
+    reason: IssueBlockerReason,
+    nextAction: string,
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const autonomy: IssueAutonomyState =
+        reason === "human_approval_required" || reason === "policy_required"
+            ? "needs_policy"
+            : "waiting";
+
+    const { error } = await supabase
+        .from("agent_issue")
+        .update({
+            lifecycle_state: "blocked",
+            blocker_reason: reason,
+            next_action: nextAction,
+            autonomy_state: autonomy,
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", issueId);
+    if (error) {
+        console.warn("[agent-issue] setBlocker failed:", error.message);
+        return;
+    }
+    await appendIssueEvent(issueId, "issue_blocked", {
+        task_type: "issue_lifecycle",
+        output_summary: `${reason}: ${nextAction}`,
+        blocker_reason: reason,
+        next_action: nextAction,
+    });
+}
+
+export async function clearBlocker(
+    issueId: string,
+    resumeState: IssueLifecycleState = "working",
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { error } = await supabase
+        .from("agent_issue")
+        .update({
+            lifecycle_state: resumeState,
+            blocker_reason: null,
+            autonomy_state: "working",
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", issueId);
+    if (error) {
+        console.warn("[agent-issue] clearBlocker failed:", error.message);
+        return;
+    }
+    await appendIssueEvent(issueId, "issue_blocker_cleared", {
+        task_type: "issue_lifecycle",
+        output_summary: `resumed to ${resumeState}`,
+    });
+}
+
+export async function complete(
+    issueId: string,
+    outputs: Record<string, unknown> = {},
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { error } = await supabase
+        .from("agent_issue")
+        .update({
+            lifecycle_state: "complete",
+            autonomy_state: "resolved",
+            completed_at: new Date().toISOString(),
+            outputs,
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", issueId);
+    if (error) {
+        console.warn("[agent-issue] complete failed:", error.message);
+        return;
+    }
+    await appendIssueEvent(issueId, "issue_complete", {
+        task_type: "issue_lifecycle",
+        output_summary: typeof outputs.resolution === "string"
+            ? outputs.resolution
+            : "completed",
+        ...outputs,
+    });
+}
+
+export async function linkTask(taskId: string, issueId: string): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+    const { error } = await supabase
+        .from("agent_task")
+        .update({ issue_id: issueId })
+        .eq("id", taskId);
+    if (error) {
+        console.warn("[agent-issue] linkTask failed:", error.message);
+    }
+}
+
+// ── Reads ────────────────────────────────────────────────────────────────────
+
+export type ListIssuesFilters = {
+    lifecycleState?: IssueLifecycleState[];
+    owner?: string;
+    /** Window for terminal lifecycle states. Defaults 14 days. */
+    terminalWindowMs?: number;
+    limit?: number;
+};
+
+const DEFAULT_TERMINAL_WINDOW_MS = 14 * 24 * 3600 * 1000;
+const OPEN_LIFECYCLE: IssueLifecycleState[] = [
+    "detected", "triaging", "working", "waiting_external", "blocked",
+];
+
+export async function listIssues(filters: ListIssuesFilters = {}): Promise<AgentIssue[]> {
+    const supabase = createClient();
+    if (!supabase) return [];
+
+    const limit = Math.min(filters.limit ?? 200, 500);
+    const since = new Date(Date.now() - (filters.terminalWindowMs ?? DEFAULT_TERMINAL_WINDOW_MS)).toISOString();
+
+    let query = supabase
+        .from("agent_issue")
+        .select("*")
+        .order("priority", { ascending: true })
+        .order("updated_at", { ascending: false });
+
+    if (filters.lifecycleState?.length) {
+        query = query.in("lifecycle_state", filters.lifecycleState);
+    } else {
+        // Default: open at any age + complete in window. Per Will's spec.
+        query = query.or(
+            `lifecycle_state.in.(${OPEN_LIFECYCLE.join(",")}),and(lifecycle_state.eq.complete,completed_at.gte.${since})`,
+        );
+    }
+    if (filters.owner) query = query.eq("owner", filters.owner);
+    query = query.limit(limit);
+
+    const { data, error } = await query;
+    if (error) {
+        console.warn("[agent-issue] listIssues failed:", error.message);
+        return [];
+    }
+    return (data ?? []) as AgentIssue[];
+}
+
+export async function getById(id: string): Promise<AgentIssue | null> {
+    const supabase = createClient();
+    if (!supabase) return null;
+    const { data, error } = await supabase.from("agent_issue").select("*").eq("id", id).maybeSingle();
+    if (error) {
+        console.warn("[agent-issue] getById failed:", error.message);
+        return null;
+    }
+    return (data ?? null) as AgentIssue | null;
+}
+
+export async function getBySource(sourceTable: string, sourceId: string): Promise<AgentIssue | null> {
+    const supabase = createClient();
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from("agent_issue")
+        .select("*")
+        .eq("source_table", sourceTable)
+        .eq("source_id", sourceId)
+        .maybeSingle();
+    if (error) {
+        console.warn("[agent-issue] getBySource failed:", error.message);
+        return null;
+    }
+    return (data ?? null) as AgentIssue | null;
+}
