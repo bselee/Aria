@@ -561,6 +561,18 @@ export class OpsManager {
             });
         });
 
+        // Phase 1 issue ledger: every 5 min, group recent tasks by
+        // business-flow key and ensure agent_issue rows exist + linked.
+        schedule("*/5 * * * *", () => {
+            this.safeRun("IssueProjection", async () => {
+                const { runIssueProjection } = await import("./issue-projection-cron");
+                const summary = await runIssueProjection();
+                if (summary.issues_created_or_advanced > 0 || summary.tasks_linked > 0) {
+                    console.log("[OpsManager] IssueProjection:", summary);
+                }
+            });
+        });
+
         console.log("✅ OpsManager background jobs registered.");
     }
 
