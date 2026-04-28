@@ -120,6 +120,10 @@ export async function storePendingApproval(result: ReconciliationResult, client:
                 verdict_type: result.overallVerdict,
             },
             deadlineAt: expiresAt,
+            // Layer B: AP reconciliation approvals are human-only — no playbook
+            // ever runs. Tag manual_only so the dashboard shows the amber
+            // "manual" badge and the Layer C runner skips this row.
+            playbookState: "manual_only",
         });
         const sb = createClient();
         if (sb) {
