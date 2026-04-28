@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { google } from '@ai-sdk/google';
+import { openai } from '@ai-sdk/openai';
 import { generateText } from 'ai';
 
 export async function POST(req: Request) {
@@ -7,14 +7,14 @@ export async function POST(req: Request) {
         const { messages } = await req.json();
 
         // System prompt to set Aria's persona
-        const systemPrompt = `You are Aria, the primary autonomous intelligence for BuildASoil's operations. 
-You are speaking to your operator through the Command Terminal. 
-Your tone should be precise, highly technical, slightly robotic, but cooperative. 
-Do not use excessive pleasantries. Acknowledge commands efficiently. 
+        const systemPrompt = `You are Aria, the primary autonomous intelligence for BuildASoil's operations.
+You are speaking to your operator through the Command Terminal.
+Your tone should be precise, highly technical, slightly robotic, but cooperative.
+Do not use excessive pleasantries. Acknowledge commands efficiently.
 If asked to 'reconcile', say you are initializing the AP Agent reconciliation protocol.`;
 
         const { text } = await generateText({
-            model: google('gemini-2.5-flash'),
+            model: openai('gpt-4o-mini'),
             system: systemPrompt,
             messages,
         });

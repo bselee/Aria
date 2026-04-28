@@ -527,6 +527,21 @@ export class OpsManager {
             });
         });
 
+        // Self-heal Layer A: tripwires every 30 min — migration drift, etc.
+        // Lazy-imports keep boot path lean.
+        schedule("*/30 * * * *", () => {
+            this.safeRun("MigrationTripwire", async () => {
+                const { runAllTripwires } = await import("./tripwires");
+                const { applyTripwireResults } = await import("./tripwire-runner");
+                const results = await runAllTripwires();
+                await applyTripwireResults(results);
+                const failing = results.filter(r => !r.ok).length;
+                if (failing > 0) {
+                    console.log(`[OpsManager] tripwires: ${failing}/${results.length} failing`);
+                }
+            });
+        });
+
         console.log("✅ OpsManager background jobs registered.");
     }
 
