@@ -45,6 +45,13 @@ export type AgentTaskStatus =
 
 export type AgentTaskOwner = "aria" | "will" | string;
 
+export type PlaybookState =
+    | "queued"
+    | "running"
+    | "succeeded"
+    | "failed"
+    | "manual_only";
+
 export type AgentTask = {
     id: string;
     type: AgentTaskType;
@@ -74,6 +81,8 @@ export type AgentTask = {
     input_hash?: string | null;
     closes_when?: ClosurePredicate | null;
     auto_handled_by?: string | null;
+    playbook_kind?: string | null;
+    playbook_state?: PlaybookState | null;
 };
 
 export type ListTasksFilters = {
@@ -97,6 +106,10 @@ export type UpsertFromSourceArgs = {
     parentTaskId?: string | null;
     deadlineAt?: string | Date | null;
     maxRetries?: number;
+    /** Layer B: declare which autonomous playbook (if any) handles this task. */
+    playbookKind?: string | null;
+    /** Layer B: initial state of the playbook attempt — omit for null/manual triage. */
+    playbookState?: PlaybookState | null;
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -189,6 +202,8 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
         parent_task_id: args.parentTaskId ?? null,
         deadline_at: isoOrNull(args.deadlineAt ?? null),
         max_retries: args.maxRetries ?? 0,
+        playbook_kind: args.playbookKind ?? null,
+        playbook_state: args.playbookState ?? null,
     };
 
     const { data, error } = await supabase
@@ -310,6 +325,8 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
             deadline_at: isoOrNull(args.deadlineAt ?? null),
             max_retries: args.maxRetries ?? 0,
             dedup_count: 1,
+            playbook_kind: args.playbookKind ?? null,
+            playbook_state: args.playbookState ?? null,
         })
         .select()
         .single();
@@ -713,4 +730,44 @@ export async function decideApprovalBySource(
             decided_by: decidedBy,
         });
     }
+}
+
+/**
+ * Layer B helper: set/update the playbook fields on an existing task.
+ * The Layer C runner uses this to mark transitions:
+ *   queued → running → succeeded | failed
+ *
+ * Manual triage uses it once with state="manual_only" to flag rows that
+ * have no autonomous attempt path (e.g. reconciler approvals).
+ *
+ * Best-effort. Always appends a `playbook_state_changed` ledger event.
+ */
+export async function setPlaybook(
+    taskId: string,
+    kind: string,
+    state: PlaybookState,
+): Promise<void> {
+    if (!hubEnabled()) return;
+    const supabase = createClient();
+    if (!supabase) return;
+
+    const { error } = await supabase
+        .from("agent_task")
+        .update({
+            playbook_kind: kind,
+            playbook_state: state,
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", taskId);
+
+    if (error) {
+        console.warn("[agent-task] setPlaybook failed:", error.message);
+        return;
+    }
+    await appendEvent(taskId, "playbook_state_changed", {
+        task_type: "playbook",
+        output_summary: `${kind}=${state}`,
+        playbook_kind: kind,
+        playbook_state: state,
+    });
 }

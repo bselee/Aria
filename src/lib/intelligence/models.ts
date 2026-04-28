@@ -71,6 +71,24 @@ export const OPENROUTER_CHAT_CHAIN = [
 ] as const;
 
 /**
+ * Free-tier OpenRouter chain for low-stakes classification work.
+ * Used by callers that pass `tier: 'free'` to unifiedObjectGeneration.
+ *
+ * DECISION(2026-04-28): Email triage (acknowledgement-agent, ap-identifier)
+ * runs ~1000 calls/day classifying intent. Paid models are wasted there —
+ * a 70B free Llama gets the 4-class label right.
+ *
+ * Free tiers are rate-limited; the cascade falls through to paid Haiku if
+ * 429s exhaust the free quota. Models proven viable for JSON via Zod
+ * schemas in early 2026 — adjust this list when OpenRouter rotates them.
+ */
+export const OPENROUTER_FREE_CHAIN = [
+    { name: 'OpenRouter Llama 3.3 70B (free)', slug: 'meta-llama/llama-3.3-70b-instruct:free' },
+    { name: 'OpenRouter Qwen 2.5 72B (free)', slug: 'qwen/qwen-2.5-72b-instruct:free' },
+    { name: 'OpenRouter DeepSeek v3 (free)', slug: 'deepseek/deepseek-chat-v3-0324:free' },
+] as const;
+
+/**
  * OpenRouter model slugs for the `models` array in raw fetch calls.
  * Used by extractor.ts for server-side model fallback (one HTTP call).
  */

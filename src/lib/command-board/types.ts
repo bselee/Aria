@@ -77,6 +77,8 @@ export type CommandBoardTaskCard = {
     parent_task_id: string | null;
     has_children: boolean;
     auto_handled_by: string | null;
+    playbook_kind: string | null;
+    playbook_state: "queued" | "running" | "succeeded" | "failed" | "manual_only" | null;
 };
 
 export type CommandBoardTaskEvent = {
