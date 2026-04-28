@@ -14,14 +14,18 @@
 import React, { useEffect, useState } from "react";
 import {
     Check,
+    CheckCircle2,
     ExternalLink,
     Hash,
     History,
+    Hourglass,
     Loader2,
     Repeat,
     StopCircle,
+    User,
     UserCheck,
     X,
+    XCircle,
 } from "lucide-react";
 
 import type { CommandBoardTaskDetail, CommandBoardTaskEvent } from "./types";
@@ -93,6 +97,46 @@ const ACTION_CLASSES: Record<ActionKind, string> = {
     retry: "bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/40",
     cancel: "bg-rose-500/10 hover:bg-rose-500/20 text-rose-200 border-rose-500/30",
 };
+
+function PlaybookStatusLine({
+    kind,
+    state,
+}: {
+    kind: string;
+    state: string | null | undefined;
+}) {
+    const Icon =
+        state === "running" ? Loader2 :
+        state === "queued" ? Hourglass :
+        state === "succeeded" ? CheckCircle2 :
+        state === "failed" ? XCircle :
+        state === "manual_only" ? User :
+        Hourglass;
+    const stateColor =
+        state === "running" ? "text-blue-300" :
+        state === "succeeded" ? "text-emerald-300" :
+        state === "failed" ? "text-rose-300" :
+        state === "manual_only" ? "text-amber-300" :
+        "text-zinc-400";
+    const iconColor =
+        state === "running" ? "text-blue-400 animate-spin" :
+        state === "succeeded" ? "text-emerald-400" :
+        state === "failed" ? "text-rose-400" :
+        state === "manual_only" ? "text-amber-400" :
+        "text-zinc-500";
+    return (
+        <div
+            data-testid="playbook-status"
+            className="flex items-center gap-2 px-2 py-1 rounded text-[11px] font-mono bg-zinc-900/60 border border-zinc-800/60"
+            aria-label={`Playbook ${kind} state ${state ?? "unknown"}`}
+        >
+            <Icon className={`w-3 h-3 ${iconColor}`} />
+            <span className="text-zinc-300">{kind}</span>
+            <span className="text-zinc-600">·</span>
+            <span className={stateColor}>{state ?? "unknown"}</span>
+        </div>
+    );
+}
 
 function EventRow({ event }: { event: CommandBoardTaskEvent }) {
     return (
@@ -293,6 +337,13 @@ export function TaskDetailPanel({
                                         : JSON.stringify(detail.closes_when)}
                                 </div>
                             </div>
+                        ) : null}
+
+                        {detail.playbook_kind ? (
+                            <PlaybookStatusLine
+                                kind={detail.playbook_kind}
+                                state={detail.playbook_state}
+                            />
                         ) : null}
 
                         {detail.source_table && detail.source_id ? (

@@ -165,7 +165,8 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 system: "AP routing engine. Return the intent label only.",
                 prompt,
                 schema,
-                schemaName: "EmailIntent"
+                schemaName: "EmailIntent",
+                tier: "free",
             }) as { intent: string };
 
             return res.intent;

@@ -31,8 +31,11 @@ import { z } from 'zod';
 import { geminiLimiter } from './rate-limiter';
 import {
     DIRECT_MODELS,
+    OPENROUTER_FREE_CHAIN,
     OPENROUTER_STRUCTURED_CHAIN,
 } from './models';
+
+export type LLMTier = 'free' | 'paid';
 
 export type LLMOptions = {
     system?: string;
@@ -40,6 +43,13 @@ export type LLMOptions = {
     messages?: ModelMessage[];
     temperature?: number;
     maxTokens?: number;
+    /**
+     * `'free'` routes to OPENROUTER_FREE_CHAIN first (Llama/Qwen/DeepSeek
+     * free tiers) before falling back to paid models on rate-limit. Use
+     * for low-stakes classification (intent, advert/invoice/statement,
+     * triage). Default `'paid'` = current behavior.
+     */
+    tier?: LLMTier;
 };
 
 export type LLMToolOptions = LLMOptions & {
@@ -77,6 +87,19 @@ function getOpenRouterProvider(): ProviderEntry[] {
     }));
 }
 
+function getOpenRouterFreeProvider(): ProviderEntry[] {
+    if (!process.env.OPENROUTER_API_KEY) return [];
+    const openrouter = createOpenAI({
+        baseURL: 'https://openrouter.ai/api/v1',
+        apiKey: process.env.OPENROUTER_API_KEY,
+    });
+    return OPENROUTER_FREE_CHAIN.map(entry => ({
+        name: entry.name,
+        model: () => openrouter(entry.slug),
+        available: true,
+    }));
+}
+
 // DECISION(2026-03-18): Task-appropriate provider chain for background agent work.
 //
 // The chain is designed with cost + resource awareness:
@@ -88,8 +111,23 @@ function getOpenRouterProvider(): ProviderEntry[] {
 //
 // Llama 3.3 70B REMOVED (2026-03-18): unreliable at Zod schemas and tool calling.
 // Chain: Gemini (free) → OpenRouter (cheap, curated) → OpenAI → Anthropic
-function getProviderChain(): ProviderEntry[] {
+function getProviderChain(tier: LLMTier = 'paid'): ProviderEntry[] {
     const chain: ProviderEntry[] = [];
+
+    if (tier === 'free') {
+        // Free chain: Llama/Qwen/DeepSeek free tiers first, then drop into the
+        // paid chain on rate-limit so the call still completes.
+        chain.push(
+            ...getOpenRouterFreeProvider(),
+            ...getOpenRouterProvider(),
+            {
+                name: 'OpenAI GPT-4o-mini',
+                model: () => openai.chat('gpt-4o-mini'),
+                available: !!process.env.OPENAI_API_KEY,
+            },
+        );
+        return chain.filter(p => p.available);
+    }
 
     chain.push(
         // Direct Gemini disabled 2026-04-28 — paid key burning quota for low-stakes
@@ -175,7 +213,7 @@ export function getProviderStatus(): Array<{ name: string; status: 'healthy' | '
  * Tries each available provider in order until one succeeds.
  */
 export async function unifiedTextGeneration(options: LLMOptions): Promise<string> {
-    const providers = getProviderChain();
+    const providers = getProviderChain(options.tier);
 
     if (providers.length === 0) {
         throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
@@ -227,7 +265,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
 }
 
 export async function unifiedToolTextGeneration(options: LLMToolOptions): Promise<LLMToolResult> {
-    const providers = getProviderChain();
+    const providers = getProviderChain(options.tier);
 
     if (providers.length === 0) {
         throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
@@ -298,7 +336,7 @@ export async function unifiedToolTextGeneration(options: LLMToolOptions): Promis
 export async function unifiedObjectGeneration<T>(
     options: LLMOptions & { schema: z.ZodType<T>, schemaName?: string }
 ): Promise<T> {
-    const providers = getProviderChain();
+    const providers = getProviderChain(options.tier);
 
     if (providers.length === 0) {
         throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');

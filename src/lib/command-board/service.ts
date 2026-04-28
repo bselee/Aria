@@ -96,6 +96,14 @@ function toCard(t: AgentTask, hasChildren: boolean): CommandBoardTaskCard {
         parent_task_id: t.parent_task_id,
         has_children: hasChildren,
         auto_handled_by: t.auto_handled_by ?? null,
+        playbook_kind: t.playbook_kind ?? null,
+        playbook_state: (t.playbook_state ?? null) as
+            | "queued"
+            | "running"
+            | "succeeded"
+            | "failed"
+            | "manual_only"
+            | null,
     };
 }
 

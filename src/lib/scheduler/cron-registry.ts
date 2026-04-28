@@ -200,6 +200,14 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'maintenance',
         weekdaysOnly: false,
     },
+    {
+        name: 'TaskSelfHealer',
+        description: 'Self-heal Layer C: dispatches queued playbooks against agent_task rows; writes outcome back to the hub',
+        schedule: '*/10 * * * *',
+        scheduleHuman: 'Every 10 minutes',
+        category: 'maintenance',
+        weekdaysOnly: false,
+    },
 ];
 
 const cronRunStatus = new Map<string, CronRunStatus>();
