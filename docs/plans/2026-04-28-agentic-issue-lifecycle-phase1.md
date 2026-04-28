@@ -161,6 +161,9 @@ ALTER TABLE public.task_history
     ALTER COLUMN task_id DROP NOT NULL;
 
 -- An event must reference at least one of (task_id, issue_id).
+-- Use NOT VALID because legacy task_history rows may predate task_id and have
+-- neither reference. The constraint still protects new writes immediately; a
+-- later cleanup/backfill can VALIDATE it if useful.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -168,7 +171,7 @@ BEGIN
     ) THEN
         ALTER TABLE public.task_history
             ADD CONSTRAINT task_history_task_or_issue_check
-            CHECK (task_id IS NOT NULL OR issue_id IS NOT NULL);
+            CHECK (task_id IS NOT NULL OR issue_id IS NOT NULL) NOT VALID;
     END IF;
 END $$;
 
@@ -539,6 +542,8 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
         // its tasks look active. Only clearBlocker() can change lifecycle
         // out of blocked. Projection-style updates that arrive here for a
         // blocked issue are limited to safe metadata (priority, inputs).
+        // Do not let projection flip owner back from will -> aria while a
+        // human/action blocker is active.
         const isBlocked = existing.lifecycle_state === "blocked";
 
         const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -549,7 +554,7 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
             if (args.nextAction !== undefined) patch.next_action = args.nextAction;
         }
         if (args.priority !== undefined) patch.priority = args.priority;
-        if (args.owner !== undefined) patch.owner = args.owner;
+        if (!isBlocked && args.owner !== undefined) patch.owner = args.owner;
         if (args.inputs !== undefined) patch.inputs = args.inputs;
 
         const { data: updated, error } = await supabase
@@ -618,7 +623,7 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
 npx vitest run src/lib/intelligence/agent-issue.test.ts
 ```
 
-Expected: PASS, 3 tests.
+Expected: PASS, 4 tests.
 
 - [ ] **Step 3.5: Commit**
 
@@ -1956,7 +1961,7 @@ Expected: 1 pre-existing test-single-po-calendar failure (still). All else green
 ## Definition of Done
 
 - `agent_issue` table exists; `agent_task.issue_id` exists.
-- `agent-issue.ts` lib exposes `createOrAdvance`, `recordHandoff`, `setBlocker`, `clearBlocker`, `complete`, `linkTask`, `listIssues`, `getById`, `getBySource`. All hub-write paths swallow errors and best-effort `appendEvent`.
+- `agent-issue.ts` lib exposes `createOrAdvance`, `recordHandoff`, `setBlocker`, `clearBlocker`, `complete`, `linkTask`, `listIssues`, `getById`, `getBySource`. All hub-write paths swallow errors and best-effort `appendIssueEvent`.
 - Projection cron runs every 5 min, derives issues from tasks, links tasks back. `IssueProjection` registered + sync test green.
 - API: `GET /api/command-board/issues`, `GET /api/command-board/issues/:id`, `POST /api/command-board/issues` (manual creation with `source_table = NULL`).
 - Telegram `/issues` works; `/tasks` is now an alias rendering issues.
