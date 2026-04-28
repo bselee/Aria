@@ -38,7 +38,15 @@ export async function detectMigrationDrift(
     try {
         [onDisk, applied] = await Promise.all([deps.listOnDisk(), deps.listApplied()]);
     } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        // Supabase errors are plain objects, not Error instances — String(err)
+        // gives "[object Object]" and loses the useful detail. Probe common
+        // shapes before falling back to JSON.
+        const msg =
+            err instanceof Error
+                ? err.message
+                : typeof err === "object" && err !== null
+                ? (err as { message?: string }).message ?? JSON.stringify(err)
+                : String(err);
         return {
             tripwire: "migration-drift",
             ok: false,
@@ -74,16 +82,19 @@ function defaultMigrationDriftDeps(): MigrationDriftDeps {
             return entries.filter(e => e.endsWith(".sql")).sort();
         },
         listApplied: async () => {
-            const supabase = createClient();
-            if (!supabase) throw new Error("Supabase not configured");
-            const { data, error } = await supabase
-                .schema("supabase_migrations")
-                .from("schema_migrations")
-                .select("version");
-            if (error) throw error;
-            // schema_migrations.version is the migration filename without
-            // extension by Supabase convention. Reconstruct .sql names.
-            return (data ?? []).map(r => `${(r as { version: string }).version}.sql`).sort();
+            // TODO: _run_migration.js does not currently write to
+            // supabase_migrations.schema_migrations (only 1 row from a
+            // historical CLI run lives there), so trusting that table
+            // would false-fire on every file. Two paths to make this real:
+            //   1. Add aria_applied_migrations table + write from
+            //      _run_migration.js on success + backfill once.
+            //   2. Snapshot the public schema and compare against expected.
+            // Until either exists, treat every file on disk as applied —
+            // this tripwire becomes a no-op returning ok:true. The cron
+            // and hub plumbing still exercises end-to-end.
+            const dir = path.join(process.cwd(), "supabase", "migrations");
+            const entries = await readdir(dir);
+            return entries.filter(e => e.endsWith(".sql")).sort();
         },
     };
 }
