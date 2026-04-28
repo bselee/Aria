@@ -71,6 +71,7 @@ export type AgentTask = {
     dedup_count?: number;
     input_hash?: string | null;
     closes_when?: ClosurePredicate | null;
+    auto_handled_by?: string | null;
 };
 
 export type ListTasksFilters = {
