@@ -19,7 +19,7 @@ import {
 
 describe('CRON_JOBS definitions', () => {
     it('contains the full current runtime schedule', () => {
-        expect(CRON_JOBS.length).toBe(18);
+        expect(CRON_JOBS.length).toBe(19);
     });
 
     it('has unique job names', () => {
@@ -64,6 +64,7 @@ describe('CRON_JOBS definitions', () => {
             'BuildCompletionWatcher',
             'POReceivingWatcher',
             'PurchasingCalendarSync',
+            'MigrationTripwire',
         ];
 
         const names = new Set(CRON_JOBS.map((job) => job.name));
