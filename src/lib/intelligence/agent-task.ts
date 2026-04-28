@@ -83,6 +83,8 @@ export type AgentTask = {
     auto_handled_by?: string | null;
     playbook_kind?: string | null;
     playbook_state?: PlaybookState | null;
+    /** Phase 1 issue ledger: parent issue this task is grouped under. Nullable. */
+    issue_id?: string | null;
 };
 
 export type ListTasksFilters = {
