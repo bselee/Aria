@@ -55,6 +55,7 @@ import {
 } from '../lib/copilot/channels/telegram';
 import { handleTelegramPOSendCallback } from '../lib/copilot/channels/telegram-callbacks';
 import * as agentTask from '../lib/intelligence/agent-task';
+import { approveTask, rejectTask, dismissTask } from '../lib/command-board/task-actions';
 import { Markup as TgMarkup } from 'telegraf';
 import { getStartupHealth } from '../lib/copilot/smoke';
 
@@ -908,55 +909,23 @@ bot.on('text', async (ctx) => {
 
     bot.action(/^task_approve_(.+)$/, async (ctx) => {
         const taskId = ctx.match[1];
-        await ctx.answerCbQuery('Approving...');
-        try {
-            const task = await agentTask.getById(taskId);
-            if (!task) {
-                await ctx.reply('❓ Task not found.');
-                return;
-            }
-            if (task.source_table === 'ap_pending_approvals' && task.source_id) {
-                const result = await approvePendingReconciliation(task.source_id);
-                await ctx.reply(`${result.success ? '✅' : '⚠️'} ${result.message}`);
-            } else {
-                await agentTask.decideApproval(taskId, 'approve', 'will-telegram');
-                await ctx.reply('✅ Approved.');
-            }
-        } catch (err: any) {
-            await ctx.reply(`❌ Approve failed: ${err.message}`);
-        }
+        const result = await approveTask(taskId, 'will-telegram');
+        await ctx.answerCbQuery(result.cbQueryText);
+        await ctx.reply(result.replyText);
     });
 
     bot.action(/^task_reject_(.+)$/, async (ctx) => {
         const taskId = ctx.match[1];
-        await ctx.answerCbQuery('Rejecting...');
-        try {
-            const task = await agentTask.getById(taskId);
-            if (!task) {
-                await ctx.reply('❓ Task not found.');
-                return;
-            }
-            if (task.source_table === 'ap_pending_approvals' && task.source_id) {
-                const message = await rejectPendingReconciliation(task.source_id);
-                await ctx.reply(`❌ ${message}`);
-            } else {
-                await agentTask.decideApproval(taskId, 'reject', 'will-telegram');
-                await ctx.reply('❌ Rejected.');
-            }
-        } catch (err: any) {
-            await ctx.reply(`❌ Reject failed: ${err.message}`);
-        }
+        const result = await rejectTask(taskId, 'will-telegram');
+        await ctx.answerCbQuery(result.cbQueryText);
+        await ctx.reply(result.replyText);
     });
 
     bot.action(/^task_dismiss_(.+)$/, async (ctx) => {
         const taskId = ctx.match[1];
-        await ctx.answerCbQuery('Dismissed');
-        try {
-            await agentTask.complete(taskId, { dismissed_by: 'will-telegram', dismissed_at: new Date().toISOString() });
-            await ctx.reply('✓ Dismissed.');
-        } catch (err: any) {
-            await ctx.reply(`❌ Dismiss failed: ${err.message}`);
-        }
+        const result = await dismissTask(taskId, 'will-telegram');
+        await ctx.answerCbQuery(result.cbQueryText);
+        await ctx.reply(result.replyText);
     });
 
     // TEXT COMMAND FALLBACK for approvals Ã¢â‚¬â€ handles /approve_<id> and /reject_<id>
