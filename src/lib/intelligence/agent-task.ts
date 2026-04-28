@@ -27,7 +27,9 @@ export type AgentTaskType =
     | "control_command"
     | "manual"
     | "code_change"
-    | "stuck_source";
+    | "stuck_source"
+    | "ci_failure"
+    | "tripwire_violation";
 
 export type AgentTaskStatus =
     | "PENDING"
