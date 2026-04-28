@@ -1,7 +1,7 @@
 /**
  * @file    route.ts
- * @purpose Dashboard Tasks API — returns the unified Aria control-plane queue
- *          backed by the `agent_task` table. Read-only in phase 1.
+ * @purpose Dashboard Tasks API — compatibility wrapper around the
+ *          command-board task service.
  *
  *          GET  /api/dashboard/tasks              → all open tasks
  *          GET  /api/dashboard/tasks?status=…     → filter by status (CSV)
@@ -10,31 +10,26 @@
  *          GET  /api/dashboard/tasks?bust=1       → bypass module cache
  *
  *          Cache: 30-second module cache, busted by ?bust=1 or POST.
- *          Phase 2 will add POST handlers for approve/reject; phase 1 is read-only.
  *
- *          See .agents/plans/control-plane.md.
+ *          DECISION(2026-04-28): Delegated to `getDashboardTasks` in
+ *          src/lib/command-board/service.ts so that the standalone
+ *          /dashboard/tasks page and the new /dashboard command-board
+ *          read the same task source. This route is a thin compat
+ *          wrapper — its existence is preserved only so older clients
+ *          that fetch it (the standalone tasks page) keep working
+ *          without changes.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { listTasks, type AgentTask } from "@/lib/intelligence/agent-task";
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-export type TasksResponse = {
-    tasks: AgentTask[];
-    counts: {
-        total: number;
-        byStatus: Record<string, number>;
-        byType: Record<string, number>;
-        byOwner: Record<string, number>;
-    };
-    cachedAt: string;
-};
+import {
+    getDashboardTasks,
+    type DashboardTasksResult,
+} from "@/lib/command-board/service";
 
 // ── Module-level cache ───────────────────────────────────────────────────────
 
 const CACHE_TTL = 30 * 1000;
-type CacheEntry = { result: TasksResponse; at: number };
+type CacheEntry = { result: DashboardTasksResult; at: number };
 const cacheByKey = new Map<string, CacheEntry>();
 
 function cacheKey(req: NextRequest): string {
@@ -46,8 +41,6 @@ function cacheKey(req: NextRequest): string {
         limit: sp.get("limit") ?? "",
     });
 }
-
-const OPEN_STATUSES = ["PENDING", "CLAIMED", "RUNNING", "NEEDS_APPROVAL"];
 
 // ── GET ──────────────────────────────────────────────────────────────────────
 
@@ -75,31 +68,14 @@ export async function GET(req: NextRequest) {
             : undefined;
 
         const limit = Math.min(parseInt(sp.get("limit") ?? "200", 10) || 200, 500);
-        const tasks = await listTasks({
+
+        const result = await getDashboardTasks({
             status: statusList,
             type: typeList,
             owner: sp.get("owner") ?? undefined,
             limit,
             includeRecentFailed: !statusFilter,
-        }) as AgentTask[];
-
-        const counts = {
-            total: tasks.length,
-            byStatus: {} as Record<string, number>,
-            byType: {} as Record<string, number>,
-            byOwner: {} as Record<string, number>,
-        };
-        for (const t of tasks) {
-            counts.byStatus[t.status] = (counts.byStatus[t.status] ?? 0) + 1;
-            counts.byType[t.type] = (counts.byType[t.type] ?? 0) + 1;
-            counts.byOwner[t.owner] = (counts.byOwner[t.owner] ?? 0) + 1;
-        }
-
-        const result: TasksResponse = {
-            tasks,
-            counts,
-            cachedAt: new Date().toISOString(),
-        };
+        });
 
         cacheByKey.set(key, { result, at: Date.now() });
 
@@ -110,7 +86,7 @@ export async function GET(req: NextRequest) {
     }
 }
 
-// ── POST — bust cache (phase 2 will add approve/reject) ─────────────────────
+// ── POST — bust cache ───────────────────────────────────────────────────────
 
 export async function POST(_req: NextRequest) {
     cacheByKey.clear();

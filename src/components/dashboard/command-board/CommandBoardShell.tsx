@@ -190,15 +190,23 @@ export function CommandBoardShell({
         }
         const healthy = heartbeats.filter(h => h.staleness === "fresh").length;
         const stale = heartbeats.filter(h => h.staleness !== "fresh").length;
-        const recentSuccess = crons.filter(c => c.lastStatus === "success").length;
-        const recentError = crons.filter(c => c.lastStatus === "error").length;
+        // Count cron *definitions* by latest status, not 24h run volume.
+        // Each cron in the registry maps to exactly one bucket so the sum
+        // stays equal to total — gives a meaningful "X / Y healthy" chip
+        // instead of a flood of run-events.
+        const cronHealthy = crons.filter(c => c.lastStatus === "success").length;
+        const cronError = crons.filter(c => c.lastStatus === "error").length;
+        const cronNeverRun = crons.filter(c => c.lastStatus == null).length;
         return {
             lanes,
             agents: { total: agents.length, healthy, stale },
             crons: {
                 total: crons.length,
-                recentSuccess,
-                recentError,
+                healthy: cronHealthy,
+                error: cronError,
+                neverRun: cronNeverRun,
+                recentSuccess24h: 0,
+                recentError24h: 0,
             },
         } as CommandBoardSummary;
     }, [summary, tasks, heartbeats, crons, agents.length]);
@@ -211,9 +219,9 @@ export function CommandBoardShell({
     const closedCount = summaryCounts.lanes["recently-closed"] ?? 0;
 
     const cronAccent =
-        summaryCounts.crons.recentError > 0
+        summaryCounts.crons.error > 0
             ? "bg-rose-500"
-            : summaryCounts.crons.recentSuccess > 0
+            : summaryCounts.crons.healthy > 0
               ? "bg-emerald-500"
               : "bg-zinc-600";
 
@@ -244,7 +252,7 @@ export function CommandBoardShell({
                     />
                     <HealthChip
                         label="Crons"
-                        value={`${summaryCounts.crons.recentSuccess}✓ / ${summaryCounts.crons.recentError}✗`}
+                        value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
                         accent={cronAccent}
                     />
                     <HealthChip
