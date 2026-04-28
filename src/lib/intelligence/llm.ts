@@ -92,11 +92,13 @@ function getProviderChain(): ProviderEntry[] {
     const chain: ProviderEntry[] = [];
 
     chain.push(
-        {
-            name: 'Gemini 2.5 Flash',
-            model: () => google(DIRECT_MODELS.geminiFlash),
-            available: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-        },
+        // Direct Gemini disabled 2026-04-28 — paid key burning quota for low-stakes
+        // classification. OpenRouter still routes to Gemini via its own quota.
+        // {
+        //     name: 'Gemini 2.5 Flash',
+        //     model: () => google(DIRECT_MODELS.geminiFlash),
+        //     available: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+        // },
         ...getOpenRouterProvider(),  // Cheap fallback — curated models from models.ts
         {
             name: 'OpenAI GPT-4o',
