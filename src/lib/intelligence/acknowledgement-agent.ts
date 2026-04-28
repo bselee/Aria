@@ -169,7 +169,8 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 system: "You are an email triage assistant for a purchasing department. Use maximum caution: if an email might need human attention, flag it as REQUIRES_HUMAN.",
                 prompt,
                 schema,
-                schemaName: "EmailAcknowledgementIntent"
+                schemaName: "EmailAcknowledgementIntent",
+                tier: "free",
             }) as { intent: string; reasoning: string };
 
             console.log(`     [LLM] Intent: ${res.intent} | Reason: ${res.reasoning}`);

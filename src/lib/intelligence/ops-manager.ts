@@ -542,6 +542,25 @@ export class OpsManager {
             });
         });
 
+        // Self-heal Layer C: every 10 min, dispatch queued playbooks against
+        // tasks that have playbook_kind set and haven't exhausted retries.
+        // Permission flags read at call time so flipping the env var without
+        // restarting the bot still works on the next cycle.
+        schedule("*/10 * * * *", () => {
+            this.safeRun("TaskSelfHealer", async () => {
+                const { runOnce } = await import("./playbooks/runner");
+                const summary = await runOnce({
+                    allow: {
+                        dbWrite: process.env.PLAYBOOK_ALLOW_DB_WRITE === "1",
+                        forcePush: process.env.PLAYBOOK_ALLOW_FORCE_PUSH === "1",
+                    },
+                });
+                if (summary.attempted > 0) {
+                    console.log("[OpsManager] TaskSelfHealer:", summary);
+                }
+            });
+        });
+
         console.log("✅ OpsManager background jobs registered.");
     }
 
