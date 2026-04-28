@@ -757,7 +757,17 @@ bot.on('text', async (ctx) => {
             chatHistory[chatId] = chatHistory[chatId].slice(-20);
         }
 
-        await ctx.reply(reply, { parse_mode: 'Markdown' });
+        try {
+            await ctx.reply(reply, { parse_mode: 'Markdown' });
+        } catch (sendErr: any) {
+            const desc = sendErr?.description ?? sendErr?.response?.description ?? sendErr?.message ?? '';
+            if (/can't parse entities|parse_mode|byte offset/i.test(desc)) {
+                console.warn('[chat] Markdown rejected by Telegram, retrying as plain text:', desc);
+                await ctx.reply(reply);
+            } else {
+                throw sendErr;
+            }
+        }
         return;
     } catch (err: any) {
         console.error('Chat Error:', err.message);
