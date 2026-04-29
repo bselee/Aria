@@ -32,6 +32,8 @@ import { upsertVendorInvoice } from "../storage/vendor-invoices";
 import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
 import { withToolAudit } from "../agents/tool-registry";
 import { ensureGmailToolsRegistered } from "../agents/register-gmail-tools";
+import { ensureMemoryToolsRegistered } from "../agents/register-memory-tools";
+import * as memory from "../memory";
 
 /**
  * @file    ap-agent.ts
@@ -228,8 +230,16 @@ export class APAgent {
             intent: z.enum(["INVOICE", "PREPAYMENT_REQUIRED", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
         });
 
-        // Recall rules to see if this vendor has specific handling instructions
-        const memories = await recall(`Accounts Payable routing rules for vendor ${from} subject ${subject} `, { topK: 3, minScore: 0.5 });
+        // Recall rules to see if this vendor has specific handling instructions.
+        // Phase 3: routes through the Memory Manager facade so the call lands
+        // in task_history as memory_query_aria attributed to ap-identifier.
+        ensureMemoryToolsRegistered();
+        const memories = await memory.query(
+            "aria-memory",
+            `Accounts Payable routing rules for vendor ${from} subject ${subject} `,
+            { topK: 3, minScore: 0.5 },
+            { agent: "ap-identifier" },
+        );
         let memoryContext = "";
         if (memories.length > 0) {
             memoryContext = "\n\nPast Experiences & Specific Vendor Rules:\n" + memories.map(m => `- [${m.category}] ${m.content} `).join("\n");
