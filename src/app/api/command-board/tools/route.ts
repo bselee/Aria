@@ -11,6 +11,7 @@ import { listTools, type ListToolsFilter, type ToolCategory, type ToolScope } fr
 import { ensureCopilotToolsRegistered } from "@/lib/agents/register-copilot-tools";
 import { ensureFinaleToolsRegistered } from "@/lib/agents/register-finale-tools";
 import { ensureGmailToolsRegistered } from "@/lib/agents/register-gmail-tools";
+import { ensureMemoryToolsRegistered } from "@/lib/agents/register-memory-tools";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -22,6 +23,7 @@ export async function GET(req: NextRequest) {
         ensureCopilotToolsRegistered();
         ensureFinaleToolsRegistered();
         ensureGmailToolsRegistered();
+        ensureMemoryToolsRegistered();
 
         const url = new URL(req.url);
         const filter: ListToolsFilter = {};
