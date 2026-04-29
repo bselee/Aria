@@ -68,6 +68,20 @@ function activeCountFor(
     return tasks.filter(t => t.owner === agentLabel).length;
 }
 
+/**
+ * Aggregate working+waiting (treated as "in flight") and blocked counts
+ * from the per-agent currentlyHandling field. Returning a stable shape
+ * even when the field is missing keeps the render path branch-free.
+ */
+function handlingFor(agent: CommandBoardAgent): { inFlight: number; blocked: number } {
+    const c = agent.currentlyHandling;
+    if (!c) return { inFlight: 0, blocked: 0 };
+    return {
+        inFlight: c.working + c.waitingExternal,
+        blocked: c.blocked,
+    };
+}
+
 function TreeRow({
     node,
     depth,
@@ -85,6 +99,7 @@ function TreeRow({
 }) {
     const state = staleness(heartbeats, node.agent.label);
     const active = activeCountFor(node.agent.label, tasks);
+    const handling = handlingFor(node.agent);
     const selected = selectedAgentId === node.agent.id;
     return (
         <div>
@@ -105,8 +120,33 @@ function TreeRow({
                 <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass(state)}`} />
                 <Bot className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                 <span className="flex-1 truncate">{node.agent.label}</span>
+                {/* Phase 2 issue-ledger overlay: emerald = in-flight issues
+                    (working + waiting_external), amber = blocked. Title
+                    surfaces the breakdown on hover so Will doesn't have to
+                    open the issue list to see what's going on. */}
+                {handling.inFlight > 0 ? (
+                    <span
+                        title={`${handling.inFlight} issue${handling.inFlight === 1 ? "" : "s"} in flight`}
+                        data-testid={`agent-handling-inflight-${node.agent.id}`}
+                        className="text-[10px] font-mono text-emerald-300 px-1 rounded bg-emerald-500/10 border border-emerald-500/20"
+                    >
+                        ▶ {handling.inFlight}
+                    </span>
+                ) : null}
+                {handling.blocked > 0 ? (
+                    <span
+                        title={`${handling.blocked} blocked issue${handling.blocked === 1 ? "" : "s"}`}
+                        data-testid={`agent-handling-blocked-${node.agent.id}`}
+                        className="text-[10px] font-mono text-amber-300 px-1 rounded bg-amber-500/10 border border-amber-500/20"
+                    >
+                        ⏸ {handling.blocked}
+                    </span>
+                ) : null}
                 {active > 0 ? (
-                    <span className="text-[10px] font-mono text-zinc-400 px-1 rounded bg-zinc-800">
+                    <span
+                        title={`${active} legacy task${active === 1 ? "" : "s"}`}
+                        className="text-[10px] font-mono text-zinc-400 px-1 rounded bg-zinc-800"
+                    >
                         {active}
                     </span>
                 ) : null}

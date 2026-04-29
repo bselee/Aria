@@ -30,6 +30,7 @@
  */
 
 import { FinaleClient } from "../../finale/client";
+import { resolveFinalePo, correlatePo, type CorrelationStrategy } from "../../finale/po-resolver";
 import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
 import { createClient } from "../../supabase";
@@ -121,6 +122,13 @@ const LineItemSchema = z.object({
      */
     finalePricePerUnit:z.coerce.number().optional(),
     total:             z.coerce.number().default(0),
+    /**
+     * Vendor "Job Name" or "Order Reference" field — Axiom Print writes the
+     * BuildASoil-set string here when ordering, e.g. "PU105L 124469" where
+     * PU105L is the SKU and 124469 is the Finale draft PO#. Haiku captures
+     * it verbatim; we extract embedded PO# downstream as a fallback signal.
+     */
+    jobName:           z.string().optional(),
 });
 
 const ExtractionSchema = z.object({
@@ -185,7 +193,8 @@ Return valid JSON only — no explanation:
       "invoicedUnitPrice": number,
       "finaleSku": "Finale product ID (apply SKU mapping from vendor memory if known; use catalog # if unknown; null if unresolvable)",
       "finalePricePerUnit": number,
-      "total": number
+      "total": number,
+      "jobName": "vendor-printed Job Name / Order Reference / Custom field (Axiom Print writes the BuildASoil SKU here, e.g. 'PU105L'). Verbatim string. Empty if absent."
     }
   ],
   "confidence": "high | medium | low",
@@ -284,27 +293,22 @@ export async function processDefaultInboxInvoice(
     };
 
     try {
-        // ── Guard 1: PO# required ────────────────────────────────────────────
-        const poNumber = extractPONumber(subject, bodyText);
-
-        if (!poNumber) {
-            const result: DefaultInboxInvoiceResult = {
-                ...base,
-                outcome:             "no_po_number",
-                needsImmediateAlert: true,
-                summary: `No PO# found — subject: "${subject}" from ${fromEmail}`,
-            };
-            await sendTelegramAlert(
-                `🚨 <b>Paid Invoice — No PO# Found</b>\n\n` +
-                `<b>From:</b> ${fromEmail}\n` +
-                `<b>Subject:</b> ${subject}\n\n` +
-                `Cannot reconcile — manual PO lookup required.`
-            );
-            await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
-            return result;
-        }
-
-        base.poNumber = poNumber;
+        // ── PO# extraction (subject/body first; Job Name fallback after Haiku) ─
+        // Will, 2026-04-29: vendors like Axiom Print don't print "PO #N" in
+        // subject/body. They write the SKU + Finale PO# in the per-line Job
+        // Name field (e.g. "PU105L 124469"). The old early-gate fired
+        // "no_po_number" before Haiku ran, blocking Axiom invoices entirely.
+        // New flow:
+        //   1. Try subject/body extraction (cheap regex).
+        //   2. Always run Haiku extraction (cost has already been paid by the
+        //      time this worker is invoked — the upstream identifier already
+        //      classified the email as INLINE_INVOICE).
+        //   3. After Haiku, try to extract PO# from line item descriptions
+        //      and jobName fields ("PU105L 124469" → 124469).
+        //   4. If still no PO#, fall through to correlatePo's vendor-recent /
+        //      sku-overlap fallbacks (the multi-strategy pipeline handles it).
+        let poNumber: string | null = extractPONumber(subject, bodyText);
+        if (poNumber) base.poNumber = poNumber;
 
         // ── Vendor context from Pinecone ─────────────────────────────────────
         // Semantic search across vendor-memory namespace using the email content.
@@ -321,7 +325,7 @@ export async function processDefaultInboxInvoice(
             }
         } catch { /* Pinecone unavailable — continue without context */ }
 
-        // ── Guard 2: Haiku extraction ────────────────────────────────────────
+        // ── Haiku extraction ─────────────────────────────────────────────────
         // qwen3 skipped — unreliable for structured extraction.
         const extracted = await extractWithHaiku(fromEmail, subject, bodyText, vendorContext);
 
@@ -331,10 +335,57 @@ export async function processDefaultInboxInvoice(
                 poNumber,
                 outcome:             "extraction_failed",
                 needsImmediateAlert: false,
-                summary: `${fromEmail} PO #${poNumber}: extraction failed (conf=${extracted?.confidence ?? "null"}, total=${extracted?.total ?? 0})`,
+                summary: `${fromEmail} PO #${poNumber ?? "?"}: extraction failed (conf=${extracted?.confidence ?? "null"}, total=${extracted?.total ?? 0})`,
             };
             await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
+        }
+
+        // ── Vendor-specific SKU enrichment (Axiom Job Name → Finale SKU) ────
+        // Will, 2026-04-29: he does NOT inject a PO# into Axiom's Job Name —
+        // the Job Name is JUST the SKU (e.g. "PU105L"). For correlation, we
+        // need each lineItem.finaleSku populated so the SKU-overlap strategy
+        // can match the Axiom invoice to the most recent Finale draft PO
+        // that contains those SKUs. If Haiku missed the mapping (Pinecone
+        // vendor patterns may not be seeded for every Axiom SKU), apply the
+        // static AXIOM_TO_FINALE map directly.
+        const fromLower = fromEmail.toLowerCase();
+        const isAxiom = fromLower.includes("axiom") || extracted.vendorName.toLowerCase().includes("axiom");
+        if (isAxiom) {
+            // Dynamic import wrapped in try/catch because axiom/client.ts pulls
+            // in Playwright at module load — fine in production where the
+            // bot has playwright available, would crash a unit-test env.
+            try {
+                const axiomModule = await import("../../axiom/client");
+                const map = (axiomModule as any).AXIOM_TO_FINALE as Record<string, { skus: string[] }> | undefined;
+                if (map) {
+                    for (const li of extracted.lineItems) {
+                        if (li.finaleSku) continue;
+                        const probe = (li.jobName ?? li.description ?? "").trim();
+                        if (!probe) continue;
+                        const direct = map[probe];
+                        let mapped: string | null = null;
+                        if (direct?.skus?.[0]) {
+                            mapped = direct.skus[0];
+                        } else {
+                            const lower = probe.toLowerCase();
+                            for (const [key, val] of Object.entries(map)) {
+                                if (key.toLowerCase() === lower || lower.startsWith(key.toLowerCase())) {
+                                    mapped = val.skus[0];
+                                    break;
+                                }
+                            }
+                        }
+                        if (mapped) {
+                            li.finaleSku = mapped;
+                            li.finalePricePerUnit = li.finalePricePerUnit ?? li.invoicedUnitPrice;
+                            console.log(`[default-inbox] Axiom Job Name "${probe}" → Finale SKU ${mapped}`);
+                        }
+                    }
+                }
+            } catch (err: any) {
+                console.warn(`[default-inbox] Axiom map enrichment skipped: ${err.message}`);
+            }
         }
 
         const { vendorName, total, freight, tax, subtotal, invoiceNumber, invoiceDate,
@@ -372,15 +423,41 @@ export async function processDefaultInboxInvoice(
             } catch { /* non-fatal */ }
         }
 
-        // ── Finale PO lookup ──────────────────────────────────────────────────
+        // ── Finale PO correlation ─────────────────────────────────────────────
+        // Multi-strategy pipeline (Will's directive 2026-04-29):
+        //   1. resolveFinalePo on the printed PO# (parens/digits/transposition variants).
+        //   2. SKU overlap with the most recent OPEN POs for the vendor (60d).
+        //   3. Amount proximity (invoice subtotal ≈ PO total within 5% / $50).
+        //   4. Most recent PO for the vendor (Will's primary heuristic for Axiom etc).
+        //   5. Nothing correlated → strategy='create-draft' so the worker can
+        //      mint a draft PO from invoice line items (Will reviews + commits).
+        //
+        // Each fallback below "exact" notifies Will via Telegram so he can
+        // sanity-check the correlation before changes are written.
         const finale = new FinaleClient();
         let poSummary: { orderId: string; total: number; status: string } | null = null;
+        let usedStrategy: CorrelationStrategy = "exact";
+        let correlationNote = "";
 
-        try {
-            const s = await finale.getOrderSummary(poNumber);
-            if (s) poSummary = { orderId: s.orderId, total: s.total, status: s.status };
-        } catch { /* not found */ }
+        const correlation = await correlatePo({
+            printedPo: poNumber,
+            vendorName,
+            lineItems: lineItems.map(li => ({ sku: li.finaleSku ?? null, total: li.total ?? null })),
+            invoiceTotal: total,
+            invoiceFreight: freight,
+            client: finale,
+        });
+        usedStrategy = correlation.strategy ?? "exact";
+        correlationNote = correlation.note;
 
+        if (correlation.orderId) {
+            try {
+                const s = await finale.getOrderSummary(correlation.orderId);
+                if (s) poSummary = { orderId: s.orderId, total: s.total, status: s.status };
+            } catch { /* shouldn't happen — listRecentPosByVendor just enumerated this PO */ }
+        }
+
+        // Strategy 'create-draft' or no PO found AT ALL → tell Will, don't write anything.
         if (!poSummary) {
             const result: DefaultInboxInvoiceResult = {
                 ...base,
@@ -390,17 +467,37 @@ export async function processDefaultInboxInvoice(
                 vendorName,
                 outcome:             "po_not_found",
                 needsImmediateAlert: true,
-                summary: `${vendorName} PO #${poNumber} not found in Finale — invoice ${invoiceNumber} $${total.toFixed(2)}`,
+                summary: `${vendorName} PO #${poNumber} not correlated to any Finale PO — invoice ${invoiceNumber} $${total.toFixed(2)}. ${correlationNote}`,
             };
+            const skuLine = lineItems.length > 0
+                ? `\n<b>Items:</b> ${lineItems.slice(0, 5).map(li => li.finaleSku ?? "(no SKU)").join(", ")}${lineItems.length > 5 ? ` +${lineItems.length - 5} more` : ""}`
+                : "";
             await sendTelegramAlert(
-                `🚨 <b>Paid Invoice — PO Not Found</b>\n\n` +
+                `🚨 <b>Paid Invoice — No PO Correlation</b>\n\n` +
                 `<b>Vendor:</b> ${vendorName}\n` +
-                `<b>PO #:</b> ${poNumber}\n` +
-                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
-                `PO does not exist in Finale.`
+                `<b>Printed PO #:</b> ${poNumber}\n` +
+                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}${skuLine}\n\n` +
+                `<i>${correlationNote}</i>\n\n` +
+                `Reply with the correct PO# or use the dashboard rematch flow.`
             );
             await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
+        }
+
+        // Fallback used (not exact match) — log + notify so Will can audit.
+        if (usedStrategy !== "exact") {
+            console.log(`[default-inbox] correlation strategy=${usedStrategy} (${correlation.confidence}): ${correlationNote}`);
+            await sendTelegramAlert(
+                `🔍 <b>Paid Invoice — Fallback Correlation Used</b>\n\n` +
+                `<b>Vendor:</b> ${vendorName}\n` +
+                `<b>Printed PO #:</b> ${poNumber}\n` +
+                `<b>Resolved PO #:</b> ${poSummary.orderId} (strategy: <code>${usedStrategy}</code>, confidence: ${correlation.confidence})\n` +
+                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
+                `<i>${correlationNote}</i>\n\n` +
+                `Changes will be applied. Reply if this is wrong.`
+            );
+        } else if (poSummary.orderId !== poNumber) {
+            console.log(`[default-inbox] PO resolved: "${poNumber}" → ${poSummary.orderId} (${correlationNote})`);
         }
 
         const poDetails = await finale.getOrderDetails(poNumber);

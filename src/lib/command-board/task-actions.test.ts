@@ -24,6 +24,14 @@ vi.mock('../finale/reconciler', () => ({
     rejectPendingReconciliation: vi.fn(),
 }));
 
+// Mock agent-issue so we can verify the cross-cutting linked-issue resolver
+// fires when a task carries an issue_id (Phase 2 dropship + AP issues).
+vi.mock('../intelligence/agent-issue', () => ({
+    getById: vi.fn(),
+    clearBlocker: vi.fn(),
+    complete: vi.fn(),
+}));
+
 import * as agentTask from '../intelligence/agent-task';
 import {
     approvePendingReconciliation,
@@ -256,6 +264,144 @@ describe('Telegram bridge', () => {
         });
         vi.mocked(agentTask.complete).mockResolvedValue(undefined);
         const r = await dismissTask('t9', 'will-dashboard');
+        expect(r.ok).toBe(true);
+        expect(r.replyText).toBe('✓ Dismissed.');
+    });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// resolveLinkedIssueFromTaskAction (cross-cutting via agent-issue)
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('linked-issue resolution on task action', () => {
+    // Pull the mocked agent-issue functions for assertions.
+    let agentIssue: typeof import('../intelligence/agent-issue');
+    beforeEach(async () => {
+        agentIssue = await import('../intelligence/agent-issue');
+        vi.mocked(agentTask.complete).mockResolvedValue(undefined);
+        vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined as any);
+    });
+
+    it('dismissTask completes the linked issue when task has issue_id (dropship case)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-drop',
+            issue_id: 'iss-drop',
+            source_table: 'gmail_messages',
+            source_id: 'm1',
+        } as any);
+        vi.mocked(agentIssue.getById).mockResolvedValue({
+            id: 'iss-drop',
+            lifecycle_state: 'blocked',
+        } as any);
+
+        await dismissTask('t-drop', 'will-telegram');
+
+        // Blocked → clearBlocker first (coherent timeline), then complete.
+        expect(agentIssue.clearBlocker).toHaveBeenCalledWith('iss-drop', 'working');
+        expect(agentIssue.complete).toHaveBeenCalledWith(
+            'iss-drop',
+            expect.objectContaining({
+                resolution: 'task_dismissed',
+                resolved_by: 'will-telegram',
+                via: 'task_action',
+                task_id: 't-drop',
+            }),
+        );
+    });
+
+    it('approveTask non-AP path completes linked issue with resolution=task_approved', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-x',
+            issue_id: 'iss-x',
+            source_table: 'something_else',
+        } as any);
+        vi.mocked(agentIssue.getById).mockResolvedValue({
+            id: 'iss-x',
+            lifecycle_state: 'working',
+        } as any);
+
+        await approveTask('t-x', 'will-dashboard');
+
+        expect(agentIssue.clearBlocker).not.toHaveBeenCalled(); // not blocked
+        expect(agentIssue.complete).toHaveBeenCalledWith(
+            'iss-x',
+            expect.objectContaining({ resolution: 'task_approved' }),
+        );
+    });
+
+    it('rejectTask non-AP path completes linked issue with resolution=task_rejected', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-y',
+            issue_id: 'iss-y',
+            source_table: 'something_else',
+        } as any);
+        vi.mocked(agentIssue.getById).mockResolvedValue({
+            id: 'iss-y',
+            lifecycle_state: 'working',
+        } as any);
+
+        await rejectTask('t-y', 'will-telegram');
+
+        expect(agentIssue.complete).toHaveBeenCalledWith(
+            'iss-y',
+            expect.objectContaining({ resolution: 'task_rejected' }),
+        );
+    });
+
+    it('skips linked-issue resolution when task has no issue_id (legacy task)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-leg',
+            issue_id: null,
+        } as any);
+
+        await dismissTask('t-leg', 'will-telegram');
+
+        expect(agentIssue.complete).not.toHaveBeenCalled();
+    });
+
+    it('skips when issue is already complete (idempotent — no duplicate event)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-c',
+            issue_id: 'iss-c',
+        } as any);
+        vi.mocked(agentIssue.getById).mockResolvedValue({
+            id: 'iss-c',
+            lifecycle_state: 'complete',
+        } as any);
+
+        await dismissTask('t-c', 'will-telegram');
+
+        expect(agentIssue.complete).not.toHaveBeenCalled();
+    });
+
+    it('AP-source approveTask intentionally does NOT resolve via task-action (reconciler owns it)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-ap',
+            issue_id: 'iss-ap',
+            source_table: 'ap_pending_approvals',
+            source_id: 'src1',
+        } as any);
+        vi.mocked(approvePendingReconciliation).mockResolvedValue({
+            success: true,
+            applied: [],
+            errors: [],
+            message: 'ok',
+        } as any);
+
+        await approveTask('t-ap', 'will-telegram');
+
+        // Reconciler path returns early — no double-completion via task-action.
+        expect(agentIssue.complete).not.toHaveBeenCalled();
+    });
+
+    it('swallows agent-issue failures (best-effort contract)', async () => {
+        vi.mocked(agentTask.getById).mockResolvedValue({
+            id: 't-err',
+            issue_id: 'iss-err',
+        } as any);
+        vi.mocked(agentIssue.getById).mockRejectedValueOnce(new Error('boom'));
+
+        const r = await dismissTask('t-err', 'will-telegram');
         expect(r.ok).toBe(true);
         expect(r.replyText).toBe('✓ Dismissed.');
     });

@@ -1,0 +1,162 @@
+/**
+ * @file    issue-projection.ts
+ * @purpose Pure logic to group agent_task rows under business-flow keys
+ *          and derive an issue's lifecycle/autonomy from its tasks.
+ *
+ *          The projection cron (issue-projection-cron.ts) wires these
+ *          helpers to live data. These functions take and return plain
+ *          values so they can be unit-tested without DB mocks.
+ *
+ *          Behavioral guardrail (Will, 2026-04-28): `blocked` is reserved
+ *          for explicit setBlocker() calls — the projection never sets it
+ *          based on FAILED task status alone. A failed task means
+ *          `working` / autonomy_state = `retrying` until retry budget
+ *          exhausts, at which point a real blocker will be set elsewhere.
+ */
+
+import type { AgentTask } from "./agent-task";
+import type { IssueLifecycleState, IssueAutonomyState } from "./agent-issue";
+
+const OPEN_TASK_STATUSES = new Set(["PENDING", "CLAIMED", "RUNNING", "NEEDS_APPROVAL"]);
+const TERMINAL_SUCCESS = new Set(["SUCCEEDED", "APPROVED"]);
+// Will, 2026-04-29: REJECTED/CANCELLED/EXPIRED are terminal states from the
+// task hub's perspective — they're decisions, not work-in-progress. An issue
+// whose tasks all landed in one of these (without any success) is also
+// resolved from a lifecycle standpoint; keeping it as `working` indefinitely
+// is wrong. We bucket them as "terminal-not-successful" and route to complete.
+const TERMINAL_NONSUCCESS = new Set(["REJECTED", "CANCELLED", "EXPIRED"]);
+
+function slugify(s: string): string {
+    return s.trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.\-]/g, "");
+}
+
+/**
+ * Pure key derivation from raw fields. Shared between the projection cron
+ * (which derives keys from AgentTask.inputs) and direct issue writers like
+ * ap-issue.ts (which build keys from raw vendor/invoice/po values at the
+ * moment of the operational event). Both paths MUST produce identical keys
+ * for the same logical flow — otherwise the projection will create a
+ * second issue for a flow that the AP path already owns.
+ */
+export function keyFromFields(fields: {
+    vendorName?: string | null;
+    invoiceNumber?: string | null;
+    poNumber?: string | null;
+    orderId?: string | null;
+    sourceTable?: string | null;
+    sourceId?: string | null;
+}): string | null {
+    const vendor = fields.vendorName ? slugify(fields.vendorName) : null;
+    const invoice = fields.invoiceNumber || null;
+    const po = fields.poNumber || null;
+    const orderId = fields.orderId || null;
+
+    if (vendor && invoice) return `${vendor}|inv:${invoice}`;
+    if (vendor && po) return `${vendor}|po:${po}`;
+    if (vendor && orderId) return `${vendor}|ord:${orderId}`;
+
+    if (fields.sourceTable && fields.sourceId) {
+        return `${fields.sourceTable}:${fields.sourceId}`;
+    }
+    return null;
+}
+
+/**
+ * Compute the business-flow key for a task. Returns null when the task is
+ * not groupable (no source, no vendor) — the caller should drop it.
+ */
+export function businessFlowKey(task: AgentTask): string | null {
+    const inputs = task.inputs as Record<string, unknown>;
+    return keyFromFields({
+        vendorName: typeof inputs?.vendor_name === "string" ? (inputs.vendor_name as string) : null,
+        invoiceNumber: typeof inputs?.invoice_number === "string" ? (inputs.invoice_number as string) : null,
+        poNumber: typeof inputs?.po_number === "string" ? (inputs.po_number as string) : null,
+        orderId: typeof inputs?.order_id === "string" ? (inputs.order_id as string) : null,
+        sourceTable: task.source_table,
+        sourceId: task.source_id,
+    });
+}
+
+export function groupTasksByFlow(tasks: AgentTask[]): Map<string, AgentTask[]> {
+    const groups = new Map<string, AgentTask[]>();
+    for (const t of tasks) {
+        const key = businessFlowKey(t);
+        if (!key) continue;
+        const arr = groups.get(key) ?? [];
+        arr.push(t);
+        groups.set(key, arr);
+    }
+    return groups;
+}
+
+export type DerivedIssueState = {
+    lifecycle_state: IssueLifecycleState;
+    autonomy_state: IssueAutonomyState;
+    title: string;
+    owner: string;
+    digest: Record<string, unknown>;
+};
+
+export function deriveIssueState(tasks: AgentTask[]): DerivedIssueState {
+    if (tasks.length === 0) {
+        return { lifecycle_state: "detected", autonomy_state: "working", title: "", owner: "aria", digest: {} };
+    }
+    const sorted = [...tasks].sort(
+        (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+    );
+    const latest = sorted[0];
+
+    const hasOpen = tasks.some(t => OPEN_TASK_STATUSES.has(t.status));
+    const allTerminalSuccess = tasks.every(t => TERMINAL_SUCCESS.has(t.status));
+    const allTerminal = tasks.every(t =>
+        TERMINAL_SUCCESS.has(t.status) ||
+        TERMINAL_NONSUCCESS.has(t.status) ||
+        t.status === "FAILED",
+    );
+    const anyFailed = tasks.some(t => t.status === "FAILED");
+    const anyTerminalNonsuccess = tasks.some(t => TERMINAL_NONSUCCESS.has(t.status));
+
+    let lifecycle_state: IssueLifecycleState = "working";
+    let autonomy_state: IssueAutonomyState = "working";
+
+    if (allTerminalSuccess) {
+        lifecycle_state = "complete";
+        autonomy_state = "resolved";
+    } else if (allTerminal && !anyFailed && anyTerminalNonsuccess) {
+        // All tasks terminal, none failed, at least one rejected/cancelled/expired.
+        // From a case standpoint this issue is resolved — Will/Aria made a decision
+        // (or the work expired) and there is no more work to do. Lifecycle:
+        // complete; autonomy: resolved (the decision IS the resolution).
+        lifecycle_state = "complete";
+        autonomy_state = "resolved";
+    } else if (hasOpen) {
+        if (tasks.length === 1 && latest.status === "PENDING" && !latest.claimed_at) {
+            lifecycle_state = "triaging";
+            autonomy_state = "waiting";
+        } else if (anyFailed) {
+            lifecycle_state = "working";
+            autonomy_state = "retrying";
+        } else {
+            lifecycle_state = "working";
+            autonomy_state = "working";
+        }
+    } else if (anyFailed) {
+        // All tasks terminal but at least one failed and none succeeded → retrying.
+        // Phase 1 still does NOT set blocked here; explicit setBlocker is the only path.
+        lifecycle_state = "working";
+        autonomy_state = "retrying";
+    }
+
+    return {
+        lifecycle_state,
+        autonomy_state,
+        title: latest.goal,
+        owner: latest.owner ?? "aria",
+        digest: {
+            task_count: tasks.length,
+            statuses: Array.from(new Set(tasks.map(t => t.status))),
+            latest_task_id: latest.id,
+            latest_status: latest.status,
+        },
+    };
+}

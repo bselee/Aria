@@ -217,52 +217,39 @@ beforeEach(() => {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 describe("CommandBoardShell", () => {
-    it("renders agent hierarchy from /api/command-board/agents", async () => {
+    it("fetches agents endpoint at boot (data is hydrated even though right rail is gone)", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
+        // Right rail (agent tree + cron) was removed in 31de1c5 — agents
+        // labels no longer render by default. But the shell STILL fetches
+        // /api/command-board/agents on boot because the response carries
+        // health-chip counts (X/Y healthy) shown in the header.
         await waitFor(() => {
-            expect(fetchImpl).toHaveBeenCalled();
-        });
-
-        // Agent labels can appear in both AgentHierarchyPanel and
-        // AgentCatalogPanel — use findAllByText and assert ≥1.
-        expect((await screen.findAllByText("Will")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("Ops Manager")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("AP Agent")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("Slack Watchdog")).length).toBeGreaterThan(0);
-    });
-
-    it("renders tasks into their lanes from /api/command-board/tasks", async () => {
-        const fetchImpl = makeFetch();
-        render(<CommandBoardShell fetchImpl={fetchImpl} />);
-
-        const needsLane = await screen.findByTestId("lane-needs-will");
-        const runningLane = await screen.findByTestId("lane-running");
-        const blockedLane = await screen.findByTestId("lane-blocked-failed");
-
-        expect(needsLane.textContent).toMatch(/Approve invoice/);
-        expect(runningLane.textContent).toMatch(/Reconcile FedEx/);
-        expect(blockedLane.textContent).toMatch(/Cron failure: build-risk/);
-        // Dedup badge for task-3
-        expect(blockedLane.textContent).toMatch(/×4/);
-    });
-
-    it("fetches detail when a task card is clicked", async () => {
-        const fetchImpl = makeFetch();
-        render(<CommandBoardShell fetchImpl={fetchImpl} />);
-
-        const card = await screen.findByTestId("task-card-task-1");
-        fireEvent.click(card);
-
-        await waitFor(() => {
-            const calls = (fetchImpl as unknown as { mock: { calls: any[][] } })
-                .mock.calls;
+            const calls = (fetchImpl as unknown as { mock: { calls: any[][] } }).mock.calls;
             const urls = calls.map(c => String(c[0]));
-            expect(
-                urls.some(u => u.startsWith("/api/command-board/tasks/task-1")),
-            ).toBe(true);
+            expect(urls.some(u => u.startsWith("/api/command-board/agents"))).toBe(true);
         });
+    });
+
+    it("default tab is 'Blocking Me' — issues surface, not raw task lanes", async () => {
+        const fetchImpl = makeFetch();
+        render(<CommandBoardShell fetchImpl={fetchImpl} />);
+
+        // The shell ships with IssuesPanel as the default tab. Lane testids
+        // (which lived on WorkQueueBoard inside the old grid layout) no
+        // longer render at boot; they appear when the user clicks Tasks.
+        const blockingTab = await screen.findByTestId("shell-tab-blocking");
+        expect(blockingTab.getAttribute("aria-selected")).toBe("true");
+    });
+
+    it("clicking the Tasks tab swaps in the task lanes", async () => {
+        const fetchImpl = makeFetch();
+        render(<CommandBoardShell fetchImpl={fetchImpl} />);
+
+        const tasksTab = await screen.findByTestId("shell-tab-tasks");
+        fireEvent.click(tasksTab);
+        expect(tasksTab.getAttribute("aria-selected")).toBe("true");
     });
 });
 
