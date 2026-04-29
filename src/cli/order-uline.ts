@@ -60,6 +60,7 @@ import {
     type CartVerificationResult,
     type ObservedUlineCartRow,
 } from './order-uline-cart';
+import { resolveUlineDraftResolution } from '../lib/purchasing/uline-flow';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -103,7 +104,6 @@ function parseArgs() {
     const args = process.argv.slice(2);
     return {
         dryRun: args.includes('--dry-run'),
-        useGrid: args.includes('--grid'),
         singlePO: args.includes('--po') ? args[args.indexOf('--po') + 1] : null,
         autoReorder: args.includes('--auto-reorder'),
         createPO: args.includes('--create-po'),
@@ -256,9 +256,10 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
  */
 export interface UlineFridayPreCheckResult {
     needsOrder: boolean;
-    reason: 'no_items_needed' | 'recent_po_exists' | 'items_need_order';
+    reason: 'no_items_needed' | 'recent_po_exists' | 'items_need_order' | 'review_required';
     recentDraftPO: { orderId: string; orderDate: string; finaleUrl: string } | null;
     manifest: OrderManifest;
+    reviewReason?: string | null;
 }
 
 /**
@@ -267,10 +268,7 @@ export interface UlineFridayPreCheckResult {
  * Does NOT create a PO or touch the browser — returns data for Telegram.
  */
 export async function runFridayUlinePreCheck(finale: FinaleClient): Promise<UlineFridayPreCheckResult> {
-    const [manifest, recentDrafts] = await Promise.all([
-        gatherAutoReorderItems(finale),
-        finale.findRecentUlineDraftPOs(7),
-    ]);
+    const manifest = await gatherAutoReorderItems(finale);
 
     if (manifest.items.length === 0) {
         return {
@@ -278,15 +276,44 @@ export async function runFridayUlinePreCheck(finale: FinaleClient): Promise<Ulin
             reason: 'no_items_needed',
             recentDraftPO: null,
             manifest,
+            reviewReason: null,
         };
     }
 
-    if (recentDrafts.length > 0) {
+    const vendorPartyId = await finale.findVendorPartyByName('ULINE').catch(() => null);
+    if (!vendorPartyId) {
+        return {
+            needsOrder: true,
+            reason: 'items_need_order',
+            recentDraftPO: null,
+            manifest,
+            reviewReason: null,
+        };
+    }
+
+    const [activeDrafts, recentOrders] = await Promise.all([
+        finale.findActiveDraftPOsForVendor(vendorPartyId),
+        finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 7),
+    ]);
+    const resolution = resolveUlineDraftResolution({ activeDrafts, recentOrders });
+
+    if (resolution.action === 'reuse_existing_draft') {
         return {
             needsOrder: false,
             reason: 'recent_po_exists',
-            recentDraftPO: recentDrafts[0],
+            recentDraftPO: resolution.draftPO,
             manifest,
+            reviewReason: null,
+        };
+    }
+
+    if (resolution.action === 'review_required') {
+        return {
+            needsOrder: false,
+            reason: 'review_required',
+            recentDraftPO: null,
+            manifest,
+            reviewReason: resolution.reason,
         };
     }
 
@@ -295,6 +322,7 @@ export async function runFridayUlinePreCheck(finale: FinaleClient): Promise<Ulin
         reason: 'items_need_order',
         recentDraftPO: null,
         manifest,
+        reviewReason: null,
     };
 }
 
@@ -554,6 +582,15 @@ export async function createFinaleDraftPO(finale: FinaleClient, manifest: OrderM
     if (!vendorPartyId) {
         console.log('   ⚠️  Could not find ULINE vendor party ID. Skipping PO creation.');
         return manifest;
+    }
+
+    const [activeDrafts, recentOrders] = await Promise.all([
+        finale.findActiveDraftPOsForVendor(vendorPartyId).catch(() => []),
+        finale.findRecentPurchaseOrdersForVendor(vendorPartyId, 7).catch(() => []),
+    ]);
+    const resolution = resolveUlineDraftResolution({ activeDrafts, recentOrders });
+    if (resolution.action === 'review_required') {
+        throw new Error(resolution.reason);
     }
 
     const finaleItems = manifest.items.map(item => ({
@@ -1133,7 +1170,7 @@ async function main() {
     }
 
     console.log(`   Items to order: ${finalItems.length}`);
-    console.log(`   Method: ${args.useGrid ? 'Grid (individual fields)' : 'Paste Items (bulk textarea)'}\n`);
+    console.log(`   Method: Paste Items (bulk textarea)\n`);
 
     if (args.dryRun) {
         console.log('   ✅ Dry run complete. Run without --dry-run to place faux order.\n');
@@ -1145,22 +1182,35 @@ async function main() {
             console.log(`   ${item.ulineModel}, ${item.quantity}`);
         }
         console.log('   ─────────────────────────────────────────');
+        console.log('\n   📝 After cart fill, verified prices will sync back to Finale PO.');
+        console.log('   🛒 Cart verification status will be shown.\n');
         return;
     }
 
     // Phase 2: Place on ULINE
-    let result: string;
+    let cartResult: UlineCartFillResult;
     if (args.useGrid) {
-        result = await placeViaQuickOrderGrid(finalItems);
+        const msg = await placeViaQuickOrderGrid(finalItems);
+        cartResult = { message: msg, verification: { status: 'unverified', matchedModels: [], missingModels: [], quantityMismatches: [], unexpectedModels: [] }, observedRows: [], errorText: undefined };
     } else {
-        result = (await placeViaQuickOrderPaste(finale, finalItems, { autonomous: false })).message;
+        cartResult = await placeViaQuickOrderPaste(finale, finalItems, {
+            autonomous: false,
+            draftPO: manifests[0]?.sourcePO || null,
+        });
     }
+    const priceSyncMsg = cartResult && 'priceUpdatesApplied' in cartResult && cartResult.priceUpdatesApplied > 0
+        ? ` | 💰 ${(cartResult as any).priceUpdatesApplied} price update(s) synced to Finale`
+        : '';
+    const cartLinkMsg = cartResult.cartUrl ? ` | 📧 Cart emailed` : '';
 
     console.log('╔══════════════════════════════════════════════════╗');
     console.log('║     DONE — Items Added to ULINE Cart            ║');
     console.log('╠══════════════════════════════════════════════════╣');
-    console.log(`║   ${result.padEnd(46)}║`);
+    console.log(`║   ${cartResult.message.padEnd(46)}║`);
     console.log(`║   Source POs: ${manifests.map(m => m.sourcePO).join(', ').padEnd(34)}║`);
+    console.log(`║   Status: ${cartResult.verification.status.padEnd(42)}║`);
+    if (priceSyncMsg) console.log(`║   ${priceSyncMsg.padEnd(48)}║`);
+    if (cartLinkMsg) console.log(`║   ${cartLinkMsg.padEnd(48)}║`);
     console.log('╠══════════════════════════════════════════════════╣');
     console.log('║   ⚠️  REVIEW YOUR CART BEFORE CHECKOUT!          ║');
     console.log('║   This was a FAUX ORDER — nothing was submitted. ║');
