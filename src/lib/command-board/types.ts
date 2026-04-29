@@ -15,6 +15,19 @@ export type CommandBoardAgent = {
     process: string[];
     skills: string[];
     workflows: string[];
+    /**
+     * Live issue-ledger counts attributed to this agent (Phase 2).
+     * Populated by `/api/command-board/agents` from
+     * `agent_issue.current_handler` aggregations. Optional so existing
+     * unit tests + callers that build CommandBoardAgent literals in
+     * isolation don't break.
+     */
+    currentlyHandling?: {
+        working: number;
+        waitingExternal: number;
+        blocked: number;
+        total: number;
+    };
 };
 
 export type CommandBoardCatalogFile = {

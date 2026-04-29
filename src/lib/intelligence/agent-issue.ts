@@ -457,6 +457,54 @@ export async function getBySource(sourceTable: string, sourceId: string): Promis
  *   are still in-flight. Approve/reject paths should pass `false` so a
  *   completed-then-reopened flow can still be found.
  */
+/**
+ * Per-handler issue counts grouped by lifecycle state. Used by
+ * `/api/command-board/agents` to render the "currently handling" overlay
+ * on the dashboard agent tree — each agent shows live working/blocked
+ * counts so Will can see what Aria is actively doing without opening
+ * the issue list.
+ *
+ * Returns a flat map keyed by `current_handler` (string). Issues with
+ * `current_handler IS NULL` are silently dropped — they have no agent to
+ * attribute to. Best-effort: a query failure returns an empty map so the
+ * dashboard renders without the overlay rather than blowing up.
+ */
+export type IssueHandlerCounts = {
+    working: number;       // detected | triaging | working
+    waitingExternal: number;
+    blocked: number;
+    total: number;         // sum of the above
+};
+
+export async function getCurrentlyHandlingCounts(): Promise<Record<string, IssueHandlerCounts>> {
+    const supabase = createClient();
+    if (!supabase) return {};
+
+    const OPEN: IssueLifecycleState[] = [
+        "detected", "triaging", "working", "waiting_external", "blocked",
+    ];
+    const { data, error } = await supabase
+        .from("agent_issue")
+        .select("current_handler, lifecycle_state")
+        .in("lifecycle_state", OPEN);
+    if (error) {
+        console.warn("[agent-issue] getCurrentlyHandlingCounts failed:", error.message);
+        return {};
+    }
+
+    const out: Record<string, IssueHandlerCounts> = {};
+    for (const row of (data ?? []) as Array<{ current_handler: string | null; lifecycle_state: string }>) {
+        const h = row.current_handler;
+        if (!h) continue;
+        const bucket = (out[h] ??= { working: 0, waitingExternal: 0, blocked: 0, total: 0 });
+        if (row.lifecycle_state === "blocked") bucket.blocked += 1;
+        else if (row.lifecycle_state === "waiting_external") bucket.waitingExternal += 1;
+        else bucket.working += 1;
+        bucket.total += 1;
+    }
+    return out;
+}
+
 export async function getByBusinessFlowKey(
     businessFlowKey: string,
     onlyOpen = true,
