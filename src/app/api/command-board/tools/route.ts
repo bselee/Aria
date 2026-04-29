@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { listTools, type ListToolsFilter, type ToolCategory, type ToolScope } from "@/lib/agents/tool-registry";
 import { ensureCopilotToolsRegistered } from "@/lib/agents/register-copilot-tools";
 import { ensureFinaleToolsRegistered } from "@/lib/agents/register-finale-tools";
+import { ensureGmailToolsRegistered } from "@/lib/agents/register-gmail-tools";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -20,6 +21,7 @@ export async function GET(req: NextRequest) {
         // themselves from their own modules as they're migrated.
         ensureCopilotToolsRegistered();
         ensureFinaleToolsRegistered();
+        ensureGmailToolsRegistered();
 
         const url = new URL(req.url);
         const filter: ListToolsFilter = {};

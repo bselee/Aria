@@ -30,6 +30,8 @@ import { recordFeedback } from "./feedback-loop";
 import * as apIssue from "./ap-issue";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
 import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
+import { withToolAudit } from "../agents/tool-registry";
+import { ensureGmailToolsRegistered } from "../agents/register-gmail-tools";
 
 /**
  * @file    ap-agent.ts
@@ -879,13 +881,21 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         // Use latin1 so binary PDF bytes are preserved correctly through Buffer round-trip
         const mimeBuffer = Buffer.from(mimeParts.join("\r\n"), "latin1");
 
+        // Phase 2: this is the most important Gmail write in the AP pipeline
+        // — it's the email that triggers vendor payment via bill.com. Audit
+        // every send with agent attribution + filename context.
+        ensureGmailToolsRegistered();
+
         try {
-            await gmail.users.messages.send({
-                userId: "me",
-                requestBody: {
-                    raw: mimeBuffer.toString("base64url"),
-                }
-            });
+            await withToolAudit(
+                "gmail_send_message",
+                { agent: apIssue.HANDLER.AP_AGENT },
+                { to: "buildasoilap@bill.com", subject: originalSubject, filename, pdfBytes: pdfBuffer.length },
+                () => gmail.users.messages.send({
+                    userId: "me",
+                    requestBody: { raw: mimeBuffer.toString("base64url") },
+                }),
+            );
             return true;
         } catch (err: any) {
             console.error("     ❌ Failed to forward to bill.com:", err.message);
