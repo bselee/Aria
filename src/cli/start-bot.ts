@@ -57,6 +57,7 @@ import { handleTelegramPOSendCallback } from '../lib/copilot/channels/telegram-c
 import * as agentTask from '../lib/intelligence/agent-task';
 import { approveTask, rejectTask, dismissTask } from '../lib/command-board/task-actions';
 import * as agentIssue from '../lib/intelligence/agent-issue';
+import { getCommandBoardIssues, getCommandBoardIssueDetail } from '../lib/command-board/service';
 import { Markup as TgMarkup } from 'telegraf';
 import { getStartupHealth } from '../lib/copilot/smoke';
 
@@ -997,12 +998,14 @@ bot.on('text', async (ctx) => {
     }
 
     async function fetchIssues(opts: { limit?: number; onlyBlocked?: boolean } = {}): Promise<{ issues: IssueRow[]; total: number }> {
-        const base = process.env.DASHBOARD_BASE_URL ?? 'http://localhost:3001';
-        const limit = opts.limit ?? 10;
-        const lifecycleParam = opts.onlyBlocked ? '&lifecycle_state=blocked' : '';
-        const res = await fetch(`${base}/api/command-board/issues?limit=${limit}${lifecycleParam}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json() as Promise<{ issues: IssueRow[]; total: number }>;
+        // Call the service layer directly — same process as the bot. Avoids
+        // a cross-process HTTP dependency on the dashboard, which is run on
+        // demand and would make /issues fail when the dashboard is offline.
+        const result = await getCommandBoardIssues({
+            limit: opts.limit ?? 10,
+            lifecycleState: opts.onlyBlocked ? ['blocked'] : undefined,
+        });
+        return { issues: result.issues as unknown as IssueRow[], total: result.total };
     }
 
     async function renderIssuesMessage(
@@ -1053,11 +1056,8 @@ bot.on('text', async (ctx) => {
             return;
         }
         try {
-            const base = process.env.DASHBOARD_BASE_URL ?? 'http://localhost:3001';
-            const res = await fetch(`${base}/api/command-board/issues/${encodeURIComponent(arg)}`);
-            if (res.status === 404) { await ctx.reply('❓ Issue not found.'); return; }
-            if (!res.ok) { await ctx.reply(`⚠️ HTTP ${res.status}`); return; }
-            const detail = await res.json() as any;
+            const detail = await getCommandBoardIssueDetail(arg);
+            if (!detail) { await ctx.reply('❓ Issue not found.'); return; }
             // The detail route flattens the issue card onto the response root
             // and adds { tasks, timeline, inputs, outputs }. See
             // getCommandBoardIssueDetail in src/lib/command-board/service.ts.
@@ -1145,12 +1145,9 @@ bot.on('text', async (ctx) => {
     bot.action(/^issue_detail_(.+)$/, async (ctx) => {
         const issueId = ctx.match[1];
         await ctx.answerCbQuery();
-        // Reuse the /issue handler logic by faking the text argument.
         try {
-            const base = process.env.DASHBOARD_BASE_URL ?? 'http://localhost:3001';
-            const res = await fetch(`${base}/api/command-board/issues/${encodeURIComponent(issueId)}`);
-            if (!res.ok) { await ctx.reply(`⚠️ HTTP ${res.status}`); return; }
-            const detail = await res.json() as any;
+            const detail = await getCommandBoardIssueDetail(issueId);
+            if (!detail) { await ctx.reply('❓ Issue not found.'); return; }
             const i = detail.issue as IssueRow & { created_at: string; updated_at: string };
             const events = (detail.events ?? []) as Array<{ event_type: string; output_summary?: string; created_at: string }>;
             const tasks = (detail.linkedTasks ?? []) as Array<{ id: string; status: string; goal?: string }>;
@@ -1475,6 +1472,25 @@ bot.on('text', async (ctx) => {
         .catch((err: any) => console.error('Ã¢ÂÅ’ Bot launch error:', err.message));
 
     console.log('Ã¢Å“â€¦ ARIA IS LIVE AND LISTENING');
+
+    // Publish the operational command list to BotFather so the Telegram client
+    // shows them in the autocomplete dropdown when typing "/". Best-effort:
+    // if Telegram is rate-limited or the API rejects, we don't block boot.
+    bot.telegram.setMyCommands([
+        { command: 'issues', description: 'Open issues — blocking-me-first' },
+        { command: 'blockers', description: 'Just the blocked subset' },
+        { command: 'issue', description: 'Issue detail (paste id from /issues)' },
+        { command: 'tasks', description: 'Task hub — approvals + recent work' },
+        { command: 'crons', description: 'Cron job status' },
+        { command: 'status', description: 'Aria heartbeat / health' },
+        { command: 'memory', description: 'Recall a pattern from Pinecone' },
+        { command: 'product', description: 'Look up a Finale SKU' },
+        { command: 'consumption', description: 'BOM consumption for a SKU' },
+        { command: 'builds', description: 'Upcoming calendar builds' },
+        { command: 'buildrisk', description: 'Build risk analysis' },
+        { command: 'requests', description: 'Slack purchase-request feed' },
+        { command: 'kaizen', description: 'Recent corrections / learnings' },
+    ]).catch((err: any) => console.warn('setMyCommands failed:', err.message));
 
     // Seed memory with vendor patterns and known processes on every boot
     // (seedMemories uses upsert so this is idempotent)
