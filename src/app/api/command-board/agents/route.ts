@@ -15,6 +15,12 @@ import {
 import { getCurrentlyHandlingCounts, type IssueHandlerCounts } from "@/lib/intelligence/agent-issue";
 import { createClient } from "@/lib/supabase";
 
+type AgentBudgetSummary = {
+    monthly_usd_cap: number;
+    current_period_usd_spent: number;
+    paused_until: string | null;
+};
+
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 // Handler-string → catalog-agent-id alias map. The Phase 2 issue ledger uses
@@ -87,11 +93,32 @@ export async function GET(_req: NextRequest) {
                 : counts;
         }
 
+        // Phase 4: per-agent budget data for the dashboard.
+        const budgetByAgent = new Map<string, AgentBudgetSummary>();
+        const sb = createClient();
+        if (sb) {
+            try {
+                const { data: budgets } = await sb
+                    .from("agent_budget")
+                    .select("agent_id, monthly_usd_cap, current_period_usd_spent, paused_until");
+                for (const b of (budgets ?? []) as Array<{ agent_id: string; monthly_usd_cap: string | number; current_period_usd_spent: string | number; paused_until: string | null }>) {
+                    budgetByAgent.set(b.agent_id, {
+                        monthly_usd_cap: Number(b.monthly_usd_cap),
+                        current_period_usd_spent: Number(b.current_period_usd_spent),
+                        paused_until: b.paused_until,
+                    });
+                }
+            } catch {
+                /* best-effort — dashboard renders without budget data */
+            }
+        }
+
         const agents = catalog.agents.map((a) => ({
             ...a,
             heartbeat: heartbeatByAgent.get(a.id) ?? null,
             activeTaskCount: activeByAgent[a.id.toLowerCase()] ?? 0,
             currentlyHandling: aliasedCounts[a.id] ?? EMPTY_COUNTS,
+            budget: budgetByAgent.get(a.id) ?? null,
         }));
 
         return NextResponse.json(
