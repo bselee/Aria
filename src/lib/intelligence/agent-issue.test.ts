@@ -32,7 +32,7 @@ function resetChain() {
 
 vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
 
-import { createOrAdvance, getCurrentlyHandlingCounts } from "./agent-issue";
+import { createOrAdvance, getCurrentlyHandlingCounts, findLinkedOpenTask } from "./agent-issue";
 
 // Helper: override what the chained supabase mock resolves to next time.
 function setNextChainResult(value: any) {
@@ -306,5 +306,51 @@ describe("getCurrentlyHandlingCounts", () => {
         });
         const counts = await getCurrentlyHandlingCounts();
         expect(counts["x"]).toEqual({ working: 3, waitingExternal: 0, blocked: 0, total: 3 });
+    });
+});
+
+describe("findLinkedOpenTask", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        resetChain();
+    });
+
+    it("prefers NEEDS_APPROVAL over in-flight tasks", async () => {
+        setNextChainResult({
+            data: [
+                { id: "t-running", status: "RUNNING", source_table: null, source_id: null },
+                { id: "t-approval", status: "NEEDS_APPROVAL", source_table: "ap_pending_approvals", source_id: "ap-1" },
+                { id: "t-pending", status: "PENDING", source_table: null, source_id: null },
+            ],
+            error: null,
+        });
+        const linked = await findLinkedOpenTask("iss-1");
+        expect(linked?.id).toBe("t-approval");
+        expect(linked?.source_table).toBe("ap_pending_approvals");
+    });
+
+    it("returns null when no actionable tasks linked", async () => {
+        setNextChainResult({ data: [], error: null });
+        const linked = await findLinkedOpenTask("iss-empty");
+        expect(linked).toBeNull();
+    });
+
+    it("returns null on query failure (best-effort, callers fall back to issue-level resolve)", async () => {
+        setNextChainResult({ data: null, error: { message: "boom" } });
+        const linked = await findLinkedOpenTask("iss-x");
+        expect(linked).toBeNull();
+    });
+
+    it("falls through to in-flight when no NEEDS_APPROVAL is linked", async () => {
+        setNextChainResult({
+            data: [
+                { id: "t-pending", status: "PENDING", source_table: null, source_id: null },
+                { id: "t-running", status: "RUNNING", source_table: null, source_id: null },
+            ],
+            error: null,
+        });
+        const linked = await findLinkedOpenTask("iss-2");
+        // First in the array after rank-stable sort — PENDING was first, both rank=1
+        expect(linked?.status).toBe("PENDING");
     });
 });
