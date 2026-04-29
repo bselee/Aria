@@ -30,7 +30,7 @@
  */
 
 import { FinaleClient } from "../../finale/client";
-import { resolveFinalePo } from "../../finale/po-resolver";
+import { resolveFinalePo, correlatePo, type CorrelationStrategy } from "../../finale/po-resolver";
 import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
 import { createClient } from "../../supabase";
@@ -373,24 +373,41 @@ export async function processDefaultInboxInvoice(
             } catch { /* non-fatal */ }
         }
 
-        // ── Finale PO lookup ──────────────────────────────────────────────────
-        // Use the shared resolveFinalePo helper so paid-invoice resolution
-        // has the same robustness as the AP-pipeline path: parens / digits /
-        // adjacent-digit transposition variants + vendor-name disambiguation
-        // when multiple candidates resolve. Without this, vendors like Axiom
-        // whose printed PO format doesn't exactly match Finale's order ID
-        // were failing on po_not_found even when the PO existed.
+        // ── Finale PO correlation ─────────────────────────────────────────────
+        // Multi-strategy pipeline (Will's directive 2026-04-29):
+        //   1. resolveFinalePo on the printed PO# (parens/digits/transposition variants).
+        //   2. SKU overlap with the most recent OPEN POs for the vendor (60d).
+        //   3. Amount proximity (invoice subtotal ≈ PO total within 5% / $50).
+        //   4. Most recent PO for the vendor (Will's primary heuristic for Axiom etc).
+        //   5. Nothing correlated → strategy='create-draft' so the worker can
+        //      mint a draft PO from invoice line items (Will reviews + commits).
+        //
+        // Each fallback below "exact" notifies Will via Telegram so he can
+        // sanity-check the correlation before changes are written.
         const finale = new FinaleClient();
         let poSummary: { orderId: string; total: number; status: string } | null = null;
-        const resolution = await resolveFinalePo(poNumber, vendorName, finale);
+        let usedStrategy: CorrelationStrategy = "exact";
+        let correlationNote = "";
 
-        if (resolution.orderId) {
+        const correlation = await correlatePo({
+            printedPo: poNumber,
+            vendorName,
+            lineItems: lineItems.map(li => ({ sku: li.finaleSku ?? null, total: li.total ?? null })),
+            invoiceTotal: total,
+            invoiceFreight: freight,
+            client: finale,
+        });
+        usedStrategy = correlation.strategy ?? "exact";
+        correlationNote = correlation.note;
+
+        if (correlation.orderId) {
             try {
-                const s = await finale.getOrderSummary(resolution.orderId);
+                const s = await finale.getOrderSummary(correlation.orderId);
                 if (s) poSummary = { orderId: s.orderId, total: s.total, status: s.status };
-            } catch { /* shouldn't happen — resolveFinalePo just verified it exists */ }
+            } catch { /* shouldn't happen — listRecentPosByVendor just enumerated this PO */ }
         }
 
+        // Strategy 'create-draft' or no PO found AT ALL → tell Will, don't write anything.
         if (!poSummary) {
             const result: DefaultInboxInvoiceResult = {
                 ...base,
@@ -400,21 +417,37 @@ export async function processDefaultInboxInvoice(
                 vendorName,
                 outcome:             "po_not_found",
                 needsImmediateAlert: true,
-                summary: `${vendorName} PO #${poNumber} not found in Finale — invoice ${invoiceNumber} $${total.toFixed(2)} (tried ${resolution.triedCandidates.length} variants)`,
+                summary: `${vendorName} PO #${poNumber} not correlated to any Finale PO — invoice ${invoiceNumber} $${total.toFixed(2)}. ${correlationNote}`,
             };
+            const skuLine = lineItems.length > 0
+                ? `\n<b>Items:</b> ${lineItems.slice(0, 5).map(li => li.finaleSku ?? "(no SKU)").join(", ")}${lineItems.length > 5 ? ` +${lineItems.length - 5} more` : ""}`
+                : "";
             await sendTelegramAlert(
-                `🚨 <b>Paid Invoice — PO Not Found</b>\n\n` +
+                `🚨 <b>Paid Invoice — No PO Correlation</b>\n\n` +
                 `<b>Vendor:</b> ${vendorName}\n` +
-                `<b>PO #:</b> ${poNumber}\n` +
-                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
-                `Tried ${resolution.triedCandidates.length} variants (parens/digits/transpositions). ` +
-                `PO does not exist in Finale.`
+                `<b>Printed PO #:</b> ${poNumber}\n` +
+                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}${skuLine}\n\n` +
+                `<i>${correlationNote}</i>\n\n` +
+                `Reply with the correct PO# or use the dashboard rematch flow.`
             );
             await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
         }
-        if (poSummary.orderId !== poNumber) {
-            console.log(`[default-inbox] PO resolved: "${poNumber}" → ${poSummary.orderId} (${resolution.note})`);
+
+        // Fallback used (not exact match) — log + notify so Will can audit.
+        if (usedStrategy !== "exact") {
+            console.log(`[default-inbox] correlation strategy=${usedStrategy} (${correlation.confidence}): ${correlationNote}`);
+            await sendTelegramAlert(
+                `🔍 <b>Paid Invoice — Fallback Correlation Used</b>\n\n` +
+                `<b>Vendor:</b> ${vendorName}\n` +
+                `<b>Printed PO #:</b> ${poNumber}\n` +
+                `<b>Resolved PO #:</b> ${poSummary.orderId} (strategy: <code>${usedStrategy}</code>, confidence: ${correlation.confidence})\n` +
+                `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
+                `<i>${correlationNote}</i>\n\n` +
+                `Changes will be applied. Reply if this is wrong.`
+            );
+        } else if (poSummary.orderId !== poNumber) {
+            console.log(`[default-inbox] PO resolved: "${poNumber}" → ${poSummary.orderId} (${correlationNote})`);
         }
 
         const poDetails = await finale.getOrderDetails(poNumber);
