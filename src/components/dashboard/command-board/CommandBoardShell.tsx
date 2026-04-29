@@ -1,20 +1,21 @@
 /**
  * @file    CommandBoardShell.tsx
- * @purpose Top-level dashboard layout. Module tabs + full-canvas content +
- *          sticky right rail with blocking-me, agent tree, cron health.
+ * @purpose Top-level dashboard layout. Module tabs + full-canvas content.
  *
  *          The 12 operational panels (AP, Receivings, Ordering, Tracking,
  *          Builds, etc.) get FULL CANVAS now — they were previously crammed
  *          into a 320px bottom dock. The "Blocking Me" tab is the default
  *          and renders the issue-ledger surface (IssuesPanel).
+ *
+ *          Tab switching is instant after first visit: every visited tab
+ *          stays mounted (CSS-hidden when inactive) so JIT compile + data
+ *          fetch happen ONCE per tab, then switching is pure visibility.
  */
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Bell, RefreshCw, ChevronRight, ChevronDown } from "lucide-react";
+import { Activity, Bell, RefreshCw } from "lucide-react";
 
-import AgentHierarchyPanel from "./AgentHierarchyPanel";
-import CronRunsPanel from "./CronRunsPanel";
 import IssuesPanel from "./IssuesPanel";
 import TasksPanel from "@/components/dashboard/TasksPanel";
 import { PANEL_BY_ID } from "./panelRegistry";
@@ -89,9 +90,10 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     const [crons, setCrons] = useState<CommandBoardCron[]>([]);
 
     const [activeTab, setActiveTab] = useState<TabId>("blocking");
-    const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-    const [agentRailOpen, setAgentRailOpen] = useState(true);
-    const [cronRailOpen, setCronRailOpen] = useState(false);
+    // Tabs that have been visited stay MOUNTED so switching back is instant.
+    // First visit pays the JIT-compile + data-fetch cost once; subsequent
+    // switches are pure CSS visibility flips.
+    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["blocking"]));
 
     const [refreshing, setRefreshing] = useState(false);
     const [lastError, setLastError] = useState<string | null>(null);
@@ -111,6 +113,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     useEffect(() => {
         if (typeof window === "undefined") return;
         try { window.localStorage.setItem(TAB_STORAGE_KEY, activeTab); } catch { /* ignore */ }
+        setVisitedTabs(prev => prev.has(activeTab) ? prev : new Set(prev).add(activeTab));
     }, [activeTab]);
 
     const fetchAll = useCallback(
@@ -281,69 +284,28 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                 ))}
             </nav>
 
-            {/* Main: full-canvas tab content + right rail */}
-            <div className="flex-1 grid grid-cols-[1fr_280px] gap-2 p-2 overflow-hidden">
-                {/* Center — full canvas */}
-                <div className="overflow-hidden">
-                    <div className="h-full overflow-hidden rounded-md border border-zinc-800/60 bg-zinc-950/40">
-                        {activeTabDef.render()}
-                    </div>
+            {/* Main: full-canvas tab content. Every visited tab stays
+                mounted so switching is instant after first load — only
+                the active one is visible (CSS), the rest are hidden but
+                still hold their fetched data + compiled JS. */}
+            <div className="flex-1 p-2 overflow-hidden">
+                <div className="h-full overflow-hidden rounded-md border border-zinc-800/60 bg-zinc-950/40">
+                    {tabs.map(tab => {
+                        const visited = visitedTabs.has(tab.id);
+                        if (!visited) return null;
+                        const isActive = tab.id === activeTab;
+                        return (
+                            <div
+                                key={tab.id}
+                                className={`h-full overflow-hidden ${isActive ? "block" : "hidden"}`}
+                                aria-hidden={!isActive}
+                            >
+                                {tab.render()}
+                            </div>
+                        );
+                    })}
                 </div>
-
-                {/* Right rail — agent tree + cron health */}
-                <aside className="flex flex-col gap-2 overflow-hidden">
-                    <RailSection
-                        title="Agents"
-                        open={agentRailOpen}
-                        onToggle={() => setAgentRailOpen(o => !o)}
-                        defaultHeight="flex-1"
-                    >
-                        <AgentHierarchyPanel
-                            agents={agents}
-                            heartbeats={heartbeats}
-                            tasks={tasks}
-                            selectedAgentId={selectedAgentId}
-                            onSelectAgent={setSelectedAgentId}
-                        />
-                    </RailSection>
-                    <RailSection
-                        title="Crons"
-                        open={cronRailOpen}
-                        onToggle={() => setCronRailOpen(o => !o)}
-                        defaultHeight="h-[200px]"
-                    >
-                        <CronRunsPanel crons={crons} />
-                    </RailSection>
-                </aside>
             </div>
-        </div>
-    );
-}
-
-function RailSection({
-    title,
-    open,
-    onToggle,
-    defaultHeight,
-    children,
-}: {
-    title: string;
-    open: boolean;
-    onToggle: () => void;
-    defaultHeight: string;
-    children: React.ReactNode;
-}) {
-    return (
-        <div className={`${open ? defaultHeight : "shrink-0"} flex flex-col overflow-hidden`}>
-            <button
-                type="button"
-                onClick={onToggle}
-                className="flex items-center gap-1 px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-zinc-500 hover:text-zinc-300 bg-zinc-900/60 border border-zinc-800/60 rounded-t"
-            >
-                {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                {title}
-            </button>
-            {open && <div className="flex-1 overflow-hidden border-x border-b border-zinc-800/60 rounded-b">{children}</div>}
         </div>
     );
 }
