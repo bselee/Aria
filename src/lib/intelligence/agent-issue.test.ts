@@ -32,7 +32,12 @@ function resetChain() {
 
 vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
 
-import { createOrAdvance } from "./agent-issue";
+import { createOrAdvance, getCurrentlyHandlingCounts } from "./agent-issue";
+
+// Helper: override what the chained supabase mock resolves to next time.
+function setNextChainResult(value: any) {
+    terminalAwaitValue = value;
+}
 
 describe("createOrAdvance", () => {
     beforeEach(() => {
@@ -240,5 +245,66 @@ describe("createOrAdvance", () => {
         // Safe metadata DID apply.
         expect(appliedPatch).toHaveProperty("priority", 1);
         expect(appliedPatch).toHaveProperty("inputs");
+    });
+});
+
+describe("getCurrentlyHandlingCounts", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        resetChain();
+    });
+
+    it("groups open issues by current_handler with state breakdown", async () => {
+        setNextChainResult({
+            data: [
+                { current_handler: "ap-agent", lifecycle_state: "working" },
+                { current_handler: "ap-agent", lifecycle_state: "working" },
+                { current_handler: "ap-agent", lifecycle_state: "blocked" },
+                { current_handler: "will", lifecycle_state: "blocked" },
+                { current_handler: "ap-reconciler", lifecycle_state: "waiting_external" },
+                { current_handler: "ap-reconciler", lifecycle_state: "detected" },
+            ],
+            error: null,
+        });
+
+        const counts = await getCurrentlyHandlingCounts();
+
+        expect(counts["ap-agent"]).toEqual({ working: 2, waitingExternal: 0, blocked: 1, total: 3 });
+        expect(counts["will"]).toEqual({ working: 0, waitingExternal: 0, blocked: 1, total: 1 });
+        expect(counts["ap-reconciler"]).toEqual({ working: 1, waitingExternal: 1, blocked: 0, total: 2 });
+    });
+
+    it("silently drops rows where current_handler is null", async () => {
+        setNextChainResult({
+            data: [
+                { current_handler: null, lifecycle_state: "working" },
+                { current_handler: "ap-agent", lifecycle_state: "working" },
+            ],
+            error: null,
+        });
+
+        const counts = await getCurrentlyHandlingCounts();
+
+        expect(Object.keys(counts)).toEqual(["ap-agent"]);
+        expect(counts["ap-agent"].total).toBe(1);
+    });
+
+    it("returns an empty map on query failure (best-effort, dashboard renders without overlay)", async () => {
+        setNextChainResult({ data: null, error: { message: "boom" } });
+        const counts = await getCurrentlyHandlingCounts();
+        expect(counts).toEqual({});
+    });
+
+    it("buckets detected/triaging/working all into 'working' (caller doesn't need 5-state breakdown)", async () => {
+        setNextChainResult({
+            data: [
+                { current_handler: "x", lifecycle_state: "detected" },
+                { current_handler: "x", lifecycle_state: "triaging" },
+                { current_handler: "x", lifecycle_state: "working" },
+            ],
+            error: null,
+        });
+        const counts = await getCurrentlyHandlingCounts();
+        expect(counts["x"]).toEqual({ working: 3, waitingExternal: 0, blocked: 0, total: 3 });
     });
 });
