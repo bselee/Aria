@@ -31,24 +31,50 @@ function slugify(s: string): string {
 }
 
 /**
- * Compute the business-flow key for a task. Returns null when the task is
- * not groupable (no source, no vendor) — the caller should drop it.
+ * Pure key derivation from raw fields. Shared between the projection cron
+ * (which derives keys from AgentTask.inputs) and direct issue writers like
+ * ap-issue.ts (which build keys from raw vendor/invoice/po values at the
+ * moment of the operational event). Both paths MUST produce identical keys
+ * for the same logical flow — otherwise the projection will create a
+ * second issue for a flow that the AP path already owns.
  */
-export function businessFlowKey(task: AgentTask): string | null {
-    const inputs = task.inputs as Record<string, unknown>;
-    const vendor = typeof inputs?.vendor_name === "string" ? slugify(inputs.vendor_name as string) : null;
-    const invoice = typeof inputs?.invoice_number === "string" ? inputs.invoice_number : null;
-    const po = typeof inputs?.po_number === "string" ? inputs.po_number : null;
-    const orderId = typeof inputs?.order_id === "string" ? inputs.order_id : null;
+export function keyFromFields(fields: {
+    vendorName?: string | null;
+    invoiceNumber?: string | null;
+    poNumber?: string | null;
+    orderId?: string | null;
+    sourceTable?: string | null;
+    sourceId?: string | null;
+}): string | null {
+    const vendor = fields.vendorName ? slugify(fields.vendorName) : null;
+    const invoice = fields.invoiceNumber || null;
+    const po = fields.poNumber || null;
+    const orderId = fields.orderId || null;
 
     if (vendor && invoice) return `${vendor}|inv:${invoice}`;
     if (vendor && po) return `${vendor}|po:${po}`;
     if (vendor && orderId) return `${vendor}|ord:${orderId}`;
 
-    if (task.source_table && task.source_id) {
-        return `${task.source_table}:${task.source_id}`;
+    if (fields.sourceTable && fields.sourceId) {
+        return `${fields.sourceTable}:${fields.sourceId}`;
     }
     return null;
+}
+
+/**
+ * Compute the business-flow key for a task. Returns null when the task is
+ * not groupable (no source, no vendor) — the caller should drop it.
+ */
+export function businessFlowKey(task: AgentTask): string | null {
+    const inputs = task.inputs as Record<string, unknown>;
+    return keyFromFields({
+        vendorName: typeof inputs?.vendor_name === "string" ? (inputs.vendor_name as string) : null,
+        invoiceNumber: typeof inputs?.invoice_number === "string" ? (inputs.invoice_number as string) : null,
+        poNumber: typeof inputs?.po_number === "string" ? (inputs.po_number as string) : null,
+        orderId: typeof inputs?.order_id === "string" ? (inputs.order_id as string) : null,
+        sourceTable: task.source_table,
+        sourceId: task.source_id,
+    });
 }
 
 export function groupTasksByFlow(tasks: AgentTask[]): Map<string, AgentTask[]> {

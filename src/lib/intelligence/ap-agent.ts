@@ -27,6 +27,7 @@ import {
     validateInvoiceBalance,
 } from "../finale/reconciler";
 import { recordFeedback } from "./feedback-loop";
+import * as apIssue from "./ap-issue";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
 import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
 
@@ -503,7 +504,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             // incrementOrCreate's dedup_count bump instead of creating new
                             // rows. Best-effort: a hub failure must not block AP polling.
                             try {
-                                await agentTask.incrementOrCreate({
+                                const dropshipTask = await agentTask.incrementOrCreate({
                                     sourceTable: "gmail_messages",
                                     sourceId: m.id!,
                                     type: "dropship_forward",
@@ -521,6 +522,40 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                         pdf_count: pdfPartsDropship.length,
                                     },
                                 });
+                                // Phase 2: also surface to the issue ledger so /issues
+                                // and the dashboard show this as the parent unit. We
+                                // don't have a vendor invoice number for dropships, so
+                                // the key falls back to gmail_messages:<id>. Block on
+                                // source_unavailable since Bill.com forward is the
+                                // failing dependency — Will needs to act manually.
+                                const dropshipIssueId = await apIssue.ensureApIssue({
+                                    vendorName: routingRule.label,
+                                    gmailMessageId: m.id!,
+                                    title: `Dropship forward failed — ${routingRule.label}`,
+                                    handler: apIssue.HANDLER.AP_AGENT,
+                                    sourceTable: "gmail_messages",
+                                    sourceId: m.id!,
+                                    lifecycleState: "working",
+                                    priority: 1,
+                                    owner: apIssue.HANDLER.WILL,
+                                    inputs: apIssue.apFlowInputs({
+                                        vendorName: routingRule.label,
+                                        gmailMessageId: m.id!,
+                                        extras: {
+                                            from,
+                                            subject,
+                                            pdf_count: pdfPartsDropship.length,
+                                        },
+                                    }),
+                                });
+                                if (dropshipIssueId) {
+                                    await apIssue.linkApTask(dropshipTask.id, dropshipIssueId);
+                                    await apIssue.blockApIssue(
+                                        dropshipIssueId,
+                                        "source_unavailable",
+                                        `Bill.com forward failed — manually forward via /tasks dropship_fwd_*`,
+                                    );
+                                }
                             } catch (hubErr: any) {
                                 console.error(`     ⚠️ Failed to surface dropship failure to hub: ${hubErr.message}`);
                             }
@@ -1494,6 +1529,33 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             console.log(`   📊 Reconciliation: ${result.overallVerdict} | Impact: $${result.totalDollarImpact.toFixed(2)}`);
 
+            // Phase 2 issue ledger: ensure an issue exists for this AP flow before
+            // any verdict branch acts on `result`. Best-effort — null id means we
+            // simply don't advance the issue ledger for this run; the AP pipeline
+            // is unaffected. Handler is set to `ap-reconciler` since reconciliation
+            // is the operational step we're currently executing. nextAction is set
+            // so the dashboard can answer "what is Aria doing right now" without
+            // reading event history.
+            const issueId = await apIssue.ensureApIssue({
+                vendorName: result.vendorName,
+                invoiceNumber: result.invoiceNumber,
+                poNumber: result.orderId,
+                orderId: result.orderId,
+                handler: apIssue.HANDLER.AP_RECONCILER,
+                lifecycleState: "working",
+                autonomyState: "working",
+                nextAction: `Reconciling invoice against PO ${result.orderId}`,
+                inputs: apIssue.apFlowInputs({
+                    vendorName: result.vendorName,
+                    invoiceNumber: result.invoiceNumber,
+                    poNumber: result.orderId,
+                    orderId: result.orderId,
+                    verdict: result.overallVerdict,
+                    matchStrategy,
+                    extras: { total_dollar_impact: result.totalDollarImpact },
+                }),
+            });
+
             // Helper to fire Pinecone memory after any reconciliation outcome (non-blocking)
             const writeReconciliationMemory = (verdict: string) => {
                 setImmediate(async () => {
@@ -1621,6 +1683,22 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }
                 writeReconciliationMemory("auto_approve");
                 await this.sendReconciliationNotification(result);
+                if (issueId) {
+                    // Re-fetch applyResult counts when a write happened. The
+                    // `if (priceChanges || feeChanges || trackingUpdate)` guard
+                    // above means applyResult only exists when we actually wrote;
+                    // for no-changes auto-approve the counts are zero by definition.
+                    const wrote = result.priceChanges.length > 0 || result.feeChanges.length > 0 || !!result.trackingUpdate;
+                    await apIssue.completeApIssue(issueId, {
+                        resolution: "auto_approved",
+                        total_dollar_impact: result.totalDollarImpact,
+                        verdict: result.overallVerdict,
+                        price_change_count: result.priceChanges.length,
+                        fee_change_count: result.feeChanges.length,
+                        tracking_updated: !!result.trackingUpdate,
+                        wrote_to_finale: wrote,
+                    });
+                }
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "needs_approval") {
@@ -1632,12 +1710,32 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     process.env.TELEGRAM_CHAT_ID!,
                     `🔍 Invoice #${result.invoiceNumber} (${result.vendorName}) changes outside guardrails — enqueued for dashboard review\n\n${result.summary}\n\nCheck the AP / Invoices panel to approve or dismiss.`
                 );
+                if (issueId) {
+                    await apIssue.recordApHandoff(
+                        issueId,
+                        apIssue.HANDLER.AP_RECONCILER,
+                        apIssue.HANDLER.WILL,
+                        apIssue.HANDOFF_REASON.NEEDS_APPROVAL_DASHBOARD,
+                    );
+                    await apIssue.blockApIssue(
+                        issueId,
+                        "human_approval_required",
+                        `Approve or dismiss in dashboard AP/Invoices panel ($${result.totalDollarImpact.toFixed(2)} impact)`,
+                    );
+                }
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "rejected") {
                 // Magnitude error — alert but do NOT apply
                 writeReconciliationMemory("rejected");
                 await this.sendReconciliationNotification(result);
+                if (issueId) {
+                    await apIssue.blockApIssue(
+                        issueId,
+                        "data_integrity_error",
+                        `≥10× price magnitude shift detected — investigate before applying ($${result.totalDollarImpact.toFixed(2)})`,
+                    );
+                }
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "duplicate") {
@@ -1645,6 +1743,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 console.log(`   🔁 Duplicate: Invoice #${result.invoiceNumber} already reconciled against PO ${orderId}`);
                 writeReconciliationMemory("duplicate");
                 await this.sendReconciliationNotification(result);
+                if (issueId) {
+                    await apIssue.completeApIssue(issueId, { resolution: "duplicate" });
+                }
                 return { success: true, verdict: result.overallVerdict };
 
             } else {
@@ -1654,6 +1755,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     await this.logReconciliation(supabase, result, { applied: [], skipped: [], errors: [] });
                 }
                 await this.sendReconciliationNotification(result);
+                if (issueId) {
+                    await apIssue.completeApIssue(issueId, { resolution: result.overallVerdict });
+                }
                 return { success: true, verdict: result.overallVerdict };
             }
 
@@ -1676,6 +1780,31 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     { invoiceNumber: invoice.invoiceNumber, orderId, error: err.message }
                 );
             } catch { /* swallow */ }
+            // Phase 2: surface to issue ledger. ensureApIssue is idempotent — if
+            // the issue already exists for this flow we just advance/no-op,
+            // otherwise we create one explicitly so the failure is visible.
+            const errIssueId = await apIssue.ensureApIssue({
+                vendorName: invoice.vendorName,
+                invoiceNumber: invoice.invoiceNumber,
+                poNumber: orderId,
+                orderId,
+                handler: apIssue.HANDLER.AP_RECONCILER,
+                lifecycleState: "working",
+                inputs: apIssue.apFlowInputs({
+                    vendorName: invoice.vendorName,
+                    invoiceNumber: invoice.invoiceNumber,
+                    poNumber: orderId,
+                    orderId,
+                    extras: { error: err.message },
+                }),
+            });
+            if (errIssueId) {
+                await apIssue.blockApIssue(
+                    errIssueId,
+                    "source_unavailable",
+                    `Reconciliation failed: ${err.message}`,
+                );
+            }
             return { success: false, verdict: "error", error: err.message };
         }
     }

@@ -443,3 +443,41 @@ export async function getBySource(sourceTable: string, sourceId: string): Promis
     }
     return (data ?? null) as AgentIssue | null;
 }
+
+/**
+ * Indexed lookup by business_flow_key. Backed by
+ * `idx_agent_issue_business_flow_key` (and the unique partial index
+ * `uq_agent_issue_business_flow_open` for OPEN states).
+ *
+ * Phase 2 producers (ap-issue.ts) call this to find the issue for a
+ * vendor/invoice/po flow without paging the whole listIssues window —
+ * O(1) instead of O(n).
+ *
+ * @param onlyOpen When true (default), restricts to lifecycle states that
+ *   are still in-flight. Approve/reject paths should pass `false` so a
+ *   completed-then-reopened flow can still be found.
+ */
+export async function getByBusinessFlowKey(
+    businessFlowKey: string,
+    onlyOpen = true,
+): Promise<AgentIssue | null> {
+    const supabase = createClient();
+    if (!supabase) return null;
+    let q = supabase
+        .from("agent_issue")
+        .select("*")
+        .eq("business_flow_key", businessFlowKey);
+    if (onlyOpen) {
+        q = q.in("lifecycle_state", ["detected", "triaging", "working", "waiting_external", "blocked"]);
+    } else {
+        // No partial-unique guarantee outside open states — pick the most
+        // recently-updated row so callers get the canonical instance.
+        q = q.order("updated_at", { ascending: false }).limit(1);
+    }
+    const { data, error } = await q.maybeSingle();
+    if (error) {
+        console.warn("[agent-issue] getByBusinessFlowKey failed:", error.message);
+        return null;
+    }
+    return (data ?? null) as AgentIssue | null;
+}

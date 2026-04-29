@@ -25,6 +25,7 @@
  */
 
 import * as agentTask from "../intelligence/agent-task";
+import * as apIssue from "../intelligence/ap-issue";
 
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
@@ -130,6 +131,45 @@ export async function storePendingApproval(result: ReconciliationResult, client:
             await sb.from("ap_pending_approvals")
                 .update({ task_id: task.id })
                 .eq("id", dbId);
+        }
+        // Phase 2 issue ledger: ensure the parent issue exists for this AP
+        // flow, link the approval task to it, and block on
+        // human_approval_required so the issue surfaces as Will-blocked on
+        // /issues and /dashboard. Best-effort — issue ledger failures must
+        // never block the Telegram approval prompt.
+        //
+        // Handler ordering: ensure with `ap-reconciler` (the handler at the
+        // moment storePendingApproval is entered), then let recordApHandoff
+        // be the single source of truth that flips it to `will`. Setting
+        // `handler: 'will'` here would make the handoff event redundant.
+        const issueId = await apIssue.ensureApIssue({
+            vendorName: result.vendorName,
+            invoiceNumber: result.invoiceNumber,
+            poNumber: result.orderId,
+            orderId: result.orderId,
+            handler: apIssue.HANDLER.AP_RECONCILER,
+            lifecycleState: "working",
+            inputs: apIssue.apFlowInputs({
+                vendorName: result.vendorName,
+                invoiceNumber: result.invoiceNumber,
+                poNumber: result.orderId,
+                orderId: result.orderId,
+                verdict: result.overallVerdict,
+            }),
+        });
+        if (issueId) {
+            await apIssue.linkApTask(task.id, issueId);
+            await apIssue.recordApHandoff(
+                issueId,
+                apIssue.HANDLER.AP_RECONCILER,
+                apIssue.HANDLER.WILL,
+                apIssue.HANDOFF_REASON.NEEDS_APPROVAL_TELEGRAM,
+            );
+            await apIssue.blockApIssue(
+                issueId,
+                "human_approval_required",
+                `Approve via Telegram or /tasks (PO ${result.orderId})`,
+            );
         }
     } catch (err: any) {
         console.warn(`[reconciler] hub upsert failed: ${err.message}`);
@@ -339,6 +379,25 @@ export async function approvePendingReconciliation(id: string): Promise<{
     // text-command fallback in one place (both routes call this function).
     await agentTask.decideApprovalBySource("ap_pending_approvals", id, "approve", "reconciler");
 
+    // Phase 2 issue ledger: clear the human_approval_required blocker and
+    // mark the issue complete. Best-effort — a missing issue (older
+    // approvals predating Phase 2) just no-ops.
+    const approvedIssueId = await apIssue.findApIssue({
+        vendorName: entry.result.vendorName,
+        invoiceNumber: entry.result.invoiceNumber,
+        poNumber: entry.result.orderId,
+        orderId: entry.result.orderId,
+    });
+    if (approvedIssueId) {
+        await apIssue.unblockApIssue(approvedIssueId, "working");
+        await apIssue.completeApIssue(approvedIssueId, {
+            resolution: "approved",
+            approved_by: "Will",
+            applied: applyResult.applied.length,
+            errors: applyResult.errors.length,
+        });
+    }
+
     // Optional: We can keep it in DB for audit trail, so omitting the delete!
 
     // Write RECONCILIATION entry to ap_activity_log for duplicate detection.
@@ -479,6 +538,23 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
 
     // Mirror decision to the control-plane hub.
     await agentTask.decideApprovalBySource("ap_pending_approvals", id, "reject", "reconciler");
+
+    // Phase 2 issue ledger: clear the blocker and mark complete with
+    // resolution=rejected. The issue IS resolved — Will made the decision
+    // (no changes apply) — so lifecycle moves to complete, not back to working.
+    const rejectedIssueId = await apIssue.findApIssue({
+        vendorName: entry.result.vendorName,
+        invoiceNumber: entry.result.invoiceNumber,
+        poNumber: entry.result.orderId,
+        orderId: entry.result.orderId,
+    });
+    if (rejectedIssueId) {
+        await apIssue.unblockApIssue(rejectedIssueId, "working");
+        await apIssue.completeApIssue(rejectedIssueId, {
+            resolution: "rejected",
+            rejected_by: "Will",
+        });
+    }
 
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
     // re-processing of the same invoice — rejections must be "sticky".
