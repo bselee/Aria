@@ -30,6 +30,7 @@
  */
 
 import { FinaleClient } from "../../finale/client";
+import { resolveFinalePo } from "../../finale/po-resolver";
 import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
 import { createClient } from "../../supabase";
@@ -373,13 +374,22 @@ export async function processDefaultInboxInvoice(
         }
 
         // ── Finale PO lookup ──────────────────────────────────────────────────
+        // Use the shared resolveFinalePo helper so paid-invoice resolution
+        // has the same robustness as the AP-pipeline path: parens / digits /
+        // adjacent-digit transposition variants + vendor-name disambiguation
+        // when multiple candidates resolve. Without this, vendors like Axiom
+        // whose printed PO format doesn't exactly match Finale's order ID
+        // were failing on po_not_found even when the PO existed.
         const finale = new FinaleClient();
         let poSummary: { orderId: string; total: number; status: string } | null = null;
+        const resolution = await resolveFinalePo(poNumber, vendorName, finale);
 
-        try {
-            const s = await finale.getOrderSummary(poNumber);
-            if (s) poSummary = { orderId: s.orderId, total: s.total, status: s.status };
-        } catch { /* not found */ }
+        if (resolution.orderId) {
+            try {
+                const s = await finale.getOrderSummary(resolution.orderId);
+                if (s) poSummary = { orderId: s.orderId, total: s.total, status: s.status };
+            } catch { /* shouldn't happen — resolveFinalePo just verified it exists */ }
+        }
 
         if (!poSummary) {
             const result: DefaultInboxInvoiceResult = {
@@ -390,17 +400,21 @@ export async function processDefaultInboxInvoice(
                 vendorName,
                 outcome:             "po_not_found",
                 needsImmediateAlert: true,
-                summary: `${vendorName} PO #${poNumber} not found in Finale — invoice ${invoiceNumber} $${total.toFixed(2)}`,
+                summary: `${vendorName} PO #${poNumber} not found in Finale — invoice ${invoiceNumber} $${total.toFixed(2)} (tried ${resolution.triedCandidates.length} variants)`,
             };
             await sendTelegramAlert(
                 `🚨 <b>Paid Invoice — PO Not Found</b>\n\n` +
                 `<b>Vendor:</b> ${vendorName}\n` +
                 `<b>PO #:</b> ${poNumber}\n` +
                 `<b>Invoice:</b> ${invoiceNumber} — $${total.toFixed(2)}\n\n` +
+                `Tried ${resolution.triedCandidates.length} variants (parens/digits/transpositions). ` +
                 `PO does not exist in Finale.`
             );
             await recordInvoiceOutcomeSafe(gmailMessageId, fromEmail, subject, result);
             return result;
+        }
+        if (poSummary.orderId !== poNumber) {
+            console.log(`[default-inbox] PO resolved: "${poNumber}" → ${poSummary.orderId} (${resolution.note})`);
         }
 
         const poDetails = await finale.getOrderDetails(poNumber);
