@@ -158,6 +158,12 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
             if (args.autonomyState !== undefined) patch.autonomy_state = args.autonomyState;
             if (args.currentHandler !== undefined) patch.current_handler = args.currentHandler;
             if (args.nextAction !== undefined) patch.next_action = args.nextAction;
+            // Stamp completed_at when projection moves us into complete and
+            // the existing row hasn't already been stamped — otherwise
+            // listIssues' "complete in last 14d" filter excludes them.
+            if (args.lifecycleState === "complete" && !existing.completed_at) {
+                patch.completed_at = new Date().toISOString();
+            }
         }
         if (args.priority !== undefined) patch.priority = args.priority;
         if (args.owner !== undefined) patch.owner = args.owner;
@@ -189,6 +195,7 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
         console.warn("[agent-issue] createOrAdvance: title required when no existing row");
         return null;
     }
+    const initialLifecycle = args.lifecycleState ?? "detected";
     const { data: created, error: insErr } = await supabase
         .from("agent_issue")
         .insert({
@@ -196,13 +203,16 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
             source_table: args.sourceTable ?? null,
             source_id: args.sourceId ?? null,
             business_flow_key: args.businessFlowKey,
-            lifecycle_state: args.lifecycleState ?? "detected",
+            lifecycle_state: initialLifecycle,
             autonomy_state: args.autonomyState ?? "working",
             current_handler: args.currentHandler ?? null,
             next_action: args.nextAction ?? null,
             priority: args.priority ?? 2,
             owner: args.owner ?? "aria",
             inputs: args.inputs ?? {},
+            // Stamp completed_at when first-creating in complete state so
+            // listIssues' time-window filter sees the row.
+            completed_at: initialLifecycle === "complete" ? new Date().toISOString() : null,
         })
         .select()
         .single();
