@@ -19,6 +19,12 @@ import type { IssueLifecycleState, IssueAutonomyState } from "./agent-issue";
 
 const OPEN_TASK_STATUSES = new Set(["PENDING", "CLAIMED", "RUNNING", "NEEDS_APPROVAL"]);
 const TERMINAL_SUCCESS = new Set(["SUCCEEDED", "APPROVED"]);
+// Will, 2026-04-29: REJECTED/CANCELLED/EXPIRED are terminal states from the
+// task hub's perspective — they're decisions, not work-in-progress. An issue
+// whose tasks all landed in one of these (without any success) is also
+// resolved from a lifecycle standpoint; keeping it as `working` indefinitely
+// is wrong. We bucket them as "terminal-not-successful" and route to complete.
+const TERMINAL_NONSUCCESS = new Set(["REJECTED", "CANCELLED", "EXPIRED"]);
 
 function slugify(s: string): string {
     return s.trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.\-]/g, "");
@@ -76,12 +82,25 @@ export function deriveIssueState(tasks: AgentTask[]): DerivedIssueState {
 
     const hasOpen = tasks.some(t => OPEN_TASK_STATUSES.has(t.status));
     const allTerminalSuccess = tasks.every(t => TERMINAL_SUCCESS.has(t.status));
+    const allTerminal = tasks.every(t =>
+        TERMINAL_SUCCESS.has(t.status) ||
+        TERMINAL_NONSUCCESS.has(t.status) ||
+        t.status === "FAILED",
+    );
     const anyFailed = tasks.some(t => t.status === "FAILED");
+    const anyTerminalNonsuccess = tasks.some(t => TERMINAL_NONSUCCESS.has(t.status));
 
     let lifecycle_state: IssueLifecycleState = "working";
     let autonomy_state: IssueAutonomyState = "working";
 
     if (allTerminalSuccess) {
+        lifecycle_state = "complete";
+        autonomy_state = "resolved";
+    } else if (allTerminal && !anyFailed && anyTerminalNonsuccess) {
+        // All tasks terminal, none failed, at least one rejected/cancelled/expired.
+        // From a case standpoint this issue is resolved — Will/Aria made a decision
+        // (or the work expired) and there is no more work to do. Lifecycle:
+        // complete; autonomy: resolved (the decision IS the resolution).
         lifecycle_state = "complete";
         autonomy_state = "resolved";
     } else if (hasOpen) {

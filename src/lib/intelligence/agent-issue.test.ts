@@ -221,17 +221,22 @@ describe("createOrAdvance", () => {
             autonomyState: "working",
             currentHandler: "ap-agent",
             nextAction: "Try again",
+            // Projection trying to flip owner back to aria — also blocked.
+            owner: "aria",
             // ...and a safe metadata bump that SHOULD apply:
             priority: 1,
             inputs: { task_count: 4 },
         });
 
         expect(appliedPatch).not.toBeNull();
-        // Lifecycle / autonomy / handler / next_action MUST be omitted from the patch.
+        // Lifecycle / autonomy / handler / next_action / owner MUST be omitted.
         expect(appliedPatch).not.toHaveProperty("lifecycle_state");
         expect(appliedPatch).not.toHaveProperty("autonomy_state");
         expect(appliedPatch).not.toHaveProperty("current_handler");
         expect(appliedPatch).not.toHaveProperty("next_action");
+        // Owner preservation: a blocked issue assigned to Will must not be
+        // flipped back to aria by the next projection cycle.
+        expect(appliedPatch).not.toHaveProperty("owner");
         // Safe metadata DID apply.
         expect(appliedPatch).toHaveProperty("priority", 1);
         expect(appliedPatch).toHaveProperty("inputs");

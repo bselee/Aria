@@ -112,6 +112,47 @@ describe("deriveIssueState", () => {
         expect(s.lifecycle_state).toBe("triaging");
     });
 
+    it("complete + resolved when all tasks REJECTED (decision = resolution)", () => {
+        const tasks = [{ ...baseTask, status: "REJECTED" }] as AgentTask[];
+        const s = deriveIssueState(tasks);
+        expect(s.lifecycle_state).toBe("complete");
+        expect(s.autonomy_state).toBe("resolved");
+    });
+
+    it("complete + resolved when all tasks CANCELLED", () => {
+        const tasks = [{ ...baseTask, status: "CANCELLED" }] as AgentTask[];
+        const s = deriveIssueState(tasks);
+        expect(s.lifecycle_state).toBe("complete");
+        expect(s.autonomy_state).toBe("resolved");
+    });
+
+    it("complete + resolved when all tasks EXPIRED", () => {
+        const tasks = [{ ...baseTask, status: "EXPIRED" }] as AgentTask[];
+        const s = deriveIssueState(tasks);
+        expect(s.lifecycle_state).toBe("complete");
+        expect(s.autonomy_state).toBe("resolved");
+    });
+
+    it("complete + resolved on mixed terminal (succeeded + rejected, none failed)", () => {
+        const tasks = [
+            { ...baseTask, status: "SUCCEEDED" },
+            { ...baseTask, status: "REJECTED" },
+        ] as AgentTask[];
+        const s = deriveIssueState(tasks);
+        expect(s.lifecycle_state).toBe("complete");
+    });
+
+    it("still retrying when terminal mix INCLUDES failed", () => {
+        // Failed tasks are explicit anomalies — keep retrying autonomy.
+        const tasks = [
+            { ...baseTask, status: "FAILED" },
+            { ...baseTask, status: "REJECTED" },
+        ] as AgentTask[];
+        const s = deriveIssueState(tasks);
+        expect(s.autonomy_state).toBe("retrying");
+        expect(s.lifecycle_state).toBe("working");
+    });
+
     it("retrying when open + at least one failed", () => {
         const tasks = [
             { ...baseTask, status: "FAILED" },

@@ -12,9 +12,16 @@ import { getCommandBoardIssueDetail } from "@/lib/command-board/service";
 
 const NO_STORE = { "Cache-Control": "no-store" };
 
-export async function GET(_req: NextRequest, { params }: { params: { id: string } }) {
+export async function GET(
+    _req: NextRequest,
+    { params }: { params: Promise<{ id: string }> },
+) {
     try {
-        const detail = await getCommandBoardIssueDetail(params.id);
+        const { id } = await params;
+        if (!id) {
+            return NextResponse.json({ error: "missing issue id" }, { status: 400, headers: NO_STORE });
+        }
+        const detail = await getCommandBoardIssueDetail(id);
         if (!detail) {
             return NextResponse.json({ error: "not found" }, { status: 404, headers: NO_STORE });
         }
