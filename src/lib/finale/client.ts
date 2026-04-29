@@ -780,6 +780,120 @@ export class FinaleClient {
     }
 
     /**
+     * List recent POs for a vendor by fuzzy supplier-name match.
+     *
+     * Used by po-resolver.ts as a fallback when the printed PO# doesn't
+     * resolve. Will's intuition: for vendors like Axiom Print, the most
+     * recent OPEN PO for the vendor is almost always the right correlation
+     * for an arriving invoice.
+     *
+     * Vendor matching: case-insensitive substring match on the supplier
+     * name. We can't reliably look up partyId from a name, so we filter
+     * server-side by date and post-filter in JS by name overlap.
+     *
+     * Returns POs sorted by `orderDate desc`. Each row carries enough to
+     * drive correlation strategies (SKUs, total, status).
+     */
+    async listRecentPosByVendor(
+        vendorName: string,
+        opts: { daysBack?: number; statuses?: string[]; limit?: number } = {},
+    ): Promise<Array<{
+        orderId: string;
+        status: string;
+        orderDate: string;
+        supplierName: string;
+        supplierPartyUrl: string | null;
+        total: number;
+        skus: string[];
+    }>> {
+        const daysBack = opts.daysBack ?? 60;
+        const statuses = opts.statuses ?? ["ORDER_CREATED", "ORDER_LOCKED", "ORDER_COMMITTED"];
+        const limit = opts.limit ?? 50;
+        try {
+            const now = new Date();
+            const begin = new Date(now);
+            begin.setDate(begin.getDate() - daysBack);
+            const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const endStr = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+            const query = {
+                query: `{
+                    orderViewConnection(
+                        first: ${limit}
+                        type: ["PURCHASE_ORDER"]
+                        statusId: [${statuses.map(s => `"${s}"`).join(", ")}]
+                        orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                        sort: [{ field: "orderDate", mode: "desc" }]
+                    ) {
+                        edges { node {
+                            orderId
+                            status
+                            orderDate
+                            supplier { partyUrl name }
+                            totalAmount { amount }
+                            itemList(first: 200) {
+                                edges { node { product { productId } } }
+                            }
+                        }}
+                    }
+                }`,
+            };
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify(query),
+            });
+            const json: any = await res.json();
+            const edges: any[] = json.data?.orderViewConnection?.edges || [];
+
+            const vendorWords = vendorName
+                .toLowerCase()
+                .split(/\s+/)
+                .filter(w => w.length > 2 && !["inc", "llc", "co", "ltd", "the"].includes(w));
+
+            const matches: Array<{
+                orderId: string;
+                status: string;
+                orderDate: string;
+                supplierName: string;
+                supplierPartyUrl: string | null;
+                total: number;
+                skus: string[];
+            }> = [];
+
+            for (const e of edges) {
+                const po = e.node;
+                const supplierName = (po.supplier?.name ?? "").toString();
+                const supplierLower = supplierName.toLowerCase();
+                // Match if any meaningful invoice word appears in supplier name
+                // OR supplier name appears in invoice vendor name (catches "Axiom" ↔ "Axiom Print").
+                const hasOverlap = vendorWords.some(w => supplierLower.includes(w))
+                    || vendorWords.length === 0
+                    || supplierLower.split(/\s+/).some(w => w.length > 2 && vendorName.toLowerCase().includes(w));
+                if (!hasOverlap) continue;
+
+                const skus = (po.itemList?.edges ?? [])
+                    .map((ie: any) => (ie.node?.product?.productId ?? "").toString())
+                    .filter(Boolean);
+                matches.push({
+                    orderId: po.orderId,
+                    status: po.status ?? "",
+                    orderDate: po.orderDate ?? "",
+                    supplierName,
+                    supplierPartyUrl: po.supplier?.partyUrl ?? null,
+                    total: Number(po.totalAmount?.amount ?? 0),
+                    skus,
+                });
+            }
+            return matches;
+        } catch (err: any) {
+            console.warn(`[finale] listRecentPosByVendor failed for "${vendorName}": ${err.message}`);
+            return [];
+        }
+    }
+
+    /**
      * Calculate the actual average lead time for a vendor by examining
      * the last N completed POs: avg(receiveDate - orderDate).
      *
