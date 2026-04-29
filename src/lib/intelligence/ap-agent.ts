@@ -1629,7 +1629,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         pendingLogId = pendingLog?.id ?? null;
                     } catch { /* proceed — Finale write is still safe, just loses idempotency guard */ }
 
-                    const applyResult = await applyReconciliation(result, finaleClient);
+                    // Phase 2: thread audit context so the auto-apply path
+                    // also writes per-call audit rows attributed to ap-reconciler.
+                    // issueId already resolved above for this verdict branch.
+                    const applyResult = await applyReconciliation(
+                        result,
+                        finaleClient,
+                        undefined,
+                        undefined,
+                        { agent: apIssue.HANDLER.AP_RECONCILER, issueId: issueId ?? null },
+                    );
 
                     if (applyResult.applied.length > 0) {
                         console.log(`   ✅ Applied ${applyResult.applied.length} change(s) to Finale PO ${orderId}`);

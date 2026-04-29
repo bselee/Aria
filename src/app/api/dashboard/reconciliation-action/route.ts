@@ -116,8 +116,22 @@ export async function POST(req: Request) {
                 .filter(fc => fc.verdict === "needs_approval" || fc.verdict === "auto_approve")
                 .map(fc => fc.feeType);
 
+            // Phase 2 (path-forward plan): audit context flows through so the
+            // dashboard approve path also writes per-call Finale-write audit
+            // rows. Use ap-reconciler agent identity to keep audit consistent
+            // across Telegram + dashboard surfaces.
+            const dashboardIssueId = await apIssue.findApIssue({
+                vendorName: reconResult.vendorName,
+                invoiceNumber: reconResult.invoiceNumber,
+                poNumber: reconResult.orderId,
+                orderId: reconResult.orderId,
+            });
             const applyResult = await applyReconciliation(
-                reconResult, finale, approvedPriceItems, approvedFeeTypes
+                reconResult,
+                finale,
+                approvedPriceItems,
+                approvedFeeTypes,
+                { agent: "ap-reconciler", issueId: dashboardIssueId },
             );
 
             // Update the log entry with review status

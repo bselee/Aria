@@ -9,6 +9,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { listTools, type ListToolsFilter, type ToolCategory, type ToolScope } from "@/lib/agents/tool-registry";
 import { ensureCopilotToolsRegistered } from "@/lib/agents/register-copilot-tools";
+import { ensureFinaleToolsRegistered } from "@/lib/agents/register-finale-tools";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -18,6 +19,7 @@ export async function GET(req: NextRequest) {
         // tool sources (bot inline tools, finale write helpers) will register
         // themselves from their own modules as they're migrated.
         ensureCopilotToolsRegistered();
+        ensureFinaleToolsRegistered();
 
         const url = new URL(req.url);
         const filter: ListToolsFilter = {};
