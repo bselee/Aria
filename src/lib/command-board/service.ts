@@ -678,3 +678,121 @@ export async function createCommandBoardControlRequest(
 
 // Re-export so tests can reference status types.
 export type { AgentTaskStatus };
+
+// ── Phase 1: issue projection ───────────────────────────────────────────────
+
+import {
+    listIssues,
+    getById as getIssueById,
+    type AgentIssue,
+} from "@/lib/intelligence/agent-issue";
+import type {
+    CommandBoardIssue,
+    CommandBoardIssueDetail,
+    CommandBoardIssueFilters,
+} from "./types";
+
+function issueRowToCard(row: AgentIssue, taskCount: number): CommandBoardIssue {
+    return {
+        id: row.id,
+        title: row.title,
+        lifecycle_state: row.lifecycle_state,
+        autonomy_state: row.autonomy_state,
+        current_handler: row.current_handler,
+        blocker_reason: row.blocker_reason,
+        next_action: row.next_action,
+        owner: row.owner,
+        priority: row.priority,
+        source_table: row.source_table,
+        source_id: row.source_id,
+        business_flow_key: row.business_flow_key,
+        age_seconds: ageSeconds(row.created_at),
+        completed_at: row.completed_at,
+        task_count: taskCount,
+    };
+}
+
+export async function getCommandBoardIssues(
+    filters: CommandBoardIssueFilters = {},
+): Promise<{ issues: CommandBoardIssue[]; total: number }> {
+    const supabase = createClient();
+    if (!supabase) return { issues: [], total: 0 };
+
+    const rows = await listIssues({
+        lifecycleState: filters.lifecycleState,
+        owner: filters.owner,
+        limit: filters.limit ?? 200,
+    });
+
+    if (rows.length === 0) return { issues: [], total: 0 };
+
+    const ids = rows.map(r => r.id);
+    const { data: counts } = await supabase
+        .from("agent_task")
+        .select("issue_id")
+        .in("issue_id", ids);
+    const countByIssue = new Map<string, number>();
+    for (const r of counts ?? []) {
+        const id = (r as { issue_id: string }).issue_id;
+        countByIssue.set(id, (countByIssue.get(id) ?? 0) + 1);
+    }
+
+    const issues = rows.map(r => issueRowToCard(r, countByIssue.get(r.id) ?? 0));
+    return { issues, total: issues.length };
+}
+
+export async function getCommandBoardIssueDetail(id: string): Promise<CommandBoardIssueDetail | null> {
+    const supabase = createClient();
+    if (!supabase) return null;
+
+    const row = await getIssueById(id);
+    if (!row) return null;
+
+    const { data: linkedTasks } = await supabase
+        .from("agent_task")
+        .select("*")
+        .eq("issue_id", id)
+        .order("created_at", { ascending: false });
+
+    const linkedTaskRows = (linkedTasks ?? []) as AgentTask[];
+    const tasks = linkedTaskRows.map(t => toCard(t, false));
+
+    // Merge issue-scoped + task-scoped events for the full case timeline.
+    const linkedTaskIds = linkedTaskRows.map(t => t.id);
+    const { data: issueEvents } = await supabase
+        .from("task_history")
+        .select("event_type, created_at, execution_trace")
+        .eq("issue_id", id)
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+    let taskEvents: any[] = [];
+    if (linkedTaskIds.length > 0) {
+        const { data } = await supabase
+            .from("task_history")
+            .select("event_type, created_at, execution_trace")
+            .in("task_id", linkedTaskIds)
+            .order("created_at", { ascending: false })
+            .limit(200);
+        taskEvents = data ?? [];
+    }
+
+    const merged = [...(issueEvents ?? []), ...taskEvents].sort(
+        (a, b) => new Date((b as any).created_at).getTime() - new Date((a as any).created_at).getTime(),
+    ).slice(0, 100);
+
+    const timeline = merged.map(r => ({
+        event_type: (r as { event_type: string }).event_type,
+        created_at: (r as { created_at: string }).created_at,
+        payload: (r as { execution_trace: Record<string, unknown> }).execution_trace ?? {},
+    }));
+
+    const card = issueRowToCard(row, tasks.length);
+    return {
+        ...card,
+        inputs: row.inputs,
+        outputs: row.outputs,
+        tasks,
+        timeline,
+    };
+}

@@ -50,6 +50,13 @@ export type LLMOptions = {
      * triage). Default `'paid'` = current behavior.
      */
     tier?: LLMTier;
+    /**
+     * Phase 4 (path-forward plan): when set, the call is gated by
+     * agent_budget — refused if the agent has exceeded its monthly cap
+     * — and charged after success. Leaving unset preserves existing
+     * un-attributed behavior (no budget enforcement).
+     */
+    agentId?: string;
 };
 
 export type LLMToolOptions = LLMOptions & {
@@ -219,6 +226,14 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
         throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
     }
 
+    // Phase 4: budget gate. When agentId is provided, refuse the call if
+    // the agent is over cap or paused. Best-effort — DB failures fall
+    // through silently rather than block work.
+    if (options.agentId) {
+        const { assertBudget } = await import("../agents/budget");
+        await assertBudget(options.agentId);
+    }
+
     let lastError: Error | null = null;
 
     for (let i = 0; i < providers.length; i++) {
@@ -235,7 +250,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
             if (provider.name.toLowerCase().includes('gemini')) {
                 await geminiLimiter.acquire();
             }
-            const { text } = await generateText({
+            const result = await generateText({
                 model: provider.model(),
                 system: options.system,
                 temperature: options.temperature,
@@ -243,7 +258,21 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
                 maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
             } as any);
-            return text;
+            // Phase 4: charge the budget after a successful call. Use the
+            // model's runtime modelId (or provider name as fallback) so the
+            // cost table can match. Best-effort — failures don't block.
+            if (options.agentId) {
+                const { chargeBudget } = await import("../agents/budget");
+                const usage = (result as any).usage ?? {};
+                const modelKey = provider.name?.toLowerCase() ?? "openrouter";
+                await chargeBudget(
+                    options.agentId,
+                    modelKey,
+                    Number(usage.promptTokens ?? usage.inputTokens ?? 0),
+                    Number(usage.completionTokens ?? usage.outputTokens ?? 0),
+                );
+            }
+            return result.text;
         } catch (err: any) {
             lastError = err;
 
@@ -342,6 +371,12 @@ export async function unifiedObjectGeneration<T>(
         throw new Error('No LLM providers configured. Set GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.');
     }
 
+    // Phase 4: budget gate (same pattern as unifiedTextGeneration).
+    if (options.agentId) {
+        const { assertBudget } = await import("../agents/budget");
+        await assertBudget(options.agentId);
+    }
+
     let lastError: Error | null = null;
 
     for (let i = 0; i < providers.length; i++) {
@@ -358,7 +393,7 @@ export async function unifiedObjectGeneration<T>(
             if (provider.name.toLowerCase().includes('gemini')) {
                 await geminiLimiter.acquire();
             }
-            const { object } = await (generateObject({
+            const result = await (generateObject({
                 model: provider.model(),
                 schema: options.schema,
                 schemaName: options.schemaName,
@@ -368,8 +403,20 @@ export async function unifiedObjectGeneration<T>(
                 // Disable strict JSON schema for OpenAI-compatible endpoints (allows optional/nullable fields)
                 providerOptions: { openai: { strictJsonSchema: false } },
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
-            } as any) as Promise<{ object: T }>);
-            return object;
+            } as any) as Promise<{ object: T; usage?: any }>);
+            // Phase 4: charge after success.
+            if (options.agentId) {
+                const { chargeBudget } = await import("../agents/budget");
+                const usage = (result as any).usage ?? {};
+                const modelKey = provider.name?.toLowerCase() ?? "openrouter";
+                await chargeBudget(
+                    options.agentId,
+                    modelKey,
+                    Number(usage.promptTokens ?? usage.inputTokens ?? 0),
+                    Number(usage.completionTokens ?? usage.outputTokens ?? 0),
+                );
+            }
+            return result.object;
         } catch (err: any) {
             lastError = err;
 

@@ -208,6 +208,14 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'maintenance',
         weekdaysOnly: false,
     },
+    {
+        name: 'IssueProjection',
+        description: 'Phase 1 issue ledger: groups recent agent_task rows by business-flow key into agent_issue rows + links via issue_id',
+        schedule: '*/5 * * * *',
+        scheduleHuman: 'Every 5 minutes',
+        category: 'maintenance',
+        weekdaysOnly: false,
+    },
 ];
 
 const cronRunStatus = new Map<string, CronRunStatus>();

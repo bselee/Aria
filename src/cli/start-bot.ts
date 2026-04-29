@@ -56,6 +56,8 @@ import {
 import { handleTelegramPOSendCallback } from '../lib/copilot/channels/telegram-callbacks';
 import * as agentTask from '../lib/intelligence/agent-task';
 import { approveTask, rejectTask, dismissTask } from '../lib/command-board/task-actions';
+import * as agentIssue from '../lib/intelligence/agent-issue';
+import { getCommandBoardIssues, getCommandBoardIssueDetail } from '../lib/command-board/service';
 import { Markup as TgMarkup } from 'telegraf';
 import { getStartupHealth } from '../lib/copilot/smoke';
 
@@ -905,6 +907,260 @@ bot.on('text', async (ctx) => {
         }
     });
 
+    // Phase 1 issue ledger (Plan D). /issues lists open business-flow issues
+    // grouped from agent_task rows by the projection cron. /tasks remains
+    // the existing approve/reject surface — it still shows raw tasks with
+    // inline action buttons. The intended `/tasks → /issues` aliasing
+    // (Will's spec) waits until the issue UI grows its own action surface,
+    // so existing muscle memory + approve buttons aren't broken in this phase.
+    // ── Issue ledger UI (Plan D, Phase 2 surface) ──────────────────────────────
+    //
+    // /issues   → blocking-me-first list with inline action buttons
+    // /blockers → just the blocked subset (the prime daily view)
+    // /issue X  → full detail for one issue (timeline + linked task)
+    //
+    // Plain text (no parse_mode) throughout — issue titles regularly contain
+    // underscores/brackets/asterisks ("restart_bot", "Invoice #124618 → PO").
+    // Telegram Markdown rejects those with "can't parse entities". The visible
+    // output is functionally identical without the markup.
+
+    type IssueRow = {
+        id: string;
+        title: string;
+        lifecycle_state: string;
+        autonomy_state: string | null;
+        current_handler: string | null;
+        blocker_reason: string | null;
+        next_action: string | null;
+        priority: number;
+        owner: string;
+    };
+
+    function isHumanApprovalRow(i: IssueRow): boolean {
+        return i.lifecycle_state === 'blocked' && i.blocker_reason === 'human_approval_required';
+    }
+
+    /**
+     * Sort blocking-me-first: human_approval_required → other blocked →
+     * waiting_external → in-flight → triaging → detected. Within bands the
+     * API's priority/updated_at ordering applies — this is a stable shuffle
+     * that promotes the rows requiring human action to the top.
+     */
+    function sortBlockingFirst(issues: IssueRow[]): IssueRow[] {
+        const rank = (i: IssueRow) => {
+            if (isHumanApprovalRow(i)) return 0;
+            if (i.lifecycle_state === 'blocked') return 1;
+            if (i.lifecycle_state === 'waiting_external') return 2;
+            if (i.lifecycle_state === 'working') return 3;
+            if (i.lifecycle_state === 'triaging') return 4;
+            return 5;
+        };
+        return [...issues].sort((a, b) => rank(a) - rank(b));
+    }
+
+    function summaryLine(issues: IssueRow[]): string {
+        const blocked = issues.filter(i => i.lifecycle_state === 'blocked').length;
+        const waiting = issues.filter(i => i.lifecycle_state === 'waiting_external').length;
+        const inFlight = issues.filter(i =>
+            i.lifecycle_state === 'working' ||
+            i.lifecycle_state === 'triaging' ||
+            i.lifecycle_state === 'detected',
+        ).length;
+        const human = issues.filter(isHumanApprovalRow).length;
+        const parts: string[] = [];
+        if (human > 0) parts.push(`👀 ${human} need you`);
+        if (blocked - human > 0) parts.push(`🚫 ${blocked - human} blocked`);
+        if (waiting > 0) parts.push(`⏳ ${waiting} waiting`);
+        if (inFlight > 0) parts.push(`▶ ${inFlight} in flight`);
+        return parts.length > 0 ? parts.join('  ·  ') : '✅ all clear';
+    }
+
+    function renderIssueRow(i: IssueRow): { line: string; buttons: any[] } {
+        const handler = i.current_handler ? ` · ${i.current_handler}` : '';
+        const blocker = i.blocker_reason ? `  🚫 ${i.blocker_reason}` : '';
+        const next = i.next_action ? `\n    → ${i.next_action}` : '';
+        const tag = isHumanApprovalRow(i) ? '👀'
+            : i.lifecycle_state === 'blocked' ? '🚫'
+                : i.lifecycle_state === 'waiting_external' ? '⏳'
+                    : '▶';
+        const line = `${tag} [${i.lifecycle_state}${handler}${blocker}] ${i.title}${next}`;
+        const buttons: any[] = [];
+        if (isHumanApprovalRow(i)) {
+            buttons.push(TgMarkup.button.callback('✅ Approve', `issue_approve_${i.id}`));
+            buttons.push(TgMarkup.button.callback('❌ Reject', `issue_reject_${i.id}`));
+        } else if (i.lifecycle_state === 'blocked') {
+            buttons.push(TgMarkup.button.callback('✓ Resolve', `issue_resolve_${i.id}`));
+        } else {
+            buttons.push(TgMarkup.button.callback('✓ Mark done', `issue_resolve_${i.id}`));
+        }
+        buttons.push(TgMarkup.button.callback('🔍 Detail', `issue_detail_${i.id}`));
+        return { line, buttons };
+    }
+
+    async function fetchIssues(opts: { limit?: number; onlyBlocked?: boolean } = {}): Promise<{ issues: IssueRow[]; total: number }> {
+        // Call the service layer directly — same process as the bot. Avoids
+        // a cross-process HTTP dependency on the dashboard, which is run on
+        // demand and would make /issues fail when the dashboard is offline.
+        const result = await getCommandBoardIssues({
+            limit: opts.limit ?? 10,
+            lifecycleState: opts.onlyBlocked ? ['blocked'] : undefined,
+        });
+        return { issues: result.issues as unknown as IssueRow[], total: result.total };
+    }
+
+    async function renderIssuesMessage(
+        opts: { onlyBlocked?: boolean; heading: string } = { heading: 'Open issues' },
+    ): Promise<{ text: string; keyboard: any }> {
+        const { issues, total } = await fetchIssues({ limit: 10, onlyBlocked: opts.onlyBlocked });
+        if (issues.length === 0) {
+            return {
+                text: opts.onlyBlocked ? '✅ Nothing blocked.' : '✅ No open issues.',
+                keyboard: { reply_markup: { inline_keyboard: [] } },
+            };
+        }
+        const sorted = sortBlockingFirst(issues);
+        const summary = summaryLine(sorted);
+        const lines: string[] = [];
+        const keyboard: any[][] = [];
+        for (const i of sorted.slice(0, 10)) {
+            const { line, buttons } = renderIssueRow(i);
+            lines.push(line);
+            keyboard.push(buttons);
+        }
+        const text = `${opts.heading} (${total})\n${summary}\n\n${lines.join('\n')}`;
+        return { text, keyboard: { reply_markup: { inline_keyboard: keyboard } } };
+    }
+
+    bot.command('issues', async (ctx) => {
+        try {
+            const { text, keyboard } = await renderIssuesMessage({ heading: 'Open issues' });
+            await ctx.reply(text, keyboard);
+        } catch (err: any) {
+            await ctx.reply(`⚠️ Issues unavailable: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.command('blockers', async (ctx) => {
+        try {
+            const { text, keyboard } = await renderIssuesMessage({ onlyBlocked: true, heading: 'Blocked issues' });
+            await ctx.reply(text, keyboard);
+        } catch (err: any) {
+            await ctx.reply(`⚠️ Blockers unavailable: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.command('issue', async (ctx) => {
+        const arg = (ctx.message.text || '').replace(/^\/issue(?:@\w+)?\s*/, '').trim();
+        if (!arg) {
+            await ctx.reply('Usage: /issue <id> — paste the issue id from /issues.');
+            return;
+        }
+        try {
+            const detail = await getCommandBoardIssueDetail(arg);
+            if (!detail) { await ctx.reply('❓ Issue not found.'); return; }
+            // The detail route flattens the issue card onto the response root
+            // and adds { tasks, timeline, inputs, outputs }. See
+            // getCommandBoardIssueDetail in src/lib/command-board/service.ts.
+            const i = detail as IssueRow & { created_at: string; updated_at: string };
+            const events = (detail.timeline ?? []) as Array<{ event_type: string; payload?: any; created_at: string }>;
+            const tasks = (detail.tasks ?? []) as Array<{ id: string; status: string; title?: string; goal?: string }>;
+            const headline = `${isHumanApprovalRow(i) ? '👀' : i.lifecycle_state === 'blocked' ? '🚫' : '▶'} ${i.title}`;
+            const meta = `state: ${i.lifecycle_state}${i.current_handler ? ` · ${i.current_handler}` : ''}${i.blocker_reason ? `\nblocker: ${i.blocker_reason}` : ''}${i.next_action ? `\nnext: ${i.next_action}` : ''}`;
+            const eventLines = events.slice(0, 8).map(e => {
+                const summary = typeof e.payload?.output_summary === 'string' ? `  — ${e.payload.output_summary.slice(0, 80)}` : '';
+                return `  ${e.created_at.slice(11, 16)}  ${e.event_type}${summary}`;
+            }).join('\n') || '  (no events yet)';
+            const taskLines = tasks.length > 0
+                ? tasks.map(t => `  · ${t.status}  ${t.title ?? t.goal ?? t.id}`).join('\n')
+                : '  (no linked tasks)';
+            const text = `${headline}\n\n${meta}\n\nrecent events:\n${eventLines}\n\nlinked tasks:\n${taskLines}`;
+            const buttons = renderIssueRow(i as any).buttons;
+            await ctx.reply(text, { reply_markup: { inline_keyboard: [buttons] } });
+        } catch (err: any) {
+            await ctx.reply(`⚠️ /issue failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    // ── Issue inline-button handlers ─────────────────────────────────────────
+    //
+    // Approve/Reject route through the linked agent_task so AP-source paths
+    // hit the reconciler (which already drives the issue to complete via Day
+    // 1.6 wiring). Resolve closes the issue directly via clearBlocker +
+    // complete — used for non-approval blockers Will fixed manually
+    // (e.g. po_not_found that's now in Finale).
+
+    bot.action(/^issue_approve_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Approving...');
+        try {
+            const linked = await agentIssue.findLinkedOpenTask(issueId);
+            if (!linked) {
+                await ctx.reply('⚠️ No linked task — use ✓ Resolve instead.');
+                return;
+            }
+            const result = await approveTask(linked.id, 'will-telegram');
+            await ctx.reply(result.replyText);
+        } catch (err: any) {
+            await ctx.reply(`❌ Approve failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.action(/^issue_reject_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Rejecting...');
+        try {
+            const linked = await agentIssue.findLinkedOpenTask(issueId);
+            if (!linked) {
+                await ctx.reply('⚠️ No linked task — use ✓ Resolve instead.');
+                return;
+            }
+            const result = await rejectTask(linked.id, 'will-telegram');
+            await ctx.reply(result.replyText);
+        } catch (err: any) {
+            await ctx.reply(`❌ Reject failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.action(/^issue_resolve_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Resolving...');
+        try {
+            const issue = await agentIssue.getById(issueId);
+            if (!issue) { await ctx.reply('❓ Issue not found.'); return; }
+            if (issue.lifecycle_state === 'complete') { await ctx.reply('Already complete.'); return; }
+            if (issue.lifecycle_state === 'blocked') {
+                await agentIssue.clearBlocker(issueId, 'working');
+            }
+            await agentIssue.complete(issueId, {
+                resolution: 'manually_resolved',
+                resolved_by: 'will-telegram',
+                via: 'issue_button',
+            });
+            await ctx.reply(`✓ Resolved: ${issue.title}`);
+        } catch (err: any) {
+            await ctx.reply(`❌ Resolve failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.action(/^issue_detail_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery();
+        try {
+            const detail = await getCommandBoardIssueDetail(issueId);
+            if (!detail) { await ctx.reply('❓ Issue not found.'); return; }
+            const i = detail.issue as IssueRow & { created_at: string; updated_at: string };
+            const events = (detail.events ?? []) as Array<{ event_type: string; output_summary?: string; created_at: string }>;
+            const tasks = (detail.linkedTasks ?? []) as Array<{ id: string; status: string; goal?: string }>;
+            const headline = `${isHumanApprovalRow(i as any) ? '👀' : i.lifecycle_state === 'blocked' ? '🚫' : '▶'} ${i.title}`;
+            const meta = `state: ${i.lifecycle_state}${i.current_handler ? ` · ${i.current_handler}` : ''}${i.blocker_reason ? `\nblocker: ${i.blocker_reason}` : ''}${i.next_action ? `\nnext: ${i.next_action}` : ''}`;
+            const eventLines = events.slice(-8).map(e => `  ${e.created_at.slice(11, 16)}  ${e.event_type}${e.output_summary ? '  — ' + e.output_summary.slice(0, 80) : ''}`).join('\n') || '  (no events yet)';
+            const taskLines = tasks.length > 0 ? tasks.map(t => `  · ${t.status}  ${t.goal ?? t.id}`).join('\n') : '  (no linked tasks)';
+            await ctx.reply(`${headline}\n\n${meta}\n\nrecent events:\n${eventLines}\n\nlinked tasks:\n${taskLines}`);
+        } catch (err: any) {
+            await ctx.reply(`⚠️ /issue failed: ${err.message ?? String(err)}`);
+        }
+    });
+
     bot.action(/^tasks_page_(\d+)$/, async (ctx) => {
         const offset = parseInt(ctx.match[1], 10) || 0;
         await ctx.answerCbQuery('Refreshing...');
@@ -1216,6 +1472,25 @@ bot.on('text', async (ctx) => {
         .catch((err: any) => console.error('Ã¢ÂÅ’ Bot launch error:', err.message));
 
     console.log('Ã¢Å“â€¦ ARIA IS LIVE AND LISTENING');
+
+    // Publish the operational command list to BotFather so the Telegram client
+    // shows them in the autocomplete dropdown when typing "/". Best-effort:
+    // if Telegram is rate-limited or the API rejects, we don't block boot.
+    bot.telegram.setMyCommands([
+        { command: 'issues', description: 'Open issues — blocking-me-first' },
+        { command: 'blockers', description: 'Just the blocked subset' },
+        { command: 'issue', description: 'Issue detail (paste id from /issues)' },
+        { command: 'tasks', description: 'Task hub — approvals + recent work' },
+        { command: 'crons', description: 'Cron job status' },
+        { command: 'status', description: 'Aria heartbeat / health' },
+        { command: 'memory', description: 'Recall a pattern from Pinecone' },
+        { command: 'product', description: 'Look up a Finale SKU' },
+        { command: 'consumption', description: 'BOM consumption for a SKU' },
+        { command: 'builds', description: 'Upcoming calendar builds' },
+        { command: 'buildrisk', description: 'Build risk analysis' },
+        { command: 'requests', description: 'Slack purchase-request feed' },
+        { command: 'kaizen', description: 'Recent corrections / learnings' },
+    ]).catch((err: any) => console.warn('setMyCommands failed:', err.message));
 
     // Seed memory with vendor patterns and known processes on every boot
     // (seedMemories uses upsert so this is idempotent)

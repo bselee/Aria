@@ -19,6 +19,7 @@ import {
     buildAuditMetadata,
     ReconciliationResult,
 } from "@/lib/finale/reconciler";
+import * as apIssue from "@/lib/intelligence/ap-issue";
 
 type ActionRequest = {
     action: "approve" | "pause" | "dismiss" | "rematch";
@@ -115,8 +116,22 @@ export async function POST(req: Request) {
                 .filter(fc => fc.verdict === "needs_approval" || fc.verdict === "auto_approve")
                 .map(fc => fc.feeType);
 
+            // Phase 2 (path-forward plan): audit context flows through so the
+            // dashboard approve path also writes per-call Finale-write audit
+            // rows. Use ap-reconciler agent identity to keep audit consistent
+            // across Telegram + dashboard surfaces.
+            const dashboardIssueId = await apIssue.findApIssue({
+                vendorName: reconResult.vendorName,
+                invoiceNumber: reconResult.invoiceNumber,
+                poNumber: reconResult.orderId,
+                orderId: reconResult.orderId,
+            });
             const applyResult = await applyReconciliation(
-                reconResult, finale, approvedPriceItems, approvedFeeTypes
+                reconResult,
+                finale,
+                approvedPriceItems,
+                approvedFeeTypes,
+                { agent: "ap-reconciler", issueId: dashboardIssueId },
             );
 
             // Update the log entry with review status
@@ -150,6 +165,28 @@ export async function POST(req: Request) {
                 supabase, reconResult.vendorName, "approved",
                 reconResult.totalDollarImpact, undefined, maxVariance
             );
+
+            // Phase 2 issue ledger: clear the human_approval_required blocker
+            // and mark the issue complete. Best-effort — same contract as the
+            // Telegram path. Activity logs predating Phase 2 won't have a
+            // matching issue and that's fine.
+            const approvedIssueId = await apIssue.findApIssue({
+                vendorName: reconResult.vendorName,
+                invoiceNumber: reconResult.invoiceNumber,
+                poNumber: reconResult.orderId,
+                orderId: reconResult.orderId,
+            });
+            if (approvedIssueId) {
+                await apIssue.unblockApIssue(approvedIssueId, "working");
+                await apIssue.completeApIssue(approvedIssueId, {
+                    resolution: "approved",
+                    approved_by: "Will",
+                    approved_via: "dashboard",
+                    applied: applyResult.applied.length,
+                    skipped: applyResult.skipped.length,
+                    errors: applyResult.errors.length,
+                });
+            }
 
             return NextResponse.json({
                 success: true,
@@ -189,6 +226,24 @@ export async function POST(req: Request) {
                 supabase, metadata.vendorName || logEntry.email_from,
                 "dismissed", 0, dismissReason
             );
+
+            // Phase 2 issue ledger: a dismissal IS a resolution (Will decided no
+            // action needed). Unblock + complete with the dismiss reason so the
+            // issue timeline records why.
+            const dismissedIssueId = await apIssue.findApIssue({
+                vendorName: metadata.vendorName || logEntry.email_from,
+                invoiceNumber: metadata.invoiceNumber,
+                poNumber: metadata.orderId,
+                orderId: metadata.orderId,
+            });
+            if (dismissedIssueId) {
+                await apIssue.unblockApIssue(dismissedIssueId, "working");
+                await apIssue.completeApIssue(dismissedIssueId, {
+                    resolution: "dismissed",
+                    dismissed_by: "Will",
+                    dismiss_reason: dismissReason ?? "unknown",
+                });
+            }
 
             return NextResponse.json({
                 success: true,
@@ -250,6 +305,28 @@ export async function POST(req: Request) {
                     })),
                 },
             }).eq("id", activityLogId);
+
+            // Phase 2 issue ledger: rematch changes the businessFlowKey (the PO
+            // is part of the key). The OLD issue is resolved by Will's decision
+            // to rematch; a NEW issue will be created on the next reconcile
+            // against the new PO via ensureApIssue's normal path. Complete the
+            // old one here with resolution=rematched so the timeline reflects
+            // the human decision.
+            const oldIssueId = await apIssue.findApIssue({
+                vendorName: metadata.vendorName || logEntry.email_from,
+                invoiceNumber: metadata.invoiceNumber,
+                poNumber: metadata.orderId,
+                orderId: metadata.orderId,
+            });
+            if (oldIssueId) {
+                await apIssue.unblockApIssue(oldIssueId, "working");
+                await apIssue.completeApIssue(oldIssueId, {
+                    resolution: "rematched",
+                    rematched_by: "Will",
+                    rematched_from_po: metadata.orderId,
+                    rematched_to_po: rematchPoNumber,
+                });
+            }
 
             return NextResponse.json({
                 success: true,

@@ -18,6 +18,7 @@
  */
 
 import * as agentTask from '../intelligence/agent-task';
+import * as agentIssue from '../intelligence/agent-issue';
 import {
     approvePendingReconciliation,
     rejectPendingReconciliation,
@@ -31,6 +32,53 @@ export type TaskActionResult =
 const NOT_FOUND_REPLY = '❓ Task not found.';
 
 const DASHBOARD_ACTOR_PREFIX = 'will-dashboard';
+
+/**
+ * Cross-cutting: when a task action runs and the task has a linked
+ * agent_issue (via `issue_id`, set by Phase 2 producers like ap-issue.ts
+ * linkApTask), advance the parent issue to terminal state too.
+ *
+ * Without this, dismissing a dropship_forward task in /tasks would close
+ * the task but leave the issue blocked on `source_unavailable` forever —
+ * Will's manual forward is the resolution, the dismiss IS the signal that
+ * it's done.
+ *
+ * The AP-source approve/reject path is intentionally skipped here: the
+ * reconciler's approvePendingReconciliation / rejectPendingReconciliation
+ * already drives the issue lifecycle (see commits 0401c33 + 8db1e43).
+ * Calling complete() again here would be a duplicate event in the timeline.
+ *
+ * Best-effort: a missing issue or a hub failure must never block the task
+ * action's reply to the user.
+ */
+async function resolveLinkedIssueFromTaskAction(
+    taskId: string,
+    action: 'approved' | 'rejected' | 'dismissed',
+    actor: string,
+): Promise<void> {
+    try {
+        const task = await agentTask.getById(taskId);
+        if (!task?.issue_id) return;
+        const issue = await agentIssue.getById(task.issue_id);
+        if (!issue) return;
+        // Already terminal — don't double-complete.
+        if (issue.lifecycle_state === 'complete') return;
+        // If blocked, clear the blocker first so the timeline shows a
+        // coherent blocker_cleared → complete sequence (same pattern as
+        // reconciler approve/reject paths).
+        if (issue.lifecycle_state === 'blocked') {
+            await agentIssue.clearBlocker(task.issue_id, 'working');
+        }
+        await agentIssue.complete(task.issue_id, {
+            resolution: `task_${action}`,
+            resolved_by: actor,
+            via: 'task_action',
+            task_id: taskId,
+        });
+    } catch (err) {
+        console.warn('[task-actions] resolveLinkedIssue failed:', err);
+    }
+}
 
 /**
  * Cross-surface bridge: when a task action runs from the dashboard, nudge
@@ -86,6 +134,7 @@ export async function approveTask(taskId: string, actor: string): Promise<TaskAc
             };
         }
         await agentTask.decideApproval(taskId, 'approve', actor);
+        await resolveLinkedIssueFromTaskAction(taskId, 'approved', actor);
         await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, '✅ Approved.');
         return { ok: true, replyText: '✅ Approved.', cbQueryText };
     } catch (err: any) {
@@ -121,6 +170,7 @@ export async function rejectTask(taskId: string, actor: string): Promise<TaskAct
             };
         }
         await agentTask.decideApproval(taskId, 'reject', actor);
+        await resolveLinkedIssueFromTaskAction(taskId, 'rejected', actor);
         await notifyTelegramOfDashboardAction(actor, 'Rejected', taskId, '❌ Rejected.');
         return { ok: true, replyText: '❌ Rejected.', cbQueryText };
     } catch (err: any) {
@@ -143,6 +193,7 @@ export async function dismissTask(taskId: string, actor: string): Promise<TaskAc
             dismissed_by: actor,
             dismissed_at: new Date().toISOString(),
         });
+        await resolveLinkedIssueFromTaskAction(taskId, 'dismissed', actor);
         await notifyTelegramOfDashboardAction(actor, 'Dismissed', taskId, '✓ Dismissed.');
         return { ok: true, replyText: '✓ Dismissed.', cbQueryText };
     } catch (err: any) {

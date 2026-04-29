@@ -15,6 +15,19 @@ export type CommandBoardAgent = {
     process: string[];
     skills: string[];
     workflows: string[];
+    /**
+     * Live issue-ledger counts attributed to this agent (Phase 2).
+     * Populated by `/api/command-board/agents` from
+     * `agent_issue.current_handler` aggregations. Optional so existing
+     * unit tests + callers that build CommandBoardAgent literals in
+     * isolation don't break.
+     */
+    currentlyHandling?: {
+        working: number;
+        waitingExternal: number;
+        blocked: number;
+        total: number;
+    };
 };
 
 export type CommandBoardCatalogFile = {
@@ -169,6 +182,42 @@ export type CommandBoardControlRequest = {
     claimed_at: string | null;
     completed_at: string | null;
     requested_by: string | null;
+};
+
+// ── Issues (Phase 1 issue ledger) ───────────────────────────────────────────
+
+export type CommandBoardIssue = {
+    id: string;
+    title: string;
+    lifecycle_state: "detected" | "triaging" | "working" | "waiting_external" | "blocked" | "complete";
+    autonomy_state: "working" | "waiting" | "retrying" | "resolved" | "needs_policy" | null;
+    current_handler: string | null;
+    blocker_reason: string | null;
+    next_action: string | null;
+    owner: string;
+    priority: number;
+    source_table: string | null;
+    source_id: string | null;
+    business_flow_key: string;
+    age_seconds: number;
+    completed_at: string | null;
+    /** Number of agent_task rows linked to this issue. */
+    task_count: number;
+};
+
+export type CommandBoardIssueDetail = CommandBoardIssue & {
+    inputs: Record<string, unknown>;
+    outputs: Record<string, unknown>;
+    /** All linked agent_task rows projected as cards. */
+    tasks: CommandBoardTaskCard[];
+    /** Lifecycle events from task_history scoped to this issue + its linked tasks. */
+    timeline: CommandBoardTaskEvent[];
+};
+
+export type CommandBoardIssueFilters = {
+    lifecycleState?: ("detected" | "triaging" | "working" | "waiting_external" | "blocked" | "complete")[];
+    owner?: string;
+    limit?: number;
 };
 
 // ── Summary ─────────────────────────────────────────────────────────────────

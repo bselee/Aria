@@ -12,9 +12,36 @@ import {
     getCommandBoardHeartbeats,
     getCommandBoardTaskList,
 } from "@/lib/command-board/service";
+import { getCurrentlyHandlingCounts, type IssueHandlerCounts } from "@/lib/intelligence/agent-issue";
 import { createClient } from "@/lib/supabase";
 
+type AgentBudgetSummary = {
+    monthly_usd_cap: number;
+    current_period_usd_spent: number;
+    paused_until: string | null;
+};
+
 const NO_STORE = { "Cache-Control": "no-store" } as const;
+
+// Handler-string → catalog-agent-id alias map. The Phase 2 issue ledger uses
+// finer-grained handler identifiers (ap-reconciler, ap-agent, …) than the
+// agent catalog (reconciliation, ap-agent, …). When a handler string isn't
+// already a catalog id, route it to its umbrella agent so the dashboard
+// rolls counts up to the right tree node.
+const HANDLER_ALIAS: Record<string, string> = {
+    "ap-reconciler": "reconciliation",
+};
+
+const EMPTY_COUNTS: IssueHandlerCounts = { working: 0, waitingExternal: 0, blocked: 0, total: 0 };
+
+function addCounts(a: IssueHandlerCounts, b: IssueHandlerCounts): IssueHandlerCounts {
+    return {
+        working: a.working + b.working,
+        waitingExternal: a.waitingExternal + b.waitingExternal,
+        blocked: a.blocked + b.blocked,
+        total: a.total + b.total,
+    };
+}
 
 export async function GET(_req: NextRequest) {
     try {
@@ -23,6 +50,10 @@ export async function GET(_req: NextRequest) {
         let heartbeats: Awaited<ReturnType<typeof getCommandBoardHeartbeats>> = [];
         const heartbeatByAgent = new Map<string, (typeof heartbeats)[number]>();
         const activeByAgent: Record<string, number> = {};
+        // Per-agent issue ledger counts (Phase 2). Same shape regardless of
+        // whether the underlying query succeeded — empty map = zero overlay,
+        // never breaks the page.
+        let handlerCounts: Record<string, IssueHandlerCounts> = {};
 
         if (createClient()) {
             try {
@@ -44,12 +75,50 @@ export async function GET(_req: NextRequest) {
             } catch {
                 /* best-effort */
             }
+            try {
+                handlerCounts = await getCurrentlyHandlingCounts();
+            } catch {
+                /* best-effort — render dashboard without the overlay */
+            }
+        }
+
+        // Aliasing: collapse fine-grained handler strings (ap-reconciler) into
+        // their catalog umbrella (reconciliation) so the tree node sees the
+        // sum. Handlers that already match a catalog id pass through.
+        const aliasedCounts: Record<string, IssueHandlerCounts> = {};
+        for (const [handler, counts] of Object.entries(handlerCounts)) {
+            const target = HANDLER_ALIAS[handler] ?? handler;
+            aliasedCounts[target] = aliasedCounts[target]
+                ? addCounts(aliasedCounts[target], counts)
+                : counts;
+        }
+
+        // Phase 4: per-agent budget data for the dashboard.
+        const budgetByAgent = new Map<string, AgentBudgetSummary>();
+        const sb = createClient();
+        if (sb) {
+            try {
+                const { data: budgets } = await sb
+                    .from("agent_budget")
+                    .select("agent_id, monthly_usd_cap, current_period_usd_spent, paused_until");
+                for (const b of (budgets ?? []) as Array<{ agent_id: string; monthly_usd_cap: string | number; current_period_usd_spent: string | number; paused_until: string | null }>) {
+                    budgetByAgent.set(b.agent_id, {
+                        monthly_usd_cap: Number(b.monthly_usd_cap),
+                        current_period_usd_spent: Number(b.current_period_usd_spent),
+                        paused_until: b.paused_until,
+                    });
+                }
+            } catch {
+                /* best-effort — dashboard renders without budget data */
+            }
         }
 
         const agents = catalog.agents.map((a) => ({
             ...a,
             heartbeat: heartbeatByAgent.get(a.id) ?? null,
             activeTaskCount: activeByAgent[a.id.toLowerCase()] ?? 0,
+            currentlyHandling: aliasedCounts[a.id] ?? EMPTY_COUNTS,
+            budget: budgetByAgent.get(a.id) ?? null,
         }));
 
         return NextResponse.json(
