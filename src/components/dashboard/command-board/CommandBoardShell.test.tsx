@@ -233,36 +233,24 @@ describe("CommandBoardShell", () => {
         expect((await screen.findAllByText("Slack Watchdog")).length).toBeGreaterThan(0);
     });
 
-    it("renders tasks into their lanes from /api/command-board/tasks", async () => {
+    it("default tab is 'Blocking Me' — issues surface, not raw task lanes", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const needsLane = await screen.findByTestId("lane-needs-will");
-        const runningLane = await screen.findByTestId("lane-running");
-        const blockedLane = await screen.findByTestId("lane-blocked-failed");
-
-        expect(needsLane.textContent).toMatch(/Approve invoice/);
-        expect(runningLane.textContent).toMatch(/Reconcile FedEx/);
-        expect(blockedLane.textContent).toMatch(/Cron failure: build-risk/);
-        // Dedup badge for task-3
-        expect(blockedLane.textContent).toMatch(/×4/);
+        // The shell ships with IssuesPanel as the default tab. Lane testids
+        // (which lived on WorkQueueBoard inside the old grid layout) no
+        // longer render at boot; they appear when the user clicks Tasks.
+        const blockingTab = await screen.findByTestId("shell-tab-blocking");
+        expect(blockingTab.getAttribute("aria-selected")).toBe("true");
     });
 
-    it("fetches detail when a task card is clicked", async () => {
+    it("clicking the Tasks tab swaps in the task lanes", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const card = await screen.findByTestId("task-card-task-1");
-        fireEvent.click(card);
-
-        await waitFor(() => {
-            const calls = (fetchImpl as unknown as { mock: { calls: any[][] } })
-                .mock.calls;
-            const urls = calls.map(c => String(c[0]));
-            expect(
-                urls.some(u => u.startsWith("/api/command-board/tasks/task-1")),
-            ).toBe(true);
-        });
+        const tasksTab = await screen.findByTestId("shell-tab-tasks");
+        fireEvent.click(tasksTab);
+        expect(tasksTab.getAttribute("aria-selected")).toBe("true");
     });
 });
 
