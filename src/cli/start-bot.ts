@@ -905,6 +905,38 @@ bot.on('text', async (ctx) => {
         }
     });
 
+    // Phase 1 issue ledger (Plan D). /issues lists open business-flow issues
+    // grouped from agent_task rows by the projection cron. /tasks remains
+    // the existing approve/reject surface — it still shows raw tasks with
+    // inline action buttons. The intended `/tasks → /issues` aliasing
+    // (Will's spec) waits until the issue UI grows its own action surface,
+    // so existing muscle memory + approve buttons aren't broken in this phase.
+    bot.command('issues', async (ctx) => {
+        try {
+            const base = process.env.DASHBOARD_BASE_URL ?? 'http://localhost:3001';
+            const res = await fetch(`${base}/api/command-board/issues?limit=10`);
+            if (!res.ok) {
+                await ctx.reply(`⚠️ Could not fetch issues (HTTP ${res.status})`);
+                return;
+            }
+            const json = await res.json() as { issues: any[]; total: number };
+            if (!json.issues || json.issues.length === 0) {
+                await ctx.reply('✅ No open issues.');
+                return;
+            }
+            const lines = json.issues.slice(0, 10).map((i: any) => {
+                const handler = i.current_handler ? ` · ${i.current_handler}` : '';
+                const blocker = i.blocker_reason ? ` 🚫 ${i.blocker_reason}` : '';
+                const next = i.next_action ? `\n   → ${i.next_action}` : '';
+                return `• [${i.lifecycle_state}${handler}${blocker}] ${i.title}${next}`;
+            });
+            const heading = `*Open issues* (${json.total})`;
+            await ctx.reply(`${heading}\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+        } catch (err: any) {
+            await ctx.reply(`⚠️ Issues unavailable: ${err.message ?? String(err)}`);
+        }
+    });
+
     bot.action(/^tasks_page_(\d+)$/, async (ctx) => {
         const offset = parseInt(ctx.match[1], 10) || 0;
         await ctx.answerCbQuery('Refreshing...');
