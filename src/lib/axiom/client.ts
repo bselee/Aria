@@ -67,7 +67,7 @@ interface SkuMapping {
     description?: string;
 }
 
-const AXIOM_TO_FINALE: Record<string, SkuMapping> = {
+export const AXIOM_TO_FINALE: Record<string, SkuMapping> = {
     // GnarBar Labels (front+back pairs)
     'GNS11_12':          { skus: ['GNS11', 'GNS21'], qtyFraction: 0.5, description: 'GnarBar-Whole 2lb F+B' },
     'GNAR BAR 2lbs':     { skus: ['GNS11', 'GNS21'], qtyFraction: 0.5, description: 'GnarBar-Whole 2lb F+B' },
