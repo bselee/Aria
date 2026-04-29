@@ -26,6 +26,8 @@
 
 import * as agentTask from "../intelligence/agent-task";
 import * as apIssue from "../intelligence/ap-issue";
+import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
+import { ensureFinaleToolsRegistered } from "../agents/register-finale-tools";
 
 import { FinaleClient } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
@@ -359,8 +361,21 @@ export async function approvePendingReconciliation(id: string): Promise<{
         }
     } catch { /* proceed — Finale write is still safe */ }
 
+    // Phase 2: pass audit context so each Finale write lands in task_history
+    // attributed to the AP reconciler. Look up the linked issue lazily — if
+    // present, audit rows scope to it; if not, agent attribution is enough.
+    const approvalIssueId = await apIssue.findApIssue({
+        vendorName: entry.result.vendorName,
+        invoiceNumber: entry.result.invoiceNumber,
+        poNumber: entry.result.orderId,
+        orderId: entry.result.orderId,
+    });
     const applyResult = await applyReconciliation(
-        entry.result, entry.client, approvedPriceItems, approvedFeeTypes
+        entry.result,
+        entry.client,
+        approvedPriceItems,
+        approvedFeeTypes,
+        { agent: "ap-reconciler", issueId: approvalIssueId },
     );
     entry.status = "approved";
     pendingApprovals.delete(id);
@@ -2015,12 +2030,23 @@ export async function applyReconciliation(
     result: ReconciliationResult,
     client: FinaleClient,
     approvedItems?: string[],  // productIds that were manually approved
-    approvedFeeTypes?: string[] // feeTypes that were manually approved
+    approvedFeeTypes?: string[], // feeTypes that were manually approved
+    audit?: ToolAuditContext, // Phase 2: per-call audit + cost attribution
 ): Promise<{
     applied: string[];
     skipped: string[];
     errors: string[];
 }> {
+    // Make sure the Finale ops are registered in the catalog (idempotent —
+    // first call wins). This is the only place the AP write path enters
+    // the registry, so it's the natural seed point.
+    ensureFinaleToolsRegistered();
+
+    // Default audit context if caller didn't pass one. Every wrapped Finale
+    // call lands in task_history regardless — no agent attribution if the
+    // caller is anonymous, but the rest of the audit row is still useful.
+    const auditCtx: ToolAuditContext = audit ?? { agent: "ap-reconciler" };
+
     const applied: string[] = [];
     const skipped: string[] = [];
     const errors: string[] = [];
@@ -2028,7 +2054,12 @@ export async function applyReconciliation(
     // 0. Populate empty draft PO from invoice items if this was a Guard 0.5 case
     if (result.populateItems && result.populateItems.length > 0) {
         try {
-            await client.addItemsToPO(result.orderId, result.populateItems);
+            await withToolAudit(
+                "finale_add_items_to_po",
+                auditCtx,
+                { orderId: result.orderId, count: result.populateItems.length },
+                () => client.addItemsToPO(result.orderId, result.populateItems!),
+            );
             applied.push(`Populated PO with ${result.populateItems.length} items from invoice`);
         } catch (err: any) {
             errors.push(`PO populate failed: ${err.message}`);
@@ -2046,14 +2077,24 @@ export async function applyReconciliation(
         }
 
         try {
-            const updateRes = await client.updateOrderItemPrice(result.orderId, pc.productId, pc.invoicePrice);
-            
+            const updateRes = await withToolAudit(
+                "finale_update_order_item_price",
+                auditCtx,
+                { orderId: result.orderId, productId: pc.productId, newPrice: pc.invoicePrice },
+                () => client.updateOrderItemPrice(result.orderId, pc.productId, pc.invoicePrice),
+            );
+
             // NEW(2026-03-18): Sync the underlying SKU supplier pricing so FUTURE orders are correct
             let skuBaseUpdated = false;
             if (updateRes.supplierPartyUrl) {
-                skuBaseUpdated = await client.updateProductSupplierPrice(pc.productId, updateRes.supplierPartyUrl, pc.invoicePrice);
+                skuBaseUpdated = await withToolAudit(
+                    "finale_update_product_supplier_price",
+                    auditCtx,
+                    { productId: pc.productId, supplierPartyUrl: updateRes.supplierPartyUrl, newPrice: pc.invoicePrice },
+                    () => client.updateProductSupplierPrice(pc.productId, updateRes.supplierPartyUrl!, pc.invoicePrice),
+                );
             }
-            
+
             applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
         } catch (err: any) {
             errors.push(`${pc.productId}: Failed — ${err.message}`);
@@ -2074,20 +2115,20 @@ export async function applyReconciliation(
 
         try {
             if (fc.isNew) {
-                await client.addOrderAdjustment(
-                    result.orderId,
-                    fc.feeType,
-                    fc.amount,
-                    fc.description
+                await withToolAudit(
+                    "finale_add_order_adjustment",
+                    auditCtx,
+                    { orderId: result.orderId, feeType: fc.feeType, amount: fc.amount, description: fc.description },
+                    () => client.addOrderAdjustment(result.orderId, fc.feeType, fc.amount, fc.description),
                 );
                 applied.push(`Fee added: ${fc.description} $${fc.amount.toFixed(2)}`);
             } else {
                 // Update existing fee (e.g. Freight sitting at $0 → actual amount)
-                await client.updateOrderAdjustmentAmount(
-                    result.orderId,
-                    fc.feeType,
-                    fc.amount,
-                    fc.description
+                await withToolAudit(
+                    "finale_update_order_adjustment_amount",
+                    auditCtx,
+                    { orderId: result.orderId, feeType: fc.feeType, amount: fc.amount, description: fc.description },
+                    () => client.updateOrderAdjustmentAmount(result.orderId, fc.feeType, fc.amount, fc.description),
                 );
                 applied.push(`Fee updated: ${fc.description} $${fc.existingAmount.toFixed(2)} → $${fc.amount.toFixed(2)}`);
             }
@@ -2108,7 +2149,12 @@ export async function applyReconciliation(
             if (newTrackingNumbers.length === 0 && !result.trackingUpdate.shipDate) {
                 skipped.push("Tracking: All tracking numbers already recorded in Supabase");
             } else {
-                const poDetails = await client.getOrderDetails(result.orderId);
+                const poDetails = await withToolAudit(
+                    "finale_get_order_details",
+                    auditCtx,
+                    { orderId: result.orderId },
+                    () => client.getOrderDetails(result.orderId),
+                );
                 const shipUrls = poDetails.shipmentUrlList || [];
 
                 if (shipUrls.length > 0) {
@@ -2125,7 +2171,12 @@ export async function applyReconciliation(
                         updates.privateNotes = `Carrier: ${result.trackingUpdate.carrierName}`;
                     }
 
-                    await client.updateShipmentTracking(firstShipment, updates);
+                    await withToolAudit(
+                        "finale_update_shipment_tracking",
+                        auditCtx,
+                        { orderId: result.orderId, shipmentUrl: firstShipment, updates },
+                        () => client.updateShipmentTracking(firstShipment, updates),
+                    );
                     applied.push(`Tracking: ${newTrackingNumbers.join(", ") || "ship date updated"}`);
 
                     // Save tracking numbers to invoices table for future dedup

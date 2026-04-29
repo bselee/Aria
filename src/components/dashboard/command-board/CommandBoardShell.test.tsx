@@ -217,20 +217,19 @@ beforeEach(() => {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 describe("CommandBoardShell", () => {
-    it("renders agent hierarchy from /api/command-board/agents", async () => {
+    it("fetches agents endpoint at boot (data is hydrated even though right rail is gone)", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
+        // Right rail (agent tree + cron) was removed in 31de1c5 — agents
+        // labels no longer render by default. But the shell STILL fetches
+        // /api/command-board/agents on boot because the response carries
+        // health-chip counts (X/Y healthy) shown in the header.
         await waitFor(() => {
-            expect(fetchImpl).toHaveBeenCalled();
+            const calls = (fetchImpl as unknown as { mock: { calls: any[][] } }).mock.calls;
+            const urls = calls.map(c => String(c[0]));
+            expect(urls.some(u => u.startsWith("/api/command-board/agents"))).toBe(true);
         });
-
-        // Agent labels can appear in both AgentHierarchyPanel and
-        // AgentCatalogPanel — use findAllByText and assert ≥1.
-        expect((await screen.findAllByText("Will")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("Ops Manager")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("AP Agent")).length).toBeGreaterThan(0);
-        expect((await screen.findAllByText("Slack Watchdog")).length).toBeGreaterThan(0);
     });
 
     it("default tab is 'Blocking Me' — issues surface, not raw task lanes", async () => {

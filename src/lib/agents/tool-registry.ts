@@ -80,11 +80,12 @@ export type RegisteredTool = {
     /** Empty = unrestricted. Otherwise list of HANDLER ids. */
     agentScope: AgentScope;
     /**
-     * The actual tool descriptor. Today this is the AI SDK `Tool` shape
-     * (description + inputSchema + execute). Keep it loose so we can
-     * register tools authored in different shapes without rewriting them.
+     * Optional AI SDK tool descriptor (for tools the copilot can invoke
+     * via the LLM's tool-call protocol). Plain code tools (Finale ops,
+     * Gmail ops, Pinecone ops) register metadata-only — the registry is
+     * the catalog + audit configuration source, not the dispatch layer.
      */
-    tool: Tool;
+    tool?: Tool;
 };
 
 export type ToolListItem = Omit<RegisteredTool, "tool"> & {
