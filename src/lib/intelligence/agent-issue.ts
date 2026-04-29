@@ -164,9 +164,14 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
             if (args.lifecycleState === "complete" && !existing.completed_at) {
                 patch.completed_at = new Date().toISOString();
             }
+            // Owner is intentionally also gated on !isBlocked (Will, 2026-04-29):
+            // a blocked issue assigned to Will (e.g. via human_approval_required)
+            // must NOT have its owner flipped back to aria by the next projection
+            // cycle. That would weaken the "only clearBlocker() exits the human
+            // decision path" invariant.
+            if (args.owner !== undefined) patch.owner = args.owner;
         }
         if (args.priority !== undefined) patch.priority = args.priority;
-        if (args.owner !== undefined) patch.owner = args.owner;
         if (args.inputs !== undefined) patch.inputs = args.inputs;
 
         const { data: updated, error } = await supabase

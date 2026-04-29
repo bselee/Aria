@@ -930,8 +930,12 @@ bot.on('text', async (ctx) => {
                 const next = i.next_action ? `\n   → ${i.next_action}` : '';
                 return `• [${i.lifecycle_state}${handler}${blocker}] ${i.title}${next}`;
             });
-            const heading = `*Open issues* (${json.total})`;
-            await ctx.reply(`${heading}\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+            // Plain text — no parse_mode. Real titles include underscores,
+            // brackets, asterisks (e.g. "restart_bot", "Cron failure: build-risk")
+            // that Markdown rejects with "can't parse entities". The visible
+            // output is functionally identical without the bold heading.
+            const heading = `Open issues (${json.total})`;
+            await ctx.reply(`${heading}\n\n${lines.join('\n')}`);
         } catch (err: any) {
             await ctx.reply(`⚠️ Issues unavailable: ${err.message ?? String(err)}`);
         }
