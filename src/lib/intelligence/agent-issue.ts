@@ -505,6 +505,44 @@ export async function getCurrentlyHandlingCounts(): Promise<Record<string, Issue
     return out;
 }
 
+/**
+ * Find the most actionable open task linked to this issue, for routing
+ * Telegram inline-button taps. Preference order:
+ *   1. NEEDS_APPROVAL (Will needs to decide)
+ *   2. PENDING / CLAIMED / RUNNING (in-flight, can be dismissed/cancelled)
+ *
+ * Returns null when nothing is linked or all linked tasks are terminal —
+ * callers should fall back to issue-level resolution (clearBlocker +
+ * complete) in that case.
+ *
+ * Best-effort: a query failure returns null (not throw). The caller
+ * surfaces that to Will as "no actionable task — resolve at the issue
+ * level".
+ */
+export async function findLinkedOpenTask(
+    issueId: string,
+): Promise<{ id: string; status: string; source_table: string | null; source_id: string | null } | null> {
+    const supabase = createClient();
+    if (!supabase) return null;
+    const ACTIONABLE = ["NEEDS_APPROVAL", "PENDING", "CLAIMED", "RUNNING"];
+    const { data, error } = await supabase
+        .from("agent_task")
+        .select("id, status, source_table, source_id")
+        .eq("issue_id", issueId)
+        .in("status", ACTIONABLE);
+    if (error) {
+        console.warn("[agent-issue] findLinkedOpenTask failed:", error.message);
+        return null;
+    }
+    if (!data || data.length === 0) return null;
+    // Prefer NEEDS_APPROVAL over in-flight states.
+    data.sort((a: any, b: any) => {
+        const rank = (s: string) => (s === "NEEDS_APPROVAL" ? 0 : 1);
+        return rank(a.status) - rank(b.status);
+    });
+    return data[0] as any;
+}
+
 export async function getByBusinessFlowKey(
     businessFlowKey: string,
     onlyOpen = true,
