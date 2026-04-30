@@ -5,10 +5,11 @@
 # logon, so aria-bot comes back automatically after a reboot without
 # requiring Will to log in and manually `pm2 start ecosystem.config.cjs`.
 #
-# IMPORTANT: aria-dashboard is INTENTIONALLY NOT auto-started. Running
-# `next dev` under pm2 tanked the machine on 2026-04-30 (12GB heap budget
-# + Chrome instability). The dashboard is manual-start only — run
-# `npx next dev -p 3001` on demand for forensic/drill-down sessions.
+# NOTE: aria-dashboard auto-start uses `next start` (production mode, ~150MB
+# RSS idle). The 2026-04-30 first attempt used `next dev` with a 12GB heap
+# budget and tanked the machine — that approach is permanently retired. Make
+# sure `npm run build` has been run before resurrect; otherwise pm2 will keep
+# restart-looping the dashboard until .next/ exists.
 #
 # RUN AS ADMINISTRATOR ONCE.
 #

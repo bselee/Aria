@@ -64,47 +64,44 @@ module.exports = {
             // Graceful shutdown: give the bot 5s to clean up Telegram polling
             kill_timeout: 5000,
         },
-        // ─── Aria Dashboard (Next.js dev server) — DISABLED FROM AUTO-START ───
+        // ─── Aria Dashboard (Next.js production mode) ───
         //
-        // ATTEMPTED 2026-04-30, ROLLED BACK SAME DAY: running `next dev` under
-        // pm2 with --max-old-space-size=12288 tanked Will's working machine
-        // and broke Chrome (stuck tabs, timeouts). The dev server's heap
-        // budget allowed it to consume far more than the 2GB
-        // max_memory_restart while pm2 only sampled RSS, so the process
-        // grew unbounded between samples.
+        // HISTORY: 2026-04-30 first attempt ran `next dev` with --max-old-space-size=12288
+        // and 2GB max_memory_restart. The dev server's JIT compile + 12GB heap budget
+        // grew unbounded between pm2 RSS samples and tanked Will's machine (Chrome
+        // tabs stuck/timing out). Rolled back same day.
         //
-        // POLICY: dashboard stays MANUAL-START ONLY. Run on demand:
-        //   npx next dev -p 3001        (forensic / drill-down only)
+        // CURRENT: Production mode (`next build` once, then `next start`). Idle RSS
+        // ~150MB, +3MB after warming three pages. --max-old-space-size=1024 caps
+        // V8 heap at 1GB; max_memory_restart at 768M restarts well before that.
         //
-        // If we ever revisit auto-start, switch to `next build` + `next start`
-        // (production mode, no JIT compile, predictable memory) and keep
-        // --max-old-space-size at or below 1024MB.
-        /*
+        // BEFORE FIRST START or after pulling code: run `npm run build` (with
+        // NODE_OPTIONS='--max-old-space-size=12288' — build itself is heavy).
+        // pm2 reload aria-dashboard picks up the rebuilt .next/.
         {
             name: "aria-dashboard",
             script: path.join(__dirname, "node_modules", "next", "dist", "bin", "next"),
-            args: ["dev", "-p", "3001"],
+            args: ["start", "-p", "3001"],
             interpreter: "node",
-            interpreter_args: "--dns-result-order=ipv4first --max-old-space-size=12288",
+            interpreter_args: "--dns-result-order=ipv4first --max-old-space-size=1024",
             cwd: __dirname,
             env: {
-                NODE_ENV: "development",
-                NODE_OPTIONS: "--dns-result-order=ipv4first --max-old-space-size=12288",
+                NODE_ENV: "production",
+                NODE_OPTIONS: "--dns-result-order=ipv4first --max-old-space-size=1024",
             },
             watch: false,
             autorestart: true,
-            max_restarts: 5,
+            max_restarts: 10,
             min_uptime: "30s",
-            restart_delay: 10000,
-            max_memory_restart: "2048M",
-            exp_backoff_restart_delay: 10000,
+            restart_delay: 5000,
+            max_memory_restart: "768M",
+            exp_backoff_restart_delay: 5000,
             log_date_format: "YYYY-MM-DD HH:mm:ss Z",
             error_file: path.join(__dirname, "logs", "aria-dashboard-error.log"),
             out_file: path.join(__dirname, "logs", "aria-dashboard-out.log"),
             merge_logs: true,
             kill_timeout: 5000,
         },
-        */
         // DECISION(2026-02-26): aria-slack is now DISABLED as a separate process.
         // The Slack Watchdog runs inside aria-bot so that /requests can access
         // live pending request data without IPC or shared DB.
