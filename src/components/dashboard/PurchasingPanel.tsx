@@ -11,6 +11,9 @@ import {
 import type { FinaleReorderMethod } from "@/lib/finale/client";
 
 // ── types ──────────────────────────────────────────────────────────────────
+type UrgencyTier = "critical" | "warning" | "watch" | "ok";
+const TIER_ORDER: UrgencyTier[] = ["critical", "warning", "watch", "ok"];
+
 type PurchasingItem = {
     productId: string; productName: string; supplierName: string; supplierPartyId: string;
     unitPrice: number; stockOnHand: number; stockOnOrder: number;
@@ -18,12 +21,18 @@ type PurchasingItem = {
     dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
-    urgency: "critical" | "warning" | "watch" | "ok";
+    urgency: UrgencyTier;
     explanation: string; suggestedQty: number;
     orderIncrementQty: number | null; isBulkDelivery: boolean;
     finaleReorderQty: number | null; finaleStockoutDays: number | null; finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;
     reorderMethod?: FinaleReorderMethod;
+    qtyDiverged?: boolean;
+    qtyDivergencePct?: number;
+    velocityInflated?: boolean;
+    velocityRawRate?: number;
+    velocityRealityCap?: number;
+    packSize?: { unitsPerPack: number; packUnit: string };
     candidate?: { directDemand: number; bomDemand: number; finishedGoodsCoverageDays?: number | null };
     assessment?: {
         decision: "order" | "reduce" | "hold" | "manual_review";
@@ -33,19 +42,12 @@ type PurchasingItem = {
         explanation: string;
     };
 };
-type PurchasingGroup = {
-    vendorName: string; vendorPartyId: string;
-    urgency: "critical" | "warning" | "watch" | "ok";
-    items: PurchasingItem[];
-};
 type AssessmentData = {
     groups: PurchasingGroup[];
     cachedAt: string;
     vendorSummaries?: Array<{
-        vendorName: string;
-        vendorPartyId: string;
-        actionableCount: number;
-        blockedCount: number;
+        vendorName: string; vendorPartyId: string;
+        actionableCount: number; blockedCount: number;
         highestConfidence: "high" | "medium" | "low" | null;
     }>;
 };
@@ -94,6 +96,7 @@ function timeAgo(iso: string) {
 export default function PurchasingPanel() {
     const [data, setData] = useState<AssessmentData | null>(null);
     const [loading, setLoading] = useState(true);
+    const [loadingTiers, setLoadingTiers] = useState<Set<UrgencyTier>>(new Set());
     const [scanning, setScanning] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
@@ -264,33 +267,96 @@ export default function PurchasingPanel() {
     }
 
     // ── data load ──────────────────────────────────────────────────────────
+    // Progressive urgency-tier loading: critical first, then warning, watch, ok.
+    // On bust, only tier 1 busts the server cache; subsequent tiers hit warm cache.
     async function load(bust = false) {
-        bust ? setScanning(true) : setLoading(true);
         setError(null);
-        try {
-            const res = await fetch(bust ? "/api/dashboard/purchasing?bust=1" : "/api/dashboard/purchasing");
-            const json = await res.json();
-            if (!res.ok) throw new Error(json.error || "Failed");
-            setData(json);
-            const ic: Record<string, Record<string, boolean>> = {};
-            const iq: Record<string, Record<string, number>> = {};
-            for (const g of json.groups as PurchasingGroup[]) {
-                ic[g.vendorPartyId] = {};
-                iq[g.vendorPartyId] = {};
-                for (const item of g.items) {
-                    ic[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
-                    iq[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
-                }
+        if (!data) setLoading(true);
+        else if (bust) setScanning(true);
+
+        const errors: string[] = [];
+
+        const runTier = async (tier: UrgencyTier, bustThis: boolean): Promise<boolean> => {
+            setLoadingTiers(p => new Set([...p, tier]));
+            try {
+                const res = await fetch(`/api/dashboard/purchasing?urgency=${tier}${bustThis ? '&bust=1' : ''}`);
+                const json: AssessmentData = await res.json();
+                if (!res.ok) throw new Error(json.error || `Failed tier ${tier}`);
+
+                // Merge incoming groups without clobbering existing UI state
+                setData(prev => {
+                    if (!prev) return json;
+                    const existingIds = new Set(prev.groups.map(g => g.vendorPartyId));
+                    const newGroups = json.groups.filter(g => !existingIds.has(g.vendorPartyId));
+                    const mergedGroups = [...prev.groups, ...newGroups];
+                    // Keep vendorSummaries from the latest response
+                    return {
+                        groups: mergedGroups,
+                        cachedAt: json.cachedAt,
+                        vendorSummaries: json.vendorSummaries ?? prev.vendorSummaries,
+                    };
+                });
+
+                // Init checkboxes/qtys for new groups
+                setChecked(prev => {
+                    const next: Record<string, Record<string, boolean>> = { ...prev };
+                    for (const g of json.groups) {
+                        if (next[g.vendorPartyId]) continue; // preserve existing
+                        next[g.vendorPartyId] = {};
+                        for (const item of g.items) {
+                            next[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
+                        }
+                    }
+                    return next;
+                });
+
+                setQtys(prev => {
+                    const next: Record<string, Record<string, number>> = { ...prev };
+                    for (const g of json.groups) {
+                        if (next[g.vendorPartyId]) continue;
+                        next[g.vendorPartyId] = {};
+                        for (const item of g.items) {
+                            // Default to OUR suggestion when quantities diverge (>20%)
+                            next[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
+                        }
+                    }
+                    return next;
+                });
+
+                return true;
+            } catch (e: any) {
+                errors.push(e.message);
+                return false;
+            } finally {
+                setLoadingTiers(p => {
+                    const n = new Set(p);
+                    n.delete(tier);
+                    return n;
+                });
             }
-            setChecked(ic);
-            setQtys(iq);
-        } catch (e: any) {
-            setError(e.message);
-        } finally {
+        };
+
+        let anySuccess = false;
+
+        // Tier 1: critical — bust if requested. Always render even if empty.
+        if (await runTier('critical', bust)) anySuccess = true;
+        if (anySuccess) {
             setLoading(false);
             setScanning(false);
         }
+
+        // Remaining tiers — never bust here; rely on warm cache.
+        for (const tier of ['warning', 'watch', 'ok'] as UrgencyTier[]) {
+            await runTier(tier, false);
+        }
+
+        if (errors.length > 0 && !anySuccess) {
+            setError(errors.join(' | '));
+        } else if (errors.length > 0) {
+            setError(errors.join(' | '));
+        }
     }
+
     useEffect(() => { load(); }, []);
 
     function toggleExpand(id: string) {
@@ -563,6 +629,16 @@ export default function PurchasingPanel() {
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
+                {loadingTiers.size > 0 && !scanning && (
+                    <span className="text-[10px] text-zinc-600 font-mono">
+                        loading {Array.from(loadingTiers).join(',')}…
+                    </span>
+                )}
+                {loadingTiers.size > 0 && !scanning && (
+                    <span className="text-[10px] text-zinc-600 font-mono">
+                        loading {Array.from(loadingTiers).join(',')}…
+                    </span>
+                )}
                 <div className="flex-1" />
 
                 <button
@@ -949,6 +1025,11 @@ export default function PurchasingPanel() {
                                                                                         {methodBadge}
                                                                                     </span>
                                                                                 )}
+                                                                                {item.packSize && !itemSnoozed && (
+                                                                                    <span className="text-[9px] font-mono text-zinc-500 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
+                                                                                        {item.packSize.unitsPerPack}/{item.packSize.packUnit}
+                                                                                    </span>
+                                                                                )}
 
                                                                                 <div className="flex-1" />
 
@@ -999,19 +1080,35 @@ export default function PurchasingPanel() {
 
                                                                             {/* Row 3: Details & Qty */}
                                                                             {!itemSnoozed && (
-                                                                                <div className="flex items-center justify-between gap-2 mt-2">
+                                                                                <div className="flex items-start justify-between gap-2 mt-2">
                                                                                     <div className="flex flex-col gap-1">
                                                                                         <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--dash-l3)]">
                                                                                             <span>{item.dailyRate.toFixed(1)}/day</span>
+                                                                                            {item.velocityInflated && item.velocityRawRate != null && (
+                                                                                                <span
+                                                                                                    title={`Finale reported ${item.velocityRawRate.toFixed(1)}/day demand — likely BOM consumption inflation. Capped to actual sales/receipts (${item.velocityRealityCap?.toFixed(2) ?? '0'}/day) to prevent over-ordering.`}
+                                                                                                    className="text-[9px] font-mono text-amber-400 border border-amber-500/20 rounded px-1"
+                                                                                                >
+                                                                                                    ⚠ capped (Finale: {item.velocityRawRate.toFixed(1)}/d)
+                                                                                                </span>
+                                                                                            )}
                                                                                             <span>·</span>
                                                                                             <span>{Math.round(item.stockOnHand)} on hand</span>
                                                                                         </div>
                                                                                         {(item.finaleReorderQty ?? 0) > 0 && (
-                                                                                            <div className="flex items-center gap-1.5 mt-0.5">
-                                                                                                <Zap className="w-3 h-3 text-cyan-500" />
-                                                                                                <span className="text-[10px] font-mono text-cyan-500/80 italic">
-                                                                                                    Finale Reorder: {item.finaleReorderQty}
+                                                                                            <div className="flex items-center gap-2 mt-0.5">
+                                                                                                <span className={`text-[10px] font-mono italic ${item.qtyDiverged ? 'text-amber-400' : 'text-cyan-500/80'}`}>
+                                                                                                    Finale: {item.finaleReorderQty}
                                                                                                 </span>
+                                                                                                <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                                <span className={`text-[10px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                                                                                    Aria: {item.suggestedQty}
+                                                                                                </span>
+                                                                                                {item.qtyDiverged && item.qtyDivergencePct != null && (
+                                                                                                    <span className="text-[9px] font-mono text-amber-400 border border-amber-500/20 rounded px-1">
+                                                                                                        ⚠ {Math.abs(item.qtyDivergencePct)}% diff
+                                                                                                    </span>
+                                                                                                )}
                                                                                             </div>
                                                                                         )}
                                                                                     </div>
