@@ -24,6 +24,11 @@ import {
     rejectPendingReconciliation,
 } from '../finale/reconciler';
 
+import {
+    createDraftPOTaskAfterApproval,
+    type DraftPOTaskPayload,
+} from './po-approval-task';
+
 export type TaskActionResult =
     | { ok: true; replyText: string; cbQueryText: string; data?: unknown }
     | { ok: false; replyText: string; cbQueryText: string; error: string };
@@ -128,6 +133,22 @@ export async function approveTask(taskId: string, actor: string): Promise<TaskAc
             await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, replyText);
             return {
                 ok: true,
+                replyText,
+                cbQueryText,
+                data: result,
+            };
+        }
+        if (task.source_table === 'po_pending_approval') {
+            // Mark approved in the hub first so the audit trail is intact even
+            // if the Finale create call fails (createDraftPOTaskAfterApproval
+            // logs and returns success=false in that case).
+            await agentTask.decideApproval(taskId, 'approve', actor);
+            const result = await createDraftPOTaskAfterApproval(taskId, actor);
+            const replyText = result.message;
+            await resolveLinkedIssueFromTaskAction(taskId, 'approved', actor);
+            await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, replyText);
+            return {
+                ok: result.success,
                 replyText,
                 cbQueryText,
                 data: result,

@@ -28,6 +28,7 @@ import { recall } from "../memory";
 import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
 import { getPreClassification } from "../nightshift-agent";
 import { FinaleClient } from "../../finale/client";
+import { requestDraftPOApproval } from "../../command-board/po-approval-task";
 import { Telegraf } from "telegraf";
 import { applyMessageLabelPolicy } from "../gmail-policy";
 import {
@@ -1251,34 +1252,53 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 const vendorPartyId = await finale.findVendorPartyByName(extracted.vendorName);
 
                 if (vendorPartyId) {
-                    // DECISION(2026-03-16): Create draft PO with placeholder SKU.
-                    // Real SKU correlation is complex — for now, use a single
-                    // generic line item at the paid amount. Will adds the real SKU.
+                    // DECISION(2026-05-11): Route through approval gate instead
+                    // of auto-creating in Finale. Will approves the queued task
+                    // from /tasks; approval calls createDraftPurchaseOrder via
+                    // createDraftPOTaskAfterApproval.
+                    //
+                    // Original DECISION(2026-03-16) on placeholder SKU still
+                    // applies: real SKU correlation is complex — payload uses a
+                    // single generic line item at the paid amount, and Will
+                    // adds the correct SKU after approval.
                     const memo = [
-                        `[Aria] Auto-created from paid invoice confirmation`,
+                        `[Aria] From paid invoice confirmation`,
                         `Invoice: ${extracted.invoiceNumber}`,
                         `Amount: $${extracted.amountPaid.toFixed(2)}`,
                         `Date: ${extracted.datePaid}`,
                         extracted.productDescription ? `Product: ${extracted.productDescription}` : null,
                         `Source email: ${from}`,
-                        `⚠️ REMINDER: Add the correct vendor SKU to this PO before committing.`,
+                        `⚠️ REMINDER: Replace PLACEHOLDER-PAID-INVOICE with the correct vendor SKU before committing.`,
                     ].filter(Boolean).join('\n');
 
-                    const result = await finale.createDraftPurchaseOrder(
-                        vendorPartyId,
-                        [{
-                            productId: 'PLACEHOLDER-PAID-INVOICE',
-                            quantity: 1,
-                            unitPrice: extracted.amountPaid,
-                        }],
-                        memo
+                    const sourceId = `paid_invoice:${extracted.invoiceNumber || extracted.datePaid}:${vendorPartyId}`;
+                    const goal = `Draft PO — ${extracted.vendorName} ($${extracted.amountPaid.toFixed(2)})`;
+                    const approval = await requestDraftPOApproval(
+                        sourceId,
+                        goal,
+                        {
+                            vendorPartyId,
+                            items: [{
+                                productId: 'PLACEHOLDER-PAID-INVOICE',
+                                quantity: 1,
+                                unitPrice: extracted.amountPaid,
+                            }],
+                            memo,
+                        },
                     );
 
-                    draftInfo = { orderId: result.orderId, finaleUrl: result.finaleUrl };
-                    console.log(`     📝 Created draft PO #${result.orderId} for review`);
+                    if (approval.taskId) {
+                        draftInfo = { orderId: `pending:${approval.taskId.slice(0, 8)}`, finaleUrl: '' };
+                        console.log(`     ⏸️ Draft PO queued for approval (task ${approval.taskId.slice(0, 8)})`);
+                    } else {
+                        console.warn(`     ⚠️ ${approval.message}`);
+                    }
                 } else {
                     console.warn(`     ⚠️ Could not find vendor party for "${extracted.vendorName}" — no draft PO created`);
                 }
+            } catch (draftErr: any) {
+                console.error(`     ❌ Draft PO creation failed:`, draftErr.message);
+            }
             } catch (draftErr: any) {
                 console.error(`     ❌ Draft PO creation failed:`, draftErr.message);
             }

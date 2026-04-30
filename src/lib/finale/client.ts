@@ -17,6 +17,8 @@
  * the product is manufactured (has a BOM), not purchased.
  */
 
+import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
+
 // ──────────────────────────────────────────────────
 // TYPES
 // ──────────────────────────────────────────────────
@@ -130,6 +132,9 @@ export interface PurchasingItem {
     finaleConsumptionQty: number | null;
     finaleDemandQty: number | null;    // 90-day demand quantity from Finale productView
     reorderMethod?: FinaleReorderMethod;
+    packSize?: { unitsPerPack: number; packUnit: string }; // null = not registered
+    qtyDiverged?: boolean;
+    qtyDivergencePct?: number;
 }
 
 export interface PurchasingGroup {
@@ -4615,6 +4620,10 @@ export class FinaleClient {
         console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates found`);
         if (candidates.length === 0) return [];
 
+        // Load pack-size registry for all candidates in one batch
+        const packSizeMap = await getPackSizes(candidates.map(c => c.productId));
+        console.log(`[finale] getPurchasingIntelligence: ${packSizeMap.size} pack-size records loaded`);
+
         // ── Step 2-8: 5x concurrent workers per candidate SKU ──
         // Vendors excluded from purchasing intelligence:
         //   isManufactured : internal BAS production depts
@@ -4762,13 +4771,33 @@ export class FinaleClient {
                                 : 'covered';
                     const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
 
-                    // Step 8: suggested qty — uses product's order increment if set, otherwise no rounding
-                    // DECISION(2026-03-04): Formerly hard-coded round-to-50. Now respects
-                    // the product's "Std reorder in qty of" field from Finale.
-                    // If no increment configured, raw quantity passes through unchanged.
+                    // Step 8: suggested qty — subtract stock + open POs, then cover window
+                    // DECISION(2026-05-11): Previously we computed dailyRate * coverDays blindly,
+                    // ignoring on-hand stock and incoming POs. This produced wild over-orders
+                    // (e.g., EM103: 11,240 units when stock + open POs already cover demand).
+                    const coverDays = leadTimeDays + 60;
+                    const neededEaches = Math.max(0, dailyRate * coverDays - effectiveStock - stockOnOrder);
+                    const rawSuggestedQty = neededEaches > 0 ? neededEaches : 0;
+
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
-                    const rawSuggestedQty = Math.max(1, dailyRate * (leadTimeDays + 60));
-                    const suggestedQty = Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty));
+                    const suggestedQty = rawSuggestedQty > 0
+                        ? Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty))
+                        : 0;
+
+                    // Qty divergence: compare our velocity-based suggestion vs Finale's reorderQuantityToOrder
+                    const finaleReorderQty = candidate.finaleReorderQty;
+                    let qtyDiverged: boolean | undefined;
+                    let qtyDivergencePct: number | undefined;
+                    if (finaleReorderQty && finaleReorderQty > 0 && suggestedQty > 0) {
+                        qtyDivergencePct = Math.round(((suggestedQty - finaleReorderQty) / finaleReorderQty) * 100);
+                        qtyDiverged = Math.abs(qtyDivergencePct) > 20;
+                    }
+
+                    // Pack-size context from canonical registry
+                    const packSizeRec = packSizeMap.get(sku);
+                    const packSize = packSizeRec
+                        ? { unitsPerPack: packSizeRec.unitsPerPack, packUnit: packSizeRec.packUnit }
+                        : undefined;
 
                     // Bulk delivery detection for facility routing
                     const isBulkDelivery = FinaleClient.isBulkDelivery(prodData);
@@ -4805,6 +4834,9 @@ export class FinaleClient {
                         finaleDemandQty: candidate.finaleDemandQty,
                         reorderMethod,
                         dailyRateSource: rateSource === "none" ? undefined : rateSource,
+                        qtyDiverged,
+                        qtyDivergencePct,
+                        packSize,
                     });
                 } catch {
                     // Skip products that error — non-fatal
