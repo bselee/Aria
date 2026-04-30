@@ -95,9 +95,11 @@ Write-Host ""
 Write-Host "[3/3] Registering AriaPm2DailyHealth (daily 7am)..." -ForegroundColor Yellow
 cmd /c "schtasks /Delete /TN AriaPm2DailyHealth /F >nul 2>nul"
 
-# Build a small inline command that restarts any stopped aria-* process.
-# pm2 jlist returns JSON; we filter to aria-* and restart any not online.
-$HealthCmd = "powershell -NoProfile -Command `"& {`$j = (& pm2 jlist | ConvertFrom-Json); foreach (`$p in `$j) { if (`$p.name -like 'aria-*' -and `$p.pm2_env.status -ne 'online') { & pm2 restart `$p.name } }}`""
+# Invoke the health-check script. Inlining a PowerShell command with curly
+# braces and embedded quotes confuses schtasks' argument parser, so we keep
+# the logic in scripts/aria-pm2-health.ps1.
+$HealthScript = Join-Path $PSScriptRoot "aria-pm2-health.ps1"
+$HealthCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$HealthScript`""
 
 schtasks /Create `
     /TN "AriaPm2DailyHealth" `
