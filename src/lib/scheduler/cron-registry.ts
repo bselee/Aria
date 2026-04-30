@@ -216,6 +216,14 @@ export const CRON_JOBS: CronJobDefinition[] = [
         category: 'maintenance',
         weekdaysOnly: false,
     },
+    {
+        name: 'IssueOrchestrator',
+        description: 'Evaluates open agent_issue rows and advances safe next actions (env-gated by ISSUE_ORCHESTRATOR_ENABLED)',
+        schedule: '*/5 * * * *',
+        scheduleHuman: 'Every 5 minutes',
+        category: 'maintenance',
+        weekdaysOnly: false,
+    },
 ];
 
 const cronRunStatus = new Map<string, CronRunStatus>();

@@ -983,7 +983,13 @@ bot.on('text', async (ctx) => {
             : i.lifecycle_state === 'blocked' ? '🚫'
                 : i.lifecycle_state === 'waiting_external' ? '⏳'
                     : '▶';
-        const line = `${tag} [${i.lifecycle_state}${handler}${blocker}] ${i.title}${next}`;
+        // Plan task 5/6: control profile from inputs.control. If absent, the
+        // mode column is omitted (UI noise reduction); paused state shows
+        // explicitly so Will can see it without expanding the row.
+        const ctrl = (i as any).inputs?.control as { mode?: string; paused?: boolean } | undefined;
+        const modeTag = ctrl?.mode ? `  · ${ctrl.mode}` : '';
+        const pausedTag = ctrl?.paused === true ? '  · ⏸ paused' : '';
+        const line = `${tag} [${i.lifecycle_state}${handler}${modeTag}${pausedTag}${blocker}] ${i.title}${next}`;
         const buttons: any[] = [];
         if (isHumanApprovalRow(i)) {
             buttons.push(TgMarkup.button.callback('✅ Approve', `issue_approve_${i.id}`));
@@ -992,6 +998,16 @@ bot.on('text', async (ctx) => {
             buttons.push(TgMarkup.button.callback('✓ Resolve', `issue_resolve_${i.id}`));
         } else {
             buttons.push(TgMarkup.button.callback('✓ Mark done', `issue_resolve_${i.id}`));
+        }
+        // Plan task 6: pause/resume + run-next controls. Only render when
+        // applicable — keep the inline keyboard compact.
+        if (ctrl?.paused === true) {
+            buttons.push(TgMarkup.button.callback('▶ Resume', `issue_resume_${i.id}`));
+        } else if (i.lifecycle_state !== 'complete') {
+            buttons.push(TgMarkup.button.callback('⏸ Pause', `issue_pause_${i.id}`));
+        }
+        if (i.lifecycle_state !== 'complete') {
+            buttons.push(TgMarkup.button.callback('⚙ Run next', `issue_run_${i.id}`));
         }
         buttons.push(TgMarkup.button.callback('🔍 Detail', `issue_detail_${i.id}`));
         return { line, buttons };
@@ -1139,6 +1155,46 @@ bot.on('text', async (ctx) => {
             await ctx.reply(`✓ Resolved: ${issue.title}`);
         } catch (err: any) {
             await ctx.reply(`❌ Resolve failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    // Plan task 6: pause / resume / run_next via the shared
+    // applyIssueControlAction service (Task 5). One service, two
+    // surfaces (Telegram + dashboard) — they cannot diverge.
+
+    bot.action(/^issue_pause_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Pausing...');
+        try {
+            const { applyIssueControlAction } = await import('../lib/intelligence/issue-control-actions');
+            const result = await applyIssueControlAction(issueId, { action: 'pause', actor: 'will-telegram' });
+            await ctx.reply(result.ok ? `⏸ ${result.message}` : `❌ ${result.message}`);
+        } catch (err: any) {
+            await ctx.reply(`❌ Pause failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.action(/^issue_resume_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Resuming...');
+        try {
+            const { applyIssueControlAction } = await import('../lib/intelligence/issue-control-actions');
+            const result = await applyIssueControlAction(issueId, { action: 'resume', actor: 'will-telegram' });
+            await ctx.reply(result.ok ? `▶ ${result.message}` : `❌ ${result.message}`);
+        } catch (err: any) {
+            await ctx.reply(`❌ Resume failed: ${err.message ?? String(err)}`);
+        }
+    });
+
+    bot.action(/^issue_run_(.+)$/, async (ctx) => {
+        const issueId = ctx.match[1];
+        await ctx.answerCbQuery('Running orchestrator...');
+        try {
+            const { applyIssueControlAction } = await import('../lib/intelligence/issue-control-actions');
+            const result = await applyIssueControlAction(issueId, { action: 'run_next_step', actor: 'will-telegram' });
+            await ctx.reply(result.ok ? `⚙ ${result.message}` : `❌ ${result.message}`);
+        } catch (err: any) {
+            await ctx.reply(`❌ Run-next failed: ${err.message ?? String(err)}`);
         }
     });
 
