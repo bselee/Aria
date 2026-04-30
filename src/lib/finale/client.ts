@@ -135,6 +135,9 @@ export interface PurchasingItem {
     packSize?: { unitsPerPack: number; packUnit: string }; // null = not registered
     qtyDiverged?: boolean;
     qtyDivergencePct?: number;
+    velocityInflated?: boolean;        // true when chooseVelocitySignal capped a demand signal that exceeded 3× sales/receipts
+    velocityRawRate?: number;          // the original (pre-cap) daily rate Finale reported, for context
+    velocityRealityCap?: number;       // max(salesVelocity, purchaseVelocity) — what the cap pinned dailyRate to
 }
 
 export interface PurchasingGroup {
@@ -430,10 +433,19 @@ export function chooseVelocitySignal(input: {
     salesVelocity: number;
     purchaseVelocity?: number;
     consumptionQty?: number | null;
-}): { dailyRate: number; signal: "demand" | "sales" | "receipts" | "none" } {
+}): {
+    dailyRate: number;
+    signal: "demand" | "sales" | "receipts" | "none";
+    inflated?: boolean;
+    rawRate?: number;
+    realityCap?: number;
+} {
     const reorderMethod = input.reorderMethod ?? "default";
     const demandVelocity = input.demandVelocity > 0 ? input.demandVelocity : 0;
     const salesVelocity = input.salesVelocity > 0 ? input.salesVelocity : 0;
+    const purchaseVelocity = input.purchaseVelocity != null && input.purchaseVelocity > 0
+        ? input.purchaseVelocity
+        : 0;
     const hasConsumption = (input.consumptionQty ?? 0) > 0;
 
     const preferredSignals: Array<"demand" | "sales"> =
@@ -445,16 +457,45 @@ export function chooseVelocitySignal(input: {
                     ? (hasConsumption ? ["demand", "sales"] : ["sales", "demand"])
                     : ["sales", "demand"];
 
+    let chosenRate = 0;
+    let chosenSignal: "demand" | "sales" | "receipts" | "none" = "none";
+
     for (const signal of preferredSignals) {
         const rate = signal === "demand" ? demandVelocity : salesVelocity;
-        if (rate > 0) return { dailyRate: rate, signal };
+        if (rate > 0) {
+            chosenRate = rate;
+            chosenSignal = signal;
+            break;
+        }
     }
 
-    if (hasConsumption && input.purchaseVelocity != null && input.purchaseVelocity > 0) {
-        return { dailyRate: input.purchaseVelocity, signal: "receipts" };
+    if (chosenSignal === "none" && hasConsumption && purchaseVelocity > 0) {
+        chosenRate = purchaseVelocity;
+        chosenSignal = "receipts";
     }
 
-    return { dailyRate: 0, signal: "none" };
+    if (chosenSignal === "none") {
+        return { dailyRate: 0, signal: "none" };
+    }
+
+    // Reality cap: actual movement (sales OR receipts) bounds Finale's
+    // computed demand/consumption signals. Finale's demandQuantity counts
+    // BOM consumption from internal builds, which can inflate by orders of
+    // magnitude vs. real reorder need (EM103: 151.88/d demand vs. ~0.2/d
+    // actual sales). Allow up to 3× the realistic max for seasonal ramps;
+    // anything above that is treated as inflated and capped to reality.
+    const reality = Math.max(salesVelocity, purchaseVelocity);
+    if (reality > 0 && chosenRate > 3 * reality) {
+        return {
+            dailyRate: reality,
+            signal: chosenSignal,
+            inflated: true,
+            rawRate: chosenRate,
+            realityCap: reality,
+        };
+    }
+
+    return { dailyRate: chosenRate, signal: chosenSignal };
 }
 
 /**
@@ -4758,7 +4799,9 @@ export class FinaleClient {
                                 : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
                                     : 'ok';
                     const parts: string[] = [
-                        `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
+                        chosenVelocity.inflated
+                            ? `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel}, capped — Finale reported ${chosenVelocity.rawRate?.toFixed(1)}/d)`
+                            : `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
                         `${Math.round(effectiveStock)} in stock → ${Math.round(runwayDays)}d`,
                         `Lead ${leadTimeDays}d`,
                     ];
@@ -4837,6 +4880,9 @@ export class FinaleClient {
                         qtyDiverged,
                         qtyDivergencePct,
                         packSize,
+                        velocityInflated: chosenVelocity.inflated,
+                        velocityRawRate: chosenVelocity.rawRate,
+                        velocityRealityCap: chosenVelocity.realityCap,
                     });
                 } catch {
                     // Skip products that error — non-fatal
