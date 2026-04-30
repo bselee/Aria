@@ -16,6 +16,8 @@
 import { tool } from 'ai';
 import { z } from 'zod';
 import { FinaleClient } from '../lib/finale/client';
+import { requestDraftPOApproval } from '../lib/command-board/po-approval-task';
+import { createHash } from 'crypto';
 import OpenAI from 'openai';
 
 // Type for Telegraf bot instance — avoids importing full Telegraf types
@@ -363,39 +365,38 @@ export function getAriaTools(opts: {
                             ? `No actionable draft lines found for vendor matching "${vendor_filter}".${blockedSummary.length ? ` Blocked: ${blockedSummary.join(' | ')}` : ''}`
                             : `No actionable draft lines found.${blockedSummary.length ? ` Blocked: ${blockedSummary.join(' | ')}` : ''}`;
                     }
-                    const created: string[] = [];
-                    const tgChatId = String(chatId);
+                    // Approval gate: bot creates an agent_task per vendor instead of
+                    // hitting Finale directly. Will approves from /tasks (Telegram),
+                    // which runs createDraftPOTaskAfterApproval to create the actual PO.
+                    const queued: string[] = [];
                     for (const plan of actionablePlans) {
                         try {
-                            const po = await finale.createDraftPurchaseOrder(
-                                plan.vendorPartyId, plan.actionableItems,
-                                'Auto-generated draft — review and commit in Finale'
+                            const skuList = plan.actionableItems.map(i => i.productId).sort().join(',');
+                            const sourceId = `bot:${plan.vendorPartyId}:${createHash('sha1').update(skuList).digest('hex').slice(0, 12)}`;
+                            const goal = `Draft PO — ${plan.vendorName} (${plan.actionableItems.length} SKU${plan.actionableItems.length !== 1 ? 's' : ''})`;
+                            const approval = await requestDraftPOApproval(
+                                sourceId,
+                                goal,
+                                {
+                                    vendorPartyId: plan.vendorPartyId,
+                                    items: plan.actionableItems,
+                                    memo: 'Bot-generated draft — review and approve in /tasks',
+                                },
                             );
-                            let poLine = `✅ PO #${po.orderId} — ${plan.vendorName} (${plan.actionableItems.length} SKU${plan.actionableItems.length !== 1 ? 's' : ''}) → ${po.facilityName}`;
-                            if (po.duplicateWarnings.length > 0) poLine += `\n${po.duplicateWarnings.join('\n')}`;
-                            if (po.priceAlerts.length > 0) poLine += `\n${po.priceAlerts.join('\n')}`;
+                            let line = `${approval.taskId ? '⏸️' : '⚠️'} ${plan.vendorName} (${plan.actionableItems.length} SKU${plan.actionableItems.length !== 1 ? 's' : ''}) — ${approval.message}`;
                             if (plan.blockedLines.length > 0) {
                                 const blocked = plan.blockedLines
                                     .slice(0, 3)
-                                    .map(line => `${line.item.productId}: ${line.assessment.explanation}`)
+                                    .map(blockedLine => `${blockedLine.item.productId}: ${blockedLine.assessment.explanation}`)
                                     .join(' | ');
-                                poLine += `\nBlocked: ${blocked}`;
+                                line += `\nBlocked: ${blocked}`;
                             }
-                            created.push(poLine);
-                            // Send inline Review & Send keyboard for this PO
-                            bot.telegram.sendMessage(tgChatId, poLine, {
-                                reply_markup: {
-                                    inline_keyboard: [[
-                                        { text: '📋 Review & Send', callback_data: `po_review_${po.orderId}` },
-                                        { text: 'Skip', callback_data: `po_skip_${po.orderId}` },
-                                    ]],
-                                },
-                            }).catch(() => { });
+                            queued.push(line);
                         } catch (e: any) {
-                            created.push(`❌ ${plan.vendorName}: ${e.message}`);
+                            queued.push(`❌ ${plan.vendorName}: ${e.message}`);
                         }
                     }
-                    return `*Draft POs Created:*\n${created.join('\n')}\n\nTap "Review & Send" on any PO above to commit and email the vendor.`;
+                    return `*Draft POs queued for approval:*\n${queued.join('\n')}\n\nRun /tasks to review and approve. The actual Finale PO is created on approval.`;
                 } catch (err: any) {
                     return `Draft PO creation failed: ${err.message}`;
                 }

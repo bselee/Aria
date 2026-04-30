@@ -17,6 +17,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Activity, Bell, RefreshCw } from "lucide-react";
 
 import IssuesPanel from "./IssuesPanel";
+import OpsTriPanel from "./OpsTriPanel";
 import TasksPanel from "@/components/dashboard/TasksPanel";
 import { PANEL_BY_ID } from "./panelRegistry";
 import type { PanelId } from "./useDashboardLayout";
@@ -52,15 +53,10 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
 // because that's the bulk of the daily flow. Builds + Tracking are
 // secondary; Tasks/Activity are diagnostic.
 type TabId =
+    | "ops"
     | "blocking"
-    | "ap"
-    | "receivings"
-    | "ordering"
-    | "tracking"
     | "builds"
     | "build-schedule"
-    | "statement-recon"
-    | "active-pos"
     | "tasks"
     | "oversight"
     | "activity";
@@ -89,11 +85,11 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     const [heartbeats, setHeartbeats] = useState<CommandBoardHeartbeat[]>([]);
     const [crons, setCrons] = useState<CommandBoardCron[]>([]);
 
-    const [activeTab, setActiveTab] = useState<TabId>("blocking");
+    const [activeTab, setActiveTab] = useState<TabId>("ops");
     // Tabs that have been visited stay MOUNTED so switching back is instant.
     // First visit pays the JIT-compile + data-fetch cost once; subsequent
     // switches are pure CSS visibility flips.
-    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["blocking"]));
+    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["ops"]));
 
     const [refreshing, setRefreshing] = useState(false);
     const [lastError, setLastError] = useState<string | null>(null);
@@ -166,15 +162,10 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
 
     const tabs: TabDef[] = useMemo(
         () => [
+            { id: "ops", label: "Ops", render: () => <OpsTriPanel /> },
             { id: "blocking", label: "Blocking Me", render: () => <IssuesPanel /> },
-            { id: "ap", label: "AP / Invoices", render: () => panelById("invoice-queue") },
-            { id: "receivings", label: "Receivings", render: () => panelById("receivings") },
-            { id: "ordering", label: "Ordering", render: () => panelById("purchasing") },
-            { id: "tracking", label: "Tracking", render: () => panelById("tracking-board") },
             { id: "builds", label: "Build Risk", render: () => panelById("build-risk") },
             { id: "build-schedule", label: "Build Schedule", render: () => panelById("build-schedule") },
-            { id: "statement-recon", label: "Statement Recon", render: () => panelById("statement-reconciliation") },
-            { id: "active-pos", label: "Active POs", render: () => panelById("active-purchases") },
             { id: "tasks", label: "Tasks", render: () => <TasksPanel /> },
             { id: "oversight", label: "Oversight", render: () => panelById("oversight") },
             { id: "activity", label: "Activity", render: () => panelById("activity") },
