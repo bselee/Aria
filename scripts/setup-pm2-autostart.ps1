@@ -68,7 +68,9 @@ Write-Host ""
 
 # Step 2: Register the at-logon resurrect task.
 Write-Host "[2/3] Registering AriaPm2Resurrect (logon trigger)..." -ForegroundColor Yellow
-schtasks /Delete /TN AriaPm2Resurrect /F 2>$null
+# Delete-if-exists. cmd /c so PowerShell 5.1 doesn't wrap stderr as a
+# NativeCommandError and trip $ErrorActionPreference="Stop" on first run.
+cmd /c "schtasks /Delete /TN AriaPm2Resurrect /F >nul 2>nul"
 
 # Wrap pm2 resurrect in a script that also waits for the network.
 $ResurrectCmd = "node `"$Pm2Path`" resurrect"
@@ -91,7 +93,7 @@ Write-Host ""
 
 # Step 3: Register the daily health check.
 Write-Host "[3/3] Registering AriaPm2DailyHealth (daily 7am)..." -ForegroundColor Yellow
-schtasks /Delete /TN AriaPm2DailyHealth /F 2>$null
+cmd /c "schtasks /Delete /TN AriaPm2DailyHealth /F >nul 2>nul"
 
 # Build a small inline command that restarts any stopped aria-* process.
 # pm2 jlist returns JSON; we filter to aria-* and restart any not online.
