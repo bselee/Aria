@@ -67,6 +67,20 @@ export type CommandBoardCatalog = {
     references: CommandBoardReference[];
 };
 
+// -- Workbenches --------------------------------------------------------------
+
+export type WorkbenchId =
+    | "issues"
+    | "ordering"
+    | "receivings"
+    | "ap"
+    | "tracking"
+    | "active-pos"
+    | "builds"
+    | "statement-recon"
+    | "agents"
+    | "runs";
+
 // ── Tasks / lanes ───────────────────────────────────────────────────────────
 
 export type CommandBoardLane =

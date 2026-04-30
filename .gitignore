@@ -116,3 +116,10 @@ aria-local.db-wal
 # Dev-server log dumps (developer-local, never useful in repo)
 tmp-next-dev-*.err.log
 tmp-next-dev-*.out.log
+
+# Local scraped data — regenerated each run (timestamped scrapedAt field)
+purchase-requests.json
+purchases-data.json
+
+# External MCP tool dir — intentionally not in this repo
+tools/excel-mcp-server/
