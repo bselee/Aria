@@ -11,7 +11,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, XCircle, RotateCcw, Eye, RefreshCw, Loader2 } from "lucide-react";
+import { CheckCircle2, XCircle, RotateCcw, Eye, RefreshCw, Loader2, Pause, Play, Settings } from "lucide-react";
 
 type IssueRow = {
     id: string;
@@ -25,7 +25,10 @@ type IssueRow = {
     owner: string;
     age_seconds: number;
     task_count?: number;
+    inputs?: { control?: { mode?: string; paused?: boolean } } & Record<string, unknown>;
 };
+
+type ControlAction = "approve" | "reject" | "resolve" | "pause" | "resume" | "run_next_step";
 
 type IssuesResponse = { issues: IssueRow[]; total: number };
 
@@ -49,7 +52,7 @@ function ageLabel(seconds: number): string {
     return `${Math.floor(seconds / 86400)}d`;
 }
 
-type ActionState = Record<string, "approve" | "reject" | "resolve" | undefined>;
+type ActionState = Record<string, ControlAction | undefined>;
 
 export default function IssuesPanel() {
     const [issues, setIssues] = useState<IssueRow[]>([]);
@@ -97,7 +100,7 @@ export default function IssuesPanel() {
         return { human, blocked, waiting, inFlight };
     }, [issues]);
 
-    const act = async (id: string, action: "approve" | "reject" | "resolve") => {
+    const act = async (id: string, action: ControlAction) => {
         setActing(s => ({ ...s, [id]: action }));
         try {
             const res = await fetch(`/api/command-board/issues/${id}/actions`, {
@@ -178,10 +181,12 @@ function IssueRowCard({
     onAction,
 }: {
     issue: IssueRow;
-    acting?: "approve" | "reject" | "resolve";
-    onAction: (id: string, action: "approve" | "reject" | "resolve") => void;
+    acting?: ControlAction;
+    onAction: (id: string, action: ControlAction) => void;
 }) {
     const human = isHumanApproval(issue);
+    const ctrl = issue.inputs?.control;
+    const paused = ctrl?.paused === true;
     const tag = human ? "👀"
         : issue.lifecycle_state === "blocked" ? "🚫"
             : issue.lifecycle_state === "waiting_external" ? "⏳"
@@ -207,6 +212,22 @@ function IssueRowCard({
                         {issue.current_handler && (
                             <span className="text-[9px] font-mono text-zinc-500">· {issue.current_handler}</span>
                         )}
+                        {ctrl?.mode && (
+                            <span
+                                data-testid={`issue-control-mode-${issue.id}`}
+                                className="text-[9px] font-mono text-blue-300/80 px-1 rounded bg-blue-500/10 border border-blue-500/20"
+                            >
+                                {ctrl.mode}
+                            </span>
+                        )}
+                        {paused && (
+                            <span
+                                data-testid={`issue-paused-${issue.id}`}
+                                className="text-[9px] font-mono text-zinc-300 px-1 rounded bg-zinc-700"
+                            >
+                                ⏸ paused
+                            </span>
+                        )}
                         {issue.blocker_reason && (
                             <span className="text-[9px] font-mono text-rose-300">🚫 {issue.blocker_reason}</span>
                         )}
@@ -217,7 +238,7 @@ function IssueRowCard({
                     )}
                 </div>
             </div>
-            <div className="px-3 pb-2 flex items-center gap-1.5">
+            <div className="px-3 pb-2 flex items-center gap-1.5 flex-wrap">
                 {human ? (
                     <>
                         <ActionButton
@@ -247,6 +268,43 @@ function IssueRowCard({
                         onClick={() => onAction(issue.id, "resolve")}
                     />
                 )}
+                {/* Plan task 7: pause / resume / run-next controls. Compact —
+                    only render when applicable. No catalog/tool data fetched
+                    in list rows. */}
+                {issue.lifecycle_state !== "complete" && (
+                    paused ? (
+                        <ActionButton
+                            label="Resume"
+                            color="zinc"
+                            icon={Play}
+                            disabled={!!acting}
+                            loading={acting === "resume"}
+                            onClick={() => onAction(issue.id, "resume")}
+                            ariaLabel={`Resume issue ${issue.id}`}
+                        />
+                    ) : (
+                        <ActionButton
+                            label="Pause"
+                            color="zinc"
+                            icon={Pause}
+                            disabled={!!acting}
+                            loading={acting === "pause"}
+                            onClick={() => onAction(issue.id, "pause")}
+                            ariaLabel={`Pause issue ${issue.id}`}
+                        />
+                    )
+                )}
+                {issue.lifecycle_state !== "complete" && (
+                    <ActionButton
+                        label="Run next"
+                        color="zinc"
+                        icon={Settings}
+                        disabled={!!acting}
+                        loading={acting === "run_next_step"}
+                        onClick={() => onAction(issue.id, "run_next_step")}
+                        ariaLabel={`Run next step for issue ${issue.id}`}
+                    />
+                )}
                 <a
                     href={`/dashboard/tasks?issue=${issue.id}`}
                     className="ml-auto inline-flex items-center gap-1 px-2 py-1 text-[10px] font-mono text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60 rounded"
@@ -266,22 +324,26 @@ function ActionButton({
     disabled,
     loading,
     onClick,
+    ariaLabel,
 }: {
     label: string;
-    color: "emerald" | "rose";
+    color: "emerald" | "rose" | "zinc";
     icon: typeof CheckCircle2;
     disabled?: boolean;
     loading?: boolean;
     onClick: () => void;
+    ariaLabel?: string;
 }) {
-    const palette = color === "emerald"
-        ? "bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 border-emerald-500/40"
-        : "bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 border-rose-500/40";
+    const palette =
+        color === "emerald" ? "bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 border-emerald-500/40"
+            : color === "rose" ? "bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 border-rose-500/40"
+                : "bg-zinc-700/50 hover:bg-zinc-700 text-zinc-200 border-zinc-600";
     return (
         <button
             type="button"
             onClick={onClick}
             disabled={disabled}
+            aria-label={ariaLabel ?? label}
             className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] font-mono rounded border disabled:opacity-50 ${palette}`}
         >
             {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Icon className="w-3 h-3" />}

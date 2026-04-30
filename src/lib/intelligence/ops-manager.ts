@@ -573,6 +573,25 @@ export class OpsManager {
             });
         });
 
+        // Plan task 4: issue orchestrator. Disabled by default until Task 8
+        // smoke confirms safe behavior. Enable via:
+        //   ISSUE_ORCHESTRATOR_ENABLED=true
+        const orchestratorEnabled = (process.env.ISSUE_ORCHESTRATOR_ENABLED ?? "false").toLowerCase() === "true";
+        if (orchestratorEnabled) {
+            schedule("*/5 * * * *", () => {
+                this.safeRun("IssueOrchestrator", async () => {
+                    const { runIssueOrchestratorOnce } = await import("./issue-orchestrator");
+                    const summary = await runIssueOrchestratorOnce({ limit: 10 });
+                    if (summary.evaluated > 0) {
+                        console.log("[OpsManager] IssueOrchestrator:", summary);
+                    }
+                });
+            });
+            console.log("⚙️  IssueOrchestrator cron enabled (ISSUE_ORCHESTRATOR_ENABLED=true).");
+        } else {
+            console.log("⚙️  IssueOrchestrator cron skipped (ISSUE_ORCHESTRATOR_ENABLED unset/false).");
+        }
+
         console.log("✅ OpsManager background jobs registered.");
     }
 
