@@ -1,14 +1,29 @@
-# Aria — Current State as of merge `b16a60a` (2026-04-29 → 30)
+# Aria — Current State as of merge `b16a60a` + `feature/issue-orchestrator` (2026-04-29 → 30)
 
 > **Reference doc, not a plan.** This file used to be a forward-looking 4-phase plan written BEFORE Phases 2–4 landed. It now describes what's actually merged on `main` and what's still open. Update it when major work lands; otherwise let it serve as the canonical "where Aria stands" reference.
 
 **Last merge:** `b16a60a` (Merge `feature/agentic-issue-lifecycle-phase1` → `main`) on 2026-04-29.
 **Stabilization commit:** `ba4d9a7` (working-tree triage, hygiene).
+**Plan D Phase 3 (orchestrator runtime):** Tasks 0-8 of `docs/plans/2026-04-30-agentic-issue-orchestrator-control.md` landed on `feature/issue-orchestrator` — 8 commits, 16 test files green, 0 TS errors, env-gated by `ISSUE_ORCHESTRATOR_ENABLED` (default false).
 **Bot rev:** PID changes per restart; `pm2 status aria-bot` for current.
 
 ---
 
 ## What's now load-bearing on `main`
+
+### Issue Orchestrator Runtime (Plan D Phase 3 — landed 2026-04-30)
+
+Built per `docs/plans/2026-04-30-agentic-issue-orchestrator-control.md`:
+
+- **Issue control profile** (`src/lib/intelligence/issue-control.ts`) — typed `IssueControlMode` (`observe_only | suggest | act_with_approval | autonomous`) stored in `agent_issue.inputs.control` (no migration). `defaultIssueControlMode()` picks posture from blocker / owner / source.
+- **Issue state machine** (`src/lib/intelligence/issue-state-machine.ts`) — single `canTransitionIssue()` guard. Locks the projection guardrail explicitly (no projection → blocked, no projection out of blocked).
+- **Issue capabilities** (`src/lib/agents/issue-capabilities.ts`) — unified catalog of skills + playbooks + tools, scoped by handler.
+- **Issue orchestrator** (`src/lib/intelligence/issue-orchestrator.ts`) — env-gated cron (`ISSUE_ORCHESTRATOR_ENABLED`, default `false`). Single-flight, cap 10 issues/cycle. Mode-gated execution: `observe_only` writes proposal events; `suggest` patches `next_action`; `act_with_approval` creates tasks with NEEDS_APPROVAL; `autonomous` enqueues safe registered steps.
+- **Shared control actions** (`src/lib/intelligence/issue-control-actions.ts`) — `applyIssueControlAction()` is the one path Telegram + dashboard share for: `set_control_mode | assign_handler | pause | resume | set_blocker | clear_blocker | run_next_step | complete`.
+- **Telegram surface** — `/issues` rows include `· <mode>` and `· ⏸ paused` inline tags; new buttons: ⏸ Pause / ▶ Resume / ⚙ Run next.
+- **Dashboard surface** — `IssuesPanel` renders the same compact strip; no new heavy fetches; tabs stay mounted.
+
+**To enable in production:** set `ISSUE_ORCHESTRATOR_ENABLED=true` in `.env.local`, then `pm2 restart aria-bot --update-env`. Cron registry shows 22 entries with `IssueOrchestrator` listed.
 
 ### Issue Ledger (Plan D Phase 1 + Phase 2)
 
