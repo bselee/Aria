@@ -1,277 +1,156 @@
-# Aria — State & Path Forward (2026-04-29)
+# Aria — Current State as of merge `b16a60a` (2026-04-29 → 30)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` for the executable phases below. Steps use checkbox (`- [ ]`) syntax for tracking. **Read the entire State section before touching code.**
+> **Reference doc, not a plan.** This file used to be a forward-looking 4-phase plan written BEFORE Phases 2–4 landed. It now describes what's actually merged on `main` and what's still open. Update it when major work lands; otherwise let it serve as the canonical "where Aria stands" reference.
 
-**Goal:** Lock down the post-Phase-2 state of Aria and define the smallest path to make the system *feel* like an agentic operations company control plane (Paperclip-shaped) on a load-bearing kernel (AIOS-shaped). Stop adding new concepts; migrate existing primitives to be load-bearing; merge the in-flight branches; THEN consider new schema.
-
-**Architecture:**
-
-```
-Paperclip   ── operational surface — issues with goals, blockers, work products,
-                governance pipeline, per-agent budgets, activity audit, org chart UI
-   ⇕
-AIOS        ── kernel — Tool Registry · Memory Manager · Scheduler · Storage Manager
-                · Permission Gates (load-bearing, every external call routes through it)
-   ⇕
-Aria today  ── agent_task hub · agent_issue ledger · task_history · 12 ops panels ·
-                cron-registry · self-heal A/B/C · 5 vendor reconcilers · heartbeats
-```
-
-The foundation is real. The cutover is what's missing.
-
-**Tech Stack:** Next.js 15, TypeScript, Supabase (Postgres), Telegraf, Vitest, existing `command-board` + `agent-task` + `agent-issue` + `cron-registry` + `OpsManager` + `playbooks` infrastructure.
+**Last merge:** `b16a60a` (Merge `feature/agentic-issue-lifecycle-phase1` → `main`) on 2026-04-29.
+**Stabilization commit:** `ba4d9a7` (working-tree triage, hygiene).
+**Bot rev:** PID changes per restart; `pm2 status aria-bot` for current.
 
 ---
 
-## Non-Negotiable Guardrails
+## What's now load-bearing on `main`
 
-- **Stop adding new concepts.** Tool Registry, Memory Manager, Scheduler scaffolding all exist. Migrate existing call-sites through them; don't build a 5th abstraction.
-- **No new schema until existing JSONB outputs prove insufficient.** `agent_task.outputs`, `reconciliation_runs`, `documents`, `vendor_invoices` already act as work products. Promote them in the UI before adding `work_product` table.
-- **Branches first, code second.** 6 PR-ready branches contain ~13K LOC of unmerged real work. Land them before starting any new feature.
-- **`blocked` is reserved for true exhaustion.** Inherited from Phase 1. Projection cron must NOT mark issues blocked just because a task is FAILED.
-- **All hub writes are best-effort.** Inherited from agent-task.ts. A ledger failure must never block the spoke action.
-- **Every kernel call is audited.** `withToolAudit` must wrap every external API call once a subsystem is migrated. Per-call cost + duration + agent attribution lands in `task_history`.
-- **Telegram is the daily driver.** Dashboard is forensic — designed to drill in when something looks wrong, not to be a primary surface.
+### Issue Ledger (Plan D Phase 1 + Phase 2)
 
----
+`agent_issue` table is the parent operational unit. Tasks are steps under issues via `agent_task.issue_id`.
 
-## State Inventory (2026-04-29)
+- **Lifecycle:** `detected | triaging | working | waiting_external | blocked | complete`
+- **Autonomy:** `working | waiting | retrying | resolved | needs_policy`
+- **Blocker enum (13):** missing_receipt · po_not_found · vendor_mismatch · extraction_failed · policy_required · external_pending · duplicate_or_conflict · source_unavailable · auth_required · data_integrity_error · retry_exhausted · human_approval_required · unknown
+- **Lib:** `src/lib/intelligence/agent-issue.ts` — `createOrAdvance`, `recordHandoff`, `setBlocker`, `clearBlocker`, `complete`, `linkTask`, `getById`, `getBySource`, `getByBusinessFlowKey`, `getCurrentlyHandlingCounts`, `findLinkedOpenTask`, `listIssues`.
+- **Producers writing directly to issues:** AP-pipeline (`reconcileAndUpdate` per verdict; `storePendingApproval`; dropship FAILED), `task-actions.ts` cross-cutting linked-issue resolver (closing a task closes the issue too), dashboard reconciliation-action route.
+- **Projection cron** still runs as a backstop for legacy paths that haven't been migrated to direct issue writes.
+- **Behavioral guardrail:** `blocked` is reserved for explicit `setBlocker()` calls — projection NEVER sets blocked from FAILED status alone.
 
-### Shipped on `main` and live in production
+### AIOS-borrowed kernel
 
-| Layer | Implementation | Where |
-|---|---|---|
-| Control plane | `agent_task` hub w/ dedup, closure predicates, 14 migrations | `20260428_create_agent_task.sql` + follow-ons |
-| Issue ledger | `agent_issue` w/ lifecycle/blockers/handoffs/projection (Phase 1) | `20260509_create_agent_issue.sql` |
-| Issue ledger Phase 2 | AP pipeline writes issues directly; dashboard approve/dismiss/rematch wired | today's branch `feature/agentic-issue-lifecycle-phase1` |
-| Self-heal | Layers A (tripwires) + B (`playbook_kind/state`) + C (autonomous runner) | `20260507_*`, `20260508_*`, `playbooks/` module |
-| Vendor reconcilers | 5 reconcilers (ULINE, Axiom, TeraGanix, FedEx, AAA) two-phase ChangeSet validation + idempotency gate | recent feat commits |
-| Heartbeats | Per-agent staleness reporting | `20260417_create_agent_heartbeats.sql` |
-| Skills (DB) | DB-backed catalog | `20260417_create_skills.sql` |
-| Memories | Pinecone + DB recall | `20260421_create_memories.sql` + `pinecone.ts` |
-| Reconciliation runs | Per-run audit log | `20260423_reconciliation_runs.sql` |
-| FedEx Invoice API | Replaces CSV scraping | `feat(fedex): add FedEx Invoice API client` |
-| Telegram surface | `/issues`, `/blockers`, `/issue <id>`, `/tasks`, `/crons`, 13 BotFather-registered commands | `start-bot.ts` |
-| Dashboard | Module-tab full-canvas layout (today). 12 ops panels accessible. | `command-board/CommandBoardShell.tsx` |
-| Tool Registry (scaffold) | Typed registry + `withToolAudit` + `/api/command-board/tools`. **NOTHING ROUTES THROUGH IT YET.** | `src/lib/agents/tool-registry.ts` |
+- **Tool Registry** (`src/lib/agents/tool-registry.ts`) — typed `RegisteredTool` + `withToolAudit(name, ctx, args, fn)` + permission gates by `agentScope`. Catalog at `GET /api/command-board/tools`.
+- **Registered tools (28 across 6 categories — verified by 2026-04-30 smoke):** build (1), finale (11), gmail (7), memory (4), scraping (1), supabase (4). Finale + gmail writes scoped to specific agents.
+- **Memory Manager facade** (`src/lib/memory/index.ts`) — `memory.{put,get,query}(namespace, ...)` collapsing 4 backends (aria-memory, vendor-memory, kaizen-memory, dropship-memory). AP path migrated.
+- **Per-agent budgets** (`agent_budget` table; `src/lib/agents/budget.ts`) — `assertBudget(agent)` before LLM call; `chargeBudget` after. Calendar-month rollover. 14 agents seeded with caps. `unifiedTextGeneration` + `unifiedObjectGeneration` accept optional `agentId`.
+- **Audit:** every wrapped call writes `task_history` with `event_type='tool_call'`, agent, args summary, duration, success/failure.
+- **Coverage caveat:** Phase 2 migrated AP-pipeline Finale write path + the bill.com forward Gmail send. **Other call sites (most of `ap-agent.ts` Gmail calls, all reconciler scripts in `src/cli/reconcile-*.ts`, copilot core, dashboard routes) still call APIs directly.** This is intentional — migration is incremental. See "Open migration debt" below.
 
-### In-flight on origin (PR-ready, awaiting review)
+### Telegram surface
 
-| Branch | LOC | Risk | Verdict |
-|---|---:|---|---|
-| `feature/slack-request-tracking` | +3129 | High conflict | Land first — Finale write hardening + AP recon surgical updates |
-| `po-lifecycle-evidence` | +1950 | High conflict | Land second — PO lifecycle evidence chain |
-| `feature/bill-selee-email-overwatch` | +1628 | Low conflict | Land third — net-new outbox monitor agent |
-| `feature/uline-friday-flow` | +2153 | Medium conflict | Review for merge — Stagehand+BrowserManager hybrid |
-| `feature/purchasing-data-fixes` | +1104 | Medium conflict | Review for merge — line-aware multi-line PO receipts |
-| `feature/build-demand-oracle` | +700 | High (cherry-pick failed) | Cherry-pick by hand or close |
+- `/issues` — blocking-first list with inline ✅ Approve / ❌ Reject / ✓ Resolve / 🔍 Detail buttons.
+- `/blockers` — blocked subset.
+- `/issue <id>` — detail timeline, linked tasks, blocker reason, next action.
+- `/tasks` — task hub (approval surface preserved for muscle memory).
+- BotFather command list published at boot — autocomplete dropdown.
+- Issue-action handlers route through `findLinkedOpenTask` → `approveTask` (so AP-source flows hit reconciler) or directly via `clearBlocker`+`complete` for blocked-non-approval issues.
 
-### Deleted in cleanup pass
+### Dashboard
 
-13 branches (7 already merged, 4 superseded duplicates, 1 prototype, 1 stale refactor).
+- Module-tab shell: **Blocking Me** (default IssuesPanel) · AP · Receivings · Ordering · Tracking · Build Risk · Build Schedule · Statement Recon · Active POs · Tasks · Oversight · Activity.
+- All 12 ops panels render full-canvas; tabs stay mounted after first visit (instant switching once JIT compile lands).
+- Right rail killed (agent tree was display-only — didn't earn the space).
+- `POST /api/command-board/issues/[id]/actions` — issue-level approve/reject/resolve.
+- **Status:** dashboard is **forensic only** — Will reports it occasionally crashes Chrome under heavy use. Do NOT promote it back to operational primary until profiled in isolation.
 
-### Not built yet
+### Paid-invoice pipeline (`default-inbox-invoice.ts`)
 
-- Per-agent USD/token budget enforcement (LLM tier routing exists, no hard-stop)
-- Memory Manager facade (4 fragmented patterns: Pinecone direct, vendor-memory, kaizen, dropship-store)
-- Scheduler dispatch w/ budget gates (each cron calls its own logic)
-- Multi-stage governance pipeline (current: 1-stage approve/reject)
-- Goal/project hierarchy
-- Per-issue cost-to-date
+- Multi-strategy PO correlation: `exact → sku-overlap → amount-proximity → vendor-recent → create-draft`.
+- `resolveFinalePo` shared helper — parens / digits-only / adjacent-digit-swap variants + vendor-name disambiguation.
+- `correlatePo` returns `{orderId, strategy, confidence, note, candidate}`.
+- `FinaleClient.listRecentPosByVendor` for vendor-name-fuzzy correlation.
+- No-PO# early gate REMOVED. Haiku always runs. Job Name field added to schema + prompt.
+- Axiom-aware enrichment: post-Haiku, when fromEmail/vendorName matches Axiom, fills `finaleSku` from the static `AXIOM_TO_FINALE` map.
+- Telegram alerts on every non-exact correlation ("🔍 Fallback Correlation Used") so Will can audit before changes apply.
 
----
+### Self-heal (Layers A/B/C)
 
-## Scope
+Pre-existing on main; Layer A tripwires + Layer B `playbook_kind/state` + Layer C autonomous playbook runner. No changes in this batch.
 
-**In scope (this plan):**
+### Reconcilers
 
-- Phase 1 — Land the 6 PR-ready branches (or formally close them). No new code.
-- Phase 2 — Make the Tool Registry load-bearing for the AP pipeline. Migration only; no new tools.
-- Phase 3 — Memory Manager facade. Collapse 4 patterns into 1. Migrate AP pipeline first.
-- Phase 4 — Per-agent budget enforcement. Small schema add + LLM tier routing wire-up.
-
-**Out of scope:**
-
-- New schema for goals/projects/work-products until JSONB outputs prove inadequate.
-- Dashboard redesign beyond today's tab cutover.
-- Heartbeat queue rewrite (Paperclip's wakeup-queue pattern). Crons work; revisit only after budgets exist.
-- Multi-stage governance — single-stage approve/reject covers AP and dashboard today.
+Pre-existing two-phase ChangeSet validation + idempotency gate via `lookupVendorInvoices` for ULINE / Axiom / TeraGanix / FedEx / AAA. FedEx Invoice API client replaces CSV scraping. No changes in this batch.
 
 ---
 
-## Preflight
+## Migrations live on production DB
 
-```bash
-# Confirm we're on the post-cutover branch with all of today's work.
-git log --oneline -1                # expect: 23f28fb or later
-
-# Confirm bot is healthy.
-pm2 status aria-bot                 # expect: online, recent uptime
-
-# Confirm DATABASE_URL works.
-node -e "require('dotenv').config({path:'.env.local'}); console.log(Boolean(process.env.DATABASE_URL))"
-
-# Confirm dashboard boots clean.
-NODE_OPTIONS='--max-old-space-size=12288 --dns-result-order=ipv4first' npx next dev -p 3001
-# Expect: Ready in <15s
-```
-
-All four green before starting any phase.
-
----
-
-## File Structure
-
-| Path | Responsibility |
+| Migration | What it adds |
 |---|---|
-| (Phase 1) | Branch merges happen via GitHub PR review. No new files. |
-| `src/lib/agents/tool-registry.ts` | (Phase 2) Already exists. Add per-call audit context to migrated callers. |
-| `src/lib/intelligence/ap-agent.ts` | (Phase 2) Wrap every Finale/Gmail/Pinecone call with `withToolAudit`. |
-| `src/lib/finale/reconciler.ts` | (Phase 2) Wrap every Finale write with `withToolAudit`. |
-| `src/lib/memory/index.ts` | (Phase 3) NEW — Memory Manager facade `memory.{put,get,query}(namespace, …)`. |
-| `src/lib/memory/types.ts` | (Phase 3) NEW — types + namespaces enum. |
-| `src/lib/memory/index.test.ts` | (Phase 3) NEW — unit tests. |
-| `supabase/migrations/20260510_create_agent_budget.sql` | (Phase 4) NEW — `agent_budget` table. |
-| `src/lib/agents/budget.ts` | (Phase 4) NEW — `checkBudget(agent)` + `chargeBudget(agent, usd)` helpers. |
-| `src/lib/intelligence/llm.ts` | (Phase 4) Hook `chargeBudget` into the unified generation path. |
+| `20260509_create_agent_issue.sql` | `agent_issue` table + `agent_task.issue_id` FK + `task_history.issue_id` |
+| `20260509b_task_history_issue_cascade.sql` | FK cascade so deleting an issue removes its events cleanly |
+| `20260510_create_agent_budget.sql` | Per-agent monthly USD/token caps + period rollover + 14 seeded agents |
+
+All three are additive — rollback drops the new artifacts without touching existing data.
 
 ---
 
-## Phase 1: Land the in-flight work (highest priority)
+## Open migration debt (NOT shipped — known + accepted)
 
-**Goal:** Reduce drift before adding anything new. Each PR review is independent.
+These are deliberate scope cuts. Don't treat any of them as broken; they're the natural expansion path.
 
-### Task 1.1 — Land `feature/slack-request-tracking` (Finale write hardening + AP recon surgical)
-
-- [ ] **Step 1.1.1:** Open PR: `gh pr create --base main --head feature/slack-request-tracking --title "feat: Finale write hardening + AP reconciliation surgical updates"`
-- [ ] **Step 1.1.2:** Conflict resolution against today's `feature/agentic-issue-lifecycle-phase1` work — focus on `reconciler.ts` and `client.ts` overlap.
-- [ ] **Step 1.1.3:** Verify the branch's `write-access.ts` gate doesn't break the dashboard purchasing flow (`/api/dashboard/purchasing/commit/route.ts` is the only allowed write path).
-- [ ] **Step 1.1.4:** Run `npm run typecheck:cli && npm test -- src/lib/finale/`. Both green.
-- [ ] **Step 1.1.5:** Merge.
-
-### Task 1.2 — Land `po-lifecycle-evidence` (PO lifecycle chain)
-
-- [ ] **Step 1.2.1:** Rebase onto main. Heavy conflict on `ops-manager.ts`, `tracking-agent.test.ts`, `calendar-lifecycle.ts`.
-- [ ] **Step 1.2.2:** The branch's `PurchasingCalendarStatus` enum must merge with current calendar logic, not replace.
-- [ ] **Step 1.2.3:** Open PR. Acceptance: PO lifecycle stage visible in `ActivePurchasesPanel` and `PurchasingCalendarPanel`.
-- [ ] **Step 1.2.4:** Merge.
-
-### Task 1.3 — Land `feature/bill-selee-email-overwatch` (outbox-monitor agent)
-
-- [ ] **Step 1.3.1:** Rebase onto main. Net-new files (`email-overwatch-agent.ts`, `email_overwatch_threads` migration); only minor conflicts on `ops-manager.ts` + `cron-registry.ts`.
-- [ ] **Step 1.3.2:** Verify the 9-state lifecycle (`po_sent_waiting_for_reply` → `closed_confident`) doesn't duplicate today's `agent_issue` lifecycle. They're complementary (outbox vs inbox).
-- [ ] **Step 1.3.3:** Migration applied via `_run_migration.js`.
-- [ ] **Step 1.3.4:** Merge.
-
-### Task 1.4 — Review and decide `feature/uline-friday-flow`, `feature/purchasing-data-fixes`, `feature/build-demand-oracle`
-
-- [ ] **Step 1.4.1:** For each branch, read the diff against main; either rebase + merge or close with a note in the PR.
-- [ ] **Step 1.4.2:** `feature/build-demand-oracle` cherry-pick attempt failed in this session — Will should rebase manually or close.
-
-**Acceptance for Phase 1:** Origin has main + the current Phase-2 branch + at most 1 in-flight branch. All others merged or closed.
+- **`ap-agent.ts` inline PO resolution (lines ~1100-1190)** still has its own copy of resolver logic. Should call shared `resolveFinalePo` to prevent drift. Low risk because both implementations work; high value to dedupe.
+- **LLM call-site `agentId` threading.** `unifiedTextGeneration` + `unifiedObjectGeneration` accept an optional `agentId` for budget gating + cost tracking. As of merge, NO call sites pass it — `agent_budget` shows $0.00 spent for all 14 agents because the gate is opt-in and unmigrated. Migration is per-call-site: add `agentId: HANDLER.X` to each `unifiedTextGeneration({...})` invocation. Smoke ran 2026-04-30 confirms the schema and library work; coverage is the gap.
+- **Tool Registry coverage gaps:** every Finale write inside AP path is audited. Reads, gmail label-modify, copilot tool calls, reconciler script calls, dashboard direct API calls — most of these still bypass the registry. Migrate as files are touched.
+- **Memory Manager coverage gaps:** AP `recall()` migrated. Other call sites of `remember()` / `recall()` / `getVendorPattern()` / `storeVendorPattern()` / `kaizen-memory` / `dropship-store` still import directly.
+- **Step 3 of PO lifecycle (auto-push order to vendor site):** ULINE has PR #14 (`feature/uline-friday-flow`, Stagehand+BrowserManager hybrid) awaiting merge. Axiom is open — would use existing `src/lib/axiom/client.ts` REST infrastructure.
+- **Step 5-7 (acknowledged → shipped → received) lifecycle states:** PR #12 (`po-lifecycle-evidence`) makes these first-class on the PO entity.
+- **Large-item anomaly check at ordering time:** flag draft POs that order >N× median for SKU/vendor (International Molasses pattern).
 
 ---
 
-## Phase 2: Tool Registry becomes load-bearing for AP pipeline
+## 6 PR-ready branches awaiting review
 
-**Goal:** Every external call in the AP pipeline routes through the registry with audit + cost attribution. Pattern proven on one subsystem before expanding.
+All pushed to origin. None merged yet. Conflict markers measured 2026-04-30 against new main (`b16a60a`).
 
-### Task 2.1 — Migrate AP pipeline Finale calls
+| PR | Branch | LOC | Conflict markers vs new main | Action |
+|---|---|---:|---:|---|
+| #14 | `feature/uline-friday-flow` | +2153 | **0** | Clean rebase. After e2e test, merge first. |
+| #16 | `feature/build-demand-oracle` | +700 | 4 | Manual rebase; prefer cherry-pick of fixes |
+| #15 | `feature/purchasing-data-fixes` | +1104 | 5 | Manual rebase |
+| #13 | `feature/bill-selee-email-overwatch` | +1628 | 5 | Manual rebase, mostly net-new files |
+| #11 | `feature/slack-request-tracking` | +3129 | 13 | Painful — overlaps reconciler/Finale write paths |
+| #12 | `po-lifecycle-evidence` | +1950 | 25 | Hardest — 8/10 files conflict (purchasing + ops-manager) |
 
-- [ ] **Step 2.1.1:** Audit all `FinaleClient` instantiations + method calls in `src/lib/intelligence/ap-agent.ts` and `src/lib/finale/reconciler.ts`.
-- [ ] **Step 2.1.2:** Register each Finale method used by AP as a tool: `finale_lookup_product`, `finale_get_order_summary`, `finale_update_order_item_price`, `finale_add_order_adjustment`, `finale_update_order_status`. Categories: `finale`. Scope: mostly `read` except the three writes which are `write` with `agentScope: ["ap-reconciler"]`.
-- [ ] **Step 2.1.3:** Replace direct calls with `withToolAudit("tool_name", ctx, args, () => finaleClient.method(...))` where `ctx = { agent: HANDLER.AP_RECONCILER, issueId }`.
-- [ ] **Step 2.1.4:** Verify `task_history` rows now appear with `event_type='tool_call'` and `task_type='tool_call'` after each AP poll cycle.
-- [ ] **Step 2.1.5:** Add to `/api/command-board/issues/[id]` detail response: tool-call count + total duration so the issue timeline shows "AP-Reconciler called lookup_product 3 times (842ms)".
-
-### Task 2.2 — Migrate Gmail calls
-
-- [ ] **Step 2.2.1:** Same pattern for `gmail.users.messages.list/get/modify` in `ap-agent.ts`.
-- [ ] **Step 2.2.2:** Register: `gmail_search`, `gmail_get_message`, `gmail_modify_labels`, `gmail_send`. All scope `read` except `gmail_modify_labels` (`write`) and `gmail_send` (`write` with strict agent scope).
-
-### Task 2.3 — Tests
-
-- [ ] **Step 2.3.1:** Update `ap-agent.test.ts` to mock through the registry.
-- [ ] **Step 2.3.2:** Add a test that asserts every external call in a single AP poll cycle produces an audit row.
-
-**Acceptance for Phase 2:** Single AP poll cycle generates 5–15 audit rows in `task_history`. Issue timeline shows tool-call line items.
+Suggested order: `#14 → #16 → #13 → #15 → #11 → #12` (clean → painful).
 
 ---
 
-## Phase 3: Memory Manager facade
+## Operational dos and don'ts
 
-**Goal:** Collapse 4 fragmented memory patterns (Pinecone direct, vendor-memory, kaizen, dropship-store) into one API. Backward compatibility — old call sites keep working until migrated.
+**DO:**
+- Use Telegram + APIs as the daily driver.
+- Restart `pm2 restart aria-bot --update-env` after any kernel/migration change.
+- Watch for "🔍 Fallback Correlation Used" alerts in Telegram — confirm before assuming the auto-applied changes are right.
+- Treat the dashboard as a **forensic surface** — open it when you need to drill into a specific issue/PO; don't park on it.
 
-### Task 3.1 — Build the facade
-
-- [ ] **Step 3.1.1:** Write `src/lib/memory/index.ts` with `memory.put(namespace, key, value, opts?)`, `memory.get(namespace, key)`, `memory.query(namespace, text, opts?)`. Namespaces: `aria-memory`, `vendor-memory`, `kaizen-memory`, `dropship-memory`, `email-context`.
-- [ ] **Step 3.1.2:** Backend dispatches per-namespace to existing implementations under the hood. No data migration.
-- [ ] **Step 3.1.3:** Tests with mocked Pinecone client.
-
-### Task 3.2 — Migrate AP pipeline calls
-
-- [ ] **Step 3.2.1:** `ap-agent.ts` `recall(...)` calls → `memory.query("aria-memory", ...)`.
-- [ ] **Step 3.2.2:** `reconciler.ts` `remember(...)` calls → `memory.put("aria-memory", ...)`.
-- [ ] **Step 3.2.3:** `vendor-memory.ts` callers in AP path → `memory.{get,put}("vendor-memory", ...)`.
-
-### Task 3.3 — Audit
-
-- [ ] **Step 3.3.1:** Wrap memory calls with `withToolAudit` (same as Phase 2 pattern). Memory ops are tools too.
-
-**Acceptance for Phase 3:** AP pipeline imports only `memory` from `@/lib/memory` — no direct `pinecone`, `vendor-memory`, or `kaizen` imports remain in `ap-agent.ts` / `reconciler.ts`.
+**DON'T:**
+- Add new architecture before the open migration debt above is reduced.
+- Add new dashboard panels until the Chrome-crash issue is profiled.
+- Delete the `aria-review` worktree at `C:/Users/BuildASoil/Documents/Projects/aria-review` — Will uses it.
+- Push to `.github/workflows/` from this assistant's token (lacks `workflow` scope) — those changes need Will's hand.
 
 ---
 
-## Phase 4: Per-agent budget enforcement
+## Recommended next sequence (post-stabilization)
 
-**Goal:** Each agent has a monthly USD cap. Exceeding pauses the agent's LLM calls until next billing cycle.
+Per the 2026-04-30 code review (treat that critique as the active plan):
 
-### Task 4.1 — Schema
-
-- [ ] **Step 4.1.1:** Migration: `agent_budget` table with `agent_id`, `monthly_usd_cap`, `monthly_token_cap`, `current_period_start`, `current_period_usd_spent`, `current_period_tokens_spent`, `paused_until`. Backfill defaults.
-- [ ] **Step 4.1.2:** Apply via `_run_migration.js`.
-
-### Task 4.2 — Library
-
-- [ ] **Step 4.2.1:** `src/lib/agents/budget.ts` with `checkBudget(agentId): Promise<{allowed: boolean, reason?: string}>` and `chargeBudget(agentId, usd, tokens, model)`.
-- [ ] **Step 4.2.2:** Period roll-over logic (calendar month).
-- [ ] **Step 4.2.3:** Tests.
-
-### Task 4.3 — Wire into LLM tier routing
-
-- [ ] **Step 4.3.1:** `src/lib/intelligence/llm.ts` `unifiedTextGeneration` / `unifiedObjectGeneration` accept an `agentId` parameter. Before each call, `await checkBudget(agentId)`. After successful call, `chargeBudget(agentId, usd, tokens, model)`.
-- [ ] **Step 4.3.2:** Migrate all callers to pass an `agentId`. Default to `"unspecified"` for un-migrated paths so nothing breaks.
-- [ ] **Step 4.3.3:** When budget hits, throw a typed `BudgetExceededError` that callers catch and gracefully degrade (skip non-essential LLM steps, use cached responses, etc.).
-
-### Task 4.4 — Surface in dashboard
-
-- [ ] **Step 4.4.1:** Add per-agent budget bars to the `/api/command-board/agents` response (current_period_usd_spent / monthly_usd_cap).
-- [ ] **Step 4.4.2:** When you eventually add the agent rail back to the dashboard, this is what justifies it.
-
-**Acceptance for Phase 4:** Hitting an agent's budget cap pauses its LLM calls. Visible in `agent_budget` table and via the agents API.
+1. **Triage 6 PR-ready branches** against new main. Each is a real PR review; some may be cherry-picks instead of full merges.
+2. **Migrate `ap-agent.ts` inline PO resolver** to shared `resolveFinalePo`. Smallest ROI but closes the drift.
+3. **Auto-push order to Axiom** (REST API; `axiom/client.ts` infrastructure already in place). Tests step 3 of the PO lifecycle for one vendor.
+4. **PR #14 ULINE e2e test** — confirms Will's "works well, needs e2e".
+5. **Large-item anomaly** — flag at draft-PO creation time, Telegram-confirm before commit.
+6. **Audit coverage check** — sweep src/ for direct `gmail.users.*` / `client.<finale_method>` calls that aren't `withToolAudit`-wrapped, log as migration backlog.
 
 ---
 
-## What Phase 5+ might look like (NOT scoped here)
+## Decision log
 
-- Multi-stage governance pipeline on `agent_task` (review → approve → execute) for high-risk writes.
-- `work_product` table once JSONB outputs prove insufficient.
-- `goal` / `project` hierarchy if BuildASoil grows to multi-business operations.
-- Heartbeat wakeup-queue rewrite (Paperclip pattern).
-- Dashboard redesign with org chart + budget bars + per-agent drill-in.
-
-These are reconsidered after Phases 1–4 land. Don't scope them now.
-
----
-
-## Decision Log
-
-- **2026-04-29:** Branch cleanup pass — 16 origin branches → 9. Deleted 13 (merged or dead). Committed `chore: gitignore local noise (SQLite WAL + dev-server logs)` (`1dbbb80`). Untracked `aria-local.db-*` from git tracking (`23f28fb`).
-- **2026-04-29:** Dashboard cutover from 3-column grid + bottom dock → top-tab full-canvas layout (`eb8a99a` then `31de1c5`). Right-rail killed.
-- **2026-04-29:** AIOS-borrowed Tool Registry scaffold landed (`bb8cca6`). NOT load-bearing — Phase 2 of this plan migrates AP pipeline through it.
-- **2026-04-29:** Phase 2 of agentic issue lifecycle wired (`0401c33` → `8db1e43` → `7772c66` → `a75daa9` → `033695f`). Issue ledger now has direct AP writes.
-- **2026-04-28:** Phase 1 of agentic issue lifecycle merged via PR #10 (covers `agent_issue` table, projection cron, `/issues` Telegram).
+- **2026-04-29:** branch cleanup — 16 origin branches → 9. Deleted 13 (merged or dead).
+- **2026-04-29:** dashboard cutover — module-tab full-canvas; right rail killed.
+- **2026-04-29:** AIOS Tool Registry / Memory Manager facade / per-agent budgets all landed (commits 702aeb2, 4bc2c5e, 8d1de7a).
+- **2026-04-29:** AP-pipeline writes the issue ledger directly (Phase 2 of Plan D).
+- **2026-04-29:** paid-invoice pipeline rebuilt with multi-strategy PO correlation; Axiom Job Name → Finale SKU enrichment via static `AXIOM_TO_FINALE` map.
+- **2026-04-29:** merge to `main` — `b16a60a`, 27 commits.
+- **2026-04-30:** working-tree hygiene + this doc rewrite — `ba4d9a7`+.
+- **2026-04-30 smoke:** verified merge reachable in production via direct lib calls (no dashboard). Issue ledger reads return 50 issues (`will`-handler shows 3 blocked). Tool Registry has 28 tools across 6 categories. 14 agent budgets seeded at $0.00 spent. `task_history` has one real `ap-reconciler:finale_get_order_details` audit row — Phase 2 wiring confirmed firing. Smoke script: `node --import tsx src/cli/smoke-merged-state.ts`.
 
 ---
 
-**For future-me reading this:** if a new feature is being scoped, check this doc first. The answer is probably "land the in-flight branches and migrate the existing primitive through the kernel before adding anything new."
+**For future-me:** if you're scoping new work, look at the "Open migration debt" + "6 PR-ready branches" sections first. The default answer for "should I add a new abstraction here?" is "no — fold into an existing primitive or migrate something to use what's already there."
