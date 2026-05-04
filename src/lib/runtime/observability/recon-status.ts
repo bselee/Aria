@@ -233,6 +233,161 @@ function renderWindow(label: string, stats: WindowStats): string {
     return `${header}\n${lines.join("\n")}`;
 }
 
+// ── Anomaly detection ─────────────────────────────────────────────────────────
+
+export interface MissingVendorEntry {
+    vendorName: string;
+    lastSeenAt: string;  // ISO timestamp of most recent outcome row
+}
+
+/**
+ * Return vendors that had ≥1 reconciliation outcome in the last `historyDays`
+ * but ZERO in the last `recentDays` — meaning invoices went quiet unexpectedly.
+ *
+ * NULL vendor_name rows are excluded (no anomaly call for unknown vendors).
+ * Returned sorted most-stale first (oldest lastSeenAt first).
+ * NEVER throws.
+ */
+export async function getMissingVendorInvoices(opts?: {
+    historyDays?: number;
+    recentDays?: number;
+}): Promise<MissingVendorEntry[]> {
+    const historyDays = opts?.historyDays ?? 90;
+    const recentDays  = opts?.recentDays  ?? 14;
+
+    try {
+        const supabase = createClient();
+        if (!supabase) return [];
+
+        const now          = new Date();
+        const historyCutoff = new Date(now.getTime() - historyDays * 86_400_000).toISOString();
+        const recentCutoff  = new Date(now.getTime() - recentDays  * 86_400_000).toISOString();
+
+        // Fetch all outcomes in history window with non-null vendor_name
+        const { data, error } = await supabase
+            .from("reconciliation_outcomes")
+            .select("vendor_name, created_at")
+            .gte("created_at", historyCutoff)
+            .not("vendor_name", "is", null)
+            .order("created_at", { ascending: false });
+
+        if (error) {
+            console.warn(`[recon-status] getMissingVendorInvoices fetch failed: ${error.message}`);
+            return [];
+        }
+
+        if (!data || data.length === 0) return [];
+
+        // Group by vendor_name → find most recent created_at
+        const latestByVendor = new Map<string, string>();
+        for (const row of data as { vendor_name: string; created_at: string }[]) {
+            const existing = latestByVendor.get(row.vendor_name);
+            if (!existing || row.created_at > existing) {
+                latestByVendor.set(row.vendor_name, row.created_at);
+            }
+        }
+
+        // Filter to vendors whose most recent is older than recentDays
+        const stale: MissingVendorEntry[] = [];
+        for (const [vendorName, lastSeenAt] of latestByVendor.entries()) {
+            if (lastSeenAt < recentCutoff) {
+                stale.push({ vendorName, lastSeenAt });
+            }
+        }
+
+        // Sort most-stale first (oldest lastSeenAt first)
+        stale.sort((a, b) => a.lastSeenAt.localeCompare(b.lastSeenAt));
+        return stale;
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[recon-status] getMissingVendorInvoices unexpected error: ${msg}`);
+        return [];
+    }
+}
+
+// ── Morning digest block ──────────────────────────────────────────────────────
+
+/**
+ * Compose a condensed AP observability block for the 8:00 AM morning digest.
+ * NEVER throws — returns a graceful fallback string on any error.
+ *
+ * Format:
+ *   *🔍 AP yesterday (last 24h)*
+ *     ❌ match_failed: 3
+ *     ⏸ pending_approval: 2 (1 stale >24h)
+ *     ✅ auto_applied: 1
+ *
+ *   *Open approvals waiting:*  4 (2 stale >24h)
+ *
+ *   *Anomaly:* 5 vendors had no invoice in the last 14 days (expected ≥1):
+ *     Acme Co, Riceland, ULINE, FedEx, TeraGanix
+ */
+export async function formatMorningApBlock(): Promise<string> {
+    try {
+        const [status, missing] = await Promise.all([
+            getReconStatus(),
+            getMissingVendorInvoices(),
+        ]);
+
+        const parts: string[] = [];
+
+        // ── Section 1: AP yesterday (24h bucket) ──
+        const h24 = status.h24;
+        const h24Outcomes = (Object.entries(h24.counts) as [ReconciliationOutcome, number][])
+            .filter(([, cnt]) => cnt > 0)
+            .sort(([, a], [, b]) => b - a);
+
+        parts.push("*🔍 AP yesterday (last 24h)*");
+        if (h24Outcomes.length === 0) {
+            parts.push("  (quiet — no AP activity)");
+        } else {
+            for (const [outcome, cnt] of h24Outcomes) {
+                const emoji = OUTCOME_EMOJI[outcome] ?? "•";
+                let line = `  ${emoji} ${outcome}: ${cnt}`;
+                if (outcome === "pending_approval" && h24.stalePendingCount > 0) {
+                    line += ` (${h24.stalePendingCount} stale >24h)`;
+                }
+                parts.push(line);
+            }
+        }
+
+        // ── Section 2: Open approvals ──
+        const openCount = status.openPendingApprovals.length;
+        if (openCount > 0) {
+            const now = new Date(status.asOf);
+            const staleThreshold = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+            const staleCount = status.openPendingApprovals.filter(
+                r => new Date(r.createdAt) < staleThreshold
+            ).length;
+
+            parts.push("");
+            let approvalLine = `*Open approvals waiting:*  ${openCount}`;
+            if (staleCount > 0) {
+                approvalLine += ` (${staleCount} stale >24h)`;
+            }
+            parts.push(approvalLine);
+        }
+
+        // ── Section 3: Anomaly — missing vendor invoices ──
+        if (missing.length > 0) {
+            const top5 = missing.slice(0, 5);
+            const extraCount = missing.length - top5.length;
+            const vendorList = top5.map(v => v.vendorName).join(", ")
+                + (extraCount > 0 ? `, +${extraCount} more` : "");
+
+            parts.push("");
+            parts.push(`*Anomaly:* ${missing.length} vendor${missing.length !== 1 ? "s" : ""} had no invoice arrive in the last 14 days (expected ≥1):`);
+            parts.push(`  ${vendorList}`);
+        }
+
+        return parts.join("\n");
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[recon-status] formatMorningApBlock error: ${msg}`);
+        return "*🔍 AP block:* unavailable (will retry tomorrow)";
+    }
+}
+
 /**
  * Render the full /recon-status Markdown message from a ReconStatus snapshot.
  * Pure function — no I/O. Testable without a DB.
