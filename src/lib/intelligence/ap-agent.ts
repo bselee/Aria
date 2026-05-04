@@ -34,6 +34,7 @@ import { withToolAudit } from "../agents/tool-registry";
 import { ensureGmailToolsRegistered } from "../agents/register-gmail-tools";
 import { ensureMemoryToolsRegistered } from "../agents/register-memory-tools";
 import * as memory from "../memory";
+import { writeReconciliationOutcome } from "../runtime/observability/reconciliation-outcomes";
 
 /**
  * @file    ap-agent.ts
@@ -1362,6 +1363,19 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             outcome.state = "unmatched";
             outcome.error = "No Finale PO match found";
             outcome.success = true;
+            // Observability: structured outcome (additive — parallel to ap_activity_log; never throws)
+            writeReconciliationOutcome({
+                runId: crypto.randomUUID(),
+                outcome: "match_failed",
+                invoiceId: invoiceData.invoiceNumber ?? undefined,
+                vendorName: invoiceData.vendorName ?? undefined,
+                outcomeMeta: {
+                    match_source: matchSource,
+                    invoice_total: invoiceData.total,
+                    ocr_confidence: invoiceData.confidence,
+                },
+                resolvedAt: new Date(),
+            }).catch(() => { /* never throws — swallow silently */ });
             return outcome;
 
         } catch (err: any) {
@@ -1728,6 +1742,22 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         wrote_to_finale: wrote,
                     });
                 }
+                // Observability: structured outcome — additive, never throws
+                writeReconciliationOutcome({
+                    runId: crypto.randomUUID(),
+                    outcome: "auto_applied",
+                    invoiceId: result.invoiceNumber ?? undefined,
+                    poId: result.orderId ?? undefined,
+                    vendorName: result.vendorName ?? undefined,
+                    outcomeMeta: {
+                        total_dollar_impact: result.totalDollarImpact,
+                        price_change_count: result.priceChanges.length,
+                        fee_change_count: result.feeChanges.length,
+                        tracking_updated: !!result.trackingUpdate,
+                        force_approval_was_set: forceApproval,
+                    },
+                    resolvedAt: new Date(),
+                }).catch(() => { /* never throws */ });
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "needs_approval") {
@@ -1752,6 +1782,22 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         `Approve or dismiss in dashboard AP/Invoices panel ($${result.totalDollarImpact.toFixed(2)} impact)`,
                     );
                 }
+                // Observability: structured outcome — additive, never throws
+                writeReconciliationOutcome({
+                    runId: crypto.randomUUID(),
+                    outcome: "pending_approval",
+                    invoiceId: result.invoiceNumber ?? undefined,
+                    poId: result.orderId ?? undefined,
+                    vendorName: result.vendorName ?? undefined,
+                    outcomeMeta: {
+                        total_dollar_impact: result.totalDollarImpact,
+                        price_change_count: result.priceChanges.length,
+                        fee_change_count: result.feeChanges.length,
+                        force_approval_was_set: forceApproval,
+                        match_strategy: matchStrategy,
+                    },
+                    // resolvedAt intentionally omitted — pending until user decides
+                }).catch(() => { /* never throws */ });
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "rejected") {
@@ -1765,7 +1811,22 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         `≥10× price magnitude shift detected — investigate before applying ($${result.totalDollarImpact.toFixed(2)})`,
                     );
                 }
-                return { success: true, verdict: result.overallVerdict };
+                // Observability: structured outcome — additive, never throws
+                writeReconciliationOutcome({
+                    runId: crypto.randomUUID(),
+                    outcome: "rejected_10x",
+                    invoiceId: result.invoiceNumber ?? undefined,
+                    poId: result.orderId ?? undefined,
+                    vendorName: result.vendorName ?? undefined,
+                    outcomeMeta: {
+                        total_dollar_impact: result.totalDollarImpact,
+                        price_change_count: result.priceChanges.length,
+                        rejected_lines: result.priceChanges
+                            .filter(pc => pc.verdict === "rejected")
+                            .map(pc => ({ sku: pc.productId, po_price: pc.poPrice, invoice_price: pc.invoicePrice })),
+                    },
+                    resolvedAt: new Date(),
+                }).catch(() => { /* never throws */ });
 
             } else if (result.overallVerdict === "duplicate") {
                 // Already reconciled — alert Will but do NOT re-apply
