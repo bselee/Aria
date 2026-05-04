@@ -2093,6 +2093,21 @@ bot.on('text', async (ctx) => {
         }
     });
 
+    // ── AP RECONCILIATION STATUS ────────────────────────────────────────────────
+    // /recon-status — bucketed counts of AP reconciliation outcomes (24h / 7d / 30d)
+    // Read-only — no writes, no callbacks.
+    bot.command(['recon-status', 'reconstatus', 'recon'], async (ctx) => {
+        try {
+            const { getReconStatus, formatReconStatus } = await import('../lib/runtime/observability/recon-status');
+            const status = await getReconStatus();
+            const text = formatReconStatus(status);
+            await ctx.reply(text, { parse_mode: 'Markdown' });
+        } catch (err: any) {
+            console.error('[recon-status] error:', err.message);
+            await ctx.reply(`⚠️ /recon-status failed: ${err.message ?? String(err)}`);
+        }
+    });
+
     })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
