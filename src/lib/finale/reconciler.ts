@@ -529,6 +529,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
     }).catch(() => { /* non-blocking */ });
 
     // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
+    // runId: approvePendingReconciliation() has no ReconciliationRun in scope — random UUID is correct
     writeReconciliationOutcome({
         runId: crypto.randomUUID(),
         outcome: "approved_by_user",
@@ -692,6 +693,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
     }).catch(() => { /* non-blocking */ });
 
     // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
+    // runId: rejectPendingReconciliation() has no ReconciliationRun in scope — random UUID is correct
     writeReconciliationOutcome({
         runId: crypto.randomUUID(),
         outcome: "rejected_by_user",
