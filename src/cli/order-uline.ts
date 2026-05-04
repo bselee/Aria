@@ -319,32 +319,14 @@ export async function executeUlineFridayApproval(
 ): Promise<UlineOrderResult> {
     const finale = new FinaleClient();
 
-    // Phase 2: Create draft PO in Finale
+    // Phase 2: Draft PO creation — DISABLED (2026-05-11). Auto PO creation removed.
+    // Items must flow through approval before ordering.
     let updatedManifest = manifest;
     let finaleUrl: string | null = null;
-    try {
-        updatedManifest = await createFinaleDraftPO(finale, manifest);
-        if (updatedManifest.sourcePO) {
-            const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-            finaleUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${updatedManifest.sourcePO}`;
-        }
-    } catch (poErr: any) {
-        console.error('[uline-friday] PO creation failed:', poErr.message);
-        return {
-            success: false,
-            itemCount: manifest.items.length,
-            items: manifestItemsToResultItems(manifest.items),
-            estimatedTotal: manifest.totalEstimate,
-            finalePO: null,
-            finaleUrl: null,
-            cartResult: '',
-            cartVerificationStatus: 'unverified',
-            cartUrl: null,
-            priceUpdatesApplied: 0,
-            skippedLowVelocity: manifest.skippedLowVelocity?.length ?? 0,
-            error: `PO creation failed: ${poErr.message}`,
-        };
-    }
+    // try {
+    //     updatedManifest = await createFinaleDraftPO(finale, manifest);
+    //     ...
+    // } catch (poErr: any) { ... }
 
     // Check guardrails before touching the browser
     const blockingWarnings = getBlockingGuardrailWarnings(updatedManifest.items);
@@ -1235,18 +1217,14 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
             };
         }
 
-        // Phase 2: Create draft PO in Finale
+        // Phase 2: Draft PO creation — DISABLED (2026-05-11). Auto PO creation removed.
+        // Items must flow through approval before ordering.
         let updatedManifest = manifest;
         let finaleUrl: string | null = null;
-        try {
-            updatedManifest = await createFinaleDraftPO(finale, manifest);
-            if (updatedManifest.sourcePO) {
-                const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
-                finaleUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${updatedManifest.sourcePO}`;
-            }
-        } catch (poErr: any) {
-            console.error('[uline-friday] PO creation failed (proceeding with cart only):', poErr.message);
-        }
+        // try {
+        //     updatedManifest = await createFinaleDraftPO(finale, manifest);
+        //     ...
+        // } catch (poErr: any) { ... }
 
         const blockingWarnings = getBlockingGuardrailWarnings(updatedManifest.items);
         if (blockingWarnings.length > 0) {

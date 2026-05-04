@@ -705,26 +705,13 @@ export class SlackWatchdog {
                 }));
 
                 try {
-                    const result = await this.finaleClient.createDraftPurchaseOrder(
-                        vendorPartyId,
-                        lineItems,
-                        `Slack request from ${userName} in #${channelName}: ${items.map(d => d.sku).join(', ')}`,
-                    );
-
-                    console.log(`  📝 Draft PO #${result.orderId} created for ${vendorName} (${items.length} items)`);
-
-                    // Update PO status for the digest
+                    // DISABLED(2026-05-11): Auto PO creation removed — Slack requests must flow through approval.
+                    console.log(`  📝 Draft PO creation disabled — ${vendorName} Slack request flagged for manual review`);
                     for (const item of items) {
-                        skuPOStatus.set(item.sku.toLowerCase(), `🆕 Draft PO Created #${result.orderId}`);
+                        skuPOStatus.set(item.sku.toLowerCase(), `⏸️ Manual review required`);
                     }
-
-                    // Send immediate Telegram notification for draft PO creation
-                    await this.sendDraftPOCreatedToTelegram(
-                        result.orderId, result.finaleUrl, vendorName,
-                        items, userName, channelName,
-                    );
                 } catch (err: any) {
-                    console.error(`  ❌ Draft PO creation failed for ${vendorName}:`, err.message);
+                    console.error(`  ❌ Draft PO handling failed for ${vendorName}:`, err.message);
                     for (const item of items) {
                         skuPOStatus.set(item.sku.toLowerCase(), `❌ No PO (auto-create failed)`);
                     }

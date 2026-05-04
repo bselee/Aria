@@ -79,3 +79,30 @@ export async function writeReconciliationOutcome(write: OutcomeWrite): Promise<v
         console.warn(`[reconciliation-outcomes] unexpected error (${write.outcome}): ${msg}`);
     }
 }
+
+export async function resolvePendingReconciliationOutcomeBySource(input: {
+    sourceActivityLogId: string;
+    resolution: "approved_by_user" | "rejected_by_user" | "expired";
+    resolvedAt?: Date;
+}): Promise<void> {
+    try {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        const { error } = await supabase
+            .from("reconciliation_outcomes")
+            .update({
+                resolved_at: (input.resolvedAt ?? new Date()).toISOString(),
+            })
+            .eq("outcome", "pending_approval")
+            .contains("outcome_meta", { source_activity_log_id: input.sourceActivityLogId })
+            .is("resolved_at", null);
+
+        if (error) {
+            console.warn(`[reconciliation-outcomes] resolve pending failed (${input.sourceActivityLogId}): ${error.message}`);
+        }
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[reconciliation-outcomes] resolve pending unexpected error (${input.sourceActivityLogId}): ${msg}`);
+    }
+}

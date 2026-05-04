@@ -2,7 +2,7 @@
  * @file    nightshift-runner.ts
  * @purpose CLI entry point for the nightshift pre-classification loop.
  *          Runs one batch per cycle, sleeps POLL_MS between cycles.
- *          Starts llama-server externally (see scripts/start-nightshift.ps1).
+ *          Uses hosted Haiku; no local LLM service is required.
  *
  * Usage:
  *   node --import tsx src/cli/nightshift-runner.ts [--dry-run]
@@ -10,27 +10,20 @@
  * Env vars:
  *   NIGHTSHIFT_POLL_MS       — poll interval in ms (default: 300000 = 5 min)
  *   NIGHTSHIFT_BATCH_SIZE    — tasks per cycle (default: 30)
- *   NIGHTSHIFT_MAX_ESCALATIONS — haiku escalation cap (default: 20)
- *   LLAMA_SERVER_URL         — Ollama address (default: http://localhost:11434)
  */
 
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import os from "os";
 import { runNightshiftLoop } from "../lib/intelligence/nightshift-agent";
 
 const POLL_MS   = parseInt(process.env.NIGHTSHIFT_POLL_MS ?? String(5 * 60 * 1000));
 const DRY_RUN   = process.argv.includes("--dry-run");
-const LLAMA_URL = process.env.LLAMA_SERVER_URL ?? "http://localhost:11434";
 const BATCH     = parseInt(process.env.NIGHTSHIFT_BATCH_SIZE ?? "30");
-const ESCALATIONS = parseInt(process.env.NIGHTSHIFT_MAX_ESCALATIONS ?? "20");
 
 const pollMin   = (POLL_MS / 60_000).toFixed(0);
-const freeGb    = (os.freemem() / 1e9).toFixed(1);
 
-console.log(`[nightshift-runner] Starting (dry-run=${DRY_RUN}). Poll=${pollMin}m, batch=${BATCH}, maxEscalations=${ESCALATIONS}`);
-console.log(`[nightshift-runner] Llama: ${LLAMA_URL} | Free RAM: ${freeGb} GB`);
+console.log(`[nightshift-runner] Starting (dry-run=${DRY_RUN}). Poll=${pollMin}m, batch=${BATCH}, classifier=haiku`);
 
 let running = true;
 process.once("SIGTERM", () => {

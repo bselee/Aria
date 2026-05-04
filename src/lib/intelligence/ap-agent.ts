@@ -1765,7 +1765,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             } else if (result.overallVerdict === "needs_approval") {
                 // Enqueue for dashboard review instead of Telegram approval
                 const balanceCheck = validateInvoiceBalance(invoice);
-                await enqueueForDashboardReview(result, balanceCheck);
+                const dashboardReviewActivityLogId = await enqueueForDashboardReview(result, balanceCheck);
                 writeReconciliationMemory("dashboard_review");
                 await this.bot.telegram.sendMessage(
                     process.env.TELEGRAM_CHAT_ID!,
@@ -1798,6 +1798,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         fee_change_count: result.feeChanges.length,
                         force_approval_was_set: forceApproval,
                         match_strategy: matchStrategy,
+                        ...(dashboardReviewActivityLogId ? { source_activity_log_id: dashboardReviewActivityLogId } : {}),
                     },
                     // resolvedAt intentionally omitted — pending until user decides
                 }).catch(() => { /* never throws */ });

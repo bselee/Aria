@@ -1007,7 +1007,15 @@ export class OpsManager {
         // Sent first — before the rest of the daily summary body — so Will
         // sees yesterday's AP health at the top of the morning digest.
         try {
-            const { formatMorningApBlock } = await import("@/lib/runtime/observability/recon-status");
+            const reconStatusModule = await import("@/lib/runtime/observability/recon-status");
+            const reconStatusAny = reconStatusModule as any;
+            const formatMorningApBlock =
+                reconStatusModule.formatMorningApBlock ??
+                reconStatusAny.default?.formatMorningApBlock ??
+                reconStatusAny["module.exports"]?.formatMorningApBlock;
+            if (typeof formatMorningApBlock !== "function") {
+                throw new Error("formatMorningApBlock export unavailable");
+            }
             const apBlock = await formatMorningApBlock();
             const chatId = process.env.TELEGRAM_CHAT_ID || "";
             if (chatId) {

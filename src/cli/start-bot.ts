@@ -2098,7 +2098,19 @@ bot.on('text', async (ctx) => {
     // Read-only — no writes, no callbacks.
     bot.command(['recon-status', 'reconstatus', 'recon'], async (ctx) => {
         try {
-            const { getReconStatus, formatReconStatus } = await import('../lib/runtime/observability/recon-status');
+            const reconStatusModule = await import('../lib/runtime/observability/recon-status');
+            const reconStatusAny = reconStatusModule as any;
+            const getReconStatus =
+                reconStatusModule.getReconStatus ??
+                reconStatusAny.default?.getReconStatus ??
+                reconStatusAny["module.exports"]?.getReconStatus;
+            const formatReconStatus =
+                reconStatusModule.formatReconStatus ??
+                reconStatusAny.default?.formatReconStatus ??
+                reconStatusAny["module.exports"]?.formatReconStatus;
+            if (typeof getReconStatus !== "function" || typeof formatReconStatus !== "function") {
+                throw new Error("recon-status exports unavailable");
+            }
             const status = await getReconStatus();
             const text = formatReconStatus(status);
             await ctx.reply(text, { parse_mode: 'Markdown' });

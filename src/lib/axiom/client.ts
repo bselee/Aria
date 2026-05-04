@@ -435,61 +435,17 @@ export async function createDraftPOFromLatestInvoice(): Promise<AxiomPOResult> {
             return { success: false, error: 'Axiom Print vendor not found in Finale', logs };
         }
 
-        // DECISION(2026-03-23): No memo/privateNotes on POs — creates noise in Finale records.
-        const result = await finale.createDraftPurchaseOrder(vendorPartyId, items);
-        logs.push(`✅ Created draft PO #${result.orderId}`);
-
-        // 6. Add freight
-        if (invoice.shipping > 0) {
-            try {
-                await finale.addOrderAdjustment(
-                    result.orderId,
-                    'FREIGHT',
-                    invoice.shipping,
-                    `Freight - Axiom Print ${invoice.invoiceNumber}`
-                );
-                logs.push(`+ Freight: $${invoice.shipping.toFixed(2)}`);
-            } catch (e: any) {
-                logs.push(`⚠️ Freight failed: ${e.message}`);
-            }
-        }
-
-        // 7. Archive to vendor_invoices
-        try {
-            await upsertVendorInvoice({
-                vendor_name: 'Axiom Print',
-                invoice_number: invoice.invoiceNumber,
-                invoice_date: invoice.orderDate?.substring(0, 10) ?? null,
-                po_number: result.orderId,
-                subtotal: invoice.subtotal,
-                freight: invoice.shipping,
-                tax: invoice.tax,
-                total: invoice.total,
-                status: 'received',
-                source: 'axiom_api',
-                source_ref: `axiom-auto-${new Date().toISOString().split('T')[0]}`,
-                line_items: lineItemSummary.map(i => ({
-                    sku: i.sku,
-                    description: i.sku,
-                    qty: i.qty,
-                    unit_price: i.unitPrice,
-                    ext_price: i.qty * i.unitPrice,
-                })),
-                raw_data: invoice as unknown as Record<string, unknown>,
-            });
-        } catch { /* dedup collision or non-critical */ }
-
+        // DISABLED(2026-05-11): Auto PO creation removed — Axiom invoices must flow through approval.
+        // Previously auto-created a draft PO here via createDraftPurchaseOrder().
+        logs.push('📝 Draft PO creation disabled — Axiom invoice flagged for manual review');
         return {
             success: true,
-            orderId: result.orderId,
-            finaleUrl: result.finaleUrl,
+            orderId: 'MANUAL-REVIEW',
             invoiceNumber: invoice.invoiceNumber,
             total: invoice.total,
-            freight: invoice.shipping,
             lineItems: lineItemSummary,
             logs,
         };
-
     } catch (err: any) {
         if (browser) await browser.close().catch(() => {});
         return { success: false, error: err.message, logs };

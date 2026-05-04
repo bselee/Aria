@@ -647,7 +647,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     console.log(`     -> Forced PAID_INVOICE (regex heuristic match)`);
                 } else {
                     // DECISION(2026-03-24): Check nightshift pre-classification before paid LLM call.
-                    // If the local model classified this overnight with confidence >= 0.7, use it.
+                    // If nightshift classified this overnight with confidence >= 0.7, use it.
                     // Falls through to paid LLM on null return — zero risk to daytime AP flow.
                     const preClass = await getPreClassification(m.gmail_message_id).catch(() => null);
                     if (preClass) {
@@ -1296,9 +1296,6 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 } else {
                     console.warn(`     ⚠️ Could not find vendor party for "${extracted.vendorName}" — no draft PO created`);
                 }
-            } catch (draftErr: any) {
-                console.error(`     ❌ Draft PO creation failed:`, draftErr.message);
-            }
             } catch (draftErr: any) {
                 console.error(`     ❌ Draft PO creation failed:`, draftErr.message);
             }

@@ -3,8 +3,6 @@
 # Run ONCE as Administrator.
 #
 # Prerequisites:
-#   - Ollama installed and set to start with Windows (ollama.exe in PATH)
-#   - qwen2.5:1.5b pulled: ollama pull qwen2.5:1.5b
 #   - node + tsx available in PATH
 #
 # Tasks created:
@@ -109,9 +107,5 @@ Get-ScheduledTask -TaskPath $TaskPath | Select-Object TaskName, State | Format-T
 
 Write-Host ""
 Write-Host "Setup complete. Nightshift will:"
-Write-Host "  6:05 PM Mon-Fri — start nightshift-runner (uses Ollama qwen2.5:1.5b)"
+Write-Host "  6:05 PM Mon-Fri — start nightshift-runner (hosted Haiku classifier)"
 Write-Host "  7:00 AM Mon-Fri — stop nightshift-runner"
-Write-Host ""
-Write-Host "Verify Ollama is running and model is pulled:"
-Write-Host "  ollama list"
-Write-Host "  ollama pull qwen2.5:1.5b"

@@ -350,91 +350,10 @@ export class InlineInvoiceHandler {
                     }
 
                     if (vendorPartyId) {
-                        // Build line items from extracted invoice data
-                        const items: Array<{ productId: string; quantity: number; unitPrice: number }> = [];
-
-                        if (invoiceData.lineItems && invoiceData.lineItems.length > 0) {
-                            for (const li of invoiceData.lineItems) {
-                                // Use SKU if extracted, otherwise use description as product ID
-                                const productId = li.sku || li.description || 'UNKNOWN-ITEM';
-                                items.push({
-                                    productId,
-                                    quantity: li.qty || 1,
-                                    unitPrice: li.unitPrice || li.total || 0,
-                                });
-                            }
-                        } else {
-                            // Fallback: single line item at total minus freight
-                            items.push({
-                                productId: 'PLACEHOLDER-INLINE-INVOICE',
-                                quantity: 1,
-                                unitPrice: total - freight,
-                            });
-                        }
-
-                        const memo = [
-                            `[Aria] Auto-created from inline invoice email`,
-                            `Invoice: ${invoiceNumber}`,
-                            `Total: $${total.toFixed(2)}`,
-                            freight > 0 ? `Freight: $${freight.toFixed(2)}` : null,
-                            `Date: ${invoiceData.invoiceDate || 'unknown'}`,
-                            invoiceData.shipDate ? `Ship Date: ${invoiceData.shipDate}` : null,
-                            invoiceData.dueDate ? `Due Date: ${invoiceData.dueDate}` : null,
-                            invoiceData.paymentTerms ? `Terms: ${invoiceData.paymentTerms}` : null,
-                            invoiceData.trackingNumbers?.length
-                                ? `Tracking: ${invoiceData.trackingNumbers.join(', ')}`
-                                : null,
-                            `Source: ${fromEmail}`,
-                            `⚠️ DRAFT — verify SKUs and details before committing.`,
-                        ].filter(Boolean).join('\n');
-
-                        const result = await finale.createDraftPurchaseOrder(vendorPartyId, items, memo);
-                        draftInfo = { orderId: result.orderId, finaleUrl: result.finaleUrl };
-                        logs.push(`📝 Created draft PO #${result.orderId}`);
-
-                        // Add freight adjustment if shipping > 0
-                        if (freight > 0) {
-                            try {
-                                await finale.addOrderAdjustment(
-                                    result.orderId,
-                                    'FREIGHT',
-                                    freight,
-                                    `Freight - ${invoiceData.vendorName} ${invoiceNumber}`
-                                );
-                                logs.push(`+ Freight: $${freight.toFixed(2)}`);
-                            } catch (freightErr: any) {
-                                logs.push(`⚠️ Freight add failed: ${freightErr.message}`);
-                            }
-                        }
-
-                        // Archive to vendor_invoices table
-                        try {
-                            await upsertVendorInvoice({
-                                vendor_name: invoiceData.vendorName,
-                                invoice_number: invoiceNumber,
-                                invoice_date: invoiceData.invoiceDate || null,
-                                po_number: result.orderId,
-                                subtotal: invoiceData.subtotal || (total - freight),
-                                freight: freight,
-                                tax: invoiceData.tax || 0,
-                                total: total,
-                                status: 'received',
-                                source: 'email_inline',
-                                source_ref: `inline-invoice-${new Date().toISOString().split('T')[0]}`,
-                                line_items: (invoiceData.lineItems || []).map((li: any) => ({
-                                    sku: li.sku || li.description,
-                                    description: li.description,
-                                    qty: li.qty,
-                                    unit_price: li.unitPrice,
-                                    ext_price: li.total,
-                                })),
-                                raw_data: invoiceData as unknown as Record<string, unknown>,
-                            });
-                        } catch { /* dedup collision or non-critical */ }
-
-                        if (result.duplicateWarnings?.length > 0) {
-                            for (const w of result.duplicateWarnings) logs.push(w);
-                        }
+                        // DISABLED(2026-05-11): Auto PO creation removed — inline invoices must flow through approval.
+                        // Previously auto-created a draft PO with placeholder SKU(s) here.
+                        logs.push(`📝 Draft PO creation disabled — ${invoiceData.vendorName} invoice ${invoiceNumber} flagged for manual review`);
+                        draftInfo = { orderId: 'MANUAL-REVIEW', finaleUrl: '' };
                     } else {
                         logs.push(`⚠️ Could not find vendor party for "${invoiceData.vendorName}" — no draft PO created`);
                     }
@@ -464,7 +383,7 @@ export class InlineInvoiceHandler {
                         `<b>Matched:</b> PO #${matchedPO.orderId} ($${matchedPO.total.toFixed(2)}, ${matchedPO.status})`,
                         freight > 0 ? `<b>Freight:</b> $${freight.toFixed(2)}` : '',
                     ].filter(Boolean).join('\n');
-                } else if (draftInfo) {
+                } else if (draftInfo && draftInfo.orderId !== 'MANUAL-REVIEW') {
                     message = [
                         `📝 <b>Invoice → Draft PO Created</b>`,
                         ``,
@@ -475,6 +394,15 @@ export class InlineInvoiceHandler {
                         ``,
                         `📝 Draft PO #${draftInfo.orderId} — verify and commit`,
                         `<a href="${draftInfo.finaleUrl}">Open in Finale →</a>`,
+                    ].filter(Boolean).join('\n');
+                } else if (draftInfo) {
+                    message = [
+                        `📝 <b>Invoice — Manual Review Needed</b>`,
+                        ``,
+                        `<b>Vendor:</b> ${escHtml(invoiceData.vendorName)}`,
+                        `<b>Invoice:</b> ${escHtml(invoiceNumber)} — $${total.toFixed(2)}`,
+                        ``,
+                        `⏸️ Draft PO creation disabled — manual approval required.`,
                     ].filter(Boolean).join('\n');
                 } else {
                     message = [

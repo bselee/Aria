@@ -53,9 +53,6 @@ const COST_PER_1K_TOKENS: Record<string, number> = {
     "gemini-2.0-flash": 0.0003,
     // OpenRouter (varies, treat as average)
     "openrouter": 0.001,
-    // Ollama / local — free
-    "qwen2.5:1.5b": 0,
-    "qwen3:4b": 0,
 };
 
 export function estimateCostUsd(model: string, inputTokens: number, outputTokens: number): number {
