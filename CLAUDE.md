@@ -61,13 +61,11 @@ node --import tsx src/cli/verify-tools.ts
 node --import tsx src/cli/run-ap-pipeline.ts       # Manually trigger AP pipeline against real Gmail invoice
 node --import tsx src/test/test-ap-agent-live.ts   # Live AP agent test
 
-# Nightshift (local LLM overnight pre-classification)
+# Nightshift (hosted overnight pre-classification)
 node --import tsx src/cli/nightshift-runner.ts [--dry-run]   # Start overnight loop manually
-node --import tsx src/cli/test-ollama.ts [model] [think]     # Ollama classification smoke test
-node --import tsx src/cli/test-ollama-pdf.ts [model]         # Ollama PDF extraction capability test
 # Task Scheduler scripts (run as Admin once to register):
 #   scripts/setup-task-scheduler.ps1  → registers NightshiftStart (6:05 PM) + NightshiftStop (7 AM)
-#   scripts/start-nightshift.ps1      → starts runner (Ollama must be running)
+#   scripts/start-nightshift.ps1      → starts runner
 #   scripts/stop-nightshift.ps1       → kills runner by PID
 ```
 
@@ -166,7 +164,7 @@ Calendar auth is a **separate OAuth flow** from Gmail — it uses `GOOGLE_CLIENT
 | `src/lib/reconciliation/notifier.ts` | Telegram summary sender for reconciliation runs |
 | `src/lib/reconciliation/invariants.ts` | Hard-stop sanity checks: subtotal match, price reasonableness |
 | `src/lib/fedex/billing.ts` | FedEx Invoice Billing API client (spike — API does not exist, see note) |
-| `src/lib/intelligence/nightshift-agent.ts` | Overnight local LLM email pre-classifier. `enqueueEmailClassification()` → `nightshift_queue` table. `runNightshiftLoop()` uses Ollama qwen2.5:1.5b, escalates to Claude Haiku on low confidence. `getPreClassification()` called by ap-identifier before paid Sonnet classify. |
+| `src/lib/intelligence/nightshift-agent.ts` | Overnight hosted Haiku email pre-classifier. `enqueueEmailClassification()` → `nightshift_queue` table. `getPreClassification()` called by ap-identifier before paid Sonnet classify. |
 | `src/lib/intelligence/sandbox-watcher.ts` | Watches `~/OneDrive/Desktop/Sandbox/` for dropped files. PDFs → AP pipeline, TXT → LLM Q&A, CSV/XLSX → summarize, images → Supabase Storage. Processed files move to `processed/`, responses to `responses/`. |
 | `src/lib/intelligence/po-correlator.ts` | Cross-inbox correlation: reads outgoing PO emails from `bill.selee@buildasoil.com` (label:PO), correlates with incoming invoices, builds vendor communication profiles (saved to `vendor_profiles` table) |
 | `src/lib/github/client.ts` | GitHub integration via Octokit: creates issues for document discrepancies, syncs issue state to Supabase, processes PR PDF uploads. Env: `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO` |
@@ -311,24 +309,17 @@ Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `
 - `Every 15 min` — AP inbox invoice check
 - `Hourly` — Advertisement cleanup
 - `Every 30 min` — PO conversation sync
-- `6:00 PM Mon-Fri` — Nightshift enqueue: batches unprocessed AP emails into `nightshift_queue` for overnight local LLM classification
+- `6:00 PM Mon-Fri` — Nightshift enqueue: batches unprocessed AP emails into `nightshift_queue` for overnight hosted classification
 
 ### Nightshift System
-Overnight email pre-classification using **Ollama** (local, always-on) to skip paid LLM calls at the 8 AM AP poll.
-
-**Model:** `qwen2.5:1.5b` (default) — suitable for email intent classification only.
-
-**Capability assessment (benchmarked 2026-03-24):**
-- ✅ Email classification (INVOICE/ADVERTISEMENT/STATEMENT/HUMAN_INTERACTION): reliable, 2-7s/email
-- ✅ Handles messy OCR text (l/I/0/O confusion) well
-- ❌ PDF invoice data extraction (gleaning): NOT suitable — fails on complex fee structures (freight/fuel/tariff), returns null on statements. Full extraction stays on Claude Haiku / Sonnet.
+Overnight email pre-classification using hosted Claude Haiku. Local Ollama/Qwen paths are intentionally removed.
 
 **Flow:**
 1. 6 PM: ops-manager reads `email_inbox_queue` (unprocessed AP, last 3 days) → enqueues to `nightshift_queue`
-2. Overnight: nightshift-runner → qwen2.5:1.5b classifies → if confidence < 0.7, escalates to Claude Haiku (cap: 20/night)
+2. Overnight: nightshift-runner → Claude Haiku classifies pending tasks
 3. 8 AM: ap-identifier calls `getPreClassification()` — ADVERTISEMENT → archived + skipped (zero paid cost); others fall through to normal paid pipeline
 
-**Scripts:** `scripts/start-nightshift.ps1` (Ollama-aware, no llama-server needed), `scripts/stop-nightshift.ps1`, `scripts/setup-task-scheduler.ps1` (run once as Admin). Task Scheduler: NightshiftStart @ 6:05 PM, NightshiftStop @ 7:00 AM Mon-Fri.
+**Scripts:** `scripts/start-nightshift.ps1`, `scripts/stop-nightshift.ps1`, `scripts/setup-task-scheduler.ps1` (run once as Admin). Task Scheduler: NightshiftStart @ 6:05 PM, NightshiftStop @ 7:00 AM Mon-Fri.
 
 **Key files:** `src/lib/intelligence/nightshift-agent.ts`, `src/cli/nightshift-runner.ts`, `supabase/migrations/20260324_create_nightshift_queue.sql` (applied).
 

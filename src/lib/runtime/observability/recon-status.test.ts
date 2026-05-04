@@ -69,7 +69,7 @@ describe("formatReconStatus — outcome counts", () => {
             },
         });
         const out = formatReconStatus(status);
-        expect(out).toContain("match_failed: 3");
+        expect(out).toContain("`match_failed`: 3");
         expect(out).not.toContain("auto_applied");
     });
 
@@ -82,8 +82,8 @@ describe("formatReconStatus — outcome counts", () => {
             },
         });
         const out = formatReconStatus(status);
-        const matchIdx = out.indexOf("match_failed: 11");
-        const autoIdx  = out.indexOf("auto_applied: 4");
+        const matchIdx = out.indexOf("`match_failed`: 11");
+        const autoIdx  = out.indexOf("`auto_applied`: 4");
         expect(matchIdx).toBeLessThan(autoIdx);
     });
 
@@ -100,12 +100,12 @@ describe("formatReconStatus — outcome counts", () => {
             },
         });
         const out = formatReconStatus(status);
-        expect(out).toContain("✅ auto_applied");
-        expect(out).toContain("✅ approved_by_user");
-        expect(out).toContain("⏸ pending_approval");
-        expect(out).toContain("❌ match_failed");
-        expect(out).toContain("🛑 rejected_10x");
-        expect(out).toContain("⏰ expired");
+        expect(out).toContain("✅ `auto_applied`");
+        expect(out).toContain("✅ `approved_by_user`");
+        expect(out).toContain("⏸ `pending_approval`");
+        expect(out).toContain("❌ `match_failed`");
+        expect(out).toContain("🛑 `rejected_10x`");
+        expect(out).toContain("⏰ `expired`");
     });
 });
 
@@ -119,7 +119,7 @@ describe("formatReconStatus — stale pending detection", () => {
             },
         });
         const out = formatReconStatus(status);
-        expect(out).toContain("pending_approval: 3 (2 stale >24h)");
+        expect(out).toContain("`pending_approval`: 3 (2 stale >24h)");
     });
 
     it("omits stale suffix when stalePendingCount is 0", () => {
@@ -131,7 +131,7 @@ describe("formatReconStatus — stale pending detection", () => {
             },
         });
         const out = formatReconStatus(status);
-        expect(out).toContain("pending_approval: 2");
+        expect(out).toContain("`pending_approval`: 2");
         expect(out).not.toContain("stale");
     });
 });
@@ -229,8 +229,8 @@ describe("formatReconStatus — full realistic snapshot", () => {
         expect(out).toContain("*Last 24h:* 0 outcomes");
         expect(out).toContain("*Last 7d:* 5 outcomes");
         expect(out).toContain("*Last 30d:* 18 outcomes");
-        expect(out).toContain("pending_approval: 2 (1 stale >24h)");
-        expect(out).toContain("pending_approval: 2 (2 stale >24h)");
+        expect(out).toContain("`pending_approval`: 2 (1 stale >24h)");
+        expect(out).toContain("`pending_approval`: 2 (2 stale >24h)");
         expect(out).toContain("match\\-failed vendors");
         expect(out).toContain("Pending approvals (open now):");
         expect(out).toContain("PO 124302 — Riceland");

@@ -37,9 +37,6 @@ describe("estimateCostUsd", () => {
         expect(estimateCostUsd("unknown-model-xyz", 9999, 9999)).toBe(0);
     });
 
-    it("local Ollama models cost zero", () => {
-        expect(estimateCostUsd("qwen2.5:1.5b", 100000, 100000)).toBe(0);
-    });
 });
 
 describe("checkBudget", () => {

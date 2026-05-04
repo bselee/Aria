@@ -1,5 +1,6 @@
 # start-nightshift.ps1
 # Starts the nightshift-runner for overnight email pre-classification.
+# Uses hosted Haiku through the app runtime; no local LLM service is required.
 
 $ErrorActionPreference = "Stop"
 
@@ -23,10 +24,7 @@ function Write-LauncherLog {
 
 Write-LauncherLog "[nightshift-start] Launcher entered."
 
-$OllamaUrl = if ($env:LLAMA_SERVER_URL) { $env:LLAMA_SERVER_URL } else { "http://localhost:11434" }
-$ModelName = if ($env:LLAMA_MODEL_NAME) { $env:LLAMA_MODEL_NAME } else { "qwen3:4b" }
-
-Write-LauncherLog "[nightshift-start] Ollama: $OllamaUrl | Model: $ModelName"
+Write-LauncherLog "[nightshift-start] Classifier: hosted Haiku"
 
 $FreeRAM = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB
 $FreeGB = [math]::Round($FreeRAM / 1GB, 1)
@@ -34,33 +32,6 @@ if ($FreeRAM -lt 4GB) {
     Write-LauncherLog "[nightshift-start] WARN low RAM: ${FreeGB} GB free."
 } else {
     Write-LauncherLog "[nightshift-start] Free RAM OK: ${FreeGB} GB"
-}
-
-Write-LauncherLog "[nightshift-start] Checking Ollama health."
-try {
-    Invoke-RestMethod -Uri "$OllamaUrl/" -Method Get -TimeoutSec 5 -ErrorAction Stop | Out-Null
-    Write-LauncherLog "[nightshift-start] Ollama is running."
-} catch {
-    Write-LauncherLog "[nightshift-start] ERROR Ollama not reachable at $OllamaUrl. Aborting."
-    exit 1
-}
-
-Write-LauncherLog "[nightshift-start] Checking model availability: $ModelName"
-try {
-    $TagResp = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -Method Get -TimeoutSec 10 -ErrorAction Stop
-    $ModelAvailable = $TagResp.models | Where-Object { $_.name -eq $ModelName -or $_.model -eq $ModelName }
-    if (-not $ModelAvailable) {
-        Write-LauncherLog "[nightshift-start] Model '$ModelName' not found locally. Pulling now."
-        & ollama pull $ModelName
-        if ($LASTEXITCODE -ne 0) {
-            Write-LauncherLog "[nightshift-start] ERROR Failed to pull $ModelName. Aborting."
-            exit 1
-        }
-    } else {
-        Write-LauncherLog "[nightshift-start] Model '$ModelName' available."
-    }
-} catch {
-    Write-LauncherLog "[nightshift-start] WARN Could not verify model list: $($_.Exception.Message). Proceeding anyway."
 }
 
 if (Test-Path $PidFile) {

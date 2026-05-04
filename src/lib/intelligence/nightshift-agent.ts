@@ -1,6 +1,6 @@
 /**
  * @file    nightshift-agent.ts
- * @purpose Local LLM overnight email pre-classification using llama-server (Qwen).
+ * @purpose Overnight email pre-classification using hosted Haiku.
  *          Enqueues unprocessed AP emails at 6 PM, runs a classification loop
  *          overnight, and stores results in nightshift_queue for the 8 AM AP
  *          identifier to consume — skipping the paid Sonnet call when confident.
@@ -12,24 +12,15 @@
  * @created 2026-03-24
  */
 
-import os from "os";
 import { createClient } from "../supabase";
 import { recall } from "./memory";
 import { getAnthropicClient } from "../anthropic";
 
 // ── Constants (overridable via env) ──────────────────────────────────────────
 
-const LLAMA_URL              = process.env.LLAMA_SERVER_URL ?? "http://localhost:11434";  // Ollama default
-// DECISION(2026-03-25): Default to qwen3:4b for overnight runs. More capable
-// than qwen2.5:1.5b (~3.5 GB RAM) but fine overnight when Will isn't on the
-// machine. Qwen 2.5 locks the UI during daytime use; 3.4 runs unencumbered at night.
-const LLAMA_MODEL            = process.env.LLAMA_MODEL_NAME ?? "qwen3:4b";
 const CONFIDENCE_THRESHOLD   = 0.7;
 const BATCH_SIZE             = parseInt(process.env.NIGHTSHIFT_BATCH_SIZE ?? "30");
-const CALL_TIMEOUT_MS        = 30_000;
 const STALE_PROCESSING_MS    = 5 * 60 * 1000;
-const MAX_HAIKU_ESCALATIONS  = parseInt(process.env.NIGHTSHIFT_MAX_ESCALATIONS ?? "20");
-const MIN_FREE_RAM_BYTES     = 2 * 1024 * 1024 * 1024;  // 2 GB circuit breaker (overnight = plenty of headroom)
 
 const VALID_INTENTS = [
     "INVOICE",
@@ -106,38 +97,7 @@ function parseClassificationResponse(
     }
 }
 
-// ── Local LLM call ────────────────────────────────────────────────────────────
-
-async function callLocalLLM(prompt: string): Promise<NightshiftResult | null> {
-    try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
-
-        const resp = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            signal: controller.signal,
-            body: JSON.stringify({
-                model: LLAMA_MODEL,
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.1,
-                max_tokens: 200,
-            }),
-        });
-        clearTimeout(timer);
-
-        if (!resp.ok) return null;
-        const data = await resp.json() as any;
-        const text: string = data?.choices?.[0]?.message?.content ?? "";
-        if (!text) return null;
-
-        return parseClassificationResponse(text, "local");
-    } catch {
-        return null;
-    }
-}
-
-// ── Haiku escalation ──────────────────────────────────────────────────────────
+// ── Haiku classification ──────────────────────────────────────────────────────
 // DECISION(2026-03-24): Uses Anthropic SDK directly (not unifiedTextGeneration) to
 // guarantee Haiku 4.5 is used — unifiedTextGeneration has no model-override param and
 // would route to Gemini first. Direct SDK call ensures cost predictability.
@@ -159,21 +119,6 @@ async function callClaudeHaiku(prompt: string): Promise<NightshiftResult | null>
         return parseClassificationResponse(text, "claude-haiku");
     } catch {
         return null;
-    }
-}
-
-// ── llama-server health check ─────────────────────────────────────────────────
-
-async function checkLlamaHealth(): Promise<boolean> {
-    try {
-        // Ollama: GET / returns plain text "Ollama is running"
-        // llama-server: GET /health returns JSON with status field
-        const resp = await fetch(`${LLAMA_URL}/`, {
-            signal: AbortSignal.timeout(3000),
-        });
-        return resp.ok;
-    } catch {
-        return false;
     }
 }
 
@@ -287,20 +232,6 @@ export interface NightshiftLoopOpts {
  */
 export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<void> {
     const { dryRun = false } = opts;
-
-    // 1. RAM circuit breaker
-    const freeMem = os.freemem();
-    if (freeMem < MIN_FREE_RAM_BYTES) {
-        console.warn(`[nightshift] RAM circuit breaker: only ${(freeMem / 1e9).toFixed(1)} GB free — skipping cycle`);
-        return;
-    }
-
-    // 2. llama-server health check
-    const llamaOk = await checkLlamaHealth();
-    if (!llamaOk) {
-        console.warn(`[nightshift] llama-server not reachable at ${LLAMA_URL} — skipping cycle`);
-        return;
-    }
 
     const supabase = createClient();
     if (!supabase) {
@@ -430,63 +361,28 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
 
         const prompt = buildClassificationPrompt(from, subject, snippet, memoryContext);
 
-        // 6c/d. Try local LLM first
-        let result: NightshiftResult | null = await callLocalLLM(prompt);
-        let escalated = false;
+        const result = await callClaudeHaiku(prompt);
+        haikuCount++;
 
-        // 6e. Escalate to Haiku if local fails or low-confidence
-        if (!result || result.confidence < CONFIDENCE_THRESHOLD) {
-            const localConf = result?.confidence ?? null;
-            if (haikuCount >= MAX_HAIKU_ESCALATIONS) {
-                const reason = "haiku_budget_exceeded";
-                console.log(`[nightshift] gmail_id=${msgId} | FAILED: ${reason}`);
-                if (!dryRun) {
-                    await supabase
-                        .from("nightshift_queue")
-                        .update({
-                            status: "failed",
-                            error: reason,
-                            updated_at: new Date().toISOString(),
-                            processed_at: new Date().toISOString(),
-                        })
-                        .eq("id", id);
-                }
-                failedCount++;
-                continue;
+        if (!result) {
+            const reason = "haiku_failed";
+            console.log(`[nightshift] gmail_id=${msgId} | FAILED: ${reason}`);
+            if (!dryRun) {
+                await supabase
+                    .from("nightshift_queue")
+                    .update({
+                        status: "failed",
+                        error: reason,
+                        updated_at: new Date().toISOString(),
+                        processed_at: new Date().toISOString(),
+                    })
+                    .eq("id", id);
             }
-
-            const haikuResult = await callClaudeHaiku(prompt);
-            haikuCount++;
-            escalated = true;
-
-            if (!haikuResult) {
-                const reason = "all_models_failed";
-                console.log(`[nightshift] gmail_id=${msgId} | FAILED: ${reason}`);
-                if (!dryRun) {
-                    await supabase
-                        .from("nightshift_queue")
-                        .update({
-                            status: "failed",
-                            error: reason,
-                            updated_at: new Date().toISOString(),
-                            processed_at: new Date().toISOString(),
-                        })
-                        .eq("id", id);
-                }
-                failedCount++;
-                continue;
-            }
-
-            if (escalated && localConf !== null) {
-                console.log(`[nightshift] gmail_id=${msgId} | escalated→haiku (local conf=${localConf.toFixed(2)}) | ${haikuResult.classification} | conf=${haikuResult.confidence.toFixed(2)}`);
-            } else {
-                console.log(`[nightshift] gmail_id=${msgId} | escalated→haiku (local returned null) | ${haikuResult.classification} | conf=${haikuResult.confidence.toFixed(2)}`);
-            }
-            result = haikuResult;
-        } else {
-            console.log(`[nightshift] gmail_id=${msgId} | ${result.classification} | conf=${result.confidence.toFixed(2)} | handler=local`);
-            localCount++;
+            failedCount++;
+            continue;
         }
+
+        console.log(`[nightshift] gmail_id=${msgId} | ${result.classification} | conf=${result.confidence.toFixed(2)} | handler=haiku`);
 
         // 6f/g. Write result (or log-only in dry-run)
         if (dryRun) {
@@ -503,11 +399,6 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
                 })
                 .eq("id", id);
         }
-    }
-
-    // 7. Haiku budget warning
-    if (haikuCount >= MAX_HAIKU_ESCALATIONS) {
-        console.warn(`[nightshift] Haiku budget hit (${MAX_HAIKU_ESCALATIONS}) — local model may need attention`);
     }
 
     // 8. Delete expired rows
@@ -676,7 +567,7 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
         // Classification summary
         if (totalClassified > 0) {
             lines.push(`📧 <b>Email Pre-Classification:</b> ${totalClassified} emails`);
-            lines.push(`   🤖 Local (Qwen): ${localCount} | ☁️ Haiku: ${haikuCount}`);
+            lines.push(`   ☁️ Haiku: ${haikuCount}`);
             const clsLine = Object.entries(byClassification)
                 .map(([k, v]) => `${k}: ${v}`)
                 .join(", ");

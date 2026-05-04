@@ -126,3 +126,34 @@ describe("writeReconciliationOutcome", () => {
         );
     });
 });
+
+describe("resolvePendingReconciliationOutcomeBySource", () => {
+    it("updates only the pending outcome linked to the source activity log id", async () => {
+        const isMock = vi.fn().mockResolvedValue({ error: null });
+        const updateMock = vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+                contains: vi.fn().mockReturnValue({
+                    is: isMock,
+                }),
+            }),
+        });
+        const mockClient = {
+            from: vi.fn().mockReturnValue({ update: updateMock }),
+        };
+        mockCreateClient.mockReturnValue(mockClient as any);
+
+        const { resolvePendingReconciliationOutcomeBySource } = await import("./reconciliation-outcomes");
+        const resolvedAt = new Date("2026-05-04T12:00:00Z");
+
+        await resolvePendingReconciliationOutcomeBySource({
+            sourceActivityLogId: "activity-123",
+            resolution: "approved_by_user",
+            resolvedAt,
+        });
+
+        expect(mockClient.from).toHaveBeenCalledWith("reconciliation_outcomes");
+        expect(updateMock).toHaveBeenCalledWith({
+            resolved_at: "2026-05-04T12:00:00.000Z",
+        });
+    });
+});

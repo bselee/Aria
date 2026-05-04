@@ -20,6 +20,10 @@ import {
     ReconciliationResult,
 } from "@/lib/finale/reconciler";
 import * as apIssue from "@/lib/intelligence/ap-issue";
+import {
+    resolvePendingReconciliationOutcomeBySource,
+    writeReconciliationOutcome,
+} from "@/lib/runtime/observability/reconciliation-outcomes";
 
 type ActionRequest = {
     action: "approve" | "pause" | "dismiss" | "rematch";
@@ -145,6 +149,27 @@ export async function POST(req: Request) {
                 },
             }).eq("id", activityLogId);
 
+            await resolvePendingReconciliationOutcomeBySource({
+                sourceActivityLogId: activityLogId,
+                resolution: "approved_by_user",
+                resolvedAt: new Date(now),
+            });
+            await writeReconciliationOutcome({
+                runId: crypto.randomUUID(),
+                outcome: "approved_by_user",
+                invoiceId: reconResult.invoiceNumber ?? undefined,
+                poId: reconResult.orderId ?? undefined,
+                vendorName: reconResult.vendorName ?? undefined,
+                outcomeMeta: {
+                    source_activity_log_id: activityLogId,
+                    applied_count: applyResult.applied.length,
+                    skipped_count: applyResult.skipped.length,
+                    error_count: applyResult.errors.length,
+                    total_dollar_impact: reconResult.totalDollarImpact,
+                },
+                resolvedAt: new Date(now),
+            });
+
             // Write vendor_name to purchase_orders for future matching
             if (reconResult.vendorName && reconResult.orderId) {
                 await supabase.from("purchase_orders").upsert({
@@ -217,6 +242,24 @@ export async function POST(req: Request) {
                 reviewed_action: "dismissed",
                 dismiss_reason: dismissReason || null,
             }).eq("id", activityLogId);
+
+            await resolvePendingReconciliationOutcomeBySource({
+                sourceActivityLogId: activityLogId,
+                resolution: "rejected_by_user",
+                resolvedAt: new Date(now),
+            });
+            await writeReconciliationOutcome({
+                runId: crypto.randomUUID(),
+                outcome: "rejected_by_user",
+                invoiceId: metadata.invoiceNumber ?? undefined,
+                poId: metadata.orderId ?? undefined,
+                vendorName: metadata.vendorName ?? logEntry.email_from ?? undefined,
+                outcomeMeta: {
+                    source_activity_log_id: activityLogId,
+                    dismiss_reason: dismissReason ?? null,
+                },
+                resolvedAt: new Date(now),
+            });
 
             // Learn from dismissal — non-blocking
             writeDismissMemory(metadata, dismissReason || "unknown");

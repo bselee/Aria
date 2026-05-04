@@ -7,16 +7,37 @@ let cache: PurchasingGroup[] | null = null;
 let cacheAt = 0;
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 
+// Scan-in-progress lock: concurrent requests de-duplicate to the same promise.
+let cachePromise: Promise<PurchasingGroup[]> | null = null;
+
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
+    const urgency = req.nextUrl.searchParams.get('urgency');
     // ?daysBack=730 for 24-month deep-dive history search; default 365
     const daysBack = Math.min(730, Math.max(30, parseInt(req.nextUrl.searchParams.get('daysBack') ?? '365') || 365));
 
-    if (bust || !cache || Date.now() - cacheAt > CACHE_TTL) {
+    const needsScan = bust || !cache || Date.now() - cacheAt > CACHE_TTL;
+
+    if (needsScan) {
+        if (!cachePromise) {
+            cachePromise = (async () => {
+                try {
+                    const client = new FinaleClient();
+                    cache = await client.getPurchasingIntelligence(daysBack);
+                    cacheAt = Date.now();
+                    return cache;
+                } catch (err: any) {
+                    // Clear invalid cache so next request retries
+                    cache = null;
+                    cacheAt = 0;
+                    throw err;
+                } finally {
+                    cachePromise = null;
+                }
+            })();
+        }
         try {
-            const client = new FinaleClient();
-            cache = await client.getPurchasingIntelligence(daysBack);
-            cacheAt = Date.now();
+            await cachePromise;
         } catch (err: any) {
             return NextResponse.json(
                 { error: err.message },
@@ -25,8 +46,16 @@ export async function GET(req: NextRequest) {
         }
     }
 
-    const assessment = assessPurchasingGroups(cache);
-    const groups = assessment.groups.map(group => ({
+    let groups = cache || [];
+
+    // Filter down to requested urgency tier(s). Supports single value or comma-separated.
+    if (urgency) {
+        const allowed = urgency.split(',') as Array<'critical' | 'warning' | 'watch' | 'ok'>;
+        groups = groups.filter(g => allowed.includes(g.urgency));
+    }
+
+    const assessment = assessPurchasingGroups(groups);
+    const responseGroups = assessment.groups.map(group => ({
         vendorName: group.vendorName,
         vendorPartyId: group.vendorPartyId,
         urgency: group.urgency,
@@ -39,7 +68,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json(
         {
-            groups,
+            groups: responseGroups,
             cachedAt: new Date(cacheAt).toISOString(),
             vendorSummaries: assessment.vendorSummaries,
         },
@@ -48,6 +77,9 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+    // Dashboard click is Will's explicit, manual action — direct create.
+    // The approval gate exists for autonomous callers (bot tool, AP worker)
+    // via lib/command-board/po-approval-task → requestDraftPOApproval.
     try {
         const { vendorPartyId, items, memo, purchaseDestination } = await req.json();
 

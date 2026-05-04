@@ -2513,11 +2513,12 @@ export function buildReconciliationReport(
 export async function enqueueForDashboardReview(
     result: ReconciliationResult,
     balanceCheck: { valid: boolean; gap: number; message: string }
-): Promise<void> {
+): Promise<string | null> {
+    let activityLogId: string | null = null;
     try {
         const supabase = createClient();
         if (supabase) {
-            await supabase.from("ap_activity_log").insert({
+            const { data } = await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId} - Dashboard Review Required`,
                 intent: "RECONCILIATION",
@@ -2536,11 +2537,13 @@ export async function enqueueForDashboardReview(
                     notes: result.notes,
                 },
                 reconciliation_report: result.report,
-            });
+            }).select("id").maybeSingle();
+            activityLogId = data?.id ?? null;
         }
     } catch (err: any) {
         console.warn(`[reconciler] Failed to enqueue for dashboard review: ${err.message}`);
     }
+    return activityLogId;
 }
 
 // ──────────────────────────────────────────────────

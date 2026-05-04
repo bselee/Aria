@@ -49,7 +49,7 @@ export interface ReconStatus {
     d30: WindowStats;
     /** Top 5 vendors with match_failed in last 30d (empty if none). */
     topMatchFailedVendors: MatchFailedVendor[];
-    /** Open pending_approval rows (resolved_at IS NULL), oldest first, max 10. */
+    /** Open ap_pending_approvals rows, oldest first, max 10. */
     openPendingApprovals: PendingApprovalRow[];
     /** ISO timestamp when this snapshot was taken. */
     asOf: string;
@@ -97,17 +97,23 @@ async function fetchRows(cutoff: Date): Promise<OutcomeRow[]> {
     }
 }
 
-/** Fetch open pending_approval rows (resolved_at IS NULL), oldest first. */
+/**
+ * Fetch currently-open pending approvals from ap_pending_approvals.
+ * "Open" means status='pending' AND expires_at > now() — the same filter
+ * reconciler.ts uses for rehydration. Dashboard review rows are tracked in
+ * reconciliation_outcomes for outcome counts; this read model uses the durable
+ * approval table for the explicit "open approvals" list.
+ */
 async function fetchOpenPending(): Promise<PendingApprovalRow[]> {
     try {
         const supabase = createClient();
         if (!supabase) return [];
 
         const { data, error } = await supabase
-            .from("reconciliation_outcomes")
-            .select("po_id, vendor_name, created_at")
-            .eq("outcome", "pending_approval")
-            .is("resolved_at", null)
+            .from("ap_pending_approvals")
+            .select("order_id, vendor_name, created_at")
+            .eq("status", "pending")
+            .gt("expires_at", new Date().toISOString())
             .order("created_at", { ascending: true })
             .limit(10);
 
@@ -115,8 +121,8 @@ async function fetchOpenPending(): Promise<PendingApprovalRow[]> {
             console.warn(`[recon-status] open pending fetch failed: ${error.message}`);
             return [];
         }
-        return (data ?? []).map((r: { po_id: string | null; vendor_name: string | null; created_at: string }) => ({
-            poId: r.po_id,
+        return (data ?? []).map((r: { order_id: string | null; vendor_name: string | null; created_at: string }) => ({
+            poId: r.order_id,
             vendorName: r.vendor_name,
             createdAt: r.created_at,
         }));
@@ -223,7 +229,7 @@ function renderWindow(label: string, stats: WindowStats): string {
 
     const lines = sorted.map(([outcome, cnt]) => {
         const emoji = OUTCOME_EMOJI[outcome] ?? "•";
-        let line = `  ${emoji} ${outcome}: ${cnt}`;
+        let line = `  ${emoji} \`${outcome}\`: ${cnt}`;
         if (outcome === "pending_approval" && stats.stalePendingCount > 0) {
             line += ` (${stats.stalePendingCount} stale >24h)`;
         }
@@ -343,7 +349,7 @@ export async function formatMorningApBlock(): Promise<string> {
         } else {
             for (const [outcome, cnt] of h24Outcomes) {
                 const emoji = OUTCOME_EMOJI[outcome] ?? "•";
-                let line = `  ${emoji} ${outcome}: ${cnt}`;
+                let line = `  ${emoji} \`${outcome}\`: ${cnt}`;
                 if (outcome === "pending_approval" && h24.stalePendingCount > 0) {
                     line += ` (${h24.stalePendingCount} stale >24h)`;
                 }
