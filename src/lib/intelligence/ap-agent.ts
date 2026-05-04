@@ -1364,6 +1364,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             outcome.error = "No Finale PO match found";
             outcome.success = true;
             // Observability: structured outcome (additive — parallel to ap_activity_log; never throws)
+            // runId: no ReconciliationRun in scope here (AP pipeline path, not CLI reconciler) — random UUID is correct
             writeReconciliationOutcome({
                 runId: crypto.randomUUID(),
                 outcome: "match_failed",
@@ -1743,6 +1744,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     });
                 }
                 // Observability: structured outcome — additive, never throws
+                // runId: no ReconciliationRun in scope here (AP pipeline path, not CLI reconciler) — random UUID is correct
                 writeReconciliationOutcome({
                     runId: crypto.randomUUID(),
                     outcome: "auto_applied",
@@ -1783,6 +1785,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     );
                 }
                 // Observability: structured outcome — additive, never throws
+                // runId: no ReconciliationRun in scope here (AP pipeline path, not CLI reconciler) — random UUID is correct
                 writeReconciliationOutcome({
                     runId: crypto.randomUUID(),
                     outcome: "pending_approval",
@@ -1812,6 +1815,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     );
                 }
                 // Observability: structured outcome — additive, never throws
+                // runId: no ReconciliationRun in scope here (AP pipeline path, not CLI reconciler) — random UUID is correct
                 writeReconciliationOutcome({
                     runId: crypto.randomUUID(),
                     outcome: "rejected_10x",
@@ -1827,6 +1831,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     },
                     resolvedAt: new Date(),
                 }).catch(() => { /* never throws */ });
+
+                return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "duplicate") {
                 // Already reconciled — alert Will but do NOT re-apply
