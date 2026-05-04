@@ -115,7 +115,11 @@ async function fetchOpenPending(): Promise<PendingApprovalRow[]> {
             console.warn(`[recon-status] open pending fetch failed: ${error.message}`);
             return [];
         }
-        return (data as PendingApprovalRow[]) ?? [];
+        return (data ?? []).map((r: { po_id: string | null; vendor_name: string | null; created_at: string }) => ({
+            poId: r.po_id,
+            vendorName: r.vendor_name,
+            createdAt: r.created_at,
+        }));
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[recon-status] unexpected error (pending): ${msg}`);
