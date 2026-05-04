@@ -21,11 +21,15 @@ import { createClient } from "../lib/supabase";
 // ─── CLI flags ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
 const DRY_RUN = !args.includes("--live");
-const DAYS_BACK = (() => {
+let DAYS_BACK = (() => {
   const idx = args.indexOf("--days");
   if (idx !== -1 && args[idx + 1]) return parseInt(args[idx + 1], 10);
   return 90;
 })();
+if (isNaN(DAYS_BACK) || DAYS_BACK <= 0) {
+  console.error("Invalid --days value; must be a positive integer");
+  process.exit(1);
+}
 
 // ─── Outcome mapping ──────────────────────────────────────────────────────────
 //
@@ -151,7 +155,7 @@ async function main() {
   const skippedBreakdown: Record<string, number> = {};
 
   type OutcomeRow = {
-    run_id: string;
+    run_id: string; // UUID-formatted string; cast to UUID by Postgres on insert
     invoice_id: string | null;
     po_id: string | null;
     vendor_name: string | null;
@@ -293,10 +297,12 @@ async function main() {
   console.log(`\nInserted: ${insertedTotal} rows`);
 
   // ── 5. Sanity query ───────────────────────────────────────────────────────
+  // .limit(5000) — CLI sanity check ceiling; avoids full scan at scale
   const { data: summary, error: sumErr } = await supabase
     .from("reconciliation_outcomes")
     .select("outcome")
-    .order("outcome");
+    .order("outcome")
+    .limit(5000);
 
   if (sumErr) {
     console.error("ERROR reading sanity summary:", sumErr.message);
