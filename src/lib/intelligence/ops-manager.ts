@@ -662,7 +662,7 @@ export class OpsManager {
     }
 
     /**
-     * Enqueue work for Nightshift (local Ollama).
+     * Enqueue work for Nightshift hosted classification.
      */
     async enqueueNightshiftWork() {
         console.log("🌙 Enqueuing work for Nightshift...");
@@ -987,20 +987,38 @@ export class OpsManager {
      * - Monday: light, meaningful review of previous week
      * - Tuesday-Thursday: standard daily ops summary
      * - Friday: weekly wrap-up summary (WeeklySummary fires 1 min later for detailed version)
+     *
+     * Phase 1a Task 5: AP reconciliation observability block prepended to the digest.
      */
     async sendDailySummary() {
-        // STUB: Daily summary not yet implemented
         const dow = new Date().toLocaleString('en-US', { weekday: 'long', timeZone: 'America/Denver' });
         const isMonday = dow === 'Monday';
         const isFriday = dow === 'Friday';
 
         if (isMonday) {
-            console.log("📊 [STUB] Preparing Monday Previous-Week Review...");
+            console.log("📊 Preparing Monday Previous-Week Review...");
         } else if (isFriday) {
-            console.log("📊 [STUB] Preparing Friday Weekly Wrap...");
+            console.log("📊 Preparing Friday Weekly Wrap...");
         } else {
-            console.log("📊 [STUB] Preparing Daily PO Summary...");
+            console.log("📊 Preparing Daily PO Summary...");
         }
+
+        // Phase 1a Task 5: AP reconciliation observability block.
+        // Sent first — before the rest of the daily summary body — so Will
+        // sees yesterday's AP health at the top of the morning digest.
+        try {
+            const { formatMorningApBlock } = await import("@/lib/runtime/observability/recon-status");
+            const apBlock = await formatMorningApBlock();
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (chatId) {
+                await this.bot.telegram.sendMessage(chatId, apBlock, { parse_mode: "Markdown" });
+            }
+        } catch (err: any) {
+            console.warn("[OpsManager] AP morning block failed (non-fatal):", err.message);
+        }
+
+        // STUB: remainder of daily summary body not yet implemented
+        // (PO counts, invoice totals, build risk, etc. to be added in later tasks)
     }
 
     /**
