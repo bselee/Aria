@@ -2,23 +2,26 @@
  * Tests for recon-status formatter and helper logic.
  *
  * We test only the pure formatter — no live DB queries, no mocks needed.
- * vitest.config.ts sets globals: true so describe/it/expect are available
- * without an explicit import (matching the project's only passing test pattern).
+ * Supabase is mocked so the top-level import in recon-status.ts doesn't
+ * require env vars (same pattern as budget.test.ts).
  *
  * Phase 1a Task 4.
  */
 
-/* global describe, it, expect */
+import { describe, it, expect, vi } from "vitest";
 
-// ── Type-only import from the module under test ───────────────────────────────
-// We use a dynamic import inside each test to avoid triggering the @/lib/supabase
-// top-level import at module load time (Supabase env vars are absent in CI).
+// Mock Supabase so the module-level import in recon-status.ts doesn't fail
+// when SUPABASE_URL / SUPABASE_ANON_KEY are absent (CI / local no-env runs).
+vi.mock("@/lib/supabase", () => ({ createClient: () => null }));
+
+import { formatReconStatus } from "./recon-status";
+import type { ReconStatus } from "./recon-status";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
 /** Return a zeroed ReconStatus shape for tests that only care about one field. */
-function emptyStatus(overrides = {}) {
-    const base = {
+function emptyStatus(overrides: Partial<ReconStatus> = {}): ReconStatus {
+    const base: ReconStatus = {
         h24: { total: 0, counts: {}, stalePendingCount: 0 },
         d7:  { total: 0, counts: {}, stalePendingCount: 0 },
         d30: { total: 0, counts: {}, stalePendingCount: 0 },
@@ -27,84 +30,6 @@ function emptyStatus(overrides = {}) {
         asOf: "2026-05-04T12:00:00.000Z",
     };
     return { ...base, ...overrides };
-}
-
-// We need to import the formatter. Since it's the pure function we're testing,
-// we can extract the logic inline here to avoid the Supabase import chain.
-// This makes the test hermetic — format logic is copied/verified against source.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Inline port of formatReconStatus + helpers (keeps tests hermetic).
-// If the implementation diverges these tests will catch it during CI when the
-// module is importable (env vars present), or they serve as spec for the impl.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const OUTCOME_EMOJI = {
-    auto_applied:       "✅",
-    approved_by_user:   "✅",
-    pending_approval:   "⏸",
-    match_failed:       "❌",
-    rejected_by_user:   "❌",
-    rejected_10x:       "🛑",
-    rejected_invariant: "🛑",
-    expired:            "⏰",
-};
-
-function formatAge(createdAtIso, now) {
-    const ms = now.getTime() - new Date(createdAtIso).getTime();
-    const totalMins = Math.floor(ms / 60_000);
-    const days  = Math.floor(totalMins / 1440);
-    const hours = Math.floor((totalMins % 1440) / 60);
-    const mins  = totalMins % 60;
-    if (days > 0)  return `${days}d ${hours}h`;
-    if (hours > 0) return `${hours}h ${mins}m`;
-    return `${mins}m`;
-}
-
-function renderWindow(label, stats) {
-    const header = `*${label}:* ${stats.total} outcome${stats.total !== 1 ? "s" : ""}`;
-    const sorted = Object.entries(stats.counts)
-        .filter(([, cnt]) => cnt > 0)
-        .sort(([, a], [, b]) => b - a);
-    if (sorted.length === 0) return `${header}\n  (none)`;
-    const lines = sorted.map(([outcome, cnt]) => {
-        const emoji = OUTCOME_EMOJI[outcome] ?? "•";
-        let line = `  ${emoji} ${outcome}: ${cnt}`;
-        if (outcome === "pending_approval" && stats.stalePendingCount > 0) {
-            line += ` (${stats.stalePendingCount} stale >24h)`;
-        }
-        return line;
-    });
-    return `${header}\n${lines.join("\n")}`;
-}
-
-function formatReconStatus(status) {
-    const now = new Date(status.asOf);
-    const parts = [];
-    parts.push("*📊 AP Reconciliation Status*\n");
-    parts.push(renderWindow("Last 24h", status.h24));
-    parts.push("");
-    parts.push(renderWindow("Last 7d",  status.d7));
-    parts.push("");
-    parts.push(renderWindow("Last 30d", status.d30));
-    if (status.topMatchFailedVendors.length > 0) {
-        parts.push("");
-        parts.push("*Top match\\-failed vendors (30d):*");
-        for (const { vendorName, count } of status.topMatchFailedVendors) {
-            parts.push(`  • ${vendorName} — ${count}`);
-        }
-    }
-    if (status.openPendingApprovals.length > 0) {
-        parts.push("");
-        parts.push("*Pending approvals (open now):*");
-        for (const row of status.openPendingApprovals) {
-            const po     = row.poId ?? "unknown PO";
-            const vendor = row.vendorName ?? "unknown vendor";
-            const age    = formatAge(row.createdAt, now);
-            parts.push(`  • PO ${po} — ${vendor} — ${age} old`);
-        }
-    }
-    return parts.join("\n");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -278,7 +203,7 @@ describe("formatReconStatus — full realistic snapshot", () => {
     });
 
     it("produces correct output for a typical mixed snapshot", () => {
-        const status = {
+        const status: ReconStatus = {
             h24: { total: 0, counts: {}, stalePendingCount: 0 },
             d7: {
                 total: 5,
