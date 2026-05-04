@@ -35,6 +35,7 @@ import { createClient } from "../supabase";
 import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
+import { writeReconciliationOutcome } from "../runtime/observability/reconciliation-outcomes";
 
 // ──────────────────────────────────────────────────
 // PENDING APPROVAL STORE
@@ -527,6 +528,23 @@ export async function approvePendingReconciliation(id: string): Promise<{
         contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
     }).catch(() => { /* non-blocking */ });
 
+    // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
+    writeReconciliationOutcome({
+        runId: crypto.randomUUID(),
+        outcome: "approved_by_user",
+        invoiceId: entry.result.invoiceNumber ?? undefined,
+        poId: entry.result.orderId ?? undefined,
+        vendorName: entry.result.vendorName ?? undefined,
+        outcomeMeta: {
+            approval_id: id,
+            applied_count: applyResult.applied.length,
+            skipped_count: applyResult.skipped.length,
+            error_count: applyResult.errors.length,
+            total_dollar_impact: entry.result.totalDollarImpact,
+        },
+        resolvedAt: new Date(),
+    }).catch(() => { /* never throws */ });
+
     return {
         success: true,
         applied: applyResult.applied,
@@ -672,6 +690,21 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         userAction: "rejected",
         contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
     }).catch(() => { /* non-blocking */ });
+
+    // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
+    writeReconciliationOutcome({
+        runId: crypto.randomUUID(),
+        outcome: "rejected_by_user",
+        invoiceId: entry.result.invoiceNumber ?? undefined,
+        poId: entry.result.orderId ?? undefined,
+        vendorName: entry.result.vendorName ?? undefined,
+        outcomeMeta: {
+            approval_id: id,
+            total_dollar_impact: entry.result.totalDollarImpact,
+            price_change_count: entry.result.priceChanges.length,
+        },
+        resolvedAt: new Date(),
+    }).catch(() => { /* never throws */ });
 
     return `❌ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
 }
