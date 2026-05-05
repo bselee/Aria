@@ -136,6 +136,14 @@ async function runObservabilityHooks(
     startedAtIso: string,
     err?: any,
 ): Promise<void> {
+    // Skip the heavy dynamic imports in test environments. Vitest sets
+    // VITEST=true automatically; without this skip, importing ops-manager
+    // transitively pulls Telegraf, Slack, the full Aria graph, blowing past
+    // the default 5s test timeout. The hooks fire normally in production.
+    if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") {
+        return;
+    }
+
     // 1. legacy in-memory cron map (used by command-board dashboard)
     try {
         const { recordCronRun } = await import("../lib/scheduler/cron-registry");
