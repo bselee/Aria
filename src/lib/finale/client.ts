@@ -18,6 +18,7 @@
  */
 
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
+import { recommendQty } from "@/lib/purchasing/qty-recommender";
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -138,6 +139,12 @@ export interface PurchasingItem {
     velocityInflated?: boolean;        // true when chooseVelocitySignal capped a demand signal that exceeded 3× sales/receipts
     velocityRawRate?: number;          // the original (pre-cap) daily rate Finale reported, for context
     velocityRealityCap?: number;       // max(salesVelocity, purchaseVelocity) — what the cap pinned dailyRate to
+    recommendation?: {
+        formulaVersion: string;
+        coverDays: number;
+        rawNeededEaches: number;
+        provenance: Array<{ step: string; detail: string; value?: number | string }>;
+    };
 }
 
 export interface PurchasingGroup {
@@ -4800,46 +4807,34 @@ export class FinaleClient {
                         continue;
                     }
 
-                    const runwayDays = effectiveStock / dailyRate;
-                    const adjustedRunwayDays = (effectiveStock + stockOnOrder) / dailyRate;
-
-                    // Step 6: urgency based on ADJUSTED runway (on-hand + on-order)
-                    // DECISION(2026-03-09): Changed from raw runwayDays to adjustedRunwayDays.
-                    // Previously used on-hand only, which caused items with active POs
-                    // (In Transit) to falsely flag as CRIT even when incoming supply covers demand.
-                    const urgency: PurchasingItem['urgency'] =
-                        adjustedRunwayDays < leadTimeDays ? 'critical'
-                            : adjustedRunwayDays < leadTimeDays + 30 ? 'warning'
-                                : adjustedRunwayDays < leadTimeDays + 60 ? 'watch'
-                                    : 'ok';
-                    const parts: string[] = [
-                        chosenVelocity.inflated
-                            ? `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel}, capped — Finale reported ${chosenVelocity.rawRate?.toFixed(1)}/d)`
-                            : `Avg ${dailyRate.toFixed(1)}/day (${rateSourceLabel})`,
-                        `${Math.round(effectiveStock)} in stock → ${Math.round(runwayDays)}d`,
-                        `Lead ${leadTimeDays}d`,
-                    ];
-                    if (stockOnOrder > 0) {
-                        parts.push(`${activity.openPOs.length} open PO (+${Math.round(stockOnOrder)}) → ${Math.round(adjustedRunwayDays)}d adjusted`);
-                    }
-                    const urgencyNote = urgency === 'critical' ? 'order now, already short'
-                        : urgency === 'warning' ? 'order soon'
-                            : urgency === 'watch' ? 'monitor'
-                                : 'covered';
-                    const explanation = parts.join(' · ') + ` — ${urgencyNote}.`;
-
-                    // Step 8: suggested qty — subtract stock + open POs, then cover window
-                    // DECISION(2026-05-11): Previously we computed dailyRate * coverDays blindly,
-                    // ignoring on-hand stock and incoming POs. This produced wild over-orders
-                    // (e.g., EM103: 11,240 units when stock + open POs already cover demand).
-                    const coverDays = leadTimeDays + 60;
-                    const neededEaches = Math.max(0, dailyRate * coverDays - effectiveStock - stockOnOrder);
-                    const rawSuggestedQty = neededEaches > 0 ? neededEaches : 0;
-
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
-                    const suggestedQty = rawSuggestedQty > 0
-                        ? Math.ceil(FinaleClient.snapToIncrement(rawSuggestedQty, orderIncrementQty))
-                        : 0;
+
+                    // ── Canonical reorder calculation ────────────────────────────
+                    // All reorder math runs through the pure recommender so every
+                    // qty, runway, and urgency comes with an auditable trace the
+                    // dashboard can render in a "Why X?" drawer.
+                    const rec = recommendQty({
+                        sku,
+                        dailyRate,
+                        dailyRateSource: rateSource,
+                        dailyRateLabel: rateSourceLabel,
+                        velocityInflated: chosenVelocity.inflated,
+                        velocityRawRate: chosenVelocity.rawRate,
+                        velocityRealityCap: chosenVelocity.realityCap,
+                        stockOnHand: effectiveStock,
+                        stockOnOrder,
+                        openPOCount: activity.openPOs.length,
+                        leadTimeDays,
+                        leadTimeProvenance,
+                        coverBufferDays: 60,
+                        orderIncrementQty,
+                    });
+
+                    const runwayDays = rec.runwayDays;
+                    const adjustedRunwayDays = rec.adjustedRunwayDays;
+                    const urgency = rec.urgency;
+                    const explanation = rec.explanation;
+                    const suggestedQty = rec.suggestedQty;
 
                     // Qty divergence: compare our velocity-based suggestion vs Finale's reorderQuantityToOrder
                     const finaleReorderQty = candidate.finaleReorderQty;
@@ -4897,6 +4892,12 @@ export class FinaleClient {
                         velocityInflated: chosenVelocity.inflated,
                         velocityRawRate: chosenVelocity.rawRate,
                         velocityRealityCap: chosenVelocity.realityCap,
+                        recommendation: {
+                            formulaVersion: rec.formulaVersion,
+                            coverDays: rec.coverDays,
+                            rawNeededEaches: rec.rawNeededEaches,
+                            provenance: rec.provenance,
+                        },
                     });
                 } catch {
                     // Skip products that error — non-fatal
