@@ -402,5 +402,54 @@ export function getAriaTools(opts: {
                 }
             },
         }),
+
+        list_cron_jobs: tool({
+            description: "List every registered Aria cron job with schedule, last-run status, and enabled/disabled. Use when Will asks about cron status, scheduled work, /jobs, what's running, or what's failing.",
+            inputSchema: z.object({
+                filter: z.string().optional().describe("Optional substring to filter job names (e.g. 'po' to see PO-related jobs only)"),
+            }),
+            execute: async ({ filter }) => {
+                try {
+                    const { listJobs } = await import("../cron/registry");
+                    const { lastRun } = await import("../cron/history");
+                    const f = (filter ?? "").toString().toLowerCase();
+                    const jobs = listJobs().filter(j => !f || j.name.toLowerCase().includes(f));
+                    if (jobs.length === 0) return f ? `No jobs match "${f}".` : "No jobs registered.";
+
+                    const rows = await Promise.all(jobs.map(async j => {
+                        const last = await lastRun(j.name);
+                        const lastStr = last
+                            ? `${last.status} (${last.duration_ms ?? "?"}ms · ${new Date(last.started_at).toLocaleString("en-US", { timeZone: "America/Denver", hour: "2-digit", minute: "2-digit", month: "numeric", day: "numeric" })})`
+                            : "never";
+                        const flag = j.enabled ? "✓" : "✗";
+                        return `${flag} *${j.name}* — \`${j.schedule}\`\n   last: ${lastStr}`;
+                    }));
+                    return rows.join("\n\n");
+                } catch (err: any) {
+                    return `list_cron_jobs failed: ${err.message}`;
+                }
+            },
+        }),
+
+        run_cron_job: tool({
+            description: "Manually trigger a registered Aria cron job. Same concurrency lock and budget as a scheduled tick — running while a tick is in flight returns 'concurrency-locked' (skipped). Use when Will says 'run X now', '/run X', or asks to manually trigger a job.",
+            inputSchema: z.object({
+                job_name: z.string().describe("Exact job name (use list_cron_jobs to discover names)"),
+            }),
+            execute: async ({ job_name }) => {
+                try {
+                    const { runJobOnce } = await import("../cron/runner");
+                    const { getJob } = await import("../cron/registry");
+                    if (!getJob(job_name)) return `Unknown job "${job_name}". Use list_cron_jobs to see available names.`;
+
+                    const result = await runJobOnce(job_name, "manual");
+                    const detail = result.failureReason ? ` (${result.failureReason})` : "";
+                    const msg = result.failureMessage ? `\n${result.failureMessage}` : "";
+                    return `*${job_name}*: ${result.status}${detail} — ${result.durationMs}ms${msg}`;
+                } catch (err: any) {
+                    return `run_cron_job failed: ${err.message}`;
+                }
+            },
+        }),
     };
 }
