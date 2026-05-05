@@ -463,7 +463,9 @@ CRITICAL RULES:
    
    Example of BAD response:
    "To determine purchases, you would need to check purchase records."`,
-                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above Ã¢â‚¬â€ do NOT ask for the complete data. Give the best answer possible from what you have.`
+                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above Ã¢â‚¬â€ do NOT ask for the complete data. Give the best answer possible from what you have.`,
+                // KAIZEN #1: ~800-token system prompt (CRITICAL RULES + persona) re-sent on every file upload.
+                cacheControl: "ephemeral",
             });
 
             reply += analysis;
