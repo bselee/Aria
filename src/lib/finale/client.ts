@@ -19,6 +19,14 @@
 
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import { recommendQty } from "@/lib/purchasing/qty-recommender";
+import {
+    loadActiveReservations,
+    loadCalibrationStats,
+    loadVendorMOQs,
+    recordRecommendationSnapshots,
+    type RecommendationSnapshot,
+} from "@/lib/purchasing/calibration";
+import { leadTimeService } from "@/lib/builds/lead-time-service";
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -560,6 +568,12 @@ const PARTY_CACHE_MAX = 200;
 // 4h TTL matches LeadTimeService cache policy.
 const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
 const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
+// Raw vendor lead-time distribution stashed by getVendorLeadTimeHistory so
+// getVendorLeadTimeDistribution can read P90 without a second Finale call.
+let _vendorLeadTimeRawCache: Map<string, number[]> | null = null;
+let _vendorLeadTimeRawCacheAt = 0;
+const VENDOR_LEAD_TIME_RAW_TTL = 4 * 60 * 60 * 1000;
 
 export class FinaleClient {
     private authHeader: string;
@@ -3942,6 +3956,31 @@ export class FinaleClient {
      * Returns Map<vendorName, medianDays>.
      * Never throws — returns empty Map on any error.
      */
+    /**
+     * Lead-time distribution per vendor — median (P50), P90, and sample count.
+     * Reads the raw days[] array stashed by `getVendorLeadTimeHistory`. Call
+     * `getVendorLeadTimeHistory()` first (the LeadTimeService warm cache does
+     * this) — this method is a cheap derived view, not a fresh API call.
+     */
+    getVendorLeadTimeDistribution(): Map<string, { p50: number; p90: number; sampleCount: number }> {
+        const out = new Map<string, { p50: number; p90: number; sampleCount: number }>();
+        if (!_vendorLeadTimeRawCache) return out;
+        if (Date.now() - _vendorLeadTimeRawCacheAt > VENDOR_LEAD_TIME_RAW_TTL) return out;
+
+        for (const [vendor, days] of _vendorLeadTimeRawCache) {
+            if (days.length < 3) continue;
+            const sorted = [...days].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            const p50 = sorted.length % 2 === 0
+                ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+                : sorted[mid];
+            const p90Index = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9));
+            const p90 = sorted[p90Index];
+            out.set(vendor, { p50, p90, sampleCount: days.length });
+        }
+        return out;
+    }
+
     async getVendorLeadTimeHistory(daysBack: number = 90): Promise<Map<string, number>> {
         try {
             const now = new Date();
@@ -4005,6 +4044,11 @@ export class FinaleClient {
                     : sorted[mid];
                 result2.set(vendor, median);
             }
+            // Stash the raw distribution for callers that want P90 — see
+            // getVendorLeadTimeDistribution(). Module-level cache because
+            // FinaleClient is reinstantiated frequently.
+            _vendorLeadTimeRawCache = byVendor;
+            _vendorLeadTimeRawCacheAt = Date.now();
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
@@ -4439,6 +4483,21 @@ export class FinaleClient {
         console.log(`[finale] createDraftPurchaseOrder: created PO #${orderId} for party ${vendorPartyId} (${items.length} items) → ${facilityName}${facilityUrl ? '' : ' (facility URL not found)'}`);
         if (duplicateWarnings.length > 0) console.log(`[finale] Duplicate warnings: ${duplicateWarnings.join(' | ')}`);
         if (priceAlerts.length > 0) console.log(`[finale] Price alerts: ${priceAlerts.join(' | ')}`);
+
+        // Phase 3a — write reservations so the next purchasing scan does not
+        // double-order the same SKUs while this draft is still open.
+        // Best-effort; reservation failure must not block PO creation.
+        try {
+            const { recordReservations: _recordReservations } = await import("@/lib/purchasing/calibration");
+            await _recordReservations(
+                orderId,
+                vendorPartyId,
+                items.map(i => ({ productId: i.productId, qty: i.quantity })),
+            );
+        } catch (err: any) {
+            console.warn(`[finale] reservation write failed for PO #${orderId}: ${err.message}`);
+        }
+
         return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts };
     }
 
@@ -4686,6 +4745,21 @@ export class FinaleClient {
         const packSizeMap = await getPackSizes(candidates.map(c => c.productId));
         console.log(`[finale] getPurchasingIntelligence: ${packSizeMap.size} pack-size records loaded`);
 
+        // ── Phase 2/3 cross-cutting loads — best-effort, parallel ──
+        // We don't have vendorPartyIds at this stage (party resolution happens
+        // per-SKU in the worker loop), so calibration + MOQ are loaded lazily
+        // inside the loop using a memo. Reservations are keyed on productId,
+        // which we DO have, so we batch-load them up front.
+        const productIds = candidates.map(c => c.productId);
+        const [reservationsMap] = await Promise.all([
+            loadActiveReservations(productIds),
+            leadTimeService.warmCache(),
+        ]);
+        const calibrationCache = new Map<string, Awaited<ReturnType<typeof loadCalibrationStats>> extends Map<string, infer V> ? V : never>();
+        const moqCache = new Map<string, Awaited<ReturnType<typeof loadVendorMOQs>> extends Map<string, infer V> ? V : never>();
+        const seenVendorIds = new Set<string>();
+        const recommendationSnapshots: RecommendationSnapshot[] = [];
+
         // ── Step 2-8: 5x concurrent workers per candidate SKU ──
         // Vendors excluded from purchasing intelligence:
         //   isManufactured : internal BAS production depts
@@ -4809,11 +4883,28 @@ export class FinaleClient {
 
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
 
+                    // ── Phase 2/3 lookups: calibration, MOQ, P90 lead time ──
+                    if (!seenVendorIds.has(partyId)) {
+                        seenVendorIds.add(partyId);
+                        const [calMap, moqMap] = await Promise.all([
+                            loadCalibrationStats([partyId]),
+                            loadVendorMOQs([partyId]),
+                        ]);
+                        const cal = calMap.get(partyId);
+                        if (cal) calibrationCache.set(partyId, cal);
+                        const moq = moqMap.get(partyId);
+                        if (moq) moqCache.set(partyId, moq);
+                    }
+                    const calibration = calibrationCache.get(partyId);
+                    const moq = moqCache.get(partyId);
+                    const reservation = reservationsMap.get(sku);
+                    const distribution = await leadTimeService.getDistribution(party.groupName);
+
                     // ── Canonical reorder calculation ────────────────────────────
                     // All reorder math runs through the pure recommender so every
                     // qty, runway, and urgency comes with an auditable trace the
                     // dashboard can render in a "Why X?" drawer.
-                    const rec = recommendQty({
+                    const recInputs = {
                         sku,
                         dailyRate,
                         dailyRateSource: rateSource,
@@ -4826,9 +4917,32 @@ export class FinaleClient {
                         openPOCount: activity.openPOs.length,
                         leadTimeDays,
                         leadTimeProvenance,
+                        leadTimeP90: distribution?.p90 ?? null,
                         coverBufferDays: 60,
                         orderIncrementQty,
-                    });
+                        safetyMultiplier: calibration?.safetyMultiplier ?? 1,
+                        calibrationSampleCount: calibration?.sampleCount ?? 0,
+                        calibrationMedianErrorPct: calibration?.medianErrorPct ?? null,
+                        reservedQty: reservation?.qty ?? 0,
+                        reservedDraftPOs: reservation?.draftPONumbers ?? [],
+                        minimumOrderEaches: moq?.minimumOrderEaches ?? null,
+                        minimumOrderDollars: moq?.minimumOrderDollars ?? null,
+                        unitPrice,
+                    } as const;
+                    const rec = recommendQty(recInputs);
+
+                    if (rec.suggestedQty > 0) {
+                        recommendationSnapshots.push({
+                            productId: sku,
+                            vendorPartyId: partyId,
+                            vendorName: party.groupName,
+                            formulaVersion: rec.formulaVersion,
+                            recommendedQty: rec.suggestedQty,
+                            finaleReorderQty: candidate.finaleReorderQty,
+                            inputs: recInputs as Record<string, any>,
+                            provenance: rec.provenance as Array<Record<string, any>>,
+                        });
+                    }
 
                     const runwayDays = rec.runwayDays;
                     const adjustedRunwayDays = rec.adjustedRunwayDays;
@@ -4933,6 +5047,14 @@ export class FinaleClient {
 
         groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
         console.log(`[finale] getPurchasingIntelligence: ${items.length} items across ${groups.length} vendors`);
+
+        // Persist recommendation snapshots — best-effort, non-blocking. Each row is
+        // the input -> output that the receive hook will calibrate against.
+        if (recommendationSnapshots.length > 0) {
+            void recordRecommendationSnapshots(recommendationSnapshots).then(n => {
+                if (n > 0) console.log(`[finale] getPurchasingIntelligence: ${n} recommendation snapshots persisted`);
+            });
+        }
         return groups;
     }
 
@@ -5012,6 +5134,17 @@ export class FinaleClient {
 
         const finalStatus = updated?.statusId || "ORDER_LOCKED";
         console.log(`[finale] commitDraftPO: PO #${orderId} committed → ${finalStatus}`);
+
+        // Release reservations now that the PO is locked into reality —
+        // future scans will see the qty as on-order through stockOnOrder.
+        try {
+            const { releaseReservations: _release } = await import("@/lib/purchasing/calibration");
+            const released = await _release(orderId, "committed");
+            if (released > 0) console.log(`[finale] commitDraftPO: released ${released} reservation(s) for PO #${orderId}`);
+        } catch (err: any) {
+            console.warn(`[finale] reservation release failed for PO #${orderId}: ${err.message}`);
+        }
+
         return { orderId, committed: true, finalStatus };
     }
 

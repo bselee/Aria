@@ -475,6 +475,14 @@ export class OpsManager {
             this.safeRun("POSync", () => this.syncPOConversations());
         });
 
+        // Calibration loop — daily at 8:30 AM, after the morning summary.
+        // Pulls newly-received POs, calibrates the recommendations they came
+        // from, recomputes vendor-level safety multipliers, and prunes
+        // expired draft reservations.
+        schedule("30 8 * * *", () => {
+            this.safeRun("QtyCalibration", () => this.runQtyCalibration());
+        });
+
         // PO-First AP Sweep every 4 hours
         schedule("30 */4 * * *", () => {
             this.safeRun("POSweep", () => runPOSweep(60, false));
@@ -1034,8 +1042,82 @@ export class OpsManager {
      * Detailed trend analysis — complements the Friday daily summary.
      */
     async sendWeeklySummary() {
-        // STUB: Weekly summary not yet implemented
-        console.log("📊 [STUB] Preparing Weekly Summary...");
+        console.log("📊 Preparing Weekly Summary (Aria vs Finale retro)...");
+        try {
+            const { summarizeAriaVsFinale } = await import("../purchasing/calibration-engine");
+            const summary = await summarizeAriaVsFinale(7);
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+
+            if (summary.totalSamples === 0) {
+                if (chatId) {
+                    await this.bot.telegram.sendMessage(chatId,
+                        "📊 *Weekly Reorder Retro*\n\nNo calibrated recommendations in the last 7 days yet — calibration loop needs received POs to score against. Check back next week.",
+                        { parse_mode: "Markdown" }
+                    );
+                }
+                return;
+            }
+
+            const lines: string[] = [];
+            lines.push("📊 *Weekly Reorder Retro — Aria vs Finale*");
+            lines.push(`Calibrated samples: ${summary.totalSamples} (${summary.coveredSamples} comparable to Finale)`);
+            if (summary.medianAriaErrorPct != null) {
+                lines.push(`Aria median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);
+            }
+            if (summary.medianFinaleErrorPct != null) {
+                lines.push(`Finale median error: ${summary.medianFinaleErrorPct >= 0 ? "+" : ""}${summary.medianFinaleErrorPct.toFixed(0)}%`);
+            }
+            lines.push(`Aria under Finale: ${summary.ariaUnderFinaleCount} · Aria over: ${summary.ariaOverFinaleCount}`);
+
+            if (summary.bestAriaWins.length > 0) {
+                lines.push("\n*Best Aria wins (saved over Finale):*");
+                for (const w of summary.bestAriaWins.slice(0, 3)) {
+                    lines.push(`  • ${w.productId} (${w.vendorName ?? "?"}) — Aria ${w.ariaErrorPct >= 0 ? "+" : ""}${w.ariaErrorPct}% vs Finale ${w.finaleErrorPct >= 0 ? "+" : ""}${w.finaleErrorPct}%`);
+                }
+            }
+            if (summary.worstAriaMisses.length > 0) {
+                lines.push("\n*Worst Aria misses (>=25% error):*");
+                for (const m of summary.worstAriaMisses.slice(0, 3)) {
+                    lines.push(`  • ${m.productId} (${m.vendorName ?? "?"}) — recommended ${m.recommendedQty}, actual ${m.actualConsumed} (${m.errorPct >= 0 ? "+" : ""}${m.errorPct}%)`);
+                }
+            }
+
+            if (chatId) {
+                await this.bot.telegram.sendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" });
+            }
+        } catch (err: any) {
+            console.error("[weekly-summary] failed:", err.message);
+        }
+    }
+
+    /**
+     * Phase 2/3 calibration loop. Runs daily at 8:30 AM. Each step is
+     * best-effort — none should be allowed to block the others.
+     */
+    async runQtyCalibration() {
+        const { attachReceivedPOsToRecommendations, recomputeVendorCalibrationStats } = await import("../purchasing/calibration-engine");
+        const { cleanupExpiredReservations } = await import("../purchasing/calibration");
+
+        try {
+            const attached = await attachReceivedPOsToRecommendations(30);
+            console.log(`[qty-calibration] receivedPOs=${attached.receivedPOs} matched=${attached.matched} calibrated=${attached.calibrated}`);
+        } catch (err: any) {
+            console.warn(`[qty-calibration] attach pass failed: ${err.message}`);
+        }
+
+        try {
+            const recompute = await recomputeVendorCalibrationStats();
+            console.log(`[qty-calibration] vendor stats refreshed for ${recompute.vendors} vendor(s)`);
+        } catch (err: any) {
+            console.warn(`[qty-calibration] recompute pass failed: ${err.message}`);
+        }
+
+        try {
+            const released = await cleanupExpiredReservations();
+            if (released > 0) console.log(`[qty-calibration] released ${released} expired draft reservation(s)`);
+        } catch (err: any) {
+            console.warn(`[qty-calibration] reservation cleanup failed: ${err.message}`);
+        }
     }
 
     /**
@@ -1121,21 +1203,55 @@ export class OpsManager {
                     }
                 }
 
-                // Alert and Update (Best effort if Supabase is down)
-                if (trackingNumbers.length > 0 && supabase) {
+                // Verify PO send + alert on tracking — best-effort, Supabase may be offline
+                if (supabase) {
                     try {
-                        const { data: existing } = await supabase.from("purchase_orders").select("tracking_numbers").eq("po_number", poNumber).maybeSingle();
+                        const { data: existing } = await supabase
+                            .from("purchase_orders")
+                            .select("tracking_numbers, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence")
+                            .eq("po_number", poNumber)
+                            .maybeSingle();
                         const oldTracking = existing?.tracking_numbers || [];
                         const newOnes = trackingNumbers.filter(t => !oldTracking.includes(t));
+
+                        const HIGH_CONF = new Set(["po_send", "vendor_reply", "manual"]);
+                        const alreadyHighConfidence = existing?.po_sent_verified_source && HIGH_CONF.has(existing.po_sent_verified_source);
+                        const sentISO = sentAt ? new Date(sentAt).toISOString() : null;
+
+                        const upsert: Record<string, any> = {
+                            po_number: poNumber,
+                            updated_at: new Date().toISOString(),
+                        };
+
                         if (newOnes.length > 0) {
                             const merged = [...new Set([...oldTracking, ...trackingNumbers])];
-                            await supabase.from("purchase_orders").upsert({
-                                po_number: poNumber,
-                                tracking_numbers: merged,
-                                vendor_response_at: responseAt ? new Date(responseAt).toISOString() : null,
-                                updated_at: new Date().toISOString()
-                            }, { onConflict: "po_number" });
+                            upsert.tracking_numbers = merged;
+                            upsert.vendor_response_at = responseAt ? new Date(responseAt).toISOString() : null;
+                        }
 
+                        if (!alreadyHighConfidence && sentISO) {
+                            const evidence = {
+                                type: "po_send",
+                                source: "gmail_outbox",
+                                at: sentISO,
+                                detail: `label:PO outbox — ${subject}`,
+                                gmail_thread_id: m.threadId,
+                            };
+                            const evidenceList = Array.isArray(existing?.po_sent_verified_evidence)
+                                ? [...existing.po_sent_verified_evidence, evidence]
+                                : [evidence];
+                            upsert.po_sent_at = existing?.po_sent_verified_at ?? sentISO;
+                            upsert.po_sent_verified_at = existing?.po_sent_verified_at ?? sentISO;
+                            upsert.po_sent_verified_source = existing?.po_sent_verified_source ?? "po_send";
+                            upsert.po_sent_verified_evidence = evidenceList;
+                        }
+
+                        const willWrite = newOnes.length > 0 || (!alreadyHighConfidence && sentISO);
+                        if (willWrite) {
+                            await supabase.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
+                        }
+
+                        if (newOnes.length > 0) {
                             await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", `📦 **Tracking Update: PO #${poNumber}**\n${vendorName}\n\n${newOnes.join('\n')}`);
                         }
                     } catch { /* Supabase offline */ }

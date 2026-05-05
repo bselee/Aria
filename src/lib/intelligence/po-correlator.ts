@@ -286,6 +286,116 @@ async function extractPOFromEmail(
 }
 
 // ──────────────────────────────────────────────────
+// PO SENT VERIFICATION BACKFILL
+// ──────────────────────────────────────────────────
+
+export interface BackfillPOSentResult {
+    scanned: number;
+    matched: number;
+    inserted: number;
+    skipped: number;
+    errors: number;
+    matchedPOs: Array<{ poNumber: string; sentDate: string; vendorName: string }>;
+}
+
+/**
+ * Walk the bill.selee@buildasoil.com `label:PO` outbox and write
+ * `purchase_orders.po_sent_verified_at` for every PO whose number we can
+ * extract from a sent message subject. Idempotent: skips POs already
+ * verified from a higher-confidence source (po_send, vendor_reply, manual).
+ *
+ * Source label written: `gmail_outbox`. Evidence rows include the Gmail
+ * message id so we can audit every backfilled verification.
+ */
+export async function backfillPOSentVerificationFromGmail(
+    daysBack: number = 365,
+    maxResults: number = 500,
+): Promise<BackfillPOSentResult> {
+    const result: BackfillPOSentResult = {
+        scanned: 0, matched: 0, inserted: 0, skipped: 0, errors: 0, matchedPOs: [],
+    };
+
+    const records = await scanPOEmails(maxResults, daysBack);
+    result.scanned = records.length;
+
+    const supabase = createClient();
+    if (!supabase) {
+        console.warn("[po-correlator] backfill: Supabase not configured");
+        return result;
+    }
+
+    for (const rec of records) {
+        try {
+            // Normalize PO number to bare digits — Finale stores orderIds without
+            // the "PO-" / "PO#" / "BuildASoil PO #" prefixes that appear in subjects.
+            const rawPoNumber = (rec.poNumber || "").trim();
+            const digitMatch = rawPoNumber.match(/(\d{3,})/);
+            const poNumber = digitMatch ? digitMatch[1] : "";
+            if (!poNumber) continue;
+            result.matched += 1;
+
+            const sentAt = new Date(rec.sentDate);
+            const sentISO = isNaN(sentAt.getTime()) ? new Date().toISOString() : sentAt.toISOString();
+
+            const { data: existing } = await supabase
+                .from("purchase_orders")
+                .select("po_number, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence")
+                .eq("po_number", poNumber)
+                .maybeSingle();
+
+            const HIGH_CONFIDENCE_SOURCES = new Set(["po_send", "vendor_reply", "manual"]);
+            if (existing?.po_sent_verified_source && HIGH_CONFIDENCE_SOURCES.has(existing.po_sent_verified_source)) {
+                result.skipped += 1;
+                continue;
+            }
+
+            const evidence = {
+                type: "po_send",
+                source: "gmail_outbox",
+                at: sentISO,
+                detail: `Gmail label:PO outbox (subject: ${rec.subject})`,
+                gmail_message_id: rec.messageId,
+                gmail_thread_id: rec.threadId,
+                vendor_email: rec.vendorEmail,
+            };
+
+            const evidenceList = Array.isArray(existing?.po_sent_verified_evidence)
+                ? [...existing.po_sent_verified_evidence, evidence]
+                : [evidence];
+
+            const upsertPayload: Record<string, any> = {
+                po_number: poNumber,
+                po_sent_at: existing?.po_sent_verified_at ?? sentISO,
+                po_sent_verified_at: existing?.po_sent_verified_at ?? sentISO,
+                po_sent_verified_source: existing?.po_sent_verified_source ?? "po_send",
+                po_sent_verified_evidence: evidenceList,
+                updated_at: new Date().toISOString(),
+            };
+            if (rec.vendorName) upsertPayload.vendor_name = rec.vendorName;
+
+            const { error } = await supabase
+                .from("purchase_orders")
+                .upsert(upsertPayload, { onConflict: "po_number" });
+
+            if (error) {
+                console.warn(`[po-correlator] backfill upsert failed for PO ${poNumber}: ${error.message}`);
+                result.errors += 1;
+                continue;
+            }
+
+            result.inserted += 1;
+            result.matchedPOs.push({ poNumber, sentDate: sentISO, vendorName: rec.vendorName });
+        } catch (err: any) {
+            console.warn(`[po-correlator] backfill exception for ${rec.poNumber}: ${err.message}`);
+            result.errors += 1;
+        }
+    }
+
+    console.log(`[po-correlator] backfillPOSentVerificationFromGmail: scanned=${result.scanned} matched=${result.matched} inserted=${result.inserted} skipped=${result.skipped} errors=${result.errors}`);
+    return result;
+}
+
+// ──────────────────────────────────────────────────
 // CROSS-INBOX CORRELATION
 // ──────────────────────────────────────────────────
 

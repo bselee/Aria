@@ -16,7 +16,7 @@
  *          touching the recommender's downstream consumers.
  */
 
-export const QTY_FORMULA_VERSION = "v1.0-extracted-2026-05-05";
+export const QTY_FORMULA_VERSION = "v2.0-calibrated-2026-05-05";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -39,8 +39,23 @@ export interface RecommenderInput {
     openPOCount: number;
     leadTimeDays: number;
     leadTimeProvenance: string;
+    leadTimeP90?: number | null;        // when provided (n>=5 vendor history), used instead of point estimate
     coverBufferDays?: number;           // default 60 — extra cover above lead time
     orderIncrementQty?: number | null;  // pack rounding (Finale "Std reorder in qty of")
+
+    /** Phase 2 — vendor calibration multiplier (>1 widens cover; <1 tightens). */
+    safetyMultiplier?: number;
+    calibrationSampleCount?: number;
+    calibrationMedianErrorPct?: number | null;
+
+    /** Phase 3a — qty already reserved against open draft POs for this SKU. */
+    reservedQty?: number;
+    reservedDraftPOs?: string[];
+
+    /** MOQ — vendor-level minimums applied after pack rounding. */
+    minimumOrderEaches?: number | null;
+    minimumOrderDollars?: number | null;
+    unitPrice?: number;
 }
 
 export interface ProvenanceStep {
@@ -61,6 +76,11 @@ export interface RecommenderResult {
     explanation: string;
     provenance: ProvenanceStep[];
     formulaVersion: string;
+    leadTimeUsed: number;
+    leadTimeBasis: "p90" | "median" | "point";
+    safetyMultiplier: number;
+    reservedQty: number;
+    moqApplied: boolean;
 }
 
 function urgencyFor(adjustedRunwayDays: number, leadTimeDays: number): Urgency {
@@ -97,9 +117,11 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     }
 
-    // ── Step 2: stock + on-order ──────────────────────────────────────────
-    const effectiveStock = Math.max(0, input.stockOnHand);
+    // ── Step 2: stock + on-order + reservations ───────────────────────────
+    const stockOnHand = Math.max(0, input.stockOnHand);
     const stockOnOrder = Math.max(0, input.stockOnOrder);
+    const reservedQty = Math.max(0, input.reservedQty ?? 0);
+    const effectiveStock = stockOnHand;
     trace.push({
         step: "on_hand",
         detail: `${Math.round(effectiveStock)} units on hand`,
@@ -114,40 +136,86 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     } else {
         trace.push({ step: "on_order", detail: "No open POs", value: 0 });
     }
+    if (reservedQty > 0) {
+        const draftLabel = (input.reservedDraftPOs ?? []).slice(0, 3).join(", ") || "active drafts";
+        trace.push({
+            step: "reserved",
+            detail: `${Math.round(reservedQty)} units already reserved across drafts (${draftLabel}) — subtracted from incoming credit`,
+            value: reservedQty,
+        });
+    }
 
     // ── Step 3: runway ────────────────────────────────────────────────────
+    const supplyForRunway = effectiveStock + stockOnOrder - reservedQty;
     const runwayDays = dailyRate > 0 ? effectiveStock / dailyRate : Number.POSITIVE_INFINITY;
     const adjustedRunwayDays = dailyRate > 0
-        ? (effectiveStock + stockOnOrder) / dailyRate
+        ? Math.max(0, supplyForRunway) / dailyRate
         : Number.POSITIVE_INFINITY;
     trace.push({
         step: "runway",
         detail: `${Math.round(effectiveStock)} ÷ ${dailyRate.toFixed(2)}/d = ${Math.round(runwayDays)}d raw, ` +
-            `${Math.round(adjustedRunwayDays)}d after on-order`,
+            `${Math.round(adjustedRunwayDays)}d after on-order/reserved`,
         value: Math.round(runwayDays),
     });
 
-    // ── Step 4: cover window ──────────────────────────────────────────────
-    const buffer = input.coverBufferDays ?? 60;
-    const coverDays = input.leadTimeDays + buffer;
-    trace.push({
-        step: "cover_days",
-        detail: `Lead ${input.leadTimeDays}d (${input.leadTimeProvenance}) + ${buffer}d safety = ${coverDays}d cover`,
-        value: coverDays,
-    });
+    // ── Step 4: lead time basis (P90 if available, else point estimate) ───
+    const leadTimeP90 = input.leadTimeP90 ?? null;
+    const leadTimeUsed = (leadTimeP90 != null && leadTimeP90 > 0)
+        ? leadTimeP90
+        : input.leadTimeDays;
+    const leadTimeBasis: "p90" | "median" | "point" = (leadTimeP90 != null && leadTimeP90 > 0)
+        ? "p90"
+        : input.leadTimeProvenance === "vendor_median" ? "median" : "point";
+    if (leadTimeBasis === "p90") {
+        trace.push({
+            step: "lead_time",
+            detail: `Using P90 lead ${leadTimeP90}d (median was ${input.leadTimeDays}d, ${input.leadTimeProvenance})`,
+            value: leadTimeUsed,
+        });
+    } else {
+        trace.push({
+            step: "lead_time",
+            detail: `Using ${input.leadTimeDays}d (${input.leadTimeProvenance}) — no P90 distribution yet`,
+            value: leadTimeUsed,
+        });
+    }
 
-    // ── Step 5: needed eaches ─────────────────────────────────────────────
+    // ── Step 5: cover window with calibration multiplier ──────────────────
+    const buffer = input.coverBufferDays ?? 60;
+    const safetyMultiplier = Math.max(0.5, Math.min(2.5, input.safetyMultiplier ?? 1));
+    const adjustedBuffer = Math.round(buffer * safetyMultiplier);
+    const coverDays = leadTimeUsed + adjustedBuffer;
+    if (safetyMultiplier !== 1 && (input.calibrationSampleCount ?? 0) >= 5) {
+        const dir = safetyMultiplier > 1 ? "widened" : "tightened";
+        trace.push({
+            step: "cover_days",
+            detail: `Lead ${leadTimeUsed}d + safety ${buffer}d × ${safetyMultiplier.toFixed(2)} ${dir} ` +
+                `(median error ${input.calibrationMedianErrorPct?.toFixed(0)}% over ` +
+                `${input.calibrationSampleCount} samples) = ${coverDays}d cover`,
+            value: coverDays,
+        });
+    } else {
+        trace.push({
+            step: "cover_days",
+            detail: `Lead ${leadTimeUsed}d + ${adjustedBuffer}d safety = ${coverDays}d cover`,
+            value: coverDays,
+        });
+    }
+
+    // ── Step 6: needed eaches (subtract supply NET of reservations) ──────
     const targetUnits = dailyRate * coverDays;
-    const rawNeededEaches = Math.max(0, targetUnits - effectiveStock - stockOnOrder);
+    const supplyForOrder = effectiveStock + stockOnOrder - reservedQty;
+    const rawNeededEaches = Math.max(0, targetUnits - supplyForOrder);
     trace.push({
         step: "raw_qty",
         detail: `${dailyRate.toFixed(2)}/d × ${coverDays}d = ${Math.round(targetUnits)} target ` +
-            `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order = ` +
-            `${Math.round(rawNeededEaches)} needed`,
+            `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
+            (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
+            ` = ${Math.round(rawNeededEaches)} needed`,
         value: Math.round(rawNeededEaches),
     });
 
-    // ── Step 6: pack rounding ─────────────────────────────────────────────
+    // ── Step 7: pack rounding ─────────────────────────────────────────────
     const orderIncrementQty = input.orderIncrementQty ?? null;
     let suggestedQty = 0;
     if (rawNeededEaches > 0) {
@@ -168,11 +236,47 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     }
 
-    // ── Step 7: urgency ───────────────────────────────────────────────────
-    const urgency = urgencyFor(adjustedRunwayDays, input.leadTimeDays);
+    // ── Step 8: vendor MOQ enforcement ────────────────────────────────────
+    let moqApplied = false;
+    if (suggestedQty > 0) {
+        const minEaches = input.minimumOrderEaches ?? null;
+        const minDollars = input.minimumOrderDollars ?? null;
+        const unitPrice = input.unitPrice && input.unitPrice > 0 ? input.unitPrice : 0;
+
+        if (minEaches && minEaches > 0 && suggestedQty < minEaches) {
+            const bumped = orderIncrementQty && orderIncrementQty > 1
+                ? Math.ceil(snapToIncrement(minEaches, orderIncrementQty))
+                : minEaches;
+            trace.push({
+                step: "moq",
+                detail: `Bumped from ${suggestedQty} to ${bumped} to meet vendor MOQ of ${minEaches} eaches`,
+                value: bumped,
+            });
+            suggestedQty = bumped;
+            moqApplied = true;
+        } else if (minDollars && minDollars > 0 && unitPrice > 0) {
+            const orderValue = suggestedQty * unitPrice;
+            if (orderValue < minDollars) {
+                const minQtyForDollars = Math.ceil(minDollars / unitPrice);
+                const bumped = orderIncrementQty && orderIncrementQty > 1
+                    ? Math.ceil(snapToIncrement(minQtyForDollars, orderIncrementQty))
+                    : minQtyForDollars;
+                trace.push({
+                    step: "moq",
+                    detail: `Bumped from ${suggestedQty} ($${orderValue.toFixed(0)}) to ${bumped} ($${(bumped * unitPrice).toFixed(0)}) to meet vendor MOQ of $${minDollars}`,
+                    value: bumped,
+                });
+                suggestedQty = bumped;
+                moqApplied = true;
+            }
+        }
+    }
+
+    // ── Step 9: urgency ───────────────────────────────────────────────────
+    const urgency = urgencyFor(adjustedRunwayDays, leadTimeUsed);
     trace.push({
         step: "urgency",
-        detail: `Adjusted runway ${Math.round(adjustedRunwayDays)}d vs lead ${input.leadTimeDays}d → ${urgency}`,
+        detail: `Adjusted runway ${Math.round(adjustedRunwayDays)}d vs lead ${leadTimeUsed}d → ${urgency}`,
         value: urgency,
     });
 
@@ -203,5 +307,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         explanation,
         provenance: trace,
         formulaVersion: QTY_FORMULA_VERSION,
+        leadTimeUsed,
+        leadTimeBasis,
+        safetyMultiplier,
+        reservedQty,
+        moqApplied,
     };
 }
