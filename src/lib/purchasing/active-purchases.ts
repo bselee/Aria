@@ -39,6 +39,11 @@ export async function loadActivePurchases(
     const pos = await finale.getRecentPurchaseOrders(daysBack);
     await leadTimeService.warmCache();
 
+    // KAIZEN #2: pre-warm per-vendor lead-time cache so the per-PO loop reads
+    // synchronously from cache instead of chaining ~N awaits serially.
+    const uniqueVendors = [...new Set(pos.map(p => p.vendorName).filter(Boolean))];
+    await Promise.all(uniqueVendors.map(v => leadTimeService.getForVendor(v)));
+
     const supabase = createClient();
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
     const trackingMap = new Map<string, string[]>();
@@ -50,25 +55,29 @@ export async function loadActivePurchases(
         try {
             for (let i = 0; i < poNumbers.length; i += 100) {
                 const chunk = poNumbers.slice(i, i + 100);
-                const { data: dbPOs } = await supabase
-                    .from("purchase_orders")
-                    .select(
-                        "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
-                        "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
-                        "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
-                        "po_sent_verified_evidence, last_eta_update"
-                    )
-                    .in("po_number", chunk);
+                // KAIZEN #7: parallelize independent Supabase queries per chunk.
+                const [poRes, sendRes] = await Promise.all([
+                    supabase
+                        .from("purchase_orders")
+                        .select(
+                            "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
+                            "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
+                            "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
+                            "po_sent_verified_evidence, last_eta_update"
+                        )
+                        .in("po_number", chunk),
+                    supabase
+                        .from("po_sends")
+                        .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
+                        .in("po_number", chunk),
+                ]);
+                const dbPOs = poRes.data;
+                const poSends = sendRes.data;
 
                 for (const dp of dbPOs || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
                     lifecycleMap.set(dp.po_number, dp);
                 }
-
-                const { data: poSends } = await supabase
-                    .from("po_sends")
-                    .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
-                    .in("po_number", chunk);
 
                 for (const row of poSends || []) {
                     if (!poSendMap.has(row.po_number)) poSendMap.set(row.po_number, []);
