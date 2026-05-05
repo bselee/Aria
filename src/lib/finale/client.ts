@@ -3277,6 +3277,21 @@ export class FinaleClient {
             currentPO.orderItemList = this.mergeDraftOrderItems(currentPO.orderItemList || [], items);
             const updated = await this.post(`/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`, currentPO);
 
+            // Phase C — also stamp recs when reusing an existing draft. Vendor
+            // is read off the existing PO's role list. Best-effort.
+            try {
+                const supplierUrl = (currentPO.orderRoleList || [])
+                    .find((r: any) => r.roleTypeId === "SUPPLIER")?.partyUrl as string | undefined;
+                const vendorPartyId = supplierUrl ? supplierUrl.split("/").pop() ?? null : null;
+                const { stampRecommendationsWithDraftPO: _stamp } = await import("@/lib/purchasing/calibration");
+                await _stamp(
+                    orderId,
+                    items.map(i => ({ productId: i.productId, vendorPartyId, draftedQty: i.quantity })),
+                );
+            } catch (err: any) {
+                console.warn(`[finale] rec-stamp write failed on reuse for PO #${orderId}: ${err.message}`);
+            }
+
             return {
                 orderId,
                 finaleUrl: this.buildFinaleOrderUrl(updated?.orderUrl || currentPO.orderUrl, orderId),
@@ -4496,6 +4511,23 @@ export class FinaleClient {
             );
         } catch (err: any) {
             console.warn(`[finale] reservation write failed for PO #${orderId}: ${err.message}`);
+        }
+
+        // Phase C — stamp the most recent recommendation per (vendor, SKU) with the
+        // draft PO number so the dashboard ribbon can show "Aria recommended N → drafted as M".
+        // Best-effort; calibration matching falls back to fuzzy receive-time match if this skips.
+        try {
+            const { stampRecommendationsWithDraftPO: _stamp } = await import("@/lib/purchasing/calibration");
+            await _stamp(
+                orderId,
+                items.map(i => ({
+                    productId: i.productId,
+                    vendorPartyId,
+                    draftedQty: i.quantity,
+                })),
+            );
+        } catch (err: any) {
+            console.warn(`[finale] rec-stamp write failed for PO #${orderId}: ${err.message}`);
         }
 
         return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts };

@@ -57,13 +57,25 @@ function mean(values: number[]): number | null {
  * Walk recently-received POs, look up the recommendation that drove each line,
  * and stamp `actual_consumed_eaches` + `error_pct`. Idempotent — already-
  * calibrated rows are skipped.
+ *
+ * Matching strategy (per line):
+ *   1. **Precision** — find an uncalibrated rec whose `resulting_po_number`
+ *      already matches this PO. This is the deterministic link stamped by
+ *      `stampRecommendationsWithDraftPO` at draft time. No time window —
+ *      explicit stamps are authoritative.
+ *   2. **Fuzzy fallback** — most-recent uncalibrated rec for this SKU within
+ *      60d before receive, **excluding rows already stamped to a different
+ *      PO**. Catches POs created before the explicit stamp infra existed,
+ *      manually-added lines that bypassed the stamp, and POs received before
+ *      the rec snapshot landed.
  */
 export async function attachReceivedPOsToRecommendations(daysBack = 30): Promise<{
     receivedPOs: number;
     matched: number;
     calibrated: number;
+    matchMethods: { precision: number; fuzzy: number };
 }> {
-    const out = { receivedPOs: 0, matched: 0, calibrated: 0 };
+    const out = { receivedPOs: 0, matched: 0, calibrated: 0, matchMethods: { precision: 0, fuzzy: 0 } };
     const db = createClient();
     if (!db) return out;
 
@@ -81,24 +93,49 @@ export async function attachReceivedPOsToRecommendations(daysBack = 30): Promise
     for (const po of received) {
         for (const line of po.items) {
             try {
-                // Find the most recent uncalibrated recommendation for this SKU
-                // recommended within the 60-day window before the PO was received.
-                const lookbackStart = new Date(po.receiveDate);
-                lookbackStart.setDate(lookbackStart.getDate() - 60);
+                let rec: RecRow | undefined;
+                let matchMethod: "precision" | "fuzzy" | null = null;
 
-                const { data: recs } = await db
+                // 1. Precision: explicit draft-time stamp for this PO + SKU.
+                const { data: precise } = await db
                     .from("qty_recommendations")
                     .select("id, product_id, vendor_party_id, recommended_qty, recommended_at, inputs_jsonb")
                     .eq("product_id", line.productId)
+                    .eq("resulting_po_number", po.orderId)
                     .is("calibrated_at", null)
-                    .gte("recommended_at", lookbackStart.toISOString())
-                    .lte("recommended_at", po.receiveDate)
                     .order("recommended_at", { ascending: false })
                     .limit(1) as { data: RecRow[] | null };
+                if (precise && precise.length > 0) {
+                    rec = precise[0];
+                    matchMethod = "precision";
+                }
 
-                const rec = recs?.[0];
-                if (!rec) continue;
+                // 2. Fuzzy: most-recent uncalibrated rec in 60d window, but
+                // skip rows already linked to a *different* PO (prevents
+                // double-attribution when the explicit stamp lives elsewhere).
+                if (!rec) {
+                    const lookbackStart = new Date(po.receiveDate);
+                    lookbackStart.setDate(lookbackStart.getDate() - 60);
+
+                    const { data: fuzzy } = await db
+                        .from("qty_recommendations")
+                        .select("id, product_id, vendor_party_id, recommended_qty, recommended_at, inputs_jsonb")
+                        .eq("product_id", line.productId)
+                        .is("calibrated_at", null)
+                        .is("resulting_po_number", null)
+                        .gte("recommended_at", lookbackStart.toISOString())
+                        .lte("recommended_at", po.receiveDate)
+                        .order("recommended_at", { ascending: false })
+                        .limit(1) as { data: RecRow[] | null };
+                    if (fuzzy && fuzzy.length > 0) {
+                        rec = fuzzy[0];
+                        matchMethod = "fuzzy";
+                    }
+                }
+
+                if (!rec || !matchMethod) continue;
                 out.matched += 1;
+                out.matchMethods[matchMethod] += 1;
 
                 const recAt = new Date(rec.recommended_at);
                 const recvAt = new Date(po.receiveDate);
@@ -129,6 +166,10 @@ export async function attachReceivedPOsToRecommendations(daysBack = 30): Promise
                 console.warn(`[calibration-engine] line calibration failed for ${line.productId}: ${err.message}`);
             }
         }
+    }
+
+    if (out.calibrated > 0) {
+        console.log(`[calibration-engine] calibrated ${out.calibrated}/${out.matched} lines · precision=${out.matchMethods.precision} fuzzy=${out.matchMethods.fuzzy}`);
     }
     return out;
 }
