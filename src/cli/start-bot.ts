@@ -23,6 +23,8 @@ import {
     TELEGRAM_CONFIG
 } from '../config/persona';
 import { OpsManager } from '../lib/intelligence/ops-manager';
+import '../cron/jobs'; // side-effect: registers every cron job
+import { startCronRunner } from '../cron/runner';
 import { registerAllCommands } from './commands';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
@@ -1621,8 +1623,9 @@ bot.on('text', async (ctx) => {
     }
 
     const ops = new OpsManager(bot);
-    ops.registerJobs();
-    console.log('[boot] OpsManager cron jobs registered.');
+    ops.registerJobs(); // no-op shim; preserved for callers/tests
+    startCronRunner();
+    console.log('[boot] Cron registry started.');
 
     // Start Slack Watchdog in-process BEFORE botDeps construction
     // so deps.watchdog captures the live instance, not null.

@@ -2,7 +2,7 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import { getLocalDb } from "../storage/local-db";
-import cron, { type ScheduledTask } from "node-cron";
+import { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
 import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
@@ -86,7 +86,13 @@ const RECONCILE_MAX_BUFFER = 10 * 1024 * 1024; // 10MB stdout cap
 export const cronLastRun = getAllCronRunStatuses();
 
 export class OpsManager {
-    private bot: Telegraf;
+    /**
+     * Live singleton instance, set in the constructor. Used by
+     * src/cron/jobs/index.ts to dispatch handlers without DI.
+     */
+    static singleton: OpsManager | null = null;
+
+    public bot: Telegraf;
     private scheduledTasks: ScheduledTask[] = [];
     private slack: WebClient | null;
     private slackChannel: string;
@@ -120,6 +126,7 @@ export class OpsManager {
 
     constructor(bot: Telegraf) {
         this.bot = bot;
+        OpsManager.singleton = this;
 
         // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
         // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
@@ -424,183 +431,98 @@ export class OpsManager {
 
     /**
      * Register all background cron jobs.
+     *
+     * DECISION(2026-05-05): Cron registration moved into the typed registry at
+     * src/cron/jobs/index.ts (defineJob entries) and started by
+     * startCronRunner() in the boot path. This method is now a no-op kept for
+     * backward compatibility with callers like start-bot.ts. The singleton
+     * field is set in the constructor; cron handlers reach OpsManager via
+     * OpsManager.singleton.
      */
     registerJobs() {
-        const TZ = { timezone: "America/Denver" };
-        this.scheduledTasks = [];
+        // Intentionally empty. See src/cron/jobs/index.ts.
+        console.log("✅ OpsManager: cron registration delegated to src/cron/jobs.");
+    }
 
-        const schedule = (expression: string, task: () => void) => {
-            const scheduledTask = cron.schedule(expression, task, TZ);
-            this.scheduledTasks.push(scheduledTask);
-            return scheduledTask;
-        };
-
-        // AP polling every 15 minutes
-        schedule("*/15 * * * *", () => {
-            this.safeRun("APPolling", () => this.pollAPInbox());
-        });
-
-        // Build risk analysis at 7:30 AM weekdays
-        schedule("30 7 * * 1-5", () => {
-            this.safeRun("BuildRisk", () => this.runDailyBuildRisk());
-        });
-
-        // Daily summary at 8:00 AM weekdays (Mon-Fri only)
-        schedule("0 8 * * 1-5", () => {
-            this.safeRun("DailySummary", () => this.sendDailySummary());
-        });
-
-        // Weekly summary at 8:01 AM Fridays
-        schedule("1 8 * * 5", () => {
-            this.safeRun("WeeklySummary", () => this.sendWeeklySummary());
-        });
-
-        // Nightshift enqueue at 6:00 PM weekdays
-        schedule("0 18 * * 1-5", () => {
-            this.safeRun("NightshiftEnqueue", () => this.enqueueNightshiftWork());
-        });
-
-        // Housekeeping at 9:00 PM
-        schedule("0 21 * * *", () => {
-            this.safeRun("Housekeeping", () => runHousekeeping());
-        });
-
-        // Dashboard stat indexing every hour
-        schedule("5 * * * *", () => {
-            this.safeRun("StatIndexing", () => this.indexOperationsContext());
-        });
-
-        // PO Sync every 30 minutes
-        schedule("*/30 * * * *", () => {
-            this.safeRun("POSync", () => this.syncPOConversations());
-        });
-
-        // Calibration loop — daily at 8:30 AM, after the morning summary.
-        // Pulls newly-received POs, calibrates the recommendations they came
-        // from, recomputes vendor-level safety multipliers, and prunes
-        // expired draft reservations.
-        schedule("30 8 * * *", () => {
-            this.safeRun("QtyCalibration", () => this.runQtyCalibration());
-        });
-
-        // PO-First AP Sweep every 4 hours
-        schedule("30 */4 * * *", () => {
-            this.safeRun("POSweep", () => runPOSweep(60, false));
-        });
-
-        // VENDOR RECONCILIATIONS
-        schedule("0 1 * * 1-5", () => {
-            this.safeRun("ReconcileAxiom", () => this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts"));
-        });
-
-        schedule("30 1 * * 1-5", () => {
-            this.safeRun("ReconcileFedEx", () => this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts"));
-        });
-
-        schedule("0 2 * * 1-5", () => {
-            this.safeRun("ReconcileTeraGanix", () => this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts"));
-        });
-
-        schedule("0 3 * * 1-5", () => {
-            this.safeRun("ReconcileULINE", () => this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts"));
-        });
-
-        // Build Completion Watcher every 30 minutes
-        schedule("*/30 * * * *", () => {
-            this.safeRun("BuildCompletionWatcher", () => this.pollBuildCompletions());
-        });
-
-        // PO Receiving Watcher every 30 minutes
-        schedule("*/30 * * * *", () => {
-            this.safeRun("POReceivingWatcher", () => this.pollPOReceivings());
-        });
-
-        // Purchasing Calendar Sync every 4 hours
-        schedule("0 */4 * * *", () => {
-            this.safeRun("PurchasingCalendarSync", () => this.syncPurchasingCalendar(60));
-        });
-
-        // Missing Reconciliation Watchdog at 9 AM weekdays
-        schedule("0 9 * * 1-5", () => {
-            this.safeRun("MissingReconciliationWatchdog", () => this.checkMissingReconciliationRuns());
-        });
-
-        // Hygiene: close completed agent_task rows every 5 minutes
-        schedule("*/5 * * * *", () => {
-            this.safeRun("CloseFinishedTasks", async () => {
-                const closed = await closeFinishedTasks();
-                if (closed > 0) {
-                    console.log(`[OpsManager] closeFinishedTasks: closed ${closed} task(s)`);
-                }
-            });
-        });
-
-        // Self-heal Layer A: tripwires every 30 min — migration drift, etc.
-        // Lazy-imports keep boot path lean.
-        schedule("*/30 * * * *", () => {
-            this.safeRun("MigrationTripwire", async () => {
-                const { runAllTripwires } = await import("./tripwires");
-                const { applyTripwireResults } = await import("./tripwire-runner");
-                const results = await runAllTripwires();
-                await applyTripwireResults(results);
-                const failing = results.filter(r => !r.ok).length;
-                if (failing > 0) {
-                    console.log(`[OpsManager] tripwires: ${failing}/${results.length} failing`);
-                }
-            });
-        });
-
-        // Self-heal Layer C: every 10 min, dispatch queued playbooks against
-        // tasks that have playbook_kind set and haven't exhausted retries.
-        // Permission flags read at call time so flipping the env var without
-        // restarting the bot still works on the next cycle.
-        schedule("*/10 * * * *", () => {
-            this.safeRun("TaskSelfHealer", async () => {
-                const { runOnce } = await import("./playbooks/runner");
-                const summary = await runOnce({
-                    allow: {
-                        dbWrite: process.env.PLAYBOOK_ALLOW_DB_WRITE === "1",
-                        forcePush: process.env.PLAYBOOK_ALLOW_FORCE_PUSH === "1",
-                    },
-                });
-                if (summary.attempted > 0) {
-                    console.log("[OpsManager] TaskSelfHealer:", summary);
-                }
-            });
-        });
-
-        // Phase 1 issue ledger: every 5 min, group recent tasks by
-        // business-flow key and ensure agent_issue rows exist + linked.
-        schedule("*/5 * * * *", () => {
-            this.safeRun("IssueProjection", async () => {
-                const { runIssueProjection } = await import("./issue-projection-cron");
-                const summary = await runIssueProjection();
-                if (summary.issues_created_or_advanced > 0 || summary.tasks_linked > 0) {
-                    console.log("[OpsManager] IssueProjection:", summary);
-                }
-            });
-        });
-
-        // Plan task 4: issue orchestrator. Disabled by default until Task 8
-        // smoke confirms safe behavior. Enable via:
-        //   ISSUE_ORCHESTRATOR_ENABLED=true
-        const orchestratorEnabled = (process.env.ISSUE_ORCHESTRATOR_ENABLED ?? "false").toLowerCase() === "true";
-        if (orchestratorEnabled) {
-            schedule("*/5 * * * *", () => {
-                this.safeRun("IssueOrchestrator", async () => {
-                    const { runIssueOrchestratorOnce } = await import("./issue-orchestrator");
-                    const summary = await runIssueOrchestratorOnce({ limit: 10 });
-                    if (summary.evaluated > 0) {
-                        console.log("[OpsManager] IssueOrchestrator:", summary);
-                    }
-                });
-            });
-            console.log("⚙️  IssueOrchestrator cron enabled (ISSUE_ORCHESTRATOR_ENABLED=true).");
-        } else {
-            console.log("⚙️  IssueOrchestrator cron skipped (ISSUE_ORCHESTRATOR_ENABLED unset/false).");
+    /** Wraps closeFinishedTasks() with a count log. */
+    public async runCloseFinishedTasks(): Promise<void> {
+        const closed = await closeFinishedTasks();
+        if (closed > 0) {
+            console.log(`[OpsManager] closeFinishedTasks: closed ${closed} task(s)`);
         }
+    }
 
-        console.log("✅ OpsManager background jobs registered.");
+    /** Self-heal Layer A: tripwires (migration drift, etc.). */
+    public async runMigrationTripwire(): Promise<void> {
+        const { runAllTripwires } = await import("./tripwires");
+        const { applyTripwireResults } = await import("./tripwire-runner");
+        const results = await runAllTripwires();
+        await applyTripwireResults(results);
+        const failing = results.filter(r => !r.ok).length;
+        if (failing > 0) {
+            console.log(`[OpsManager] tripwires: ${failing}/${results.length} failing`);
+        }
+    }
+
+    /** Self-heal Layer C: dispatch queued playbooks. Reads env at call time. */
+    public async runTaskSelfHealer(): Promise<void> {
+        const { runOnce } = await import("./playbooks/runner");
+        const summary = await runOnce({
+            allow: {
+                dbWrite: process.env.PLAYBOOK_ALLOW_DB_WRITE === "1",
+                forcePush: process.env.PLAYBOOK_ALLOW_FORCE_PUSH === "1",
+            },
+        });
+        if (summary.attempted > 0) {
+            console.log("[OpsManager] TaskSelfHealer:", summary);
+        }
+    }
+
+    /** Phase 1 issue ledger: project recent tasks into agent_issue rows. */
+    public async runIssueProjection(): Promise<void> {
+        const { runIssueProjection } = await import("./issue-projection-cron");
+        const summary = await runIssueProjection();
+        if (summary.issues_created_or_advanced > 0 || summary.tasks_linked > 0) {
+            console.log("[OpsManager] IssueProjection:", summary);
+        }
+    }
+
+    /** Plan task 4: issue orchestrator. Gated by ISSUE_ORCHESTRATOR_ENABLED. */
+    public async runIssueOrchestrator(): Promise<void> {
+        const { runIssueOrchestratorOnce } = await import("./issue-orchestrator");
+        const summary = await runIssueOrchestratorOnce({ limit: 10 });
+        if (summary.evaluated > 0) {
+            console.log("[OpsManager] IssueOrchestrator:", summary);
+        }
+    }
+
+    /** Housekeeping wrapper. */
+    public async runHousekeeping(): Promise<void> {
+        await runHousekeeping();
+    }
+
+    /** PO-First AP Sweep wrapper. */
+    public async runPOSweep(): Promise<void> {
+        await runPOSweep(60, false);
+    }
+
+    /** Vendor reconciliation wrappers. */
+    public async runReconcileAxiom(): Promise<void> {
+        await this.runReconciliation("Axiom", "node --import tsx src/cli/reconcile-axiom.ts");
+    }
+    public async runReconcileFedEx(): Promise<void> {
+        await this.runReconciliation("FedEx", "node --import tsx src/cli/reconcile-fedex.ts");
+    }
+    public async runReconcileTeraGanix(): Promise<void> {
+        await this.runReconciliation("TeraGanix", "node --import tsx src/cli/reconcile-teraganix.ts");
+    }
+    public async runReconcileULINE(): Promise<void> {
+        await this.runReconciliation("ULINE", "node --import tsx src/cli/reconcile-uline.ts");
+    }
+
+    /** Purchasing calendar sync wrapper (60-day window). */
+    public async runPurchasingCalendarSync(): Promise<void> {
+        await this.syncPurchasingCalendar(60);
     }
 
     /**
@@ -697,7 +619,7 @@ export class OpsManager {
     /**
      * Run a child process reconciliation script.
      */
-    private async runReconciliation(vendorName: string, command: string) {
+    public async runReconciliation(vendorName: string, command: string) {
         console.log(`🔄 Starting ${vendorName} reconciliation...`);
         try {
             const { stdout, stderr } = await execAsync(command, { timeout: RECONCILE_TIMEOUT_MS, maxBuffer: RECONCILE_MAX_BUFFER });
@@ -1100,7 +1022,7 @@ export class OpsManager {
 
         try {
             const attached = await attachReceivedPOsToRecommendations(30);
-            console.log(`[qty-calibration] receivedPOs=${attached.receivedPOs} matched=${attached.matched} calibrated=${attached.calibrated}`);
+            console.log(`[qty-calibration] receivedPOs=${attached.receivedPOs} matched=${attached.matched} calibrated=${attached.calibrated} (precision=${attached.matchMethods.precision} fuzzy=${attached.matchMethods.fuzzy})`);
         } catch (err: any) {
             console.warn(`[qty-calibration] attach pass failed: ${err.message}`);
         }
