@@ -137,7 +137,41 @@ export class APIdentifierAgent {
         this.bot = bot || null;
     }
 
-    private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
+    /**
+     * Labels we trust from the overnight nightshift Haiku pre-classifier.
+     * If nightshift produced one of these with confidence ≥ 0.7, we skip
+     * the paid Sonnet call entirely (KAIZEN #3, 2026-05-05).
+     */
+    private static readonly NIGHTSHIFT_KNOWN_LABELS: ReadonlySet<string> = new Set([
+        "INVOICE",
+        "STATEMENT",
+        "ADVERTISEMENT",
+        "HUMAN_INTERACTION",
+        "PAID_INVOICE",
+    ]);
+
+    private async classifyEmailIntent(
+        subject: string,
+        from: string,
+        snippet: string,
+        gmailMessageId?: string,
+    ): Promise<string> {
+        // KAIZEN #3 (2026-05-05): Honor nightshift pre-classification before paying for Sonnet.
+        // getPreClassification() already enforces conf ≥ 0.7 + valid label, but we re-check
+        // here defensively so this method is safe to call from any path.
+        if (gmailMessageId) {
+            const pre = await getPreClassification(gmailMessageId).catch(() => null);
+            if (
+                pre &&
+                typeof pre.confidence === "number" &&
+                pre.confidence >= 0.7 &&
+                APIdentifierAgent.NIGHTSHIFT_KNOWN_LABELS.has(pre.classification)
+            ) {
+                console.log(`     -> Pre-classified (${pre.handler}, conf=${pre.confidence.toFixed(2)}): ${pre.classification} [skipped paid Sonnet]`);
+                return pre.classification;
+            }
+        }
+
         const schema = z.object({
             intent: z.enum(["INVOICE", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION", "PAID_INVOICE"]),
         });
@@ -646,17 +680,11 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     intent = "PAID_INVOICE";
                     console.log(`     -> Forced PAID_INVOICE (regex heuristic match)`);
                 } else {
-                    // DECISION(2026-03-24): Check nightshift pre-classification before paid LLM call.
-                    // If nightshift classified this overnight with confidence >= 0.7, use it.
-                    // Falls through to paid LLM on null return — zero risk to daytime AP flow.
-                    const preClass = await getPreClassification(m.gmail_message_id).catch(() => null);
-                    if (preClass) {
-                        intent = preClass.classification;
-                        console.log(`     -> Pre-classified (${preClass.handler}, conf=${preClass.confidence.toFixed(2)}): ${intent}`);
-                    } else {
-                        intent = await this.classifyEmailIntent(subject, from, snippet);
-                        console.log(`     -> Classified as: ${intent}`);
-                    }
+                    // DECISION(2026-03-24, refined 2026-05-05 KAIZEN #3):
+                    // classifyEmailIntent() now internally honors nightshift pre-classification
+                    // (conf ≥ 0.7 + known label) and skips the paid Sonnet call when present.
+                    intent = await this.classifyEmailIntent(subject, from, snippet, m.gmail_message_id);
+                    console.log(`     -> Classified as: ${intent}`);
                 }
 
                 if (intent === "ADVERTISEMENT") {
