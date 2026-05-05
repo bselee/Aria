@@ -228,6 +228,131 @@ export interface RecommendationSnapshot {
     provenance: Array<Record<string, any>>;
 }
 
+// ──────────────────────────────────────────────────
+// REC → DRAFT PO BACKREF (Phase C)
+// ──────────────────────────────────────────────────
+
+export interface DraftedPOLink {
+    productId: string;
+    vendorPartyId: string | null;
+    draftedQty: number;
+}
+
+/**
+ * Stamp the most recent uncalibrated, unlinked recommendation per (vendor, SKU)
+ * with the draft PO number that consumed it. Best-effort.
+ *
+ * Logic per item: take the most recent qty_recommendations row matching
+ * (vendor_party_id, product_id) that has no resulting_po_number set yet — that
+ * is the recommendation Will saw on the dashboard right before clicking Draft PO.
+ * Stamp the orderId, drafted timestamp, and the actual qty drafted (which may
+ * differ from recommended_qty if Will edited it).
+ *
+ * Multiple SKUs per PO → one stamp per SKU. If a SKU has no recent rec
+ * (e.g. manual add, or older than the lookup window), it's silently skipped —
+ * no harm, just no backref for that line.
+ */
+export async function stampRecommendationsWithDraftPO(
+    draftPONumber: string,
+    items: DraftedPOLink[],
+): Promise<number> {
+    if (items.length === 0) return 0;
+    const db = createClient();
+    if (!db) return 0;
+
+    let stamped = 0;
+    const draftedAt = new Date().toISOString();
+    // Lookback window: 30d. Recs older than this almost certainly weren't the
+    // one Will acted on. Tighter than the 60d calibration window because the
+    // draft action is a real-time event.
+    const sinceIso = new Date(Date.now() - 30 * 86400_000).toISOString();
+
+    for (const item of items) {
+        try {
+            // Find the most recent unstamped rec for this (vendor, SKU).
+            const query = db
+                .from("qty_recommendations")
+                .select("id")
+                .eq("product_id", item.productId)
+                .is("resulting_po_number", null)
+                .gte("recommended_at", sinceIso)
+                .order("recommended_at", { ascending: false })
+                .limit(1);
+            // vendor_party_id may be null on either side; only filter when known.
+            if (item.vendorPartyId) query.eq("vendor_party_id", item.vendorPartyId);
+
+            const { data: candidates, error: selErr } = await query;
+            if (selErr) {
+                console.warn(`[calibration] stamp lookup failed for ${item.productId}: ${selErr.message}`);
+                continue;
+            }
+            if (!candidates || candidates.length === 0) continue;
+
+            const { error: updErr } = await db
+                .from("qty_recommendations")
+                .update({
+                    resulting_po_number: draftPONumber,
+                    resulting_po_drafted_at: draftedAt,
+                    resulting_po_drafted_qty: item.draftedQty,
+                })
+                .eq("id", candidates[0].id);
+            if (updErr) {
+                console.warn(`[calibration] stamp update failed for ${item.productId}: ${updErr.message}`);
+                continue;
+            }
+            stamped++;
+        } catch (err: any) {
+            console.warn(`[calibration] stampRecommendationsWithDraftPO exception for ${item.productId}: ${err.message}`);
+        }
+    }
+    return stamped;
+}
+
+// ──────────────────────────────────────────────────
+// REC SUMMARY READ (for dashboard ribbon)
+// ──────────────────────────────────────────────────
+
+export interface DraftedPORecSummary {
+    poNumber: string;
+    productId: string;
+    recommendedQty: number;
+    draftedQty: number;
+    recommendedAt: string;
+    draftedAt: string;
+}
+
+/** Read back the rec → PO link rows for a list of PO numbers. */
+export async function loadDraftedPORecSummaries(
+    poNumbers: string[],
+): Promise<Map<string, DraftedPORecSummary[]>> {
+    const map = new Map<string, DraftedPORecSummary[]>();
+    if (poNumbers.length === 0) return map;
+    const db = createClient();
+    if (!db) return map;
+    try {
+        const { data } = await db
+            .from("qty_recommendations")
+            .select("resulting_po_number, product_id, recommended_qty, resulting_po_drafted_qty, recommended_at, resulting_po_drafted_at")
+            .in("resulting_po_number", poNumbers);
+        for (const row of data ?? []) {
+            const po = row.resulting_po_number;
+            if (!po) continue;
+            if (!map.has(po)) map.set(po, []);
+            map.get(po)!.push({
+                poNumber: po,
+                productId: row.product_id,
+                recommendedQty: Number(row.recommended_qty ?? 0),
+                draftedQty: Number(row.resulting_po_drafted_qty ?? 0),
+                recommendedAt: row.recommended_at,
+                draftedAt: row.resulting_po_drafted_at,
+            });
+        }
+    } catch (err: any) {
+        console.warn(`[calibration] loadDraftedPORecSummaries failed: ${err.message}`);
+    }
+    return map;
+}
+
 /**
  * Best-effort batch insert of recommendation snapshots. We don't need durability
  * — a missed snapshot just means one fewer calibration sample later. Errors are

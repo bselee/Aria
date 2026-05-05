@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { FinaleClient } from "@/lib/finale/client";
 import { loadActivePurchases } from "@/lib/purchasing/active-purchases";
+import { loadDraftedPORecSummaries } from "@/lib/purchasing/calibration";
 import { createClient } from "@/lib/supabase";
 
 export async function GET(req: Request) {
@@ -8,8 +9,16 @@ export async function GET(req: Request) {
         const finale = new FinaleClient();
         const activePos = await loadActivePurchases(finale, 60);
 
+        // Phase C — attach rec backreferences (recommended vs drafted qty per SKU).
+        // Best-effort: a Supabase miss returns the active POs without rec links.
+        const recsByPO = await loadDraftedPORecSummaries(activePos.map(p => p.orderId));
+        const enriched = activePos.map(po => ({
+            ...po,
+            recLinks: recsByPO.get(po.orderId) ?? [],
+        }));
+
         return NextResponse.json({
-            purchases: activePos,
+            purchases: enriched,
             cachedAt: new Date().toISOString(),
         });
 

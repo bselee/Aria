@@ -73,10 +73,43 @@ type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
 type FocusFilter = "today" | "week" | "all";
+type LifecycleBucket = "need" | "topping" | "on_order" | "other";
+type LifecycleFilter = LifecycleBucket | "all";
+
+// Minimal subset of ActivePurchase needed to enrich openPOs with lifecycle detail.
+// Declared locally to avoid pulling server-only modules into the client bundle.
+type RecLink = {
+    productId: string;
+    recommendedQty: number;
+    draftedQty: number;
+    recommendedAt: string;
+    draftedAt: string;
+};
+
+type OpenPODetail = {
+    orderId: string;
+    expectedDate?: string;
+    leadProvenance?: string;
+    trackingNumbers?: string[];
+    lifecycleStage?: string;
+    vendorAcknowledgedAt?: string | null;
+    sentVerification?: { verified?: boolean; sentAt?: string | null; source?: string | null };
+    isReceived?: boolean;
+    recLinks?: RecLink[];
+};
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
 const FOCUS_FILTER_LS = "aria-dash-purchasing-focus";
+const LIFECYCLE_FILTER_LS = "aria-dash-purchasing-lifecycle";
+
+function lifecycleBucket(item: PurchasingItem): LifecycleBucket {
+    const reasons = item.assessment?.reasonCodes ?? [];
+    if (reasons.includes("on_order_already_covers_need")) return "on_order";
+    const decision = item.assessment?.decision;
+    if (decision === "order") return item.stockOnOrder > 0 ? "topping" : "need";
+    return "other"; // hold (other reasons), manual_review, reduce
+}
 const URGENCY_RANK = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
 // DECISION(2026-03-10): Badge hierarchy reform — only CRIT gets a filled pill.
 // WARN = amber text only (no pill).  WATCH/OK = invisible badge.
@@ -161,6 +194,8 @@ export default function PurchasingPanel() {
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("today");
+    const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
+    const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
 
     // ULINE direct ordering
     const [ulineOrdering, setUlineOrdering] = useState(false);
@@ -186,6 +221,47 @@ export default function PurchasingPanel() {
         }
     }, []);
     useEffect(() => { localStorage.setItem(FOCUS_FILTER_LS, focusFilter); }, [focusFilter]);
+    useEffect(() => {
+        const saved = localStorage.getItem(LIFECYCLE_FILTER_LS) as LifecycleFilter | null;
+        if (saved === "need" || saved === "topping" || saved === "on_order" || saved === "other" || saved === "all") {
+            setLifecycleFilter(saved);
+        }
+    }, []);
+    useEffect(() => { localStorage.setItem(LIFECYCLE_FILTER_LS, lifecycleFilter); }, [lifecycleFilter]);
+
+    // Fetch open-PO detail (ETA, tracking, lifecycle) once per panel load. Best-effort —
+    // missing detail just means the lifecycle ribbon falls back to PO# + qty + orderDate.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch("/api/dashboard/active-purchases");
+                if (!res.ok) return;
+                const json: { purchases?: any[] } = await res.json();
+                if (cancelled || !json.purchases) return;
+                const m = new Map<string, OpenPODetail>();
+                for (const p of json.purchases) {
+                    if (!p.orderId) continue;
+                    const id = String(p.orderId);
+                    m.set(id, {
+                        orderId: id,
+                        expectedDate: p.expectedDate,
+                        leadProvenance: p.leadProvenance,
+                        trackingNumbers: Array.isArray(p.trackingNumbers) ? p.trackingNumbers : [],
+                        lifecycleStage: p.lifecycleStage,
+                        vendorAcknowledgedAt: p.vendorAcknowledgedAt ?? null,
+                        sentVerification: p.sentVerification
+                            ? { verified: p.sentVerification.verified, sentAt: p.sentVerification.sentAt, source: p.sentVerification.source }
+                            : undefined,
+                        isReceived: p.isReceived,
+                        recLinks: Array.isArray(p.recLinks) ? p.recLinks : [],
+                    });
+                }
+                setOpenPosDetail(m);
+            } catch { /* best-effort */ }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     // Load snooze state from localStorage; purge expired entries on mount
     useEffect(() => {
@@ -272,6 +348,10 @@ export default function PurchasingPanel() {
         const bucket = getOrderingFocusBucket(item);
         if (focusFilter === "today") return bucket === "today";
         return bucket === "today" || bucket === "week";
+    }
+    function itemMatchesLifecycle(item: PurchasingItem): boolean {
+        if (lifecycleFilter === "all") return true;
+        return lifecycleBucket(item) === lifecycleFilter;
     }
     // Vendor is effectively hidden if vendor-level snoozed OR every item is individually snoozed
     function vendorSnoozed(g: PurchasingGroup): boolean {
@@ -442,6 +522,33 @@ export default function PurchasingPanel() {
 
     async function handleCreateOne(group: PurchasingGroup) {
         const pid = group.vendorPartyId;
+
+        // Soft guard: warn if any selected SKU already has open POs covering it.
+        // Catches the muscle-memory double-order on rows where Aria is suggesting
+        // a top-up rather than a fresh order.
+        const selectedItemsWithOpenPOs = group.items.filter(item =>
+            !isSnoozed(item.productId)
+            && checked[pid]?.[item.productId]
+            && item.openPOs
+            && item.openPOs.length > 0
+        );
+        if (selectedItemsWithOpenPOs.length > 0) {
+            const lines = selectedItemsWithOpenPOs.map(item => {
+                const pos = item.openPOs.map(p => {
+                    const d = openPosDetail.get(p.orderId);
+                    const eta = d?.expectedDate ? ` · ETA ${new Date(d.expectedDate).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}` : '';
+                    return `PO ${p.orderId} (qty ${p.quantity}${eta})`;
+                }).join(', ');
+                return `  • ${item.productId}: ${pos}`;
+            }).join('\n');
+            const proceed = window.confirm(
+                `${selectedItemsWithOpenPOs.length} SKU(s) already have open POs in flight:\n\n${lines}\n\n` +
+                `Aria still recommends ordering more (incremental need beyond what's coming).\n\n` +
+                `Create a new draft PO anyway?`
+            );
+            if (!proceed) return;
+        }
+
         setCreatingPO(p => new Set(p).add(pid));
         try {
             const result = await createVendorPO(group);
@@ -569,9 +676,20 @@ export default function PurchasingPanel() {
     const focusGroups = displayGroups
         .map(group => ({
             ...group,
-            items: sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item))),
+            items: sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item) && itemMatchesLifecycle(item))),
         }))
         .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
+
+    // Lifecycle bucket counts — computed across all focus-matched items so tabs
+    // reveal what's hidden on the current focus window. Uses the same vendor
+    // visibility filter (snooze) as the rest of the pipeline.
+    const lifecycleCounts: Record<LifecycleBucket, number> = { need: 0, topping: 0, on_order: 0, other: 0 };
+    for (const g of displayGroups) {
+        for (const item of g.items) {
+            if (!itemMatchesFocus(item)) continue;
+            lifecycleCounts[lifecycleBucket(item)]++;
+        }
+    }
     const visibleGroups = vendorTab === "all" ? focusGroups : focusGroups.filter(g => g.vendorPartyId === vendorTab);
 
     // Total hidden items across all snoozed vendors + individually snoozed items
@@ -794,6 +912,34 @@ export default function PurchasingPanel() {
 
             {!isCollapsed && (
                 <>
+                    {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
+                    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                        <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">show</span>
+                        {([
+                            { k: "need" as const, label: "Need Order", tone: "bg-red-500/15 text-red-300 border-red-500/40", inactive: "text-zinc-400 border-zinc-700 hover:text-zinc-200" },
+                            { k: "topping" as const, label: "Topping Up", tone: "bg-amber-500/15 text-amber-300 border-amber-500/40", inactive: "text-zinc-500 border-zinc-700 hover:text-zinc-300" },
+                            { k: "on_order" as const, label: "On Order", tone: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40", inactive: "text-zinc-500 border-zinc-800 hover:text-zinc-300" },
+                            { k: "other" as const, label: "Other Holds", tone: "bg-zinc-700 text-zinc-200 border-zinc-500", inactive: "text-zinc-500 border-zinc-800 hover:text-zinc-300" },
+                        ]).map(t => (
+                            <button key={t.k}
+                                onClick={() => setLifecycleFilter(t.k)}
+                                className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${lifecycleFilter === t.k ? t.tone : t.inactive}`}
+                                title={t.k === "need" ? "Need a fresh PO — nothing already on order"
+                                    : t.k === "topping" ? "Open PO exists but Aria sees additional need"
+                                    : t.k === "on_order" ? "Open PO already covers near-term need — no action"
+                                    : "Other holds (FG covered, uneconomic, manual review)"}
+                            >
+                                {t.label} <span className="opacity-60">{lifecycleCounts[t.k]}</span>
+                            </button>
+                        ))}
+                        <button onClick={() => setLifecycleFilter("all")}
+                            className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${lifecycleFilter === "all" ? "bg-zinc-700 text-zinc-200 border-zinc-500" : "text-zinc-500 border-zinc-800 hover:text-zinc-300"}`}
+                            title="All buckets at once"
+                        >
+                            All <span className="opacity-60">{lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other}</span>
+                        </button>
+                    </div>
+
                     {/* ── Vendor tabs ── active vendors + snoozed (greyed) when showSnoozed */}
                     {focusGroups.length > 0 && (
                         <div className="flex items-center border-b border-zinc-800/60 bg-zinc-950/30 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -1174,6 +1320,55 @@ export default function PurchasingPanel() {
                                                                                     {snoozeMenu === iKey && renderSnoozeMenu(iKey)}
                                                                                 </div>
                                                                             </div>
+
+                                                                            {/* Row 1.5: Open-PO lifecycle ribbon — one chip per open PO covering this SKU */}
+                                                                            {!itemSnoozed && item.openPOs && item.openPOs.length > 0 && (
+                                                                                <div className="mt-1.5 flex flex-col gap-1">
+                                                                                    {item.openPOs.map((openPo) => {
+                                                                                        const detail = openPosDetail.get(openPo.orderId);
+                                                                                        const stage = detail?.lifecycleStage;
+                                                                                        // Color the chip by stage — green when shipped/delivered, amber when sent but unconfirmed, blue when sent+acked, gray when unknown.
+                                                                                        const chipClass = stage === "delivered" || stage === "moving_with_tracking"
+                                                                                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-200"
+                                                                                            : stage === "vendor_acknowledged" || stage === "tracking_unavailable"
+                                                                                                ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-200"
+                                                                                                : detail?.sentVerification?.verified
+                                                                                                    ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-200"
+                                                                                                    : "bg-zinc-800/60 border-zinc-700/60 text-zinc-300";
+                                                                                        // Build the inline status pieces.
+                                                                                        const pieces: string[] = [];
+                                                                                        if (detail?.sentVerification?.verified) pieces.push(`sent ✓`);
+                                                                                        if (detail?.vendorAcknowledgedAt) pieces.push(`acked ${new Date(detail.vendorAcknowledgedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
+                                                                                        if ((detail?.trackingNumbers?.length ?? 0) > 0) pieces.push(`📦 ${detail!.trackingNumbers![0].slice(-6)}`);
+                                                                                        if (detail?.expectedDate) pieces.push(`ETA ${new Date(detail.expectedDate).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
+                                                                                        // Phase C — find the rec link for THIS sku (the one being recommended).
+                                                                                        const recLink = (detail?.recLinks ?? []).find(r => r.productId === item.productId);
+                                                                                        const recDivergence = recLink && recLink.recommendedQty > 0
+                                                                                            ? Math.round(((recLink.draftedQty - recLink.recommendedQty) / recLink.recommendedQty) * 100)
+                                                                                            : null;
+                                                                                        return (
+                                                                                            <div key={openPo.orderId} className={`flex items-center gap-2 text-[10.5px] font-mono px-2 py-1 rounded border ${chipClass}`}>
+                                                                                                <span className="font-semibold shrink-0">PO {openPo.orderId}</span>
+                                                                                                <span className="text-[10px] opacity-70 shrink-0">qty {openPo.quantity}</span>
+                                                                                                {recLink && (
+                                                                                                    <span
+                                                                                                        className="text-[9.5px] font-mono text-cyan-300/80 border border-cyan-500/30 rounded px-1 shrink-0"
+                                                                                                        title={`Aria recommended ${recLink.recommendedQty} on ${new Date(recLink.recommendedAt).toLocaleDateString()} → drafted ${recLink.draftedQty} on ${new Date(recLink.draftedAt).toLocaleDateString()}`}
+                                                                                                    >
+                                                                                                        rec {recLink.recommendedQty}→{recLink.draftedQty}
+                                                                                                        {recDivergence != null && Math.abs(recDivergence) >= 10 && (
+                                                                                                            <span className="ml-1 text-amber-400">{recDivergence > 0 ? '+' : ''}{recDivergence}%</span>
+                                                                                                        )}
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {pieces.length > 0 && <span className="text-zinc-500 shrink-0">·</span>}
+                                                                                                <span className="truncate">{pieces.join(' · ')}</span>
+                                                                                                {!detail && <span className="text-[9.5px] text-zinc-500 italic shrink-0">no tracking detail</span>}
+                                                                                            </div>
+                                                                                        );
+                                                                                    })}
+                                                                                </div>
+                                                                            )}
 
                                                                             {/* Row 2: Description & Amount */}
                                                                             {!itemSnoozed && (
