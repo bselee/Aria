@@ -5,8 +5,11 @@ import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart }
 import {
     canIncludeInDraftPO,
     canUseDirectOrdering,
+    getEffectiveShortageDays,
     getOrderingFocusBucket,
+    itemMatchesOrderingFocus,
     shouldAutoSelectItem,
+    type OrderingFocusFilter,
 } from "@/lib/purchasing/dashboard-focus";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import type { FinaleReorderMethod } from "@/lib/finale/client";
@@ -83,7 +86,9 @@ type CommitReview = {
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
-type FocusFilter = "today" | "week" | "all";
+// v2 (2026-05-06): planning windows replace today/week.
+// localStorage migrates legacy values: today -> order_now, week -> 30.
+type FocusFilter = OrderingFocusFilter;
 type LifecycleBucket = "need" | "topping" | "on_order" | "other";
 type LifecycleFilter = LifecycleBucket | "all";
 
@@ -204,7 +209,7 @@ export default function PurchasingPanel() {
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
-    const [focusFilter, setFocusFilter] = useState<FocusFilter>("today");
+    const [focusFilter, setFocusFilter] = useState<FocusFilter>("order_now");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
     const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
 
@@ -226,8 +231,12 @@ export default function PurchasingPanel() {
     }, []);
     useEffect(() => { localStorage.setItem("aria-dash-purchasing-h", String(bodyHeight)); }, [bodyHeight]);
     useEffect(() => {
-        const savedFocus = localStorage.getItem(FOCUS_FILTER_LS) as FocusFilter | null;
-        if (savedFocus === "today" || savedFocus === "week" || savedFocus === "all") {
+        // v2 migration: legacy 'today' -> 'order_now', 'week' -> '30'.
+        // Anything unrecognized falls through to the default (order_now).
+        const savedFocus = localStorage.getItem(FOCUS_FILTER_LS);
+        if (savedFocus === "today") setFocusFilter("order_now");
+        else if (savedFocus === "week") setFocusFilter("30");
+        else if (savedFocus === "order_now" || savedFocus === "30" || savedFocus === "60" || savedFocus === "90" || savedFocus === "all") {
             setFocusFilter(savedFocus);
         }
     }, []);
@@ -355,10 +364,7 @@ export default function PurchasingPanel() {
         return "Selected items need PO handling";
     }
     function itemMatchesFocus(item: PurchasingItem): boolean {
-        if (focusFilter === "all") return true;
-        const bucket = getOrderingFocusBucket(item);
-        if (focusFilter === "today") return bucket === "today";
-        return bucket === "today" || bucket === "week";
+        return itemMatchesOrderingFocus(item, focusFilter);
     }
     function itemMatchesLifecycle(item: PurchasingItem): boolean {
         if (lifecycleFilter === "all") return true;
@@ -681,7 +687,60 @@ export default function PurchasingPanel() {
 
     // ── derived state ──────────────────────────────────────────────────────
     const allGroups = data?.groups ?? [];
-    const sortedGroups = [...allGroups].sort((a, b) => URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]);
+
+    /**
+     * v2 vendor sort. Score each group by *real* purchase need: earliest
+     * effective shortage among actionable items, then severity, then count,
+     * then total open need (refinement: tiebreaker that works even when
+     * nothing is checked yet — sums suggestedQty × unitPrice across actionable
+     * items, not just selected ones), then dollar value of selections, then
+     * alphabetical.
+     */
+    function vendorNeedScore(group: PurchasingGroup): {
+        earliestShortage: number;
+        urgencyRank: number;
+        actionableCount: number;
+        openNeedDollars: number;
+        selectedDollars: number;
+    } {
+        const actionable = group.items.filter(item =>
+            item.assessment?.decision === "order" || item.assessment?.decision === "reduce",
+        );
+        const candidates = actionable.length > 0 ? actionable : group.items;
+        const earliestShortage = candidates.length > 0
+            ? Math.min(...candidates.map(getEffectiveShortageDays))
+            : Number.POSITIVE_INFINITY;
+        const urgencyRank = candidates.length > 0
+            ? Math.min(...candidates.map(item => URGENCY_RANK[item.urgency]))
+            : URGENCY_RANK.ok;
+        const openNeedDollars = actionable.reduce(
+            (sum, item) => sum + (item.suggestedQty || 0) * (item.unitPrice || 0),
+            0,
+        );
+        const selectedDollars = actionable.reduce((sum, item) => {
+            const isChecked = !isSnoozed(item.productId) && checked[group.vendorPartyId]?.[item.productId];
+            return isChecked ? sum + (item.suggestedQty || 0) * (item.unitPrice || 0) : sum;
+        }, 0);
+        return {
+            earliestShortage,
+            urgencyRank,
+            actionableCount: actionable.length,
+            openNeedDollars,
+            selectedDollars,
+        };
+    }
+    const sortedGroups = [...allGroups].sort((a, b) => {
+        const left = vendorNeedScore(a);
+        const right = vendorNeedScore(b);
+        return (
+            left.earliestShortage - right.earliestShortage
+            || left.urgencyRank - right.urgencyRank
+            || right.actionableCount - left.actionableCount
+            || right.openNeedDollars - left.openNeedDollars
+            || right.selectedDollars - left.selectedDollars
+            || a.vendorName.localeCompare(b.vendorName)
+        );
+    });
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g));
     const displayGroups = showSnoozed ? sortedGroups : activeGroups;
     const focusGroups = displayGroups
@@ -709,8 +768,18 @@ export default function PurchasingPanel() {
         return n + g.items.filter(i => isSnoozed(i.productId)).length;
     }, 0);
 
-    const todayCount = activeGroups.flatMap(g => g.items).filter(item => getOrderingFocusBucket(item) === "today").length;
-    const weekCount = activeGroups.flatMap(g => g.items).filter(item => getOrderingFocusBucket(item) === "week").length;
+    // v2 cumulative window counts — every pill counts items, not vendors.
+    // Lifecycle filter is applied so the count matches the visible-rows count.
+    const focusCount = (filter: FocusFilter) =>
+        activeGroups
+            .flatMap(g => g.items)
+            .filter(item => itemMatchesOrderingFocus(item, filter) && itemMatchesLifecycle(item))
+            .length;
+    const orderNowCount = focusCount("order_now");
+    const thirtyCount = focusCount("30");
+    const sixtyCount = focusCount("60");
+    const ninetyCount = focusCount("90");
+    const allCount = focusCount("all");
     const actionableVendors = focusGroups.filter(g =>
         !createdPOs[g.vendorPartyId] &&
         g.items.some(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId])
@@ -848,33 +917,26 @@ export default function PurchasingPanel() {
                 )}
                 <div className="flex-1" />
 
-                <button
-                    onClick={() => setFocusFilter("today")}
-                    className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "today"
-                        ? "bg-red-500/20 text-red-300 border-red-500/40"
-                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
-                        }`}
-                >
-                    {todayCount} TODAY
-                </button>
-                <button
-                    onClick={() => setFocusFilter("week")}
-                    className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "week"
-                        ? "bg-yellow-500/20 text-yellow-300 border-yellow-500/40"
-                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
-                        }`}
-                >
-                    {weekCount} WEEK
-                </button>
-                <button
-                    onClick={() => setFocusFilter("all")}
-                    className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors ${focusFilter === "all"
-                        ? "bg-zinc-700 text-zinc-200 border-zinc-600"
-                        : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
-                        }`}
-                >
-                    ALL {activeGroups.length}
-                </button>
+                {/* v2 ordering filter — Order Now / 30 / 60 / 90 / All. Cumulative. Item-counted. */}
+                {([
+                    { k: "order_now" as const, label: "ORDER NOW", count: orderNowCount, active: "bg-red-500/20 text-red-300 border-red-500/40", title: "Items short within lead time (or already short with no PO coverage)" },
+                    { k: "30" as const, label: "30", count: thirtyCount, active: "bg-amber-500/20 text-amber-300 border-amber-500/40", title: "Show items projected short within 30 days" },
+                    { k: "60" as const, label: "60", count: sixtyCount, active: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40", title: "Show items projected short within 60 days" },
+                    { k: "90" as const, label: "90", count: ninetyCount, active: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40", title: "Show items projected short within 90 days" },
+                    { k: "all" as const, label: "ALL", count: allCount, active: "bg-zinc-700 text-zinc-200 border-zinc-600", title: "Every actionable item" },
+                ]).map(b => (
+                    <button
+                        key={b.k}
+                        onClick={() => setFocusFilter(b.k)}
+                        title={b.title}
+                        className={`text-xs font-mono ${b.k === "order_now" ? "font-bold" : ""} px-1.5 py-0.5 rounded border transition-colors ${focusFilter === b.k
+                            ? b.active
+                            : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
+                            }`}
+                    >
+                        {b.count} {b.label}
+                    </button>
+                ))}
 
                 {/* Snoozed badge — toggles reveal */}
                 {hiddenItemCount > 0 && (
@@ -961,7 +1023,13 @@ export default function PurchasingPanel() {
                                     : "border-transparent text-zinc-400 hover:text-zinc-200"
                                     }`}
                             >
-                                {focusFilter === "today" ? "Today" : focusFilter === "week" ? "This Week" : "All"} <span className="opacity-60">{focusGroups.length}</span>
+                                {({
+                                    order_now: "Order Now",
+                                    "30": "Next 30 Days",
+                                    "60": "Next 60 Days",
+                                    "90": "Next 90 Days",
+                                    all: "All",
+                                } as Record<FocusFilter, string>)[focusFilter]} <span className="opacity-60">{focusGroups.length}</span>
                             </button>
 
                             {focusGroups.map(g => {
@@ -1038,8 +1106,14 @@ export default function PurchasingPanel() {
                                         const qty = groupQtys[item.productId] ?? item.suggestedQty;
                                         return sum + qty * Math.max(0, item.unitPrice);
                                     }, 0);
-                                    const earliestRunway = activeItems.length > 0
-                                        ? Math.min(...activeItems.map(item => item.runwayDays))
+                                    // v2: use effective shortage (finaleStockout > adjustedRunway > rawRunway).
+                                    // Prefer actionable items so a row with a held SKU at 0d doesn't dominate the badge.
+                                    const actionableForShortage = activeItems.filter(i =>
+                                        i.assessment?.decision === "order" || i.assessment?.decision === "reduce",
+                                    );
+                                    const shortageCandidates = actionableForShortage.length > 0 ? actionableForShortage : activeItems;
+                                    const earliestRunway = shortageCandidates.length > 0
+                                        ? Math.min(...shortageCandidates.map(getEffectiveShortageDays))
                                         : null;
                                     const diffCount = activeItems.filter(item => item.qtyDiverged).length;
                                     const allCheckedFlag = activeItems.length > 0 && activeItems.every(i => groupChecked[i.productId]);
@@ -1072,9 +1146,12 @@ export default function PurchasingPanel() {
                                                             ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
                                                             : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
                                                     </span>
-                                                    {!vSnoozed && earliestRunway != null && (
-                                                        <span className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}>
-                                                            first out {Math.round(earliestRunway)}d
+                                                    {!vSnoozed && earliestRunway != null && Number.isFinite(earliestRunway) && (
+                                                        <span
+                                                            className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}
+                                                            title="Earliest effective shortage among actionable items (finaleStockout > adjustedRunway > rawRunway)"
+                                                        >
+                                                            shortage {Math.round(earliestRunway)}d
                                                         </span>
                                                     )}
                                                     {!vSnoozed && selectedCount > 0 && (
@@ -1340,16 +1417,32 @@ export default function PurchasingPanel() {
 
                                                                                 <div className="flex-1" />
 
-                                                                                {!itemSnoozed && (
-                                                                                    <span className={`text-xs font-mono shrink-0 ${rc}`}>
-                                                                                        Out in {Math.round(item.runwayDays)}d
-                                                                                        {item.stockOnOrder > 0 && (
-                                                                                            <span className="text-zinc-400 font-normal text-[10px]">
-                                                                                                {" "}→{Math.round(item.adjustedRunwayDays)}d
+                                                                                {!itemSnoozed && (() => {
+                                                                                    // v2: shortage label uses effective shortage, not raw runway.
+                                                                                    // Refinement A: when the lifecycle ribbon below will render
+                                                                                    // (item has open POs), drop the "→Xd adjusted" tail since the
+                                                                                    // ribbon shows the same coverage in more detail.
+                                                                                    const effective = getEffectiveShortageDays(item);
+                                                                                    const ribbonBelow = (item.openPOs?.length ?? 0) > 0;
+                                                                                    const rawIsZero = item.runwayDays === 0 && item.adjustedRunwayDays > 0;
+                                                                                    if (rawIsZero && !ribbonBelow) {
+                                                                                        return (
+                                                                                            <span className={`text-xs font-mono shrink-0 ${rc}`}>
+                                                                                                on hand out · covered <span className="text-zinc-300">{Math.round(item.adjustedRunwayDays)}d</span>
                                                                                             </span>
-                                                                                        )}
-                                                                                    </span>
-                                                                                )}
+                                                                                        );
+                                                                                    }
+                                                                                    return (
+                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`} title="Effective shortage: finaleStockoutDays > adjustedRunwayDays > runwayDays">
+                                                                                            shortage {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
+                                                                                            {!ribbonBelow && item.stockOnOrder > 0 && (
+                                                                                                <span className="text-zinc-400 font-normal text-[10px]">
+                                                                                                    {" "}(raw {Math.round(item.runwayDays)}d)
+                                                                                                </span>
+                                                                                            )}
+                                                                                        </span>
+                                                                                    );
+                                                                                })()}
 
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button
