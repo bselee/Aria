@@ -57,6 +57,15 @@ export type LLMOptions = {
      * un-attributed behavior (no budget enforcement).
      */
     agentId?: string;
+    /**
+     * KAIZEN #1: Anthropic prompt caching for repeated system prompts.
+     * When `'ephemeral'` AND the active provider is Anthropic AND the
+     * system prompt is >=1024 tokens (Anthropic's cache minimum), the
+     * call is sent with cache_control so subsequent calls within ~5 min
+     * pay 10% of input cost on cached blocks. Other providers ignore.
+     * Default `'off'` preserves existing behavior.
+     */
+    cacheControl?: "off" | "ephemeral";
 };
 
 export type LLMToolOptions = LLMOptions & {
@@ -216,6 +225,27 @@ export function getProviderStatus(): Array<{ name: string; status: 'healthy' | '
 }
 
 /**
+ * KAIZEN #1 helper. Returns Anthropic prompt-caching providerOptions IFF the
+ * active provider is Anthropic, cacheControl is 'ephemeral', and the system
+ * prompt is large enough to benefit (>=4000 chars ≈ >=1024 tokens, the
+ * Anthropic cache minimum). Anything else returns undefined so the call
+ * proceeds without provider-specific options.
+ *
+ * Single source of truth — every unified* function calls this so callsites
+ * never have to remember the cache wiring per-provider.
+ */
+function buildAnthropicCacheOptions(
+    cacheControl: LLMOptions["cacheControl"],
+    providerName: string,
+    systemText: string | undefined,
+): Record<string, unknown> | undefined {
+    if (cacheControl !== "ephemeral") return undefined;
+    if (!systemText || systemText.length < 4000) return undefined;
+    if (!providerName.toLowerCase().includes("anthropic")) return undefined;
+    return { anthropic: { cacheControl: { type: "ephemeral" } } };
+}
+
+/**
  * Generates raw text using the provider fallback chain.
  * Tries each available provider in order until one succeeds.
  */
@@ -250,6 +280,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
             if (provider.name.toLowerCase().includes('gemini')) {
                 await geminiLimiter.acquire();
             }
+            const cacheOpts = buildAnthropicCacheOptions(options.cacheControl, provider.name, options.system);
             const result = await generateText({
                 model: provider.model(),
                 system: options.system,
@@ -257,6 +288,7 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
                 maxTokens: options.maxTokens,
                 maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
+                ...(cacheOpts ? { providerOptions: cacheOpts } : {}),
             } as any);
             // Phase 4: charge the budget after a successful call. Use the
             // model's runtime modelId (or provider name as fallback) so the
@@ -314,6 +346,7 @@ export async function unifiedToolTextGeneration(options: LLMToolOptions): Promis
                 await geminiLimiter.acquire();
             }
 
+            const cacheOpts = buildAnthropicCacheOptions(options.cacheControl, provider.name, options.system);
             const result = await generateText({
                 model: provider.model(),
                 system: options.system,
@@ -323,6 +356,7 @@ export async function unifiedToolTextGeneration(options: LLMToolOptions): Promis
                 maxRetries: 0,
                 tools: options.tools,
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
+                ...(cacheOpts ? { providerOptions: cacheOpts } : {}),
             } as any);
 
             const stepCalls = Array.isArray((result as any).steps)
@@ -393,6 +427,7 @@ export async function unifiedObjectGeneration<T>(
             if (provider.name.toLowerCase().includes('gemini')) {
                 await geminiLimiter.acquire();
             }
+            const cacheOpts = buildAnthropicCacheOptions(options.cacheControl, provider.name, options.system);
             const result = await (generateObject({
                 model: provider.model(),
                 schema: options.schema,
@@ -400,8 +435,10 @@ export async function unifiedObjectGeneration<T>(
                 system: options.system,
                 temperature: options.temperature,
                 maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
-                // Disable strict JSON schema for OpenAI-compatible endpoints (allows optional/nullable fields)
-                providerOptions: { openai: { strictJsonSchema: false } },
+                providerOptions: {
+                    openai: { strictJsonSchema: false },
+                    ...(cacheOpts ?? {}),
+                },
                 ...(options.messages ? { messages: options.messages } : { prompt: options.prompt }),
             } as any) as Promise<{ object: T; usage?: any }>);
             // Phase 4: charge after success.

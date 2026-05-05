@@ -424,7 +424,10 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
             system: INVOICE_SYSTEM_PROMPT,
             prompt: `Invoice text:\n${rawText.slice(0, 20000)}${tableContext}`,
             schema: InvoiceSchema,
-            schemaName: "Invoice"
+            schemaName: "Invoice",
+            // KAIZEN #1: ~835-token system prompt re-sent for every invoice;
+            // Anthropic cache_control gives ~90% input-cost reduction on hits.
+            cacheControl: "ephemeral",
         });
 
         const invoice = data as InvoiceData;
