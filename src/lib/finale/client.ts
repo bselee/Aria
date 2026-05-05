@@ -23,6 +23,8 @@ import {
     loadActiveReservations,
     loadCalibrationStats,
     loadVendorMOQs,
+    loadVendorReorderPolicies,
+    type VendorReorderPolicy,
     recordRecommendationSnapshots,
     type RecommendationSnapshot,
 } from "@/lib/purchasing/calibration";
@@ -147,6 +149,21 @@ export interface PurchasingItem {
     velocityInflated?: boolean;        // true when chooseVelocitySignal capped a demand signal that exceeded 3× sales/receipts
     velocityRawRate?: number;          // the original (pre-cap) daily rate Finale reported, for context
     velocityRealityCap?: number;       // max(salesVelocity, purchaseVelocity) — what the cap pinned dailyRate to
+    /** v2.1 — vendor reorder policy that drove this row, if any (vendor_reorder_policies table). */
+    vendorPolicy?: {
+        leadTimeOverrideDays: number | null;
+        targetCoverDays: number | null;
+        moqMode: "enforce" | "warn" | "ignore";
+        overbuyReviewPct: number;
+        overbuyReviewDollars: number;
+        notes: string | null;
+    };
+    /** v2.1 — true when MOQ would have triggered but moqMode='warn' suppressed the bump. */
+    moqWarning?: boolean;
+    /** v2.1 — true when ordering constraints created a large overbuy; render a "Review" badge. */
+    reviewRequired?: boolean;
+    /** v2.1 — human-readable list of review reasons for dashboard rendering. */
+    reviewReasons?: string[];
     recommendation?: {
         formulaVersion: string;
         coverDays: number;
@@ -4789,6 +4806,7 @@ export class FinaleClient {
         ]);
         const calibrationCache = new Map<string, Awaited<ReturnType<typeof loadCalibrationStats>> extends Map<string, infer V> ? V : never>();
         const moqCache = new Map<string, Awaited<ReturnType<typeof loadVendorMOQs>> extends Map<string, infer V> ? V : never>();
+        const reorderPolicyCache = new Map<string, VendorReorderPolicy>();
         const seenVendorIds = new Set<string>();
         const recommendationSnapshots: RecommendationSnapshot[] = [];
 
@@ -4915,22 +4933,34 @@ export class FinaleClient {
 
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
 
-                    // ── Phase 2/3 lookups: calibration, MOQ, P90 lead time ──
+                    // ── Phase 2/3 lookups: calibration, MOQ, P90 lead time, vendor policy ──
                     if (!seenVendorIds.has(partyId)) {
                         seenVendorIds.add(partyId);
-                        const [calMap, moqMap] = await Promise.all([
+                        const [calMap, moqMap, policyMap] = await Promise.all([
                             loadCalibrationStats([partyId]),
                             loadVendorMOQs([partyId]),
+                            loadVendorReorderPolicies([partyId]),
                         ]);
                         const cal = calMap.get(partyId);
                         if (cal) calibrationCache.set(partyId, cal);
                         const moq = moqMap.get(partyId);
                         if (moq) moqCache.set(partyId, moq);
+                        const policy = policyMap.get(partyId);
+                        if (policy) reorderPolicyCache.set(partyId, policy);
                     }
                     const calibration = calibrationCache.get(partyId);
                     const moq = moqCache.get(partyId);
+                    const reorderPolicy = reorderPolicyCache.get(partyId);
                     const reservation = reservationsMap.get(sku);
                     const distribution = await leadTimeService.getDistribution(party.groupName);
+
+                    // v2.1 — vendor policy lead-time override flows through both the
+                    // recommender input AND the surfaced item.leadTimeProvenance so the
+                    // dashboard "Why X?" drawer reflects what the recommender actually used.
+                    const effectiveLeadTimeDays = reorderPolicy?.leadTimeOverrideDays ?? leadTimeDays;
+                    const effectiveLeadTimeProvenance = reorderPolicy?.leadTimeOverrideDays
+                        ? `${reorderPolicy.leadTimeOverrideDays}d vendor policy override`
+                        : leadTimeProvenance;
 
                     // ── Canonical reorder calculation ────────────────────────────
                     // All reorder math runs through the pure recommender so every
@@ -4947,8 +4977,8 @@ export class FinaleClient {
                         stockOnHand: effectiveStock,
                         stockOnOrder,
                         openPOCount: activity.openPOs.length,
-                        leadTimeDays,
-                        leadTimeProvenance,
+                        leadTimeDays: effectiveLeadTimeDays,
+                        leadTimeProvenance: effectiveLeadTimeProvenance,
                         leadTimeP90: distribution?.p90 ?? null,
                         coverBufferDays: 60,
                         orderIncrementQty,
@@ -4960,6 +4990,12 @@ export class FinaleClient {
                         minimumOrderEaches: moq?.minimumOrderEaches ?? null,
                         minimumOrderDollars: moq?.minimumOrderDollars ?? null,
                         unitPrice,
+                        // v2.1 — vendor policy
+                        leadTimeOverrideDays: reorderPolicy?.leadTimeOverrideDays ?? null,
+                        targetCoverDays: reorderPolicy?.targetCoverDays ?? null,
+                        moqMode: reorderPolicy?.moqMode ?? "enforce",
+                        overbuyReviewPct: reorderPolicy?.overbuyReviewPct ?? 50,
+                        overbuyReviewDollars: reorderPolicy?.overbuyReviewDollars ?? 1000,
                     } as const;
                     const rec = recommendQty(recInputs);
 
@@ -5014,8 +5050,8 @@ export class FinaleClient {
                         dailyRate,
                         runwayDays,
                         adjustedRunwayDays,
-                        leadTimeDays,
-                        leadTimeProvenance,
+                        leadTimeDays: effectiveLeadTimeDays,
+                        leadTimeProvenance: effectiveLeadTimeProvenance,
                         openPOs: activity.openPOs.map(po => ({
                             orderId: po.orderId,
                             quantity: po.quantity,
@@ -5038,6 +5074,18 @@ export class FinaleClient {
                         velocityInflated: chosenVelocity.inflated,
                         velocityRawRate: chosenVelocity.rawRate,
                         velocityRealityCap: chosenVelocity.realityCap,
+                        // v2.1 — vendor reorder policy + flags
+                        vendorPolicy: reorderPolicy ? {
+                            leadTimeOverrideDays: reorderPolicy.leadTimeOverrideDays,
+                            targetCoverDays: reorderPolicy.targetCoverDays,
+                            moqMode: reorderPolicy.moqMode,
+                            overbuyReviewPct: reorderPolicy.overbuyReviewPct,
+                            overbuyReviewDollars: reorderPolicy.overbuyReviewDollars,
+                            notes: reorderPolicy.notes,
+                        } : undefined,
+                        moqWarning: rec.moqWarning,
+                        reviewRequired: rec.reviewRequired,
+                        reviewReasons: rec.reviewReasons,
                         recommendation: {
                             formulaVersion: rec.formulaVersion,
                             coverDays: rec.coverDays,
