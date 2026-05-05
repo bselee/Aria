@@ -300,16 +300,33 @@ Recent additions to `invoices`: `tariff NUMERIC(12,2)`, `labor NUMERIC(12,2)`, `
 - In-memory `Set` deduplication prevents re-alerting on the same thread/SKU combination (switched from Pinecone due to index dimension mismatch — see `watchdog.ts:130`).
 - Product catalog built from last 100 POs in Supabase, refreshed every 30 min.
 
-### Cron Schedule (OpsManager, America/Denver timezone)
-`OpsManager` is instantiated inside `start-bot.ts` (`new OpsManager(bot)`) — **all cron jobs require `aria-bot` to be running**. There is no standalone cron process.
+### Cron Framework (`src/cron/`)
+Scheduled work is **declarative**. Every job lives in `src/cron/jobs/index.ts` as one `defineJob({ name, schedule, handler, budget?, onFail?, dependsOn?, enabled? })` entry. The runner (`src/cron/runner.ts`) walks the registry at boot, schedules each enabled job via `node-cron` with `bottleneck` concurrency locks, and routes failures via `onFail` (`log` | `escalate-to-supervisor` | `telegram-will` | `silent`). Run history persists to `cron_runs`.
 
-- `7:30 AM Mon-Fri` — Build risk analysis (Telegram + Slack #purchasing)
-- `8:00 AM daily` — Daily PO/invoice/email summary
-- `8:01 AM Fridays` — Weekly summary
-- `Every 15 min` — AP inbox invoice check
-- `Hourly` — Advertisement cleanup
-- `Every 30 min` — PO conversation sync
-- `6:00 PM Mon-Fri` — Nightshift enqueue: batches unprocessed AP emails into `nightshift_queue` for overnight hosted classification
+- **`/jobs` Telegram tool** (`list_cron_jobs`) — list every registered job with schedule + last-run status + enabled flag.
+- **`/run <job-name>` Telegram tool** (`run_cron_job`) — manually trigger a job. Same concurrency lock, budget, and observability as a scheduled tick.
+- **`dependsOn`** — declarative job dependency. A tick is `skipped` (with `failureReason="dependency-not-succeeded"`) if any named upstream's most recent run did not succeed. Used by `ap-morning-deep` to wait for `nightshift-classify`.
+- **Observability hooks** fold-in: every successful/failed tick fires (a) the legacy in-memory `recordCronRun()` map (consumed by command-board dashboard), (b) `memoryLayerManager.archiveSession()`, and (c) `OpsManager.cronHookSuccess/Failure()` (heartbeat + supervisor exception). Hooks skip in vitest to avoid transitive import timeout.
+- `OpsManager.singleton` is set in the constructor and used by `cron/jobs/index.ts` handlers to dispatch into existing methods without DI.
+
+#### Schedule (America/Denver, all jobs registered in `src/cron/jobs/index.ts`)
+
+- `7:30 AM Mon-Fri` — `build-risk` (Telegram + Slack #purchasing)
+- `8:00 AM Mon-Fri` — `daily-summary` (multi-block: AP, POs in flight by lifecycle, builds today, tasks awaiting Will)
+- `8:01 AM Friday` — `weekly-summary`
+- `8:30 AM daily` — `qty-calibration` (rec stamping + vendor stats recompute)
+- `9:00 AM Mon-Fri` — `missing-reconciliation-watchdog` (KAIZEN: was firing weekend false alarms)
+- `Every 15 min` — `ap-polling` (inbox poll + `runPOSweep` post-pass — KAIZEN #5: was its own */4h cron)
+- `Every 4 hours` — `po-sync` (KAIZEN #4: was every 30m), `purchasing-calendar-sync`
+- `Hourly` — `stat-indexing` (Pinecone op-context refresh)
+- `6:00 PM Mon-Fri` — `nightshift-enqueue` (batches unprocessed AP into `nightshift_queue`)
+- `9:00 PM daily` — `housekeeping` (feedback-loop sweep)
+- `Every 30 min` — `build-completion-watcher`, `po-receiving-watcher`, `migration-tripwire`
+- `Every 10 min` — `task-self-healer`
+- `Every 5 min` — `close-finished-tasks`, `issue-projection`, `issue-orchestrator` (gated on `ISSUE_ORCHESTRATOR_ENABLED`)
+- Vendor reconciliations: `reconcile-axiom`, `reconcile-fedex`, `reconcile-teraganix`, `reconcile-uline` (early-morning weekday slots)
+
+**All cron jobs require `aria-bot` to be running.** There is no standalone cron process.
 
 ### Nightshift System
 Overnight email pre-classification using hosted Claude Haiku. Local Ollama/Qwen paths are intentionally removed.
