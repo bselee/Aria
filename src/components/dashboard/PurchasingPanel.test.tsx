@@ -118,6 +118,59 @@ function stubFetch() {
     }));
 }
 
+// ── helpers shared with v2 ordering filter tests below ──────────────────────
+function makeWatchItem(overrides: Partial<ReturnType<typeof makeFixtureItem>> = {}) {
+    return {
+        ...makeFixtureItem(),
+        productId: "WATCH-1",
+        productName: "Watchlist SKU",
+        urgency: "watch",
+        runwayDays: 75,
+        adjustedRunwayDays: 75,
+        finaleStockoutDays: 75,
+        leadTimeDays: 14,
+        moqWarning: false,
+        reviewRequired: false,
+        reviewReasons: [],
+        ...overrides,
+    };
+}
+
+function stubFetchWithMixedItems() {
+    // Two items: one critical (Colorful) and one watch-tier (75d shortage). Critical
+    // matches order_now, watch matches 90 only, neither matches 30 or 60.
+    const watchItem = makeWatchItem({ supplierName: "WatchVendor", supplierPartyId: "20001" });
+    const criticalPayload = {
+        groups: [
+            {
+                vendorName: "Colorful Packaging Ltd",
+                vendorPartyId: "10918",
+                urgency: "critical",
+                items: [makeFixtureItem()],
+            },
+            {
+                vendorName: "WatchVendor",
+                vendorPartyId: "20001",
+                urgency: "watch",
+                items: [watchItem],
+            },
+        ],
+        cachedAt: "2026-05-05T12:00:00.000Z",
+        vendorSummaries: [],
+    };
+    const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        let body: any = emptyPayload;
+        if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+            body = criticalPayload;
+        } else if (url.includes("/api/dashboard/active-purchases")) {
+            body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+    }));
+}
+
 describe("PurchasingPanel - vendor policy badges", () => {
     afterEach(() => {
         vi.restoreAllMocks();
@@ -144,5 +197,88 @@ describe("PurchasingPanel - vendor policy badges", () => {
         expect(
             screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
         ).toBeTruthy();
+    });
+});
+
+describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    // Helper: find toolbar filter button by its label substring. The toolbar
+    // buttons are uniquely titled (the only buttons in the panel with these
+    // tooltips), so title-based lookup is robust to the count+label split.
+    function findFilterButton(titleSubstring: string): HTMLButtonElement | null {
+        const buttons = Array.from(document.querySelectorAll("button"));
+        return buttons.find(b => (b.title || "").toLowerCase().includes(titleSubstring.toLowerCase())) ?? null;
+    }
+
+    it("toolbar shows Order Now / 30 / 60 / 90 / All — and no TODAY/WEEK", async () => {
+        stubLocalStorage();
+        stubFetchWithMixedItems();
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        // Each filter button is identified by its tooltip title.
+        await waitFor(() => expect(findFilterButton("Items short within lead time")).not.toBeNull());
+        expect(findFilterButton("within 30 days")).not.toBeNull();
+        expect(findFilterButton("within 60 days")).not.toBeNull();
+        expect(findFilterButton("within 90 days")).not.toBeNull();
+        expect(findFilterButton("Every actionable item")).not.toBeNull();
+
+        // Old TODAY/WEEK button text is gone (TODAY tooltip would have read differently).
+        // Use case-sensitive query to avoid matching the new "ORDER NOW" header.
+        const allBtns = Array.from(document.querySelectorAll("button"));
+        expect(allBtns.some(b => b.textContent?.includes("TODAY"))).toBe(false);
+        expect(allBtns.some(b => b.textContent?.includes("WEEK"))).toBe(false);
+    });
+
+    it("counts use item count, not vendor count, and 'All' totals every actionable item", async () => {
+        stubLocalStorage();
+        stubFetchWithMixedItems();
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        // Two actionable items total → All count = 2
+        await waitFor(() => {
+            const allBtn = findFilterButton("Every actionable item");
+            expect(allBtn?.textContent).toMatch(/2\s+ALL/);
+        });
+        // 90-day window includes both critical (12d) AND watch (75d)
+        const ninetyBtn = findFilterButton("within 90 days");
+        expect(ninetyBtn?.textContent).toMatch(/2\s+90/);
+        // 30-day window includes ONLY critical (12d ≤ 30; watch's 75d > 30)
+        const thirtyBtn = findFilterButton("within 30 days");
+        expect(thirtyBtn?.textContent).toMatch(/1\s+30/);
+    });
+
+    it("migrates legacy localStorage 'today' to order_now (active = red tint)", async () => {
+        stubLocalStorage();
+        localStorage.setItem("aria-dash-purchasing-focus", "today");
+        stubFetchWithMixedItems();
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        await waitFor(() => {
+            const orderNowBtn = findFilterButton("Items short within lead time");
+            expect(orderNowBtn?.className).toMatch(/red-/);
+        });
+    });
+
+    it("migrates legacy localStorage 'week' to 30 (active = amber tint)", async () => {
+        stubLocalStorage();
+        localStorage.setItem("aria-dash-purchasing-focus", "week");
+        stubFetchWithMixedItems();
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        await waitFor(() => {
+            const thirtyBtn = findFilterButton("within 30 days");
+            expect(thirtyBtn?.className).toMatch(/amber-/);
+        });
     });
 });
