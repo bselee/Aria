@@ -217,6 +217,32 @@ beforeEach(() => {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 describe("CommandBoardShell", () => {
+    it("surfaces the purchasing lifecycle as a split workflow", async () => {
+        const fetchImpl = makeFetch();
+        render(<CommandBoardShell fetchImpl={fetchImpl} />);
+
+        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
+        const orderingPane = screen.getByTestId("lifecycle-pane-ordering");
+        const purchasesPane = screen.getByTestId("lifecycle-pane-purchases");
+        const rcvPane = screen.getByTestId("lifecycle-pane-rcv");
+
+        expect(lifecycleTab.textContent).toBe("Lifecycle");
+        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
+        expect(orderingPane.textContent).toContain("Ordering");
+        expect(purchasesPane.textContent).toContain("Purchases");
+        expect(rcvPane.textContent).toContain("RCV");
+    });
+
+    it("labels the shell Ops Board and removes redundant lifecycle drill-in tabs", async () => {
+        const fetchImpl = makeFetch();
+        render(<CommandBoardShell fetchImpl={fetchImpl} />);
+
+        expect(await screen.findByText("Ops Board")).toBeTruthy();
+        expect(screen.queryByTestId("shell-tab-ordering")).toBeNull();
+        expect(screen.queryByTestId("shell-tab-purchases")).toBeNull();
+        expect(screen.queryByTestId("shell-tab-rcv")).toBeNull();
+    });
+
     it("fetches agents endpoint at boot (data is hydrated even though right rail is gone)", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
@@ -232,15 +258,12 @@ describe("CommandBoardShell", () => {
         });
     });
 
-    it("default tab is 'Blocking Me' — issues surface, not raw task lanes", async () => {
+    it("default tab is Lifecycle because purchasing needs ordering, active purchases, and RCV together", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        // The shell ships with IssuesPanel as the default tab. Lane testids
-        // (which lived on WorkQueueBoard inside the old grid layout) no
-        // longer render at boot; they appear when the user clicks Tasks.
-        const blockingTab = await screen.findByTestId("shell-tab-blocking");
-        expect(blockingTab.getAttribute("aria-selected")).toBe("true");
+        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
+        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
     });
 
     it("clicking the Tasks tab swaps in the task lanes", async () => {
