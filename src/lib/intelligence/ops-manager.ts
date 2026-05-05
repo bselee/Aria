@@ -963,9 +963,10 @@ export class OpsManager {
             console.log("📊 Preparing Daily PO Summary...");
         }
 
-        // Phase 1a Task 5: AP reconciliation observability block.
-        // Sent first — before the rest of the daily summary body — so Will
-        // sees yesterday's AP health at the top of the morning digest.
+        const chatId = process.env.TELEGRAM_CHAT_ID || "";
+        const blocks: string[] = [];
+
+        // Block 1: AP reconciliation observability.
         try {
             const reconStatusModule = await import("@/lib/runtime/observability/recon-status");
             const reconStatusAny = reconStatusModule as any;
@@ -977,16 +978,98 @@ export class OpsManager {
                 throw new Error("formatMorningApBlock export unavailable");
             }
             const apBlock = await formatMorningApBlock();
-            const chatId = process.env.TELEGRAM_CHAT_ID || "";
-            if (chatId) {
-                await this.bot.telegram.sendMessage(chatId, apBlock, { parse_mode: "Markdown" });
+            if (apBlock && String(apBlock).trim().length > 0) {
+                blocks.push(String(apBlock).trim());
             }
         } catch (err: any) {
             console.warn("[OpsManager] AP morning block failed (non-fatal):", err.message);
+            blocks.push(`📬 AP: error ${err.message}`);
         }
 
-        // STUB: remainder of daily summary body not yet implemented
-        // (PO counts, invoice totals, build risk, etc. to be added in later tasks)
+        // Block 2: POs in flight — count by lifecycle stage.
+        try {
+            const purchases = await loadActivePurchases(finaleClient, 60);
+            const counts = new Map<string, number>();
+            for (const p of purchases) {
+                const stage = (p as any).lifecycleStage || "unknown";
+                counts.set(stage, (counts.get(stage) ?? 0) + 1);
+            }
+            const total = purchases.length;
+            const lines = [`📦 *POs in flight* (${total} total)`];
+            const ordered = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+            for (const [stage, count] of ordered) {
+                lines.push(`  • ${stage}: ${count}`);
+            }
+            if (ordered.length === 0) {
+                lines.push("  • none");
+            }
+            blocks.push(lines.join("\n"));
+        } catch (err: any) {
+            console.warn("[OpsManager] POs-in-flight block failed:", err.message);
+            blocks.push(`📦 POs in flight: error ${err.message}`);
+        }
+
+        // Block 3: Builds today (next 24h).
+        try {
+            const calendar = new CalendarClient();
+            const events = await calendar.getAllUpcomingBuilds(2);
+            const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" }); // YYYY-MM-DD
+            const tomorrow = new Date(Date.now() + 86400000)
+                .toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+            const todays = events.filter(e => e.startDate === today || e.startDate === tomorrow);
+            if (todays.length === 0) {
+                blocks.push(`🏗 *Builds today*: none scheduled in the next 24h`);
+            } else {
+                const sample = todays.slice(0, 3).map(e => `  • ${e.startDate}: ${e.title || "(untitled)"}`);
+                const more = todays.length > 3 ? `\n  • …+${todays.length - 3} more` : "";
+                blocks.push(`🏗 *Builds today* (${todays.length} in next 24h)\n${sample.join("\n")}${more}`);
+            }
+        } catch (err: any) {
+            console.warn("[OpsManager] Builds-today block failed:", err.message);
+            blocks.push(`🏗 Builds today: not available (${err.message})`);
+        }
+
+        // Block 4: Tasks awaiting Will.
+        try {
+            const needs = await agentTask.listTasks({ status: ["NEEDS_APPROVAL"], limit: 200 });
+            const failedWill = (await agentTask.listTasks({ status: ["FAILED"], owner: "will", limit: 200 })) ?? [];
+            const total = needs.length + failedWill.length;
+            const lines = [`✋ *Tasks awaiting Will* (${total} total)`];
+            if (total === 0) {
+                lines.push("  • inbox clear");
+            } else {
+                if (needs.length > 0) lines.push(`  • needs approval: ${needs.length}`);
+                if (failedWill.length > 0) lines.push(`  • failed (Will-owned): ${failedWill.length}`);
+                const top = [...needs, ...failedWill].slice(0, 3);
+                for (const t of top) {
+                    const goal = String((t as any).goal || (t as any).type || "task").slice(0, 80);
+                    lines.push(`    – ${goal}`);
+                }
+            }
+            blocks.push(lines.join("\n"));
+        } catch (err: any) {
+            console.warn("[OpsManager] Tasks-awaiting-Will block failed:", err.message);
+            blocks.push(`✋ Tasks awaiting Will: error ${err.message}`);
+        }
+
+        // Assemble + cap under ~3000 chars, then send as a single Telegram message.
+        let body = blocks.join("\n\n");
+        const MAX_CHARS = 3000;
+        if (body.length > MAX_CHARS) {
+            body = body.slice(0, MAX_CHARS - 20) + "\n…(truncated)";
+        }
+        if (chatId && body.length > 0) {
+            try {
+                await this.bot.telegram.sendMessage(chatId, body, { parse_mode: "Markdown" });
+            } catch (err: any) {
+                console.warn("[OpsManager] daily summary send failed, retrying without markdown:", err.message);
+                try {
+                    await this.bot.telegram.sendMessage(chatId, body);
+                } catch (err2: any) {
+                    console.error("[OpsManager] daily summary send failed completely:", err2.message);
+                }
+            }
+        }
     }
 
     /**
