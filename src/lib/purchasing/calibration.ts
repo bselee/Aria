@@ -214,6 +214,62 @@ export async function loadVendorMOQs(
 }
 
 // ──────────────────────────────────────────────────
+// VENDOR REORDER POLICY (planning preferences)
+// ──────────────────────────────────────────────────
+
+export type VendorMoqMode = "enforce" | "warn" | "ignore";
+
+export interface VendorReorderPolicy {
+    vendorPartyId: string;
+    vendorName: string | null;
+    leadTimeOverrideDays: number | null;
+    targetCoverDays: number | null;
+    moqMode: VendorMoqMode;
+    overbuyReviewPct: number;
+    overbuyReviewDollars: number;
+    notes: string | null;
+}
+
+/**
+ * Load vendor-level reorder planning policies. Separate from MOQ facts:
+ * MOQ rows are *what the vendor said*, policy rows are *how we choose to
+ * handle it* (enforce / warn / ignore) plus cover-window and lead-time
+ * overrides.
+ *
+ * Best-effort: a Supabase outage returns an empty map and the recommender
+ * falls back to system defaults — the default-unchanged invariant.
+ */
+export async function loadVendorReorderPolicies(
+    vendorPartyIds: string[],
+): Promise<Map<string, VendorReorderPolicy>> {
+    const map = new Map<string, VendorReorderPolicy>();
+    if (vendorPartyIds.length === 0) return map;
+    const db = createClient();
+    if (!db) return map;
+    try {
+        const { data } = await db
+            .from("vendor_reorder_policies")
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes")
+            .in("vendor_party_id", vendorPartyIds);
+        for (const row of data ?? []) {
+            map.set(row.vendor_party_id, {
+                vendorPartyId: row.vendor_party_id,
+                vendorName: row.vendor_name ?? null,
+                leadTimeOverrideDays: row.lead_time_override_days,
+                targetCoverDays: row.target_cover_days,
+                moqMode: (row.moq_mode ?? "enforce") as VendorMoqMode,
+                overbuyReviewPct: Number(row.overbuy_review_pct ?? 50),
+                overbuyReviewDollars: Number(row.overbuy_review_dollars ?? 1000),
+                notes: row.notes ?? null,
+            });
+        }
+    } catch (err: any) {
+        console.warn(`[calibration] loadVendorReorderPolicies failed: ${err.message}`);
+    }
+    return map;
+}
+
+// ──────────────────────────────────────────────────
 // RECOMMENDATION SNAPSHOT
 // ──────────────────────────────────────────────────
 
