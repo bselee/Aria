@@ -121,6 +121,7 @@ describe("recommendQty — provenance trace", () => {
             "on_hand",
             "on_order",
             "runway",
+            "lead_time",
             "cover_days",
             "raw_qty",
             "pack_round",
@@ -152,6 +153,127 @@ describe("recommendQty — provenance trace", () => {
     it("includes formula version", () => {
         const result = recommendQty(baseInput());
         expect(result.formulaVersion).toBe(QTY_FORMULA_VERSION);
+    });
+});
+
+describe("recommendQty — calibration safety multiplier", () => {
+    it("widens cover days when safetyMultiplier > 1 and sample count >= 5", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2, stockOnHand: 50, leadTimeDays: 14, coverBufferDays: 60,
+            safetyMultiplier: 1.5, calibrationSampleCount: 8, calibrationMedianErrorPct: -32,
+        }));
+        // base cover = 14 + 60 = 74. With 1.5x multiplier on buffer: 14 + 90 = 104.
+        expect(result.coverDays).toBe(104);
+        expect(result.safetyMultiplier).toBe(1.5);
+        const coverStep = result.provenance.find(p => p.step === "cover_days");
+        expect(coverStep?.detail).toContain("median error");
+        expect(coverStep?.detail).toContain("8 samples");
+    });
+
+    it("ignores multiplier with insufficient sample count (< 5)", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2, stockOnHand: 50, leadTimeDays: 14, coverBufferDays: 60,
+            safetyMultiplier: 1.5, calibrationSampleCount: 3,
+        }));
+        // multiplier still applied to math, but trace should not reference samples
+        const coverStep = result.provenance.find(p => p.step === "cover_days");
+        expect(coverStep?.detail).not.toContain("samples");
+    });
+
+    it("clamps multiplier to [0.5, 2.5] to prevent runaway calibration", () => {
+        const high = recommendQty(baseInput({ safetyMultiplier: 100 }));
+        expect(high.safetyMultiplier).toBe(2.5);
+        const low = recommendQty(baseInput({ safetyMultiplier: 0.01 }));
+        expect(low.safetyMultiplier).toBe(0.5);
+    });
+});
+
+describe("recommendQty — draft PO reservation", () => {
+    it("subtracts reserved qty from supply pool", () => {
+        // 2/d × 74d = 148 target. 50 on hand + 100 on order - 50 reserved = 100 effective.
+        // Need 148 - 100 = 48.
+        const result = recommendQty(baseInput({
+            dailyRate: 2, stockOnHand: 50, stockOnOrder: 100, openPOCount: 1,
+            reservedQty: 50, reservedDraftPOs: ["DRAFT-9999"],
+            leadTimeDays: 14,
+        }));
+        expect(result.rawNeededEaches).toBe(48);
+        expect(result.reservedQty).toBe(50);
+    });
+
+    it("emits a reserved provenance step listing draft POs", () => {
+        const result = recommendQty(baseInput({
+            reservedQty: 30, reservedDraftPOs: ["DRAFT-1", "DRAFT-2"],
+        }));
+        const reservedStep = result.provenance.find(p => p.step === "reserved");
+        expect(reservedStep).toBeTruthy();
+        expect(reservedStep?.detail).toContain("DRAFT-1");
+        expect(reservedStep?.detail).toContain("DRAFT-2");
+    });
+
+    it("reduces adjusted runway when reservations exist", () => {
+        const without = recommendQty(baseInput({ stockOnHand: 50, stockOnOrder: 100, openPOCount: 1 }));
+        const withReserved = recommendQty(baseInput({ stockOnHand: 50, stockOnOrder: 100, openPOCount: 1, reservedQty: 50 }));
+        expect(withReserved.adjustedRunwayDays).toBeLessThan(without.adjustedRunwayDays);
+    });
+});
+
+describe("recommendQty — vendor MOQ enforcement", () => {
+    it("bumps up to minimum eaches when below MOQ", () => {
+        // Need 30, MOQ is 100 — bump.
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 44, leadTimeDays: 14,
+            minimumOrderEaches: 100,
+        }));
+        expect(result.suggestedQty).toBe(100);
+        expect(result.moqApplied).toBe(true);
+        expect(result.provenance.find(p => p.step === "moq")?.detail).toContain("Bumped");
+    });
+
+    it("snaps MOQ bump to pack increment when set", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 44, leadTimeDays: 14,
+            minimumOrderEaches: 100, orderIncrementQty: 24,
+        }));
+        // 100 snapped to 24-pack → 120
+        expect(result.suggestedQty).toBe(120);
+    });
+
+    it("bumps up to minimum dollars when below MOQ", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 44, leadTimeDays: 14,
+            minimumOrderDollars: 500, unitPrice: 10,
+        }));
+        // need 30 × $10 = $300, MOQ = $500 → 50 eaches
+        expect(result.suggestedQty).toBeGreaterThanOrEqual(50);
+        expect(result.moqApplied).toBe(true);
+    });
+
+    it("does not apply MOQ when no order is needed", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 1000,  // already covered
+            minimumOrderEaches: 100,
+        }));
+        expect(result.suggestedQty).toBe(0);
+        expect(result.moqApplied).toBe(false);
+    });
+});
+
+describe("recommendQty — P90 lead time", () => {
+    it("uses P90 instead of point estimate when provided", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2, stockOnHand: 50,
+            leadTimeDays: 7, leadTimeP90: 14,
+        }));
+        expect(result.leadTimeUsed).toBe(14);
+        expect(result.leadTimeBasis).toBe("p90");
+        expect(result.coverDays).toBe(74);  // 14 + 60
+    });
+
+    it("falls back to point estimate when no P90 provided", () => {
+        const result = recommendQty(baseInput({ leadTimeDays: 14 }));
+        expect(result.leadTimeUsed).toBe(14);
+        expect(result.leadTimeBasis).not.toBe("p90");
     });
 });
 

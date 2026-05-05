@@ -24,6 +24,12 @@ export interface LeadTimeResult {
     label: string; // e.g. "13d median · vendor history" | "7d (Finale)" | "14d default"
 }
 
+export interface LeadTimeDistribution {
+    p50: number;
+    p90: number;
+    sampleCount: number;
+}
+
 // ──────────────────────────────────────────────────
 // SERVICE
 // ──────────────────────────────────────────────────
@@ -101,6 +107,27 @@ export class LeadTimeService {
             provenance: 'default',
             label: '14d default',
         };
+    }
+
+    /**
+     * P50/P90/sampleCount distribution for a vendor when we have enough history
+     * (>=5 receipts). Returns null when the cache is empty or no match found —
+     * caller should fall back to the median + buffer model.
+     */
+    async getDistribution(vendorName: string): Promise<LeadTimeDistribution | null> {
+        if (!this.cache) await this.warmCache();
+        if (!vendorName) return null;
+        const distMap = finaleClient.getVendorLeadTimeDistribution();
+        if (distMap.size === 0) return null;
+        const key = vendorName.trim().toLowerCase();
+        for (const [cacheKey, dist] of distMap.entries()) {
+            if (cacheKey.toLowerCase() === key
+                || cacheKey.toLowerCase().includes(key)
+                || key.includes(cacheKey.toLowerCase())) {
+                return dist.sampleCount >= 5 ? dist : null;
+            }
+        }
+        return null;
     }
 
     /** Invalidate the cache (e.g. after receiving a PO — lead time history just changed). */

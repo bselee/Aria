@@ -2094,6 +2094,61 @@ bot.on('text', async (ctx) => {
     });
 
     // ── AP RECONCILIATION STATUS ────────────────────────────────────────────────
+    // /qty-status — calibration health (vendor error rates + recent recommendation accuracy)
+    bot.command(['qty-status', 'qtystatus', 'qty'], async (ctx) => {
+        try {
+            const { createClient } = await import('../lib/supabase');
+            const { summarizeAriaVsFinale } = await import('../lib/purchasing/calibration-engine');
+            const db = createClient();
+            if (!db) {
+                await ctx.reply("⚠️ Supabase not configured");
+                return;
+            }
+
+            const since30 = new Date();
+            since30.setDate(since30.getDate() - 30);
+
+            const [{ data: vendorStats }, summary, { count: openReservations }, { count: pendingRecs }] = await Promise.all([
+                db.from('vendor_calibration_stats')
+                    .select('vendor_name, sample_count, median_error_pct, bias_pct, safety_multiplier')
+                    .gte('sample_count', 5)
+                    .order('sample_count', { ascending: false })
+                    .limit(8),
+                summarizeAriaVsFinale(30),
+                db.from('qty_reservations').select('id', { count: 'exact', head: true }).is('released_at', null),
+                db.from('qty_recommendations').select('id', { count: 'exact', head: true }).is('calibrated_at', null).gte('recommended_at', since30.toISOString()),
+            ]);
+
+            const lines: string[] = [];
+            lines.push("📊 *Qty Calibration Status*\n");
+            lines.push(`Open draft reservations: ${openReservations ?? 0}`);
+            lines.push(`Uncalibrated recs (30d): ${pendingRecs ?? 0}`);
+            lines.push(`Calibrated samples (30d): ${summary.totalSamples}`);
+            if (summary.medianAriaErrorPct != null) {
+                lines.push(`Aria median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);
+            }
+            if (summary.medianFinaleErrorPct != null) {
+                lines.push(`Finale median error: ${summary.medianFinaleErrorPct >= 0 ? "+" : ""}${summary.medianFinaleErrorPct.toFixed(0)}%`);
+            }
+
+            if (vendorStats && vendorStats.length > 0) {
+                lines.push("\n*Top vendors (by sample count):*");
+                for (const v of vendorStats) {
+                    const med = v.median_error_pct != null ? `${v.median_error_pct >= 0 ? '+' : ''}${Number(v.median_error_pct).toFixed(0)}%` : 'n/a';
+                    const mul = Number(v.safety_multiplier).toFixed(2);
+                    lines.push(`  • ${v.vendor_name ?? '?'} — n=${v.sample_count}, med ${med}, ×${mul}`);
+                }
+            } else {
+                lines.push("\n_No vendor stats yet — need ≥5 calibrated samples per vendor._");
+            }
+
+            await ctx.reply(lines.join("\n"), { parse_mode: 'Markdown' });
+        } catch (err: any) {
+            console.error('[qty-status] error:', err.message);
+            await ctx.reply(`⚠️ /qty-status failed: ${err.message ?? String(err)}`);
+        }
+    });
+
     // /recon-status — bucketed counts of AP reconciliation outcomes (24h / 7d / 30d)
     // Read-only — no writes, no callbacks.
     bot.command(['recon-status', 'reconstatus', 'recon'], async (ctx) => {
