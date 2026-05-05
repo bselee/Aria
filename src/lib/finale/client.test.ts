@@ -293,6 +293,82 @@ describe("FinaleClient draft PO creation guardrails", () => {
     });
 });
 
+describe("FinaleClient native PO email", () => {
+    const originalEnv = {
+        FINALE_API_KEY: process.env.FINALE_API_KEY,
+        FINALE_API_SECRET: process.env.FINALE_API_SECRET,
+        FINALE_ACCOUNT_PATH: process.env.FINALE_ACCOUNT_PATH,
+        FINALE_BASE_URL: process.env.FINALE_BASE_URL,
+        FINALE_PO_EMAIL_ACTION_TEMPLATE: process.env.FINALE_PO_EMAIL_ACTION_TEMPLATE,
+    };
+
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        delete process.env.FINALE_PO_EMAIL_ACTION_TEMPLATE;
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    afterEach(() => {
+        process.env.FINALE_API_KEY = originalEnv.FINALE_API_KEY;
+        process.env.FINALE_API_SECRET = originalEnv.FINALE_API_SECRET;
+        process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
+        process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
+        process.env.FINALE_PO_EMAIL_ACTION_TEMPLATE = originalEnv.FINALE_PO_EMAIL_ACTION_TEMPLATE;
+    });
+
+    it("posts to a Finale PO email action URL when available", async () => {
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                orderId: "124790",
+                statusId: "ORDER_LOCKED",
+                actionUrlEmailPurchaseOrder: "/buildasoil/api/order/124790/action/emailPurchaseOrder",
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({ ok: true, messageId: "finale-email-1" }) as any);
+
+        const client = new FinaleClient();
+        const result = await client.sendPurchaseOrderEmail("124790", {
+            toEmail: "vendor@example.com",
+            subject: "BuildASoil PO # 124790 - Clarke - 5/1/2026",
+            body: "Please see our attached PO.",
+        });
+
+        expect(result).toMatchObject({
+            orderId: "124790",
+            sent: true,
+            pdfAttached: true,
+            actionUrl: "/buildasoil/api/order/124790/action/emailPurchaseOrder",
+        });
+
+        const sendCall = vi.mocked(global.fetch).mock.calls[1];
+        expect(String(sendCall[0])).toBe("https://finale.example/buildasoil/api/order/124790/action/emailPurchaseOrder");
+        expect(JSON.parse(String((sendCall[1] as RequestInit).body))).toMatchObject({
+            toEmail: "vendor@example.com",
+            to: "vendor@example.com",
+            subject: "BuildASoil PO # 124790 - Clarke - 5/1/2026",
+            body: "Please see our attached PO.",
+        });
+    });
+
+    it("fails closed when no Finale native PO email action exists", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            orderId: "124790",
+            statusId: "ORDER_LOCKED",
+            actionUrlEdit: "/buildasoil/api/order/124790/edit",
+        }) as any);
+
+        const client = new FinaleClient();
+        await expect(client.sendPurchaseOrderEmail("124790", {
+            toEmail: "vendor@example.com",
+            subject: "BuildASoil PO # 124790 - Clarke - 5/1/2026",
+            body: "Please see our attached PO.",
+        })).rejects.toThrow(/native PO email action/i);
+    });
+});
+
 describe("FinaleClient receivings pagination", () => {
     beforeEach(() => {
         process.env.FINALE_API_KEY = "key";

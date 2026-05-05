@@ -173,6 +173,20 @@ export interface DraftPOReview {
     canCommit: boolean;   // true only if statusId === 'ORDER_CREATED'
 }
 
+export interface SendPurchaseOrderEmailInput {
+    toEmail: string;
+    subject: string;
+    body: string;
+}
+
+export interface SendPurchaseOrderEmailResult {
+    orderId: string;
+    sent: boolean;
+    pdfAttached: boolean;
+    actionUrl: string;
+    messageId?: string | null;
+}
+
 export interface ConsumptionReport {
     productId: string;
     name: string;
@@ -4998,6 +5012,64 @@ export class FinaleClient {
         const finalStatus = updated?.statusId || "ORDER_LOCKED";
         console.log(`[finale] commitDraftPO: PO #${orderId} committed → ${finalStatus}`);
         return { orderId, committed: true, finalStatus };
+    }
+
+    async sendPurchaseOrderEmail(
+        orderId: string,
+        input: SendPurchaseOrderEmailInput,
+    ): Promise<SendPurchaseOrderEmailResult> {
+        const po = await this.getOrderDetails(orderId);
+        const actionUrl = this.resolvePurchaseOrderEmailActionUrl(orderId, po);
+
+        const result = await this.post(actionUrl, {
+            toEmail: input.toEmail,
+            to: input.toEmail,
+            subject: input.subject,
+            body: input.body,
+            message: input.body,
+        });
+
+        return {
+            orderId,
+            sent: true,
+            pdfAttached: true,
+            actionUrl,
+            messageId: result?.messageId ?? result?.id ?? null,
+        };
+    }
+
+    private resolvePurchaseOrderEmailActionUrl(orderId: string, po: any): string {
+        const template = process.env.FINALE_PO_EMAIL_ACTION_TEMPLATE;
+        if (template) {
+            return template
+                .replaceAll("{accountPath}", this.accountPath)
+                .replaceAll("{orderId}", encodeURIComponent(orderId));
+        }
+
+        const candidates = [
+            po.actionUrlEmailPurchaseOrder,
+            po.actionUrlEmailPO,
+            po.actionUrlSendPurchaseOrder,
+            po.actionUrlSendPO,
+            po.actionUrlEmailOrder,
+            po.actionUrlEmail,
+            po.emailPurchaseOrderActionUrl,
+            po.sendPurchaseOrderActionUrl,
+        ].filter((value): value is string => typeof value === "string" && value.length > 0);
+
+        const nativePOEmailAction = candidates.find((url) => {
+            const normalized = url.toLowerCase();
+            return normalized.includes("email") && (normalized.includes("purchase") || normalized.includes("po"));
+        }) ?? candidates[0];
+
+        if (!nativePOEmailAction) {
+            throw new Error(
+                `Finale native PO email action was not available for PO ${orderId}. ` +
+                `Configure FINALE_PO_EMAIL_ACTION_TEMPLATE after capturing Finale's Email purchase order action URL.`
+            );
+        }
+
+        return nativePOEmailAction;
     }
 
     // ── private helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──
