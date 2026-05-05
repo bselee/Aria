@@ -128,7 +128,16 @@ async function extractScannedPDF(
 ): Promise<PDFExtractionResult> {
     let extractedText = "";
     let successStrategy = "unknown";
-    const base64 = buffer.toString("base64");
+
+    // KAIZEN #8: memoize base64 once per call so multi-strategy fallbacks
+    // don't re-encode the same buffer. First strategy that needs it pays
+    // the cost; subsequent strategies hit the cache.
+    let _base64Cache: string | undefined;
+    const toBase64 = () => {
+        if (_base64Cache) return _base64Cache;
+        _base64Cache = buffer.toString("base64");
+        return _base64Cache;
+    };
 
     const callOpenRouter = async (model: string): Promise<boolean> => {
         if (!process.env.OPENROUTER_API_KEY) return false;
@@ -149,7 +158,7 @@ async function extractScannedPDF(
                     messages: [{
                         role: "user",
                         content: [
-                            { type: "image_url", image_url: { url: `data:application/pdf;base64,${base64}` } },
+                            { type: "image_url", image_url: { url: `data:application/pdf;base64,${toBase64()}` } },
                             { type: "text", text: `${SCANNED_PDF_SYSTEM}\n\n${SCANNED_PDF_PROMPT}` },
                         ],
                     }],
