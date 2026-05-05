@@ -26,8 +26,20 @@ defineJob({
     name: "ap-polling",
     schedule: "*/15 * * * *",
     onFail: "log",
-    description: "Poll ap@buildasoil.com for new invoices.",
-    handler: async () => { await ops()?.pollAPInbox(); },
+    description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
+    handler: async () => {
+        const o = ops();
+        if (!o) return;
+        await o.pollAPInbox();
+        // KAIZEN #5: po-sweep folded into ap-polling. Was its own */4h cron;
+        // now runs as a post-pass on every ap-polling tick to share the inbox
+        // walk with classification + forwarding. The ~3-4x more frequent run
+        // is fine — po-sweep is mostly a no-op when there's nothing to match.
+        try { await o.runPOSweep(); } catch (err: any) {
+            console.warn(`[ap-polling] post-pass po-sweep failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 180_000 },  // bumped from default to cover the post-pass
 });
 
 defineJob({
@@ -96,13 +108,8 @@ defineJob({
     handler: async () => { await ops()?.runQtyCalibration(); },
 });
 
-defineJob({
-    name: "po-sweep",
-    schedule: "30 */4 * * *",
-    onFail: "log",
-    description: "PO-first AP sweep every 4 hours.",
-    handler: async () => { await ops()?.runPOSweep(); },
-});
+// po-sweep removed — KAIZEN #5: folded into ap-polling as a post-pass.
+// runPOSweep() remains on OpsManager and is invoked on every ap-polling tick.
 
 defineJob({
     name: "reconcile-axiom",

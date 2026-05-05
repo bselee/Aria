@@ -16,7 +16,7 @@ const EXPECTED_JOBS = [
     "stat-indexing",
     "po-sync",
     "qty-calibration",
-    "po-sweep",
+    // KAIZEN #5: po-sweep folded into ap-polling as post-pass
     "reconcile-axiom",
     "reconcile-fedex",
     "reconcile-teraganix",
