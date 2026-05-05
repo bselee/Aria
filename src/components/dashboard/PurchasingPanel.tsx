@@ -48,6 +48,17 @@ type PurchasingItem = {
         reasonCodes: string[];
         explanation: string;
     };
+    vendorPolicy?: {
+        leadTimeOverrideDays: number | null;
+        targetCoverDays: number | null;
+        moqMode: "enforce" | "warn" | "ignore";
+        overbuyReviewPct: number;
+        overbuyReviewDollars: number;
+        notes: string | null;
+    };
+    moqWarning?: boolean;
+    reviewRequired?: boolean;
+    reviewReasons?: string[];
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -1294,6 +1305,38 @@ export default function PurchasingPanel() {
                                                                                         {item.packSize.unitsPerPack}/{item.packSize.packUnit}
                                                                                     </span>
                                                                                 )}
+                                                                                {!itemSnoozed && item.vendorPolicy?.targetCoverDays != null && item.vendorPolicy.targetCoverDays > 0 && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-emerald-300 border border-emerald-500/30 bg-emerald-500/5 rounded px-1 shrink-0"
+                                                                                        title={item.vendorPolicy.notes ?? "Vendor policy target cover window"}
+                                                                                    >
+                                                                                        {item.vendorPolicy.targetCoverDays}d cover
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.vendorPolicy?.leadTimeOverrideDays != null && item.vendorPolicy.leadTimeOverrideDays > 0 && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-zinc-300 border border-zinc-600/50 bg-zinc-800/40 rounded px-1 shrink-0"
+                                                                                        title="Vendor policy lead-time override"
+                                                                                    >
+                                                                                        {item.vendorPolicy.leadTimeOverrideDays}d lead
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.moqWarning && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded px-1 shrink-0"
+                                                                                        title="Vendor MOQ not met (warn-only — qty not bumped)"
+                                                                                    >
+                                                                                        MOQ warn
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.reviewRequired && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-red-300 border border-red-500/40 bg-red-500/10 rounded px-1 shrink-0"
+                                                                                        title="Recommendation flagged for review — see reasons below"
+                                                                                    >
+                                                                                        Review
+                                                                                    </span>
+                                                                                )}
 
                                                                                 <div className="flex-1" />
 
@@ -1461,6 +1504,13 @@ export default function PurchasingPanel() {
                                                                                             </button>
                                                                                         )}
                                                                                     </div>
+                                                                                    {item.reviewReasons && item.reviewReasons.length > 0 && (
+                                                                                        <div className="mt-1 rounded border border-red-500/40 bg-red-950/20 px-2 py-1 text-[11px] font-mono text-red-300 space-y-0.5">
+                                                                                            {item.reviewReasons.map((reason, i) => (
+                                                                                                <div key={i}>{reason}</div>
+                                                                                            ))}
+                                                                                        </div>
+                                                                                    )}
                                                                                     {item.recommendation && whyOpen.has(`${pid}:${item.productId}`) && (
                                                                                         <div className="mt-1 border border-cyan-900/40 bg-cyan-950/20 rounded p-2 space-y-1">
                                                                                             <div className="text-[10px] font-mono text-cyan-300/80 mb-1">
