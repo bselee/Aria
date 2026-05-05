@@ -24,6 +24,24 @@ type ActivePurchase = {
         status_display: string | null;
         estimated_delivery_at: string | null;
     }>;
+    lifecycleStage?: string;
+    lifecycleSummary?: string;
+    lastMovementSummary?: string | null;
+    trackingUnavailableAt?: string | null;
+    trackingRequestedAt?: string | null;
+    vendorAcknowledgedAt?: string | null;
+    sentVerification: {
+        verified: boolean;
+        sentAt: string | null;
+        source: "po_send" | "purchase_order" | "tracking" | "vendor_reply" | "manual" | null;
+        evidence: Array<{ type: string; at: string | null; detail: string }>;
+    };
+    etaProfile?: {
+        expectedDate: string;
+        source: "tracking_eta" | "vendor_reply_eta" | "vendor_weekday_pattern" | "vendor_median" | "sku_product" | "default";
+        confidence: "high" | "medium" | "low";
+        label: string;
+    };
 };
 
 type ApiResponse = {
@@ -85,6 +103,7 @@ export default function ActivePurchasesPanel() {
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [verifyingSent, setVerifyingSent] = useState<Set<string>>(new Set());
 
     // Dismissal state
     const [dismissed, setDismissed] = useState<Set<string>>(new Set());
@@ -171,6 +190,31 @@ export default function ActivePurchasesPanel() {
         return () => clearInterval(t);
     }, [fetchPurchases]);
 
+    async function markSentVerified(orderId: string) {
+        setVerifyingSent((prev) => new Set(prev).add(orderId));
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "mark_sent_verified", orderId }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "Verification failed");
+            setPurchases((prev) => prev.map((po) => po.orderId === orderId
+                ? { ...po, lifecycleStage: po.lifecycleStage || "sent", sentVerification: json.sentVerification }
+                : po));
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setVerifyingSent((prev) => {
+                const next = new Set(prev);
+                next.delete(orderId);
+                return next;
+            });
+        }
+    }
+
     const visiblePurchases = purchases.filter((po) => !dismissed.has(po.orderId));
 
     return (
@@ -233,6 +277,15 @@ export default function ActivePurchasesPanel() {
                             {visiblePurchases.map(po => {
                                 const isReceived = po.isReceived;
                                 const isCancelled = po.status.toLowerCase() === "cancelled";
+                                const sentVerified = po.sentVerification?.verified;
+                                const sentSource = po.sentVerification?.source;
+                                const sentAt = po.sentVerification?.sentAt;
+                                const etaConfidence = po.etaProfile?.confidence ?? "low";
+                                const etaTone = etaConfidence === "high"
+                                    ? "text-emerald-300"
+                                    : etaConfidence === "medium"
+                                    ? "text-cyan-300"
+                                    : "text-zinc-500";
                                 const poProductIds = po.items.map(item => item.productId);
                                 const matchesLifecycle = lifecycle.matchesFocus({
                                     vendorName: po.vendorName,
@@ -312,7 +365,32 @@ export default function ActivePurchasesPanel() {
                                             {isReceived && po.receiveDate ? (
                                                 <span>Rcvd {fmtDate(po.receiveDate)}</span>
                                             ) : (
-                                                <span>Exp: <span className="text-zinc-300">{fmtDate(po.expectedDate)}</span> <span className="opacity-50">({po.leadProvenance})</span></span>
+                                                <span>
+                                                    Exp: <span className={etaTone}>{fmtDate(po.expectedDate)}</span>{" "}
+                                                    <span className="opacity-60">({po.etaProfile?.label || po.leadProvenance})</span>
+                                                </span>
+                                            )}
+
+                                            <span className="text-zinc-700">Â·</span>
+                                            {sentVerified ? (
+                                                <span
+                                                    className="inline-flex items-center gap-1 text-emerald-300 shrink-0"
+                                                    title={(po.sentVerification.evidence || []).map((entry) => entry.detail).join("\n")}
+                                                >
+                                                    PO sent verified{sentAt ? ` ${fmtDate(sentAt)}` : ""} <span className="text-emerald-500/70">({sentSource})</span>
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex items-center gap-1.5 shrink-0">
+                                                    <span className="text-amber-300">PO send unverified</span>
+                                                    <button
+                                                        onClick={() => markSentVerified(po.orderId)}
+                                                        disabled={verifyingSent.has(po.orderId)}
+                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/30 text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-40"
+                                                        title="Mark this PO as sent after verifying externally"
+                                                    >
+                                                        {verifyingSent.has(po.orderId) ? "saving" : "mark verified"}
+                                                    </button>
+                                                </span>
                                             )}
 
                                             {((po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0) && (

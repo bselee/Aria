@@ -6,6 +6,8 @@ import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
+import { derivePOSentVerification, type POSentVerification } from "./po-sent-verification";
+import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -20,6 +22,8 @@ export interface ActivePurchase extends FullPO {
     trackingUnavailableAt?: string | null;
     trackingRequestedAt?: string | null;
     vendorAcknowledgedAt?: string | null;
+    sentVerification: POSentVerification;
+    etaProfile: VendorEtaProfile;
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -40,6 +44,7 @@ export async function loadActivePurchases(
     const trackingMap = new Map<string, string[]>();
     const shipmentMap = new Map<string, ShipmentRecord[]>();
     const lifecycleMap = new Map<string, Record<string, any>>();
+    const poSendMap = new Map<string, Array<Record<string, any>>>();
 
     if (supabase && poNumbers.length > 0) {
         try {
@@ -47,12 +52,27 @@ export async function loadActivePurchases(
                 const chunk = poNumbers.slice(i, i + 100);
                 const { data: dbPOs } = await supabase
                     .from("purchase_orders")
-                    .select("po_number, tracking_numbers, lifecycle_stage, last_movement_summary, tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at")
+                    .select(
+                        "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
+                        "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
+                        "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
+                        "po_sent_verified_evidence, last_eta_update"
+                    )
                     .in("po_number", chunk);
 
                 for (const dp of dbPOs || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
                     lifecycleMap.set(dp.po_number, dp);
+                }
+
+                const { data: poSends } = await supabase
+                    .from("po_sends")
+                    .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
+                    .in("po_number", chunk);
+
+                for (const row of poSends || []) {
+                    if (!poSendMap.has(row.po_number)) poSendMap.set(row.po_number, []);
+                    poSendMap.get(row.po_number)!.push(row);
                 }
             }
 
@@ -110,8 +130,9 @@ export async function loadActivePurchases(
         let expectedDate: string;
         let leadProvenance: string;
 
+        let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
         if (po.orderDate) {
-            const lt = await leadTimeService.getForVendor(po.vendorName);
+            lt = await leadTimeService.getForVendor(po.vendorName);
             expectedDate = addDays(po.orderDate, lt.days);
             leadProvenance = lt.label;
         } else {
@@ -120,12 +141,36 @@ export async function loadActivePurchases(
         }
 
         const poLifecycle = lifecycleMap.get(po.orderId);
+        const vendorPromisedEta =
+            poLifecycle?.last_eta_update?.estimated_delivery_at ??
+            poLifecycle?.last_eta_update?.eta ??
+            poLifecycle?.last_eta_update?.date ??
+            null;
+        const etaProfile = deriveVendorEtaProfile({
+            vendorName: po.vendorName,
+            orderDate: po.orderDate || new Date().toISOString().slice(0, 10),
+            fallbackLeadDays: lt?.days ?? 14,
+            fallbackLabel: lt?.label ?? "14d default",
+            fallbackSource: lt?.provenance ?? "default",
+            vendorPromisedEta,
+            shipments: shipments.map((shipment) => ({
+                estimated_delivery_at: shipment.estimated_delivery_at,
+                delivered_at: shipment.delivered_at,
+                created_at: shipment.created_at,
+            })),
+        });
+        const sentVerification = derivePOSentVerification({
+            poNumber: po.orderId,
+            purchaseOrder: poLifecycle,
+            sendRows: poSendMap.get(po.orderId) || [],
+            hasTracking: (trackingMap.get(po.orderId)?.length || 0) > 0 || shipments.length > 0,
+        });
 
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
-            expectedDate,
-            leadProvenance,
+            expectedDate: etaProfile.expectedDate || expectedDate,
+            leadProvenance: etaProfile.label || leadProvenance,
             isReceived,
             completionState,
             trackingNumbers: trackingMap.get(po.orderId) || [],
@@ -135,6 +180,8 @@ export async function loadActivePurchases(
             trackingUnavailableAt: poLifecycle?.tracking_unavailable_at || null,
             trackingRequestedAt: poLifecycle?.tracking_requested_at || null,
             vendorAcknowledgedAt: poLifecycle?.vendor_acknowledged_at || null,
+            sentVerification,
+            etaProfile,
         });
     }
 

@@ -1,13 +1,11 @@
 /**
  * @file    po-sender.ts
- * @purpose Commit draft POs in Finale and email them to vendors via bill.selee@buildasoil.com.
+ * @purpose Commit draft POs in Finale and send them through Finale's native PO email flow.
  *          Pending confirmation state is durably mirrored to `copilot_action_sessions`
  *          and cached in-memory for fast same-process reads.
  */
 
 import { createClient } from '../supabase';
-import { getAuthenticatedClient } from '../gmail/auth';
-import { gmail as GmailApi } from '@googleapis/gmail';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
 import * as agentTask from '../intelligence/agent-task';
@@ -272,40 +270,40 @@ export async function lookupVendorOrderEmail(
 // ──────────────────────────────────────────────────
 
 export function generatePOEmailBody(review: DraftPOReview): { subject: string; body: string } {
-    const subject = `Purchase Order #${review.orderId} – BuildASoil`;
-
-    const header = `  ${'SKU'.padEnd(22)} ${'Description'.padEnd(34)} ${'Qty'.padStart(8)}  ${'Unit Price'.padStart(11)}  ${'Line Total'.padStart(12)}`;
-    const divider = `  ${'-'.repeat(93)}`;
-
-    const itemRows = review.items.map(item => {
-        const sku = item.productId.slice(0, 21).padEnd(22);
-        const desc = item.productName.slice(0, 33).padEnd(34);
-        const qty = String(item.quantity).padStart(8);
-        const unit = `$${item.unitPrice.toFixed(2)}`.padStart(11);
-        const total = `$${item.lineTotal.toFixed(2)}`.padStart(12);
-        return `  ${sku} ${desc} ${qty}  ${unit}  ${total}`;
-    }).join('\n');
+    const date = new Date(`${review.orderDate.slice(0, 10)}T00:00:00`);
+    const datePart = Number.isNaN(date.getTime())
+        ? review.orderDate
+        : `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
+    const subject = `BuildASoil PO # ${review.orderId} - ${review.vendorName} - ${datePart}`;
 
     const body = [
-        `BuildASoil — Purchase Order`,
+        `Hi ${review.vendorName},`,
         ``,
-        `PO Number : ${review.orderId}`,
-        `Date      : ${review.orderDate}`,
-        `Vendor    : ${review.vendorName}`,
+        `Please see our attached PO.`,
         ``,
-        header,
-        divider,
-        itemRows,
-        divider,
-        `  ${'TOTAL'.padEnd(78)} $${review.total.toFixed(2).padStart(12)}`,
+        `Please acknowledge receipt and send ETA in this email thread.`,
         ``,
-        `Please confirm receipt of this purchase order and provide your estimated delivery date.`,
+        `Thanks,`,
         ``,
-        `Thank you,`,
         `BuildASoil Purchasing`,
     ].join('\n');
 
     return { subject, body };
+}
+
+async function findExistingPOSend(orderId: string): Promise<any | null> {
+    const db = createClient();
+    if (!db) return null;
+
+    const { data } = await db
+        .from('po_sends')
+        .select('*')
+        .eq('po_number', orderId)
+        .order('sent_at', { ascending: false, nullsFirst: false })
+        .limit(1)
+        .maybeSingle();
+
+    return data?.sent_at ? data : null;
 }
 
 // ──────────────────────────────────────────────────
@@ -320,9 +318,17 @@ export async function commitAndSendPO(
     id: string,
     triggeredBy: 'telegram' | 'dashboard',
     skipEmail: boolean = false
-): Promise<{ orderId: string; sentTo: string | null; gmailMessageId: string | null; emailSkipped: boolean; emailError?: string }> {
+): Promise<{
+    orderId: string;
+    sentTo: string | null;
+    gmailMessageId: null;
+    finaleEmailSent: boolean;
+    pdfAttached: boolean;
+    emailSkipped: boolean;
+    emailError?: string;
+}> {
     const pending = await getPendingPOSend(id);
-    if (!pending) throw new Error('Pending PO send not found or expired — initiate a new Review & Send');
+    if (!pending) throw new Error('Pending PO send not found or expired - initiate a new Review & Send');
 
     const { orderId, review, vendorEmail } = pending;
 
@@ -332,41 +338,35 @@ export async function commitAndSendPO(
         });
     } catch { /* best-effort */ }
 
+    if (!skipEmail) {
+        const existing = await findExistingPOSend(orderId);
+        if (existing) {
+            throw new Error(`PO #${orderId} was already sent at ${existing.sent_at}; blocked duplicate vendor email`);
+        }
+    }
+
     // 1. Commit in Finale
     const finale = new FinaleClient();
     await finale.commitDraftPO(orderId);
     const committedAt = new Date().toISOString();
 
-    // 2. Send email via bill.selee@buildasoil.com (if not skipped and email exists)
-    let gmailMessageId = null;
+    // 2. Send through Finale's native PO email action so the Finale PDF is attached.
+    let finaleEmailSent = false;
+    let pdfAttached = false;
     let sentAt = null;
-    let emailError: string | undefined;
+    let finaleEmailActionUrl: string | undefined;
 
     if (!skipEmail && vendorEmail) {
-        try {
-            const auth = await getAuthenticatedClient('default');
-            const gmail = GmailApi({ version: 'v1', auth });
-
-            const { subject, body } = generatePOEmailBody(review);
-            const mimeMessage = [
-                `To: ${vendorEmail}`,
-                `From: bill.selee@buildasoil.com`,
-                `Subject: ${subject}`,
-                `Content-Type: text/plain; charset=utf-8`,
-                ``,
-                body,
-            ].join('\r\n');
-
-            const sendResult = await gmail.users.messages.send({
-                userId: 'me',
-                requestBody: { raw: Buffer.from(mimeMessage).toString('base64url') },
-            });
-
-            gmailMessageId = sendResult.data.id || '';
-            sentAt = new Date().toISOString();
-        } catch (err: any) {
-            emailError = err.message;
-        }
+        const { subject, body } = generatePOEmailBody(review);
+        const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
+            toEmail: vendorEmail,
+            subject,
+            body,
+        });
+        finaleEmailSent = sendResult.sent;
+        pdfAttached = sendResult.pdfAttached;
+        finaleEmailActionUrl = sendResult.actionUrl;
+        sentAt = new Date().toISOString();
     }
 
     const { subject } = generatePOEmailBody(review);
@@ -385,26 +385,25 @@ export async function commitAndSendPO(
                 committed_at: committedAt,
                 sent_at: sentAt,
                 triggered_by: triggeredBy,
-                gmail_message_id: gmailMessageId,
+                gmail_message_id: null,
             }),
             db.from('ap_activity_log').insert({
                 email_from: 'bill.selee@buildasoil.com',
                 email_subject: subject,
-                intent: 'PO_SEND',
-                action_taken: emailError
-                    ? `PO #${orderId} committed in Finale (Email failed: ${emailError})`
-                    : skipEmail || !vendorEmail
+                intent: finaleEmailSent ? 'PO_SEND_FINALE' : 'PO_COMMIT',
+                action_taken: skipEmail || !vendorEmail
                     ? `PO #${orderId} committed in Finale (Email skipped/unavailable)`
-                    : `PO #${orderId} committed in Finale and emailed to ${vendorEmail}`,
+                    : `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`,
                 notified_slack: false,
                 metadata: {
                     orderId,
                     vendorEmail: skipEmail ? null : vendorEmail,
                     triggeredBy,
-                    gmailMessageId,
+                    finaleEmailSent,
+                    pdfAttached,
+                    finaleEmailActionUrl,
                     itemCount: review.items.length,
                     emailSkipped: skipEmail || !vendorEmail,
-                    emailError,
                 },
             }),
             db.from('purchase_orders').upsert({
@@ -412,7 +411,7 @@ export async function commitAndSendPO(
                 vendor_name: review.vendorName,
                 committed_at: committedAt,
                 po_sent_at: sentAt,
-                po_email_message_id: gmailMessageId,
+                po_email_message_id: finaleEmailActionUrl ?? null,
                 lifecycle_stage: 'sent',
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'po_number' }),
@@ -423,8 +422,9 @@ export async function commitAndSendPO(
     return {
         orderId,
         sentTo: skipEmail ? null : vendorEmail,
-        gmailMessageId,
+        gmailMessageId: null,
+        finaleEmailSent,
+        pdfAttached,
         emailSkipped: skipEmail || !vendorEmail,
-        emailError,
     };
 }

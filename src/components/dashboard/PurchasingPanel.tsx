@@ -93,6 +93,32 @@ function timeAgo(iso: string) {
     return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
 }
 
+function orderingNeedScore(item: PurchasingItem): number {
+    const stockoutDays = item.finaleStockoutDays ?? item.adjustedRunwayDays ?? item.runwayDays;
+    return Number.isFinite(stockoutDays) ? stockoutDays : 9999;
+}
+
+function sortItemsByNeed(items: PurchasingItem[]): PurchasingItem[] {
+    return [...items].sort((a, b) => {
+        const runwayDelta = (a.runwayDays ?? 9999) - (b.runwayDays ?? 9999);
+        if (runwayDelta !== 0) return runwayDelta;
+
+        const stockoutDelta = orderingNeedScore(a) - orderingNeedScore(b);
+        if (stockoutDelta !== 0) return stockoutDelta;
+
+        const urgencyDelta = URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency];
+        if (urgencyDelta !== 0) return urgencyDelta;
+
+        const confidenceRank = { high: 0, medium: 1, low: 2 } as const;
+        const confidenceDelta =
+            (confidenceRank[a.assessment?.confidence ?? "low"] ?? 2) -
+            (confidenceRank[b.assessment?.confidence ?? "low"] ?? 2);
+        if (confidenceDelta !== 0) return confidenceDelta;
+
+        return b.suggestedQty - a.suggestedQty;
+    });
+}
+
 // ── component ──────────────────────────────────────────────────────────────
 export default function PurchasingPanel() {
     const lifecycle = usePurchasingLifecycle();
@@ -528,7 +554,7 @@ export default function PurchasingPanel() {
     const focusGroups = displayGroups
         .map(group => ({
             ...group,
-            items: group.items.filter(item => itemMatchesFocus(item)),
+            items: sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item))),
         }))
         .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
     const visibleGroups = vendorTab === "all" ? focusGroups : focusGroups.filter(g => g.vendorPartyId === vendorTab);
@@ -1043,12 +1069,7 @@ export default function PurchasingPanel() {
                                                         ) : null}
                                                     </div>
 
-                                                    {[...group.items]
-                                                        .sort((a, b) =>
-                                                            URGENCY_RANK[a.urgency] !== URGENCY_RANK[b.urgency]
-                                                                ? URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]
-                                                                : a.runwayDays - b.runwayDays
-                                                        )
+                                                    {sortItemsByNeed(group.items)
                                                         .filter(item => showSnoozed || !isSnoozed(item.productId))
                                                         .map(item => {
                                                             const itemSnoozed = isSnoozed(item.productId);

@@ -4,6 +4,7 @@ import type { DraftPOReview } from "../finale/client";
 const {
     sessionRows,
     commitDraftPOMock,
+    sendPurchaseOrderEmailMock,
     gmailSendMock,
     createClientMock,
     upsertFromSourceMock,
@@ -11,6 +12,12 @@ const {
 } = vi.hoisted(() => {
     const sessionRows = new Map<string, any>();
     const commitDraftPOMock = vi.fn().mockResolvedValue(undefined);
+    const sendPurchaseOrderEmailMock = vi.fn().mockResolvedValue({
+        orderId: "PO-1001",
+        sent: true,
+        pdfAttached: true,
+        actionUrl: "/buildasoil/api/order/PO-1001/action/emailPurchaseOrder",
+    });
     const gmailSendMock = vi.fn().mockResolvedValue({ data: { id: "gmail-1" } });
     const upsertFromSourceMock = vi.fn().mockResolvedValue("task-1");
     const updateBySourceMock = vi.fn().mockResolvedValue(undefined);
@@ -43,7 +50,27 @@ const {
                 };
             }
 
-            if (table === "po_sends" || table === "ap_activity_log") {
+            if (table === "po_sends") {
+                return {
+                    select: () => ({
+                        eq: (_field: string, value: string) => ({
+                            order: () => ({
+                                limit: () => ({
+                                    maybeSingle: async () => ({
+                                        data: value === "PO-ALREADY-SENT"
+                                            ? { po_number: value, sent_at: "2026-05-01T12:00:00.000Z" }
+                                            : null,
+                                        error: null,
+                                    }),
+                                }),
+                            }),
+                        }),
+                    }),
+                    insert: async (_row: any) => ({ data: null, error: null }),
+                };
+            }
+
+            if (table === "ap_activity_log") {
                 return {
                     insert: async (_row: any) => ({ data: null, error: null }),
                 };
@@ -59,6 +86,7 @@ const {
     return {
         sessionRows,
         commitDraftPOMock,
+        sendPurchaseOrderEmailMock,
         gmailSendMock,
         createClientMock,
         upsertFromSourceMock,
@@ -87,6 +115,7 @@ vi.mock("@googleapis/gmail", () => ({
 vi.mock("../finale/client", () => ({
     FinaleClient: class FinaleClient {
         commitDraftPO = commitDraftPOMock;
+        sendPurchaseOrderEmail = sendPurchaseOrderEmailMock;
     },
 }));
 
@@ -98,6 +127,7 @@ vi.mock("../intelligence/agent-task", () => ({
 import { executePOSendAction } from "./actions";
 import {
     clearPendingPOSendCache,
+    generatePOEmailBody,
     getPendingPOSend,
     storePendingPOSend,
 } from "../purchasing/po-sender";
@@ -128,6 +158,12 @@ describe("PO send actions", () => {
         sessionRows.clear();
         vi.clearAllMocks();
         commitDraftPOMock.mockResolvedValue(undefined);
+        sendPurchaseOrderEmailMock.mockResolvedValue({
+            orderId: "PO-1001",
+            sent: true,
+            pdfAttached: true,
+            actionUrl: "/buildasoil/api/order/PO-1001/action/emailPurchaseOrder",
+        });
         gmailSendMock.mockResolvedValue({ data: { id: "gmail-1" } });
         upsertFromSourceMock.mockResolvedValue("task-1");
         updateBySourceMock.mockResolvedValue(undefined);
@@ -183,8 +219,28 @@ describe("PO send actions", () => {
         );
     });
 
-    it("returns partial_success when Finale commit succeeds but email send fails", async () => {
-        gmailSendMock.mockRejectedValueOnce(new Error("SMTP offline"));
+    it("formats vendor PO email using the approved subject and concise body", () => {
+        const email = generatePOEmailBody({
+            ...makeReview("124790"),
+            vendorName: "Clarke",
+            orderDate: "2026-05-01",
+        });
+
+        expect(email.subject).toBe("BuildASoil PO # 124790 - Clarke - 5/1/2026");
+        expect(email.body).toBe([
+            "Hi Clarke,",
+            "",
+            "Please see our attached PO.",
+            "",
+            "Please acknowledge receipt and send ETA in this email thread.",
+            "",
+            "Thanks,",
+            "",
+            "BuildASoil Purchasing",
+        ].join("\n"));
+    });
+
+    it("uses Finale native PO email so the PDF attachment is included", async () => {
         const sendId = await storePendingPOSend("PO-1003", makeReview("PO-1003"), "vendor@example.com", "vendor_profiles", {
             channel: "dashboard",
         });
@@ -194,13 +250,59 @@ describe("PO send actions", () => {
             triggeredBy: "dashboard",
         });
 
-        expect(result.status).toBe("partial_success");
-        expect(result.userMessage).toMatch(/committed/i);
-        expect(result.userMessage).toMatch(/email/i);
+        expect(result.status).toBe("success");
+        expect(sendPurchaseOrderEmailMock).toHaveBeenCalledWith("PO-1003", expect.objectContaining({
+            toEmail: "vendor@example.com",
+            subject: "BuildASoil PO # PO-1003 - ULINE - 3/26/2026",
+            body: expect.stringContaining("Please see our attached PO."),
+        }));
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(result.details).toMatchObject({
+            finaleEmailSent: true,
+            pdfAttached: true,
+            emailSkipped: false,
+        });
         expect(updateBySourceMock).toHaveBeenCalledWith(
             "copilot_action_sessions",
             sendId,
             expect.objectContaining({ status: "SUCCEEDED" }),
         );
+    });
+
+    it("fails closed when Finale cannot send the PO email with PDF", async () => {
+        sendPurchaseOrderEmailMock.mockRejectedValueOnce(new Error("Finale native PO email action was not available"));
+        const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
+            channel: "dashboard",
+        });
+
+        const result = await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+        });
+
+        expect(result.status).toBe("failed");
+        expect(result.userMessage).toMatch(/Finale native PO email action/i);
+        expect(gmailSendMock).not.toHaveBeenCalled();
+    });
+
+    it("blocks duplicate vendor emails when a PO has already been sent", async () => {
+        const sendId = await storePendingPOSend(
+            "PO-ALREADY-SENT",
+            makeReview("PO-ALREADY-SENT"),
+            "vendor@example.com",
+            "vendor_profiles",
+            { channel: "dashboard" },
+        );
+
+        const result = await executePOSendAction({
+            sendId,
+            triggeredBy: "dashboard",
+        });
+
+        expect(result.status).toBe("failed");
+        expect(result.userMessage).toMatch(/already sent/i);
+        expect(commitDraftPOMock).not.toHaveBeenCalled();
+        expect(sendPurchaseOrderEmailMock).not.toHaveBeenCalled();
+        expect(gmailSendMock).not.toHaveBeenCalled();
     });
 });
