@@ -324,70 +324,111 @@ export async function backfillPOSentVerificationFromGmail(
         return result;
     }
 
+    const HIGH_CONFIDENCE_SOURCES = new Set(["po_send", "vendor_reply", "manual"]);
+
+    // Normalize all PO numbers up-front so we can do a single batched SELECT.
+    type Prepped = {
+        poNumber: string;
+        sentISO: string;
+        rec: typeof records[number];
+    };
+    const prepped: Prepped[] = [];
     for (const rec of records) {
-        try {
-            // Normalize PO number to bare digits — Finale stores orderIds without
-            // the "PO-" / "PO#" / "BuildASoil PO #" prefixes that appear in subjects.
-            const rawPoNumber = (rec.poNumber || "").trim();
-            const digitMatch = rawPoNumber.match(/(\d{3,})/);
-            const poNumber = digitMatch ? digitMatch[1] : "";
-            if (!poNumber) continue;
-            result.matched += 1;
+        const rawPoNumber = (rec.poNumber || "").trim();
+        const digitMatch = rawPoNumber.match(/(\d{3,})/);
+        const poNumber = digitMatch ? digitMatch[1] : "";
+        if (!poNumber) continue;
+        result.matched += 1;
+        const sentAt = new Date(rec.sentDate);
+        const sentISO = isNaN(sentAt.getTime()) ? new Date().toISOString() : sentAt.toISOString();
+        prepped.push({ poNumber, sentISO, rec });
+    }
 
-            const sentAt = new Date(rec.sentDate);
-            const sentISO = isNaN(sentAt.getTime()) ? new Date().toISOString() : sentAt.toISOString();
+    if (prepped.length === 0) {
+        console.log(`[po-correlator] backfillPOSentVerificationFromGmail: scanned=${result.scanned} matched=${result.matched} inserted=${result.inserted} skipped=${result.skipped} errors=${result.errors}`);
+        return result;
+    }
 
-            const { data: existing } = await supabase
-                .from("purchase_orders")
-                .select("po_number, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence")
-                .eq("po_number", poNumber)
-                .maybeSingle();
+    // Batched SELECT: one query for all candidate PO numbers.
+    const allPONumbers = Array.from(new Set(prepped.map(p => p.poNumber)));
+    const { data: existingRows, error: selectErr } = await supabase
+        .from("purchase_orders")
+        .select("po_number, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence")
+        .in("po_number", allPONumbers);
 
-            const HIGH_CONFIDENCE_SOURCES = new Set(["po_send", "vendor_reply", "manual"]);
-            if (existing?.po_sent_verified_source && HIGH_CONFIDENCE_SOURCES.has(existing.po_sent_verified_source)) {
-                result.skipped += 1;
-                continue;
-            }
+    if (selectErr) {
+        console.warn(`[po-correlator] backfill batched select failed: ${selectErr.message}`);
+        result.errors += prepped.length;
+        return result;
+    }
 
-            const evidence = {
-                type: "po_send",
-                source: "gmail_outbox",
-                at: sentISO,
-                detail: `Gmail label:PO outbox (subject: ${rec.subject})`,
-                gmail_message_id: rec.messageId,
-                gmail_thread_id: rec.threadId,
-                vendor_email: rec.vendorEmail,
-            };
+    const existingByPO = new Map<string, any>(
+        (existingRows ?? []).map((r: any) => [r.po_number, r]),
+    );
 
-            const evidenceList = Array.isArray(existing?.po_sent_verified_evidence)
-                ? [...existing.po_sent_verified_evidence, evidence]
-                : [evidence];
+    // Collapse multiple records for the same PO into one upsert payload, accumulating evidence.
+    const upsertByPO = new Map<string, Record<string, any>>();
+    const matchedForReport = new Map<string, { poNumber: string; sentDate: string; vendorName: string }>();
+    const nowISO = new Date().toISOString();
 
-            const upsertPayload: Record<string, any> = {
-                po_number: poNumber,
-                po_sent_at: existing?.po_sent_verified_at ?? sentISO,
-                po_sent_verified_at: existing?.po_sent_verified_at ?? sentISO,
-                po_sent_verified_source: existing?.po_sent_verified_source ?? "po_send",
-                po_sent_verified_evidence: evidenceList,
-                updated_at: new Date().toISOString(),
-            };
-            if (rec.vendorName) upsertPayload.vendor_name = rec.vendorName;
+    for (const { poNumber, sentISO, rec } of prepped) {
+        const existing = existingByPO.get(poNumber);
+        if (existing?.po_sent_verified_source && HIGH_CONFIDENCE_SOURCES.has(existing.po_sent_verified_source)) {
+            result.skipped += 1;
+            continue;
+        }
 
-            const { error } = await supabase
-                .from("purchase_orders")
-                .upsert(upsertPayload, { onConflict: "po_number" });
+        const evidence = {
+            type: "po_send",
+            source: "gmail_outbox",
+            at: sentISO,
+            detail: `Gmail label:PO outbox (subject: ${rec.subject})`,
+            gmail_message_id: rec.messageId,
+            gmail_thread_id: rec.threadId,
+            vendor_email: rec.vendorEmail,
+        };
 
-            if (error) {
-                console.warn(`[po-correlator] backfill upsert failed for PO ${poNumber}: ${error.message}`);
-                result.errors += 1;
-                continue;
-            }
+        const prior = upsertByPO.get(poNumber);
+        if (prior) {
+            // Already queued for this PO from another record — append evidence only.
+            const existingEvidence = Array.isArray(prior.po_sent_verified_evidence)
+                ? prior.po_sent_verified_evidence
+                : [];
+            prior.po_sent_verified_evidence = [...existingEvidence, evidence];
+            if (rec.vendorName && !prior.vendor_name) prior.vendor_name = rec.vendorName;
+            continue;
+        }
 
-            result.inserted += 1;
-            result.matchedPOs.push({ poNumber, sentDate: sentISO, vendorName: rec.vendorName });
-        } catch (err: any) {
-            console.warn(`[po-correlator] backfill exception for ${rec.poNumber}: ${err.message}`);
-            result.errors += 1;
+        const evidenceList = Array.isArray(existing?.po_sent_verified_evidence)
+            ? [...existing.po_sent_verified_evidence, evidence]
+            : [evidence];
+
+        const upsertPayload: Record<string, any> = {
+            po_number: poNumber,
+            po_sent_at: existing?.po_sent_verified_at ?? sentISO,
+            po_sent_verified_at: existing?.po_sent_verified_at ?? sentISO,
+            po_sent_verified_source: existing?.po_sent_verified_source ?? "po_send",
+            po_sent_verified_evidence: evidenceList,
+            updated_at: nowISO,
+        };
+        if (rec.vendorName) upsertPayload.vendor_name = rec.vendorName;
+
+        upsertByPO.set(poNumber, upsertPayload);
+        matchedForReport.set(poNumber, { poNumber, sentDate: sentISO, vendorName: rec.vendorName });
+    }
+
+    const toUpsert = Array.from(upsertByPO.values());
+    if (toUpsert.length > 0) {
+        const { error: upsertErr } = await supabase
+            .from("purchase_orders")
+            .upsert(toUpsert, { onConflict: "po_number" });
+
+        if (upsertErr) {
+            console.warn(`[po-correlator] backfill batched upsert failed (${toUpsert.length} rows): ${upsertErr.message}`);
+            result.errors += toUpsert.length;
+        } else {
+            result.inserted += toUpsert.length;
+            for (const m of matchedForReport.values()) result.matchedPOs.push(m);
         }
     }
 
