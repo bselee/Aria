@@ -33,6 +33,12 @@ type PurchasingItem = {
     velocityInflated?: boolean;
     velocityRawRate?: number;
     velocityRealityCap?: number;
+    recommendation?: {
+        formulaVersion: string;
+        coverDays: number;
+        rawNeededEaches: number;
+        provenance: Array<{ step: string; detail: string; value?: number | string }>;
+    };
     packSize?: { unitsPerPack: number; packUnit: string };
     candidate?: { directDemand: number; bomDemand: number; finishedGoodsCoverageDays?: number | null };
     assessment?: {
@@ -130,6 +136,15 @@ export default function PurchasingPanel() {
 
     const [vendorTab, setVendorTab] = useState<string>("all");
     const [expanded, setExpanded] = useState<Set<string>>(new Set());
+    const [whyOpen, setWhyOpen] = useState<Set<string>>(new Set());
+    const toggleWhy = useCallback((id: string) => {
+        setWhyOpen(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }, []);
     const [checked, setChecked] = useState<Record<string, Record<string, boolean>>>({});
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
@@ -1234,10 +1249,42 @@ export default function PurchasingPanel() {
                                                                                 </div>
                                                                             )}
 
-                                                                            {/* Row 4: Explanation */}
+                                                                            {/* Row 4: Explanation + Why drawer */}
                                                                             {!itemSnoozed && (
-                                                                                <div className="mt-2 text-[11px] font-mono text-zinc-400 italic">
-                                                                                    {item.assessment?.explanation ?? item.explanation}
+                                                                                <div className="mt-2 space-y-1">
+                                                                                    <div className="flex items-start justify-between gap-2">
+                                                                                        <div className="text-[11px] font-mono text-zinc-400 italic flex-1">
+                                                                                            {item.assessment?.explanation ?? item.explanation}
+                                                                                        </div>
+                                                                                        {item.recommendation && (
+                                                                                            <button
+                                                                                                onClick={(e) => { e.stopPropagation(); toggleWhy(`${pid}:${item.productId}`); }}
+                                                                                                className="text-[10px] font-mono text-cyan-400 hover:text-cyan-200 underline-offset-2 hover:underline shrink-0"
+                                                                                                title="Show full reorder math trace"
+                                                                                            >
+                                                                                                {whyOpen.has(`${pid}:${item.productId}`) ? "Hide why" : `Why ${item.suggestedQty}?`}
+                                                                                            </button>
+                                                                                        )}
+                                                                                    </div>
+                                                                                    {item.recommendation && whyOpen.has(`${pid}:${item.productId}`) && (
+                                                                                        <div className="mt-1 border border-cyan-900/40 bg-cyan-950/20 rounded p-2 space-y-1">
+                                                                                            <div className="text-[10px] font-mono text-cyan-300/80 mb-1">
+                                                                                                formula {item.recommendation.formulaVersion} · cover {item.recommendation.coverDays}d · raw need {Math.round(item.recommendation.rawNeededEaches)}
+                                                                                            </div>
+                                                                                            {item.recommendation.provenance.map((step, i) => (
+                                                                                                <div key={i} className="text-[10.5px] font-mono text-zinc-300 leading-snug">
+                                                                                                    <span className="text-cyan-400">{step.step}</span>
+                                                                                                    <span className="text-zinc-500"> → </span>
+                                                                                                    <span>{step.detail}</span>
+                                                                                                </div>
+                                                                                            ))}
+                                                                                            {(item.finaleReorderQty ?? 0) > 0 && (
+                                                                                                <div className="text-[10px] font-mono text-zinc-500 pt-1 border-t border-cyan-900/40">
+                                                                                                    Finale says {item.finaleReorderQty} (ignored — Aria's trace above is the source of truth)
+                                                                                                </div>
+                                                                                            )}
+                                                                                        </div>
+                                                                                    )}
                                                                                 </div>
                                                                             )}
                                                                         </div>
