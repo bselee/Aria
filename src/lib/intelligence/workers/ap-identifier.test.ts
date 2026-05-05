@@ -1318,3 +1318,100 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         expect(updateInMock).toHaveBeenCalledWith("id", ["row-aaa-stale-1"]);
     });
 });
+
+describe("APIdentifierAgent classifyEmailIntent — KAIZEN #3 nightshift bypass", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it("skips paid Sonnet when nightshift returns conf >= 0.7 with a known label", async () => {
+        getPreClassificationMock.mockResolvedValue({
+            classification: "ADVERTISEMENT",
+            handler: "claude-haiku",
+            confidence: 0.92,
+        });
+
+        const agent: any = new APIdentifierAgent();
+        const intent = await agent.classifyEmailIntent(
+            "Big sale this week!",
+            "marketing@vendor.com",
+            "Click here for 20% off",
+            "gmail-msg-bypass-1",
+        );
+
+        expect(intent).toBe("ADVERTISEMENT");
+        expect(getPreClassificationMock).toHaveBeenCalledWith("gmail-msg-bypass-1");
+        expect(unifiedObjectGenerationMock).not.toHaveBeenCalled();
+    });
+
+    it("falls through to paid Sonnet when nightshift confidence is below 0.7", async () => {
+        getPreClassificationMock.mockResolvedValue({
+            classification: "INVOICE",
+            handler: "claude-haiku",
+            confidence: 0.55,
+        });
+        unifiedObjectGenerationMock.mockResolvedValue({ intent: "HUMAN_INTERACTION" });
+
+        const agent: any = new APIdentifierAgent();
+        const intent = await agent.classifyEmailIntent(
+            "Question about my order",
+            "customer@vendor.com",
+            "Hi, when does this ship?",
+            "gmail-msg-lowconf",
+        );
+
+        expect(intent).toBe("HUMAN_INTERACTION");
+        expect(unifiedObjectGenerationMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls through to paid Sonnet when nightshift returns null (not yet classified)", async () => {
+        getPreClassificationMock.mockResolvedValue(null);
+        unifiedObjectGenerationMock.mockResolvedValue({ intent: "INVOICE" });
+
+        const agent: any = new APIdentifierAgent();
+        const intent = await agent.classifyEmailIntent(
+            "Invoice 12345",
+            "ap@vendor.com",
+            "Please remit payment",
+            "gmail-msg-null",
+        );
+
+        expect(intent).toBe("INVOICE");
+        expect(unifiedObjectGenerationMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores nightshift label outside the known set and falls through to paid Sonnet", async () => {
+        getPreClassificationMock.mockResolvedValue({
+            classification: "GARBAGE_LABEL",
+            handler: "claude-haiku",
+            confidence: 0.99,
+        });
+        unifiedObjectGenerationMock.mockResolvedValue({ intent: "HUMAN_INTERACTION" });
+
+        const agent: any = new APIdentifierAgent();
+        const intent = await agent.classifyEmailIntent(
+            "Some subject",
+            "x@y.com",
+            "snippet",
+            "gmail-msg-bad-label",
+        );
+
+        expect(intent).toBe("HUMAN_INTERACTION");
+        expect(unifiedObjectGenerationMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("calls paid Sonnet when no gmailMessageId is provided (defensive fallback)", async () => {
+        unifiedObjectGenerationMock.mockResolvedValue({ intent: "STATEMENT" });
+
+        const agent: any = new APIdentifierAgent();
+        const intent = await agent.classifyEmailIntent(
+            "Statement of account",
+            "ar@vendor.com",
+            "Your monthly statement is attached",
+        );
+
+        expect(intent).toBe("STATEMENT");
+        expect(getPreClassificationMock).not.toHaveBeenCalled();
+        expect(unifiedObjectGenerationMock).toHaveBeenCalledTimes(1);
+    });
+});
