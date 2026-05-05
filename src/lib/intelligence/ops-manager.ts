@@ -226,6 +226,36 @@ export class OpsManager {
      * - Supabase cron_runs table audit trail
      * - Supervisor exception queue on failure
      */
+    /**
+     * Hook called by src/cron/runner on each successful tick. Fires heartbeat
+     * to OversightAgent so the dashboard "agent healthy" signal stays fresh.
+     * Best-effort — never throws.
+     */
+    public async cronHookSuccess(taskName: string): Promise<void> {
+        try {
+            await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastSuccess: new Date() });
+        } catch (e: any) {
+            console.warn(`[ops-manager] cronHookSuccess(${taskName}) heartbeat failed: ${e.message}`);
+        }
+    }
+
+    /**
+     * Hook called by src/cron/runner on each failed tick. Fires heartbeat with
+     * the error AND escalates via SupervisorAgent. Best-effort — never throws.
+     */
+    public async cronHookFailure(taskName: string, error: any): Promise<void> {
+        try {
+            await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastError: String(error?.message ?? error) });
+        } catch (e: any) {
+            console.warn(`[ops-manager] cronHookFailure(${taskName}) heartbeat failed: ${e.message}`);
+        }
+        try {
+            this.supervisor.reportAgentException(taskName, error);
+        } catch (e: any) {
+            console.warn(`[ops-manager] cronHookFailure(${taskName}) supervisor escalate failed: ${e.message}`);
+        }
+    }
+
     private async safeRun(taskName: string, task: () => Promise<any> | any) {
         const startTime = performance.now();
         let cronRunId: number | null = null;

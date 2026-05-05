@@ -73,6 +73,7 @@ export async function runJobOnce(
 
     const correlationId = `${jobName}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     const startMs = Date.now();
+    const startedAtIso = new Date().toISOString();
     const historyId = await recordStart({ jobName, invokedBy, correlationId });
 
     const ac = new AbortController();
@@ -93,6 +94,7 @@ export async function runJobOnce(
             signal: ac.signal,
         }));
         result = { status: "succeeded", durationMs: Date.now() - startMs };
+        await runObservabilityHooks(jobName, "success", result, startedAtIso);
     } catch (err: any) {
         const aborted = ac.signal.aborted;
         result = {
@@ -101,6 +103,7 @@ export async function runJobOnce(
             failureReason: aborted ? "duration-exceeded" : "handler-threw",
             failureMessage: err?.message ?? String(err),
         };
+        await runObservabilityHooks(jobName, "failure", result, startedAtIso, err);
         await routeFailure(jobName, job.onFail ?? "log", result);
     } finally {
         if (durationTimer) clearTimeout(durationTimer);
@@ -115,6 +118,67 @@ export async function runJobOnce(
     });
 
     return result;
+}
+
+/**
+ * Cross-cutting observability concerns that previously lived in OpsManager.safeRun:
+ *   1. recordCronRun → updates the legacy in-memory cron status map (dashboard reads this)
+ *   2. memoryLayerManager.archiveSession → cron tick session archive
+ *   3. OpsManager.singleton heartbeat + supervisor exception (instance-level, optional)
+ *
+ * All best-effort. A failure in any hook must not propagate — the tick already
+ * succeeded or failed independently.
+ */
+async function runObservabilityHooks(
+    jobName: string,
+    outcome: "success" | "failure",
+    result: RunResult,
+    startedAtIso: string,
+    err?: any,
+): Promise<void> {
+    // 1. legacy in-memory cron map (used by command-board dashboard)
+    try {
+        const { recordCronRun } = await import("../lib/scheduler/cron-registry");
+        if (outcome === "success") {
+            recordCronRun(jobName, result.durationMs, "success");
+        } else {
+            recordCronRun(jobName, result.durationMs, "error", result.failureMessage);
+        }
+    } catch (e: any) {
+        console.warn(`[cron:${jobName}] hook recordCronRun failed: ${e.message}`);
+    }
+
+    // 2. memory layer session archive
+    try {
+        const { memoryLayerManager } = await import("../lib/intelligence/memory-layer-manager");
+        await memoryLayerManager.archiveSession(`cron:${jobName}:${startedAtIso}`, {
+            sessionId: `cron:${jobName}:${startedAtIso}`,
+            agentName: "ops-manager",
+            taskType: jobName,
+            inputSummary: `Scheduled task ${jobName}`,
+            outputSummary: outcome === "success"
+                ? `Completed in ${result.durationMs}ms`
+                : (result.failureMessage ?? "unknown error"),
+            status: outcome,
+            createdAt: startedAtIso,
+        });
+    } catch (e: any) {
+        console.warn(`[cron:${jobName}] hook memoryLayerManager failed: ${e.message}`);
+    }
+
+    // 3. heartbeat + supervisor exception via OpsManager.singleton (best-effort; null in test contexts)
+    try {
+        const { OpsManager } = await import("../lib/intelligence/ops-manager");
+        const ops = OpsManager.singleton;
+        if (!ops) return;
+        if (outcome === "success") {
+            await ops.cronHookSuccess(jobName);
+        } else {
+            await ops.cronHookFailure(jobName, err ?? new Error(result.failureMessage ?? "unknown"));
+        }
+    } catch (e: any) {
+        console.warn(`[cron:${jobName}] hook ops-singleton failed: ${e.message}`);
+    }
 }
 
 async function routeFailure(jobName: string, mode: string, result: RunResult): Promise<void> {
