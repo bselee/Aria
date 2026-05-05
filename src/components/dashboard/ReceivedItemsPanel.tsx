@@ -4,6 +4,7 @@ import React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createBrowserClient } from "@/lib/supabase";
+import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 
 type ReceivedPO = {
     orderId: string;
@@ -72,6 +73,7 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
 }
 
 export default function ReceivedItemsPanel() {
+    const lifecycle = usePurchasingLifecycle();
     const [pos, setPos] = useState<ReceivedPO[]>([]);
     const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
     const [apMap, setApMap] = useState<ApStatusMap>({});
@@ -250,8 +252,19 @@ export default function ReceivedItemsPanel() {
                                 const apStatus = apMap[po.orderId];
                                 const dollars = fmtDollars(po.total);
                                 const discrepancy = partialDiscrepancy(po);
+                                const poProductIds = po.items.map(item => item.productId);
+                                const matchesLifecycle = lifecycle.matchesFocus({
+                                    vendorName: po.supplier,
+                                    orderId: po.orderId,
+                                    productIds: poProductIds,
+                                });
                                 return (
-                                    <div key={po.orderId} className="px-4 py-2.5 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors">
+                                    <div
+                                        key={po.orderId}
+                                        onMouseEnter={() => lifecycle.setFocus({ source: "rcv", vendorName: po.supplier, orderId: po.orderId, productIds: poProductIds })}
+                                        onMouseLeave={lifecycle.clearFocus}
+                                        className={`px-4 py-2.5 border-b border-zinc-800/40 transition-colors ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                    >
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
                                             <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
@@ -288,7 +301,7 @@ export default function ReceivedItemsPanel() {
                                             )}
                                             <span className="text-zinc-700 text-xs">·</span>
                                             {po.items.map((item, index) => (
-                                                <span key={`${item.productId}-${index}`} className="text-sm font-mono text-zinc-200">
+                                                <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${lifecycle.matchesFocus({ productIds: [item.productId] }) ? "text-cyan-100" : "text-zinc-200"}`}>
                                                     {item.productId}
                                                     <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
                                                 </span>

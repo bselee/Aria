@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
 import {
     canIncludeInDraftPO,
@@ -8,6 +8,7 @@ import {
     getOrderingFocusBucket,
     shouldAutoSelectItem,
 } from "@/lib/purchasing/dashboard-focus";
+import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import type { FinaleReorderMethod } from "@/lib/finale/client";
 
 // ── types ──────────────────────────────────────────────────────────────────
@@ -94,6 +95,7 @@ function timeAgo(iso: string) {
 
 // ── component ──────────────────────────────────────────────────────────────
 export default function PurchasingPanel() {
+    const lifecycle = usePurchasingLifecycle();
     const [data, setData] = useState<AssessmentData | null>(null);
     const [loading, setLoading] = useState(true);
     const [loadingTiers, setLoadingTiers] = useState<Set<UrgencyTier>>(new Set());
@@ -128,11 +130,12 @@ export default function PurchasingPanel() {
     useEffect(() => { if (localStorage.getItem("aria-dash-purchasing-collapsed") === "true") setIsCollapsed(true); }, []);
     useEffect(() => { localStorage.setItem("aria-dash-purchasing-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
-    const [bodyHeight, setBodyHeight] = useState(340);
+    const [bodyHeight, setBodyHeight] = useState(620);
+    const [listScrollTop, setListScrollTop] = useState(0);
     const dragRef = useRef<{ startY: number; startH: number } | null>(null);
     useEffect(() => {
         const s = localStorage.getItem("aria-dash-purchasing-h");
-        if (s) setBodyHeight(Math.max(120, Math.min(700, parseInt(s))));
+        if (s) setBodyHeight(Math.max(420, Math.min(1000, parseInt(s))));
     }, []);
     useEffect(() => { localStorage.setItem("aria-dash-purchasing-h", String(bodyHeight)); }, [bodyHeight]);
     useEffect(() => {
@@ -166,7 +169,7 @@ export default function PurchasingPanel() {
         dragRef.current = { startY: e.clientY, startH: bodyHeight };
         const onMove = (ev: MouseEvent) => {
             if (!dragRef.current) return;
-            setBodyHeight(Math.max(120, Math.min(700, dragRef.current.startH + ev.clientY - dragRef.current.startY)));
+            setBodyHeight(Math.max(420, Math.min(1000, dragRef.current.startH + ev.clientY - dragRef.current.startY)));
         };
         const onUp = () => { dragRef.current = null; window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
         window.addEventListener("mousemove", onMove);
@@ -345,10 +348,9 @@ export default function PurchasingPanel() {
             setScanning(false);
         }
 
-        // Remaining tiers — never bust here; rely on warm cache.
-        for (const tier of ['warning', 'watch', 'ok'] as UrgencyTier[]) {
-            await runTier(tier, false);
-        }
+        // Remaining tiers share the warm cache and can load together. This keeps
+        // Ordering from feeling like it is filling one bucket at a time.
+        await Promise.all((['warning', 'watch', 'ok'] as UrgencyTier[]).map(tier => runTier(tier, false)));
 
         if (errors.length > 0 && !anySuccess) {
             setError(errors.join(' | '));
@@ -552,6 +554,41 @@ export default function PurchasingPanel() {
         }
     }, [focusGroups, vendorTab]);
 
+    const GROUP_HEADER_ESTIMATE = 52;
+    const SELECT_ALL_ESTIMATE = 34;
+    const ITEM_ROW_ESTIMATE = 132;
+    const VIRTUAL_OVERSCAN_PX = 700;
+
+    const estimatedGroupHeights = visibleGroups.map(group => {
+        const pid = group.vendorPartyId;
+        const vSnoozed = vendorSnoozed(group);
+        const isExpanded = !vSnoozed && (expanded.has(pid) || vendorTab === pid);
+        if (!isExpanded) return GROUP_HEADER_ESTIMATE;
+        const itemCount = group.items.filter(item => showSnoozed || !isSnoozed(item.productId)).length;
+        return GROUP_HEADER_ESTIMATE + SELECT_ALL_ESTIMATE + itemCount * ITEM_ROW_ESTIMATE;
+    });
+    const totalVirtualHeight = estimatedGroupHeights.reduce((sum, h) => sum + h, 0);
+    const virtualTop = Math.max(0, listScrollTop - VIRTUAL_OVERSCAN_PX);
+    const virtualBottom = listScrollTop + bodyHeight + VIRTUAL_OVERSCAN_PX;
+    let measuredTop = 0;
+    let virtualStart = 0;
+    let virtualEnd = visibleGroups.length;
+    let cursor = 0;
+    for (let i = 0; i < estimatedGroupHeights.length; i++) {
+        const next = cursor + estimatedGroupHeights[i];
+        if (next < virtualTop) {
+            virtualStart = i + 1;
+            measuredTop = next;
+        }
+        if (cursor <= virtualBottom) {
+            virtualEnd = i + 1;
+        }
+        cursor = next;
+    }
+    const virtualGroups = visibleGroups.slice(virtualStart, virtualEnd);
+    const measuredBottom = estimatedGroupHeights.slice(virtualStart, virtualEnd).reduce((sum, h) => sum + h, 0);
+    const virtualBottomPad = Math.max(0, totalVirtualHeight - measuredTop - measuredBottom);
+
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className="border-b border-zinc-800 shrink-0">
@@ -721,9 +758,9 @@ export default function PurchasingPanel() {
                         <div className="flex items-center border-b border-zinc-800/60 bg-zinc-950/30 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                             <button
                                 onClick={() => setVendorTab("all")}
-                                className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 ${vendorTab === "all"
-                                    ? "border-zinc-400 text-zinc-300 bg-zinc-800/30"
-                                    : "border-transparent text-zinc-600 hover:text-zinc-400"
+                                className={`px-3 py-1.5 text-xs font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 ${vendorTab === "all"
+                                    ? "border-zinc-300 text-zinc-100 bg-zinc-800/30"
+                                    : "border-transparent text-zinc-400 hover:text-zinc-200"
                                     }`}
                             >
                                 {focusFilter === "today" ? "Today" : focusFilter === "week" ? "This Week" : "All"} <span className="opacity-60">{focusGroups.length}</span>
@@ -738,11 +775,11 @@ export default function PurchasingPanel() {
                                 return (
                                     <button key={g.vendorPartyId}
                                         onClick={() => setVendorTab(g.vendorPartyId)}
-                                        className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 flex items-center gap-1 ${vSnoozed
+                                        className={`px-3 py-1.5 text-xs font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 flex items-center gap-1 ${vSnoozed
                                             ? "border-transparent text-zinc-700 hover:text-zinc-500"
                                             : isActive
                                                 ? `${cfg.tab} bg-zinc-800/30`
-                                                : "border-transparent text-zinc-600 hover:text-zinc-400"
+                                                : "border-transparent text-zinc-400 hover:text-zinc-200"
                                             }`}
                                     >
                                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
@@ -781,8 +818,10 @@ export default function PurchasingPanel() {
                             <div
                                 className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full"
                                 style={{ height: bodyHeight }}
+                                onScroll={e => setListScrollTop(e.currentTarget.scrollTop)}
                             >
-                                {visibleGroups.map(group => {
+                                <div style={{ height: measuredTop }} aria-hidden="true" />
+                                {virtualGroups.map(group => {
                                     const cfg = URGENCY[group.urgency];
                                     const pid = group.vendorPartyId;
                                     const vSnoozeKey = `v:${pid}`;
@@ -796,26 +835,61 @@ export default function PurchasingPanel() {
                                     const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
                                     const directOrderBlocked = selectedItems.some(i => !canUseDirectOrdering(group.vendorName, i.reorderMethod));
                                     const selectedCount = activeItems.filter(i => groupChecked[i.productId]).length;
+                                    const selectedUnits = selectedItems.reduce((sum, item) => sum + (groupQtys[item.productId] ?? item.suggestedQty), 0);
+                                    const selectedValue = selectedItems.reduce((sum, item) => {
+                                        const qty = groupQtys[item.productId] ?? item.suggestedQty;
+                                        return sum + qty * Math.max(0, item.unitPrice);
+                                    }, 0);
+                                    const earliestRunway = activeItems.length > 0
+                                        ? Math.min(...activeItems.map(item => item.runwayDays))
+                                        : null;
+                                    const diffCount = activeItems.filter(item => item.qtyDiverged).length;
                                     const allCheckedFlag = activeItems.length > 0 && activeItems.every(i => groupChecked[i.productId]);
                                     const hasActionable = activeItems.some(i => i.urgency === "critical" || i.urgency === "warning");
+                                    const groupProductIds = activeItems.map(item => item.productId);
+                                    const groupMatchesLifecycle = lifecycle.matchesFocus({
+                                        vendorName: group.vendorName,
+                                        productIds: groupProductIds,
+                                    });
 
                                     return (
-                                        <div key={pid} className={`border-b border-zinc-800/40 ${vSnoozed ? "opacity-40" : ""}`}>
+                                        <div
+                                            key={pid}
+                                            onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds })}
+                                            onMouseLeave={lifecycle.clearFocus}
+                                            className={`border-b border-zinc-800/60 ${vSnoozed ? "opacity-45" : ""} ${groupMatchesLifecycle ? "bg-cyan-500/5 ring-1 ring-inset ring-cyan-500/35" : ""}`}
+                                        >
                                             {/* ── Vendor header ── */}
-                                            <div className="flex items-center gap-2 px-4 py-2 hover:bg-zinc-800/20 transition-colors">
+                                            <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-zinc-800/30 transition-colors">
                                                 <span className={`w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
                                                 <button
                                                     onClick={() => !vSnoozed && toggleExpand(pid)}
                                                     className="flex-1 text-left flex items-center gap-2 min-w-0"
                                                 >
-                                                    <span className={`text-sm font-mono font-semibold truncate ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
+                                                    <span className={`text-base font-mono font-semibold truncate ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
                                                         {group.vendorName}
                                                     </span>
-                                                    <span className="text-[11px] font-mono text-[var(--dash-l2)] shrink-0">
+                                                    <span className="text-xs font-mono text-zinc-200 shrink-0">
                                                         {vSnoozed
                                                             ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
                                                             : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
                                                     </span>
+                                                    {!vSnoozed && earliestRunway != null && (
+                                                        <span className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}>
+                                                            first out {Math.round(earliestRunway)}d
+                                                        </span>
+                                                    )}
+                                                    {!vSnoozed && selectedCount > 0 && (
+                                                        <span className="text-xs font-mono text-emerald-300 shrink-0">
+                                                            selected {selectedCount} / {selectedUnits} units
+                                                            {selectedValue > 0 ? ` / $${selectedValue.toFixed(0)}` : ""}
+                                                        </span>
+                                                    )}
+                                                    {!vSnoozed && diffCount > 0 && (
+                                                        <span className="text-[11px] font-mono text-amber-300 border border-amber-500/30 rounded px-1 shrink-0">
+                                                            {diffCount} qty diff
+                                                        </span>
+                                                    )}
                                                 </button>
 
                                                 {!vSnoozed && cfg.label && (
@@ -920,7 +994,7 @@ export default function PurchasingPanel() {
                                                         <input type="checkbox" checked={allCheckedFlag}
                                                             onChange={e => selectAll(group, e.target.checked)}
                                                             className="w-3 h-3 rounded accent-zinc-400 shrink-0" />
-                                                        <span className="text-[10px] font-mono text-zinc-600">
+                                                        <span className="text-[11px] font-mono text-zinc-400">
                                                             {allCheckedFlag ? "Deselect all" : "Select all"}
                                                         </span>
                                                         <div className="flex-1" />
@@ -985,10 +1059,18 @@ export default function PurchasingPanel() {
                                                             const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
                                                             const iKey = item.productId;
                                                             const methodBadge = reorderMethodBadge(item.reorderMethod);
+                                                            const openOrderId = item.openPOs[0]?.orderId;
+                                                            const itemMatchesLifecycle = lifecycle.matchesFocus({
+                                                                vendorName: group.vendorName,
+                                                                orderId: openOrderId,
+                                                                productIds: [item.productId],
+                                                            });
 
                                                             return (
                                                                 <div key={iKey}
-                                                                    className={`px-4 py-3 border-b border-zinc-800/20 last:border-0 ${itemSnoozed ? "opacity-35" : isChecked ? "" : "opacity-50"
+                                                                    onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] })}
+                                                                    onMouseLeave={lifecycle.clearFocus}
+                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 ${itemMatchesLifecycle ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35" : ""} ${itemSnoozed ? "opacity-35" : isChecked ? "" : "opacity-90"
                                                                         }`}>
                                                                     <div className="flex items-start gap-3">
                                                                         {!itemSnoozed && (
@@ -1006,7 +1088,7 @@ export default function PurchasingPanel() {
                                                                             {/* Row 1: Dot · SKU · Badges · Runway · Snooze */}
                                                                             <div className="flex items-center gap-2">
                                                                                 <span className={`w-2 h-2 rounded-full shrink-0 ${itemSnoozed ? "bg-zinc-700" : URGENCY[item.urgency].dot}`} />
-                                                                                <span className={`text-sm font-mono font-bold truncate ${itemSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
+                                                                                <span className={`text-base font-mono font-bold truncate ${itemSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
                                                                                     {item.productId}
                                                                                 </span>
 
@@ -1026,7 +1108,7 @@ export default function PurchasingPanel() {
                                                                                     </span>
                                                                                 )}
                                                                                 {item.packSize && !itemSnoozed && (
-                                                                                    <span className="text-[9px] font-mono text-zinc-500 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
+                                                                                    <span className="text-[10px] font-mono text-zinc-400 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
                                                                                         {item.packSize.unitsPerPack}/{item.packSize.packUnit}
                                                                                     </span>
                                                                                 )}
@@ -1034,10 +1116,10 @@ export default function PurchasingPanel() {
                                                                                 <div className="flex-1" />
 
                                                                                 {!itemSnoozed && (
-                                                                                    <span className={`text-[11px] font-mono shrink-0 ${rc}`}>
+                                                                                    <span className={`text-xs font-mono shrink-0 ${rc}`}>
                                                                                         Out in {Math.round(item.runwayDays)}d
                                                                                         {item.stockOnOrder > 0 && (
-                                                                                            <span className="text-zinc-600 font-normal text-[10px]">
+                                                                                            <span className="text-zinc-400 font-normal text-[10px]">
                                                                                                 {" "}→{Math.round(item.adjustedRunwayDays)}d
                                                                                             </span>
                                                                                         )}
@@ -1049,7 +1131,7 @@ export default function PurchasingPanel() {
                                                                                         onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === iKey ? null : iKey); }}
                                                                                         className={`text-[11px] font-mono transition-colors ${itemSnoozed
                                                                                             ? "text-zinc-600 hover:text-emerald-400"
-                                                                                            : "text-zinc-700 hover:text-zinc-400"
+                                                                                            : "text-zinc-500 hover:text-zinc-300"
                                                                                             }`}
                                                                                         title={itemSnoozed ? "Unsnooze" : "Snooze this item"}
                                                                                     >{itemSnoozed ? "↩" : "···"}</button>
@@ -1060,18 +1142,18 @@ export default function PurchasingPanel() {
                                                                             {/* Row 2: Description & Amount */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center gap-2 mt-1">
-                                                                                    <span className="text-[11px] font-mono text-[var(--dash-l2)] flex-1 truncate">{item.productName}</span>
+                                                                                    <span className="text-[13px] font-mono text-zinc-200 flex-1 truncate">{item.productName}</span>
                                                                                     {item.reorderMethod === "default" && item.dailyRateSource === "demand" && (
-                                                                                        <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                                                                        <span className="text-[11px] font-mono text-zinc-300 shrink-0">
                                                                                             demand fallback
                                                                                         </span>
                                                                                     )}
                                                                                     {item.unitPrice > 0 ? (
-                                                                                        <span className="text-[11px] font-mono text-emerald-400 font-semibold shrink-0">
+                                                                                        <span className="text-xs font-mono text-emerald-300 font-semibold shrink-0">
                                                                                             ${item.unitPrice.toFixed(2)}/ea
                                                                                         </span>
                                                                                     ) : (
-                                                                                        <span className="text-[11px] font-mono text-zinc-600 shrink-0">
+                                                                                        <span className="text-xs font-mono text-zinc-400 shrink-0">
                                                                                             $0.00
                                                                                         </span>
                                                                                     )}
@@ -1082,7 +1164,7 @@ export default function PurchasingPanel() {
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-start justify-between gap-2 mt-2">
                                                                                     <div className="flex flex-col gap-1">
-                                                                                        <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--dash-l3)]">
+                                                                                        <div className="flex items-center gap-2 text-xs font-mono text-zinc-300">
                                                                                             <span>{item.dailyRate.toFixed(1)}/day</span>
                                                                                             {item.velocityInflated && item.velocityRawRate != null && (
                                                                                                 <span
@@ -1097,11 +1179,11 @@ export default function PurchasingPanel() {
                                                                                         </div>
                                                                                         {(item.finaleReorderQty ?? 0) > 0 && (
                                                                                             <div className="flex items-center gap-2 mt-0.5">
-                                                                                                <span className={`text-[10px] font-mono italic ${item.qtyDiverged ? 'text-amber-400' : 'text-cyan-500/80'}`}>
+                                                                                                <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
                                                                                                     Finale: {item.finaleReorderQty}
                                                                                                 </span>
                                                                                                 <span className="text-zinc-600 text-[10px]">→</span>
-                                                                                                <span className={`text-[10px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                                                                                <span className={`text-[11px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-300' : 'text-zinc-200'}`}>
                                                                                                     Aria: {item.suggestedQty}
                                                                                                 </span>
                                                                                                 {item.qtyDiverged && item.qtyDivergencePct != null && (
@@ -1114,16 +1196,16 @@ export default function PurchasingPanel() {
                                                                                     </div>
                                                                                     <div className="flex items-center gap-2">
                                                                                         <label className="flex items-center gap-1.5 shrink-0">
-                                                                                            <span className="text-[10px] font-mono text-zinc-500">qty</span>
+                                                                                            <span className="text-[11px] font-mono text-zinc-300">qty</span>
                                                                                             <input
                                                                                                 type="number" min={1} value={qty}
                                                                                                 onChange={e => setQty(pid, iKey, parseInt(e.target.value) || 1)}
                                                                                                 onClick={e => e.stopPropagation()}
-                                                                                                className="w-16 px-1.5 py-0.5 text-[11px] font-mono bg-zinc-900 border border-zinc-700 hover:border-zinc-500 rounded text-zinc-200 focus:outline-none focus:border-emerald-500 text-right transition-colors"
+                                                                                                className="w-20 px-2 py-1 text-xs font-mono bg-zinc-900 border border-zinc-600 hover:border-zinc-400 rounded text-zinc-50 focus:outline-none focus:border-emerald-500 text-right transition-colors"
                                                                                             />
                                                                                         </label>
                                                                                         {item.unitPrice > 0 && (
-                                                                                            <span className="text-[11px] font-mono text-zinc-300 font-semibold shrink-0 w-16 text-right">
+                                                                                            <span className="text-xs font-mono text-zinc-200 font-semibold shrink-0 w-20 text-right">
                                                                                                 = ${(qty * item.unitPrice).toFixed(0)}
                                                                                             </span>
                                                                                         )}
@@ -1133,7 +1215,7 @@ export default function PurchasingPanel() {
 
                                                                             {/* Row 4: Explanation */}
                                                                             {!itemSnoozed && (
-                                                                                <div className="mt-1.5 text-[10px] font-mono text-zinc-600 italic">
+                                                                                <div className="mt-2 text-[11px] font-mono text-zinc-400 italic">
                                                                                     {item.assessment?.explanation ?? item.explanation}
                                                                                 </div>
                                                                             )}
@@ -1147,6 +1229,7 @@ export default function PurchasingPanel() {
                                         </div>
                                     );
                                 })}
+                                <div style={{ height: virtualBottomPad }} aria-hidden="true" />
                             </div>
 
                             {/* ULINE order result banner */}

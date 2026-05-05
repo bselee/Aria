@@ -17,8 +17,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Activity, Bell, RefreshCw } from "lucide-react";
 
 import IssuesPanel from "./IssuesPanel";
-import OpsTriPanel from "./OpsTriPanel";
 import TasksPanel from "@/components/dashboard/TasksPanel";
+import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
+import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
+import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
+import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
 import { PANEL_BY_ID } from "./panelRegistry";
 import type { PanelId } from "./useDashboardLayout";
 import type {
@@ -53,7 +56,7 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
 // because that's the bulk of the daily flow. Builds + Tracking are
 // secondary; Tasks/Activity are diagnostic.
 type TabId =
-    | "ops"
+    | "lifecycle"
     | "blocking"
     | "builds"
     | "build-schedule"
@@ -64,6 +67,42 @@ type TabId =
 type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
 
 const TAB_STORAGE_KEY = "aria-dash-active-tab";
+
+function PurchasingLifecyclePanel() {
+    return (
+        <PurchasingLifecycleProvider>
+            <div
+                className="grid h-full min-h-0 grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
+                data-testid="purchasing-lifecycle-panel"
+            >
+            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
+                    Ordering
+                </div>
+                <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
+                    <PurchasingPanel />
+                </div>
+            </section>
+            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-purchases">
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
+                    Purchases
+                </div>
+                <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
+                    <ActivePurchasesPanel />
+                </div>
+            </section>
+            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-rcv">
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
+                    RCV
+                </div>
+                <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
+                    <ReceivedItemsPanel />
+                </div>
+            </section>
+            </div>
+        </PurchasingLifecycleProvider>
+    );
+}
 
 function HealthChip({ label, value, accent }: { label: string; value: string | number; accent: string }) {
     return (
@@ -85,11 +124,11 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     const [heartbeats, setHeartbeats] = useState<CommandBoardHeartbeat[]>([]);
     const [crons, setCrons] = useState<CommandBoardCron[]>([]);
 
-    const [activeTab, setActiveTab] = useState<TabId>("ops");
+    const [activeTab, setActiveTab] = useState<TabId>("lifecycle");
     // Tabs that have been visited stay MOUNTED so switching back is instant.
     // First visit pays the JIT-compile + data-fetch cost once; subsequent
     // switches are pure CSS visibility flips.
-    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["ops"]));
+    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["lifecycle"]));
 
     const [refreshing, setRefreshing] = useState(false);
     const [lastError, setLastError] = useState<string | null>(null);
@@ -102,7 +141,8 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         if (typeof window === "undefined") return;
         try {
             const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
-            if (saved) setActiveTab(saved as TabId);
+            if (saved === "ops" || saved === "ordering" || saved === "purchases" || saved === "rcv") setActiveTab("lifecycle");
+            else if (saved) setActiveTab(saved as TabId);
         } catch { /* ignore */ }
     }, []);
 
@@ -162,7 +202,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
 
     const tabs: TabDef[] = useMemo(
         () => [
-            { id: "ops", label: "Ops", render: () => <OpsTriPanel /> },
+            { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
             { id: "blocking", label: "Blocking Me", render: () => <IssuesPanel /> },
             { id: "builds", label: "Build Risk", render: () => panelById("build-risk") },
             { id: "build-schedule", label: "Build Schedule", render: () => panelById("build-schedule") },
@@ -205,10 +245,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
             {/* Header */}
             <header className="px-4 py-2 border-b border-zinc-800/80 flex items-center gap-3 bg-[#09090b]">
                 <div className="flex items-center gap-2">
-                    <span className="w-7 h-7 rounded-full bg-zinc-800 flex items-center justify-center font-black tracking-tighter text-blue-400 text-xs">
-                        A
-                    </span>
-                    <h1 className="text-sm font-semibold text-zinc-100 tracking-tight">Aria · Command Board</h1>
+                    <h1 className="text-sm font-semibold text-zinc-100 tracking-tight">Ops Board</h1>
                 </div>
                 <div className="flex items-center gap-2 ml-2">
                     <HealthChip
@@ -264,10 +301,10 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                         aria-selected={activeTab === tab.id}
                         onClick={() => setActiveTab(tab.id)}
                         data-testid={`shell-tab-${tab.id}`}
-                        className={`px-2.5 py-1 rounded text-[11px] font-mono uppercase tracking-wider border transition-colors ${
+                        className={`px-2.5 py-1 rounded text-xs font-mono uppercase tracking-wider border transition-colors ${
                             activeTab === tab.id
                                 ? "bg-blue-500/20 text-blue-100 border-blue-500/40"
-                                : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:text-zinc-200 hover:border-zinc-700"
+                                : "bg-zinc-900 text-zinc-300 border-zinc-800 hover:text-zinc-100 hover:border-zinc-700"
                         }`}
                     >
                         {tab.label}

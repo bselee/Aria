@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X } from "lucide-react";
+import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 
 type ActivePurchase = {
     orderId: string;
@@ -78,6 +79,7 @@ function timeAgo(iso: string) {
 }
 
 export default function ActivePurchasesPanel() {
+    const lifecycle = usePurchasingLifecycle();
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
     const [cachedAt, setCachedAt] = useState("");
     const [loading, setLoading] = useState(true);
@@ -231,6 +233,12 @@ export default function ActivePurchasesPanel() {
                             {visiblePurchases.map(po => {
                                 const isReceived = po.isReceived;
                                 const isCancelled = po.status.toLowerCase() === "cancelled";
+                                const poProductIds = po.items.map(item => item.productId);
+                                const matchesLifecycle = lifecycle.matchesFocus({
+                                    vendorName: po.vendorName,
+                                    orderId: po.orderId,
+                                    productIds: poProductIds,
+                                });
 
                                 let statusLabel = "In Transit";
                                 let statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
@@ -265,7 +273,12 @@ export default function ActivePurchasesPanel() {
                                 }
 
                                 return (
-                                    <div key={po.orderId} className="px-4 py-3 border-b border-zinc-800/40 hover:bg-zinc-800/20 transition-colors group relative">
+                                    <div
+                                        key={po.orderId}
+                                        onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
+                                        onMouseLeave={lifecycle.clearFocus}
+                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                    >
                                         {/* Dismiss Button */}
                                         <button
                                             onClick={() => dismissPurchase(po.orderId)}
@@ -342,7 +355,7 @@ export default function ActivePurchasesPanel() {
                                         {/* Line 3: Line Items */}
                                         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
                                             {po.items.map((item, idx) => (
-                                                <span key={item.productId + idx} className="text-[11px] font-mono text-zinc-300 bg-zinc-800/40 px-1.5 py-px rounded border border-zinc-700/50">
+                                                <span key={item.productId + idx} className={`text-[11px] font-mono px-1.5 py-px rounded border ${lifecycle.matchesFocus({ productIds: [item.productId] }) ? "text-cyan-100 bg-cyan-500/15 border-cyan-500/40" : "text-zinc-300 bg-zinc-800/40 border-zinc-700/50"}`}>
                                                     {item.productId} <span className="text-zinc-500">×{item.quantity.toLocaleString()}</span>
                                                 </span>
                                             ))}
