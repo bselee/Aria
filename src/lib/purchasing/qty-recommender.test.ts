@@ -294,3 +294,119 @@ describe("recommendQty — explanation backwards compat", () => {
         expect(result.explanation).toContain("2 open PO (+200)");
     });
 });
+
+describe("recommendQty — vendor reorder policy", () => {
+    it("uses targetCoverDays as total cover when provided", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2,
+            stockOnHand: 50,
+            leadTimeDays: 14,
+            targetCoverDays: 180,
+        }));
+
+        expect(result.coverDays).toBe(180);
+        // need = 2/d × 180d − 50 = 310
+        expect(result.rawNeededEaches).toBe(310);
+        const coverStep = result.provenance.find(p => p.step === "cover_days");
+        expect(coverStep?.detail).toContain("vendor policy");
+    });
+
+    it("cover override mentions safetyMultiplier bypass when calibration would have shifted it", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2,
+            stockOnHand: 50,
+            leadTimeDays: 14,
+            targetCoverDays: 180,
+            safetyMultiplier: 1.25,
+            calibrationSampleCount: 8,
+        }));
+
+        // Cover stays 180, NOT 180 × 1.25
+        expect(result.coverDays).toBe(180);
+        const coverStep = result.provenance.find(p => p.step === "cover_days");
+        expect(coverStep?.detail).toContain("bypassed");
+    });
+
+    it("uses lead time override ahead of P90 or point estimate", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 0,
+            leadTimeDays: 14,
+            leadTimeP90: 21,
+            leadTimeOverrideDays: 45,
+        }));
+
+        expect(result.leadTimeUsed).toBe(45);
+        const ltStep = result.provenance.find(p => p.step === "lead_time");
+        expect(ltStep?.detail).toContain("override");
+    });
+
+    it("warns but does not bump quantity when moqMode is warn", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 44,
+            leadTimeDays: 14,
+            minimumOrderEaches: 100,
+            moqMode: "warn",
+        }));
+
+        // need = 1/d × 74d − 44 = 30; warn does not bump
+        expect(result.suggestedQty).toBe(30);
+        expect(result.moqApplied).toBe(false);
+        expect(result.moqWarning).toBe(true);
+        const moqStep = result.provenance.find(p => p.step === "moq");
+        expect(moqStep?.detail).toContain("warn-only");
+    });
+
+    it("ignores MOQ when moqMode is ignore", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 44,
+            leadTimeDays: 14,
+            minimumOrderEaches: 100,
+            moqMode: "ignore",
+        }));
+
+        expect(result.suggestedQty).toBe(30);
+        expect(result.moqApplied).toBe(false);
+        expect(result.moqWarning).toBe(false);
+    });
+
+    it("flags review when pack rounding creates a large overbuy", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 44,
+            leadTimeDays: 14,
+            orderIncrementQty: 100,
+            unitPrice: 20,
+            overbuyReviewPct: 50,
+            overbuyReviewDollars: 1000,
+        }));
+
+        // need=30, snapped to 100-pack → 100. Overbuy=70 / 30 = 233% pct, $1400.
+        expect(result.suggestedQty).toBe(100);
+        expect(result.reviewRequired).toBe(true);
+        expect(result.reviewReasons.join(" ")).toMatch(/overbuy/i);
+    });
+
+    it("does not flag review when overbuy is below both thresholds", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 75,
+            leadTimeDays: 14,
+            orderIncrementQty: 1,
+            unitPrice: 5,
+            // need = 74 − 75 ⇒ 0 → no order, no review
+            overbuyReviewPct: 50,
+            overbuyReviewDollars: 1000,
+        }));
+
+        expect(result.suggestedQty).toBe(0);
+        expect(result.reviewRequired).toBe(false);
+        expect(result.reviewReasons).toEqual([]);
+    });
+
+    it("formula version reflects the v2.1 policy bump", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.1-vendor-policy-2026-05-06");
+    });
+});

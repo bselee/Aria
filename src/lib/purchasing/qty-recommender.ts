@@ -16,7 +16,12 @@
  *          touching the recommender's downstream consumers.
  */
 
-export const QTY_FORMULA_VERSION = "v2.0-calibrated-2026-05-05";
+// Bumped on every behavioral change so the calibration loop can bucket
+// error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
+//   v2.0-calibrated-2026-05-05 — phase 2 calibration baseline
+//   v2.1-vendor-policy-2026-05-06 — vendor reorder policy overrides
+//     (lead time override, target cover, MOQ tri-state, overbuy review flags)
+export const QTY_FORMULA_VERSION = "v2.1-vendor-policy-2026-05-06";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -56,6 +61,20 @@ export interface RecommenderInput {
     minimumOrderEaches?: number | null;
     minimumOrderDollars?: number | null;
     unitPrice?: number;
+
+    /**
+     * v2.1 — vendor reorder policy overrides (`vendor_reorder_policies` table).
+     * Default-unchanged: omitting these keeps the v2.0 behavior verbatim.
+     */
+    leadTimeOverrideDays?: number | null;
+    /** Total cover desired (lead + safety in one number). When set, overrides leadTimeUsed + buffer × multiplier and bypasses safetyMultiplier. */
+    targetCoverDays?: number | null;
+    /** enforce (default — bumps qty), warn (sets moqWarning, no bump), ignore (no bump, no warn). */
+    moqMode?: "enforce" | "warn" | "ignore";
+    /** Overbuy review threshold — default 50% (i.e. flag when suggestedQty > rawNeededEaches × 1.5). */
+    overbuyReviewPct?: number | null;
+    /** Overbuy review threshold in dollars — default $1000. */
+    overbuyReviewDollars?: number | null;
 }
 
 export interface ProvenanceStep {
@@ -81,6 +100,12 @@ export interface RecommenderResult {
     safetyMultiplier: number;
     reservedQty: number;
     moqApplied: boolean;
+    /** v2.1 — true when MOQ would have triggered but moqMode='warn' suppressed the bump. */
+    moqWarning: boolean;
+    /** v2.1 — true when ordering constraints (pack/MOQ) caused a large overbuy worth Will reviewing. */
+    reviewRequired: boolean;
+    /** v2.1 — human-readable reasons for reviewRequired (empty when reviewRequired is false). */
+    reviewReasons: string[];
 }
 
 function urgencyFor(adjustedRunwayDays: number, leadTimeDays: number): Urgency {
@@ -158,15 +183,29 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         value: Math.round(runwayDays),
     });
 
-    // ── Step 4: lead time basis (P90 if available, else point estimate) ───
+    // ── Step 4: lead time basis ───────────────────────────────────────────
+    // Precedence: vendor policy override > P90 > point/median.
+    const leadTimeOverride = input.leadTimeOverrideDays ?? null;
     const leadTimeP90 = input.leadTimeP90 ?? null;
-    const leadTimeUsed = (leadTimeP90 != null && leadTimeP90 > 0)
-        ? leadTimeP90
-        : input.leadTimeDays;
-    const leadTimeBasis: "p90" | "median" | "point" = (leadTimeP90 != null && leadTimeP90 > 0)
-        ? "p90"
-        : input.leadTimeProvenance === "vendor_median" ? "median" : "point";
-    if (leadTimeBasis === "p90") {
+    const hasOverride = leadTimeOverride != null && leadTimeOverride > 0;
+    const hasP90 = leadTimeP90 != null && leadTimeP90 > 0;
+    const leadTimeUsed = hasOverride
+        ? leadTimeOverride!
+        : hasP90
+            ? leadTimeP90!
+            : input.leadTimeDays;
+    const leadTimeBasis: "p90" | "median" | "point" = hasOverride
+        ? "point"  // override is treated as a point estimate (Will set it deliberately)
+        : hasP90
+            ? "p90"
+            : input.leadTimeProvenance === "vendor_median" ? "median" : "point";
+    if (hasOverride) {
+        trace.push({
+            step: "lead_time",
+            detail: `Using ${leadTimeOverride}d vendor policy override (was ${input.leadTimeDays}d ${input.leadTimeProvenance})`,
+            value: leadTimeUsed,
+        });
+    } else if (leadTimeBasis === "p90") {
         trace.push({
             step: "lead_time",
             detail: `Using P90 lead ${leadTimeP90}d (median was ${input.leadTimeDays}d, ${input.leadTimeProvenance})`,
@@ -180,26 +219,43 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     }
 
-    // ── Step 5: cover window with calibration multiplier ──────────────────
+    // ── Step 5: cover window ──────────────────────────────────────────────
+    // v2.1 — vendor policy targetCoverDays takes precedence over lead+buffer×multiplier.
+    // When targetCoverDays is set, safetyMultiplier is intentionally bypassed: Will
+    // set the cover deliberately, calibration shouldn't dampen it.
     const buffer = input.coverBufferDays ?? 60;
     const safetyMultiplier = Math.max(0.5, Math.min(2.5, input.safetyMultiplier ?? 1));
-    const adjustedBuffer = Math.round(buffer * safetyMultiplier);
-    const coverDays = leadTimeUsed + adjustedBuffer;
-    if (safetyMultiplier !== 1 && (input.calibrationSampleCount ?? 0) >= 5) {
-        const dir = safetyMultiplier > 1 ? "widened" : "tightened";
+    const targetCoverDays = input.targetCoverDays ?? null;
+    let coverDays: number;
+    if (targetCoverDays != null && targetCoverDays > 0) {
+        coverDays = Math.max(leadTimeUsed, targetCoverDays);
+        const bypassed = safetyMultiplier !== 1
+            ? ` (safetyMultiplier=${safetyMultiplier.toFixed(2)} bypassed — vendor policy authoritative)`
+            : "";
         trace.push({
             step: "cover_days",
-            detail: `Lead ${leadTimeUsed}d + safety ${buffer}d × ${safetyMultiplier.toFixed(2)} ${dir} ` +
-                `(median error ${input.calibrationMedianErrorPct?.toFixed(0)}% over ` +
-                `${input.calibrationSampleCount} samples) = ${coverDays}d cover`,
+            detail: `Using ${coverDays}d total cover from vendor policy${bypassed}`,
             value: coverDays,
         });
     } else {
-        trace.push({
-            step: "cover_days",
-            detail: `Lead ${leadTimeUsed}d + ${adjustedBuffer}d safety = ${coverDays}d cover`,
-            value: coverDays,
-        });
+        const adjustedBuffer = Math.round(buffer * safetyMultiplier);
+        coverDays = leadTimeUsed + adjustedBuffer;
+        if (safetyMultiplier !== 1 && (input.calibrationSampleCount ?? 0) >= 5) {
+            const dir = safetyMultiplier > 1 ? "widened" : "tightened";
+            trace.push({
+                step: "cover_days",
+                detail: `Lead ${leadTimeUsed}d + safety ${buffer}d × ${safetyMultiplier.toFixed(2)} ${dir} ` +
+                    `(median error ${input.calibrationMedianErrorPct?.toFixed(0)}% over ` +
+                    `${input.calibrationSampleCount} samples) = ${coverDays}d cover`,
+                value: coverDays,
+            });
+        } else {
+            trace.push({
+                step: "cover_days",
+                detail: `Lead ${leadTimeUsed}d + ${adjustedBuffer}d safety = ${coverDays}d cover`,
+                value: coverDays,
+            });
+        }
     }
 
     // ── Step 6: needed eaches (subtract supply NET of reservations) ──────
@@ -236,41 +292,95 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     }
 
-    // ── Step 8: vendor MOQ enforcement ────────────────────────────────────
+    // ── Step 8: vendor MOQ — tri-state mode ───────────────────────────────
+    // v2.1 — moqMode: 'enforce' (default — bump qty), 'warn' (sets moqWarning,
+    // no bump), 'ignore' (no bump, no warn). Mode comes from vendor_reorder_policies.
+    const moqMode = input.moqMode ?? "enforce";
     let moqApplied = false;
+    let moqWarning = false;
     if (suggestedQty > 0) {
         const minEaches = input.minimumOrderEaches ?? null;
         const minDollars = input.minimumOrderDollars ?? null;
         const unitPrice = input.unitPrice && input.unitPrice > 0 ? input.unitPrice : 0;
 
-        if (minEaches && minEaches > 0 && suggestedQty < minEaches) {
-            const bumped = orderIncrementQty && orderIncrementQty > 1
-                ? Math.ceil(snapToIncrement(minEaches, orderIncrementQty))
-                : minEaches;
-            trace.push({
-                step: "moq",
-                detail: `Bumped from ${suggestedQty} to ${bumped} to meet vendor MOQ of ${minEaches} eaches`,
-                value: bumped,
-            });
-            suggestedQty = bumped;
-            moqApplied = true;
-        } else if (minDollars && minDollars > 0 && unitPrice > 0) {
-            const orderValue = suggestedQty * unitPrice;
-            if (orderValue < minDollars) {
-                const minQtyForDollars = Math.ceil(minDollars / unitPrice);
-                const bumped = orderIncrementQty && orderIncrementQty > 1
-                    ? Math.ceil(snapToIncrement(minQtyForDollars, orderIncrementQty))
-                    : minQtyForDollars;
-                trace.push({
-                    step: "moq",
-                    detail: `Bumped from ${suggestedQty} ($${orderValue.toFixed(0)}) to ${bumped} ($${(bumped * unitPrice).toFixed(0)}) to meet vendor MOQ of $${minDollars}`,
-                    value: bumped,
-                });
-                suggestedQty = bumped;
-                moqApplied = true;
+        const wouldTriggerEaches = minEaches != null && minEaches > 0 && suggestedQty < minEaches;
+        const orderValue = suggestedQty * unitPrice;
+        const wouldTriggerDollars = !wouldTriggerEaches
+            && minDollars != null && minDollars > 0 && unitPrice > 0 && orderValue < minDollars;
+
+        if (wouldTriggerEaches || wouldTriggerDollars) {
+            if (moqMode === "ignore") {
+                // Silent — keep the qty as-is, no provenance step.
+                // (We could log it, but the whole point of 'ignore' is the user knows MOQ is bogus.)
+            } else if (moqMode === "warn") {
+                moqWarning = true;
+                if (wouldTriggerEaches) {
+                    trace.push({
+                        step: "moq",
+                        detail: `MOQ ${minEaches} eaches not met by ${suggestedQty} (warn-only — no bump per vendor policy)`,
+                        value: suggestedQty,
+                    });
+                } else {
+                    trace.push({
+                        step: "moq",
+                        detail: `MOQ $${minDollars} not met by ${suggestedQty} × $${unitPrice.toFixed(2)} = $${orderValue.toFixed(0)} (warn-only — no bump per vendor policy)`,
+                        value: suggestedQty,
+                    });
+                }
+            } else {
+                // enforce — existing behavior
+                if (wouldTriggerEaches) {
+                    const bumped = orderIncrementQty && orderIncrementQty > 1
+                        ? Math.ceil(snapToIncrement(minEaches!, orderIncrementQty))
+                        : minEaches!;
+                    trace.push({
+                        step: "moq",
+                        detail: `Bumped from ${suggestedQty} to ${bumped} to meet vendor MOQ of ${minEaches} eaches`,
+                        value: bumped,
+                    });
+                    suggestedQty = bumped;
+                    moqApplied = true;
+                } else if (wouldTriggerDollars) {
+                    const minQtyForDollars = Math.ceil(minDollars! / unitPrice);
+                    const bumped = orderIncrementQty && orderIncrementQty > 1
+                        ? Math.ceil(snapToIncrement(minQtyForDollars, orderIncrementQty))
+                        : minQtyForDollars;
+                    trace.push({
+                        step: "moq",
+                        detail: `Bumped from ${suggestedQty} ($${orderValue.toFixed(0)}) to ${bumped} ($${(bumped * unitPrice).toFixed(0)}) to meet vendor MOQ of $${minDollars}`,
+                        value: bumped,
+                    });
+                    suggestedQty = bumped;
+                    moqApplied = true;
+                }
             }
         }
     }
+
+    // ── Step 8.5: overbuy review flags ────────────────────────────────────
+    // v2.1 — when pack rounding or MOQ enforcement creates a large overbuy
+    // (>=overbuyReviewPct% above raw need OR >=overbuyReviewDollars), flag
+    // the row for Will to review on the dashboard.
+    const reviewReasons: string[] = [];
+    if (rawNeededEaches > 0 && suggestedQty > rawNeededEaches) {
+        const overbuyQty = suggestedQty - rawNeededEaches;
+        const overbuyPct = (overbuyQty / rawNeededEaches) * 100;
+        const unitPrice = input.unitPrice && input.unitPrice > 0 ? input.unitPrice : 0;
+        const overbuyDollars = unitPrice > 0 ? overbuyQty * unitPrice : 0;
+        const pctThreshold = input.overbuyReviewPct ?? 50;
+        const dollarsThreshold = input.overbuyReviewDollars ?? 1000;
+        if (overbuyPct >= pctThreshold || overbuyDollars >= dollarsThreshold) {
+            const reason = `Large overbuy from ordering constraints: +${Math.round(overbuyQty)} eaches (${Math.round(overbuyPct)}%)` +
+                (overbuyDollars > 0 ? `, approx $${overbuyDollars.toFixed(0)}` : "");
+            reviewReasons.push(reason);
+            trace.push({
+                step: "review",
+                detail: reason,
+                value: Math.round(overbuyQty),
+            });
+        }
+    }
+    const reviewRequired = reviewReasons.length > 0;
 
     // ── Step 9: urgency ───────────────────────────────────────────────────
     const urgency = urgencyFor(adjustedRunwayDays, leadTimeUsed);
@@ -312,5 +422,8 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         safetyMultiplier,
         reservedQty,
         moqApplied,
+        moqWarning,
+        reviewRequired,
+        reviewReasons,
     };
 }
