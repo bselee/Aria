@@ -62,6 +62,8 @@ type PurchasingItem = {
     moqWarning?: boolean;
     reviewRequired?: boolean;
     reviewReasons?: string[];
+    roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
+    roundingAlternatives?: number[];
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -209,6 +211,7 @@ export default function PurchasingPanel() {
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
+    const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("order_now");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
     const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
@@ -899,6 +902,11 @@ export default function PurchasingPanel() {
                 <div className="fixed inset-0 z-40" onClick={() => setSnoozeMenu(null)} />
             )}
 
+            {/* Backdrop — closes any open qty override dropdown */}
+            {qtyDropdownOpen && (
+                <div className="fixed inset-0 z-40" onClick={() => setQtyDropdownOpen(null)} />
+            )}
+
             {/* ── Header ── */}
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
@@ -1562,7 +1570,7 @@ export default function PurchasingPanel() {
                                                                                         )}
                                                                                     </div>
                                                                                     <div className="flex items-center gap-2">
-                                                                                        <label className="flex items-center gap-1.5 shrink-0">
+                                                                                        <label className="flex items-center gap-1.5 shrink-0 relative">
                                                                                             <span className="text-[11px] font-mono text-zinc-300">qty</span>
                                                                                             <input
                                                                                                 type="number" min={1} value={qty}
@@ -1570,6 +1578,60 @@ export default function PurchasingPanel() {
                                                                                                 onClick={e => e.stopPropagation()}
                                                                                                 className="w-20 px-2 py-1 text-xs font-mono bg-zinc-900 border border-zinc-600 hover:border-zinc-400 rounded text-zinc-50 focus:outline-none focus:border-emerald-500 text-right transition-colors"
                                                                                             />
+                                                                                            {item.roundingAlternatives && item.roundingAlternatives.length > 0 && (() => {
+                                                                                                const isOpen = qtyDropdownOpen?.pid === pid && qtyDropdownOpen?.productId === item.productId;
+                                                                                                const auto = item.suggestedQty;
+                                                                                                const alts = Array.from(new Set((item.roundingAlternatives ?? []).filter(v => v !== auto))).sort((a, b) => a - b).slice(0, 2);
+                                                                                                const entries: Array<{ value: number; isAuto: boolean }> = [
+                                                                                                    { value: auto, isAuto: true },
+                                                                                                    ...alts.map(v => ({ value: v, isAuto: false })),
+                                                                                                ];
+                                                                                                return (
+                                                                                                    <>
+                                                                                                        <button
+                                                                                                            type="button"
+                                                                                                            title="Snap to a different clean number"
+                                                                                                            onClick={e => {
+                                                                                                                e.stopPropagation();
+                                                                                                                setQtyDropdownOpen(isOpen ? null : { pid, productId: item.productId });
+                                                                                                            }}
+                                                                                                            className="ml-0.5 px-1 py-0.5 text-[10px] font-mono bg-zinc-900 border border-zinc-700 hover:border-zinc-400 rounded text-zinc-400 hover:text-zinc-100 leading-none"
+                                                                                                        >
+                                                                                                            ▾
+                                                                                                        </button>
+                                                                                                        {isOpen && (
+                                                                                                            <div
+                                                                                                                onClick={e => e.stopPropagation()}
+                                                                                                                className="absolute z-50 right-0 top-full mt-1 bg-zinc-900 border border-zinc-700 rounded shadow-lg min-w-[8rem]"
+                                                                                                            >
+                                                                                                                {entries.map(entry => {
+                                                                                                                    const delta = entry.value - auto;
+                                                                                                                    const sign = delta >= 0 ? "+" : "";
+                                                                                                                    return (
+                                                                                                                        <button
+                                                                                                                            key={entry.value}
+                                                                                                                            type="button"
+                                                                                                                            onClick={e => {
+                                                                                                                                e.stopPropagation();
+                                                                                                                                setQty(pid, iKey, entry.value);
+                                                                                                                                setQtyDropdownOpen(null);
+                                                                                                                            }}
+                                                                                                                            className="w-full flex items-center justify-between gap-2 px-2 py-1 text-[11px] font-mono text-zinc-200 hover:bg-zinc-800 text-left"
+                                                                                                                        >
+                                                                                                                            <span className="font-semibold">{entry.value}</span>
+                                                                                                                            {entry.isAuto ? (
+                                                                                                                                <span className="text-[10px] text-emerald-400">(auto)</span>
+                                                                                                                            ) : (
+                                                                                                                                <span className="text-[10px] text-zinc-500">{sign}{delta}</span>
+                                                                                                                            )}
+                                                                                                                        </button>
+                                                                                                                    );
+                                                                                                                })}
+                                                                                                            </div>
+                                                                                                        )}
+                                                                                                    </>
+                                                                                                );
+                                                                                            })()}
                                                                                         </label>
                                                                                         {item.unitPrice > 0 && (
                                                                                             <span className="text-xs font-mono text-zinc-200 font-semibold shrink-0 w-20 text-right">
