@@ -214,6 +214,87 @@ export async function loadVendorMOQs(
 }
 
 // ──────────────────────────────────────────────────
+// VENDOR RECENT LINE QTYS (cognitive rounding history signal)
+// ──────────────────────────────────────────────────
+
+/**
+ * v2.2 — pull the last N completed PO line quantities for a vendor across
+ * all SKUs (vendors tend to use consistent batch sizes for related products).
+ * Used by cognitive rounding to detect favorite-batch clusters (e.g.
+ * Colorful Packaging always orders in 500s and 1000s).
+ *
+ * Reaches into the Finale GraphQL directly — uses the same auth pattern as
+ * other client.ts queries but inline so calibration.ts stays decoupled
+ * from the FinaleClient class.
+ *
+ * Best-effort: a Finale outage returns an empty array and the recommender
+ * falls back to the cognitive ladder.
+ */
+export async function loadVendorRecentLineQtys(
+    finaleAuthHeader: string,
+    finaleApiBase: string,
+    finaleAccountPath: string,
+    vendorPartyId: string,
+    limit: number = 8,
+): Promise<number[]> {
+    if (!vendorPartyId) return [];
+    try {
+        // 6-month window — long enough to see vendor patterns, short enough
+        // that the data reflects current pricing/case-size assumptions.
+        const now = new Date();
+        const begin = new Date(now);
+        begin.setDate(begin.getDate() - 180);
+        const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+        const endStr = new Date(now.getTime() + 86400000).toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+        const query = {
+            query: `{
+                orderViewConnection(
+                    first: ${Math.max(limit * 2, 16)}
+                    type: ["PURCHASE_ORDER"]
+                    statusId: ["ORDER_COMPLETED"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                ) {
+                    edges { node {
+                        orderId
+                        supplier { partyUrl }
+                        itemList(first: 200) {
+                            edges { node { quantity } }
+                        }
+                    } }
+                }
+            }`,
+        };
+
+        const res = await fetch(`${finaleApiBase}/${finaleAccountPath}/api/graphql`, {
+            method: "POST",
+            headers: { Authorization: finaleAuthHeader, "Content-Type": "application/json" },
+            body: JSON.stringify(query),
+        });
+        const json: any = await res.json();
+        const edges: any[] = json?.data?.orderViewConnection?.edges ?? [];
+
+        const qtys: number[] = [];
+        for (const e of edges) {
+            const po = e.node;
+            const partyUrl: string = po.supplier?.partyUrl ?? "";
+            const partyId = partyUrl.split("/").pop();
+            if (partyId !== vendorPartyId) continue;
+            for (const ie of (po.itemList?.edges ?? [])) {
+                const q = Number(ie.node?.quantity);
+                if (Number.isFinite(q) && q > 0) qtys.push(q);
+            }
+            if (qtys.length >= limit) break;
+        }
+        return qtys.slice(0, limit);
+    } catch (err: any) {
+        console.warn(`[calibration] loadVendorRecentLineQtys failed for ${vendorPartyId}: ${err.message}`);
+        return [];
+    }
+}
+
+// ──────────────────────────────────────────────────
 // VENDOR REORDER POLICY (planning preferences)
 // ──────────────────────────────────────────────────
 
@@ -228,6 +309,13 @@ export interface VendorReorderPolicy {
     overbuyReviewPct: number;
     overbuyReviewDollars: number;
     notes: string | null;
+    /**
+     * v2.2 — explicit favorite batch sizes for cognitive rounding
+     * (vendor_reorder_policies.favorite_batches). NULL when not set;
+     * recommender then learns from PO history or falls back to the
+     * cognitive ladder.
+     */
+    favoriteBatches: number[] | null;
 }
 
 /**
@@ -249,7 +337,7 @@ export async function loadVendorReorderPolicies(
     try {
         const { data } = await db
             .from("vendor_reorder_policies")
-            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes")
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches")
             .in("vendor_party_id", vendorPartyIds);
         for (const row of data ?? []) {
             map.set(row.vendor_party_id, {
@@ -261,6 +349,9 @@ export async function loadVendorReorderPolicies(
                 overbuyReviewPct: Number(row.overbuy_review_pct ?? 50),
                 overbuyReviewDollars: Number(row.overbuy_review_dollars ?? 1000),
                 notes: row.notes ?? null,
+                favoriteBatches: Array.isArray(row.favorite_batches) && row.favorite_batches.length > 0
+                    ? row.favorite_batches.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n) && n > 0)
+                    : null,
             });
         }
     } catch (err: any) {
