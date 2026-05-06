@@ -70,14 +70,16 @@ describe("recommendQty — basic math", () => {
     });
 
     it("rounds up to vendor pack size", () => {
-        // Need 98 → pack-snap to 12-pack → 108
-        // v2.2: cognitive ladder (tier 100-249 step 25) snaps 108 → 100,
-        // then honorPack picks nearest pack-12 multiple to 100 → 96.
+        // Need 98 → pack-snap to 12-pack → 108.
+        // v2.2: cognitive ladder snaps 108 → 100 (tier 100-249, step 25).
+        // honorPack tries pack-multiple of 100: 96 or 108. 96 < 108 floor →
+        // forced up to 108. Pack increment is a hard vendor constraint;
+        // cognitive rounding cannot underbuy below the pack-rounded need.
         const result = recommendQty(baseInput({
             dailyRate: 2, stockOnHand: 50, leadTimeDays: 14, orderIncrementQty: 12,
         }));
         expect(result.rawNeededEaches).toBe(98);
-        expect(result.suggestedQty).toBe(96);
+        expect(result.suggestedQty).toBe(108);
     });
 });
 
