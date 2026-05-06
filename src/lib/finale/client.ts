@@ -24,6 +24,7 @@ import {
     loadCalibrationStats,
     loadVendorMOQs,
     loadVendorReorderPolicies,
+    loadVendorRecentLineQtys,
     type VendorReorderPolicy,
     recordRecommendationSnapshots,
     type RecommendationSnapshot,
@@ -164,6 +165,10 @@ export interface PurchasingItem {
     reviewRequired?: boolean;
     /** v2.1 — human-readable list of review reasons for dashboard rendering. */
     reviewReasons?: string[];
+    /** v2.2 — which rounding layer produced suggestedQty (cognitive/historical/vendor_explicit), null when no snap fired. */
+    roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
+    /** v2.2 — two alternative qty values for one-click override in the dashboard dropdown. */
+    roundingAlternatives?: number[];
     recommendation?: {
         formulaVersion: string;
         coverDays: number;
@@ -4805,6 +4810,9 @@ export class FinaleClient {
         const calibrationCache = new Map<string, Awaited<ReturnType<typeof loadCalibrationStats>> extends Map<string, infer V> ? V : never>();
         const moqCache = new Map<string, Awaited<ReturnType<typeof loadVendorMOQs>> extends Map<string, infer V> ? V : never>();
         const reorderPolicyCache = new Map<string, VendorReorderPolicy>();
+        // v2.2 — last 8 completed PO line qtys per vendor, used by cognitive
+        // rounding to detect favorite-batch clusters.
+        const recentLineQtysCache = new Map<string, number[]>();
         const seenVendorIds = new Set<string>();
         const recommendationSnapshots: RecommendationSnapshot[] = [];
 
@@ -4931,13 +4939,14 @@ export class FinaleClient {
 
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
 
-                    // ── Phase 2/3 lookups: calibration, MOQ, P90 lead time, vendor policy ──
+                    // ── Phase 2/3/v2.2 lookups: calibration, MOQ, vendor policy, recent line qtys ──
                     if (!seenVendorIds.has(partyId)) {
                         seenVendorIds.add(partyId);
-                        const [calMap, moqMap, policyMap] = await Promise.all([
+                        const [calMap, moqMap, policyMap, recentQtys] = await Promise.all([
                             loadCalibrationStats([partyId]),
                             loadVendorMOQs([partyId]),
                             loadVendorReorderPolicies([partyId]),
+                            loadVendorRecentLineQtys(this.authHeader, this.apiBase, this.accountPath, partyId, 8),
                         ]);
                         const cal = calMap.get(partyId);
                         if (cal) calibrationCache.set(partyId, cal);
@@ -4945,6 +4954,7 @@ export class FinaleClient {
                         if (moq) moqCache.set(partyId, moq);
                         const policy = policyMap.get(partyId);
                         if (policy) reorderPolicyCache.set(partyId, policy);
+                        recentLineQtysCache.set(partyId, recentQtys);
                     }
                     const calibration = calibrationCache.get(partyId);
                     const moq = moqCache.get(partyId);
@@ -4994,6 +5004,9 @@ export class FinaleClient {
                         moqMode: reorderPolicy?.moqMode ?? "enforce",
                         overbuyReviewPct: reorderPolicy?.overbuyReviewPct ?? 50,
                         overbuyReviewDollars: reorderPolicy?.overbuyReviewDollars ?? 1000,
+                        // v2.2 — cognitive rounding inputs
+                        historicalLineQtys: recentLineQtysCache.get(partyId) ?? [],
+                        favoriteBatches: reorderPolicy?.favoriteBatches ?? null,
                     } as const;
                     const rec = recommendQty(recInputs);
 
@@ -5084,6 +5097,9 @@ export class FinaleClient {
                         moqWarning: rec.moqWarning,
                         reviewRequired: rec.reviewRequired,
                         reviewReasons: rec.reviewReasons,
+                        // v2.2 — cognitive rounding metadata for the dashboard override dropdown
+                        roundingMethod: rec.roundingMethod,
+                        roundingAlternatives: rec.roundingAlternatives,
                         recommendation: {
                             formulaVersion: rec.formulaVersion,
                             coverDays: rec.coverDays,
