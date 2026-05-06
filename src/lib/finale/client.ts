@@ -175,6 +175,18 @@ export interface PurchasingItem {
         rawNeededEaches: number;
         provenance: Array<{ step: string; detail: string; value?: number | string }>;
     };
+    /** v3 — BOM demand engine: classifies item as resale or BOM component */
+    itemType?: 'resale' | 'bom-component';
+    /** v3 — which finished goods consume this component, with demand context.
+     *  buildsWorth is approximate (uses dailySalesRate*30 as batch proxy in v1). */
+    feedsFinishedGoods?: Array<{
+        sku: string;
+        name: string;
+        dailySalesRate: number;
+        buildsWorth: number;
+    }>;
+    /** v3 — total daily burn rate summed across all FG consumers (BOM items only) */
+    totalBurnRate?: number;
 }
 
 export interface PurchasingGroup {
@@ -585,6 +597,12 @@ const PARTY_NAME_CACHE_MAX = 500;
 const _partyCacheShared = new Map<string, { groupName: string; isManufactured: boolean; isDropship: boolean; ts: number }>();
 const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
 const PARTY_CACHE_MAX = 200;
+
+/** Vendors we never order from on the purchasing dashboard:
+ *  internal manufacturing depts + dropship vendors handled outside the PO flow.
+ *  Shared by getPurchasingIntelligence and getBOMDemand so the two pipelines stay aligned. */
+export const EXCLUDED_VENDOR_PATTERN =
+    /buildasoil|manufacturing|soil dept|bas soil|autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
 
 // Component vendor resolution cache — SKU → { vendorName, vendorPartyId, ts }
 // 4h TTL matches LeadTimeService cache policy.
@@ -4566,7 +4584,7 @@ export class FinaleClient {
      * purchasedIn / soldIn  — date-windowed velocity signals
      * committedPOs          — all-time open supply (no date filter; Committed = always current)
      */
-    private async getProductActivity(sku: string, daysBack: number): Promise<{
+    async getProductActivity(sku: string, daysBack: number): Promise<{
         purchasedQty: number;
         soldQty: number;
         openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
