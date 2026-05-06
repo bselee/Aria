@@ -1559,14 +1559,10 @@ export class FinaleClient {
                                             }
                                         }
                                     }
-                                    shipmentList(first: 50) {
-                                        edges {
-                                            node {
-                                                shipmentId
-                                                receiveDate
-                                                quantity
-                                            }
-                                        }
+                                    shipmentList {
+                                        shipmentId
+                                        receiveDate
+                                        quantity
                                     }
                                 }
                             }
@@ -1587,9 +1583,11 @@ export class FinaleClient {
                         (item: any) => item.node.product?.productId === productId
                     );
                     const originalQty = parseFinaleNumber(matchingItem?.node.quantity) || 0;
-                    const receivedQty = (po.shipmentList?.edges || [])
-                        .filter((s: any) => s.node.receiveDate)
-                        .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.node.quantity || 0), 0);
+                    // Finale schema removed `(first: ...)` arg + edges/node wrapper on
+                    // shipmentList — it now returns the array directly.
+                    const receivedQty = (po.shipmentList || [])
+                        .filter((s: any) => s.receiveDate)
+                        .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.quantity || 0), 0);
                     const remainingQty = originalQty - receivedQty;
                     if (remainingQty <= 0) return null;
                     return {
