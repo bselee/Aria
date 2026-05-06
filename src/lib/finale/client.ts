@@ -598,9 +598,17 @@ const _partyCacheShared = new Map<string, { groupName: string; isManufactured: b
 const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
 const PARTY_CACHE_MAX = 200;
 
-/** Vendors we never order from on the purchasing dashboard:
- *  internal manufacturing depts + dropship vendors handled outside the PO flow.
- *  Shared by getPurchasingIntelligence and getBOMDemand so the two pipelines stay aligned. */
+/**
+ * Vendors we never order from on the purchasing dashboard:
+ * internal manufacturing depts + dropship vendors handled outside the PO flow.
+ *
+ * The combined pattern that the upcoming getBOMDemand pipeline (Task 3) will use
+ * directly. getPurchasingIntelligence still uses inline regexes inside the two
+ * resolveParty closures (around line ~4193 and ~4839) — they encode the
+ * isManufactured/isDropship boolean split separately, so they're intentionally
+ * NOT migrated to this constant. If you edit one of those inline regexes,
+ * keep this constant in sync (or vice versa) until they're consolidated.
+ */
 export const EXCLUDED_VENDOR_PATTERN =
     /buildasoil|manufacturing|soil dept|bas soil|autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
 
