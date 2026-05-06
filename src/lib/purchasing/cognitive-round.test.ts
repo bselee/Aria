@@ -141,4 +141,14 @@ describe("pack increment interaction", () => {
         // 60 is already pack-aligned and a multiple of 10 (clean). No snap needed.
         expect(r.snappedQty).toBe(60);
     });
+
+    it("never returns below rawQty when packIncrement is set (hard vendor constraint)", () => {
+        // raw 108 (the recommender already pack-rounded 98 → 108 in step 7).
+        // Cognitive ladder snaps 108 → 100 (tier 100-249, step 25). The
+        // pack-12 multiples adjacent to 100 are 96 (Δ4) and 108 (Δ8); 96 wins
+        // by distance — but 96 < 108 underbuys the pack-rounded demand.
+        // Floor forces the result back up to 108.
+        const r = roundToCleanQty({ rawQty: 108, packIncrement: 12 });
+        expect(r.snappedQty).toBe(108);
+    });
 });

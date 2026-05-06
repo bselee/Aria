@@ -102,21 +102,34 @@ function detectFavorites(historical: number[]): number[] {
 }
 
 /**
- * After picking a snap target, ensure it's a multiple of packIncrement.
- * If it isn't, round up to the nearest pack-multiple at-or-above the snap
- * (we never round below an explicit snap target — that would defeat the
- * point of the snap). If pack alone is already clean (e.g. pack=60), the
- * snap target is the pack-aligned value.
+ * After picking a snap target, snap to a multiple of packIncrement that is
+ * also ≥ `rawQtyFloor`. Pack increment represents a hard vendor constraint
+ * (e.g. "we sell in cases of 12"), so the result must never go below the
+ * pre-snap qty — otherwise the cognitive ladder could underbuy below the
+ * actual recommended demand.
+ *
+ * Examples (all with packIncrement=12):
+ *   honorPack(25, 12, 22)   → 24    (lower neighbor of 25; 24 ≥ 22 ✓)
+ *   honorPack(100, 12, 108) → 108   (lower 96 < floor 108 → force up to 108)
+ *   honorPack(60, 60, 60)   → 60    (already pack-aligned and ≥ floor)
  */
-function honorPack(snapTarget: number, packIncrement: number | null | undefined): number {
+function honorPack(snapTarget: number, packIncrement: number | null | undefined, rawQtyFloor: number): number {
     if (!packIncrement || packIncrement <= 1) return snapTarget;
-    if (snapTarget % packIncrement === 0) return snapTarget;
-    // Find pack-multiples adjacent to the snap target; pick the nearest.
-    const lower = Math.floor(snapTarget / packIncrement) * packIncrement;
-    const upper = lower + packIncrement;
-    const dLower = snapTarget - lower;
-    const dUpper = upper - snapTarget;
-    return dUpper <= dLower ? upper : lower;
+    let result: number;
+    if (snapTarget % packIncrement === 0) {
+        result = snapTarget;
+    } else {
+        const lower = Math.floor(snapTarget / packIncrement) * packIncrement;
+        const upper = lower + packIncrement;
+        const dLower = snapTarget - lower;
+        const dUpper = upper - snapTarget;
+        result = dUpper <= dLower ? upper : lower;
+    }
+    // Pack is a hard vendor constraint — never go below the input qty.
+    if (result < rawQtyFloor) {
+        result = Math.ceil(rawQtyFloor / packIncrement) * packIncrement;
+    }
+    return result;
 }
 
 export function roundToCleanQty(input: CognitiveRoundInput): CognitiveRoundResult {
@@ -135,7 +148,7 @@ export function roundToCleanQty(input: CognitiveRoundInput): CognitiveRoundResul
 
     // Edge: tiny qty (<5) → smallest cognitive tier.
     if (raw < 5) {
-        const result = honorPack(5, input.packIncrement);
+        const result = honorPack(5, input.packIncrement, raw);
         return {
             snappedQty: result,
             delta: result - raw,
@@ -152,7 +165,7 @@ export function roundToCleanQty(input: CognitiveRoundInput): CognitiveRoundResul
     if (explicit) {
         const snap = snapToFavorites(raw, explicit);
         if (snap != null) {
-            const result = honorPack(snap, input.packIncrement);
+            const result = honorPack(snap, input.packIncrement, raw);
             const sorted = [...explicit].sort((a, b) => a - b);
             const idx = sorted.indexOf(snap);
             const alternatives = [
@@ -175,7 +188,7 @@ export function roundToCleanQty(input: CognitiveRoundInput): CognitiveRoundResul
     if (learned.length > 0) {
         const snap = snapToFavorites(raw, learned);
         if (snap != null) {
-            const result = honorPack(snap, input.packIncrement);
+            const result = honorPack(snap, input.packIncrement, raw);
             const idx = learned.indexOf(snap);
             const alternatives = [
                 idx > 0 ? learned[idx - 1] : null,
@@ -196,7 +209,7 @@ export function roundToCleanQty(input: CognitiveRoundInput): CognitiveRoundResul
     // ─── Layer 1 — cognitive ladder (always-on floor) ───────────────────
     const step = ladderStepFor(raw);
     const snap = snapToLadder(raw, step);
-    const result = honorPack(snap, input.packIncrement);
+    const result = honorPack(snap, input.packIncrement, raw);
     // Two alternatives: the next tier-step below and above the snap (or the rounded raw if below).
     const alts: number[] = [];
     if (snap - step > 0) alts.push(snap - step);
