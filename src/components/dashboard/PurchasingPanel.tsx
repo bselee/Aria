@@ -78,7 +78,7 @@ type POResult = { orderId: string; finaleUrl: string };
 type CommitReview = {
     sendId: string;
     review: {
-        orderId: string; vendorName: string; total: number; orderDate: string;
+        orderId: string; vendorName: string; vendorPartyId: string; total: number; orderDate: string;
         items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number }>;
         finaleUrl: string;
     };
@@ -427,9 +427,9 @@ export default function PurchasingPanel() {
                 const json: AssessmentData = await res.json();
                 if (!res.ok) throw new Error(json.error || `Failed tier ${tier}`);
 
-                // Merge incoming groups without clobbering existing UI state
+                // Merge progressive tiers, but replace stale data after an explicit rescan.
                 setData(prev => {
-                    if (!prev) return json;
+                    if (!prev || bustThis) return json;
                     const existingIds = new Set(prev.groups.map(g => g.vendorPartyId));
                     const newGroups = json.groups.filter(g => !existingIds.has(g.vendorPartyId));
                     const mergedGroups = [...prev.groups, ...newGroups];
@@ -631,8 +631,26 @@ export default function PurchasingPanel() {
             });
             const json = await res.json();
             if (!res.ok) { setError(json.error || 'Send failed'); return; }
-            setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+            if (json.status === 'failed') {
+                setError(json.userMessage || json.error || 'Send failed');
+                return;
+            }
+            const details = json.details ?? {};
+            if (details.finaleEmailSent) {
+                setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+            }
+            setCreatedPOs(prev => {
+                const next = { ...prev };
+                delete next[commitModal.review.vendorPartyId];
+                return next;
+            });
+            setData(prev => prev
+                ? { ...prev, groups: prev.groups.filter(g => g.vendorPartyId !== commitModal.review.vendorPartyId) }
+                : prev);
             setCommitModal(null);
+            if (json.status === 'partial_success') {
+                setError(json.userMessage || 'PO committed in Finale, but the vendor email still needs review.');
+            }
             await load(true);
         } catch (e: any) {
             setError(`Send failed: ${e.message}`);
@@ -747,10 +765,15 @@ export default function PurchasingPanel() {
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g));
     const displayGroups = showSnoozed ? sortedGroups : activeGroups;
     const focusGroups = displayGroups
-        .map(group => ({
-            ...group,
-            items: sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item) && itemMatchesLifecycle(item))),
-        }))
+        .map(group => {
+            const hasDraftPO = !!createdPOs[group.vendorPartyId];
+            return {
+                ...group,
+                items: hasDraftPO
+                    ? []
+                    : sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item) && itemMatchesLifecycle(item))),
+            };
+        })
         .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
 
     // Lifecycle bucket counts — computed across all focus-matched items so tabs
@@ -1041,10 +1064,10 @@ export default function PurchasingPanel() {
                             </button>
 
                             {focusGroups.map(g => {
-                                const vSnoozed = vendorSnoozed(g);
                                 const cfg = URGENCY[g.urgency];
                                 const isActive = vendorTab === g.vendorPartyId;
                                 const hasPO = !!createdPOs[g.vendorPartyId];
+                                const vSnoozed = !hasPO && vendorSnoozed(g);
                                 const checkedCount = g.items.filter(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId]).length;
                                 return (
                                     <button key={g.vendorPartyId}
@@ -1099,10 +1122,10 @@ export default function PurchasingPanel() {
                                     const cfg = URGENCY[group.urgency];
                                     const pid = group.vendorPartyId;
                                     const vSnoozeKey = `v:${pid}`;
-                                    const vSnoozed = vendorSnoozed(group);
-                                    const isExpanded = !vSnoozed && (expanded.has(pid) || vendorTab === pid);
                                     const isCreatingThis = creatingPO.has(pid);
                                     const po = createdPOs[pid];
+                                    const vSnoozed = !po && vendorSnoozed(group);
+                                    const isExpanded = !vSnoozed && (expanded.has(pid) || vendorTab === pid);
                                     const groupChecked = checked[pid] ?? {};
                                     const groupQtys = qtys[pid] ?? {};
                                     const activeItems = group.items.filter(i => !isSnoozed(i.productId));
