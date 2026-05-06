@@ -200,6 +200,56 @@ describe("PurchasingPanel - vendor policy badges", () => {
     });
 });
 
+describe("PurchasingPanel - qty override dropdown", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it("renders chevron when roundingAlternatives is non-empty", async () => {
+        stubLocalStorage();
+
+        const itemWithAlts = {
+            ...makeFixtureItem(),
+            roundingMethod: "historical" as const,
+            roundingAlternatives: [600, 1000],
+        };
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Colorful Packaging Ltd",
+                    vendorPartyId: "10918",
+                    urgency: "critical",
+                    items: [itemWithAlts],
+                },
+            ],
+            cachedAt: "2026-05-05T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const empty = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+            const url = String(input);
+            let body: any = empty;
+            if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        const vendorTab = await screen.findByText(/Colorful Packagi/i);
+        fireEvent.click(vendorTab);
+
+        await waitFor(() => {
+            const chevron = document.querySelector('[title="Snap to a different clean number"]');
+            expect(chevron).not.toBeNull();
+        });
+    });
+});
+
 describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
     afterEach(() => {
         vi.restoreAllMocks();
@@ -280,5 +330,55 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
             const thirtyBtn = findFilterButton("within 30 days");
             expect(thirtyBtn?.className).toMatch(/amber-/);
         });
+    });
+});
+
+describe("PurchasingPanel - draft PO state", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it("keeps the green draft PO marker but removes drafted items from the needing list", async () => {
+        stubLocalStorage();
+
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Colorful Packaging Ltd",
+                    vendorPartyId: "10918",
+                    urgency: "critical",
+                    items: [makeFixtureItem()],
+                },
+            ],
+            cachedAt: "2026-05-05T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const empty = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url.includes("/api/dashboard/purchasing") && init?.method === "POST") {
+                return Promise.resolve({
+                    ok: true,
+                    json: () => Promise.resolve({ orderId: "124790", finaleUrl: "https://finale.example/po/124790" }),
+                });
+            }
+            let body: any = empty;
+            if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        fireEvent.click(await screen.findByText(/Colorful Packaging Ltd/i));
+        await waitFor(() => expect(screen.getByText(/Colorful printed label/i)).toBeTruthy());
+        fireEvent.click(screen.getByText(/Draft PO \(1\)/i));
+
+        await waitFor(() => expect(screen.getAllByText(/PO #124790/i).length).toBeGreaterThan(0));
+        expect(screen.queryByText(/Colorful printed label/i)).toBeNull();
     });
 });
