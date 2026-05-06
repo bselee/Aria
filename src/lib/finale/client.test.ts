@@ -460,11 +460,11 @@ describe("findCommittedPOsForProduct remainingQty", () => {
                             total: "500",
                             supplier: { name: "Test Vendor" },
                             itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
-                            shipmentList: {
-                                edges: [{
-                                    node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "100" }
-                                }]
-                            },
+                            // 2026-05-06: Finale schema removed (first:..) + edges/node wrapper on
+                            // order.shipmentList — shipmentList is now a direct array.
+                            shipmentList: [
+                                { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "100" },
+                            ],
                         },
                     }],
                 },
@@ -489,11 +489,9 @@ describe("findCommittedPOsForProduct remainingQty", () => {
                             total: "500",
                             supplier: { name: "Test Vendor" },
                             itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
-                            shipmentList: {
-                                edges: [{
-                                    node: { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" }
-                                }]
-                            },
+                            shipmentList: [
+                                { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" },
+                            ],
                         },
                     }],
                 },
@@ -520,11 +518,9 @@ describe("findCommittedPOsForProduct remainingQty", () => {
                             total: "500",
                             supplier: { name: "Test Vendor" },
                             itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
-                            shipmentList: {
-                                edges: [{
-                                    node: { shipmentId: "sh-1", receiveDate: null, quantity: "0" }
-                                }]
-                            },
+                            shipmentList: [
+                                { shipmentId: "sh-1", receiveDate: null, quantity: "0" },
+                            ],
                         },
                     }],
                 },
