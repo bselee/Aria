@@ -55,10 +55,11 @@ describe("recommendQty — basic math", () => {
 
     it("targets dailyRate × (lead + buffer) and subtracts stock + on-order", () => {
         // 2/d × (14 + 60) = 148 target − 50 on hand − 0 on order = 98 needed
+        // v2.2: cognitive ladder (tier 30-99 step 10) snaps 98 → 100 (Δ2 vs Δ8 to 90)
         const result = recommendQty(baseInput({ dailyRate: 2, stockOnHand: 50, leadTimeDays: 14, coverBufferDays: 60 }));
         expect(result.coverDays).toBe(74);
         expect(result.rawNeededEaches).toBe(98);
-        expect(result.suggestedQty).toBe(98);
+        expect(result.suggestedQty).toBe(100);
     });
 
     it("returns zero when stock + on-order already covers cover window", () => {
@@ -69,12 +70,14 @@ describe("recommendQty — basic math", () => {
     });
 
     it("rounds up to vendor pack size", () => {
-        // Need 98 → snap to 12-pack → 108
+        // Need 98 → pack-snap to 12-pack → 108
+        // v2.2: cognitive ladder (tier 100-249 step 25) snaps 108 → 100,
+        // then honorPack picks nearest pack-12 multiple to 100 → 96.
         const result = recommendQty(baseInput({
             dailyRate: 2, stockOnHand: 50, leadTimeDays: 14, orderIncrementQty: 12,
         }));
         expect(result.rawNeededEaches).toBe(98);
-        expect(result.suggestedQty).toBe(108);
+        expect(result.suggestedQty).toBe(96);
     });
 });
 
@@ -407,6 +410,70 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the v2.1 policy bump", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.1-vendor-policy-2026-05-06");
+        expect(QTY_FORMULA_VERSION).toBe("v2.2-cognitive-round-2026-05-06");
+    });
+});
+
+describe("recommendQty — cognitive rounding integration", () => {
+    it("Will's example: 591 raw + Colorful history snaps to 500 with historical_round provenance", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 10,
+            stockOnHand: 0,
+            stockOnOrder: 0,
+            leadTimeDays: 21,
+            targetCoverDays: 60,    // 10/d × 60d = 600 raw need; close to Colorful 500/1000 cluster
+            historicalLineQtys: [500, 1000, 500, 500, 1000, 500],
+        }));
+        // Raw need 600, historical snap → 500 (closer than 1000)
+        expect(result.suggestedQty).toBe(500);
+        expect(result.roundingMethod).toBe("historical");
+        const step = result.provenance.find(p => p.step === "historical_round");
+        expect(step).toBeDefined();
+        expect(step?.detail).toContain("500");
+    });
+
+    it("explicit favoriteBatches overrides historical", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 10, stockOnHand: 0, leadTimeDays: 21, targetCoverDays: 60,
+            historicalLineQtys: [500, 500, 1000, 500],
+            favoriteBatches: [250, 750],
+        }));
+        // Raw 600, explicit favorites [250, 750] — nearest is 750.
+        expect(result.suggestedQty).toBe(750);
+        expect(result.roundingMethod).toBe("vendor_explicit");
+        expect(result.provenance.find(p => p.step === "vendor_round")).toBeDefined();
+    });
+
+    it("no history + no explicit → cognitive ladder", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 0, leadTimeDays: 14, coverBufferDays: 8,  // 1/d × 22d = 22 raw
+        }));
+        expect(result.suggestedQty).toBe(25);
+        expect(result.roundingMethod).toBe("cognitive");
+        expect(result.provenance.find(p => p.step === "cognitive_round")).toBeDefined();
+    });
+
+    it("MOQ still wins over cognitive snap", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 1, stockOnHand: 0, leadTimeDays: 14, coverBufferDays: 8,  // raw 22
+            minimumOrderEaches: 100,
+            moqMode: "enforce",
+        }));
+        // Cognitive snaps 22 → 25, MOQ bumps 25 → 100.
+        expect(result.suggestedQty).toBe(100);
+        expect(result.moqApplied).toBe(true);
+    });
+
+    it("formula version is bumped to v2.2", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.2-cognitive-round-2026-05-06");
+    });
+
+    it("emits 2 rounding alternatives for the UI dropdown", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 10, stockOnHand: 0, leadTimeDays: 21, targetCoverDays: 60,
+            historicalLineQtys: [500, 1000, 500, 500, 1000, 500],
+        }));
+        expect(result.roundingAlternatives).toBeDefined();
+        expect(result.roundingAlternatives!.length).toBeGreaterThan(0);
     });
 });

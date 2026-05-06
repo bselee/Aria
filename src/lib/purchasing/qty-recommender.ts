@@ -16,12 +16,15 @@
  *          touching the recommender's downstream consumers.
  */
 
+import { roundToCleanQty } from "./cognitive-round";
+
 // Bumped on every behavioral change so the calibration loop can bucket
 // error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
 //   v2.0-calibrated-2026-05-05 — phase 2 calibration baseline
 //   v2.1-vendor-policy-2026-05-06 — vendor reorder policy overrides
 //     (lead time override, target cover, MOQ tri-state, overbuy review flags)
-export const QTY_FORMULA_VERSION = "v2.1-vendor-policy-2026-05-06";
+//   v2.2-cognitive-round-2026-05-06 — cognitive/historical PO qty rounding
+export const QTY_FORMULA_VERSION = "v2.2-cognitive-round-2026-05-06";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -75,6 +78,19 @@ export interface RecommenderInput {
     overbuyReviewPct?: number | null;
     /** Overbuy review threshold in dollars — default $1000. */
     overbuyReviewDollars?: number | null;
+
+    /**
+     * v2.2 — last N completed PO line qtys for this vendor (across SKUs is fine
+     * — vendors tend to use consistent batch sizes for related products).
+     * Used by cognitive rounding to detect favorite-batch clusters.
+     */
+    historicalLineQtys?: number[];
+    /**
+     * v2.2 — explicit per-vendor favorite batches from
+     * vendor_reorder_policies.favorite_batches. When set (non-empty), overrides
+     * historical learning.
+     */
+    favoriteBatches?: number[] | null;
 }
 
 export interface ProvenanceStep {
@@ -106,6 +122,10 @@ export interface RecommenderResult {
     reviewRequired: boolean;
     /** v2.1 — human-readable reasons for reviewRequired (empty when reviewRequired is false). */
     reviewReasons: string[];
+    /** v2.2 — which rounding layer fired (cognitive/historical/vendor_explicit), or null if no rounding was needed (qty was 0). */
+    roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
+    /** v2.2 — two alternative snap targets for the UI override dropdown. */
+    roundingAlternatives?: number[];
 }
 
 function urgencyFor(adjustedRunwayDays: number, leadTimeDays: number): Urgency {
@@ -292,6 +312,34 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     }
 
+    // ── Step 7.5: cognitive/historical/explicit rounding ──────────────────
+    // v2.2 — never present an odd number on a draft PO. Snap to a clean number
+    // using the historical pattern when available, the explicit override when
+    // set, or the magnitude-aware cognitive ladder otherwise.
+    let roundingMethod: "cognitive" | "historical" | "vendor_explicit" | null = null;
+    let roundingAlternatives: number[] = [];
+    if (suggestedQty > 0) {
+        const round = roundToCleanQty({
+            rawQty: suggestedQty,
+            packIncrement: orderIncrementQty,
+            historicalQtys: input.historicalLineQtys,
+            explicitFavorites: input.favoriteBatches ?? null,
+        });
+        if (round.method !== "noop" && round.snappedQty !== suggestedQty) {
+            const stepName = round.method === "historical" ? "historical_round"
+                : round.method === "vendor_explicit" ? "vendor_round"
+                : "cognitive_round";
+            trace.push({
+                step: stepName,
+                detail: round.detail,
+                value: round.snappedQty,
+            });
+            suggestedQty = round.snappedQty;
+        }
+        roundingMethod = round.method === "noop" ? null : round.method;
+        roundingAlternatives = round.alternatives;
+    }
+
     // ── Step 8: vendor MOQ — tri-state mode ───────────────────────────────
     // v2.1 — moqMode: 'enforce' (default — bump qty), 'warn' (sets moqWarning,
     // no bump), 'ignore' (no bump, no warn). Mode comes from vendor_reorder_policies.
@@ -425,5 +473,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         moqWarning,
         reviewRequired,
         reviewReasons,
+        roundingMethod,
+        roundingAlternatives,
     };
 }
