@@ -18,6 +18,21 @@ describe("derivePOSentVerification", () => {
         });
     });
 
+    it("does not treat a commit-only po_sends row as sent verification", () => {
+        const result = derivePOSentVerification({
+            poNumber: "124790",
+            purchaseOrder: {},
+            sendRows: [{ committed_at: "2026-05-01T12:00:00.000Z", sent_at: null }],
+            hasTracking: false,
+        });
+
+        expect(result).toMatchObject({
+            verified: false,
+            sentAt: null,
+            source: null,
+        });
+    });
+
     it("verifies a sent PO from tracking evidence even when send evidence is missing", () => {
         const result = derivePOSentVerification({
             poNumber: "124790",

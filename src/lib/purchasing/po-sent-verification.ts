@@ -32,7 +32,7 @@ function firstTimestamp(...values: Array<string | null | undefined>): string | n
 export function derivePOSentVerification(input: DerivePOSentVerificationInput): POSentVerification {
     const evidence: POSentEvidence[] = [];
     const po = input.purchaseOrder ?? {};
-    const sendRow = (input.sendRows ?? []).find((row) => row?.sent_at || row?.committed_at);
+    const sendRow = (input.sendRows ?? []).find((row) => row?.sent_at);
     const manualAt = firstTimestamp(po.po_sent_verified_at, po.manual_sent_verified_at);
 
     if (manualAt) {
@@ -46,7 +46,7 @@ export function derivePOSentVerification(input: DerivePOSentVerificationInput): 
     if (sendRow) {
         evidence.push({
             type: "po_send",
-            at: firstTimestamp(sendRow.sent_at, sendRow.committed_at),
+            at: sendRow.sent_at,
             detail: "PO send log recorded by Aria",
         });
     }

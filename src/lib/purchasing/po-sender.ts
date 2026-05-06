@@ -353,20 +353,25 @@ export async function commitAndSendPO(
     // 2. Send through Finale's native PO email action so the Finale PDF is attached.
     let finaleEmailSent = false;
     let pdfAttached = false;
-    let sentAt = null;
+    let sentAt: string | null = null;
     let finaleEmailActionUrl: string | undefined;
+    let emailError: string | undefined;
 
     if (!skipEmail && vendorEmail) {
         const { subject, body } = generatePOEmailBody(review);
-        const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
-            toEmail: vendorEmail,
-            subject,
-            body,
-        });
-        finaleEmailSent = sendResult.sent;
-        pdfAttached = sendResult.pdfAttached;
-        finaleEmailActionUrl = sendResult.actionUrl;
-        sentAt = new Date().toISOString();
+        try {
+            const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
+                toEmail: vendorEmail,
+                subject,
+                body,
+            });
+            finaleEmailSent = sendResult.sent;
+            pdfAttached = sendResult.pdfAttached;
+            finaleEmailActionUrl = sendResult.actionUrl;
+            sentAt = new Date().toISOString();
+        } catch (err: any) {
+            emailError = err?.message ?? String(err);
+        }
     }
 
     const { subject } = generatePOEmailBody(review);
@@ -374,57 +379,75 @@ export async function commitAndSendPO(
     // 3. Log to Supabase
     const db = createClient();
     if (db) {
-        await Promise.allSettled([
-            db.from('po_sends').insert({
-                po_number: orderId,
-                vendor_name: review.vendorName,
-                vendor_party_id: review.vendorPartyId,
-                sent_to_email: skipEmail ? null : vendorEmail,
-                total_amount: review.total,
-                item_count: review.items.length,
-                committed_at: committedAt,
-                sent_at: sentAt,
-                triggered_by: triggeredBy,
-                gmail_message_id: null,
-            }),
+        const lifecycleStage = finaleEmailSent ? 'sent' : 'committed';
+        const writes: Array<PromiseLike<any>> = [
             db.from('ap_activity_log').insert({
                 email_from: 'bill.selee@buildasoil.com',
                 email_subject: subject,
                 intent: finaleEmailSent ? 'PO_SEND_FINALE' : 'PO_COMMIT',
-                action_taken: skipEmail || !vendorEmail
-                    ? `PO #${orderId} committed in Finale (Email skipped/unavailable)`
-                    : `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`,
+                action_taken: finaleEmailSent
+                    ? `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`
+                    : `PO #${orderId} committed in Finale (Email skipped/unavailable)`,
                 notified_slack: false,
                 metadata: {
                     orderId,
-                    vendorEmail: skipEmail ? null : vendorEmail,
+                    vendorEmail: finaleEmailSent ? vendorEmail : null,
                     triggeredBy,
                     finaleEmailSent,
                     pdfAttached,
                     finaleEmailActionUrl,
                     itemCount: review.items.length,
                     emailSkipped: skipEmail || !vendorEmail,
+                    emailError: emailError ?? null,
                 },
             }),
             db.from('purchase_orders').upsert({
                 po_number: orderId,
                 vendor_name: review.vendorName,
+                status: 'open',
                 committed_at: committedAt,
-                po_sent_at: sentAt,
-                po_email_message_id: finaleEmailActionUrl ?? null,
-                lifecycle_stage: 'sent',
+                po_sent_at: finaleEmailSent ? sentAt : null,
+                po_email_message_id: finaleEmailSent ? finaleEmailActionUrl ?? null : null,
+                lifecycle_stage: lifecycleStage,
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'po_number' }),
-        ]);
+        ];
+
+        if (finaleEmailSent && vendorEmail && sentAt) {
+            writes.push(db.from('po_sends').insert({
+                po_number: orderId,
+                vendor_name: review.vendorName,
+                vendor_party_id: review.vendorPartyId,
+                sent_to_email: vendorEmail,
+                total_amount: review.total,
+                item_count: review.items.length,
+                committed_at: committedAt,
+                sent_at: sentAt,
+                triggered_by: triggeredBy,
+                gmail_message_id: null,
+                metadata: {
+                    orderId,
+                    vendorEmail,
+                    triggeredBy,
+                    finaleEmailSent,
+                    pdfAttached,
+                    finaleEmailActionUrl,
+                    itemCount: review.items.length,
+                },
+            }));
+        }
+
+        await Promise.allSettled(writes);
     }
 
     await expirePendingPOSend(id, 'confirmed');
     return {
         orderId,
-        sentTo: skipEmail ? null : vendorEmail,
+        sentTo: finaleEmailSent ? vendorEmail : null,
         gmailMessageId: null,
         finaleEmailSent,
         pdfAttached,
         emailSkipped: skipEmail || !vendorEmail,
+        emailError,
     };
 }
