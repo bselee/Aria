@@ -466,6 +466,79 @@ describe("reconcileInvoiceToPO guardrails", () => {
         expect(result.overallVerdict).not.toBe("duplicate");
     });
 
+    // Regression: po-sweep can hand reconcileInvoiceToPO an invoice whose
+    // raw_data is null (legacy DB rows) — the synthetic fallback uses
+    // match.line_items which is null when no extraction has run. Before the
+    // fix, validateInvoiceBalance threw "Cannot read properties of undefined
+    // (reading 'filter')" twice per AP-polling cycle (every ~15 min).
+    it("does not throw when invoice.lineItems is missing (po-sweep legacy invoices)", async () => {
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            subtotal: 500,
+            freight: 0,
+            total: 500,
+            amountDue: 500,
+        });
+        // Simulate the po-sweep fallback shape where line_items is null in DB
+        delete (invoice as any).lineItems;
+
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [
+                    { productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Organic Compost" },
+                ],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+
+        // Should not throw, and should surface the missing-lineItems condition
+        expect(result).toBeDefined();
+        expect(result.warnings.some(w => /no lineItems/i.test(w))).toBe(true);
+        expect(result.priceChanges).toEqual([]);
+    });
+
+    // Same regression but with explicit null (matches Supabase JSONB null)
+    it("does not throw when invoice.lineItems is null", async () => {
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            subtotal: 500,
+            total: 500,
+            amountDue: 500,
+        });
+        (invoice as any).lineItems = null;
+
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+        // Pre-fix this threw "Cannot read properties of undefined (reading 'filter')"
+        // inside validateInvoiceBalance. We just need it not to crash.
+        expect(result).toBeDefined();
+        expect(result.priceChanges).toEqual([]);
+    });
+
     it("includes a canonical reconciliation key in audit metadata", () => {
         const metadata = buildAuditMetadata(
             {

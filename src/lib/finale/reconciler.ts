@@ -1128,6 +1128,20 @@ export async function reconcileInvoiceToPO(
 ): Promise<ReconciliationResult> {
     const warnings: string[] = [];
 
+    // ── Defensive: lineItems is typed as required, but runtime callers (po-sweep,
+    // legacy DB rows missing raw_data, partial extractions) can pass invoices
+    // with lineItems=null/undefined. Normalize once here so every downstream
+    // consumer (validateInvoiceBalance, reconcileLineItems, subtotal helpers,
+    // notes builder) can safely iterate. The field absence is itself a useful
+    // signal — surface it as a warning.
+    if (!Array.isArray(invoice.lineItems)) {
+        warnings.push(
+            `Invoice has no lineItems array (got ${invoice.lineItems === null ? "null" : typeof invoice.lineItems}). ` +
+            `Reconciling fees/totals only — line-item price changes cannot be computed.`
+        );
+        invoice = { ...invoice, lineItems: [] };
+    }
+
     // ── Balance validation ─────────────────────────────────────────────────────
     // M2 FIX: Two tiers — "warn" is non-blocking, "gate" forces needs_approval.
     // A large balance gap means OCR extraction is untrustworthy.
