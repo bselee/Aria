@@ -174,7 +174,8 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
                             });
                         }
                     } catch (err: any) {
-                        console.error(`     ❌ Reconciliation failed:`, err.message);
+                        console.error(`     ❌ Reconciliation failed for PO ${po.orderId} / inv ${match.invoice_number}:`, err.message);
+                        if (err?.stack) console.error(err.stack);
                     }
                 }
             }
