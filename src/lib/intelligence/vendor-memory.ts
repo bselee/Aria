@@ -106,7 +106,8 @@ export async function storeVendorPattern(pattern: VendorPattern): Promise<void> 
  * Retrieve the stored pattern for a specific vendor.
  * Returns null if no pattern is stored.
  */
-export async function getVendorPattern(vendorName: string): Promise<VendorPattern | null> {
+export async function getVendorPattern(vendorName: string | null | undefined): Promise<VendorPattern | null> {
+    if (typeof vendorName !== "string" || !vendorName) return null;
     try {
         const index = getIndex();
         const id = `vendor-${vendorName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
