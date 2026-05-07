@@ -16,15 +16,16 @@ describe('computeComponentBurnRates', () => {
         expect(result.get('COMPOST')!.feedsFinishedGoods).toHaveLength(1);
     });
 
-    it('computes buildsWorth from stock and per-unit qty', () => {
+    it('captures qtyPerUnit per FG so callers can compute buildsWorth themselves', () => {
         const fgVelocities = [
             { sku: 'LIGHT-MIX', name: 'Light Mix', dailySalesRate: 10, bom: [{ componentSku: 'PERLITE', quantity: 2 }] },
+            { sku: 'CRAFT-LITE', name: 'Craft Lite', dailySalesRate: 5, bom: [{ componentSku: 'PERLITE', quantity: 3 }] },
         ];
         const result = computeComponentBurnRates(fgVelocities);
         const perlite = result.get('PERLITE')!;
-        // With 100 units of PERLITE and typical build size 50, buildsWorth = 100/(2*50) = 1
-        const buildsWorth = perlite.computeBuildsWorth(100, 50);
-        expect(buildsWorth).toBe(1);
+        const byFg = new Map(perlite.feedsFinishedGoods.map(fg => [fg.sku, fg.qtyPerUnit]));
+        expect(byFg.get('LIGHT-MIX')).toBe(2);
+        expect(byFg.get('CRAFT-LITE')).toBe(3);
     });
 });
 
@@ -65,5 +66,46 @@ describe('mergeIntoGroups', () => {
         const bomGroups = [{ vendorName: 'B', vendorPartyId: 'p2', urgency: 'warning' as const, items: [] }];
         const merged = mergeIntoGroups(resaleGroups, bomGroups);
         expect(merged).toHaveLength(2);
+    });
+
+    it('sorts merged groups worst-urgency-first then alphabetically', () => {
+        const merged = mergeIntoGroups(
+            [
+                { vendorName: 'Zeta', vendorPartyId: 'pZ', urgency: 'critical' as const, items: [] },
+                { vendorName: 'Alpha', vendorPartyId: 'pA', urgency: 'ok' as const, items: [] },
+            ],
+            [
+                { vendorName: 'Beta', vendorPartyId: 'pB', urgency: 'critical' as const, items: [] },
+            ],
+        );
+        expect(merged.map(g => g.vendorName)).toEqual(['Beta', 'Zeta', 'Alpha']);
+    });
+
+    it('does not mutate input groups', () => {
+        const resale = [{
+            vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'ok' as const,
+            items: [{ productId: 'WIDGET' } as any],
+        }];
+        const bom = [{
+            vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'critical' as const,
+            items: [{ productId: 'PERLITE' } as any],
+        }];
+        mergeIntoGroups(resale, bom);
+        expect(resale[0].items).toHaveLength(1);
+        expect(resale[0].urgency).toBe('ok');
+        expect(bom[0].items).toHaveLength(1);
+    });
+
+    it('merges multiple BOM groups feeding the same vendor', () => {
+        const merged = mergeIntoGroups(
+            [],
+            [
+                { vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'warning' as const, items: [{ productId: 'A' } as any] },
+                { vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'critical' as const, items: [{ productId: 'B' } as any] },
+            ],
+        );
+        expect(merged).toHaveLength(1);
+        expect(merged[0].items).toHaveLength(2);
+        expect(merged[0].urgency).toBe('critical');
     });
 });

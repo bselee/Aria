@@ -4,7 +4,11 @@
 
 **Goal:** Add demand-driven BOM component purchasing to the existing purchasing panel — items tagged by type, filterable by mode, with build-batch context for BOM materials.
 
-**Architecture:** New `getBOMDemand()` function in `client.ts` computes component burn rates from FG shipment velocity × BOM explosion. API route merges BOM items with existing resale items. UI adds a mode toggle and enriches BOM rows with "feeds" context.
+**Architecture:**
+- **Pure functions** (`computeComponentBurnRates`, `classifyUrgency`, `mergeIntoGroups`) live in `src/lib/finale/bom-demand.ts` with their own tests — no Finale dependency, no module cache.
+- **Async pipeline** is a public method `FinaleClient.getBOMDemand()` on `client.ts` (alongside `getPurchasingIntelligence`) so it shares auth/state legitimately. It calls the public methods `client.getBillOfMaterials(sku)` and `client.getProductActivity(sku, daysBack)` (the latter promoted from private in Task 1) plus `leadTimeService.getForVendor()` for lead times.
+- **Route** (`/api/dashboard/purchasing`) holds the BOM cache the same way it holds the resale cache, accepts `?mode=all|resale|bom` and `?summary=bom`, and merges via `mergeIntoGroups`.
+- **UI** adds a mode toggle and BOM-only "feeds" context line.
 
 **Tech Stack:** TypeScript, Next.js API routes, React (PurchasingPanel), Finale REST + GraphQL APIs, vitest for tests.
 
@@ -14,29 +18,32 @@
 
 | Action | File | Responsibility |
 |--------|------|----------------|
-| Create | `src/lib/finale/bom-demand.ts` | `getBOMDemand()` pipeline — FG velocity, BOM explosion, component stock/runway, vendor grouping |
-| Create | `src/lib/finale/bom-demand.test.ts` | Unit tests for burn rate math, urgency classification, vendor merging |
-| Modify | `src/lib/finale/client.ts:119-185` | Extend `PurchasingItem` and `PurchasingGroup` with `itemType` + `feedsFinishedGoods` fields |
-| Modify | `src/app/api/dashboard/purchasing/route.ts` | Add `?mode=` param, run BOM pipeline, merge vendor groups |
-| Modify | `src/components/dashboard/PurchasingPanel.tsx` | Mode selector toggle, BOM badge, "feeds" expandable row |
+| Modify | `src/lib/finale/client.ts` | Extend `PurchasingItem` with `itemType` + `feedsFinishedGoods`; promote `getProductActivity` to `public`; export shared `EXCLUDED_VENDOR_PATTERN`; add `FinaleClient.getBOMDemand()` method |
+| Create | `src/lib/finale/bom-demand.ts` | Pure functions only: `computeComponentBurnRates`, `classifyUrgency`, `mergeIntoGroups` + types |
+| Create | `src/lib/finale/bom-demand.test.ts` | Unit tests for the three pure functions |
+| Modify | `src/app/api/dashboard/purchasing/route.ts` | Add `?mode=` + `?summary=bom` params, hold BOM cache, merge groups |
+| Modify | `src/components/dashboard/PurchasingPanel.tsx` | Mode selector toggle, BOM badge, "feeds" line |
 | Create | `src/components/dashboard/ComponentDemandCard.tsx` | Read-only build-screen summary card (top N components by urgency) |
 | Modify | `src/components/dashboard/BuildSchedulePanel.tsx` | Slot `ComponentDemandCard` into panel |
 
 ---
 
-### Task 1: Extend PurchasingItem Interface
+### Task 1: Extend PurchasingItem + expose internals BOM pipeline needs
 
 **Files:**
-- Modify: `src/lib/finale/client.ts:119-185`
+- Modify: `src/lib/finale/client.ts`
 
-- [ ] **Step 1: Add `itemType` and `feedsFinishedGoods` to PurchasingItem**
+This task makes the small, isolated `client.ts` changes the rest of the plan depends on: new optional fields on `PurchasingItem`, promoting `getProductActivity` to public, and extracting the dropship/excluded-vendor regex to a shared module-level const so both pipelines reference the same source of truth.
 
-In `src/lib/finale/client.ts`, add these fields to the `PurchasingItem` interface (after the `recommendation` field, around line 177):
+- [ ] **Step 1: Add `itemType`, `feedsFinishedGoods`, `totalBurnRate` to `PurchasingItem`**
+
+Find the `PurchasingItem` interface in `src/lib/finale/client.ts` (grep anchor: `^export interface PurchasingItem`). Add these fields at the end of the interface, just before the closing `}`:
 
 ```typescript
     /** v3 — BOM demand engine: classifies item as resale or BOM component */
     itemType?: 'resale' | 'bom-component';
-    /** v3 — which finished goods consume this component, with demand context */
+    /** v3 — which finished goods consume this component, with demand context.
+     *  buildsWorth is approximate (uses dailySalesRate*30 as batch proxy in v1). */
     feedsFinishedGoods?: Array<{
         sku: string;
         name: string;
@@ -47,23 +54,53 @@ In `src/lib/finale/client.ts`, add these fields to the `PurchasingItem` interfac
     totalBurnRate?: number;
 ```
 
-- [ ] **Step 2: Verify typecheck passes**
+- [ ] **Step 2: Promote `getProductActivity` to public**
 
-Run: `npx tsc --noEmit -p tsconfig.cli.json 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator" | head -20`
-Expected: No new errors (existing items don't require the new optional fields).
+Find the method declaration (grep anchor: `private async getProductActivity`). Remove the `private` keyword:
 
-- [ ] **Step 3: Commit**
+```typescript
+async getProductActivity(sku: string, daysBack: number): Promise<{
+```
+
+CLAUDE.md already documents `getProductActivity` as effectively public (combined-query pattern shared with `findCommittedPOsForProduct`). The BOM pipeline reuses it for FG sales velocity.
+
+- [ ] **Step 3: Extract excluded-vendor regex to a shared module-level const**
+
+Currently the dropship/manufactured exclusion regex is duplicated inside the closure-scoped `resolveParty` helpers (around line 4193 and 4839 — search anchor: `autopot|printful|grand`). Add a module-level export near the other top-of-file constants (search anchor: `URGENCY_RANK` or `_partyCacheShared`):
+
+```typescript
+/** Vendors we never order from on the purchasing dashboard:
+ *  internal manufacturing depts + dropship vendors handled outside the PO flow.
+ *  Shared by getPurchasingIntelligence and getBOMDemand so the two pipelines stay aligned. */
+export const EXCLUDED_VENDOR_PATTERN =
+    /buildasoil|manufacturing|soil dept|bas soil|autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
+```
+
+Then update the two closure-scoped uses to call `EXCLUDED_VENDOR_PATTERN.test(groupName)` instead of inline regex literals (preserve their existing isManufactured/isDropship split — those stay separate booleans; this constant is just the *combined* gate). Concretely: in each `resolveParty` closure, the existing `isManufactured = ...test(groupName)` and `isDropship = ...test(groupName)` lines are unchanged. Only the BOM pipeline (Task 3) will use the combined `EXCLUDED_VENDOR_PATTERN` directly. **No behavior change in this step** — just exporting the combined pattern.
+
+- [ ] **Step 4: Verify typecheck passes**
+
+```bash
+npm run typecheck:cli 2>&1 | grep "error TS" | grep -v "finale/client.ts\|folder-watcher\|validator" | head -20
+```
+Expected: no output.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/lib/finale/client.ts
-git commit -m "feat(purchasing): extend PurchasingItem with itemType + feedsFinishedGoods fields
+git commit -m "feat(purchasing): extend PurchasingItem + expose BOM-pipeline internals
+
+- Add itemType/feedsFinishedGoods/totalBurnRate optional fields
+- Promote getProductActivity to public (shared with BOM pipeline)
+- Export EXCLUDED_VENDOR_PATTERN — single source for dropship/mfg exclusion
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 2: Implement `getBOMDemand()` Core Pipeline
+### Task 2: Pure compute functions in bom-demand.ts
 
 **Files:**
 - Create: `src/lib/finale/bom-demand.ts`
@@ -285,279 +322,255 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Implement `getBOMDemand()` Finale Integration
+### Task 3: Add `FinaleClient.getBOMDemand()` method
 
 **Files:**
-- Modify: `src/lib/finale/bom-demand.ts`
+- Modify: `src/lib/finale/client.ts`
 
-This task adds the async function that calls Finale APIs (FG shipments, BOM fetch, stock lookup, vendor resolution) and assembles `PurchasingGroup[]` with `itemType: 'bom-component'`.
+This task adds the async pipeline as a public method on `FinaleClient`, alongside the existing `getPurchasingIntelligence()`. Living on the class means it has direct access to `this.apiBase / this.accountPath / this.authHeader / this.get(...)` — no `as any` casts. It calls the public methods promoted in Task 1 and the pure functions written in Task 2.
 
-- [ ] **Step 1: Add `getBOMDemand()` async function**
+- [ ] **Step 1: Add the method**
 
-Append to `src/lib/finale/bom-demand.ts`:
+Find a good insertion point near `getPurchasingIntelligence` (grep anchor: `async getPurchasingIntelligence`). Add this method on `FinaleClient`:
 
 ```typescript
-import { FinaleClient } from './client';
-import type { LeadTimeService } from '@/lib/builds/lead-time-service';
+    /**
+     * Demand-driven BOM component purchasing pipeline.
+     *
+     * 1. Page active SKUs (productViewConnection)
+     * 2. For each active SKU: getBillOfMaterials → if non-empty, treat as FG candidate
+     * 3. For FG candidates with sales in window: collect (sku, name, dailySalesRate, bom)
+     * 4. Explode burn rates per component (computeComponentBurnRates)
+     * 5. For each component: REST product GET → stock, supplier; resolve vendor;
+     *    leadTimeService.getForVendor(); classify urgency
+     * 6. Group by vendor, sort worst-first
+     *
+     * Returns PurchasingGroup[] where every item has itemType='bom-component'.
+     * Caching is the route's responsibility (same pattern as getPurchasingIntelligence).
+     *
+     * v1 simplification: pages all Active products and BOM-checks each one. Most
+     * Active SKUs have no BOM, so this wastes ~1 product GET per non-FG SKU. The
+     * 30-min route cache absorbs the cost. v2 should narrow the candidate set
+     * via a productAssocList GraphQL filter or a sales-velocity prefilter.
+     */
+    async getBOMDemand(daysBack = 90): Promise<PurchasingGroup[]> {
+        const { computeComponentBurnRates, classifyUrgency, type FGVelocity } =
+            await import('./bom-demand');
 
-// ── Module-level BOM demand cache ──────────────────────────────────────────
-let _bomCache: PurchasingGroup[] | null = null;
-let _bomCacheAt = 0;
-const BOM_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+        // ── Step 1: Page Active SKUs ──
+        const PAGE_SIZE = 500;
+        let cursor: string | null = null;
+        const activeSkus: string[] = [];
 
-export function clearBOMCache() {
-    _bomCache = null;
-    _bomCacheAt = 0;
-}
-
-export function getBOMCacheAge(): number {
-    return _bomCacheAt ? Date.now() - _bomCacheAt : Infinity;
-}
-
-/**
- * Demand-driven BOM component purchasing pipeline.
- *
- * 1. Find manufactured FGs with recent sales velocity
- * 2. Explode their BOMs to leaf components
- * 3. Compute per-component burn rate and runway
- * 4. Resolve vendors, classify urgency, group
- *
- * Returns PurchasingGroup[] where every item has itemType='bom-component'.
- */
-export async function getBOMDemand(
-    daysBack = 90,
-    options?: { bust?: boolean }
-): Promise<PurchasingGroup[]> {
-    if (!options?.bust && _bomCache && Date.now() - _bomCacheAt < BOM_CACHE_TTL) {
-        return _bomCache;
-    }
-
-    const client = new FinaleClient();
-    const accountPath = (client as any).accountPath as string;
-    const apiBase = (client as any).apiBase as string;
-    const authHeader = (client as any).authHeader as string;
-
-    // ── Step 1: Find manufactured FGs with sales in the window ──
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - daysBack);
-    const beginDate = cutoff.toLocaleDateString('en-CA'); // YYYY-MM-DD
-    const endDate = new Date().toLocaleDateString('en-CA');
-
-    // Page all active products, collect those with isManufactured = true
-    const PAGE_SIZE = 500;
-    let cursor: string | null = null;
-    const manufacturedSkus: string[] = [];
-
-    while (true) {
-        const afterClause = cursor ? `, after: "${cursor}"` : '';
-        const query = {
-            query: `{
-                productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
-                    pageInfo { hasNextPage endCursor }
-                    edges { node { productId status } }
-                }
-            }`
-        };
-        const res = await fetch(`${apiBase}/${accountPath}/api/graphql`, {
-            method: 'POST',
-            headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-            body: JSON.stringify(query),
-        });
-        const json: any = await res.json();
-        const conn = json.data?.productViewConnection;
-        if (!conn) break;
-
-        for (const edge of conn.edges || []) {
-            if (edge.node.status === 'Active') {
-                manufacturedSkus.push(edge.node.productId);
-            }
-        }
-        if (!conn.pageInfo.hasNextPage) break;
-        cursor = conn.pageInfo.endCursor;
-    }
-
-    // Filter to manufactured products (have BOM) — 3 concurrent workers
-    const fgVelocities: FGVelocity[] = [];
-    const skuQueue = [...manufacturedSkus];
-    const bomCache = new Map<string, Array<{ componentSku: string; quantity: number }>>();
-
-    await Promise.all(Array.from({ length: 3 }, async () => {
-        while (skuQueue.length > 0) {
-            const sku = skuQueue.shift()!;
-            try {
-                const bom = await client.getBillOfMaterials(sku);
-                if (bom.length === 0) continue; // Not manufactured — no BOM
-
-                bomCache.set(sku, bom);
-
-                // Get FG shipment velocity (sales orders completed in window)
-                const activity = await (client as any).getProductActivity(sku, daysBack);
-                const dailySalesRate = activity.soldQty / daysBack;
-                if (dailySalesRate <= 0) continue; // No sales = no demand signal
-
-                const prodData = await (client as any).get(`/${accountPath}/api/product/${encodeURIComponent(sku)}`);
-                const name: string = prodData.internalName || prodData.productId || sku;
-
-                fgVelocities.push({ sku, name, dailySalesRate, bom });
-            } catch (err: any) {
-                console.error(`[bom-demand] Error processing FG ${sku}:`, err.message);
-            }
-            await new Promise(r => setTimeout(r, 100)); // Rate limit
-        }
-    }));
-
-    if (fgVelocities.length === 0) {
-        _bomCache = [];
-        _bomCacheAt = Date.now();
-        return [];
-    }
-
-    // ── Step 2: Compute component burn rates ──
-    const componentDemands = computeComponentBurnRates(fgVelocities);
-
-    // ── Step 3: For each component, get stock + vendor + lead time ──
-    const items: PurchasingItem[] = [];
-    const componentQueue = Array.from(componentDemands.entries());
-
-    await Promise.all(Array.from({ length: 3 }, async () => {
-        while (componentQueue.length > 0) {
-            const [compSku, demand] = componentQueue.shift()!;
-            try {
-                const prodData = await (client as any).get(`/${accountPath}/api/product/${encodeURIComponent(compSku)}`);
-                const suppliers: any[] = prodData.supplierList || [];
-                const mainSupplier = suppliers.find((s: any) => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
-                if (!mainSupplier?.supplierPartyUrl) continue;
-
-                // Resolve vendor (uses shared cache)
-                const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
-                let groupName = 'Unknown';
-                try {
-                    const partyRes = await fetch(`${apiBase}/${accountPath}/api/partygroup/${partyId}`, {
-                        headers: { Authorization: authHeader, Accept: 'application/json' },
-                    });
-                    const partyData = await partyRes.json();
-                    groupName = partyData.groupName || partyData.name || 'Unknown';
-                } catch { /* use Unknown */ }
-
-                // Skip if this component's vendor is also manufactured/dropship
-                if (/buildasoil|manufacturing|soil dept|bas soil/i.test(groupName)) continue;
-                if (/autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName)) continue;
-
-                const stockOnHand: number = parseFloat(prodData.quantityOnHand ?? prodData.stockLevel ?? '0') || 0;
-                const leadTimeDays = parseInt(String(prodData.leadTime ?? ''), 10) || 14;
-                const runwayDays = demand.totalBurnRate > 0 ? stockOnHand / demand.totalBurnRate : 9999;
-                const urgency = classifyUrgency(runwayDays, leadTimeDays);
-
-                // Compute buildsWorth per FG (use median batch = dailySalesRate * 30 as proxy)
-                const feedsFinishedGoods = demand.feedsFinishedGoods.map(fg => {
-                    const batchSize = fg.dailySalesRate * 30; // 30 days of sales as typical build
-                    const buildsWorth = batchSize > 0 && fg.qtyPerUnit > 0
-                        ? stockOnHand / (fg.qtyPerUnit * batchSize)
-                        : 0;
-                    return {
-                        sku: fg.sku,
-                        name: fg.name,
-                        dailySalesRate: fg.dailySalesRate,
-                        buildsWorth: Math.round(buildsWorth * 10) / 10,
-                    };
-                });
-
-                // Suggested qty: cover 60 days of burn
-                const coverDays = 60;
-                const suggestedQty = Math.max(0, Math.ceil(demand.totalBurnRate * coverDays - stockOnHand));
-
-                items.push({
-                    productId: compSku,
-                    productName: prodData.internalName || compSku,
-                    supplierName: groupName,
-                    supplierPartyId: partyId,
-                    unitPrice: mainSupplier.price ?? 0,
-                    stockOnHand,
-                    stockOnOrder: 0, // TODO: could fetch open POs for components
-                    purchaseVelocity: 0,
-                    salesVelocity: 0,
-                    demandVelocity: demand.totalBurnRate,
-                    dailyRate: demand.totalBurnRate,
-                    dailyRateSource: 'demand',
-                    runwayDays: Math.round(runwayDays * 10) / 10,
-                    adjustedRunwayDays: Math.round(runwayDays * 10) / 10,
-                    leadTimeDays,
-                    leadTimeProvenance: parseInt(String(prodData.leadTime ?? ''), 10) > 0
-                        ? `${prodData.leadTime}d (Finale)` : '14d default',
-                    openPOs: [],
-                    urgency,
-                    explanation: `BOM component — burns ${demand.totalBurnRate.toFixed(1)}/day across ${demand.feedsFinishedGoods.length} FGs. ${Math.round(runwayDays)}d runway.`,
-                    suggestedQty,
-                    orderIncrementQty: prodData.orderIncrementQuantity ?? null,
-                    isBulkDelivery: true, // BOM materials go to production facility
-                    finaleReorderQty: null,
-                    finaleStockoutDays: null,
-                    finaleConsumptionQty: null,
-                    finaleDemandQty: null,
-                    itemType: 'bom-component',
-                    feedsFinishedGoods,
-                    totalBurnRate: demand.totalBurnRate,
-                });
-            } catch (err: any) {
-                console.error(`[bom-demand] Error resolving component ${compSku}:`, err.message);
-            }
-            await new Promise(r => setTimeout(r, 100));
-        }
-    }));
-
-    // ── Step 4: Group by vendor ──
-    const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
-    const vendorMap = new Map<string, PurchasingGroup>();
-
-    for (const item of items) {
-        const existing = vendorMap.get(item.supplierPartyId);
-        if (existing) {
-            existing.items.push(item);
-            if (urgencyRank[item.urgency] < urgencyRank[existing.urgency]) {
-                existing.urgency = item.urgency;
-            }
-        } else {
-            vendorMap.set(item.supplierPartyId, {
-                vendorName: item.supplierName,
-                vendorPartyId: item.supplierPartyId,
-                urgency: item.urgency,
-                items: [item],
+        while (true) {
+            const afterClause = cursor ? `, after: "${cursor}"` : '';
+            const body = {
+                query: `{
+                    productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        edges { node { productId status } }
+                    }
+                }`
+            };
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
             });
+            const json: any = await res.json();
+            const conn = json.data?.productViewConnection;
+            if (!conn) break;
+            for (const edge of conn.edges || []) {
+                if (edge.node.status === 'Active') activeSkus.push(edge.node.productId);
+            }
+            if (!conn.pageInfo.hasNextPage) break;
+            cursor = conn.pageInfo.endCursor;
         }
+
+        // ── Step 2-3: Find FG candidates (have BOM + have sales) ──
+        const fgVelocities: FGVelocity[] = [];
+        const skuQueue = [...activeSkus];
+
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (skuQueue.length > 0) {
+                const sku = skuQueue.shift()!;
+                try {
+                    const bom = await this.getBillOfMaterials(sku);
+                    if (bom.length === 0) continue; // not an FG
+
+                    const activity = await this.getProductActivity(sku, daysBack);
+                    const dailySalesRate = activity.soldQty / daysBack;
+                    if (dailySalesRate <= 0) continue; // no demand signal
+
+                    const prodData = await this.get(
+                        `/${this.accountPath}/api/product/${encodeURIComponent(sku)}`
+                    );
+                    const name: string = prodData.internalName || prodData.productId || sku;
+                    fgVelocities.push({ sku, name, dailySalesRate, bom });
+                } catch (err: any) {
+                    console.error(`[bom-demand] FG ${sku} failed:`, err.message);
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        if (fgVelocities.length === 0) return [];
+
+        // ── Step 4: Burn rates ──
+        const componentDemands = computeComponentBurnRates(fgVelocities);
+
+        // ── Step 5: Resolve each component (stock, vendor, lead time, urgency) ──
+        const { leadTimeService } = await import('@/lib/builds/lead-time-service');
+        const items: PurchasingItem[] = [];
+        const componentQueue = Array.from(componentDemands.entries());
+
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (componentQueue.length > 0) {
+                const [compSku, demand] = componentQueue.shift()!;
+                try {
+                    const prodData = await this.get(
+                        `/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`
+                    );
+                    const suppliers: any[] = prodData.supplierList || [];
+                    const mainSupplier = suppliers.find((s: any) =>
+                        s.supplierPrefOrderId?.includes('MAIN')
+                    ) || suppliers[0];
+                    if (!mainSupplier?.supplierPartyUrl) continue;
+
+                    const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
+                    let groupName = 'Unknown';
+                    try {
+                        const partyRes = await fetch(
+                            `${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`,
+                            { headers: { Authorization: this.authHeader, Accept: 'application/json' } }
+                        );
+                        const partyData = await partyRes.json();
+                        groupName = partyData.groupName || partyData.name || 'Unknown';
+                    } catch { /* keep Unknown */ }
+
+                    if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
+
+                    const stockOnHand: number =
+                        parseFloat(prodData.quantityOnHand ?? prodData.stockLevel ?? '0') || 0;
+
+                    const lt = await leadTimeService.getForVendor(groupName, compSku);
+                    const leadTimeDays = lt.days;
+                    const leadTimeProvenance = lt.label;
+
+                    const runwayDays = demand.totalBurnRate > 0
+                        ? stockOnHand / demand.totalBurnRate
+                        : 9999;
+                    const urgency = classifyUrgency(runwayDays, leadTimeDays);
+
+                    // buildsWorth approximation: batch ≈ dailySalesRate*30. Phase 2 derives
+                    // real batch sizes from production receipt history.
+                    const feedsFinishedGoods = demand.feedsFinishedGoods.map(fg => {
+                        const batchSize = fg.dailySalesRate * 30;
+                        const buildsWorth = batchSize > 0 && fg.qtyPerUnit > 0
+                            ? stockOnHand / (fg.qtyPerUnit * batchSize)
+                            : 0;
+                        return {
+                            sku: fg.sku,
+                            name: fg.name,
+                            dailySalesRate: fg.dailySalesRate,
+                            buildsWorth: Math.round(buildsWorth * 10) / 10,
+                        };
+                    });
+
+                    const coverDays = 60;
+                    const suggestedQty = Math.max(
+                        0,
+                        Math.ceil(demand.totalBurnRate * coverDays - stockOnHand)
+                    );
+
+                    items.push({
+                        productId: compSku,
+                        productName: prodData.internalName || compSku,
+                        supplierName: groupName,
+                        supplierPartyId: partyId,
+                        unitPrice: mainSupplier.unitPrice ?? mainSupplier.price ?? 0,
+                        stockOnHand,
+                        stockOnOrder: 0, // v2: fetch open POs for components
+                        purchaseVelocity: 0,
+                        salesVelocity: 0,
+                        demandVelocity: demand.totalBurnRate,
+                        dailyRate: demand.totalBurnRate,
+                        dailyRateSource: 'demand',
+                        runwayDays: Math.round(runwayDays * 10) / 10,
+                        adjustedRunwayDays: Math.round(runwayDays * 10) / 10,
+                        leadTimeDays,
+                        leadTimeProvenance,
+                        openPOs: [],
+                        urgency,
+                        explanation:
+                            `BOM component — burns ${demand.totalBurnRate.toFixed(1)}/day across ` +
+                            `${demand.feedsFinishedGoods.length} FGs. ${Math.round(runwayDays)}d runway.`,
+                        suggestedQty,
+                        orderIncrementQty: prodData.orderIncrementQuantity ?? null,
+                        isBulkDelivery: true, // BOM materials route to production facility
+                        finaleReorderQty: null,
+                        finaleStockoutDays: null,
+                        finaleConsumptionQty: null,
+                        finaleDemandQty: null,
+                        itemType: 'bom-component',
+                        feedsFinishedGoods,
+                        totalBurnRate: demand.totalBurnRate,
+                    });
+                } catch (err: any) {
+                    console.error(`[bom-demand] component ${compSku} failed:`, err.message);
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        // ── Step 6: Group by vendor, worst-urgency-first ──
+        const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
+        const vendorMap = new Map<string, PurchasingGroup>();
+        for (const item of items) {
+            const existing = vendorMap.get(item.supplierPartyId);
+            if (existing) {
+                existing.items.push(item);
+                if (urgencyRank[item.urgency] < urgencyRank[existing.urgency]) {
+                    existing.urgency = item.urgency;
+                }
+            } else {
+                vendorMap.set(item.supplierPartyId, {
+                    vendorName: item.supplierName,
+                    vendorPartyId: item.supplierPartyId,
+                    urgency: item.urgency,
+                    items: [item],
+                });
+            }
+        }
+        return Array.from(vendorMap.values()).sort((a, b) => {
+            const ud = urgencyRank[a.urgency] - urgencyRank[b.urgency];
+            return ud !== 0 ? ud : a.vendorName.localeCompare(b.vendorName);
+        });
     }
-
-    const groups = Array.from(vendorMap.values()).sort((a, b) => {
-        const ud = urgencyRank[a.urgency] - urgencyRank[b.urgency];
-        return ud !== 0 ? ud : a.vendorName.localeCompare(b.vendorName);
-    });
-
-    _bomCache = groups;
-    _bomCacheAt = Date.now();
-    return groups;
-}
 ```
 
-- [ ] **Step 2: Update imports at top of file**
+Key differences from a naïve port:
+- No `(client as any)` — uses `this.apiBase / this.accountPath / this.authHeader / this.get / this.getBillOfMaterials / this.getProductActivity` directly.
+- Lead time comes from `leadTimeService.getForVendor()` — same source as resale path.
+- Vendor exclusion uses the shared `EXCLUDED_VENDOR_PATTERN` exported in Task 1 (no inline regex).
+- No module cache — that's the route's job.
 
-Ensure the import from `./client` at the top includes all needed types:
-
-```typescript
-import { FinaleClient, PurchasingGroup, PurchasingItem } from './client';
-```
-
-- [ ] **Step 3: Run typecheck**
-
-Run: `npx tsc --noEmit -p tsconfig.cli.json 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator" | head -20`
-Expected: No errors.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 2: Verify typecheck**
 
 ```bash
-git add src/lib/finale/bom-demand.ts
-git commit -m "feat(purchasing): getBOMDemand() — full Finale integration pipeline
+npm run typecheck:cli 2>&1 | grep "error TS" | grep -v "finale/client.ts\|folder-watcher\|validator" | head -20
+```
+Expected: no output.
 
-Fetches manufactured FG sales velocity, explodes BOMs, computes
-component burn rates, resolves vendors, classifies urgency.
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/lib/finale/client.ts
+git commit -m "feat(purchasing): FinaleClient.getBOMDemand() — async pipeline
+
+Lives on FinaleClient alongside getPurchasingIntelligence so it shares
+auth/state. Pages Active SKUs, BOM-checks each, explodes burn rates,
+resolves vendor + lead time per component, groups by vendor.
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
@@ -571,21 +584,26 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Add BOM cache + mode param handling**
 
+> **assessPurchasingGroups compatibility note**: `shouldSuppressAsNonMoving` checks `salesVelocity || demandVelocity || purchaseVelocity || finaleConsumptionQty || finaleDemandQty || finaleReorderQty || openPOs.length || urgency==critical/warning`. BOM items have `demandVelocity = totalBurnRate > 0`, so they pass the suppression filter unchanged. No assessment-service change is required.
+
 Replace the full content of `src/app/api/dashboard/purchasing/route.ts`:
 
 ```typescript
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
-import { getBOMDemand, clearBOMCache, mergeIntoGroups, getBOMCacheAge } from '@/lib/finale/bom-demand';
+import { mergeIntoGroups } from '@/lib/finale/bom-demand';
 
-// Module-level cache — full scan takes several minutes and makes hundreds of API calls.
+// Module-level caches — full scans take minutes and make hundreds of API calls.
 let cache: PurchasingGroup[] | null = null;
 let cacheAt = 0;
+let bomCache: PurchasingGroup[] | null = null;
+let bomCacheAt = 0;
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 
-// Scan-in-progress lock: concurrent requests de-duplicate to the same promise.
+// Scan-in-progress locks: concurrent requests de-duplicate to the same promise.
 let cachePromise: Promise<PurchasingGroup[]> | null = null;
+let bomCachePromise: Promise<PurchasingGroup[]> | null = null;
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
@@ -599,6 +617,8 @@ export async function GET(req: NextRequest) {
     const summary = req.nextUrl.searchParams.get('summary');
     const summaryLimit = parseInt(req.nextUrl.searchParams.get('limit') ?? '10') || 10;
 
+    const client = new FinaleClient();
+
     // ── Resale pipeline (existing) ──
     let resaleGroups: PurchasingGroup[] = [];
     if (mode === 'all' || mode === 'resale') {
@@ -607,7 +627,6 @@ export async function GET(req: NextRequest) {
             if (!cachePromise) {
                 cachePromise = (async () => {
                     try {
-                        const client = new FinaleClient();
                         cache = await client.getPurchasingIntelligence(daysBack);
                         cacheAt = Date.now();
                         return cache;
@@ -637,13 +656,41 @@ export async function GET(req: NextRequest) {
 
     // ── BOM pipeline ──
     let bomGroups: PurchasingGroup[] = [];
-    if (mode === 'all' || mode === 'bom') {
-        try {
-            bomGroups = await getBOMDemand(bomDaysBack, { bust });
-        } catch (err: any) {
-            console.error('[purchasing/route] BOM demand error:', err.message);
-            // Non-fatal: return resale data even if BOM fails
+    if (mode === 'all' || mode === 'bom' || summary === 'bom') {
+        const needsBomScan = bust || !bomCache || Date.now() - bomCacheAt > CACHE_TTL;
+        if (needsBomScan) {
+            if (!bomCachePromise) {
+                bomCachePromise = (async () => {
+                    try {
+                        bomCache = await client.getBOMDemand(bomDaysBack);
+                        bomCacheAt = Date.now();
+                        return bomCache;
+                    } catch (err: any) {
+                        console.error('[purchasing/route] BOM demand error:', err.message);
+                        bomCache = []; // non-fatal — empty BOM but resale still works
+                        bomCacheAt = Date.now();
+                        return bomCache;
+                    } finally {
+                        bomCachePromise = null;
+                    }
+                })();
+            }
+            try {
+                await bomCachePromise;
+            } catch { /* swallowed above */ }
         }
+        bomGroups = bomCache || [];
+    }
+
+    // ── Summary mode (for build screen card) ──
+    if (summary === 'bom') {
+        const allBomItems = bomGroups.flatMap(g => g.items)
+            .sort((a, b) => a.runwayDays - b.runwayDays)
+            .slice(0, summaryLimit);
+        return NextResponse.json(
+            { items: allBomItems, cachedAt: new Date(bomCacheAt || Date.now()).toISOString() },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
     }
 
     // ── Merge & filter ──
@@ -659,18 +706,6 @@ export async function GET(req: NextRequest) {
     if (urgency) {
         const allowed = urgency.split(',') as Array<'critical' | 'warning' | 'watch' | 'ok'>;
         groups = groups.filter(g => allowed.includes(g.urgency));
-    }
-
-    // ── Summary mode (for build screen card) ──
-    if (summary === 'bom') {
-        const allBomItems = bomGroups.flatMap(g => g.items)
-            .sort((a, b) => a.runwayDays - b.runwayDays)
-            .slice(0, summaryLimit);
-        const bomAge = getBOMCacheAge();
-        return NextResponse.json(
-            { items: allBomItems, cachedAt: new Date(Date.now() - bomAge).toISOString() },
-            { headers: { 'Cache-Control': 'no-store' } }
-        );
     }
 
     const assessment = assessPurchasingGroups(groups);
@@ -712,14 +747,13 @@ export async function POST(req: NextRequest) {
 
         // Invalidate both caches so next GET reflects the new PO
         cache = null;
-        clearBOMCache();
+        bomCache = null;
 
         return NextResponse.json(result);
     } catch (err: any) {
         return NextResponse.json({ error: err.message }, { status: 500 });
     }
 }
-
 ```
 
 - [ ] **Step 2: Verify typecheck**
@@ -756,9 +790,11 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 **Files:**
 - Modify: `src/components/dashboard/PurchasingPanel.tsx`
 
+> **Anchor strategy:** the panel is ~1700 lines and shifts often. Don't rely on the line numbers below — use the grep anchors. PurchasingPanel.tsx is large enough that a wrong insertion point will produce silent UI bugs.
+
 - [ ] **Step 1: Add itemMode state and type**
 
-Near the top of the component (after existing state declarations around line 216), add:
+Find the other panel-state declarations (grep anchor: `const [focusFilter, setFocusFilter] = useState`). Add nearby:
 
 ```typescript
 type ItemMode = 'all' | 'resale' | 'bom';
@@ -767,7 +803,7 @@ const [itemMode, setItemMode] = useState<ItemMode>('all');
 
 - [ ] **Step 2: Update the `load` function to pass mode**
 
-Find the existing `load` function (fetches from `/api/dashboard/purchasing`). Update the URL to include the mode param:
+Find the `load` function inside the component (it builds a URL like `/api/dashboard/purchasing?...`). Update the URL to include the mode param:
 
 ```typescript
 const url = `/api/dashboard/purchasing?${bust ? 'bust=1&' : ''}mode=${itemMode}`;
@@ -777,7 +813,7 @@ Also add `itemMode` to the dependency array of the `useEffect` that triggers `lo
 
 - [ ] **Step 3: Add mode selector UI before the lifecycle tabs**
 
-Insert a new filter row just above the lifecycle tabs section (around line 1019). Add between the ordering focus buttons and the lifecycle tabs:
+Find the lifecycle-tabs render block (grep anchor: `Lifecycle bucket counts` or the `URGENCY[g.urgency]` mapping inside the focusGroups render). Insert a new filter row just above the lifecycle tabs and just below the ordering focus buttons (the focus buttons render at grep anchor: `focusFilter === b.k`):
 
 ```typescript
 {/* ── Item type mode: All / Resale / BOM Materials ── */}
@@ -802,7 +838,7 @@ Insert a new filter row just above the lifecycle tabs section (around line 1019)
 
 - [ ] **Step 4: Add BOM badge to item rows**
 
-In the item row rendering section, add a badge next to the SKU name when `item.itemType === 'bom-component'`:
+Find the per-item render block — the row that shows the SKU name and urgency tone. Grep anchor: search for `productName` near a `<span>` rendering inside the per-vendor `items.map(...)` loop. Add a badge next to the SKU name when `item.itemType === 'bom-component'`:
 
 ```typescript
 {item.itemType === 'bom-component' && (
@@ -814,13 +850,13 @@ In the item row rendering section, add a badge next to the SKU name when `item.i
 
 - [ ] **Step 5: Add "feeds" line for BOM items**
 
-Below the SKU name/badge, render the feeds context for BOM items:
+Below the SKU name/badge, render the feeds context for BOM items. Note "≈" prefix and "builds covered" wording — the buildsWorth math uses `dailySalesRate*30` as a v1 batch-size proxy, so the value is approximate.
 
 ```typescript
 {item.itemType === 'bom-component' && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0 && (
     <div className="text-[9px] text-zinc-500 font-mono mt-0.5 truncate">
         feeds: {item.feedsFinishedGoods.slice(0, 2).map(fg =>
-            `${fg.name} (${fg.buildsWorth} builds)`
+            `${fg.name} (≈${fg.buildsWorth} builds covered)`
         ).join(' · ')}
         {item.feedsFinishedGoods.length > 2 && ` · +${item.feedsFinishedGoods.length - 2} more`}
     </div>
@@ -959,8 +995,8 @@ export default function ComponentDemandCard() {
                                 {Math.round(item.runwayDays)}d
                             </span>
                             {item.feedsFinishedGoods?.[0] && (
-                                <span className="text-zinc-500 text-[9px] truncate max-w-[100px]">
-                                    {item.feedsFinishedGoods[0].buildsWorth} builds
+                                <span className="text-zinc-500 text-[9px] truncate max-w-[110px]">
+                                    ≈{item.feedsFinishedGoods[0].buildsWorth} builds
                                 </span>
                             )}
                             <span className="text-zinc-600 text-[9px] truncate max-w-[80px]">
@@ -969,7 +1005,10 @@ export default function ComponentDemandCard() {
                         </div>
                     ))}
 
-                    <a href="/dashboard?tab=purchasing&mode=bom"
+                    {/* Dashboard tab/mode aren't query-param driven yet — link to /dashboard
+                        and let Will click the Purchasing tab → BOM Materials button.
+                        TODO(v2): wire up ?tab= and ?mode= for direct navigation. */}
+                    <a href="/dashboard"
                         className="flex items-center gap-1 text-[10px] font-mono text-purple-400 hover:text-purple-300 pt-1 transition-colors"
                     >
                         View all in Purchasing <ArrowRight className="w-2.5 h-2.5" />
@@ -989,19 +1028,20 @@ In `src/components/dashboard/BuildSchedulePanel.tsx`, add the import at the top:
 import ComponentDemandCard from './ComponentDemandCard';
 ```
 
-Then render `<ComponentDemandCard />` just before the `BuildDemandSection` (around line 447):
+Then render `<ComponentDemandCard />` just before the `BuildDemandSection` (grep anchor: `<BuildDemandSection snapshot={snapshot}` — currently line 448, but use the anchor):
 
 ```typescript
 <ComponentDemandCard />
+<BuildDemandSection snapshot={snapshot} />
 ```
 
 - [ ] **Step 3: Verify in browser**
 
 Run `npm run dev`, open the dashboard build schedule panel. Confirm:
 - Component Demand card renders with purple header
-- Shows top components by urgency with runway days
+- Shows top components by urgency with runway days and "≈X builds" approx label
 - Collapses/expands
-- "View all in Purchasing →" link works
+- "View all in Purchasing →" link navigates to `/dashboard` (Will manually clicks the Purchasing tab + BOM Materials)
 - Returns `null` (hidden) when no BOM data available
 
 - [ ] **Step 4: Commit**
@@ -1018,53 +1058,26 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Tag Existing Resale Items
+### Task 7: Integration Test & Verify End-to-End
 
-**Files:**
-- Modify: `src/lib/finale/client.ts` (inside `getPurchasingIntelligence`)
-
-- [ ] **Step 1: Add `itemType: 'resale'` to item construction**
-
-In `getPurchasingIntelligence()`, find where `PurchasingItem` objects are constructed (around line 4980-5080 where all the fields are assembled into the item object). Add `itemType: 'resale' as const` to the item literal:
-
-```typescript
-itemType: 'resale' as const,
-```
-
-This ensures the API always returns a typed item regardless of whether the BOM pipeline runs.
-
-- [ ] **Step 2: Verify typecheck**
-
-Run: `npx tsc --noEmit -p tsconfig.cli.json 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator" | head -20`
-Expected: No new errors.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/lib/finale/client.ts
-git commit -m "feat(purchasing): tag existing items as itemType='resale'
-
-Ensures consistent typing across both pipelines.
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
-```
-
----
-
-### Task 8: Integration Test & Verify End-to-End
+> **Old Task 7 (tagging resale items via getPurchasingIntelligence) was dropped** — Task 4's route already does `item.itemType || 'resale'` on every resale item before serializing, so an explicit tag inside the producer is redundant. If the resale items grow other consumers that need the type, revisit.
 
 **Files:**
 - Create: `src/lib/finale/bom-demand.integration.test.ts` (optional, manual verification)
 
 - [ ] **Step 1: Run full typecheck**
 
-Run: `npm run typecheck:all 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator" | head -20`
-Expected: Clean (no new errors).
+```bash
+npm run typecheck:all 2>&1 | grep "error TS" | grep -v "finale/client.ts\|folder-watcher\|validator" | head -20
+```
+Expected: no output.
 
 - [ ] **Step 2: Run unit tests**
 
-Run: `npx vitest run src/lib/finale/bom-demand.test.ts`
-Expected: All tests pass.
+```bash
+npx vitest run src/lib/finale/bom-demand.test.ts src/components/dashboard/PurchasingPanel.test.tsx
+```
+Expected: all pass. Existing PurchasingPanel tests must still pass — the mode toggle and BOM badge are additive.
 
 - [ ] **Step 3: Manual browser verification**
 
@@ -1073,10 +1086,10 @@ Start `npm run dev` and verify:
 2. Click "BOM Materials" → shows only BOM components with purple badges
 3. Click "Resale" → shows only resale items (no BOM badge)
 4. Click "All" → both types merged, vendors with both show combined
-5. BOM items show "feeds: Light Mix (X builds) · ..." line
-6. Build screen → Component Demand card visible with urgency-sorted items
-7. "View all in Purchasing →" navigates correctly
-8. Creating a Draft PO still works (same flow)
+5. BOM items show `feeds: Light Mix (≈X builds covered) · ...` line
+6. Build screen → Component Demand card visible with urgency-sorted items and `≈X builds` approx label
+7. "View all in Purchasing →" navigates to `/dashboard` (manual click into Purchasing tab is expected — no deep-link in v1)
+8. Creating a Draft PO still works (same flow). Creating a PO invalidates BOTH caches; next refetch shows updated state.
 
 - [ ] **Step 4: Final commit (if any fixes needed)**
 

@@ -18,8 +18,6 @@ export interface ComponentDemand {
         dailySalesRate: number;
         qtyPerUnit: number;
     }>;
-    /** Compute builds-worth given current stock and a specific FG batch size */
-    computeBuildsWorth: (stock: number, batchSize: number) => number;
 }
 
 // ── Pure computation ───────────────────────────────────────────────────────
@@ -54,10 +52,6 @@ export function computeComponentBurnRates(fgVelocities: FGVelocity[]): Map<strin
                         dailySalesRate: fg.dailySalesRate,
                         qtyPerUnit: comp.quantity,
                     }],
-                    computeBuildsWorth: (stock: number, batchSize: number) => {
-                        if (batchSize <= 0 || comp.quantity <= 0) return 0;
-                        return stock / (comp.quantity * batchSize);
-                    },
                 });
             }
         }
@@ -89,18 +83,18 @@ export function mergeIntoGroups(
     const merged = new Map<string, PurchasingGroup>();
 
     for (const g of resaleGroups) {
-        merged.set(g.vendorPartyId, { ...g, items: [...g.items] });
+        merged.set(g.vendorPartyId, { ...g, items: g.items.map(it => ({ ...it })) });
     }
 
     for (const g of bomGroups) {
         const existing = merged.get(g.vendorPartyId);
         if (existing) {
-            existing.items.push(...g.items);
+            existing.items.push(...g.items.map(it => ({ ...it })));
             if (urgencyRank[g.urgency] < urgencyRank[existing.urgency]) {
                 existing.urgency = g.urgency;
             }
         } else {
-            merged.set(g.vendorPartyId, { ...g, items: [...g.items] });
+            merged.set(g.vendorPartyId, { ...g, items: g.items.map(it => ({ ...it })) });
         }
     }
 
