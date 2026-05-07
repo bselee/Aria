@@ -1593,7 +1593,6 @@ export class FinaleClient {
                                     shipmentList {
                                         shipmentId
                                         receiveDate
-                                        quantity
                                     }
                                 }
                             }
@@ -1614,13 +1613,12 @@ export class FinaleClient {
                         (item: any) => item.node.product?.productId === productId
                     );
                     const originalQty = parseFinaleNumber(matchingItem?.node.quantity) || 0;
-                    // Finale schema removed `(first: ...)` arg + edges/node wrapper on
-                    // shipmentList — it now returns the array directly.
-                    const receivedQty = (po.shipmentList || [])
-                        .filter((s: any) => s.receiveDate)
-                        .reduce((sum: number, s: any) => sum + parseFinaleNumber(s.quantity || 0), 0);
-                    const remainingQty = originalQty - receivedQty;
-                    if (remainingQty <= 0) return null;
+                    if (originalQty <= 0) return null;
+                    // Finale's `shipment` GraphQL type has no per-line quantity field.
+                    // POs with all lines received transition to status='Completed' and
+                    // are dropped by the status filter above; remaining Committed/Locked
+                    // POs are reported at original ordered qty (matches getProductActivity).
+                    const remainingQty = originalQty;
                     return {
                         orderId: po.orderId,
                         status: po.status,
