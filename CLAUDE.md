@@ -42,12 +42,16 @@ pm2 monit             # Real-time dashboard
 pm2 save              # Persist process list
 pm2 startup           # Generate OS startup script
 
-# After any code change to the bot:
-npm run typecheck:cli                                         # 0 errors expected — fail loudly if not
-pm2 restart aria-bot
-sleep 5 && pm2 logs aria-bot --lines 200 --nostream | grep "$(date '+%Y-%m-%d %H:')" | grep -Ei "error|failed|unhandled|ECONNREFUSED" | grep -v "info\b"
-# ↑ Smoke check: any output here = boot-time failure (Telegram poll, Pinecone, Supabase, etc).
-#   No output = bot is healthy. `npm run typecheck` uses --max-old-space-size=12288 to avoid OOM.
+# After any code change, use the streamlined ship + smoke commands:
+npm run ship:bot         &&  npm run smoke:bot         # bot   — typecheck:cli + restart
+npm run ship:dashboard   &&  npm run smoke:dashboard   # dash  — typecheck + build + reload
+# `smoke:*` runs scripts/smoke.sh — exits 0 with "smoke[X]: clean" on success, 1 with the
+# offending log lines on failure. Filters informational OpenRouter fallback warnings.
+#
+# IMPORTANT (dashboard): `pm2 restart aria-dashboard` alone does NOT pick up code changes.
+# Next.js runs `next start` against the prebuilt `.next/` dir, so you MUST `npm run build`
+# first. `ship:dashboard` does this for you. `next.config.js` has `ignoreBuildErrors: true`,
+# so the typecheck step in `ship:dashboard` is what surfaces type errors — don't skip it.
 
 # TypeScript — split configs
 npm run typecheck        # Next.js app code only (tsconfig.json)
