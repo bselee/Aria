@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase";
 import { Calendar, AlertTriangle, CheckCircle2, ChevronDown, ShoppingCart, TrendingUp } from "lucide-react";
 import { computeBuildDemandOracle, type BuildDemandOracle, type OracleVendorGroup, type OracleComponent } from "@/lib/builds/build-demand-oracle";
+import ComponentDemandCard from "./ComponentDemandCard";
 
 type Build = {
   sku: string;
@@ -444,6 +445,7 @@ export default function BuildSchedulePanel() {
         </div>
       )}
 
+      <ComponentDemandCard />
       {/* ── Build Demand Oracle: Orders Needed Now ── */}
       <BuildDemandSection snapshot={snapshot} />
 
