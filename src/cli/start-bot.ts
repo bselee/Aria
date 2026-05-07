@@ -1730,11 +1730,16 @@ bot.on('text', async (ctx) => {
     // Only monitor high-frequency "always running" crons. Once-daily crons
     // (DailySummary, BuildRisk, etc.) legitimately go 20+ hours between runs
     // and should NOT trigger stale alerts.
+    // Names match defineJob({ name: ... }) in src/cron/jobs/index.ts (kebab-case).
+    // The cron framework's recordStart() writes cron_runs.task_name as the
+    // job's registered name; previously this list used legacy PascalCase
+    // values that never appeared in cron_runs, causing constant false alerts.
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
-        { name: 'APPolling', maxStaleMin: 25 },
-        { name: 'POSync', maxStaleMin: 45 },
-        { name: 'BuildCompletionWatcher', maxStaleMin: 45 },
-        { name: 'POReceivingWatcher', maxStaleMin: 45 },
+        { name: 'ap-polling', maxStaleMin: 25 },
+        // po-sync was reduced to every 4h via kaizen #4; allow 6h tolerance.
+        { name: 'po-sync', maxStaleMin: 6 * 60 },
+        { name: 'build-completion-watcher', maxStaleMin: 45 },
+        { name: 'po-receiving-watcher', maxStaleMin: 45 },
     ];
     let lastCronWatchdogAlert = 0;
     setInterval(async () => {

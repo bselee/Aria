@@ -75,7 +75,7 @@ describe("buildOpsHealthDecision", () => {
     it("recommends restart when the AP cron and heartbeat are stale", () => {
         const decision = buildOpsHealthDecision(
             makeSnapshot({
-                staleCrons: ["APPolling"],
+                staleCrons: ["ap-polling"],
                 botHeartbeatAgeMinutes: 22,
             }),
         );
@@ -83,7 +83,7 @@ describe("buildOpsHealthDecision", () => {
         expect(decision.degraded).toBe(true);
         expect(decision.shouldAlert).toBe(true);
         expect(decision.shouldRestart).toBe(true);
-        expect(decision.reasons).toContain("stale_cron:APPolling");
+        expect(decision.reasons).toContain("stale_cron:ap-polling");
         expect(decision.reasons).toContain("bot_heartbeat_stale");
     });
 
@@ -103,7 +103,7 @@ describe("buildOpsHealthDecision", () => {
     it("suppresses restart when a recent restart request already exists", () => {
         const decision = buildOpsHealthDecision(
             makeSnapshot({
-                staleCrons: ["APPolling"],
+                staleCrons: ["ap-polling"],
                 botHeartbeatAgeMinutes: 15,
             }),
             { hasRecentRestartRequest: true },
