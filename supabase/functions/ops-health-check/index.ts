@@ -21,12 +21,15 @@ interface OpsHealthDecision {
     reasons: string[];
 }
 
+// Names match defineJob({ name: ... }) in src/cron/jobs/index.ts (kebab-case).
+// These match what the cron framework writes to cron_runs.task_name and what
+// the ops_health_summary view emits in stale_crons.
 const RESTART_WORTHY_STALE_CRONS = new Set([
-    "APPolling",
-    "POSync",
-    "BuildCompletionWatcher",
-    "POReceivingWatcher",
-    "StatIndexing",
+    "ap-polling",
+    "po-sync",
+    "build-completion-watcher",
+    "po-receiving-watcher",
+    "stat-indexing",
 ]);
 
 function json(data: unknown, status = 200) {

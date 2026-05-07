@@ -45,12 +45,15 @@ export interface AgentHeartbeatRecord {
 const DEFAULT_HEARTBEAT_STALE_MINUTES = 10;
 const DEFAULT_AP_BACKLOG_ALERT_MINUTES = 30;
 const DEFAULT_NIGHTSHIFT_BACKLOG_ALERT_MINUTES = 60;
+// Names match defineJob({ name: ... }) in src/cron/jobs/index.ts (kebab-case).
+// These match what the cron framework writes to cron_runs.task_name and what
+// the ops_health_summary view emits in stale_crons.
 const RESTART_WORTHY_STALE_CRONS = new Set([
-    "APPolling",
-    "POSync",
-    "BuildCompletionWatcher",
-    "POReceivingWatcher",
-    "StatIndexing",
+    "ap-polling",
+    "po-sync",
+    "build-completion-watcher",
+    "po-receiving-watcher",
+    "stat-indexing",
 ]);
 
 export function normalizeProjectStatus(status: string | null | undefined): OpsProjectStatus {
