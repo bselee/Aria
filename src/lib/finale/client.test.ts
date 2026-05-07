@@ -438,7 +438,7 @@ describe("FinaleClient receivings pagination", () => {
     });
 });
 
-describe("findCommittedPOsForProduct remainingQty", () => {
+describe("findCommittedPOsForProduct quantityOnOrder", () => {
     beforeEach(() => {
         process.env.FINALE_API_KEY = "key";
         process.env.FINALE_API_SECRET = "secret";
@@ -448,36 +448,12 @@ describe("findCommittedPOsForProduct remainingQty", () => {
         global.fetch = vi.fn();
     });
 
-    it("excludes fully-received POs", async () => {
-        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
-            data: {
-                orderViewConnection: {
-                    edges: [{
-                        node: {
-                            orderId: "PO-FULL",
-                            status: "Committed",
-                            orderDate: "2026-01-15",
-                            total: "500",
-                            supplier: { name: "Test Vendor" },
-                            itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
-                            // 2026-05-06: Finale schema removed (first:..) + edges/node wrapper on
-                            // order.shipmentList — shipmentList is now a direct array.
-                            shipmentList: [
-                                { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "100" },
-                            ],
-                        },
-                    }],
-                },
-            },
-        }) as any);
+    // Finale's `shipment` GraphQL type has no per-line quantity field. POs with
+    // every line received transition to status='Completed' and are dropped by
+    // the Committed/Locked status filter — so we report quantityOnOrder at the
+    // original ordered qty for any still-Committed PO.
 
-        const client = new FinaleClient();
-        const pos = await client.findCommittedPOsForProduct("SKU-001");
-
-        expect(pos).toHaveLength(0);
-    });
-
-    it("includes POs with remaining quantity", async () => {
+    it("reports original qty for committed POs regardless of shipment activity", async () => {
         vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
             data: {
                 orderViewConnection: {
@@ -490,7 +466,7 @@ describe("findCommittedPOsForProduct remainingQty", () => {
                             supplier: { name: "Test Vendor" },
                             itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
                             shipmentList: [
-                                { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z", quantity: "40" },
+                                { shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z" },
                             ],
                         },
                     }],
@@ -503,24 +479,22 @@ describe("findCommittedPOsForProduct remainingQty", () => {
 
         expect(pos).toHaveLength(1);
         expect(pos[0]?.orderId).toBe("PO-PARTIAL");
-        expect(pos[0]?.quantityOnOrder).toBe(60);
+        expect(pos[0]?.quantityOnOrder).toBe(100);
     });
 
-    it("skips POs with no receiveDate on shipments", async () => {
+    it("filters out POs whose status is not Committed or Locked", async () => {
         vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
             data: {
                 orderViewConnection: {
                     edges: [{
                         node: {
-                            orderId: "PO-UNRECEIVED",
-                            status: "Committed",
+                            orderId: "PO-DONE",
+                            status: "Completed",
                             orderDate: "2026-01-15",
                             total: "500",
                             supplier: { name: "Test Vendor" },
                             itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "100" } }] },
-                            shipmentList: [
-                                { shipmentId: "sh-1", receiveDate: null, quantity: "0" },
-                            ],
+                            shipmentList: [{ shipmentId: "sh-1", receiveDate: "2026-02-01T10:00:00Z" }],
                         },
                     }],
                 },
@@ -530,7 +504,31 @@ describe("findCommittedPOsForProduct remainingQty", () => {
         const client = new FinaleClient();
         const pos = await client.findCommittedPOsForProduct("SKU-001");
 
-        expect(pos).toHaveLength(1);
-        expect(pos[0]?.quantityOnOrder).toBe(100);
+        expect(pos).toHaveLength(0);
+    });
+
+    it("returns no rows when the matching item has zero ordered qty", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                orderViewConnection: {
+                    edges: [{
+                        node: {
+                            orderId: "PO-ZERO",
+                            status: "Committed",
+                            orderDate: "2026-01-15",
+                            total: "0",
+                            supplier: { name: "Test Vendor" },
+                            itemList: { edges: [{ node: { product: { productId: "SKU-001" }, quantity: "0" } }] },
+                            shipmentList: [],
+                        },
+                    }],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const pos = await client.findCommittedPOsForProduct("SKU-001");
+
+        expect(pos).toHaveLength(0);
     });
 });
