@@ -84,7 +84,14 @@ export interface ReceivedPO {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number; orderedQuantity?: number }>;
+    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    receiptHistory?: Array<{
+        shipmentId: string;
+        receiveDate: string;
+        receiveDateTime: string;
+        receivedBy?: string | null;
+        items: Array<{ productId: string; quantity: number }>;
+    }>;
     finaleUrl: string;
 }
 
@@ -388,6 +395,73 @@ export function getShipmentReceiverName(shipment: any): string | null {
     return null;
 }
 
+function getShipmentLineContainers(shipment: any): any[] {
+    const candidates = [
+        shipment?.itemList,
+        shipment?.shipmentItemList,
+        shipment?.orderItemList,
+        shipment?.items,
+    ];
+
+    const lines: any[] = [];
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (Array.isArray(candidate)) {
+            lines.push(...candidate);
+        } else if (Array.isArray(candidate.edges)) {
+            lines.push(...candidate.edges.map((edge: any) => edge?.node ?? edge));
+        }
+    }
+    return lines.map((line) => line?.node ?? line).filter(Boolean);
+}
+
+function getShipmentLineProductId(line: any): string | null {
+    const direct = [
+        line?.productId,
+        line?.sku,
+        line?.product?.productId,
+        line?.product?.sku,
+    ];
+    for (const value of direct) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+
+    const productUrl = line?.productUrl || line?.product?.productUrl || line?.product?.url;
+    if (typeof productUrl === "string" && productUrl.trim()) {
+        const tail = productUrl.split("/").filter(Boolean).pop();
+        if (tail) return decodeURIComponent(tail);
+    }
+
+    return null;
+}
+
+function getShipmentLineQuantity(line: any): number {
+    const values = [
+        line?.quantityReceived,
+        line?.receivedQuantity,
+        line?.quantityAccepted,
+        line?.receivedQty,
+        line?.qtyReceived,
+        line?.quantity,
+        line?.qty,
+    ];
+    for (const value of values) {
+        const parsed = parseFinaleNumber(value);
+        if (parsed > 0) return parsed;
+    }
+    return 0;
+}
+
+function getShipmentReceiptItems(shipment: any): Array<{ productId: string; quantity: number }> {
+    return getShipmentLineContainers(shipment)
+        .map((line) => {
+            const productId = getShipmentLineProductId(line);
+            const quantity = getShipmentLineQuantity(line);
+            return productId && quantity > 0 ? { productId, quantity } : null;
+        })
+        .filter(Boolean) as Array<{ productId: string; quantity: number }>;
+}
+
 export function deriveReceivedPurchaseOrders(
     edges: any[],
     windowStart: string,
@@ -421,6 +495,7 @@ export function deriveReceivedPurchaseOrders(
                 items: (po.itemList?.edges || []).map((ie: any) => ({
                     productId: ie.node.product?.productId || "?",
                     quantity: parseFinaleNumber(ie.node.quantity),
+                    orderedQuantity: parseFinaleNumber(ie.node.quantity),
                 })),
                 finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
             } satisfies ReceivedPO;
@@ -436,8 +511,10 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
         const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
         const shipmentReceipts = shipmentDetails
             .map((shipment) => ({
+                shipmentId: String(shipment?.shipmentId || ""),
                 receiptDateTime: getShipmentReceiptDateTime(shipment),
                 receivedBy: getShipmentReceiverName(shipment),
+                items: getShipmentReceiptItems(shipment),
             }))
             .filter((shipment) => Boolean(shipment.receiptDateTime))
             .sort((a, b) => String(b.receiptDateTime).localeCompare(String(a.receiptDateTime)));
@@ -445,12 +522,43 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
         if (shipmentReceipts.length === 0) return order;
 
         const latestReceipt = shipmentReceipts[0];
+        const receiptHistory = [...shipmentReceipts]
+            .sort((a, b) => String(a.receiptDateTime).localeCompare(String(b.receiptDateTime)))
+            .map((receipt) => ({
+                shipmentId: receipt.shipmentId,
+                receiveDate: parseISODateOnly(receipt.receiptDateTime || "") || "",
+                receiveDateTime: receipt.receiptDateTime || "",
+                receivedBy: receipt.receivedBy || null,
+                items: receipt.items,
+            }));
+
+        const receivedBySku = new Map<string, number>();
+        for (const receipt of receiptHistory) {
+            for (const item of receipt.items) {
+                receivedBySku.set(item.productId, (receivedBySku.get(item.productId) ?? 0) + item.quantity);
+            }
+        }
+        const hasLineReceiptQuantities = receivedBySku.size > 0;
 
         return {
             ...order,
             receiveDateTime: latestReceipt.receiptDateTime || order.receiveDateTime,
             receiveDate: parseISODateOnly(latestReceipt.receiptDateTime || "") || order.receiveDate,
             receivedBy: latestReceipt.receivedBy || order.receivedBy || null,
+            receiptHistory,
+            items: order.items.map((item) => {
+                const orderedQuantity = item.orderedQuantity ?? item.quantity;
+                if (!hasLineReceiptQuantities) {
+                    return { ...item, orderedQuantity };
+                }
+                const receivedQuantity = receivedBySku.get(item.productId) ?? 0;
+                return {
+                    ...item,
+                    orderedQuantity,
+                    receivedQuantity,
+                    openQuantity: Math.max(0, orderedQuantity - receivedQuantity),
+                };
+            }),
         };
     });
 }
@@ -1324,7 +1432,39 @@ export class FinaleClient {
                 cursor = pageInfo.endCursor;
             }
 
-            return deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
+            const received = deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
+            if (received.length === 0) return received;
+
+            const receivedOrderIds = new Set(received.map((po) => po.orderId));
+            const shipmentDetailsByOrderId: Record<string, any[]> = {};
+            await Promise.all(edges.map(async (edge: any) => {
+                const po = edge.node;
+                if (!receivedOrderIds.has(po?.orderId)) return;
+
+                const receivedShipmentIds = getShipmentsInReceiptWindow(po, today, tomorrowStr)
+                    .map((shipment: any) => String(shipment?.shipmentId || ""))
+                    .filter(Boolean);
+                const receivedShipmentIdSet = new Set(receivedShipmentIds);
+                const urls: string[] = Array.isArray(po?.shipmentUrlList) && po.shipmentUrlList.length > 0
+                    ? po.shipmentUrlList
+                    : receivedShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
+
+                const details = await Promise.all(urls.map(async (url) => {
+                    try {
+                        const detail = await this.getShipmentDetails(url);
+                        const detailId = String(detail?.shipmentId || "");
+                        return !detailId || receivedShipmentIdSet.size === 0 || receivedShipmentIdSet.has(detailId)
+                            ? detail
+                            : null;
+                    } catch {
+                        return null;
+                    }
+                }));
+
+                shipmentDetailsByOrderId[po.orderId] = details.filter(Boolean);
+            }));
+
+            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId);
         } catch (err: any) {
             console.error("Failed to fetch received POs:", err.message);
             return [];
