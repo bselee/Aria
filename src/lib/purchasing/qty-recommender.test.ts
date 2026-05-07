@@ -81,6 +81,46 @@ describe("recommendQty — basic math", () => {
         expect(result.rawNeededEaches).toBe(98);
         expect(result.suggestedQty).toBe(108);
     });
+
+    it("uses a 10-each fallback increment for Miles Filippelli when Finale has no pack info", () => {
+        const seven = recommendQty(baseInput({
+            vendorName: "Miles Filippelli",
+            dailyRate: 1,
+            stockOnHand: 0,
+            leadTimeDays: 7,
+            coverBufferDays: 0,
+            orderIncrementQty: null,
+        }));
+        const twentyTwo = recommendQty(baseInput({
+            vendorName: "Miles Filippelli",
+            dailyRate: 1,
+            stockOnHand: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 8,
+            orderIncrementQty: null,
+        }));
+
+        expect(seven.rawNeededEaches).toBe(7);
+        expect(seven.suggestedQty).toBe(10);
+        expect(twentyTwo.rawNeededEaches).toBe(22);
+        expect(twentyTwo.suggestedQty).toBe(30);
+        expect(twentyTwo.provenance.find(step => step.step === "pack_round")?.detail)
+            .toContain("Miles Filippelli fallback");
+    });
+
+    it("does not override Finale pack info for Miles Filippelli", () => {
+        const result = recommendQty(baseInput({
+            vendorName: "Miles Filippelli",
+            dailyRate: 1,
+            stockOnHand: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 8,
+            orderIncrementQty: 12,
+        }));
+
+        expect(result.rawNeededEaches).toBe(22);
+        expect(result.suggestedQty).toBe(24);
+    });
 });
 
 describe("recommendQty — urgency tiers", () => {
@@ -411,8 +451,8 @@ describe("recommendQty — vendor reorder policy", () => {
         expect(result.reviewReasons).toEqual([]);
     });
 
-    it("formula version reflects the v2.1 policy bump", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.2-cognitive-round-2026-05-06");
+    it("formula version reflects the v2.3 vendor fallback increment bump", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.3-vendor-fallback-increments-2026-05-07");
     });
 });
 
@@ -466,8 +506,8 @@ describe("recommendQty — cognitive rounding integration", () => {
         expect(result.moqApplied).toBe(true);
     });
 
-    it("formula version is bumped to v2.2", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.2-cognitive-round-2026-05-06");
+    it("formula version is bumped to v2.3", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.3-vendor-fallback-increments-2026-05-07");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {

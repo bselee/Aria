@@ -148,6 +148,28 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
         });
     }
 
+    if (effectiveQty <= 0) {
+        return createPurchasingAssessment({
+            vendorName: input.vendorName,
+            productId: input.productId,
+            decision: "hold",
+            recommendedQty: 0,
+            confidence: "high",
+            reasonCodes: ["no_order_quantity_recommended"],
+            explanation: "No reorder quantity is recommended after current stock, open POs, and target cover are applied.",
+            metrics: {
+                directDemand,
+                bomDemand,
+                sharedDemand,
+                stockOnHand: input.stockOnHand,
+                stockOnOrder: input.stockOnOrder,
+                adjustedRunwayDays: input.adjustedRunwayDays,
+                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
+                leadTimeDays: input.leadTimeDays,
+            },
+        });
+    }
+
     return createPurchasingAssessment({
         vendorName: input.vendorName,
         productId: input.productId,

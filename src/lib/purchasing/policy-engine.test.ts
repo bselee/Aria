@@ -103,6 +103,22 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.reasonCodes).toContain("order_economics_unclear");
     });
 
+    it("holds with precise explanation when computed order quantity is zero", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            vendorName: "Miles Filippelli",
+            productId: "FWE102",
+            directDemand: 0.1,
+            stockOnHand: 13,
+            adjustedRunwayDays: 130,
+            suggestedQty: 0,
+        }));
+
+        expect(assessment.decision).toBe("hold");
+        expect(assessment.recommendedQty).toBe(0);
+        expect(assessment.reasonCodes).toContain("no_order_quantity_recommended");
+        expect(assessment.explanation).toContain("No reorder quantity is recommended");
+    });
+
     it("keeps manual items actionable when movement still supports reorder", () => {
         const assessment = assessPurchasingCandidate(makeCandidate({
             reorderMethod: "manual",

@@ -5002,6 +5002,7 @@ export class FinaleClient {
                     // dashboard can render in a "Why X?" drawer.
                     const recInputs = {
                         sku,
+                        vendorName: party.groupName,
                         dailyRate,
                         dailyRateSource: rateSource,
                         dailyRateLabel: rateSourceLabel,
