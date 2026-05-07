@@ -24,7 +24,8 @@ import { roundToCleanQty } from "./cognitive-round";
 //   v2.1-vendor-policy-2026-05-06 — vendor reorder policy overrides
 //     (lead time override, target cover, MOQ tri-state, overbuy review flags)
 //   v2.2-cognitive-round-2026-05-06 — cognitive/historical PO qty rounding
-export const QTY_FORMULA_VERSION = "v2.2-cognitive-round-2026-05-06";
+//   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
+export const QTY_FORMULA_VERSION = "v2.3-vendor-fallback-increments-2026-05-07";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -36,6 +37,7 @@ export type Urgency = "critical" | "warning" | "watch" | "ok";
 
 export interface RecommenderInput {
     sku: string;
+    vendorName?: string;
     dailyRate: number;
     dailyRateSource: "demand" | "sales" | "receipts" | "none";
     dailyRateLabel: string;             // e.g. "90d demand", "365d sales", "365d receipts"
@@ -140,6 +142,23 @@ function urgencyNote(urgency: Urgency): string {
     if (urgency === "warning") return "order soon";
     if (urgency === "watch") return "monitor";
     return "covered";
+}
+
+function fallbackIncrementForVendor(vendorName?: string): number | null {
+    if (!vendorName) return null;
+    if (/miles\s+filippelli/i.test(vendorName)) return 10;
+    return null;
+}
+
+function effectiveOrderIncrement(input: RecommenderInput): { increment: number | null; source: "finale" | "vendor_fallback" | "none" } {
+    if (input.orderIncrementQty && input.orderIncrementQty > 1) {
+        return { increment: input.orderIncrementQty, source: "finale" };
+    }
+    const fallback = fallbackIncrementForVendor(input.vendorName);
+    if (fallback && fallback > 1) {
+        return { increment: fallback, source: "vendor_fallback" };
+    }
+    return { increment: null, source: "none" };
 }
 
 export function recommendQty(input: RecommenderInput): RecommenderResult {
@@ -292,16 +311,19 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     });
 
     // ── Step 7: pack rounding ─────────────────────────────────────────────
-    const orderIncrementQty = input.orderIncrementQty ?? null;
+    const { increment: orderIncrementQty, source: orderIncrementSource } = effectiveOrderIncrement(input);
     let suggestedQty = 0;
     if (rawNeededEaches > 0) {
         const snapped = snapToIncrement(rawNeededEaches, orderIncrementQty);
         suggestedQty = Math.ceil(snapped);
+        const fallbackVendor = input.vendorName ?? "vendor";
         trace.push({
             step: "pack_round",
-            detail: orderIncrementQty && orderIncrementQty > 1
+            detail: orderIncrementSource === "finale"
                 ? `Rounded up to nearest ${orderIncrementQty}-pack → ${suggestedQty}`
-                : `No pack increment registered → rounded up to ${suggestedQty}`,
+                : orderIncrementSource === "vendor_fallback"
+                    ? `No Finale pack increment registered; ${fallbackVendor} fallback rounds to ${orderIncrementQty}s → ${suggestedQty}`
+                    : `No pack increment registered → rounded up to ${suggestedQty}`,
             value: suggestedQty,
         });
     } else {
