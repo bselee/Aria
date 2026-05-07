@@ -15,7 +15,14 @@ type ReceivedPO = {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number }>;
+    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    receiptHistory?: Array<{
+        shipmentId: string;
+        receiveDate: string;
+        receiveDateTime: string;
+        receivedBy?: string | null;
+        items: Array<{ productId: string; quantity: number }>;
+    }>;
     finaleUrl: string;
 };
 
@@ -66,10 +73,26 @@ function receiveSortValue(po: ReceivedPO): number {
 
 function partialDiscrepancy(po: ReceivedPO): string | null {
     if (po.receiptStatus !== "partial" || po.items.length === 0) return null;
-    const skuList = po.items.map(item => item.productId).filter(Boolean);
+    const skuList = po.items
+        .filter(item => item.openQuantity == null || item.openQuantity > 0)
+        .map(item => item.productId)
+        .filter(Boolean);
     if (skuList.length === 0) return "partial receipt";
     if (skuList.length <= 2) return `short on ${skuList.join(", ")}`;
     return `short on ${skuList.slice(0, 2).join(", ")} +${skuList.length - 2} more`;
+}
+
+function fmtQty(n: number | null | undefined): string {
+    return Number(n || 0).toLocaleString();
+}
+
+function hasPartialLineQuantities(po: ReceivedPO): boolean {
+    return po.receiptStatus === "partial" && po.items.some(item => item.receivedQuantity != null || item.openQuantity != null);
+}
+
+function receiptItemsText(items: Array<{ productId: string; quantity: number }>): string {
+    if (items.length === 0) return "receipt recorded; line quantities unavailable";
+    return items.map(item => `${item.productId} ×${fmtQty(item.quantity)}`).join(", ");
 }
 
 export default function ReceivedItemsPanel() {
@@ -307,6 +330,36 @@ export default function ReceivedItemsPanel() {
                                                 </span>
                                             ))}
                                         </div>
+                                        {hasPartialLineQuantities(po) && (
+                                            <div className="mt-1.5 space-y-0.5">
+                                                {po.items.map((item) => {
+                                                    const ordered = item.orderedQuantity ?? item.quantity;
+                                                    const received = item.receivedQuantity ?? 0;
+                                                    const open = item.openQuantity ?? Math.max(0, ordered - received);
+                                                    return (
+                                                        <div key={`${po.orderId}-${item.productId}-partial`} className="text-[10.5px] font-mono text-amber-200/90">
+                                                            {item.productId} ordered {fmtQty(ordered)}
+                                                            <span className="text-zinc-500"> Â· </span>
+                                                            received {fmtQty(received)}
+                                                            <span className="text-zinc-500"> Â· </span>
+                                                            open {fmtQty(open)}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                        {po.receiptStatus === "partial" && po.receiptHistory && po.receiptHistory.length > 0 && (
+                                            <div className="mt-1 space-y-0.5 border-l border-amber-500/30 pl-2">
+                                                {po.receiptHistory.map((receipt, index) => (
+                                                    <div key={`${po.orderId}-${receipt.shipmentId || index}`} className="text-[10.5px] font-mono text-zinc-400">
+                                                        <span className="text-amber-300">rcv{index + 1} {fmtDateTime(receipt.receiveDateTime || receipt.receiveDate)}</span>
+                                                        {receipt.receivedBy && <span className="text-cyan-300/70"> by {receipt.receivedBy}</span>}
+                                                        <span className="text-zinc-600"> Â· </span>
+                                                        <span className="text-zinc-300">{receiptItemsText(receipt.items)}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             })}

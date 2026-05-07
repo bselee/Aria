@@ -150,4 +150,66 @@ describe("receivings helpers", () => {
             receivedBy: "Warehouse A",
         });
     });
+
+    it("enriches partial receipts with per-shipment received quantities and open balance", () => {
+        const enriched = enrichReceivedPurchaseOrdersWithShipmentDetails([
+            {
+                orderId: "PO-PARTIAL",
+                orderDate: "2026-05-01",
+                receiveDate: "2026-05-06",
+                receiveDateTime: "2026-05-06",
+                receivedBy: null,
+                receiptStatus: "partial",
+                supplier: "Bottle Vendor",
+                total: 900,
+                items: [{ productId: "BOTTLE-1G", quantity: 300 }],
+                finaleUrl: "https://example.test/finale-order",
+            },
+        ], {
+            "PO-PARTIAL": [
+                {
+                    shipmentId: "rcv-1",
+                    receiveDate: "2026-05-06T09:00:00-06:00",
+                    receivedByName: "Luis",
+                    itemList: [
+                        { productId: "BOTTLE-1G", quantityReceived: "150" },
+                    ],
+                },
+                {
+                    shipmentId: "rcv-2",
+                    receiveDate: "2026-05-07T11:00:00-06:00",
+                    receivedByName: "Mia",
+                    itemList: [
+                        { productId: "BOTTLE-1G", quantityReceived: "75" },
+                    ],
+                },
+            ],
+        });
+
+        expect(enriched[0]?.receiptHistory).toEqual([
+            {
+                shipmentId: "rcv-1",
+                receiveDate: "2026-05-06",
+                receiveDateTime: "2026-05-06T15:00:00.000Z",
+                receivedBy: "Luis",
+                items: [{ productId: "BOTTLE-1G", quantity: 150 }],
+            },
+            {
+                shipmentId: "rcv-2",
+                receiveDate: "2026-05-07",
+                receiveDateTime: "2026-05-07T17:00:00.000Z",
+                receivedBy: "Mia",
+                items: [{ productId: "BOTTLE-1G", quantity: 75 }],
+            },
+        ]);
+        expect(enriched[0]?.items).toEqual([
+            {
+                productId: "BOTTLE-1G",
+                quantity: 300,
+                orderedQuantity: 300,
+                receivedQuantity: 225,
+                openQuantity: 75,
+            },
+        ]);
+    });
 });

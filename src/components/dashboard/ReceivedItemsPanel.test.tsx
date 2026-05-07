@@ -115,6 +115,56 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/short on BPM01/i)).toBeTruthy();
   });
 
+  it("renders partial receipt history and open quantities", async () => {
+    stubLocalStorage();
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-300",
+          orderDate: "2026-05-01",
+          receiveDate: "2026-05-06",
+          receiveDateTime: "2026-05-07T11:00:00-06:00",
+          receiptStatus: "partial",
+          supplier: "Bottle Vendor",
+          total: 900,
+          items: [
+            { productId: "BOTTLE-1G", quantity: 300, orderedQuantity: 300, receivedQuantity: 225, openQuantity: 75 },
+          ],
+          receiptHistory: [
+            {
+              shipmentId: "rcv-1",
+              receiveDate: "2026-05-06",
+              receiveDateTime: "2026-05-06T09:00:00-06:00",
+              receivedBy: "Luis",
+              items: [{ productId: "BOTTLE-1G", quantity: 150 }],
+            },
+            {
+              shipmentId: "rcv-2",
+              receiveDate: "2026-05-07",
+              receiveDateTime: "2026-05-07T11:00:00-06:00",
+              receivedBy: "Mia",
+              items: [{ productId: "BOTTLE-1G", quantity: 75 }],
+            },
+          ],
+          finaleUrl: "https://example.com/po",
+        },
+      ],
+      days: 14,
+      asOf: "2026-05-07",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(screen.getByText(/BOTTLE-1G ordered 300/i)).toBeTruthy();
+    expect(screen.getByText(/received 225/i)).toBeTruthy();
+    expect(screen.getByText(/open 75/i)).toBeTruthy();
+    expect(screen.getByText(/rcv1 May 6 9:00 AM/i)).toBeTruthy();
+    expect(screen.getByText(/BOTTLE-1G ×150/i)).toBeTruthy();
+    expect(screen.getByText(/rcv2 May 7 11:00 AM/i)).toBeTruthy();
+    expect(screen.getByText(/BOTTLE-1G ×75/i)).toBeTruthy();
+  });
+
   it("sorts receivings newest first and summarizes multiple short SKUs", async () => {
     stubLocalStorage();
     stubFetch({
