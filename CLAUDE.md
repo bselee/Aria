@@ -43,9 +43,11 @@ pm2 save              # Persist process list
 pm2 startup           # Generate OS startup script
 
 # After any code change to the bot:
-npm run typecheck 2>&1 | grep -v "finale/client.ts" | grep "error TS" | grep -v "folder-watcher\|validator"
-# ↑ Uses --max-old-space-size=12288 to avoid OOM. Filters 3 pre-existing error sources; no output = clean. Then:
+npm run typecheck:cli                                         # 0 errors expected — fail loudly if not
 pm2 restart aria-bot
+sleep 5 && pm2 logs aria-bot --lines 80 --nostream | grep -Ei "error|failed|unhandled|ECONNREFUSED" | grep -v "info\b"
+# ↑ Smoke check: any output here = boot-time failure (Telegram poll, Pinecone, Supabase, etc).
+#   No output = bot is healthy. `npm run typecheck` uses --max-old-space-size=12288 to avoid OOM.
 
 # TypeScript — split configs
 npm run typecheck        # Next.js app code only (tsconfig.json)
