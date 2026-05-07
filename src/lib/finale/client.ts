@@ -4878,6 +4878,220 @@ export class FinaleClient {
      *
      * @param daysBack  Lookback window for velocity calculation (default: 90 days)
      */
+    /**
+     * Demand-driven BOM component purchasing pipeline.
+     *
+     * 1. Page active SKUs (productViewConnection)
+     * 2. For each active SKU: getBillOfMaterials → if non-empty, treat as FG candidate
+     * 3. For FG candidates with sales in window: collect (sku, name, dailySalesRate, bom)
+     * 4. Explode burn rates per component (computeComponentBurnRates)
+     * 5. For each component: REST product GET → stock, supplier; resolve vendor;
+     *    leadTimeService.getForVendor(); classify urgency
+     * 6. Group by vendor, sort worst-first
+     *
+     * Returns PurchasingGroup[] where every item has itemType='bom-component'.
+     * Caching is the route's responsibility (same pattern as getPurchasingIntelligence).
+     *
+     * v1 simplification: pages all Active products and BOM-checks each one. Most
+     * Active SKUs have no BOM, so this wastes ~1 product GET per non-FG SKU. The
+     * 30-min route cache absorbs the cost. v2 should narrow the candidate set
+     * via a productAssocList GraphQL filter or a sales-velocity prefilter.
+     */
+    async getBOMDemand(daysBack = 90): Promise<PurchasingGroup[]> {
+        const { computeComponentBurnRates, classifyUrgency } = await import('./bom-demand');
+        type FGVelocity = import('./bom-demand').FGVelocity;
+
+        // ── Step 1: Page Active SKUs ──
+        const PAGE_SIZE = 500;
+        let cursor: string | null = null;
+        const activeSkus: string[] = [];
+
+        while (true) {
+            const afterClause = cursor ? `, after: "${cursor}"` : '';
+            const body = {
+                query: `{
+                    productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        edges { node { productId status } }
+                    }
+                }`
+            };
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const json: any = await res.json();
+            const conn = json.data?.productViewConnection;
+            if (!conn) break;
+            for (const edge of conn.edges || []) {
+                if (edge.node.status === 'Active') activeSkus.push(edge.node.productId);
+            }
+            if (!conn.pageInfo.hasNextPage) break;
+            cursor = conn.pageInfo.endCursor;
+        }
+
+        // ── Step 2-3: Find FG candidates (have BOM + have sales) ──
+        const fgVelocities: FGVelocity[] = [];
+        const skuQueue = [...activeSkus];
+
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (skuQueue.length > 0) {
+                const sku = skuQueue.shift()!;
+                try {
+                    const bom = await this.getBillOfMaterials(sku);
+                    if (bom.length === 0) continue; // not an FG
+
+                    const activity = await this.getProductActivity(sku, daysBack);
+                    const dailySalesRate = activity.soldQty / daysBack;
+                    if (dailySalesRate <= 0) continue; // no demand signal
+
+                    const prodData = await this.get(
+                        `/${this.accountPath}/api/product/${encodeURIComponent(sku)}`
+                    );
+                    const name: string = prodData.internalName || prodData.productId || sku;
+                    fgVelocities.push({ sku, name, dailySalesRate, bom });
+                } catch (err: any) {
+                    console.error(`[bom-demand] FG ${sku} failed:`, err.message);
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        if (fgVelocities.length === 0) return [];
+
+        // ── Step 4: Burn rates ──
+        const componentDemands = computeComponentBurnRates(fgVelocities);
+
+        // ── Step 5: Resolve each component (stock, vendor, lead time, urgency) ──
+        const { leadTimeService } = await import('@/lib/builds/lead-time-service');
+        const items: PurchasingItem[] = [];
+        const componentQueue = Array.from(componentDemands.entries());
+
+        await Promise.all(Array.from({ length: 3 }, async () => {
+            while (componentQueue.length > 0) {
+                const [compSku, demand] = componentQueue.shift()!;
+                try {
+                    const prodData = await this.get(
+                        `/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`
+                    );
+                    const suppliers: any[] = prodData.supplierList || [];
+                    const mainSupplier = suppliers.find((s: any) =>
+                        s.supplierPrefOrderId?.includes('MAIN')
+                    ) || suppliers[0];
+                    if (!mainSupplier?.supplierPartyUrl) continue;
+
+                    const partyId = mainSupplier.supplierPartyUrl.split('/').pop() || '';
+                    let groupName = 'Unknown';
+                    try {
+                        const partyRes = await fetch(
+                            `${this.apiBase}/${this.accountPath}/api/partygroup/${partyId}`,
+                            { headers: { Authorization: this.authHeader, Accept: 'application/json' } }
+                        );
+                        const partyData = await partyRes.json();
+                        groupName = partyData.groupName || partyData.name || 'Unknown';
+                    } catch { /* keep Unknown */ }
+
+                    if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
+
+                    const stockOnHand: number =
+                        parseFloat(prodData.quantityOnHand ?? prodData.stockLevel ?? '0') || 0;
+
+                    const lt = await leadTimeService.getForVendor(groupName, compSku);
+                    const leadTimeDays = lt.days;
+                    const leadTimeProvenance = lt.label;
+
+                    const runwayDays = demand.totalBurnRate > 0
+                        ? stockOnHand / demand.totalBurnRate
+                        : 9999;
+                    const urgency = classifyUrgency(runwayDays, leadTimeDays);
+
+                    // buildsWorth approximation: batch ≈ dailySalesRate*30. Phase 2 derives
+                    // real batch sizes from production receipt history.
+                    const feedsFinishedGoods = demand.feedsFinishedGoods.map(fg => {
+                        const batchSize = fg.dailySalesRate * 30;
+                        const buildsWorth = batchSize > 0 && fg.qtyPerUnit > 0
+                            ? stockOnHand / (fg.qtyPerUnit * batchSize)
+                            : 0;
+                        return {
+                            sku: fg.sku,
+                            name: fg.name,
+                            dailySalesRate: fg.dailySalesRate,
+                            buildsWorth: Math.round(buildsWorth * 10) / 10,
+                        };
+                    });
+
+                    const coverDays = 60;
+                    const suggestedQty = Math.max(
+                        0,
+                        Math.ceil(demand.totalBurnRate * coverDays - stockOnHand)
+                    );
+
+                    items.push({
+                        productId: compSku,
+                        productName: prodData.internalName || compSku,
+                        supplierName: groupName,
+                        supplierPartyId: partyId,
+                        unitPrice: mainSupplier.unitPrice ?? mainSupplier.price ?? 0,
+                        stockOnHand,
+                        stockOnOrder: 0, // v2: fetch open POs for components
+                        purchaseVelocity: 0,
+                        salesVelocity: 0,
+                        demandVelocity: demand.totalBurnRate,
+                        dailyRate: demand.totalBurnRate,
+                        dailyRateSource: 'demand',
+                        runwayDays: Math.round(runwayDays * 10) / 10,
+                        adjustedRunwayDays: Math.round(runwayDays * 10) / 10,
+                        leadTimeDays,
+                        leadTimeProvenance,
+                        openPOs: [],
+                        urgency,
+                        explanation:
+                            `BOM component — burns ${demand.totalBurnRate.toFixed(1)}/day across ` +
+                            `${demand.feedsFinishedGoods.length} FGs. ${Math.round(runwayDays)}d runway.`,
+                        suggestedQty,
+                        orderIncrementQty: prodData.orderIncrementQuantity ?? null,
+                        isBulkDelivery: true, // BOM materials route to production facility
+                        finaleReorderQty: null,
+                        finaleStockoutDays: null,
+                        finaleConsumptionQty: null,
+                        finaleDemandQty: null,
+                        itemType: 'bom-component',
+                        feedsFinishedGoods,
+                        totalBurnRate: demand.totalBurnRate,
+                    });
+                } catch (err: any) {
+                    console.error(`[bom-demand] component ${compSku} failed:`, err.message);
+                }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }));
+
+        // ── Step 6: Group by vendor, worst-urgency-first ──
+        const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
+        const vendorMap = new Map<string, PurchasingGroup>();
+        for (const item of items) {
+            const existing = vendorMap.get(item.supplierPartyId);
+            if (existing) {
+                existing.items.push(item);
+                if (urgencyRank[item.urgency] < urgencyRank[existing.urgency]) {
+                    existing.urgency = item.urgency;
+                }
+            } else {
+                vendorMap.set(item.supplierPartyId, {
+                    vendorName: item.supplierName,
+                    vendorPartyId: item.supplierPartyId,
+                    urgency: item.urgency,
+                    items: [item],
+                });
+            }
+        }
+        return Array.from(vendorMap.values()).sort((a, b) => {
+            const ud = urgencyRank[a.urgency] - urgencyRank[b.urgency];
+            return ud !== 0 ? ud : a.vendorName.localeCompare(b.vendorName);
+        });
+    }
+
     async getPurchasingIntelligence(daysBack = 365, vendorFilter?: string | null): Promise<PurchasingGroup[]> {
         const PAGE_SIZE = 500;
         const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
