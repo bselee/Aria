@@ -539,6 +539,37 @@ describe("reconcileInvoiceToPO guardrails", () => {
         expect(result.priceChanges).toEqual([]);
     });
 
+    // Same regression family — legacy Supabase rows can also have null vendor_name.
+    // Pre-fix this threw "Cannot read properties of undefined (reading 'replace')"
+    // inside wordOverlapSimilarity → validateVendorCorrelation.
+    it("does not throw when invoice.vendorName is missing", async () => {
+        const invoice = makeInvoice({
+            poNumber: "PO-001",
+            subtotal: 500,
+            total: 500,
+            amountDue: 500,
+            lineItems: [],
+        });
+        (invoice as any).vendorName = undefined;
+
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+        expect(result).toBeDefined();
+        expect(result.warnings.some(w => /vendorName/i.test(w))).toBe(true);
+    });
+
     it("includes a canonical reconciliation key in audit metadata", () => {
         const metadata = buildAuditMetadata(
             {

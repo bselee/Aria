@@ -1141,6 +1141,18 @@ export async function reconcileInvoiceToPO(
         );
         invoice = { ...invoice, lineItems: [] };
     }
+    // Same defense for the string fields the reconciler treats as required:
+    // legacy vendor_invoices rows (null vendor_name / null raw_data) feed
+    // through po-sweep.ts:122 with these fields undefined, blowing up
+    // wordOverlapSimilarity (.replace on undefined) and getVendorPattern
+    // (.toLowerCase on undefined).
+    if (typeof invoice.vendorName !== "string" || !invoice.vendorName) {
+        warnings.push(`Invoice has no vendorName (got ${typeof invoice.vendorName}); vendor correlation will fail closed.`);
+        invoice = { ...invoice, vendorName: "" };
+    }
+    if (typeof invoice.invoiceNumber !== "string") {
+        invoice = { ...invoice, invoiceNumber: invoice.invoiceNumber == null ? "" : String(invoice.invoiceNumber) };
+    }
 
     // ── Balance validation ─────────────────────────────────────────────────────
     // M2 FIX: Two tiers — "warn" is non-blocking, "gate" forces needs_approval.
@@ -1263,14 +1275,15 @@ export async function reconcileInvoiceToPO(
                 summary: populateSummary,
                 totalDollarImpact: lineTotal + feeTotal,
                 autoApplicable: false,
-                warnings: [resolvedNote],
+                warnings: [...warnings, resolvedNote],
                 populateItems,
-                report: buildReconciliationReport(invoice, poSummary, [], feeChanges, balanceCheck, "needs_approval", [resolvedNote]),
+                report: buildReconciliationReport(invoice, poSummary, [], feeChanges, balanceCheck, "needs_approval", [...warnings, resolvedNote]),
             };
         }
 
         // No SKUs resolved in Finale — can't auto-populate, flag for manual review
         const emptyPoWarnings = [
+            ...warnings,
             `PO ${orderId} has 0 line items — ${invoice.lineItems?.length ?? 0} invoice SKUs could not be resolved in Finale. Manual review required.`
         ];
         return {
@@ -1298,7 +1311,7 @@ export async function reconcileInvoiceToPO(
 
     if (!vendorCorrelation.pass) {
         // Low confidence — no name, PO#, or SKU evidence. Escalate for human review.
-        const vendorMismatchWarnings = [vendorCorrelation.note];
+        const vendorMismatchWarnings = [...warnings, vendorCorrelation.note];
         return {
             orderId,
             invoiceNumber: invoice.invoiceNumber,
@@ -1550,11 +1563,12 @@ export function normalizeLineTotal(
  * Normalizes to lowercase, strips punctuation, splits on whitespace.
  * "BuildASoil Organics" vs "BuildASoil Organics LLC" → ~0.67
  */
-function wordOverlapSimilarity(a: string, b: string): number {
+function wordOverlapSimilarity(a: string | null | undefined, b: string | null | undefined): number {
     // Fix 7: Collapse dotted initials before stripping punctuation so that
     // "A.B.C. Corp" tokenizes as ["abc", "corp"] not ["a", "b", "c", "corp"],
     // giving correct Jaccard overlap against "ABC Corp".
-    const normalize = (s: string) => {
+    const normalize = (s: string | null | undefined) => {
+        if (typeof s !== "string" || !s) return [];
         const collapsed = s.replace(/\b([A-Za-z])\.([A-Za-z]\.)+/g, (m) => m.replace(/\./g, ""));
         return collapsed.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
     };
