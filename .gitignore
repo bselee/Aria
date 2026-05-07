@@ -123,3 +123,6 @@ purchases-data.json
 
 # External MCP tool dir — intentionally not in this repo
 tools/excel-mcp-server/
+
+# Stray screenshots at repo root (smoke-test artifacts)
+/*.png
