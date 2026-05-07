@@ -64,6 +64,14 @@ type PurchasingItem = {
     reviewReasons?: string[];
     roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
     roundingAlternatives?: number[];
+    itemType?: 'resale' | 'bom-component';
+    feedsFinishedGoods?: Array<{
+        sku: string;
+        name: string;
+        dailySalesRate: number;
+        buildsWorth: number;
+    }>;
+    totalBurnRate?: number;
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -214,6 +222,8 @@ export default function PurchasingPanel() {
     const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("order_now");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
+    type ItemMode = 'all' | 'resale' | 'bom';
+    const [itemMode, setItemMode] = useState<ItemMode>('all');
     const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
 
     // ULINE direct ordering
@@ -423,7 +433,7 @@ export default function PurchasingPanel() {
         const runTier = async (tier: UrgencyTier, bustThis: boolean): Promise<boolean> => {
             setLoadingTiers(p => new Set([...p, tier]));
             try {
-                const res = await fetch(`/api/dashboard/purchasing?urgency=${tier}${bustThis ? '&bust=1' : ''}`);
+                const res = await fetch(`/api/dashboard/purchasing?urgency=${tier}&mode=${itemMode}${bustThis ? '&bust=1' : ''}`);
                 const json: AssessmentData = await res.json();
                 if (!res.ok) throw new Error(json.error || `Failed tier ${tier}`);
 
@@ -500,7 +510,8 @@ export default function PurchasingPanel() {
         }
     }
 
-    useEffect(() => { load(); }, []);
+    useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+    useEffect(() => { load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [itemMode]);
 
     function toggleExpand(id: string) {
         setExpanded(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -1016,6 +1027,24 @@ export default function PurchasingPanel() {
 
             {!isCollapsed && (
                 <>
+                    {/* ── Item type mode: All / Resale / BOM Materials ── */}
+                    <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-800/60 bg-zinc-950/30">
+                        <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">type</span>
+                        {([
+                            { k: 'all' as const, label: 'All', tone: 'bg-zinc-700 text-zinc-200 border-zinc-500' },
+                            { k: 'resale' as const, label: 'Resale', tone: 'bg-blue-500/20 text-blue-300 border-blue-500/40' },
+                            { k: 'bom' as const, label: 'BOM Materials', tone: 'bg-purple-500/20 text-purple-300 border-purple-500/40' },
+                        ]).map(t => (
+                            <button key={t.k}
+                                onClick={() => setItemMode(t.k)}
+                                className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${
+                                    itemMode === t.k ? t.tone : 'text-zinc-500 border-zinc-700 hover:text-zinc-300'
+                                }`}
+                            >
+                                {t.label}
+                            </button>
+                        ))}
+                    </div>
                     {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
                     <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                         <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">show</span>
@@ -1540,7 +1569,14 @@ export default function PurchasingPanel() {
                                                                             {/* Row 2: Description & Amount */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="flex items-center gap-2 mt-1">
-                                                                                    <span className="text-[13px] font-mono text-zinc-200 flex-1 truncate">{item.productName}</span>
+                                                                                    <span className="text-[13px] font-mono text-zinc-200 flex-1 truncate">
+                                                                                        {item.productName}
+                                                                                        {item.itemType === 'bom-component' && (
+                                                                                            <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 ml-1">
+                                                                                                BOM
+                                                                                            </span>
+                                                                                        )}
+                                                                                    </span>
                                                                                     {item.reorderMethod === "default" && item.dailyRateSource === "demand" && (
                                                                                         <span className="text-[11px] font-mono text-zinc-300 shrink-0">
                                                                                             demand fallback
@@ -1555,6 +1591,15 @@ export default function PurchasingPanel() {
                                                                                             $0.00
                                                                                         </span>
                                                                                     )}
+                                                                                </div>
+                                                                            )}
+
+                                                                            {!itemSnoozed && item.itemType === 'bom-component' && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0 && (
+                                                                                <div className="text-[9px] text-zinc-500 font-mono mt-0.5 truncate">
+                                                                                    feeds: {item.feedsFinishedGoods.slice(0, 2).map(fg =>
+                                                                                        `${fg.name} (≈${fg.buildsWorth} builds covered)`
+                                                                                    ).join(' · ')}
+                                                                                    {item.feedsFinishedGoods.length > 2 && ` · +${item.feedsFinishedGoods.length - 2} more`}
                                                                                 </div>
                                                                             )}
 
