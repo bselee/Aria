@@ -438,6 +438,42 @@ describe("FinaleClient receivings pagination", () => {
     });
 });
 
+describe("FinaleClient product activity stock parsing", () => {
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = "key";
+        process.env.FINALE_API_SECRET = "secret";
+        process.env.FINALE_ACCOUNT_PATH = "buildasoil";
+        process.env.FINALE_BASE_URL = "https://finale.example";
+        vi.restoreAllMocks();
+        global.fetch = vi.fn();
+    });
+
+    it("prefers GraphQL stockOnHand when unitsInStock reports zero", async () => {
+        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
+            data: {
+                purchasedIn: { edges: [] },
+                soldIn: { edges: [] },
+                committedPOs: { edges: [] },
+                stockInfo: {
+                    edges: [{
+                        node: {
+                            stockOnHand: "300",
+                            stockAvailable: "275",
+                            unitsInStock: "0",
+                        },
+                    }],
+                },
+            },
+        }) as any);
+
+        const client = new FinaleClient();
+        const activity = await client.getProductActivity("BOTTLE-1G", 90);
+
+        expect(activity.stockOnHand).toBe(300);
+        expect(activity.stockAvailable).toBe(275);
+    });
+});
+
 describe("findCommittedPOsForProduct quantityOnOrder", () => {
     beforeEach(() => {
         process.env.FINALE_API_KEY = "key";
