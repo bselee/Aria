@@ -707,6 +707,16 @@ const PARTY_CACHE_TTL = 60 * 60 * 1000;  // 1 hour
 const PARTY_CACHE_MAX = 200;
 
 /**
+ * BOM components that have permanently 404'd from Finale's product master.
+ * Stale BOM entries pointing at SKUs that no longer exist; never resolve.
+ * Process-lifetime cache only — fresh boots will rediscover them in one wasted scan.
+ * Only populated on a clean 404; transient 5xx / network errors do NOT poison this set.
+ */
+const _bomComponent404Cache = new Set<string>();
+// Exported for tests only. Do not import from production code.
+export const __bomComponent404CacheForTests = _bomComponent404Cache;
+
+/**
  * Vendors we never order from on the purchasing dashboard:
  * internal manufacturing depts + dropship vendors handled outside the PO flow.
  *
@@ -4972,10 +4982,18 @@ export class FinaleClient {
         await Promise.all(Array.from({ length: 3 }, async () => {
             while (componentQueue.length > 0) {
                 const [compSku, demand] = componentQueue.shift()!;
+                // Win #2: Skip components that have permanently 404'd this process lifetime.
+                if (_bomComponent404Cache.has(compSku)) continue;
                 try {
-                    const prodData = await this.get(
-                        `/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`
-                    );
+                    // Win #1: Fire REST product details + GraphQL activity in parallel —
+                    // both target the same compSku, so cut wall-clock per component ~in half.
+                    // Finale REST returns "--" for stockOnHand on every product —
+                    // GraphQL productViewConnection (via getProductActivity) is the only
+                    // reliable source. getProductActivity also gives us open POs for free.
+                    const [prodData, compActivity] = await Promise.all([
+                        this.get(`/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`),
+                        this.getProductActivity(compSku, daysBack),
+                    ]);
                     const suppliers: any[] = prodData.supplierList || [];
                     const mainSupplier = suppliers.find((s: any) =>
                         s.supplierPrefOrderId?.includes('MAIN')
@@ -4995,10 +5013,6 @@ export class FinaleClient {
 
                     if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
 
-                    // Finale REST returns "--" for stockOnHand on every product —
-                    // the only reliable source is GraphQL productViewConnection.
-                    // getProductActivity also gives us open POs (→ stockOnOrder) for free.
-                    const compActivity = await this.getProductActivity(compSku, daysBack);
                     const stockOnHand = compActivity.stockOnHand ?? 0;
                     const stockOnOrder = compActivity.openPOs.reduce(
                         (sum, po) => sum + (po.quantity || 0),
@@ -5072,6 +5086,12 @@ export class FinaleClient {
                         totalBurnRate: demand.totalBurnRate,
                     });
                 } catch (err: any) {
+                    // Win #2: Cache clean-404s so we skip them next call this process lifetime.
+                    // Match `Finale API 404:` from get() / getProductActivity. Don't poison
+                    // on 5xx / network errors — those are transient.
+                    if (typeof err?.message === 'string' && /Finale API 404\b/.test(err.message)) {
+                        _bomComponent404Cache.add(compSku);
+                    }
                     console.error(`[bom-demand] component ${compSku} failed:`, err.message);
                 }
                 await new Promise(r => setTimeout(r, 100));

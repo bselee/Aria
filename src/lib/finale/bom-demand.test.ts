@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups } from './bom-demand';
+import { FinaleClient, __bomComponent404CacheForTests } from './client';
 
 describe('computeComponentBurnRates', () => {
     it('sums burn rate across multiple FGs sharing a component', () => {
@@ -107,5 +108,191 @@ describe('mergeIntoGroups', () => {
         expect(merged).toHaveLength(1);
         expect(merged[0].items).toHaveLength(2);
         expect(merged[0].urgency).toBe('critical');
+    });
+});
+
+describe('getBOMDemand perf optimisations', () => {
+    const originalEnv = {
+        FINALE_API_KEY: process.env.FINALE_API_KEY,
+        FINALE_API_SECRET: process.env.FINALE_API_SECRET,
+        FINALE_ACCOUNT_PATH: process.env.FINALE_ACCOUNT_PATH,
+        FINALE_BASE_URL: process.env.FINALE_BASE_URL,
+    };
+
+    beforeEach(() => {
+        process.env.FINALE_API_KEY = 'key';
+        process.env.FINALE_API_SECRET = 'secret';
+        process.env.FINALE_ACCOUNT_PATH = 'buildasoil';
+        process.env.FINALE_BASE_URL = 'https://finale.example';
+        __bomComponent404CacheForTests.clear();
+        vi.restoreAllMocks();
+    });
+
+    afterEach(() => {
+        process.env.FINALE_API_KEY = originalEnv.FINALE_API_KEY;
+        process.env.FINALE_API_SECRET = originalEnv.FINALE_API_SECRET;
+        process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
+        process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
+        __bomComponent404CacheForTests.clear();
+    });
+
+    /**
+     * Win #1 proof: REST product GET and GraphQL activity for the same component
+     * are dispatched in parallel — a slow REST + fast GraphQL must finish in ~max(slow, fast),
+     * not slow+fast. Asserts both have started before either has finished.
+     */
+    it('fetches REST product and GraphQL activity in parallel per component (Win #1)', async () => {
+        const client = new FinaleClient();
+
+        // Force exactly one FG with one component via stubbed deps:
+        let restCalledAt = 0;
+        let activityCalledAt = 0;
+        let restResolvedAt = 0;
+        let activityResolvedAt = 0;
+
+        // Patch private get() via prototype (TS-private, runtime-accessible).
+        const proto = FinaleClient.prototype as any;
+        vi.spyOn(proto, 'get').mockImplementation(async (endpoint: string) => {
+            if (endpoint.includes('/api/product/COMP1')) {
+                restCalledAt = performance.now();
+                await new Promise(r => setTimeout(r, 80)); // slow side
+                restResolvedAt = performance.now();
+                return {
+                    productId: 'COMP1',
+                    internalName: 'Component 1',
+                    supplierList: [{ supplierPartyUrl: '/buildasoil/api/partygroup/V1', unitPrice: 5 }],
+                    orderIncrementQuantity: 10,
+                };
+            }
+            if (endpoint.includes('/api/product/FG1')) {
+                return { productId: 'FG1', internalName: 'Finished Good' };
+            }
+            return {};
+        });
+
+        vi.spyOn(client, 'getProductActivity').mockImplementation(async (sku: string) => {
+            if (sku === 'COMP1') {
+                activityCalledAt = performance.now();
+                await new Promise(r => setTimeout(r, 10)); // fast side
+                activityResolvedAt = performance.now();
+                return { stockOnHand: 100, openPOs: [], purchasedQty: 0, soldQty: 0 } as any;
+            }
+            // FG sales — must be > 0 to qualify as candidate
+            return { stockOnHand: 0, openPOs: [], purchasedQty: 0, soldQty: 90 } as any;
+        });
+
+        vi.spyOn(client, 'getBillOfMaterials').mockImplementation(async (sku: string) => {
+            if (sku === 'FG1') return [{ componentSku: 'COMP1', quantity: 1 } as any];
+            return [];
+        });
+
+        // productViewConnection paging + partygroup vendor lookup go through global fetch.
+        global.fetch = vi.fn(async (url: any) => {
+            const u = String(url);
+            if (u.includes('/api/graphql')) {
+                return new Response(JSON.stringify({
+                    data: {
+                        productViewConnection: {
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            edges: [
+                                { node: { productId: 'FG1', status: 'Active' } },
+                                { node: { productId: 'COMP1', status: 'Active' } },
+                            ],
+                        },
+                    },
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+            if (u.includes('/api/partygroup/V1')) {
+                return new Response(JSON.stringify({ groupName: 'Vendor One' }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as any;
+
+        // Stub lead-time service to avoid unrelated DB calls.
+        const ltModule = await import('@/lib/builds/lead-time-service');
+        vi.spyOn(ltModule.leadTimeService, 'getForVendor').mockResolvedValue({
+            days: 14,
+            label: 'default',
+            source: 'default',
+        } as any);
+
+        const groups = await client.getBOMDemand(90);
+
+        expect(groups).toHaveLength(1);
+        expect(groups[0].items[0].productId).toBe('COMP1');
+
+        // Parallelism check: activity must have *started* before REST *resolved*.
+        expect(activityCalledAt).toBeGreaterThan(0);
+        expect(restCalledAt).toBeGreaterThan(0);
+        expect(activityCalledAt).toBeLessThan(restResolvedAt);
+        // Fast side resolves long before slow side (clear evidence of parallel).
+        expect(activityResolvedAt).toBeLessThan(restResolvedAt);
+    });
+
+    /**
+     * Win #2 proof: a clean Finale 404 on a component is recorded in the
+     * process-lifetime skip set so the next call doesn't waste a fetch.
+     * Transient 5xx / network errors must NOT poison the set.
+     */
+    it('caches clean-404 components and skips them next call (Win #2)', async () => {
+        const client = new FinaleClient();
+
+        const proto = FinaleClient.prototype as any;
+        const getSpy = vi.spyOn(proto, 'get').mockImplementation(async (endpoint: string) => {
+            if (endpoint.includes('/api/product/GHOST')) {
+                throw new Error('Finale API 404: Not Found — product GHOST');
+            }
+            if (endpoint.includes('/api/product/FLAKY')) {
+                throw new Error('Finale API 503: Service Unavailable');
+            }
+            return { productId: 'FG1', internalName: 'FG' };
+        });
+
+        vi.spyOn(client, 'getProductActivity').mockImplementation(async (sku: string) => {
+            return { stockOnHand: 0, openPOs: [], purchasedQty: 0, soldQty: 90 } as any;
+        });
+
+        vi.spyOn(client, 'getBillOfMaterials').mockImplementation(async (sku: string) => {
+            if (sku === 'FG1') return [
+                { componentSku: 'GHOST', quantity: 1 } as any,
+                { componentSku: 'FLAKY', quantity: 1 } as any,
+            ];
+            return [];
+        });
+
+        global.fetch = vi.fn(async (url: any) => {
+            const u = String(url);
+            if (u.includes('/api/graphql')) {
+                return new Response(JSON.stringify({
+                    data: {
+                        productViewConnection: {
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            edges: [{ node: { productId: 'FG1', status: 'Active' } }],
+                        },
+                    },
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+            return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as any;
+
+        const ltModule = await import('@/lib/builds/lead-time-service');
+        vi.spyOn(ltModule.leadTimeService, 'getForVendor').mockResolvedValue({
+            days: 14, label: 'default', source: 'default',
+        } as any);
+
+        await client.getBOMDemand(90);
+
+        // 404 SKU is now cached; transient-5xx SKU is NOT.
+        expect(__bomComponent404CacheForTests.has('GHOST')).toBe(true);
+        expect(__bomComponent404CacheForTests.has('FLAKY')).toBe(false);
+
+        // Second pass: GHOST should be skipped before any product GET fires.
+        const ghostCallsBefore = getSpy.mock.calls.filter(c => String(c[0]).includes('GHOST')).length;
+        await client.getBOMDemand(90);
+        const ghostCallsAfter = getSpy.mock.calls.filter(c => String(c[0]).includes('GHOST')).length;
+        expect(ghostCallsAfter).toBe(ghostCallsBefore); // no new fetch attempted
     });
 });
