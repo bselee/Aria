@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups } from './bom-demand';
-import { FinaleClient, __bomComponent404CacheForTests } from './client';
+import { FinaleClient, __bomComponent404CacheForTests, __skuHasNoBomCacheForTests } from './client';
 
 describe('computeComponentBurnRates', () => {
     it('sums burn rate across multiple FGs sharing a component', () => {
@@ -125,6 +125,7 @@ describe('getBOMDemand perf optimisations', () => {
         process.env.FINALE_ACCOUNT_PATH = 'buildasoil';
         process.env.FINALE_BASE_URL = 'https://finale.example';
         __bomComponent404CacheForTests.clear();
+        __skuHasNoBomCacheForTests.clear();
         vi.restoreAllMocks();
     });
 
@@ -134,6 +135,7 @@ describe('getBOMDemand perf optimisations', () => {
         process.env.FINALE_ACCOUNT_PATH = originalEnv.FINALE_ACCOUNT_PATH;
         process.env.FINALE_BASE_URL = originalEnv.FINALE_BASE_URL;
         __bomComponent404CacheForTests.clear();
+        __skuHasNoBomCacheForTests.clear();
     });
 
     /**
@@ -294,5 +296,44 @@ describe('getBOMDemand perf optimisations', () => {
         await client.getBOMDemand(90);
         const ghostCallsAfter = getSpy.mock.calls.filter(c => String(c[0]).includes('GHOST')).length;
         expect(ghostCallsAfter).toBe(ghostCallsBefore); // no new fetch attempted
+    });
+
+    /**
+     * Win #3: SKUs that returned no BOM the first time are skipped on second
+     * scan, eliminating the bulk of the FG-discovery loop's network calls.
+     */
+    it('caches no-BOM SKUs and skips getBillOfMaterials next call (Win #3)', async () => {
+        const client = new FinaleClient();
+
+        // Two active SKUs. Neither has a BOM. Second scan should issue zero
+        // getBillOfMaterials calls for either.
+        global.fetch = vi.fn(async (url: any) => {
+            const u = String(url);
+            if (u.includes('/api/graphql')) {
+                return new Response(JSON.stringify({
+                    data: {
+                        productViewConnection: {
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            edges: [
+                                { node: { productId: 'NO-BOM-A', status: 'Active' } },
+                                { node: { productId: 'NO-BOM-B', status: 'Active' } },
+                            ],
+                        },
+                    },
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+            return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as any;
+
+        const bomSpy = vi.spyOn(client, 'getBillOfMaterials').mockResolvedValue([]);
+
+        await client.getBOMDemand(90);
+        const callsAfterFirst = bomSpy.mock.calls.length;
+        expect(callsAfterFirst).toBe(2); // both SKUs queried first time
+        expect(__skuHasNoBomCacheForTests.has('NO-BOM-A')).toBe(true);
+        expect(__skuHasNoBomCacheForTests.has('NO-BOM-B')).toBe(true);
+
+        await client.getBOMDemand(90);
+        expect(bomSpy.mock.calls.length).toBe(callsAfterFirst); // no new BOM lookups
     });
 });
