@@ -4994,8 +4994,15 @@ export class FinaleClient {
 
                     if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
 
-                    const stockOnHand: number =
-                        parseFloat(prodData.quantityOnHand ?? prodData.stockLevel ?? '0') || 0;
+                    // Finale REST returns "--" for stockOnHand on every product —
+                    // the only reliable source is GraphQL productViewConnection.
+                    // getProductActivity also gives us open POs (→ stockOnOrder) for free.
+                    const compActivity = await this.getProductActivity(compSku, daysBack);
+                    const stockOnHand = compActivity.stockOnHand ?? 0;
+                    const stockOnOrder = compActivity.openPOs.reduce(
+                        (sum, po) => sum + (po.quantity || 0),
+                        0,
+                    );
 
                     const lt = await leadTimeService.getForVendor(groupName, compSku);
                     const leadTimeDays = lt.days;
@@ -5004,7 +5011,10 @@ export class FinaleClient {
                     const runwayDays = demand.totalBurnRate > 0
                         ? stockOnHand / demand.totalBurnRate
                         : 9999;
-                    const urgency = classifyUrgency(runwayDays, leadTimeDays);
+                    const adjustedRunwayDays = demand.totalBurnRate > 0
+                        ? (stockOnHand + stockOnOrder) / demand.totalBurnRate
+                        : 9999;
+                    const urgency = classifyUrgency(adjustedRunwayDays, leadTimeDays);
 
                     // buildsWorth approximation: batch ≈ dailySalesRate*30. Phase 2 derives
                     // real batch sizes from production receipt history.
@@ -5034,17 +5044,17 @@ export class FinaleClient {
                         supplierPartyId: partyId,
                         unitPrice: mainSupplier.unitPrice ?? mainSupplier.price ?? 0,
                         stockOnHand,
-                        stockOnOrder: 0, // v2: fetch open POs for components
+                        stockOnOrder,
                         purchaseVelocity: 0,
                         salesVelocity: 0,
                         demandVelocity: demand.totalBurnRate,
                         dailyRate: demand.totalBurnRate,
                         dailyRateSource: 'demand',
                         runwayDays: Math.round(runwayDays * 10) / 10,
-                        adjustedRunwayDays: Math.round(runwayDays * 10) / 10,
+                        adjustedRunwayDays: Math.round(adjustedRunwayDays * 10) / 10,
                         leadTimeDays,
                         leadTimeProvenance,
-                        openPOs: [],
+                        openPOs: compActivity.openPOs,
                         urgency,
                         explanation:
                             `BOM component — burns ${demand.totalBurnRate.toFixed(1)}/day across ` +
