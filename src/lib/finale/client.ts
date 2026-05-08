@@ -717,6 +717,18 @@ const _bomComponent404Cache = new Set<string>();
 export const __bomComponent404CacheForTests = _bomComponent404Cache;
 
 /**
+ * SKUs that returned no BOM (or 404'd) from getBillOfMaterials.
+ * The FG-discovery loop in getBOMDemand scans ~2500 active SKUs to find which
+ * have BOMs; most don't. Caching the "no-BOM" answer across calls cuts the
+ * SECOND cold scan dramatically since the bulk of the time is BOM lookups
+ * for SKUs we've already proven have no BOM. Process-lifetime; rebuilt on
+ * restart. Cleared if a SKU later acquires a BOM (we re-check after restart).
+ */
+const _skuHasNoBomCache = new Set<string>();
+// Exported for tests only.
+export const __skuHasNoBomCacheForTests = _skuHasNoBomCache;
+
+/**
  * Vendors we never order from on the purchasing dashboard:
  * internal manufacturing depts + dropship vendors handled outside the PO flow.
  *
@@ -2806,7 +2818,12 @@ export class FinaleClient {
             })).filter((c: any) => c.componentSku && c.quantity > 0);
 
         } catch (err: any) {
-            console.error(`Failed to fetch BOM for ${productId}:`, err.message);
+            // 404 is the expected outcome for any product without a BOM (most
+            // active SKUs). Logging every one drowned dashboards in noise during
+            // cold scans. Real failures (5xx, network errors) still surface.
+            if (!/Finale API 404\b/.test(err.message ?? '')) {
+                console.error(`Failed to fetch BOM for ${productId}:`, err.message);
+            }
             return [];
         }
     }
@@ -4949,9 +4966,15 @@ export class FinaleClient {
         await Promise.all(Array.from({ length: 3 }, async () => {
             while (skuQueue.length > 0) {
                 const sku = skuQueue.shift()!;
+                // Skip SKUs we've already proven have no BOM (saves ~80% of
+                // network roundtrips on warm scans).
+                if (_skuHasNoBomCache.has(sku)) continue;
                 try {
                     const bom = await this.getBillOfMaterials(sku);
-                    if (bom.length === 0) continue; // not an FG
+                    if (bom.length === 0) {
+                        _skuHasNoBomCache.add(sku);
+                        continue; // not an FG
+                    }
 
                     const activity = await this.getProductActivity(sku, daysBack);
                     const dailySalesRate = activity.soldQty / daysBack;
