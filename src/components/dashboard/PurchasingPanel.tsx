@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart } from "lucide-react";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart, Loader2 } from "lucide-react";
 import {
     canIncludeInDraftPO,
     canUseDirectOrdering,
@@ -946,15 +946,13 @@ export default function PurchasingPanel() {
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
-                {scanning && <span className="text-xs text-zinc-600 font-mono">scanning…</span>}
-                {loadingTiers.size > 0 && !scanning && (
-                    <span className="text-[10px] text-zinc-600 font-mono">
-                        loading {Array.from(loadingTiers).join(',')}…
-                    </span>
-                )}
-                {loadingTiers.size > 0 && !scanning && (
-                    <span className="text-[10px] text-zinc-600 font-mono">
-                        loading {Array.from(loadingTiers).join(',')}…
+                {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
+                {isLoading && data && (
+                    <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {scanning ? "Refreshing Finale…" : loadingTiers.size > 0
+                            ? `Loading ${Array.from(loadingTiers).join(", ")}…`
+                            : "Scanning…"}
                     </span>
                 )}
                 <div className="flex-1" />
@@ -1125,14 +1123,30 @@ export default function PurchasingPanel() {
                     )}
 
                     {isLoading && !data && (
-                        <div className="px-4 py-2 space-y-2.5">
-                            {[1, 2, 3, 4].map(i => (
-                                <div key={i} className="flex items-center gap-2.5">
-                                    <div className="w-2 h-2 rounded-full skeleton-shimmer shrink-0" />
-                                    <div className="skeleton-shimmer h-3.5" style={{ width: `${50 + i * 12}%` }} />
-                                    <div className="skeleton-shimmer h-3 w-10 ml-auto" />
+                        <div className="px-4 py-10 flex items-center justify-center">
+                            <div className="flex flex-col items-center gap-3 px-6 py-6 rounded-lg border border-emerald-500/30 bg-emerald-500/5 shadow-lg max-w-md w-full">
+                                <div className="relative">
+                                    <Loader2 className="w-9 h-9 text-emerald-400 animate-spin" />
+                                    <Package className="w-4 h-4 text-emerald-300 absolute inset-0 m-auto" />
                                 </div>
-                            ))}
+                                <div className="text-sm font-mono font-semibold text-emerald-200 tracking-wide">
+                                    {scanning ? "Refreshing Finale…" : "Scanning Finale…"}
+                                </div>
+                                <div className="text-[11px] font-mono text-zinc-400 text-center min-h-[14px]">
+                                    {loadingTiers.size > 0
+                                        ? `Loading ${Array.from(loadingTiers).join(", ")} items…`
+                                        : "Cold-path scans take 3–6 minutes. Hang tight."}
+                                </div>
+                                {/* Subtle skeleton hint underneath */}
+                                <div className="w-full space-y-1.5 pt-2">
+                                    {[1, 2, 3].map(i => (
+                                        <div key={i} className="flex items-center gap-2">
+                                            <div className="w-1.5 h-1.5 rounded-full skeleton-shimmer shrink-0" />
+                                            <div className="skeleton-shimmer h-2.5 rounded" style={{ width: `${45 + i * 14}%` }} />
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
                         </div>
                     )}
                     {error && (
