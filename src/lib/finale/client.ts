@@ -4849,16 +4849,17 @@ export class FinaleClient {
                 }
             }
 
-                const stockNode = data?.stockInfo?.edges?.[0]?.node;
-                const rawStock = stockNode?.unitsInStock ?? stockNode?.stockOnHand ?? null;
-                return {
-                    purchasedQty,
-                    soldQty,
-                    openPOs,
-                    stockOnHand: this.parseFinaleNum(rawStock),
-                    stockAvailable: this.parseFinaleNum(stockNode?.stockAvailable),
-                    lastPurchaseDate,
-                };
+            const stockNode = data?.stockInfo?.edges?.[0]?.node;
+            const stockOnHand = this.parseFinaleNum(stockNode?.stockOnHand)
+                ?? this.parseFinaleNum(stockNode?.unitsInStock);
+            return {
+                purchasedQty,
+                soldQty,
+                openPOs,
+                stockOnHand,
+                stockAvailable: this.parseFinaleNum(stockNode?.stockAvailable),
+                lastPurchaseDate,
+            };
         } catch (err: any) {
             console.error(`[finale] getProductActivity error for ${sku}:`, err.message);
             return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
