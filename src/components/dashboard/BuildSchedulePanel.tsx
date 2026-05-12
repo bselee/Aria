@@ -17,6 +17,7 @@ type Build = {
 
 type SnapshotComponent = {
   componentSku: string;
+  productName?: string | null;
   totalRequiredQty: number;
   onHand: number | null;
   onOrder: number | null;
@@ -119,7 +120,10 @@ function FulfillmentBadge({ scheduledQty, actualQty }: { scheduledQty: number; a
   );
 }
 
-function BuildRow({ b, risk, completed }: { b: Build; risk: string; completed?: Completion }) {
+function BuildRow({ b, risk, completed, components }: {
+  b: Build; risk: string; completed?: Completion;
+  components?: SnapshotComponent[];
+}) {
   const desc = b.originalEvent
     ? b.originalEvent.replace(/^\d+\s*(x\s*)?(bags?|units?|lbs?|of\s+)?/i, "").trim().slice(0, 45) || null
     : null;
@@ -127,33 +131,73 @@ function BuildRow({ b, risk, completed }: { b: Build; risk: string; completed?: 
   const dot = completed ? "bg-emerald-500" : RISK_DOT[risk];
   const showRisk = !completed && risk !== "OK";
 
+  // Click-to-expand: list the BOM components this build consumes. Pulled
+  // from the snapshot (components where usedIn includes this SKU). Sorted
+  // by risk severity, then stockout days asc, so the items that block
+  // the build sit at the top of the drawer.
+  const [open, setOpen] = useState(false);
+  const consumed = (components ?? [])
+    .filter(c => c.usedIn?.includes(b.sku))
+    .sort((a, b) => {
+      const ra = a.riskLevel === 'CRITICAL' ? 0 : a.riskLevel === 'WARNING' ? 1 : a.riskLevel === 'WATCH' ? 2 : 3;
+      const rb = b.riskLevel === 'CRITICAL' ? 0 : b.riskLevel === 'WARNING' ? 1 : b.riskLevel === 'WATCH' ? 2 : 3;
+      if (ra !== rb) return ra - rb;
+      return (a.stockoutDays ?? Infinity) - (b.stockoutDays ?? Infinity);
+    });
+  const canExpand = consumed.length > 0;
+
   return (
-    <div className="px-4 py-2.5 border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors">
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className={`w-2 h-2 rounded-full shrink-0 mt-0.5 ${dot}`} />
-          <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{b.sku}</span>
-          <span className="text-[10px] font-mono px-1 border border-zinc-700 bg-zinc-800 text-zinc-400 rounded shrink-0">{b.designation}</span>
+    <div className="border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors">
+      <button
+        type="button"
+        onClick={() => canExpand && setOpen(v => !v)}
+        disabled={!canExpand}
+        className={`w-full px-4 py-2.5 text-left ${canExpand ? 'cursor-pointer' : 'cursor-default'}`}
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className={`w-2 h-2 rounded-full shrink-0 mt-0.5 ${dot}`} />
+            {canExpand && (
+              <ChevronDown className={`w-3 h-3 text-zinc-500 shrink-0 transition-transform ${open ? '' : '-rotate-90'}`} />
+            )}
+            <span className="text-sm font-mono font-semibold text-zinc-100 truncate">{b.sku}</span>
+            <span className="text-[10px] font-mono px-1 border border-zinc-700 bg-zinc-800 text-zinc-400 rounded shrink-0">{b.designation}</span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {!completed && (
+              <span className="text-sm font-mono text-emerald-400">×{b.quantity.toLocaleString()}</span>
+            )}
+            {completed && (
+              <FulfillmentBadge scheduledQty={b.quantity} actualQty={completed.quantity} />
+            )}
+            {showRisk && (
+              <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
+            )}
+            {completed && (
+              <span className="text-[10px] font-mono text-emerald-400">
+                ✓ {fmtCompletedAt(completed.completed_at)}
+              </span>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {!completed && (
-            <span className="text-sm font-mono text-emerald-400">×{b.quantity.toLocaleString()}</span>
-          )}
-          {completed && (
-            <FulfillmentBadge scheduledQty={b.quantity} actualQty={completed.quantity} />
-          )}
-          {showRisk && (
-            <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
-          )}
-          {completed && (
-            <span className="text-[10px] font-mono text-emerald-400">
-              ✓ {fmtCompletedAt(completed.completed_at)}
-            </span>
-          )}
+        {desc && (
+          <div className="text-[11px] text-zinc-600 truncate mt-0.5 pl-5">{desc}</div>
+        )}
+      </button>
+      {open && canExpand && (
+        <div className="pl-10 pr-4 pb-2 pt-1 bg-zinc-950/40 border-t border-zinc-800/30">
+          {consumed.map(c => (
+            <div key={c.componentSku} className="flex items-center gap-2 text-[11px] font-mono py-0.5">
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${RISK_DOT[c.riskLevel]}`} />
+              <span className="text-zinc-200 font-semibold shrink-0">{c.componentSku}</span>
+              {c.productName && (
+                <span className="text-zinc-400 truncate flex-1" title={c.productName}>· {c.productName}</span>
+              )}
+              <span className="text-zinc-500 shrink-0 ml-auto">{c.stockoutDays != null ? `${c.stockoutDays}d` : '—'}</span>
+              <span className="text-zinc-600 shrink-0">on hand {c.onHand ?? '?'}</span>
+            </div>
+          ))}
         </div>
-      </div>
-      {desc && (
-        <div className="text-[11px] text-zinc-600 truncate mt-0.5 pl-5">{desc}</div>
       )}
     </div>
   );
@@ -265,9 +309,8 @@ export default function BuildSchedulePanel() {
     return d.toISOString().slice(0, 10) === today;
   });
 
-  const atRiskComponents = snapshot
-    ? Object.values(snapshot.components).filter(c => c.riskLevel !== "OK")
-    : [];
+  const allComponents = snapshot ? Object.values(snapshot.components) : [];
+  const atRiskComponents = allComponents.filter(c => c.riskLevel !== "OK");
 
   // Group into unified timeline by date
   const timelineMap = new Map<string, { builds: Build[]; stockouts: SnapshotComponent[] }>();
@@ -351,7 +394,7 @@ export default function BuildSchedulePanel() {
                 {todayCompletions.map(c => {
                   const build = allBuilds.find(b => b.sku === c.sku);
                   if (build) {
-                    return <BuildRow key={`b-${c.id}`} b={build} risk="OK" completed={c} />;
+                    return <BuildRow key={`b-${c.id}`} b={build} risk="OK" completed={c} components={allComponents} />;
                   } else {
                     return <CompletionRow key={`c-${c.id}`} c={c} noCalEvent />;
                   }
@@ -382,16 +425,20 @@ export default function BuildSchedulePanel() {
                     b={b}
                     risk={buildRisk(b.sku)}
                     completed={completionBySku.get(b.sku)}
+                    components={allComponents}
                   />
                 ))}
 
-                {/* Stockout warnings */}
-                {stockouts.map(comp => (
+                {/* Stockout warnings — sorted by stockout days asc (worst first) */}
+                {stockouts
+                  .slice()
+                  .sort((a, b) => (a.stockoutDays ?? Infinity) - (b.stockoutDays ?? Infinity))
+                  .map(comp => (
                   <div key={`s-${comp.componentSku}`} className="px-4 py-2 border-b border-zinc-800/20 bg-rose-500/[0.02] border-l-2 border-l-rose-500/30 flex flex-col gap-1">
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="w-3 h-3 text-rose-500/70 shrink-0" />
                       <span className="text-xs font-mono font-semibold text-rose-300">
-                        {comp.componentSku} runs out
+                        {comp.componentSku}{comp.productName ? <span className="text-zinc-400 font-normal"> · {comp.productName}</span> : null} runs out
                       </span>
                       {comp.incomingPOs.length > 0 && (
                         <span className="text-[10px] font-mono text-emerald-500 ml-auto border border-emerald-500/30 bg-emerald-500/10 px-1 py-0.5 rounded">
@@ -429,6 +476,7 @@ export default function BuildSchedulePanel() {
                         b={b}
                         risk="OK"
                         completed={completionBySku.get(b.sku)}
+                        components={allComponents}
                       />
                     ))}
                   </section>

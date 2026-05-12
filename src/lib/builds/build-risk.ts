@@ -26,6 +26,7 @@ import { FinaleClient } from '../finale/client';
 
 export interface ComponentDemand {
     componentSku: string;
+    productName?: string | null;       // Friendly Finale internalName (post-2026-05-12 snapshots)
     totalRequiredQty: number;
     onHand: number | null;           // Current stock on hand from Finale
     onOrder: number | null;
@@ -233,6 +234,7 @@ export async function runBuildRiskAnalysis(
                 if (!componentDemandTracker.has(sku)) {
                     componentDemandTracker.set(sku, {
                         componentSku: sku,
+                        productName: null,
                         totalRequiredQty: 0,
                         onHand: null,
                         onOrder: null,
@@ -289,6 +291,7 @@ export async function runBuildRiskAnalysis(
 
     const tasks = demandEntries.map(demand => async () => {
         const profile = await finale.getComponentStockProfile(demand.componentSku);
+        demand.productName = profile.productName;
         demand.onHand = profile.onHand;
         demand.onOrder = profile.onOrder;
         demand.stockoutDays = profile.stockoutDays;
