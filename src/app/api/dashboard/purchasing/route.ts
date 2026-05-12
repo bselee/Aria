@@ -2,17 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
 import { mergeIntoGroups } from '@/lib/finale/bom-demand';
-
-// Module-level caches — full scans take minutes and make hundreds of API calls.
-let cache: PurchasingGroup[] | null = null;
-let cacheAt = 0;
-let bomCache: PurchasingGroup[] | null = null;
-let bomCacheAt = 0;
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
-
-// Scan-in-progress locks: concurrent requests de-duplicate to the same promise.
-let cachePromise: Promise<PurchasingGroup[]> | null = null;
-let bomCachePromise: Promise<PurchasingGroup[]> | null = null;
+import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
@@ -27,68 +17,37 @@ export async function GET(req: NextRequest) {
     const summaryLimit = parseInt(req.nextUrl.searchParams.get('limit') ?? '10') || 10;
 
     const client = new FinaleClient();
+    let refreshing = false;
 
-    // ── Resale pipeline (existing) ──
+    // ── Resale pipeline ──
     let resaleGroups: PurchasingGroup[] = [];
     if (mode === 'all' || mode === 'resale') {
-        const needsScan = bust || !cache || Date.now() - cacheAt > CACHE_TTL;
-        if (needsScan) {
-            if (!cachePromise) {
-                cachePromise = (async () => {
-                    try {
-                        cache = await client.getPurchasingIntelligence(daysBack);
-                        cacheAt = Date.now();
-                        return cache;
-                    } catch (err: any) {
-                        cache = null;
-                        cacheAt = 0;
-                        throw err;
-                    } finally {
-                        cachePromise = null;
-                    }
-                })();
-            }
-            try {
-                await cachePromise;
-            } catch (err: any) {
-                return NextResponse.json(
-                    { error: err.message },
-                    { status: 500, headers: { 'Cache-Control': 'no-store' } }
-                );
-            }
+        try {
+            const r = await readSWR(resaleSlot, () => client.getPurchasingIntelligence(daysBack), bust);
+            resaleGroups = r.value.map(g => ({
+                ...g,
+                items: g.items.map(item => ({ ...item, itemType: item.itemType || 'resale' as const })),
+            }));
+            refreshing = refreshing || r.refreshing;
+        } catch (err: any) {
+            return NextResponse.json(
+                { error: err.message },
+                { status: 500, headers: { 'Cache-Control': 'no-store' } }
+            );
         }
-        resaleGroups = (cache || []).map(g => ({
-            ...g,
-            items: g.items.map(item => ({ ...item, itemType: item.itemType || 'resale' as const })),
-        }));
     }
 
-    // ── BOM pipeline ──
+    // ── BOM pipeline (non-fatal — errors return empty so resale still works) ──
     let bomGroups: PurchasingGroup[] = [];
     if (mode === 'all' || mode === 'bom' || summary === 'bom') {
-        const needsBomScan = bust || !bomCache || Date.now() - bomCacheAt > CACHE_TTL;
-        if (needsBomScan) {
-            if (!bomCachePromise) {
-                bomCachePromise = (async () => {
-                    try {
-                        bomCache = await client.getBOMDemand(bomDaysBack);
-                        bomCacheAt = Date.now();
-                        return bomCache;
-                    } catch (err: any) {
-                        console.error('[purchasing/route] BOM demand error:', err.message);
-                        bomCache = []; // non-fatal — empty BOM but resale still works
-                        bomCacheAt = Date.now();
-                        return bomCache;
-                    } finally {
-                        bomCachePromise = null;
-                    }
-                })();
-            }
-            try {
-                await bomCachePromise;
-            } catch { /* swallowed above */ }
+        try {
+            const r = await readSWR(bomSlot, () => client.getBOMDemand(bomDaysBack), bust);
+            bomGroups = r.value;
+            refreshing = refreshing || r.refreshing;
+        } catch (err: any) {
+            console.error('[purchasing/route] BOM demand error:', err.message);
+            bomGroups = [];
         }
-        bomGroups = bomCache || [];
     }
 
     // ── Summary mode (for build screen card) ──
@@ -97,7 +56,7 @@ export async function GET(req: NextRequest) {
             .sort((a, b) => a.runwayDays - b.runwayDays)
             .slice(0, summaryLimit);
         return NextResponse.json(
-            { items: allBomItems, cachedAt: new Date(bomCacheAt || Date.now()).toISOString() },
+            { items: allBomItems, cachedAt: new Date(bomSlot.at || Date.now()).toISOString(), refreshing },
             { headers: { 'Cache-Control': 'no-store' } }
         );
     }
@@ -132,9 +91,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(
         {
             groups: responseGroups,
-            cachedAt: new Date(cacheAt).toISOString(),
+            cachedAt: new Date(resaleSlot.at || bomSlot.at || Date.now()).toISOString(),
             vendorSummaries: assessment.vendorSummaries,
             mode,
+            refreshing,
         },
         { headers: { 'Cache-Control': 'no-store' } }
     );
@@ -154,9 +114,9 @@ export async function POST(req: NextRequest) {
         const client = new FinaleClient();
         const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
 
-        // Invalidate both caches so next GET reflects the new PO
-        cache = null;
-        bomCache = null;
+        // Invalidate caches so the next GET shows the new PO. The next read
+        // will SWR-refresh in the background — user still gets a fast response.
+        invalidatePurchasingCaches();
 
         return NextResponse.json(result);
     } catch (err: any) {

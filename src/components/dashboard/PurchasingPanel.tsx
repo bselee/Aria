@@ -12,7 +12,7 @@ import {
     type OrderingFocusFilter,
 } from "@/lib/purchasing/dashboard-focus";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
-import type { FinaleReorderMethod } from "@/lib/finale/client";
+import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -72,6 +72,9 @@ type PurchasingItem = {
         buildsWorth: number;
     }>;
     totalBurnRate?: number;
+    medianPOGapDays?: number;
+    projectedNextOrderDate?: string;
+    receiptConfidence?: 'high' | 'medium' | 'low';
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -81,6 +84,8 @@ type AssessmentData = {
         actionableCount: number; blockedCount: number;
         highestConfidence: "high" | "medium" | "low" | null;
     }>;
+    refreshing?: boolean;
+    error?: string;
 };
 type POResult = { orderId: string; finaleUrl: string };
 type CommitReview = {
@@ -220,7 +225,9 @@ export default function PurchasingPanel() {
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
     const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
-    const [focusFilter, setFocusFilter] = useState<FocusFilter>("order_now");
+    // Default to "all" so every item is visible, sorted most-needed-first.
+    // Will: "We just want items in ordering to be staged from most needed to least always."
+    const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
     type ItemMode = 'all' | 'resale' | 'bom';
     const [itemMode, setItemMode] = useState<ItemMode>('all');
@@ -379,6 +386,11 @@ export default function PurchasingPanel() {
     function itemMatchesFocus(item: PurchasingItem): boolean {
         return itemMatchesOrderingFocus(item, focusFilter);
     }
+    function itemMatchesMode(item: PurchasingItem): boolean {
+        if (itemMode === "all") return true;
+        if (itemMode === "bom") return item.itemType === "bom-component";
+        return item.itemType !== "bom-component";
+    }
     function itemMatchesLifecycle(item: PurchasingItem): boolean {
         if (lifecycleFilter === "all") return true;
         return lifecycleBucket(item) === lifecycleFilter;
@@ -421,97 +433,65 @@ export default function PurchasingPanel() {
     }
 
     // ── data load ──────────────────────────────────────────────────────────
-    // Progressive urgency-tier loading: critical first, then warning, watch, ok.
-    // On bust, only tier 1 busts the server cache; subsequent tiers hit warm cache.
+    // Single fetch — all tiers, sorted by need server-side then again client-side.
+    // SWR keeps this fast (warm cache returns in <100ms).
     async function load(bust = false) {
         setError(null);
         if (!data) setLoading(true);
         else if (bust) setScanning(true);
 
-        const errors: string[] = [];
+        setLoadingTiers(new Set(['critical', 'warning', 'watch', 'ok']));
+        try {
+            const res = await fetch(`/api/dashboard/purchasing?mode=all${bust ? '&bust=1' : ''}`);
+            const json: AssessmentData = await res.json();
+            if (!res.ok) throw new Error(json.error || `Failed to load ordering`);
 
-        const runTier = async (tier: UrgencyTier, bustThis: boolean): Promise<boolean> => {
-            setLoadingTiers(p => new Set([...p, tier]));
-            try {
-                const res = await fetch(`/api/dashboard/purchasing?urgency=${tier}&mode=${itemMode}${bustThis ? '&bust=1' : ''}`);
-                const json: AssessmentData = await res.json();
-                if (!res.ok) throw new Error(json.error || `Failed tier ${tier}`);
+            if (json.refreshing) setScanning(true);
+            else setScanning(false);
 
-                // Merge progressive tiers, but replace stale data after an explicit rescan.
-                setData(prev => {
-                    if (!prev || bustThis) return json;
-                    const existingIds = new Set(prev.groups.map(g => g.vendorPartyId));
-                    const newGroups = json.groups.filter(g => !existingIds.has(g.vendorPartyId));
-                    const mergedGroups = [...prev.groups, ...newGroups];
-                    // Keep vendorSummaries from the latest response
-                    return {
-                        groups: mergedGroups,
-                        cachedAt: json.cachedAt,
-                        vendorSummaries: json.vendorSummaries ?? prev.vendorSummaries,
-                    };
-                });
-
-                // Init checkboxes/qtys for new groups
-                setChecked(prev => {
-                    const next: Record<string, Record<string, boolean>> = { ...prev };
-                    for (const g of json.groups) {
-                        if (next[g.vendorPartyId]) continue; // preserve existing
-                        next[g.vendorPartyId] = {};
-                        for (const item of g.items) {
-                            next[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
-                        }
-                    }
-                    return next;
-                });
-
-                setQtys(prev => {
-                    const next: Record<string, Record<string, number>> = { ...prev };
-                    for (const g of json.groups) {
-                        if (next[g.vendorPartyId]) continue;
-                        next[g.vendorPartyId] = {};
-                        for (const item of g.items) {
-                            // Default to OUR suggestion when quantities diverge (>20%)
-                            next[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
-                        }
-                    }
-                    return next;
-                });
-
-                return true;
-            } catch (e: any) {
-                errors.push(e.message);
-                return false;
-            } finally {
-                setLoadingTiers(p => {
-                    const n = new Set(p);
-                    n.delete(tier);
-                    return n;
-                });
-            }
-        };
-
-        let anySuccess = false;
-
-        // Tier 1: critical — bust if requested. Always render even if empty.
-        if (await runTier('critical', bust)) anySuccess = true;
-        if (anySuccess) {
+            setData(json);
             setLoading(false);
-            setScanning(false);
-        }
 
-        // Remaining tiers share the warm cache and can load together. This keeps
-        // Ordering from feeling like it is filling one bucket at a time.
-        await Promise.all((['warning', 'watch', 'ok'] as UrgencyTier[]).map(tier => runTier(tier, false)));
-
-        if (errors.length > 0 && !anySuccess) {
-            setError(errors.join(' | '));
-        } else if (errors.length > 0) {
-            setError(errors.join(' | '));
+            // Init checkboxes/qtys for new groups
+            setChecked(prev => {
+                const next: Record<string, Record<string, boolean>> = { ...prev };
+                for (const g of json.groups) {
+                    if (next[g.vendorPartyId]) continue;
+                    next[g.vendorPartyId] = {};
+                    for (const item of g.items) {
+                        next[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
+                    }
+                }
+                return next;
+            });
+            setQtys(prev => {
+                const next: Record<string, Record<string, number>> = { ...prev };
+                for (const g of json.groups) {
+                    if (next[g.vendorPartyId]) continue;
+                    next[g.vendorPartyId] = {};
+                    for (const item of g.items) {
+                        next[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
+                    }
+                }
+                return next;
+            });
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setLoadingTiers(new Set());
         }
     }
 
     useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
-    useEffect(() => { load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [itemMode]);
+
+    // Auto-poll while the server reports a background scan in flight. Stops
+    // as soon as `refreshing` flips false (cache is warm).
+    useEffect(() => {
+        if (!data?.refreshing) return;
+        const t = setTimeout(() => { load(); }, 15_000);
+        return () => clearTimeout(t);
+        /* eslint-disable-next-line react-hooks/exhaustive-deps */
+    }, [data?.refreshing, data?.cachedAt]);
 
     function toggleExpand(id: string) {
         setExpanded(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -718,7 +698,12 @@ export default function PurchasingPanel() {
     }
 
     // ── derived state ──────────────────────────────────────────────────────
-    const allGroups = data?.groups ?? [];
+    const allGroups = (data?.groups ?? [])
+        .map(group => ({
+            ...group,
+            items: group.items.filter(itemMatchesMode),
+        }))
+        .filter(group => group.items.length > 0);
 
     /**
      * v2 vendor sort. Score each group by *real* purchase need: earliest
@@ -950,7 +935,7 @@ export default function PurchasingPanel() {
                 {isLoading && data && (
                     <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
                         <Loader2 className="w-3 h-3 animate-spin" />
-                        {scanning ? "Refreshing Finale…" : loadingTiers.size > 0
+                        {scanning ? "Refreshing…" : loadingTiers.size > 0
                             ? `Loading ${Array.from(loadingTiers).join(", ")}…`
                             : "Scanning…"}
                     </span>
@@ -1130,7 +1115,7 @@ export default function PurchasingPanel() {
                                     <Package className="w-4 h-4 text-emerald-300 absolute inset-0 m-auto" />
                                 </div>
                                 <div className="text-sm font-mono font-semibold text-emerald-200 tracking-wide">
-                                    {scanning ? "Refreshing Finale…" : "Scanning Finale…"}
+                                    {scanning ? "Refreshing…" : "Refreshing…"}
                                 </div>
                                 <div className="text-[11px] font-mono text-zinc-400 text-center min-h-[14px]">
                                     {loadingTiers.size > 0
@@ -1730,6 +1715,11 @@ export default function PurchasingPanel() {
                                                                                     <div className="flex items-start justify-between gap-2">
                                                                                         <div className="text-[11px] font-mono text-zinc-400 italic flex-1">
                                                                                             {item.assessment?.explanation ?? item.explanation}
+                                                                                            {item.projectedNextOrderDate && (
+                                                                                                <span className="ml-2 text-cyan-300 not-italic">
+                                                                                                    · 🔮 Next order ~{item.projectedNextOrderDate}
+                                                                                                </span>
+                                                                                            )}
                                                                                         </div>
                                                                                         {item.recommendation && (
                                                                                             <button

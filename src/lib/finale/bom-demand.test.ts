@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups } from './bom-demand';
+import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding } from './bom-demand';
 import { FinaleClient, __bomComponent404CacheForTests, __skuHasNoBomCacheForTests } from './client';
 
 describe('computeComponentBurnRates', () => {
@@ -42,6 +42,171 @@ describe('classifyUrgency', () => {
     });
     it('returns ok when runway >= lead time + 60', () => {
         expect(classifyUrgency(90, 14)).toBe('ok');
+    });
+});
+
+describe('chooseBomVelocity', () => {
+    it('prefers receipt velocity when present', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 0.42, bomDerivedVelocity: 0.18 }))
+            .toEqual({ value: 0.42, source: 'receipts' });
+    });
+    it('falls back to BOM-derived velocity when receipts are zero', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 0, bomDerivedVelocity: 0.18 }))
+            .toEqual({ value: 0.18, source: 'demand' });
+    });
+    it('returns none when both signals are zero', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 0, bomDerivedVelocity: 0 }))
+            .toEqual({ value: 0, source: 'none' });
+    });
+});
+
+describe('computeReceiptConfidence', () => {
+    it('high when ≥4 POs spread ≥180 days', () => {
+        expect(computeReceiptConfidence({
+            purchaseCount: 6,
+            firstPurchaseDate: '2025-08-01',
+            lastPurchaseDate: '2026-05-01',
+        })).toBe('high');
+    });
+    it('medium when 2-3 POs spread ≥90 days', () => {
+        expect(computeReceiptConfidence({
+            purchaseCount: 3,
+            firstPurchaseDate: '2026-01-01',
+            lastPurchaseDate: '2026-05-01',
+        })).toBe('medium');
+    });
+    it('low for a single PO', () => {
+        expect(computeReceiptConfidence({
+            purchaseCount: 1,
+            firstPurchaseDate: '2026-03-01',
+            lastPurchaseDate: '2026-03-01',
+        })).toBe('low');
+    });
+    it('low when POs cluster within 30 days', () => {
+        expect(computeReceiptConfidence({
+            purchaseCount: 3,
+            firstPurchaseDate: '2026-05-01',
+            lastPurchaseDate: '2026-05-20',
+        })).toBe('low');
+    });
+    it('low when dates are missing', () => {
+        expect(computeReceiptConfidence({
+            purchaseCount: 5,
+            firstPurchaseDate: null,
+            lastPurchaseDate: null,
+        })).toBe('low');
+    });
+});
+
+describe('computeMedianPOGap', () => {
+    it('returns null when fewer than 2 dates', () => {
+        expect(computeMedianPOGap([])).toBeNull();
+        expect(computeMedianPOGap(['2026-04-01'])).toBeNull();
+    });
+    it('computes monthly cadence', () => {
+        const gap = computeMedianPOGap(['2026-01-15', '2026-02-15', '2026-03-15', '2026-04-15']);
+        // Calendar months have 28-31 days; median of {31, 28, 31} = 31, or of even count averaged
+        expect(gap).toBeGreaterThanOrEqual(28);
+        expect(gap).toBeLessThanOrEqual(31);
+    });
+    it('returns the median, not the mean', () => {
+        // Gaps: 10, 10, 60 → sorted 10, 10, 60 → median 10
+        const gap = computeMedianPOGap(['2026-01-01', '2026-01-11', '2026-01-21', '2026-03-22']);
+        expect(gap).toBe(10);
+    });
+});
+
+describe('classifyBomUrgency', () => {
+    it('critical when adjusted runway under lead time', () => {
+        expect(classifyBomUrgency({ adjustedRunwayDays: 10, leadTimeDays: 14, medianPOGapDays: 30 }))
+            .toBe('critical');
+    });
+    it('uses cadence as warning threshold when available', () => {
+        // 14d lead + 30d cadence = warning cutoff 44d
+        expect(classifyBomUrgency({ adjustedRunwayDays: 40, leadTimeDays: 14, medianPOGapDays: 30 }))
+            .toBe('warning');
+        expect(classifyBomUrgency({ adjustedRunwayDays: 50, leadTimeDays: 14, medianPOGapDays: 30 }))
+            .toBe('watch');
+    });
+    it('uses 2× cadence as watch threshold', () => {
+        // 14d + 2×30 = 74d watch cutoff
+        expect(classifyBomUrgency({ adjustedRunwayDays: 70, leadTimeDays: 14, medianPOGapDays: 30 }))
+            .toBe('watch');
+        expect(classifyBomUrgency({ adjustedRunwayDays: 80, leadTimeDays: 14, medianPOGapDays: 30 }))
+            .toBe('ok');
+    });
+    it('falls back to lead+45/+90 when cadence is null', () => {
+        expect(classifyBomUrgency({ adjustedRunwayDays: 50, leadTimeDays: 14, medianPOGapDays: null }))
+            .toBe('warning'); // <14+45=59
+        expect(classifyBomUrgency({ adjustedRunwayDays: 70, leadTimeDays: 14, medianPOGapDays: null }))
+            .toBe('watch'); // <14+90=104
+    });
+});
+
+describe('applyCommonOrderRounding', () => {
+    it('passes through when no history', () => {
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 3, purchaseQtys: [] });
+        expect(r.suggestedQty).toBe(3);
+        expect(r.commonOrderQty).toBeNull();
+        expect(r.rationale).toBe('no-history');
+    });
+    it('snaps up to single historical qty', () => {
+        // Raw 3, single past order of 12 → snap to 12
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 3, purchaseQtys: [12] });
+        expect(r.suggestedQty).toBe(12);
+        expect(r.commonOrderQty).toBe(12);
+        expect(r.rationale).toBe('single');
+    });
+    it('snaps up to mode when ≥40% of orders match', () => {
+        // Raw 3, mode = 12 (3 of 5 orders) → snap to 12
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 3, purchaseQtys: [12, 12, 12, 24, 6] });
+        expect(r.suggestedQty).toBe(12);
+        expect(r.rationale).toBe('mode');
+    });
+    it('multiplies the mode when raw need exceeds it', () => {
+        // Raw 25, mode 12 → snap up to 36 (3x)
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 25, purchaseQtys: [12, 12, 12, 12] });
+        expect(r.suggestedQty).toBe(36);
+    });
+    it('uses median when variance is low and no mode', () => {
+        // Qtys: 10, 11, 12, 13 → no mode, mean=11.5, stddev≈1.12, cv≈0.097 → low variance → median 11.5
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 5, purchaseQtys: [10, 11, 12, 13] });
+        expect(r.rationale).toBe('median');
+        expect(r.commonOrderQty).toBe(11.5);
+    });
+    it('does not round when orders are highly variable', () => {
+        // Qtys: 5, 50, 200, 1000 → very high CV → no rounding
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 100, purchaseQtys: [5, 50, 200, 1000] });
+        expect(r.suggestedQty).toBe(100);
+        expect(r.rationale).toBe('variable');
+        expect(r.commonOrderQty).toBeNull();
+    });
+    it('worm-castings truckload: snaps to 42000 mode', () => {
+        const r = applyCommonOrderRounding({
+            rawSuggestedQty: 35860,
+            purchaseQtys: [42000, 42000, 42000, 42000],
+        });
+        expect(r.suggestedQty).toBe(42000);
+        expect(r.commonOrderQty).toBe(42000);
+        expect(r.rationale).toBe('mode');
+    });
+});
+
+describe('projectNextOrderDate', () => {
+    it('returns today when runway is already below lead-time threshold', () => {
+        const now = new Date('2026-05-12');
+        const out = projectNextOrderDate({
+            stockOnHand: 10, stockOnOrder: 0, dailyBurn: 5, leadTimeDays: 14, now,
+        });
+        expect(out).toBe('2026-05-12');
+    });
+    it('projects future date based on remaining runway after lead-time buffer', () => {
+        const now = new Date('2026-05-12');
+        // 100 stock @ 1/day = 100d runway, minus 14d lead = order in 86d ≈ 2026-08-06
+        const out = projectNextOrderDate({
+            stockOnHand: 100, stockOnOrder: 0, dailyBurn: 1, leadTimeDays: 14, now,
+        });
+        expect(out).toBe('2026-08-06');
     });
 });
 
@@ -232,6 +397,75 @@ describe('getBOMDemand perf optimisations', () => {
         expect(activityCalledAt).toBeLessThan(restResolvedAt);
         // Fast side resolves long before slow side (clear evidence of parallel).
         expect(activityResolvedAt).toBeLessThan(restResolvedAt);
+    });
+
+    it('excludes inactive and do-not-reorder BOM components from purchasing demand', async () => {
+        const client = new FinaleClient();
+
+        const proto = FinaleClient.prototype as any;
+        vi.spyOn(proto, 'get').mockImplementation(async (endpoint: string) => {
+            if (endpoint.includes('/api/product/COMP-DNR')) {
+                return {
+                    productId: 'COMP-DNR',
+                    internalName: 'Deprecated component',
+                    statusId: 'PRODUCT_INACTIVE',
+                    userCategory: 'Deprecating',
+                    reorderGuidelineList: [
+                        { reorderCalculationMethodId: '##doNotReorder' },
+                    ],
+                    supplierList: [{ supplierPartyUrl: '/buildasoil/api/partygroup/V1', unitPrice: 5 }],
+                    orderIncrementQuantity: 1,
+                };
+            }
+            if (endpoint.includes('/api/product/FG1')) {
+                return { productId: 'FG1', internalName: 'Finished Good' };
+            }
+            return {};
+        });
+
+        vi.spyOn(client, 'getProductActivity').mockImplementation(async (sku: string) => {
+            if (sku === 'COMP-DNR') {
+                return { stockOnHand: 0, openPOs: [], purchasedQty: 0, soldQty: 0 } as any;
+            }
+            return { stockOnHand: 0, openPOs: [], purchasedQty: 0, soldQty: 90 } as any;
+        });
+
+        vi.spyOn(client, 'getBillOfMaterials').mockImplementation(async (sku: string) => {
+            if (sku === 'FG1') return [{ componentSku: 'COMP-DNR', quantity: 1 } as any];
+            return [];
+        });
+
+        global.fetch = vi.fn(async (url: any) => {
+            const u = String(url);
+            if (u.includes('/api/graphql')) {
+                return new Response(JSON.stringify({
+                    data: {
+                        productViewConnection: {
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            edges: [{ node: { productId: 'FG1', status: 'Active' } }],
+                        },
+                    },
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+            if (u.includes('/api/partygroup/V1')) {
+                return new Response(JSON.stringify({ groupName: 'Vendor One' }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as any;
+
+        const ltModule = await import('@/lib/builds/lead-time-service');
+        vi.spyOn(ltModule.leadTimeService, 'getForVendor').mockResolvedValue({
+            days: 14,
+            label: 'default',
+            source: 'default',
+        } as any);
+
+        const groups = await client.getBOMDemand(90);
+
+        expect(groups).toHaveLength(0);
     });
 
     /**
