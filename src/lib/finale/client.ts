@@ -194,6 +194,12 @@ export interface PurchasingItem {
     }>;
     /** v3 — total daily burn rate summed across all FG consumers (BOM items only) */
     totalBurnRate?: number;
+    /** Median days between past POs for this SKU — drives cadence-aware urgency. */
+    medianPOGapDays?: number;
+    /** Estimated date when stock will hit the lead-time threshold = "place next order by then". */
+    projectedNextOrderDate?: string;
+    /** Confidence in receipt-derived velocity. */
+    receiptConfidence?: 'high' | 'medium' | 'low';
 }
 
 export interface PurchasingGroup {
@@ -905,6 +911,8 @@ export class FinaleClient {
      * DECISION(2026-03-04): Products marked "Do not reorder" in Finale should be
      * excluded from ALL reorder assessments and draft PO creation. We check
      * multiple possible locations since Finale's storage varies:
+     *   - inactive product status
+     *   - category/user category marked "Deprecating"
      *   - `reorderPointPolicy` field (e.g. "DO_NOT_REORDER", "doNotReorder")
      *   - `doNotReorder` boolean field
      *   - Product name or description containing "do not reorder" (case-insensitive)
@@ -915,6 +923,16 @@ export class FinaleClient {
      */
     static isDoNotReorder(productData: any): boolean {
         if (!productData) return false;
+
+        const status = String(productData.statusId || productData.status || '').toLowerCase();
+        if (status.includes('inactive') || status.includes('discontinued')) {
+            return true;
+        }
+
+        const category = String(productData.userCategory || productData.category || '').toLowerCase();
+        if (category.includes('deprecat')) {
+            return true;
+        }
 
         // Check reorderPointPolicy field
         const policy = String(productData.reorderPointPolicy || '').toLowerCase();
@@ -4764,6 +4782,10 @@ export class FinaleClient {
         stockOnHand: number | null;
         stockAvailable: number | null;
         lastPurchaseDate: string | null;
+        firstPurchaseDate: string | null;
+        purchaseCount: number;
+        purchaseDates: string[];
+        purchaseQtys: number[];
     }> {
         const now = new Date();
         const end = new Date(now);
@@ -4834,15 +4856,24 @@ export class FinaleClient {
 
             let purchasedQty = 0;
             let lastPurchaseDate: string | null = null;
+            let firstPurchaseDate: string | null = null;
+            let purchaseCount = 0;
+            const purchaseDates: string[] = [];
+            const purchaseQtys: number[] = [];
             for (const edge of data?.purchasedIn?.edges || []) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
                 if (!lastPurchaseDate && po.orderDate) {
                     lastPurchaseDate = po.orderDate;
                 }
+                if (po.orderDate) firstPurchaseDate = po.orderDate; // edges are desc; last seen = earliest
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
-                        purchasedQty += parseFinaleNumber(ie.node.quantity);
+                        const lineQty = parseFinaleNumber(ie.node.quantity);
+                        purchasedQty += lineQty;
+                        purchaseCount += 1;
+                        if (po.orderDate) purchaseDates.push(po.orderDate);
+                        if (lineQty > 0) purchaseQtys.push(lineQty);
                         break;
                     }
                 }
@@ -4886,10 +4917,14 @@ export class FinaleClient {
                 stockOnHand,
                 stockAvailable: this.parseFinaleNum(stockNode?.stockAvailable),
                 lastPurchaseDate,
+                firstPurchaseDate,
+                purchaseCount,
+                purchaseDates,
+                purchaseQtys,
             };
         } catch (err: any) {
             console.error(`[finale] getProductActivity error for ${sku}:`, err.message);
-            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null };
+            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null, firstPurchaseDate: null, purchaseCount: 0, purchaseDates: [], purchaseQtys: [] };
         }
     }
 
@@ -4926,7 +4961,7 @@ export class FinaleClient {
      * via a productAssocList GraphQL filter or a sales-velocity prefilter.
      */
     async getBOMDemand(daysBack = 90): Promise<PurchasingGroup[]> {
-        const { computeComponentBurnRates, classifyUrgency } = await import('./bom-demand');
+        const { computeComponentBurnRates, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding } = await import('./bom-demand');
         type FGVelocity = import('./bom-demand').FGVelocity;
 
         // ── Step 1: Page Active SKUs ──
@@ -4978,8 +5013,11 @@ export class FinaleClient {
 
                     const activity = await this.getProductActivity(sku, daysBack);
                     const dailySalesRate = activity.soldQty / daysBack;
-                    if (dailySalesRate <= 0) continue; // no demand signal
 
+                    // DECISION(2026-05-12): Don't gate on FG sales rate. Components
+                    // surface based on their own receipt velocity (primary signal),
+                    // so build-ahead/contract FGs that never show retail sales still
+                    // contribute via their components' historical purchasing.
                     const prodData = await this.get(
                         `/${this.accountPath}/api/product/${encodeURIComponent(sku)}`
                     );
@@ -5017,6 +5055,8 @@ export class FinaleClient {
                         this.get(`/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`),
                         this.getProductActivity(compSku, daysBack),
                     ]);
+                    if (FinaleClient.isDoNotReorder(prodData)) continue;
+
                     const suppliers: any[] = prodData.supplierList || [];
                     const mainSupplier = suppliers.find((s: any) =>
                         s.supplierPrefOrderId?.includes('MAIN')
@@ -5046,13 +5086,39 @@ export class FinaleClient {
                     const leadTimeDays = lt.days;
                     const leadTimeProvenance = lt.label;
 
-                    const runwayDays = demand.totalBurnRate > 0
-                        ? stockOnHand / demand.totalBurnRate
+                    // DECISION(2026-05-12): Receipt velocity is the primary signal.
+                    // Captures seasonality, builds, contracts, wholesale, growth —
+                    // everything the FG-sales-derived burn rate misses. FG-derived
+                    // demand is the fallback for components with no purchase history.
+                    const receiptVelocity = compActivity.purchasedQty / daysBack;
+                    const bomDerivedVelocity = demand.totalBurnRate;
+                    const chosen = chooseBomVelocity({ receiptVelocity, bomDerivedVelocity });
+                    const confidence = chosen.source === 'receipts'
+                        ? computeReceiptConfidence({
+                            purchaseCount: compActivity.purchaseCount,
+                            firstPurchaseDate: compActivity.firstPurchaseDate,
+                            lastPurchaseDate: compActivity.lastPurchaseDate,
+                        })
+                        : 'medium';
+                    const dailyBurn = chosen.value;
+                    if (dailyBurn <= 0) continue; // nothing to order — no receipts AND no FG demand
+
+                    const runwayDays = dailyBurn > 0 ? stockOnHand / dailyBurn : 9999;
+                    const adjustedRunwayDays = dailyBurn > 0
+                        ? (stockOnHand + stockOnOrder) / dailyBurn
                         : 9999;
-                    const adjustedRunwayDays = demand.totalBurnRate > 0
-                        ? (stockOnHand + stockOnOrder) / demand.totalBurnRate
-                        : 9999;
-                    const urgency = classifyUrgency(adjustedRunwayDays, leadTimeDays);
+                    const medianPOGapDays = computeMedianPOGap(compActivity.purchaseDates);
+                    const urgency = classifyBomUrgency({
+                        adjustedRunwayDays,
+                        leadTimeDays,
+                        medianPOGapDays,
+                    });
+                    const projectedNextOrderDate = projectNextOrderDate({
+                        stockOnHand,
+                        stockOnOrder,
+                        dailyBurn,
+                        leadTimeDays,
+                    });
 
                     // buildsWorth approximation: batch ≈ dailySalesRate*30. Phase 2 derives
                     // real batch sizes from production receipt history.
@@ -5070,10 +5136,29 @@ export class FinaleClient {
                     });
 
                     const coverDays = 60;
-                    const suggestedQty = Math.max(
+                    const rawSuggestedQty = Math.max(
                         0,
-                        Math.ceil(demand.totalBurnRate * coverDays - stockOnHand)
+                        Math.ceil(dailyBurn * coverDays - stockOnHand)
                     );
+                    const rounded = applyCommonOrderRounding({
+                        rawSuggestedQty,
+                        purchaseQtys: compActivity.purchaseQtys,
+                    });
+                    const suggestedQty = rounded.suggestedQty;
+
+                    const cadenceLabel = medianPOGapDays
+                        ? `~${Math.round(medianPOGapDays)}d cadence`
+                        : `${compActivity.purchaseCount} PO${compActivity.purchaseCount === 1 ? '' : 's'}`;
+                    const sourceLabel = chosen.source === 'receipts'
+                        ? `${dailyBurn.toFixed(2)}/d from receipts (${cadenceLabel}, ${confidence} confidence)`
+                        : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`;
+                    const roundingLabel = rounded.commonOrderQty != null
+                        ? rounded.rationale === 'mode'
+                            ? ` Rounded up to your usual order of ${rounded.commonOrderQty} (raw need ${rounded.rawSuggestedQty}).`
+                            : rounded.rationale === 'median'
+                                ? ` Rounded up to median order of ${rounded.commonOrderQty} (raw need ${rounded.rawSuggestedQty}).`
+                                : ` Last order was ${rounded.commonOrderQty}; matched up (raw need ${rounded.rawSuggestedQty}).`
+                        : '';
 
                     items.push({
                         productId: compSku,
@@ -5083,11 +5168,11 @@ export class FinaleClient {
                         unitPrice: mainSupplier.unitPrice ?? mainSupplier.price ?? 0,
                         stockOnHand,
                         stockOnOrder,
-                        purchaseVelocity: 0,
+                        purchaseVelocity: receiptVelocity,
                         salesVelocity: 0,
-                        demandVelocity: demand.totalBurnRate,
-                        dailyRate: demand.totalBurnRate,
-                        dailyRateSource: 'demand',
+                        demandVelocity: bomDerivedVelocity,
+                        dailyRate: dailyBurn,
+                        dailyRateSource: chosen.source === 'none' ? undefined : chosen.source,
                         runwayDays: Math.round(runwayDays * 10) / 10,
                         adjustedRunwayDays: Math.round(adjustedRunwayDays * 10) / 10,
                         leadTimeDays,
@@ -5095,8 +5180,8 @@ export class FinaleClient {
                         openPOs: compActivity.openPOs,
                         urgency,
                         explanation:
-                            `BOM component — burns ${demand.totalBurnRate.toFixed(1)}/day across ` +
-                            `${demand.feedsFinishedGoods.length} FGs. ${Math.round(runwayDays)}d runway.`,
+                            `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
+                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}`,
                         suggestedQty,
                         orderIncrementQty: prodData.orderIncrementQuantity ?? null,
                         isBulkDelivery: true, // BOM materials route to production facility
@@ -5106,7 +5191,14 @@ export class FinaleClient {
                         finaleDemandQty: null,
                         itemType: 'bom-component',
                         feedsFinishedGoods,
-                        totalBurnRate: demand.totalBurnRate,
+                        totalBurnRate: dailyBurn,
+                        medianPOGapDays: medianPOGapDays ?? undefined,
+                        projectedNextOrderDate,
+                        receiptConfidence: chosen.source === 'receipts' ? confidence : undefined,
+                        roundingMethod: rounded.commonOrderQty != null ? 'historical' : null,
+                        roundingAlternatives: rounded.commonOrderQty != null && rounded.rawSuggestedQty !== rounded.suggestedQty
+                            ? [rounded.rawSuggestedQty]
+                            : undefined,
                     });
                 } catch (err: any) {
                     // Win #2: Cache clean-404s so we skip them next call this process lifetime.
@@ -5636,7 +5728,12 @@ export class FinaleClient {
     /**
      * Commit a draft PO in Finale (ORDER_CREATED → ORDER_LOCKED).
      * Throws if the PO is not in ORDER_CREATED status (guards against re-commit).
-     * Strategy: POST to actionUrlComplete if present; fall back to posting statusId: ORDER_LOCKED.
+     *
+     * DECISION(2026-05-12): "No reception, no complete." Use direct statusId
+     * POST → ORDER_LOCKED instead of actionUrlComplete. Finale's /complete
+     * endpoint auto-promotes the PO to ORDER_COMPLETED even when zero units
+     * have been received, which falsely marks the PO as fully received and
+     * hides it from open-PO queries. Mirrors the pattern in restoreOrderStatus.
      */
     async commitDraftPO(orderId: string): Promise<{ orderId: string; committed: boolean; finalStatus: string }> {
         const po = await this.getOrderDetails(orderId);
@@ -5645,19 +5742,10 @@ export class FinaleClient {
             throw new Error(`PO ${orderId} is in status "${po.statusId}" — can only commit ORDER_CREATED drafts`);
         }
 
-        console.log(`[finale] commitDraftPO: PO #${orderId} actionUrlComplete=${po.actionUrlComplete ?? "none"}`);
-
-        let updated: any;
-        if (po.actionUrlComplete) {
-            // Preferred: use Finale's built-in commit action URL
-            updated = await this.post(po.actionUrlComplete, {});
-        } else {
-            // Fallback: POST full order document with committed status
-            updated = await this.post(
-                `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
-                { ...po, statusId: "ORDER_LOCKED" }
-            );
-        }
+        const updated: any = await this.post(
+            `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
+            { ...po, statusId: "ORDER_LOCKED" }
+        );
 
         const finalStatus = updated?.statusId || "ORDER_LOCKED";
         console.log(`[finale] commitDraftPO: PO #${orderId} committed → ${finalStatus}`);
