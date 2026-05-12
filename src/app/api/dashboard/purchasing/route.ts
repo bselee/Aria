@@ -3,6 +3,7 @@ import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
 import { mergeIntoGroups } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
+import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
@@ -88,6 +89,26 @@ export async function GET(req: NextRequest) {
         })),
     }));
 
+    // ── Upcoming-builds digest (next 30 days from calendar forward-demand) ──
+    // Compact list for the header panel. Same data the morning Telegram pulls.
+    const forwardMap = readForwardDemand(30);
+    const buildSet = new Map<string, { earliestDate: string; componentCount: number }>();
+    for (const entry of forwardMap.values()) {
+        for (const fg of entry.feedsBuilds) {
+            const existing = buildSet.get(fg);
+            if (existing) {
+                existing.componentCount += 1;
+                if (entry.earliestBuildDate < existing.earliestDate) existing.earliestDate = entry.earliestBuildDate;
+            } else {
+                buildSet.set(fg, { earliestDate: entry.earliestBuildDate, componentCount: 1 });
+            }
+        }
+    }
+    const upcomingBuilds = Array.from(buildSet.entries())
+        .map(([sku, info]) => ({ sku, earliestDate: info.earliestDate, componentCount: info.componentCount }))
+        .sort((a, b) => a.earliestDate.localeCompare(b.earliestDate))
+        .slice(0, 12);
+
     return NextResponse.json(
         {
             groups: responseGroups,
@@ -95,6 +116,7 @@ export async function GET(req: NextRequest) {
             vendorSummaries: assessment.vendorSummaries,
             mode,
             refreshing,
+            upcomingBuilds,
         },
         { headers: { 'Cache-Control': 'no-store' } }
     );
