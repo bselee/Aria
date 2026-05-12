@@ -17,7 +17,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Activity, Bell, RefreshCw } from "lucide-react";
 
 import IssuesPanel from "./IssuesPanel";
-import TasksPanel from "@/components/dashboard/TasksPanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
@@ -59,9 +58,6 @@ type TabId =
     | "lifecycle"
     | "blocking"
     | "builds"
-    | "build-schedule"
-    | "tasks"
-    | "oversight"
     | "activity";
 
 type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
@@ -141,7 +137,8 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         if (typeof window === "undefined") return;
         try {
             const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
-            if (saved === "ops" || saved === "ordering" || saved === "purchases" || saved === "rcv") setActiveTab("lifecycle");
+            const RETIRED = new Set(["ops", "ordering", "purchases", "rcv", "build-schedule", "tasks", "oversight"]);
+            if (saved && RETIRED.has(saved)) setActiveTab("lifecycle");
             else if (saved) setActiveTab(saved as TabId);
         } catch { /* ignore */ }
     }, []);
@@ -204,10 +201,23 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         () => [
             { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
             { id: "blocking", label: "Blocking Me", render: () => <IssuesPanel /> },
-            { id: "builds", label: "Build Risk", render: () => panelById("build-risk") },
-            { id: "build-schedule", label: "Build Schedule", render: () => panelById("build-schedule") },
-            { id: "tasks", label: "Tasks", render: () => <TasksPanel /> },
-            { id: "oversight", label: "Oversight", render: () => panelById("oversight") },
+            {
+                id: "builds",
+                label: "Builds",
+                // Schedule + risk consolidated into one stacked view.
+                // All-needed components surface in Ordering (lifecycle tab), so
+                // this tab is for situational awareness on the build queue.
+                render: () => (
+                    <div className="flex flex-col h-full min-h-0 overflow-auto gap-2 p-2">
+                        <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
+                            {panelById("build-schedule")}
+                        </section>
+                        <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
+                            {panelById("build-risk")}
+                        </section>
+                    </div>
+                ),
+            },
             { id: "activity", label: "Activity", render: () => panelById("activity") },
         ],
         [panelById],
