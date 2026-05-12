@@ -758,6 +758,9 @@ const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
 let _vendorLeadTimeRawCache: Map<string, number[]> | null = null;
 let _vendorLeadTimeRawCacheAt = 0;
 const VENDOR_LEAD_TIME_RAW_TTL = 4 * 60 * 60 * 1000;
+// Vendor on-time arrival rate (0..1) — computed alongside lead-time history.
+// Read by getBOMDemand to discount stockOnOrder for chronically-late vendors.
+let _vendorOnTimeRateCache: Map<string, number> = new Map();
 
 export class FinaleClient {
     private authHeader: string;
@@ -4206,6 +4209,22 @@ export class FinaleClient {
      * `getVendorLeadTimeHistory()` first (the LeadTimeService warm cache does
      * this) — this method is a cheap derived view, not a fresh API call.
      */
+    /**
+     * Vendor on-time arrival rate (0..1). Computed from the same data as
+     * lead-time history — a PO is "on-time" if it arrived within the vendor's
+     * median + 7d buffer. Fuzzy name match (same logic as LeadTimeService).
+     * Returns 1.0 (assume on-time) when no history exists for the vendor.
+     */
+    getVendorOnTimeRate(vendorName: string): number {
+        if (!vendorName) return 1;
+        const key = vendorName.trim().toLowerCase();
+        for (const [cacheKey, rate] of _vendorOnTimeRateCache.entries()) {
+            const ck = cacheKey.toLowerCase();
+            if (ck === key || ck.includes(key) || key.includes(ck)) return rate;
+        }
+        return 1;
+    }
+
     getVendorLeadTimeDistribution(): Map<string, { p50: number; p90: number; sampleCount: number }> {
         const out = new Map<string, { p50: number; p90: number; sampleCount: number }>();
         if (!_vendorLeadTimeRawCache) return out;
@@ -4225,7 +4244,7 @@ export class FinaleClient {
         return out;
     }
 
-    async getVendorLeadTimeHistory(daysBack: number = 90): Promise<Map<string, number>> {
+    async getVendorLeadTimeHistory(daysBack: number = 365): Promise<Map<string, number>> {
         try {
             const now = new Date();
             const end = new Date(now);
@@ -4277,22 +4296,30 @@ export class FinaleClient {
                 byVendor.get(vendor)!.push(days);
             }
 
-            // Compute median for vendors with ≥ 3 data points
+            // Compute median for vendors with ≥ 2 data points (was 3; monthly-cadence
+            // vendors had too few POs in the 90d window to qualify).
             const result2 = new Map<string, number>();
+            const onTimeMap = new Map<string, number>();
             for (const [vendor, days] of byVendor) {
-                if (days.length < 3) continue;
+                if (days.length < 2) continue;
                 const sorted = [...days].sort((a, b) => a - b);
                 const mid = Math.floor(sorted.length / 2);
                 const median = sorted.length % 2 === 0
                     ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
                     : sorted[mid];
                 result2.set(vendor, median);
+
+                // On-time rate: count POs that arrived within median + 7d buffer.
+                const tolerance = median + 7;
+                const onTime = days.filter(d => d <= tolerance).length;
+                onTimeMap.set(vendor, onTime / days.length);
             }
             // Stash the raw distribution for callers that want P90 — see
             // getVendorLeadTimeDistribution(). Module-level cache because
             // FinaleClient is reinstantiated frequently.
             _vendorLeadTimeRawCache = byVendor;
             _vendorLeadTimeRawCacheAt = Date.now();
+            _vendorOnTimeRateCache = onTimeMap;
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
@@ -4961,7 +4988,8 @@ export class FinaleClient {
      * via a productAssocList GraphQL filter or a sales-velocity prefilter.
      */
     async getBOMDemand(daysBack = 90): Promise<PurchasingGroup[]> {
-        const { computeComponentBurnRates, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding } = await import('./bom-demand');
+        const { computeComponentBurnRates, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding, computeTrendAdjustedVelocity } = await import('./bom-demand');
+        const { loadStockoutCounts, recordStockoutEvent } = await import('@/lib/purchasing/stockout-history');
         type FGVelocity = import('./bom-demand').FGVelocity;
 
         // ── Step 1: Page Active SKUs ──
@@ -5035,6 +5063,10 @@ export class FinaleClient {
         // ── Step 4: Burn rates ──
         const componentDemands = computeComponentBurnRates(fgVelocities);
 
+        // Load 180-day stockout counts up front so each component loop iteration
+        // can read in O(1) and pad its lead time accordingly.
+        const stockoutCounts = await loadStockoutCounts();
+
         // ── Step 5: Resolve each component (stock, vendor, lead time, urgency) ──
         const { leadTimeService } = await import('@/lib/builds/lead-time-service');
         const items: PurchasingItem[] = [];
@@ -5077,20 +5109,40 @@ export class FinaleClient {
                     if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
 
                     const stockOnHand = compActivity.stockOnHand ?? 0;
-                    const stockOnOrder = compActivity.openPOs.reduce(
+                    const rawStockOnOrder = compActivity.openPOs.reduce(
                         (sum, po) => sum + (po.quantity || 0),
                         0,
                     );
+                    // Discount stockOnOrder by the vendor's historical on-time rate.
+                    // 100% on-time → no discount. 60% on-time → trust only 60% of
+                    // open POs as supply we'll have when we need it.
+                    const onTimeRate = this.getVendorOnTimeRate(groupName);
+                    const stockOnOrder = rawStockOnOrder * onTimeRate;
 
                     const lt = await leadTimeService.getForVendor(groupName, compSku);
-                    const leadTimeDays = lt.days;
-                    const leadTimeProvenance = lt.label;
+                    const baseLeadTimeDays = lt.days;
+                    // Pad lead time for SKUs with prior stockouts — they proved the
+                    // default buffer wasn't enough. 1 event → 1.5×, 2 → 2.0×, 3+ → 2.5×.
+                    const { leadTimeMultiplierFromStockouts } = await import('@/lib/purchasing/stockout-history');
+                    const priorStockouts = stockoutCounts.get(compSku)?.eventCount ?? 0;
+                    const stockoutMultiplier = leadTimeMultiplierFromStockouts(priorStockouts);
+                    const leadTimeDays = Math.ceil(baseLeadTimeDays * stockoutMultiplier);
+                    const leadTimeProvenance = priorStockouts > 0
+                        ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
+                        : lt.label;
 
                     // DECISION(2026-05-12): Receipt velocity is the primary signal.
                     // Captures seasonality, builds, contracts, wholesale, growth —
                     // everything the FG-sales-derived burn rate misses. FG-derived
                     // demand is the fallback for components with no purchase history.
-                    const receiptVelocity = compActivity.purchasedQty / daysBack;
+                    // Trend-adjusted: if recent half is materially higher than prior
+                    // half, use the recent rate so growing SKUs aren't understated.
+                    const trend = computeTrendAdjustedVelocity({
+                        purchaseDates: compActivity.purchaseDates,
+                        purchaseQtys: compActivity.purchaseQtys,
+                        daysBack,
+                    });
+                    const receiptVelocity = trend.velocity;
                     const bomDerivedVelocity = demand.totalBurnRate;
                     const chosen = chooseBomVelocity({ receiptVelocity, bomDerivedVelocity });
                     const confidence = chosen.source === 'receipts'
@@ -5119,6 +5171,21 @@ export class FinaleClient {
                         dailyBurn,
                         leadTimeDays,
                     });
+
+                    // Record stockout event if adjusted runway dropped below lead time
+                    // (this is the "we're already late ordering" condition). Idempotent
+                    // per SKU per day. Fire-and-forget — don't block the scan.
+                    if (adjustedRunwayDays < leadTimeDays && dailyBurn > 0) {
+                        void recordStockoutEvent({
+                            productId: compSku,
+                            vendorPartyId: partyId || null,
+                            stockOnHand,
+                            stockOnOrder,
+                            dailyBurn,
+                            runwayDays: adjustedRunwayDays,
+                            leadTimeDays,
+                        });
+                    }
 
                     // buildsWorth approximation: batch ≈ dailySalesRate*30. Phase 2 derives
                     // real batch sizes from production receipt history.
@@ -5149,8 +5216,14 @@ export class FinaleClient {
                     const cadenceLabel = medianPOGapDays
                         ? `~${Math.round(medianPOGapDays)}d cadence`
                         : `${compActivity.purchaseCount} PO${compActivity.purchaseCount === 1 ? '' : 's'}`;
+                    const trendLabel = trend.trendingUp && chosen.source === 'receipts'
+                        ? ` ↑ trending up`
+                        : '';
+                    const onTimeLabel = onTimeRate < 0.85 && rawStockOnOrder > 0
+                        ? ` On-order discounted ${Math.round((1 - onTimeRate) * 100)}% (vendor late ${Math.round((1 - onTimeRate) * 100)}% historically).`
+                        : '';
                     const sourceLabel = chosen.source === 'receipts'
-                        ? `${dailyBurn.toFixed(2)}/d from receipts (${cadenceLabel}, ${confidence} confidence)`
+                        ? `${dailyBurn.toFixed(2)}/d from receipts (${cadenceLabel}, ${confidence} confidence)${trendLabel}`
                         : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`;
                     const roundingLabel = rounded.commonOrderQty != null
                         ? rounded.rationale === 'mode'
@@ -5181,7 +5254,7 @@ export class FinaleClient {
                         urgency,
                         explanation:
                             `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
-                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}`,
+                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}`,
                         suggestedQty,
                         orderIncrementQty: prodData.orderIncrementQuantity ?? null,
                         isBulkDelivery: true, // BOM materials route to production facility
