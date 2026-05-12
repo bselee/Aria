@@ -86,6 +86,7 @@ type AssessmentData = {
     }>;
     refreshing?: boolean;
     error?: string;
+    upcomingBuilds?: Array<{ sku: string; earliestDate: string; componentCount: number }>;
 };
 type POResult = { orderId: string; finaleUrl: string };
 type CommitReview = {
@@ -1055,6 +1056,24 @@ export default function PurchasingPanel() {
                             All <span className="opacity-60">{lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other}</span>
                         </button>
                     </div>
+
+                    {/* ── Upcoming builds digest (next 30d from calendar) ── */}
+                    {data?.upcomingBuilds && data.upcomingBuilds.length > 0 && (
+                        <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                            <span className="text-[10px] font-mono text-cyan-300 shrink-0 mr-1">📅 Next 30d:</span>
+                            {data.upcomingBuilds.map(b => (
+                                <span key={b.sku}
+                                    className="text-[10px] font-mono px-2 py-0.5 rounded border border-zinc-800 text-zinc-400 shrink-0"
+                                    title={`${b.componentCount} component(s) needed`}
+                                >
+                                    <span className="text-cyan-400">{b.earliestDate.slice(5)}</span>
+                                    <span className="mx-1 text-zinc-600">·</span>
+                                    <span className="text-zinc-300">{b.sku}</span>
+                                    <span className="ml-1 text-zinc-600">({b.componentCount})</span>
+                                </span>
+                            ))}
+                        </div>
+                    )}
 
                     {/* ── Vendor tabs ── active vendors + snoozed (greyed) when showSnoozed */}
                     {focusGroups.length > 0 && (
