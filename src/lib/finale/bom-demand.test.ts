@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding } from './bom-demand';
+import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding, computeTrendAdjustedVelocity } from './bom-demand';
 import { FinaleClient, __bomComponent404CacheForTests, __skuHasNoBomCacheForTests } from './client';
 
 describe('computeComponentBurnRates', () => {
@@ -140,6 +140,55 @@ describe('classifyBomUrgency', () => {
             .toBe('warning'); // <14+45=59
         expect(classifyBomUrgency({ adjustedRunwayDays: 70, leadTimeDays: 14, medianPOGapDays: null }))
             .toBe('watch'); // <14+90=104
+    });
+});
+
+describe('computeTrendAdjustedVelocity', () => {
+    const now = new Date('2026-05-12');
+    it('returns full-window rate when prior and recent halves are similar', () => {
+        // 100 units over 90d, evenly distributed
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-03-01', '2026-03-20', '2026-04-10', '2026-05-01'],
+            purchaseQtys: [25, 25, 25, 25],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingUp).toBe(false);
+        expect(r.velocity).toBeCloseTo(100 / 90, 5);
+    });
+    it('flags trending up when recent half ≥1.25× prior half', () => {
+        // Prior 45d: 20 units. Recent 45d: 50 units. Ratio 2.5×.
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-03-01', '2026-04-15', '2026-05-01'],
+            purchaseQtys: [20, 25, 25],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingUp).toBe(true);
+        expect(r.recentRate).toBeGreaterThan(r.priorRate);
+        // Velocity should be recent rate (50 / 45 ≈ 1.11)
+        expect(r.velocity).toBeGreaterThan(20 / 90);
+    });
+    it('does not flag trend when only recent data exists (no baseline)', () => {
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-05-01', '2026-05-05'],
+            purchaseQtys: [10, 10],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingUp).toBe(false);
+        // Falls back to full-window rate
+        expect(r.velocity).toBeCloseTo(20 / 90, 5);
+    });
+    it('falls back to full rate with too little data', () => {
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-05-01'],
+            purchaseQtys: [42000],
+            daysBack: 90,
+            now,
+        });
+        expect(r.velocity).toBeCloseTo(42000 / 90, 5);
+        expect(r.trendingUp).toBe(false);
     });
 });
 

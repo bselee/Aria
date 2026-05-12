@@ -152,6 +152,57 @@ export function classifyBomUrgency(input: {
 }
 
 /**
+ * Growth-aware receipt velocity. Compare recent half of the window to the
+ * prior half. If recent-half rate is materially higher (≥1.25×), the SKU is
+ * trending up and the full-window average understates current burn. Use the
+ * recent-half rate. Otherwise stick with the full-window average.
+ *
+ * Returns the chosen rate and a flag so callers can surface "trending up"
+ * in the explanation.
+ */
+export function computeTrendAdjustedVelocity(input: {
+    purchaseDates?: string[];
+    purchaseQtys?: number[];
+    daysBack: number;
+    now?: Date;
+}): { velocity: number; trendingUp: boolean; recentRate: number; priorRate: number } {
+    const purchaseDates = input.purchaseDates ?? [];
+    const purchaseQtys = input.purchaseQtys ?? [];
+    const { daysBack } = input;
+    const now = input.now ?? new Date();
+    const total = purchaseQtys.reduce((s, q) => s + q, 0);
+    const fullRate = daysBack > 0 ? total / daysBack : 0;
+
+    if (purchaseDates.length !== purchaseQtys.length || purchaseDates.length < 2) {
+        return { velocity: fullRate, trendingUp: false, recentRate: fullRate, priorRate: fullRate };
+    }
+
+    const halfMs = (daysBack / 2) * 86_400_000;
+    const cutoff = now.getTime() - halfMs;
+    let recentTotal = 0;
+    let priorTotal = 0;
+    for (let i = 0; i < purchaseDates.length; i++) {
+        const t = new Date(purchaseDates[i]).getTime();
+        if (isNaN(t)) continue;
+        if (t >= cutoff) recentTotal += purchaseQtys[i];
+        else priorTotal += purchaseQtys[i];
+    }
+    const halfWindow = daysBack / 2;
+    const recentRate = recentTotal / halfWindow;
+    const priorRate = priorTotal / halfWindow;
+
+    // Trending up = recent rate at least 1.25x prior, AND prior is non-trivial
+    // (otherwise a single recent burst would dominate from zero baseline).
+    const trendingUp = priorRate > 0 && recentRate >= priorRate * 1.25;
+    return {
+        velocity: trendingUp ? recentRate : fullRate,
+        trendingUp,
+        recentRate,
+        priorRate,
+    };
+}
+
+/**
  * Cognitive rounding for BOM components: snap suggested quantity to your usual
  * order size based on past PO line qtys. Catches case/pallet/truckload sizes
  * we never declared explicitly. Returns the original suggestion unchanged
@@ -165,7 +216,7 @@ export function classifyBomUrgency(input: {
  */
 export function applyCommonOrderRounding(input: {
     rawSuggestedQty: number;
-    purchaseQtys: number[];
+    purchaseQtys?: number[];
 }): {
     suggestedQty: number;
     rawSuggestedQty: number;
