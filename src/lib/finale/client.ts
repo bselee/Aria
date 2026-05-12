@@ -4990,6 +4990,7 @@ export class FinaleClient {
     async getBOMDemand(daysBack = 90): Promise<PurchasingGroup[]> {
         const { computeComponentBurnRates, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding, computeTrendAdjustedVelocity } = await import('./bom-demand');
         const { loadStockoutCounts, recordStockoutEvent } = await import('@/lib/purchasing/stockout-history');
+        const { readForwardDemand } = await import('@/lib/purchasing/forward-demand');
         type FGVelocity = import('./bom-demand').FGVelocity;
 
         // ── Step 1: Page Active SKUs ──
@@ -5066,6 +5067,10 @@ export class FinaleClient {
         // Load 180-day stockout counts up front so each component loop iteration
         // can read in O(1) and pad its lead time accordingly.
         const stockoutCounts = await loadStockoutCounts();
+        // Forward-demand snapshot from the calendar BOM pipeline (LLM-cached
+        // separately, refreshes every 4h). Cold cache returns empty — that's
+        // fine; the next scan picks up the calendar lift.
+        const forwardDemand = readForwardDemand(30);
 
         // ── Step 5: Resolve each component (stock, vendor, lead time, urgency) ──
         const { leadTimeService } = await import('@/lib/builds/lead-time-service');
@@ -5160,11 +5165,27 @@ export class FinaleClient {
                         ? (stockOnHand + stockOnOrder) / dailyBurn
                         : 9999;
                     const medianPOGapDays = computeMedianPOGap(compActivity.purchaseDates);
-                    const urgency = classifyBomUrgency({
+
+                    // Forward-demand bump: if upcoming calendar builds will consume
+                    // more than (stockOnHand + stockOnOrder), that's a hard shortfall
+                    // — bump urgency regardless of historical-velocity math.
+                    const forward = forwardDemand.get(compSku);
+                    const forwardShortfall = forward
+                        ? Math.max(0, forward.requiredQty - (stockOnHand + stockOnOrder))
+                        : 0;
+
+                    let urgency = classifyBomUrgency({
                         adjustedRunwayDays,
                         leadTimeDays,
                         medianPOGapDays,
                     });
+                    if (forwardShortfall > 0) {
+                        // Days until earliest build that needs this component
+                        const buildMs = forward ? new Date(forward.earliestBuildDate).getTime() - Date.now() : Infinity;
+                        const buildDays = buildMs / 86_400_000;
+                        if (buildDays < leadTimeDays) urgency = 'critical';
+                        else if (urgency === 'ok' || urgency === 'watch') urgency = 'warning';
+                    }
                     const projectedNextOrderDate = projectNextOrderDate({
                         stockOnHand,
                         stockOnOrder,
@@ -5203,10 +5224,13 @@ export class FinaleClient {
                     });
 
                     const coverDays = 60;
-                    const rawSuggestedQty = Math.max(
+                    const baseNeed = Math.max(
                         0,
                         Math.ceil(dailyBurn * coverDays - stockOnHand)
                     );
+                    // Floor the suggestion at the forward shortfall — we have to
+                    // cover scheduled builds first, then add coverage cushion.
+                    const rawSuggestedQty = Math.max(baseNeed, forwardShortfall);
                     const rounded = applyCommonOrderRounding({
                         rawSuggestedQty,
                         purchaseQtys: compActivity.purchaseQtys,
@@ -5222,6 +5246,11 @@ export class FinaleClient {
                     const onTimeLabel = onTimeRate < 0.85 && rawStockOnOrder > 0
                         ? ` On-order discounted ${Math.round((1 - onTimeRate) * 100)}% (vendor late ${Math.round((1 - onTimeRate) * 100)}% historically).`
                         : '';
+                    const forwardLabel = forward && forwardShortfall > 0
+                        ? ` 📅 Build ${forward.earliestBuildDate} needs ${forward.requiredQty} (${forwardShortfall} short).`
+                        : forward
+                            ? ` 📅 Covers build ${forward.earliestBuildDate} (need ${forward.requiredQty}).`
+                            : '';
                     const sourceLabel = chosen.source === 'receipts'
                         ? `${dailyBurn.toFixed(2)}/d from receipts (${cadenceLabel}, ${confidence} confidence)${trendLabel}`
                         : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`;
@@ -5254,7 +5283,7 @@ export class FinaleClient {
                         urgency,
                         explanation:
                             `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
-                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}`,
+                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}`,
                         suggestedQty,
                         orderIncrementQty: prodData.orderIncrementQuantity ?? null,
                         isBulkDelivery: true, // BOM materials route to production facility

@@ -88,9 +88,14 @@ export async function prewarmPurchasingCaches(): Promise<void> {
     stash.prewarmRunning = true;
     const client = new FinaleClient();
     try {
+        // Calendar forward-demand kicked off in parallel — it hits the LLM and
+        // takes 30s-2min, but never blocks the BOM scan; it just enriches the
+        // next scan once it lands.
+        const { prewarmForwardDemand } = await import('./forward-demand');
         await Promise.allSettled([
             readSWR(resaleSlot, () => client.getPurchasingIntelligence(365), false),
             readSWR(bomSlot, () => client.getBOMDemand(90), false),
+            prewarmForwardDemand(30),
         ]);
     } finally {
         stash.prewarmRunning = false;
