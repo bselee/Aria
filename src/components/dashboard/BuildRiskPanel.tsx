@@ -99,10 +99,18 @@ export default function BuildRiskPanel() {
     return () => { supabase.removeChannel(sub); };
   }, []);
 
+  // Sort: most-needed first. Risk tier wins, then stockout days asc within tier
+  // (smaller = worse). null stockout days sink to bottom of their tier.
   const atRisk = snapshot
     ? Object.values(snapshot.components)
       .filter(c => c.riskLevel !== "OK")
-      .sort((a, b) => RISK[a.riskLevel].order - RISK[b.riskLevel].order)
+      .sort((a, b) => {
+        const tier = RISK[a.riskLevel].order - RISK[b.riskLevel].order;
+        if (tier !== 0) return tier;
+        const aOut = a.stockoutDays ?? Number.POSITIVE_INFINITY;
+        const bOut = b.stockoutDays ?? Number.POSITIVE_INFINITY;
+        return aOut - bOut;
+      })
     : [];
 
   return (
@@ -160,9 +168,14 @@ export default function BuildRiskPanel() {
                   {/* Risk dot */}
                   <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${cfg.dot}`} />
                   <div className="min-w-0">
-                    {/* Line 1: SKU + stockout + POs */}
+                    {/* Line 1: SKU · name + stockout + POs */}
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-sm font-mono font-semibold text-zinc-100">{comp.componentSku}</span>
+                      {comp.productName && (
+                        <span className="text-xs font-mono text-zinc-400 truncate max-w-[260px]" title={comp.productName}>
+                          · {comp.productName}
+                        </span>
+                      )}
                       <span className={`text-[11px] font-mono ${comp.riskLevel === "CRITICAL" ? `px-1.5 py-0.5 rounded border ${cfg.badge}` : cfg.badge}`}>
                         {comp.riskLevel}
                       </span>

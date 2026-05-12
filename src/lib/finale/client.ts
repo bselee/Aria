@@ -1974,6 +1974,7 @@ export class FinaleClient {
         consumptionQuantity: number | null;
         leadTimeDays: number | null;
         reorderQuantityToOrder: number | null;
+        productName: string | null;
         hasFinaleData: boolean;      // Whether Finale returned ANY meaningful data
         incomingPOs: Array<{ orderId: string; supplier: string; quantity: number; orderDate: string; expectedDelivery?: string }>;
     }> {
@@ -1986,6 +1987,7 @@ export class FinaleClient {
             consumptionQuantity: null as number | null,
             leadTimeDays: null as number | null,
             reorderQuantityToOrder: null as number | null,
+            productName: null as string | null,
             hasFinaleData: false,
             incomingPOs: [] as Array<{ orderId: string; supplier: string; quantity: number; orderDate: string; expectedDelivery?: string }>,
         };
@@ -2005,6 +2007,7 @@ export class FinaleClient {
                     productViewConnection(first: 1, productId: "${productId}") {
                         edges {
                             node {
+                                internalName
                                 stockOnHand
                                 stockAvailable
                                 stockOnOrder
@@ -2021,6 +2024,9 @@ export class FinaleClient {
             const data = await this.graphql(query, `Stock Profile ${productId}`);
             const node = data?.productViewConnection?.edges?.[0]?.node;
             if (node) {
+                profile.productName = typeof node.internalName === 'string' && node.internalName.trim()
+                    ? node.internalName.trim()
+                    : null;
                 profile.onHand = parseVal(node.stockOnHand);
                 profile.available = parseVal(node.stockAvailable);
                 profile.onOrder = parseVal(node.stockOnOrder);
