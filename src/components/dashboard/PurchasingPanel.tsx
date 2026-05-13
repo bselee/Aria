@@ -233,10 +233,9 @@ export default function PurchasingPanel() {
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
     type ItemMode = 'all' | 'resale' | 'bom';
-    // Hardcoded to BOM Materials — Will's purchasing workflow for resale items
-    // runs through other paths (vendor reconcilers, Lifecycle tab); this view
-    // is exclusively BOM/raw materials.
-    const [itemMode] = useState<ItemMode>('bom');
+    // Both resale and BOM items visible together (no UI toggle — the BOM
+    // treatment renders cleanly for BOM rows, resale rows show their own data).
+    const [itemMode] = useState<ItemMode>('all');
     const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
 
     // ULINE direct ordering
@@ -496,7 +495,7 @@ export default function PurchasingPanel() {
 
         setLoadingTiers(new Set(['critical', 'warning', 'watch', 'ok']));
         try {
-            const res = await fetch(`/api/dashboard/purchasing?mode=bom${bust ? '&bust=1' : ''}`);
+            const res = await fetch(`/api/dashboard/purchasing?mode=all${bust ? '&bust=1' : ''}`);
             const json: AssessmentData = await res.json();
             if (!res.ok) throw new Error(json.error || `Failed to load ordering`);
 
