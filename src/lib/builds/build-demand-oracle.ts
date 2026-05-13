@@ -23,6 +23,7 @@ export type ComponentUrgency = 'CRITICAL' | 'WARNING' | 'WATCH' | 'OK';
 
 export interface OracleComponent {
     componentSku: string;
+    productName?: string | null;
     onHand: number | null;
     stockoutDays: number | null;
     leadTimeDays: number | null;
@@ -257,6 +258,7 @@ export function computeBuildDemandOracle(
 
         const oracleComp: OracleComponent = {
             componentSku: _compSku,
+            productName: (comp as any).productName ?? null,
             onHand,
             stockoutDays: comp.stockoutDays,
             leadTimeDays: comp.leadTimeDays,
