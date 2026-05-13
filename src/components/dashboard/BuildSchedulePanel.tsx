@@ -577,17 +577,33 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
                 )}
               </div>
               <div className="space-y-1.5">
-                {group.components.map(comp => (
-                  <div key={comp.componentSku} className="flex items-center gap-2 text-[11px]">
-                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : 'bg-amber-400'}`} />
-                    <span className="font-mono font-semibold text-zinc-200 w-24 truncate">{comp.componentSku}</span>
-                    <span className="text-zinc-500 font-mono">×{comp.thirtyDayNeed.toLocaleString()} need</span>
-                    <span className={`font-mono ml-auto ${comp.gap < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                      {comp.gap < 0 ? `⚠️ gap ${Math.abs(comp.gap).toLocaleString()}` : `${comp.onHand ?? 0} on hand`}
-                    </span>
-                    <span className="font-mono text-zinc-600 text-[10px]">{comp.leadTimeDays ?? 14}d LT</span>
-                  </div>
-                ))}
+                {group.components.map(comp => {
+                  const affected = (comp.blocksFGs.length > 0 ? comp.blocksFGs : comp.usedIn).slice(0, 3);
+                  const moreCount = Math.max(0, (comp.blocksFGs.length > 0 ? comp.blocksFGs.length : comp.usedIn.length) - 3);
+                  const fullList = (comp.blocksFGs.length > 0 ? comp.blocksFGs : comp.usedIn).join(', ');
+                  return (
+                    <div key={comp.componentSku} className="space-y-0.5">
+                      <div className="flex items-center gap-2 text-[11px]">
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : 'bg-amber-400'}`} />
+                        <span className="font-mono font-semibold text-zinc-200 shrink-0">{comp.componentSku}</span>
+                        {comp.productName && (
+                          <span className="text-zinc-400 truncate max-w-[260px]" title={comp.productName}>· {comp.productName}</span>
+                        )}
+                        <span className="text-zinc-500 font-mono ml-auto shrink-0">×{comp.thirtyDayNeed.toLocaleString()} need</span>
+                        <span className={`font-mono shrink-0 ${comp.gap < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                          {comp.gap < 0 ? `⚠ gap ${Math.abs(comp.gap).toLocaleString()}` : `${comp.onHand ?? 0} on hand`}
+                        </span>
+                        <span className="font-mono text-zinc-600 text-[10px] shrink-0">{comp.leadTimeDays ?? 14}d LT</span>
+                      </div>
+                      {affected.length > 0 && (
+                        <div className="text-[10px] font-mono text-zinc-500 pl-4 truncate" title={fullList}>
+                          {comp.blocksFGs.length > 0 ? '⚠ blocks' : '↳ feeds'}: {affected.join(', ')}
+                          {moreCount > 0 && ` · +${moreCount}`}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ))}
@@ -636,7 +652,8 @@ function OracleForecastSection({ snapshot }: { snapshot: Snapshot | null }) {
           <table className="w-full text-[11px] font-mono">
             <thead>
               <tr className="border-b border-zinc-800/50">
-                <th className="px-4 py-2 text-left text-zinc-500 font-semibold">SKU</th>
+                <th className="px-4 py-2 text-left text-zinc-500 font-semibold">SKU · Name</th>
+                <th className="px-3 py-2 text-left text-zinc-500 font-semibold">Affects</th>
                 <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 1-4</th>
                 <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 5-8</th>
                 <th className="px-3 py-2 text-right text-zinc-500 font-semibold">Wk 9-12</th>
@@ -646,30 +663,56 @@ function OracleForecastSection({ snapshot }: { snapshot: Snapshot | null }) {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/20">
-              {oracle.twelveWeekForecast.flatMap(g =>
-                g.components.map(comp => (
-                  <tr key={comp.componentSku} className="hover:bg-zinc-800/20">
-                    <td className="px-4 py-2">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : comp.riskLevel === 'WARNING' ? 'bg-amber-400' : 'bg-blue-400'}`} />
-                        <span className="font-semibold text-zinc-200 truncate">{comp.componentSku}</span>
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW149 > 0 ? comp.weeklyNeedW149.toLocaleString() : '—'}</td>
-                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW158 > 0 ? `${comp.weeklyNeedW158.toLocaleString()} (est.)` : '—'}</td>
-                    <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW1912 > 0 ? `${comp.weeklyNeedW1912.toLocaleString()} (est.)` : '—'}</td>
-                    <td className="px-3 py-2 text-right text-zinc-400">{comp.onHand ?? '?'}</td>
-                    <td className="px-3 py-2 text-right">
-                      {comp.stockoutDays != null ? `${comp.stockoutDays}d` : '—'}
-                    </td>
-                    <td className="px-4 py-2 text-right">
-                      <span className={`font-semibold ${comp.oracleStatus === 'ORDER NOW' ? 'text-rose-400' : comp.oracleStatus === 'REORDER SOON' ? 'text-amber-400' : 'text-emerald-400'}`}>
-                        {comp.oracleStatus}
-                      </span>
-                    </td>
+              {oracle.twelveWeekForecast
+                .flatMap(g => g.components.map(c => ({ comp: c, vendor: g.vendorName })))
+                // Most-needed first: ORDER NOW → REORDER SOON → COVERED, then by stockoutDays asc
+                .sort((a, b) => {
+                  const sa = a.comp.oracleStatus === 'ORDER NOW' ? 0 : a.comp.oracleStatus === 'REORDER SOON' ? 1 : 2;
+                  const sb = b.comp.oracleStatus === 'ORDER NOW' ? 0 : b.comp.oracleStatus === 'REORDER SOON' ? 1 : 2;
+                  if (sa !== sb) return sa - sb;
+                  const da = a.comp.stockoutDays ?? Number.POSITIVE_INFINITY;
+                  const db = b.comp.stockoutDays ?? Number.POSITIVE_INFINITY;
+                  return da - db;
+                })
+                .map(({ comp, vendor }) => {
+                  const blocks = comp.blocksFGs;
+                  const usedIn = comp.usedIn;
+                  const affectedList = blocks.length > 0 ? blocks : usedIn;
+                  const affectedDisplay = affectedList.slice(0, 2).join(', ');
+                  const moreCount = Math.max(0, affectedList.length - 2);
+                  return (
+                    <tr key={`${vendor}-${comp.componentSku}`} className="hover:bg-zinc-800/20">
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${comp.riskLevel === 'CRITICAL' ? 'bg-rose-500' : comp.riskLevel === 'WARNING' ? 'bg-amber-400' : 'bg-blue-400'}`} />
+                          <span className="font-semibold text-zinc-200 shrink-0">{comp.componentSku}</span>
+                          {comp.productName && (
+                            <span className="text-zinc-400 truncate max-w-[280px]" title={comp.productName}>· {comp.productName}</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-zinc-500 truncate max-w-[180px]" title={affectedList.join(', ')}>
+                        {affectedList.length === 0 ? '—' : (
+                          <span className={blocks.length > 0 ? 'text-rose-400' : ''}>
+                            {blocks.length > 0 ? '⚠ ' : ''}{affectedDisplay}{moreCount > 0 ? ` +${moreCount}` : ''}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW149 > 0 ? comp.weeklyNeedW149.toLocaleString() : '—'}</td>
+                      <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW158 > 0 ? `${comp.weeklyNeedW158.toLocaleString()} (est.)` : '—'}</td>
+                      <td className="px-3 py-2 text-right text-zinc-400">{comp.weeklyNeedW1912 > 0 ? `${comp.weeklyNeedW1912.toLocaleString()} (est.)` : '—'}</td>
+                      <td className="px-3 py-2 text-right text-zinc-400">{comp.onHand ?? '?'}</td>
+                      <td className="px-3 py-2 text-right">
+                        {comp.stockoutDays != null ? `${comp.stockoutDays}d` : '—'}
+                      </td>
+                      <td className="px-4 py-2 text-right">
+                        <span className={`font-semibold ${comp.oracleStatus === 'ORDER NOW' ? 'text-rose-400' : comp.oracleStatus === 'REORDER SOON' ? 'text-amber-400' : 'text-emerald-400'}`}>
+                          {comp.oracleStatus}
+                        </span>
+                      </td>
                   </tr>
-                ))
-              )}
+                );
+              })}
             </tbody>
           </table>
         </div>
