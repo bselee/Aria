@@ -1653,17 +1653,10 @@ If no invoice number is found, use null.`,
                 const total = invoicePages.reduce((sum, p) => sum + (p.amount || 0), 0);
                 const totalStr = total > 0 ? `\n<b>Statement Total:</b> $${total.toFixed(2)}` : '';
 
-                try {
-                    await this.bot.telegram.sendMessage(chatId, [
-                        `✂️ <b>${vendorLabel} Statement Split</b>`,
-                        ``,
-                        `Split <b>${queuedCount}</b> invoice(s); discarded <b>${discardedCount}</b> non-invoice page(s):`,
-                        invoiceList,
-                        totalStr,
-                        ``,
-                        `📤 Queued for Bill.com forwarding`,
-                    ].filter(Boolean).join('\n'), { parse_mode: 'HTML' });
-                } catch { /* non-critical */ }
+                // Silenced 2026-05-13: statement splits run autonomously and
+                // were producing Telegram noise on every vendor statement.
+                // The same info is in ap_activity_log + dashboard AP queue.
+                console.log(`[ap-identifier] ${vendorLabel} statement split: ${queuedCount} queued, ${discardedCount} discarded${totalStr ? ' (' + totalStr.replace(/<[^>]+>|\n/g, '').trim() + ')' : ''}`);
             }
         }
 
@@ -1924,19 +1917,8 @@ If no invoice number is found, use null.`,
             const total = splitResult.invoices.reduce((sum, invoice) => sum + (invoice.amount || 0), 0);
             const totalStr = total > 0 ? `\n<b>Statement Total:</b> $${total.toFixed(2)}` : "";
 
-            try {
-                await this.bot.telegram.sendMessage(chatId, [
-                    `✂️ <b>${vendorLabel} Statement Split</b>`,
-                    "",
-                    `Split <b>${queuedCount}</b> invoice(s); discarded <b>${splitResult.discardedCount}</b> non-invoice page(s):`,
-                    invoiceList,
-                    totalStr,
-                    "",
-                    "📤 Queued for Bill.com forwarding",
-                ].filter(Boolean).join("\n"), { parse_mode: "HTML" });
-            } catch {
-                // Non-critical notification failure.
-            }
+            // Silenced 2026-05-13 (see paired silence above).
+            console.log(`[ap-identifier] ${vendorLabel} statement split: ${queuedCount} queued, ${splitResult.discardedCount} discarded${totalStr ? ' (' + totalStr.replace(/<[^>]+>|\n/g, '').trim() + ')' : ''}`);
         }
 
         return { status: "handled", queuedCount };

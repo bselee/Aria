@@ -1160,6 +1160,7 @@ export class OpsManager {
      */
     async syncPOConversations() {
         console.log("📦 Syncing PO Conversations...");
+        const trackingUpdatesBatch: Array<{ poNumber: string; vendorName: string; newOnes: string[] }> = [];
         try {
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
@@ -1331,10 +1332,27 @@ export class OpsManager {
                             await supabase.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
                         }
 
+                        // Batch tracking updates into a single end-of-run message
+                        // instead of one Telegram per PO. trackingUpdatesBatch is
+                        // collected and flushed below.
                         if (newOnes.length > 0) {
-                            await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", `📦 **Tracking Update: PO #${poNumber}**\n${vendorName}\n\n${newOnes.join('\n')}`);
+                            trackingUpdatesBatch.push({ poNumber, vendorName, newOnes });
                         }
                     } catch { /* Supabase offline */ }
+                }
+            }
+
+            // Flush tracking-updates batch as ONE Telegram message at the end
+            // of the run. Was firing one message per PO per cycle — too noisy.
+            if (trackingUpdatesBatch.length > 0) {
+                const lines = trackingUpdatesBatch.map(b =>
+                    `• #${b.poNumber} ${b.vendorName}: ${b.newOnes.join(', ')}`
+                );
+                const msg = `📦 *Tracking Updates* (${trackingUpdatesBatch.length})\n\n${lines.join('\n')}`;
+                try {
+                    await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: 'Markdown' });
+                } catch (e: any) {
+                    console.warn('[po-sync] tracking batch send failed:', e.message);
                 }
             }
         } catch (err: any) {

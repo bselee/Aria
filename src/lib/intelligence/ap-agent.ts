@@ -1014,15 +1014,10 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     const { getVendorPattern } = await import("./vendor-memory");
                     const pattern = await getVendorPattern(invoiceData.vendorName);
                     if (pattern?.invoiceBehavior === "multi_page_split") {
+                        // Silenced 2026-05-13: was firing on every multi-page
+                        // vendor invoice. Logged to console only — Will can
+                        // review in the dashboard when needed.
                         console.warn(`⚠️ [vendor-memory] ${invoiceData.vendorName} requires multi_page_split — forwarded as single file`);
-                        const chatId = process.env.TELEGRAM_CHAT_ID || "";
-                        await this.bot.telegram.sendMessage(chatId,
-                            `⚠️ *Vendor pattern: multi-page split required*\n` +
-                            `Vendor: ${invoiceData.vendorName}\nFile: \`${filename}\`\n` +
-                            `_${pattern.handlingRule}_\n\n` +
-                            `PDF was forwarded as-is to Bill.com — please split manually if this is a multi-invoice bundle.`,
-                            { parse_mode: "Markdown" }
-                        ).catch(() => { });
                     }
                 } catch {
                     // Non-fatal — vendor memory is advisory only
@@ -1050,11 +1045,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         ocr_duration_ms: extracted.ocrDurationMs || null,
                     });
                 } catch { /* best-effort — Telegram alert is the primary signal */ }
-                const chatId = process.env.TELEGRAM_CHAT_ID || "";
-                await this.bot.telegram.sendMessage(chatId,
-                    `⚠️ *Low-confidence invoice parse*\nFile: \`${filename}\`\nVendor: ${invoiceData.vendorName}\nForwarded to Bill.com but no Finale reconciliation attempted. Please review manually.`,
-                    { parse_mode: "Markdown" }
-                );
+                // Silenced 2026-05-13: low-confidence parses are visible in
+                // the dashboard AP queue + ap_activity_log. Was Telegram noise.
+                console.warn(`[ap-agent] low-confidence parse — ${filename} / ${invoiceData.vendorName} — Bill.com forwarded, no Finale reconcile`);
                 await this.logActivity(supabase, from, subject, "INVOICE", `Low-confidence parse — reconciliation skipped for ${filename}`);
                 outcome.state = "skipped_low_confidence";
                 outcome.error = `Low-confidence parse for ${filename}`;
