@@ -114,7 +114,7 @@ defineJob({
     name: "po-followup-watcher",
     schedule: "45 7 * * 1-5",
     onFail: "log",
-    description: "10 AM Mon-Fri: nudge vendors quiet on a sent PO; escalate or mark NONCOMM.",
+    description: "7:45 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
     handler: async () => {
         const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
         const outcomes = await runPOFollowupWatcher();
@@ -124,6 +124,42 @@ defineJob({
         }, {});
         if (Object.keys(counts).length > 0) {
             console.log(`[po-followup-watcher] outcomes:`, counts);
+        }
+    },
+});
+
+// Detect POs stalled at any pipeline stage. Reads existing tables, no writes.
+// Surfaces via /api/dashboard/po-stuck + Telegram digest on cron run.
+defineJob({
+    name: "po-stuck-detector",
+    schedule: "50 7 * * 1-5",
+    onFail: "log",
+    description: "7:50 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc).",
+    handler: async () => {
+        const { detectStuckPOs, summariseStuck } = await import("@/lib/purchasing/po-stuck-detector");
+        const rows = await detectStuckPOs();
+        const summary = summariseStuck(rows);
+        if (summary.total > 0) {
+            console.log(`[po-stuck-detector] ${summary.total} stuck:`, summary.byStage);
+        }
+    },
+});
+
+// Refresh carrier status for every active shipment.
+defineJob({
+    name: "carrier-poll",
+    schedule: "0 6 * * *",
+    onFail: "log",
+    description: "6 AM daily: refresh live carrier status for active shipments.",
+    handler: async () => {
+        const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
+        const outcomes = await pollActiveShipments();
+        const counts = outcomes.reduce<Record<string, number>>((acc, o) => {
+            acc[o.action] = (acc[o.action] ?? 0) + 1;
+            return acc;
+        }, {});
+        if (Object.keys(counts).length > 0) {
+            console.log(`[carrier-poll] outcomes:`, counts);
         }
     },
 });
