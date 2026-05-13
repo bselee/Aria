@@ -1213,12 +1213,22 @@ export class OpsManager {
                     }
                 }
 
-                // Extract tracking...
+                // Extract tracking + ETA from vendor replies. We gather one
+                // representative vendor-reply body so the LLM ETA extractor
+                // sees the most-recent vendor message (likely to contain the
+                // current ship promise).
+                let firstVendorBody: string | null = null;
+                let firstVendorSubject: string | null = null;
                 for (const msg of thread.messages) {
                     const bodyParts: string[] = [msg.snippet || ''];
                     if (msg.payload?.body?.data) bodyParts.push(_decodeGmailBody(msg.payload.body.data));
                     if (msg.payload?.parts) _walkMsgParts(msg.payload.parts, bodyParts);
                     const bodyText = bodyParts.join('\n');
+                    const fromH = msg.payload?.headers?.find(h => h.name === 'From')?.value || '';
+                    if (firstVendorBody == null && !fromH.toLowerCase().includes('buildasoil.com')) {
+                        firstVendorBody = bodyText;
+                        firstVendorSubject = msg.payload?.headers?.find(h => h.name === 'Subject')?.value || null;
+                    }
                     const ltlCarrier = detectLTLCarrier(bodyText);
 
                     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
@@ -1243,7 +1253,7 @@ export class OpsManager {
                     try {
                         const { data: existing } = await supabase
                             .from("purchase_orders")
-                            .select("tracking_numbers, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence")
+                            .select("tracking_numbers, po_sent_verified_at, po_sent_verified_source, po_sent_verified_evidence, vendor_stated_eta_extracted_at")
                             .eq("po_number", poNumber)
                             .maybeSingle();
                         const oldTracking = existing?.tracking_numbers || [];
@@ -1274,6 +1284,29 @@ export class OpsManager {
                         }
                         if (humanReplyDetectedAt) {
                             upsert.human_reply_detected_at = humanReplyDetectedAt;
+                        }
+
+                        // LLM ETA extraction — only when we have a fresh vendor reply
+                        // body and the PO doesn't already have a recent extracted ETA.
+                        const existingEta = (existing as any)?.vendor_stated_eta_extracted_at;
+                        const tooRecent = existingEta && (Date.now() - new Date(existingEta).getTime()) < 5 * 86_400_000;
+                        if (firstVendorBody && responseAt && !tooRecent) {
+                            try {
+                                const { extractETAFromText } = await import('@/lib/purchasing/eta-extractor');
+                                const eta = await extractETAFromText({
+                                    body: firstVendorBody,
+                                    subject: firstVendorSubject ?? undefined,
+                                });
+                                if (eta.confidence !== 'low' && (eta.etaDate || eta.shipDate)) {
+                                    upsert.vendor_stated_eta = eta.etaDate;
+                                    upsert.vendor_stated_ship_date = eta.shipDate;
+                                    upsert.vendor_stated_eta_confidence = eta.confidence;
+                                    upsert.vendor_stated_eta_extracted_at = new Date().toISOString();
+                                    upsert.vendor_stated_eta_rationale = eta.rationale;
+                                }
+                            } catch (etaErr: any) {
+                                console.warn('[po-sync] ETA extract failed:', etaErr?.message ?? etaErr);
+                            }
                         }
 
                         if (!alreadyHighConfidence && sentISO) {
