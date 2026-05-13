@@ -29,8 +29,6 @@ const DROPSHIP_PATTERN = /autopot|printful|grand.?master|\bhlg\b|horticulture li
 // stays untouched — review manually.
 const WINDOW_MIN_DAYS = 5;
 const WINDOW_MAX_DAYS = 9;
-// Inbound scan reaches back 14d to give correlation a fair chance.
-const INBOX_LOOKBACK_DAYS = 14;
 
 export interface FollowupOutcome {
     poNumber: string;
@@ -62,14 +60,18 @@ function daysSince(iso: string | null | undefined): number | null {
     return Math.floor((Date.now() - t) / 86_400_000);
 }
 
-async function fetchRecentInbound(gmail: any): Promise<any[]> {
-    const sinceDate = new Date(Date.now() - INBOX_LOOKBACK_DAYS * 86_400_000);
-    const sinceStr = sinceDate.toISOString().slice(0, 10).replace(/-/g, '/');
-    // Inbound = not from buildasoil.com domain. Excludes auto-replies via header check later.
+/**
+ * Targeted per-PO search: pull messages that contain this PO number, sent
+ * by anyone other than us, within 30 days. Much more reliable than a single
+ * upfront sweep — the PO# anchor guarantees relevance and Gmail's search
+ * surface filters efficiently.
+ */
+async function searchInboundForPO(gmail: any, poNumber: string): Promise<any[]> {
+    const digits = poNumber.replace(/^PO-?/i, '');
     const list = await gmail.users.messages.list({
         userId: 'me',
-        q: `-from:buildasoil.com after:${sinceStr}`,
-        maxResults: 200,
+        q: `${digits} newer_than:30d -from:buildasoil.com`,
+        maxResults: 15,
     });
     const messages = list.data?.messages ?? [];
     const full: any[] = [];
@@ -233,8 +235,6 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
     const gmail = GmailApi({ version: 'v1', auth });
     const agent = new VendorCommsAgent(gmail);
 
-    // Single inbox scan, applied to every candidate PO. Saves Gmail quota.
-    const inbound = await fetchRecentInbound(gmail);
     const uniqueSet = uniqueVendorPOs(filtered);
 
     for (const po of filtered) {
@@ -261,7 +261,11 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
             poSentAt: po.po_sent_verified_at,
         };
 
-        const match = matchPOAgainstInbox(target, inbound);
+        // Targeted Gmail search per-PO (Will: "all data is there"). The PO#
+        // anchor pulls Ben Arends-style "Re: BuildASoil PO # NNNNN" replies
+        // even when they're sent from accounting / shipping / fulfillment.
+        const poInbound = await searchInboundForPO(gmail, po.po_number);
+        const match = matchPOAgainstInbox(target, poInbound);
 
         if (match.matched) {
             if (!dryRun) {
