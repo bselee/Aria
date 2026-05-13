@@ -35,7 +35,7 @@ import {
     OPENROUTER_STRUCTURED_CHAIN,
 } from './models';
 
-export type LLMTier = 'free' | 'paid';
+export type LLMTier = 'free' | 'paid' | 'free_only';
 
 export type LLMOptions = {
     system?: string;
@@ -129,6 +129,14 @@ function getOpenRouterFreeProvider(): ProviderEntry[] {
 // Chain: Gemini (free) → OpenRouter (cheap, curated) → OpenAI → Anthropic
 function getProviderChain(tier: LLMTier = 'paid'): ProviderEntry[] {
     const chain: ProviderEntry[] = [];
+
+    if (tier === 'free_only') {
+        // Strict: OpenRouter free chain only. No paid fallback. The call
+        // returns null/throws when the free quota is exhausted — caller
+        // must handle the failure gracefully.
+        chain.push(...getOpenRouterFreeProvider());
+        return chain.filter(p => p.available);
+    }
 
     if (tier === 'free') {
         // Free chain: Llama/Qwen/DeepSeek free tiers first, then drop into the
