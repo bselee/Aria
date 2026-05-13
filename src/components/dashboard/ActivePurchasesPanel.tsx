@@ -427,8 +427,8 @@ export default function ActivePurchasesPanel() {
                                         </button>
 
                                         {/* Line 1: Vendor, Date, Tags */}
-                                        <div className="flex items-center gap-2 min-w-0 pr-8">
-                                            <span className="text-sm font-semibold text-zinc-100 truncate">{po.vendorName}</span>
+                                        <div className="flex items-center gap-2 flex-wrap min-w-0 pr-8">
+                                            <span className="text-sm font-semibold text-zinc-100 truncate min-w-[120px] max-w-[260px]" title={po.vendorName}>{po.vendorName}</span>
                                             {(() => {
                                                 const r = relFor(po.vendorName);
                                                 if (!r?.grade) return null;
@@ -460,7 +460,7 @@ export default function ActivePurchasesPanel() {
                                                     ✓ Vendor ack
                                                 </span>
                                             )}
-                                            {daysOut != null && !po.isReceived && (
+                                            {daysOut != null && !po.isReceived && !overdue && (
                                                 <span className="text-[10px] font-mono text-zinc-600 shrink-0">{daysOut}d out</span>
                                             )}
                                             {po.total > 0 && (
@@ -471,7 +471,7 @@ export default function ActivePurchasesPanel() {
                                         </div>
 
                                         {/* Line 2: Links and Schedule text */}
-                                        <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-[var(--dash-l2)]">
+                                        <div className="mt-1 flex items-center gap-x-2 gap-y-1 flex-wrap text-[11px] font-mono text-[var(--dash-l2)]">
                                             <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
                                                 onClick={e => e.stopPropagation()}
                                                 className="text-blue-500 hover:text-blue-400 transition-colors inline-flex items-center gap-1 shrink-0">
@@ -495,7 +495,7 @@ export default function ActivePurchasesPanel() {
                                                 </span>
                                             )}
 
-                                            <span className="text-zinc-700">Â·</span>
+                                            <span className="text-zinc-700">·</span>
                                             {sentVerified ? (
                                                 <span
                                                     className="inline-flex items-center gap-1 text-emerald-300 shrink-0"
