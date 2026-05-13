@@ -215,6 +215,23 @@ export default function ActivePurchasesPanel() {
         }
     }
 
+    // ── Vendor reliability map ──
+    const [reliability, setReliability] = useState<Record<string, { grade: string | null; replyRate: number | null; onTimeRate: number | null; poCount: number; avgDaysToDelivery: number | null; avgReplyHours: number | null }>>({});
+    useEffect(() => {
+        let cancelled = false;
+        fetch('/api/dashboard/vendor-reliability')
+            .then(r => r.json())
+            .then(j => {
+                if (cancelled) return;
+                const m: Record<string, any> = {};
+                for (const row of j.rows ?? []) m[(row.vendorName ?? '').toLowerCase()] = row;
+                setReliability(m);
+            })
+            .catch(() => undefined);
+        return () => { cancelled = true; };
+    }, []);
+    function relFor(name: string) { return reliability[(name ?? '').toLowerCase()] ?? null; }
+
     // ── Timeline drawer state ──
     const [timelineOrderId, setTimelineOrderId] = useState<string | null>(null);
     const [timelineData, setTimelineData] = useState<any | null>(null);
@@ -412,6 +429,24 @@ export default function ActivePurchasesPanel() {
                                         {/* Line 1: Vendor, Date, Tags */}
                                         <div className="flex items-center gap-2 min-w-0 pr-8">
                                             <span className="text-sm font-semibold text-zinc-100 truncate">{po.vendorName}</span>
+                                            {(() => {
+                                                const r = relFor(po.vendorName);
+                                                if (!r?.grade) return null;
+                                                const tone = r.grade === 'A' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                                    : r.grade === 'B' ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                                                    : r.grade === 'C' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                                                    : r.grade === 'D' ? 'bg-orange-500/20 text-orange-300 border-orange-500/40'
+                                                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40';
+                                                const reply = r.avgReplyHours != null ? `${Math.round(r.avgReplyHours)}h reply` : 'no reply data';
+                                                const onTime = r.onTimeRate != null ? `${Math.round(r.onTimeRate * 100)}% on-time` : 'no delivery data';
+                                                const deliv = r.avgDaysToDelivery != null ? `${Math.round(r.avgDaysToDelivery)}d avg delivery` : null;
+                                                const title = `${r.poCount} POs · ${reply} · ${onTime}${deliv ? ` · ${deliv}` : ''}`;
+                                                return (
+                                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${tone}`} title={title}>
+                                                        {r.grade}
+                                                    </span>
+                                                );
+                                            })()}
                                             <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${statusColor}`}>
                                                 {statusLabel}
                                             </span>

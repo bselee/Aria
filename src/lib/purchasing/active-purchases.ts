@@ -63,7 +63,7 @@ export async function loadActivePurchases(
                             "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
                             "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
                             "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
-                            "po_sent_verified_evidence, last_eta_update"
+                            "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence"
                         )
                         .in("po_number", chunk),
                     supabase
@@ -151,6 +151,12 @@ export async function loadActivePurchases(
 
         const poLifecycle = lifecycleMap.get(po.orderId);
         const vendorPromisedEta =
+            // LLM-extracted vendor-stated ETA wins when present (high or medium confidence).
+            (poLifecycle?.vendor_stated_eta &&
+                (poLifecycle?.vendor_stated_eta_confidence === 'high' ||
+                 poLifecycle?.vendor_stated_eta_confidence === 'medium')
+                    ? poLifecycle.vendor_stated_eta
+                    : null) ??
             poLifecycle?.last_eta_update?.estimated_delivery_at ??
             poLifecycle?.last_eta_update?.eta ??
             poLifecycle?.last_eta_update?.date ??
