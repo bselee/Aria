@@ -11,7 +11,7 @@
 
 import React from "react";
 
-import ActivityFeed from "@/components/dashboard/ActivityFeed";
+import ActivityTerminal from "@/components/dashboard/ActivityTerminal";
 import RecentRunsPanel from "./RecentRunsPanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import BuildRiskPanel from "@/components/dashboard/BuildRiskPanel";
@@ -52,7 +52,7 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         short: "Activity",
         render: () => (
             <div className="flex flex-col flex-1 overflow-hidden min-h-[300px]">
-                <ActivityFeed />
+                <ActivityTerminal />
             </div>
         ),
     },

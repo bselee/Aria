@@ -16,7 +16,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Bell, RefreshCw } from "lucide-react";
 
-import IssuesPanel from "./IssuesPanel";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
@@ -56,7 +55,6 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
 // secondary; Tasks/Activity are diagnostic.
 type TabId =
     | "lifecycle"
-    | "blocking"
     | "builds"
     | "activity";
 
@@ -137,7 +135,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         if (typeof window === "undefined") return;
         try {
             const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
-            const RETIRED = new Set(["ops", "ordering", "purchases", "rcv", "build-schedule", "tasks", "oversight"]);
+            const RETIRED = new Set(["ops", "ordering", "purchases", "rcv", "build-schedule", "tasks", "oversight", "blocking"]);
             if (saved && RETIRED.has(saved)) setActiveTab("lifecycle");
             else if (saved) setActiveTab(saved as TabId);
         } catch { /* ignore */ }
@@ -200,7 +198,6 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     const tabs: TabDef[] = useMemo(
         () => [
             { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
-            { id: "blocking", label: "Blocking Me", render: () => <IssuesPanel /> },
             {
                 id: "builds",
                 label: "Builds",
