@@ -113,6 +113,37 @@ export class VendorCommsAgent {
     }
 
     /**
+     * Create a follow-up email as a Gmail DRAFT (does not send). Used by the
+     * po-followup-watcher so Will reviews each poke before it goes out.
+     * Returns the Gmail draft ID for traceability.
+     */
+    async draftFollowUp(context: VendorCommContext, followUpCount: number): Promise<{ draftId: string | null }> {
+        const sentDateStr = context.sentAt.toLocaleDateString('en-US', {
+            month: 'short', day: 'numeric', year: 'numeric',
+            timeZone: 'America/Denver',
+        });
+        const body = this.getFollowUpBody(context.poNumber, sentDateStr, followUpCount);
+        const rawEmail = buildFollowUpEmail({
+            to: context.vendorEmail,
+            subject: `Re: ${context.subject}`,
+            inReplyTo: context.messageId,
+            references: context.messageId,
+            body,
+        });
+        const res = await this.gmail.users.drafts.create({
+            userId: 'me',
+            requestBody: {
+                message: {
+                    raw: Buffer.from(rawEmail).toString('base64url'),
+                    threadId: context.threadId,
+                },
+            },
+        });
+        console.log(`[vendor-comms] Drafted follow-up #${followUpCount} to ${context.vendorEmail} for PO #${context.poNumber} — draftId: ${res.data.id}`);
+        return { draftId: res.data.id ?? null };
+    }
+
+    /**
      * Send a follow-up email (L1 or L2 based on count).
      */
     async sendFollowUp(context: VendorCommContext, followUpCount: number): Promise<void> {
