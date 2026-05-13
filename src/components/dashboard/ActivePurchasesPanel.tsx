@@ -215,6 +215,22 @@ export default function ActivePurchasesPanel() {
         }
     }
 
+    // ── Timeline drawer state ──
+    const [timelineOrderId, setTimelineOrderId] = useState<string | null>(null);
+    const [timelineData, setTimelineData] = useState<any | null>(null);
+    const [timelineLoading, setTimelineLoading] = useState(false);
+    useEffect(() => {
+        if (!timelineOrderId) { setTimelineData(null); return; }
+        let cancelled = false;
+        setTimelineLoading(true);
+        fetch(`/api/dashboard/po-timeline/${encodeURIComponent(timelineOrderId)}`)
+            .then(r => r.json())
+            .then(j => { if (!cancelled) setTimelineData(j); })
+            .catch(() => { if (!cancelled) setTimelineData({ error: 'fetch failed' }); })
+            .finally(() => { if (!cancelled) setTimelineLoading(false); });
+        return () => { cancelled = true; };
+    }, [timelineOrderId]);
+
     const todayMs = Date.now();
     function effectiveExpected(po: ActivePurchase): string | null {
         return po.etaProfile?.expectedDate || po.expectedDate || null;
@@ -381,11 +397,12 @@ export default function ActivePurchasesPanel() {
                                         key={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
-                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                        onClick={() => setTimelineOrderId(po.orderId)}
+                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
                                     >
                                         {/* Dismiss Button */}
                                         <button
-                                            onClick={() => dismissPurchase(po.orderId)}
+                                            onClick={e => { e.stopPropagation(); dismissPurchase(po.orderId); }}
                                             className="absolute right-3 top-3 opacity-0 group-hover:opacity-100 p-1 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 rounded transition-all"
                                             title="Dismiss PO"
                                         >
@@ -421,6 +438,7 @@ export default function ActivePurchasesPanel() {
                                         {/* Line 2: Links and Schedule text */}
                                         <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-[var(--dash-l2)]">
                                             <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
+                                                onClick={e => e.stopPropagation()}
                                                 className="text-blue-500 hover:text-blue-400 transition-colors inline-flex items-center gap-1 shrink-0">
                                                 {po.orderId} <ExternalLink className="w-2.5 h-2.5" />
                                             </a>
@@ -454,7 +472,7 @@ export default function ActivePurchasesPanel() {
                                                 <span className="inline-flex items-center gap-1.5 shrink-0">
                                                     <span className="text-amber-300">PO send unverified</span>
                                                     <button
-                                                        onClick={() => markSentVerified(po.orderId)}
+                                                        onClick={e => { e.stopPropagation(); markSentVerified(po.orderId); }}
                                                         disabled={verifyingSent.has(po.orderId)}
                                                         className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/30 text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-40"
                                                         title="Mark this PO as sent after verifying externally"
@@ -486,6 +504,7 @@ export default function ActivePurchasesPanel() {
                                                         return (
                                                             <span key={i} className="inline-flex items-center gap-1 shrink-0">
                                                                 <a href={entry.url} target="_blank" rel="noopener noreferrer"
+                                                                    onClick={e => e.stopPropagation()}
                                                                     className="text-cyan-400 hover:text-cyan-300 hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5">
                                                                     {display}<ExternalLink className="w-2 h-2 opacity-60" />
                                                                 </a>
@@ -520,6 +539,39 @@ export default function ActivePurchasesPanel() {
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
                 </>
+            )}
+            {timelineOrderId && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setTimelineOrderId(null)}>
+                    <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="px-4 py-3 border-b border-zinc-800 flex items-center gap-2">
+                            <span className="text-sm font-mono font-semibold text-zinc-200">PO #{timelineOrderId} timeline</span>
+                            <span className="text-[10px] font-mono text-zinc-600">{timelineData?.vendorName ?? ''}</span>
+                            <div className="flex-1" />
+                            <button onClick={() => setTimelineOrderId(null)} className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300"><X className="w-3.5 h-3.5" /></button>
+                        </div>
+                        <div className="px-4 py-3 overflow-y-auto">
+                            {timelineLoading && <div className="text-[11px] font-mono text-zinc-500">Loading…</div>}
+                            {timelineData?.error && <div className="text-[11px] font-mono text-rose-400">{timelineData.error}</div>}
+                            {timelineData?.events && timelineData.events.length === 0 && <div className="text-[11px] font-mono text-zinc-500">No events recorded for this PO yet.</div>}
+                            {timelineData?.events?.map((e: any, i: number) => {
+                                const tone = e.kind === 'delivered' || e.kind === 'received' || e.kind === 'reconciled' || e.kind === 'acked'
+                                    ? 'text-emerald-400'
+                                    : e.kind === 'noncomm'
+                                    ? 'text-rose-400'
+                                    : e.kind === 'tracking_requested' || e.kind === 'tracking_requested_l2'
+                                    ? 'text-amber-300'
+                                    : 'text-cyan-300';
+                                return (
+                                    <div key={i} className="flex items-start gap-3 py-1.5 border-b border-zinc-800/40">
+                                        <span className="text-[10px] font-mono text-zinc-600 w-32 shrink-0 mt-0.5">{new Date(e.at).toLocaleString()}</span>
+                                        <span className={`text-[11px] font-mono ${tone} w-44 shrink-0 mt-0.5`}>{e.label}</span>
+                                        <span className="text-[10px] font-mono text-zinc-500 truncate">{e.detail ?? ''}</span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );
