@@ -108,6 +108,26 @@ defineJob({
     handler: async () => { await ops()?.runQtyCalibration(); },
 });
 
+// Politely follow up with vendors who haven't acknowledged a sent PO.
+// L1 at sent+5d → L2 at L1+7d → mark NONCOMM at L2+7d. Dropships excluded.
+defineJob({
+    name: "po-followup-watcher",
+    schedule: "0 10 * * 1-5",
+    onFail: "log",
+    description: "10 AM Mon-Fri: nudge vendors quiet on a sent PO; escalate or mark NONCOMM.",
+    handler: async () => {
+        const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
+        const outcomes = await runPOFollowupWatcher();
+        const counts = outcomes.reduce<Record<string, number>>((acc, o) => {
+            acc[o.action] = (acc[o.action] ?? 0) + 1;
+            return acc;
+        }, {});
+        if (Object.keys(counts).length > 0) {
+            console.log(`[po-followup-watcher] outcomes:`, counts);
+        }
+    },
+});
+
 // po-sweep removed — KAIZEN #5: folded into ap-polling as a post-pass.
 // runPOSweep() remains on OpsManager and is invoked on every ap-polling tick.
 
