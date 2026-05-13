@@ -75,6 +75,8 @@ type PurchasingItem = {
     medianPOGapDays?: number;
     projectedNextOrderDate?: string;
     receiptConfidence?: 'high' | 'medium' | 'low';
+    triggerReason?: 'build-driven' | 'stockout-padded' | 'runway-short' | 'cadence' | null;
+    triggerDetail?: string;
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -231,7 +233,10 @@ export default function PurchasingPanel() {
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
     const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
     type ItemMode = 'all' | 'resale' | 'bom';
-    const [itemMode, setItemMode] = useState<ItemMode>('all');
+    // Hardcoded to BOM Materials — Will's purchasing workflow for resale items
+    // runs through other paths (vendor reconcilers, Lifecycle tab); this view
+    // is exclusively BOM/raw materials.
+    const [itemMode] = useState<ItemMode>('bom');
     const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
 
     // ULINE direct ordering
@@ -401,13 +406,61 @@ export default function PurchasingPanel() {
         return isSnoozed(`v:${g.vendorPartyId}`) || g.items.every(i => isSnoozed(i.productId));
     }
     // Inline dropdown — rendered as JSX, not a React component, to avoid closure issues
+    function fillTruckloadForVendor(vendorPartyId: string, multiplier: number) {
+        // Scale every currently-CHECKED item's qty up by `multiplier`. Maintains
+        // ratios across the vendor's selection. Snaps each result up to the
+        // item's own commonOrderQty (from cognitive rounding) when present, so
+        // the final qtys remain pallet/case-friendly.
+        const group = data?.groups.find(g => g.vendorPartyId === vendorPartyId);
+        if (!group) return;
+        setQtys(prev => {
+            const next = { ...prev };
+            const vendorQtys = { ...(next[vendorPartyId] ?? {}) };
+            for (const item of group.items) {
+                const isOn = checked[vendorPartyId]?.[item.productId];
+                if (!isOn || isSnoozed(item.productId)) continue;
+                const current = vendorQtys[item.productId] ?? item.assessment?.recommendedQty ?? item.suggestedQty;
+                const scaled = current * multiplier;
+                const unit = item.roundingAlternatives && item.roundingAlternatives.length > 0
+                    ? item.suggestedQty // already snapped — use as the unit
+                    : null;
+                vendorQtys[item.productId] = unit && unit > 0
+                    ? Math.ceil(scaled / unit) * unit
+                    : Math.ceil(scaled);
+            }
+            next[vendorPartyId] = vendorQtys;
+            return next;
+        });
+        setSnoozeMenu(null);
+    }
+
     function renderSnoozeMenu(k: string) {
         const snoozed = isSnoozed(k);
+        const isVendor = k.startsWith('v:');
+        const vendorPartyId = isVendor ? k.slice(2) : null;
         return (
-            <div className="absolute right-0 top-full mt-0.5 z-50 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[150px]">
+            <div className="absolute right-0 top-full mt-0.5 z-50 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[170px]">
+                {isVendor && vendorPartyId && (
+                    <>
+                        <div className="px-3 py-0.5 text-[9px] font-mono text-zinc-600 uppercase tracking-wider border-b border-zinc-800 mb-0.5">
+                            Fill truckload
+                        </div>
+                        <div className="flex gap-1 px-2 py-1">
+                            {[2, 3, 4].map(n => (
+                                <button key={n}
+                                    onClick={() => fillTruckloadForVendor(vendorPartyId, n)}
+                                    className="flex-1 text-[10px] font-mono px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-800 hover:text-cyan-300 hover:border-cyan-500/40 transition-colors"
+                                    title={`Scale every checked item by ×${n}, snapped to typical order size`}
+                                >
+                                    ×{n}
+                                </button>
+                            ))}
+                        </div>
+                    </>
+                )}
                 {snoozed ? (
                     <button onClick={() => doUnsnooze(k)}
-                        className="w-full text-left px-3 py-1.5 text-[10px] font-mono text-emerald-400 hover:bg-zinc-800">
+                        className="w-full text-left px-3 py-1.5 text-[10px] font-mono text-emerald-400 hover:bg-zinc-800 border-t border-zinc-800">
                         ↩ Unsnooze
                     </button>
                 ) : (
@@ -443,7 +496,7 @@ export default function PurchasingPanel() {
 
         setLoadingTiers(new Set(['critical', 'warning', 'watch', 'ok']));
         try {
-            const res = await fetch(`/api/dashboard/purchasing?mode=all${bust ? '&bust=1' : ''}`);
+            const res = await fetch(`/api/dashboard/purchasing?mode=bom${bust ? '&bust=1' : ''}`);
             const json: AssessmentData = await res.json();
             if (!res.ok) throw new Error(json.error || `Failed to load ordering`);
 
@@ -1011,24 +1064,6 @@ export default function PurchasingPanel() {
 
             {!isCollapsed && (
                 <>
-                    {/* ── Item type mode: All / Resale / BOM Materials ── */}
-                    <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-800/60 bg-zinc-950/30">
-                        <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">type</span>
-                        {([
-                            { k: 'all' as const, label: 'All', tone: 'bg-zinc-700 text-zinc-200 border-zinc-500' },
-                            { k: 'resale' as const, label: 'Resale', tone: 'bg-blue-500/20 text-blue-300 border-blue-500/40' },
-                            { k: 'bom' as const, label: 'BOM Materials', tone: 'bg-purple-500/20 text-purple-300 border-purple-500/40' },
-                        ]).map(t => (
-                            <button key={t.k}
-                                onClick={() => setItemMode(t.k)}
-                                className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${
-                                    itemMode === t.k ? t.tone : 'text-zinc-500 border-zinc-700 hover:text-zinc-300'
-                                }`}
-                            >
-                                {t.label}
-                            </button>
-                        ))}
-                    </div>
                     {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
                     <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                         <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">show</span>
@@ -1056,24 +1091,6 @@ export default function PurchasingPanel() {
                             All <span className="opacity-60">{lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other}</span>
                         </button>
                     </div>
-
-                    {/* ── Upcoming builds digest (next 30d from calendar) ── */}
-                    {data?.upcomingBuilds && data.upcomingBuilds.length > 0 && (
-                        <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                            <span className="text-[10px] font-mono text-cyan-300 shrink-0 mr-1">📅 Next 30d:</span>
-                            {data.upcomingBuilds.map(b => (
-                                <span key={b.sku}
-                                    className="text-[10px] font-mono px-2 py-0.5 rounded border border-zinc-800 text-zinc-400 shrink-0"
-                                    title={`${b.componentCount} component(s) needed`}
-                                >
-                                    <span className="text-cyan-400">{b.earliestDate.slice(5)}</span>
-                                    <span className="mx-1 text-zinc-600">·</span>
-                                    <span className="text-zinc-300">{b.sku}</span>
-                                    <span className="ml-1 text-zinc-600">({b.componentCount})</span>
-                                </span>
-                            ))}
-                        </div>
-                    )}
 
                     {/* ── Vendor tabs ── active vendors + snoozed (greyed) when showSnoozed */}
                     {focusGroups.length > 0 && (
@@ -1243,6 +1260,27 @@ export default function PurchasingPanel() {
                                                             {diffCount} qty diff
                                                         </span>
                                                     )}
+                                                    {/* Affected FGs across this vendor's BOM items (collapsed view) */}
+                                                    {!vSnoozed && (() => {
+                                                        const fgs = new Map<string, string>();
+                                                        for (const it of activeItems) {
+                                                            for (const fg of it.feedsFinishedGoods ?? []) {
+                                                                if (!fgs.has(fg.sku)) fgs.set(fg.sku, fg.name);
+                                                            }
+                                                        }
+                                                        if (fgs.size === 0) return null;
+                                                        const list = Array.from(fgs.entries());
+                                                        const shown = list.slice(0, 3);
+                                                        return (
+                                                            <span
+                                                                className="text-[10px] font-mono text-purple-300/80 truncate max-w-[420px] shrink"
+                                                                title={list.map(([sku, name]) => `${sku} · ${name}`).join('\n')}
+                                                            >
+                                                                affects {shown.map(([sku]) => sku).join(', ')}
+                                                                {list.length > shown.length && ` · +${list.length - shown.length}`}
+                                                            </span>
+                                                        );
+                                                    })()}
                                                 </button>
 
                                                 {!vSnoozed && cfg.label && (
@@ -1521,6 +1559,24 @@ export default function PurchasingPanel() {
                                                                                         </span>
                                                                                     );
                                                                                 })()}
+
+                                                                                {/* Per-row trigger reason badge */}
+                                                                                {!itemSnoozed && item.triggerReason && (
+                                                                                    <span
+                                                                                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${
+                                                                                            item.triggerReason === 'build-driven' ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
+                                                                                            : item.triggerReason === 'stockout-padded' ? 'bg-rose-500/15 text-rose-300 border-rose-500/40'
+                                                                                            : item.triggerReason === 'runway-short' ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                                                                                            : 'bg-zinc-700/40 text-zinc-400 border-zinc-700'
+                                                                                        }`}
+                                                                                        title={item.triggerDetail ?? ''}
+                                                                                    >
+                                                                                        {item.triggerReason === 'build-driven' ? '📅 build' :
+                                                                                         item.triggerReason === 'stockout-padded' ? '🔁 stockout' :
+                                                                                         item.triggerReason === 'runway-short' ? '⏱ runway' :
+                                                                                         '🗓 cadence'}
+                                                                                    </span>
+                                                                                )}
 
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button

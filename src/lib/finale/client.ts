@@ -200,6 +200,10 @@ export interface PurchasingItem {
     projectedNextOrderDate?: string;
     /** Confidence in receipt-derived velocity. */
     receiptConfidence?: 'high' | 'medium' | 'low';
+    /** Why this row is urgent — surfaced as a per-row badge in the BOM view. */
+    triggerReason?: 'build-driven' | 'stockout-padded' | 'runway-short' | 'cadence' | null;
+    /** Brief one-line context for the trigger ("Build 2026-05-19 short 50") */
+    triggerDetail?: string;
 }
 
 export interface PurchasingGroup {
@@ -5307,6 +5311,70 @@ export class FinaleClient {
                         roundingAlternatives: rounded.commonOrderQty != null && rounded.rawSuggestedQty !== rounded.suggestedQty
                             ? [rounded.rawSuggestedQty]
                             : undefined,
+                        // Per-row trigger reason — priority order: build > stockout > runway > cadence.
+                        triggerReason: forwardShortfall > 0
+                            ? 'build-driven'
+                            : stockoutMultiplier > 1
+                                ? 'stockout-padded'
+                                : adjustedRunwayDays < baseLeadTimeDays
+                                    ? 'runway-short'
+                                    : urgency === 'critical' || urgency === 'warning'
+                                        ? 'cadence'
+                                        : null,
+                        triggerDetail: forwardShortfall > 0 && forward
+                            ? `Build ${forward.earliestBuildDate}: need ${forward.requiredQty.toLocaleString()}, ${forwardShortfall.toLocaleString()} short`
+                            : stockoutMultiplier > 1
+                                ? `Lead time padded ×${stockoutMultiplier.toFixed(1)} (${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
+                                : adjustedRunwayDays < baseLeadTimeDays
+                                    ? `${Math.round(adjustedRunwayDays)}d runway < ${baseLeadTimeDays}d lead time`
+                                    : medianPOGapDays
+                                        ? `Due in ~${Math.round(adjustedRunwayDays - baseLeadTimeDays)}d (${Math.round(medianPOGapDays)}d cadence)`
+                                        : undefined,
+                        // Why-drawer provenance for the BOM row.
+                        recommendation: {
+                            formulaVersion: 'bom-v3-2026-05-12',
+                            coverDays,
+                            rawNeededEaches: rounded.rawSuggestedQty,
+                            provenance: [
+                                {
+                                    step: 'Daily burn',
+                                    detail: chosen.source === 'receipts'
+                                        ? `${dailyBurn.toFixed(2)}/d from receipts · ${compActivity.purchaseCount} POs · ${confidence} confidence${trend.trendingUp ? ' · trending up' : ''}`
+                                        : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`,
+                                    value: dailyBurn,
+                                },
+                                {
+                                    step: 'Lead time',
+                                    detail: leadTimeProvenance,
+                                    value: leadTimeDays,
+                                },
+                                ...(forward ? [{
+                                    step: 'Calendar build',
+                                    detail: `Earliest build ${forward.earliestBuildDate} consumes ${forward.requiredQty.toLocaleString()}; shortfall ${forwardShortfall.toLocaleString()}`,
+                                    value: forward.requiredQty,
+                                }] : []),
+                                ...(onTimeRate < 1 ? [{
+                                    step: 'Vendor on-time',
+                                    detail: `${Math.round(onTimeRate * 100)}% historical on-time rate · on-order discounted to ${stockOnOrder.toLocaleString()}`,
+                                    value: onTimeRate,
+                                }] : []),
+                                {
+                                    step: 'Cover days target',
+                                    detail: `${coverDays}d`,
+                                    value: coverDays,
+                                },
+                                {
+                                    step: 'Raw need',
+                                    detail: `ceil(${dailyBurn.toFixed(2)} × ${coverDays} − ${stockOnHand.toLocaleString()}) = ${rounded.rawSuggestedQty.toLocaleString()}`,
+                                    value: rounded.rawSuggestedQty,
+                                },
+                                ...(rounded.commonOrderQty != null ? [{
+                                    step: 'Cognitive rounding',
+                                    detail: `${rounded.rationale === 'mode' ? 'Mode' : rounded.rationale === 'median' ? 'Median' : 'Last order'} ${rounded.commonOrderQty.toLocaleString()} from past POs → ${rounded.suggestedQty.toLocaleString()}`,
+                                    value: rounded.suggestedQty,
+                                }] : []),
+                            ],
+                        },
                     });
                 } catch (err: any) {
                     // Win #2: Cache clean-404s so we skip them next call this process lifetime.
