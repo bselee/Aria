@@ -1264,6 +1264,18 @@ export class OpsManager {
                             upsert.vendor_response_at = responseAt ? new Date(responseAt).toISOString() : null;
                         }
 
+                        // Close the read↔write loop: every vendor reply on a PO thread
+                        // counts as an acknowledgment, even when no tracking numbers
+                        // landed in it. The Purchases panel reads vendor_acknowledged_at
+                        // to render the "✓ Vendor ack" chip.
+                        if (responseAt) {
+                            upsert.vendor_acknowledged_at = new Date(responseAt).toISOString();
+                            upsert.vendor_ack_source = 'thread_reply';
+                        }
+                        if (humanReplyDetectedAt) {
+                            upsert.human_reply_detected_at = humanReplyDetectedAt;
+                        }
+
                         if (!alreadyHighConfidence && sentISO) {
                             const evidence = {
                                 type: "po_send",
@@ -1281,7 +1293,7 @@ export class OpsManager {
                             upsert.po_sent_verified_evidence = evidenceList;
                         }
 
-                        const willWrite = newOnes.length > 0 || (!alreadyHighConfidence && sentISO);
+                        const willWrite = newOnes.length > 0 || (!alreadyHighConfidence && sentISO) || !!responseAt;
                         if (willWrite) {
                             await supabase.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
                         }
