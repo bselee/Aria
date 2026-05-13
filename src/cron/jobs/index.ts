@@ -112,7 +112,7 @@ defineJob({
 // L1 at sent+5d → L2 at L1+7d → mark NONCOMM at L2+7d. Dropships excluded.
 defineJob({
     name: "po-followup-watcher",
-    schedule: "0 10 * * 1-5",
+    schedule: "45 7 * * 1-5",
     onFail: "log",
     description: "10 AM Mon-Fri: nudge vendors quiet on a sent PO; escalate or mark NONCOMM.",
     handler: async () => {

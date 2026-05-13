@@ -1,44 +1,58 @@
 /**
  * @file    po-followup-watcher.ts
- * @purpose Politely ask vendors to confirm their PO when they've been quiet.
+ * @purpose Identify vendors quiet on a recently-sent PO, check if they replied
+ *          OUTSIDE the original thread, and if not, DRAFT a polite poke for
+ *          Will to review and send. Never auto-sends.
  *
- * Runs daily. For every committed PO where we have evidence the PO was sent
- * but no acknowledgment + no tracking after N days, sends a polite in-thread
- * follow-up. Escalates L1 → L2 → marks vendor NONCOMM (Telegram alert to
- * Will so he can call).
+ * Flow per PO (sent 5-9 days ago, no ack, no tracking):
+ *   1. Scan bill.selee@ inbox for recent inbound mail (~14d).
+ *   2. Run vendor-reply-detector with strategies: subject_po → body_po →
+ *      domain_unique. If matched, write vendor_acknowledged_at + source.
+ *   3. If no match, find the original PO thread, build VendorCommContext,
+ *      call VendorCommsAgent.draftFollowUp() to create a Gmail DRAFT.
+ *      Set tracking_requested_at so we don't re-draft.
  *
- * Dropship vendors are excluded entirely — memory note 2026-05-04: an auto
- * "thanks for the update" reply was sent to Autopot; dropships get NO email
- * from Aria, ever.
+ * Dropships excluded (memory note 2026-05-04). Window is forward-looking
+ * only: POs sent ≥10 days ago are aged out and never poked — Will reviews
+ * those manually via /unresponsive or the dashboard.
  */
 import { createClient } from "@/lib/supabase";
 import { VendorCommsAgent, type VendorCommContext } from "@/lib/intelligence/vendor-comms-agent";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import { matchPOAgainstInbox, type POTarget } from "./vendor-reply-detector";
+import { lookupVendorOrderEmail } from "./po-sender";
 
-// Dropship match — keep in sync with EXCLUDED_VENDOR_PATTERN in client.ts.
 const DROPSHIP_PATTERN = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
 
-const L1_AFTER_DAYS = 5;
-const L2_AFTER_DAYS = 7;       // days after L1 with no reply
-const NONCOMM_AFTER_DAYS = 7;  // days after L2 with no reply
+// Forward-looking window: only pokes POs sent 5–9 days ago. Anything older
+// stays untouched — review manually.
+const WINDOW_MIN_DAYS = 5;
+const WINDOW_MAX_DAYS = 9;
+// Inbound scan reaches back 14d to give correlation a fair chance.
+const INBOX_LOOKBACK_DAYS = 14;
+
+export interface FollowupOutcome {
+    poNumber: string;
+    action:
+        | 'cross_thread_match'    // vendor reply found outside PO thread → acked
+        | 'l1_drafted'            // Gmail draft created for Will to review
+        | 'skipped_dropship'
+        | 'skipped_no_thread'
+        | 'skipped_aged_out'
+        | 'skipped_recent';
+    reason?: string;
+}
 
 interface StalePO {
     po_number: string;
     vendor_name: string | null;
-    vendor_email: string | null;
+    vendor_party_id: string | null;
     po_sent_verified_at: string | null;
     vendor_acknowledged_at: string | null;
     tracking_numbers: string[] | null;
     tracking_requested_at: string | null;
-    tracking_requested_at_l2: string | null;
     vendor_noncomm_at: string | null;
-}
-
-interface Outcome {
-    poNumber: string;
-    action: 'l1_sent' | 'l2_sent' | 'noncomm_marked' | 'skipped_dropship' | 'skipped_no_thread' | 'skipped_recent';
-    reason?: string;
 }
 
 function daysSince(iso: string | null | undefined): number | null {
@@ -48,118 +62,251 @@ function daysSince(iso: string | null | undefined): number | null {
     return Math.floor((Date.now() - t) / 86_400_000);
 }
 
-/**
- * Find the original outbound PO email thread by subject. Returns Gmail
- * threadId + the first outbound message's id, subject, sentAt — enough
- * to build VendorCommContext.
- */
+async function fetchRecentInbound(gmail: any): Promise<any[]> {
+    const sinceDate = new Date(Date.now() - INBOX_LOOKBACK_DAYS * 86_400_000);
+    const sinceStr = sinceDate.toISOString().slice(0, 10).replace(/-/g, '/');
+    // Inbound = not from buildasoil.com domain. Excludes auto-replies via header check later.
+    const list = await gmail.users.messages.list({
+        userId: 'me',
+        q: `-from:buildasoil.com after:${sinceStr}`,
+        maxResults: 200,
+    });
+    const messages = list.data?.messages ?? [];
+    const full: any[] = [];
+    for (const m of messages) {
+        try {
+            const got = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
+            if (got.data) full.push(got.data);
+        } catch { /* skip individual message failures */ }
+    }
+    return full;
+}
+
 async function findPOThread(gmail: any, poNumber: string): Promise<{
     threadId: string; messageId: string; subject: string; sentAt: Date; vendorEmail: string | null;
 } | null> {
+    const digits = poNumber.replace(/^PO-?/i, '');
+    // Broad search; the in-thread filter below requires a real outbound PO
+    // send so we never address Will himself by mistake.
     const search = await gmail.users.messages.list({
         userId: 'me',
-        q: `(label:PO OR subject:"BuildASoil PO #${poNumber}")`,
-        maxResults: 5,
+        q: `(subject:"PO #${digits}" OR subject:"PO ${digits}")`,
+        maxResults: 10,
     });
     const msgs = search.data?.messages ?? [];
     for (const m of msgs) {
-        const t = await gmail.users.threads.get({ userId: 'me', id: m.threadId, format: 'metadata', metadataHeaders: ['Subject', 'To', 'Date', 'Message-ID'] });
-        const firstMsg = t.data.messages?.[0];
-        if (!firstMsg) continue;
-        const headers = firstMsg.payload?.headers ?? [];
+        const t = await gmail.users.threads.get({
+            userId: 'me', id: m.threadId,
+            format: 'metadata',
+            metadataHeaders: ['Subject', 'To', 'From', 'Date', 'Message-ID'],
+        });
+        const allMsgs = t.data.messages ?? [];
+        if (allMsgs.length === 0) continue;
+
+        // Two outbound PO paths exist:
+        //   (a) Gmail send from bill.selee@ — has SENT label; To: is often
+        //       bill.selee@ with the real vendor in BCC. Vendor email must
+        //       come from lookupVendorOrderEmail (caller).
+        //   (b) Finale native send — From=noreply@mail.finaleinventory.com,
+        //       To: is the actual vendor. No SENT label (it landed in inbox).
+        let anchor: any = null;
+        let toVendor: string | null = null;
+        for (const msg of allMsgs) {
+            const labels = msg.labelIds ?? [];
+            const hs = msg.payload?.headers ?? [];
+            const fromHeader = (hs.find((h: any) => h.name === 'From')?.value ?? '').toLowerCase();
+            const isGmailSend = labels.includes('SENT');
+            const isFinaleSend = /noreply@mail\.finaleinventory\.com/i.test(fromHeader);
+            if (!isGmailSend && !isFinaleSend) continue;
+            anchor = msg;
+            if (isFinaleSend) {
+                const toHeader = hs.find((h: any) => h.name === 'To')?.value ?? '';
+                const em = toHeader.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+                if (em && !/buildasoil\.com/i.test(em[0])) toVendor = em[0];
+            }
+            break;
+        }
+        if (!anchor) continue;
+
+        const headers = anchor.payload?.headers ?? [];
         const subject = headers.find((h: any) => h.name === 'Subject')?.value ?? '';
-        if (!new RegExp(`PO\\s*#?\\s*${poNumber}\\b`).test(subject)) continue;
-        const toHeader = headers.find((h: any) => h.name === 'To')?.value ?? '';
-        const messageIdHeader = headers.find((h: any) => h.name === 'Message-ID')?.value ?? firstMsg.id;
-        // Extract first email from To: e.g. "Vendor <a@b.com>" or "a@b.com, c@d.com"
-        const emailMatch = toHeader.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
-        const vendorEmail = emailMatch ? emailMatch[0] : null;
+        if (!new RegExp(`PO[-\\s]*#?\\s*${digits}\\b`).test(subject)) continue;
+        const messageIdHeader = headers.find((h: any) => h.name === 'Message-ID')?.value ?? anchor.id;
+
         return {
-            threadId: firstMsg.threadId!,
+            threadId: anchor.threadId!,
             messageId: messageIdHeader,
             subject,
-            sentAt: new Date(parseInt(firstMsg.internalDate!)),
-            vendorEmail,
+            sentAt: new Date(parseInt(anchor.internalDate!)),
+            vendorEmail: toVendor,  // null when we need lookupVendorOrderEmail fallback
         };
     }
     return null;
 }
 
+/** Pull recent vendor email patterns from past PO threads (for domain hints). */
+async function resolveVendorDomainHints(gmail: any, vendorName: string | null): Promise<string[]> {
+    if (!vendorName) return [];
+    const hints = new Set<string>();
+    try {
+        const search = await gmail.users.messages.list({
+            userId: 'me',
+            q: `subject:"${vendorName}" newer_than:90d`,
+            maxResults: 10,
+        });
+        for (const m of search.data?.messages ?? []) {
+            const t = await gmail.users.threads.get({
+                userId: 'me', id: m.threadId, format: 'metadata', metadataHeaders: ['To', 'From'],
+            });
+            for (const msg of t.data.messages ?? []) {
+                for (const h of msg.payload?.headers ?? []) {
+                    const v = h.value || '';
+                    const mEm = v.match(/[\w.+-]+@([\w-]+\.[\w.-]+)/);
+                    if (mEm && !/buildasoil\.com/i.test(mEm[0])) {
+                        hints.add(mEm[1].toLowerCase());
+                    }
+                }
+            }
+        }
+    } catch { /* best effort */ }
+    return Array.from(hints);
+}
+
 /**
- * Main entry point — called from the cron job.
+ * Determine which POs are unique per vendor in the current stale set —
+ * required for the domain_unique correlation strategy to be safe.
  */
-export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise<Outcome[]> {
+function uniqueVendorPOs(stale: StalePO[]): Set<string> {
+    const counts = new Map<string, number>();
+    for (const p of stale) {
+        const v = (p.vendor_name ?? '').toLowerCase().trim();
+        if (!v) continue;
+        counts.set(v, (counts.get(v) ?? 0) + 1);
+    }
+    const result = new Set<string>();
+    for (const p of stale) {
+        const v = (p.vendor_name ?? '').toLowerCase().trim();
+        if (v && counts.get(v) === 1) result.add(p.po_number);
+    }
+    return result;
+}
+
+/**
+ * Main entry. Pass dryRun to plan without writing/drafting.
+ */
+export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise<FollowupOutcome[]> {
     const dryRun = opts?.dryRun ?? false;
     const supabase = createClient();
     if (!supabase) return [];
 
-    const outcomes: Outcome[] = [];
+    const outcomes: FollowupOutcome[] = [];
+    const cutoffMax = new Date(Date.now() - WINDOW_MIN_DAYS * 86_400_000).toISOString();
+    const cutoffMin = new Date(Date.now() - WINDOW_MAX_DAYS * 86_400_000).toISOString();
 
-    // Query: POs where we sent ≥5 days ago and have no ack + no tracking AND
-    // haven't been marked noncomm. Includes ones already at L1 so we can
-    // promote to L2 / noncomm based on age.
-    const sentBefore = new Date(Date.now() - L1_AFTER_DAYS * 86_400_000).toISOString();
     const { data: pos, error } = await supabase
         .from('purchase_orders')
         .select(
-            'po_number, vendor_name, vendor_email, po_sent_verified_at, ' +
-            'vendor_acknowledged_at, tracking_numbers, tracking_requested_at, ' +
-            'tracking_requested_at_l2, vendor_noncomm_at'
+            'po_number, vendor_name, vendor_party_id, po_sent_verified_at, ' +
+            'vendor_acknowledged_at, tracking_numbers, tracking_requested_at, vendor_noncomm_at'
         )
-        .lte('po_sent_verified_at', sentBefore)
+        .gte('po_sent_verified_at', cutoffMin)
+        .lte('po_sent_verified_at', cutoffMax)
         .is('vendor_noncomm_at', null)
-        .limit(50);
+        .is('vendor_acknowledged_at', null)
+        .is('tracking_requested_at', null)  // not yet drafted
+        .limit(20);
 
     if (error) {
         console.error('[po-followup] query failed:', error.message);
         return [];
     }
+    if (!pos || pos.length === 0) return outcomes;
 
-    if (!pos || pos.length === 0) {
-        return outcomes;
-    }
+    const filtered: StalePO[] = (pos as StalePO[]).filter(po => {
+        if (po.vendor_acknowledged_at) return false;
+        if (po.tracking_numbers && po.tracking_numbers.length > 0) return false;
+        return true;
+    });
+    if (filtered.length === 0) return outcomes;
 
     const auth = await getAuthenticatedClient('default');
     const gmail = GmailApi({ version: 'v1', auth });
     const agent = new VendorCommsAgent(gmail);
 
-    for (const po of pos as StalePO[]) {
-        // Skip if already acknowledged or tracking landed
-        if (po.vendor_acknowledged_at) continue;
-        if (po.tracking_numbers && po.tracking_numbers.length > 0) continue;
+    // Single inbox scan, applied to every candidate PO. Saves Gmail quota.
+    const inbound = await fetchRecentInbound(gmail);
+    const uniqueSet = uniqueVendorPOs(filtered);
 
-        // Dropship guard — never message these vendors
+    for (const po of filtered) {
         if (DROPSHIP_PATTERN.test(po.vendor_name ?? '')) {
             outcomes.push({ poNumber: po.po_number, action: 'skipped_dropship' });
             continue;
         }
-
-        const daysSinceSent = daysSince(po.po_sent_verified_at);
-        const daysSinceL1 = daysSince(po.tracking_requested_at);
-        const daysSinceL2 = daysSince(po.tracking_requested_at_l2);
-
-        // Decide which tier to fire
-        let tier: 1 | 2 | 3 | 0 = 0;
-        if (po.tracking_requested_at_l2 && daysSinceL2 != null && daysSinceL2 >= NONCOMM_AFTER_DAYS) {
-            tier = 3; // mark noncomm
-        } else if (po.tracking_requested_at && daysSinceL1 != null && daysSinceL1 >= L2_AFTER_DAYS && !po.tracking_requested_at_l2) {
-            tier = 2;
-        } else if (!po.tracking_requested_at && daysSinceSent != null && daysSinceSent >= L1_AFTER_DAYS) {
-            tier = 1;
-        } else {
-            outcomes.push({ poNumber: po.po_number, action: 'skipped_recent' });
+        const dSent = daysSince(po.po_sent_verified_at);
+        if (dSent == null || dSent < WINDOW_MIN_DAYS || dSent > WINDOW_MAX_DAYS) {
+            outcomes.push({ poNumber: po.po_number, action: 'skipped_aged_out', reason: `sent ${dSent}d ago` });
             continue;
         }
 
+        // Build vendor domain hints from past correspondence
+        const domainHints = await resolveVendorDomainHints(gmail, po.vendor_name);
+        const isUnique = uniqueSet.has(po.po_number);
+
+        // Strategy: only allow domain_unique when this PO is the lone unacked
+        // candidate for its vendor in the current window.
+        const target: POTarget = {
+            poNumber: po.po_number,
+            vendorName: po.vendor_name ?? '',
+            vendorDomainHints: isUnique ? domainHints : [],
+            poSentAt: po.po_sent_verified_at,
+        };
+
+        const match = matchPOAgainstInbox(target, inbound);
+
+        if (match.matched) {
+            if (!dryRun) {
+                await supabase.from('purchase_orders').update({
+                    vendor_acknowledged_at: match.receivedAt,
+                    vendor_ack_source: match.source,
+                    updated_at: new Date().toISOString(),
+                }).eq('po_number', po.po_number);
+            }
+            outcomes.push({
+                poNumber: po.po_number,
+                action: 'cross_thread_match',
+                reason: `${match.source}: ${match.evidenceDetail} (from ${match.fromEmail})`,
+            });
+            continue;
+        }
+
+        // No cross-thread evidence either. Draft a polite poke for Will.
         const thread = await findPOThread(gmail, po.po_number);
-        if (!thread || !thread.vendorEmail) {
-            outcomes.push({ poNumber: po.po_number, action: 'skipped_no_thread', reason: 'no Gmail thread found' });
+        if (!thread) {
+            outcomes.push({ poNumber: po.po_number, action: 'skipped_no_thread', reason: 'no outbound PO thread' });
+            continue;
+        }
+
+        // Prefer the vendor email taken straight off the Finale outbound (To:),
+        // fall back to lookupVendorOrderEmail (vendor_profiles → Finale party).
+        let vendorEmail = thread.vendorEmail;
+        let vendorEmailSource = thread.vendorEmail ? 'finale_outbound_to' : 'unknown';
+        if (!vendorEmail) {
+            const lookup = await lookupVendorOrderEmail(po.vendor_name ?? '', po.vendor_party_id ?? '');
+            vendorEmail = lookup.email;
+            vendorEmailSource = lookup.source;
+        }
+        if (!vendorEmail || /buildasoil\.com/i.test(vendorEmail)) {
+            outcomes.push({
+                poNumber: po.po_number,
+                action: 'skipped_no_thread',
+                reason: `no vendor email on file (source=${vendorEmailSource})`,
+            });
             continue;
         }
 
         const ctx: VendorCommContext = {
             poNumber: po.po_number,
-            vendorEmail: thread.vendorEmail,
+            vendorEmail,
             vendorName: po.vendor_name ?? '',
             subject: thread.subject,
             threadId: thread.threadId,
@@ -167,26 +314,20 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
             sentAt: thread.sentAt,
             hasTracking: false,
             trackingQuality: 'none',
-            responseType: tier === 1 ? 'follow_up_l1' : tier === 2 ? 'follow_up_l2' : 'escalate',
+            responseType: 'follow_up_l1',
         };
 
         try {
-            if (tier === 3) {
-                if (!dryRun) await agent.markVendorNoncomm(ctx);
-                outcomes.push({ poNumber: po.po_number, action: 'noncomm_marked' });
-            } else {
-                if (!dryRun) {
-                    await agent.sendFollowUp(ctx, tier);
-                    const col = tier === 1 ? 'tracking_requested_at' : 'tracking_requested_at_l2';
-                    await supabase
-                        .from('purchase_orders')
-                        .update({ [col]: new Date().toISOString(), updated_at: new Date().toISOString() })
-                        .eq('po_number', po.po_number);
-                }
-                outcomes.push({ poNumber: po.po_number, action: tier === 1 ? 'l1_sent' : 'l2_sent' });
+            if (!dryRun) {
+                await agent.draftFollowUp(ctx, 1);
+                await supabase
+                    .from('purchase_orders')
+                    .update({ tracking_requested_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+                    .eq('po_number', po.po_number);
             }
+            outcomes.push({ poNumber: po.po_number, action: 'l1_drafted' });
         } catch (err: any) {
-            console.error(`[po-followup] ${po.po_number} tier=${tier} failed:`, err?.message ?? err);
+            console.error(`[po-followup] ${po.po_number} draft failed:`, err?.message ?? err);
         }
     }
 
