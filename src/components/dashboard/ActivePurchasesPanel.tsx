@@ -215,7 +215,53 @@ export default function ActivePurchasesPanel() {
         }
     }
 
-    const visiblePurchases = purchases.filter((po) => !dismissed.has(po.orderId));
+    const todayMs = Date.now();
+    function effectiveExpected(po: ActivePurchase): string | null {
+        return po.etaProfile?.expectedDate || po.expectedDate || null;
+    }
+    function dayDiff(a: string | null, b: string | null): number | null {
+        if (!a || !b) return null;
+        const ta = new Date(a).getTime();
+        const tb = new Date(b).getTime();
+        if (isNaN(ta) || isNaN(tb)) return null;
+        return Math.round((ta - tb) / 86_400_000);
+    }
+    function daysSince(d: string | null): number | null {
+        if (!d) return null;
+        const t = new Date(d).getTime();
+        if (isNaN(t)) return null;
+        return Math.floor((todayMs - t) / 86_400_000);
+    }
+    function isOverdue(po: ActivePurchase): boolean {
+        if (po.isReceived) return false;
+        const exp = effectiveExpected(po);
+        if (!exp) return false;
+        return new Date(exp).getTime() < todayMs;
+    }
+
+    const visiblePurchases = purchases
+        .filter((po) => !dismissed.has(po.orderId))
+        .sort((a, b) => {
+            // Received → bottom (most recent at top of the received pile)
+            if (a.isReceived !== b.isReceived) return a.isReceived ? 1 : -1;
+            if (a.isReceived && b.isReceived) {
+                return (b.receiveDate || "").localeCompare(a.receiveDate || "");
+            }
+            // Overdue first — most-late at top
+            const aOv = isOverdue(a), bOv = isOverdue(b);
+            if (aOv !== bOv) return aOv ? -1 : 1;
+            if (aOv && bOv) {
+                const aExp = effectiveExpected(a) || "";
+                const bExp = effectiveExpected(b) || "";
+                return aExp.localeCompare(bExp); // earlier expected = more late
+            }
+            // Soonest expected next
+            const aExp = effectiveExpected(a) || "9999-12-31";
+            const bExp = effectiveExpected(b) || "9999-12-31";
+            if (aExp !== bExp) return aExp.localeCompare(bExp);
+            // Tiebreak: earliest order date
+            return (a.orderDate || "").localeCompare(b.orderDate || "");
+        });
 
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
@@ -325,12 +371,17 @@ export default function ActivePurchasesPanel() {
                                     statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
                                 }
 
+                                const expISO = effectiveExpected(po);
+                                const overdue = isOverdue(po);
+                                const daysLate = overdue ? -1 * (dayDiff(expISO, new Date().toISOString().slice(0, 10)) ?? 0) : 0;
+                                const daysOut = daysSince(po.orderDate);
+                                const receivedDiff = po.isReceived && po.receiveDate ? dayDiff(po.receiveDate, expISO) : null;
                                 return (
                                     <div
                                         key={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
-                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
                                     >
                                         {/* Dismiss Button */}
                                         <button
@@ -347,6 +398,19 @@ export default function ActivePurchasesPanel() {
                                             <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${statusColor}`}>
                                                 {statusLabel}
                                             </span>
+                                            {overdue && (
+                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0">
+                                                    ⚠ OVERDUE {daysLate}d
+                                                </span>
+                                            )}
+                                            {po.vendorAcknowledgedAt && !po.isReceived && (
+                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-300/90 border-emerald-500/30 shrink-0" title={`Vendor acknowledged ${po.vendorAcknowledgedAt}`}>
+                                                    ✓ Vendor ack
+                                                </span>
+                                            )}
+                                            {daysOut != null && !po.isReceived && (
+                                                <span className="text-[10px] font-mono text-zinc-600 shrink-0">{daysOut}d out</span>
+                                            )}
                                             {po.total > 0 && (
                                                 <span className="text-xs font-mono text-zinc-400 shrink-0 ml-auto mr-1">
                                                     ${po.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
@@ -363,10 +427,17 @@ export default function ActivePurchasesPanel() {
                                             <span className="text-zinc-700">·</span>
 
                                             {isReceived && po.receiveDate ? (
-                                                <span>Rcvd {fmtDate(po.receiveDate)}</span>
+                                                <span>
+                                                    Rcvd {fmtDate(po.receiveDate)}
+                                                    {receivedDiff != null && (
+                                                        <span className={`ml-1 ${receivedDiff < 0 ? 'text-emerald-400' : receivedDiff > 0 ? 'text-rose-400' : 'text-zinc-500'}`}>
+                                                            ({receivedDiff === 0 ? 'on time' : receivedDiff < 0 ? `${Math.abs(receivedDiff)}d early` : `${receivedDiff}d late`})
+                                                        </span>
+                                                    )}
+                                                </span>
                                             ) : (
                                                 <span>
-                                                    Exp: <span className={etaTone}>{fmtDate(po.expectedDate)}</span>{" "}
+                                                    Exp: <span className={`${overdue ? 'text-rose-300' : etaTone}`}>{fmtDate(po.expectedDate)}</span>{" "}
                                                     <span className="opacity-60">({po.etaProfile?.label || po.leadProvenance})</span>
                                                 </span>
                                             )}

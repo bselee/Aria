@@ -34,12 +34,32 @@ export async function POST(req: NextRequest) {
                 );
             }
 
+            // Hard-stop: any zero-qty line means the draft is malformed
+            const zeroQtyLines = review.items.filter(i => !i.quantity || i.quantity === 0);
+            if (zeroQtyLines.length > 0) {
+                return NextResponse.json(
+                    { error: 'Draft has lines with qty=0; fix in Finale before sending' },
+                    { status: 400 }
+                );
+            }
+
             const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
             const sendId = await storePendingPOSend(orderId, review, email, source, {
                 channel: 'dashboard',
             });
 
-            return NextResponse.json({ review, email, emailSource: source, sendId });
+            // Soft warnings — UI surfaces but does not block
+            const warnings: string[] = [];
+            if (review.total < 10) warnings.push(`total $${review.total.toFixed(2)} below $10 — confirm before sending`);
+            if (!email) warnings.push('no vendor email on file');
+
+            return NextResponse.json({
+                review,
+                email,
+                emailSource: source,
+                sendId,
+                ...(warnings.length > 0 ? { warning: warnings.join('; ') } : {}),
+            });
 
         } else if (action === 'send') {
             const { sendId } = body;
@@ -58,7 +78,12 @@ export async function POST(req: NextRequest) {
                 triggeredBy: 'dashboard',
                 skipEmail: body.skipEmail || false,
             });
-            return NextResponse.json(result, { status: result.status === 'failed' ? 404 : 200 });
+            // Bubble verification to top-level so dashboard doesn't need to dig into details
+            const verification = (result as any)?.details?.verification ?? null;
+            return NextResponse.json(
+                { ...result, ...(verification ? { verification } : {}) },
+                { status: result.status === 'failed' ? 404 : 200 },
+            );
 
         } else if (action === 'cancel') {
             const { sendId } = body;

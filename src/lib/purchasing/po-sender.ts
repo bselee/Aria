@@ -9,6 +9,7 @@ import { createClient } from '../supabase';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
 import * as agentTask from '../intelligence/agent-task';
+import type { CommitVerification } from './po-verification';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -326,6 +327,7 @@ export async function commitAndSendPO(
     pdfAttached: boolean;
     emailSkipped: boolean;
     emailError?: string;
+    verification: CommitVerification;
 }> {
     const pending = await getPendingPOSend(id);
     if (!pending) throw new Error('Pending PO send not found or expired - initiate a new Review & Send');
@@ -350,6 +352,23 @@ export async function commitAndSendPO(
     await finale.commitDraftPO(orderId);
     const committedAt = new Date().toISOString();
 
+    // 1b. Post-commit verification — re-fetch and confirm status flipped to ORDER_LOCKED
+    const verificationIssues: string[] = [];
+    let finalStatus = 'ORDER_LOCKED';
+    let committed = true;
+    try {
+        const postCommitPO = await finale.getOrderDetails(orderId);
+        finalStatus = postCommitPO?.statusId ?? 'unknown';
+        committed = finalStatus === 'ORDER_LOCKED';
+        if (!committed) {
+            verificationIssues.push(
+                `commit confirmed ORDER_CREATED → expected ORDER_LOCKED, got ${finalStatus}`
+            );
+        }
+    } catch (err: any) {
+        verificationIssues.push(`post-commit re-fetch failed: ${err?.message ?? String(err)}`);
+    }
+
     // 2. Send through Finale's native PO email action so the Finale PDF is attached.
     let finaleEmailSent = false;
     let pdfAttached = false;
@@ -371,6 +390,32 @@ export async function commitAndSendPO(
             sentAt = new Date().toISOString();
         } catch (err: any) {
             emailError = err?.message ?? String(err);
+        }
+    }
+
+    // 2b. Post-send verification — wait 8s for Finale to update, then check lastEmailedAt
+    let emailVerified = false;
+    let lastEmailedAt: string | null = null;
+    if (!skipEmail && finaleEmailSent) {
+        try {
+            await new Promise(r => setTimeout(r, 8000));
+            const postSendPO = await finale.getOrderDetails(orderId);
+            const rawTs = postSendPO?.lastEmailedAt
+                ?? postSendPO?.lastEmailDate
+                ?? postSendPO?.emailHistory?.[0]?.timestamp
+                ?? null;
+            if (rawTs) {
+                const ts = new Date(rawTs);
+                if (!isNaN(ts.getTime())) {
+                    lastEmailedAt = ts.toISOString();
+                    if (Date.now() - ts.getTime() <= 60_000) emailVerified = true;
+                }
+            }
+            if (!emailVerified) {
+                verificationIssues.push('Finale accepted send but lastEmailedAt did not update');
+            }
+        } catch (err: any) {
+            verificationIssues.push(`post-send re-fetch failed: ${err?.message ?? String(err)}`);
         }
     }
 
@@ -401,11 +446,19 @@ export async function commitAndSendPO(
                     emailError: emailError ?? null,
                 },
             }),
+            // Direct push to purchase_orders so the Active Purchases panel
+            // sees the new PO immediately (no 4 h po-sync wait). Best-effort —
+            // wrapped in allSettled below.
             db.from('purchase_orders').upsert({
                 po_number: orderId,
                 vendor_name: review.vendorName,
+                vendor_party_id: review.vendorPartyId,
                 status: 'open',
-                committed_at: committedAt,
+                order_date: review.orderDate,
+                total_amount: review.total,
+                item_count: review.items.length,
+                finale_url: review.finaleUrl,
+                committed_at: committed ? committedAt : null,
                 po_sent_at: finaleEmailSent ? sentAt : null,
                 po_email_message_id: finaleEmailSent ? finaleEmailActionUrl ?? null : null,
                 lifecycle_stage: lifecycleStage,
@@ -449,5 +502,13 @@ export async function commitAndSendPO(
         pdfAttached,
         emailSkipped: skipEmail || !vendorEmail,
         emailError,
+        verification: {
+            committed,
+            finalStatus,
+            emailSent: finaleEmailSent,
+            emailVerified,
+            lastEmailedAt,
+            issues: verificationIssues,
+        },
     };
 }

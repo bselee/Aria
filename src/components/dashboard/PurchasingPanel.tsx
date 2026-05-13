@@ -13,6 +13,7 @@ import {
 } from "@/lib/purchasing/dashboard-focus";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
+import type { ExpectedDelivery, DraftVerification, CommitVerification } from "@/lib/purchasing/po-verification";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -90,7 +91,12 @@ type AssessmentData = {
     error?: string;
     upcomingBuilds?: Array<{ sku: string; earliestDate: string; componentCount: number }>;
 };
-type POResult = { orderId: string; finaleUrl: string };
+type POResult = {
+    orderId: string;
+    finaleUrl: string;
+    expectedDelivery?: ExpectedDelivery;
+    verification?: DraftVerification;
+};
 type CommitReview = {
     sendId: string;
     review: {
@@ -100,7 +106,10 @@ type CommitReview = {
     };
     email: string;
     emailSource: string;
+    warning?: string;
 };
+type SendStepStatus = 'pending' | 'ok' | 'fail' | 'skip';
+type SendSteps = { commit?: SendStepStatus; email?: SendStepStatus; verify?: SendStepStatus };
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
 type UlineOrderResult = { success: boolean; itemsAdded: number; message: string; priceUpdatesApplied?: number; errors?: string[] };
@@ -216,6 +225,11 @@ export default function PurchasingPanel() {
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
+    // Full POResult per vendor (for verification + ETA display on the success pill).
+    const [createdPODetails, setCreatedPODetails] = useState<Record<string, POResult>>({});
+    // Per-modal step state for the Commit & Send flow.
+    const [sendSteps, setSendSteps] = useState<SendSteps>({});
+    const [commitIssues, setCommitIssues] = useState<string[]>([]);
 
     // commit & send modal
     const [commitModal, setCommitModal] = useState<CommitReview | null>(null);
@@ -616,7 +630,10 @@ export default function PurchasingPanel() {
         setCreatingPO(p => new Set(p).add(pid));
         try {
             const result = await createVendorPO(group);
-            if (result) setCreatedPOs(p => ({ ...p, [pid]: result }));
+            if (result) {
+                setCreatedPOs(p => ({ ...p, [pid]: result }));
+                setCreatedPODetails(p => ({ ...p, [pid]: result }));
+            }
             await load(true);
         } catch (e: any) {
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
@@ -640,7 +657,10 @@ export default function PurchasingPanel() {
             if (r.status === "fulfilled" && r.value) updates[groups[idx].vendorPartyId] = r.value;
             else if (r.status === "rejected") errs.push(`${groups[idx].vendorName}: ${r.reason?.message ?? "failed"}`);
         });
-        if (Object.keys(updates).length) setCreatedPOs(p => ({ ...p, ...updates }));
+        if (Object.keys(updates).length) {
+            setCreatedPOs(p => ({ ...p, ...updates }));
+            setCreatedPODetails(p => ({ ...p, ...updates }));
+        }
         if (errs.length) setError(errs.join(" | "));
         setCreatingPO(new Set());
         if (Object.keys(updates).length > 0) await load(true);
@@ -656,7 +676,9 @@ export default function PurchasingPanel() {
             });
             const json = await res.json();
             if (!res.ok) { setError(json.error || 'Failed to fetch PO review'); return; }
-            setCommitModal({ sendId: json.sendId, review: json.review, email: json.email, emailSource: json.emailSource });
+            setCommitModal({ sendId: json.sendId, review: json.review, email: json.email, emailSource: json.emailSource, warning: json.warning });
+            setSendSteps({});
+            setCommitIssues([]);
         } catch (e: any) {
             setError(`Review failed: ${e.message}`);
         } finally {
@@ -667,6 +689,8 @@ export default function PurchasingPanel() {
     async function handleConfirmSend(skipEmail: boolean = false) {
         if (!commitModal?.sendId) return;
         setSendingPO(true);
+        setSendSteps({ commit: 'pending', email: skipEmail ? 'skip' : 'pending', verify: 'pending' });
+        setCommitIssues([]);
         try {
             const res = await fetch('/api/dashboard/purchasing/commit', {
                 method: 'POST',
@@ -674,13 +698,30 @@ export default function PurchasingPanel() {
                 body: JSON.stringify({ action: 'send', sendId: commitModal.sendId, skipEmail }),
             });
             const json = await res.json();
-            if (!res.ok) { setError(json.error || 'Send failed'); return; }
+            if (!res.ok) {
+                setSendSteps({ commit: 'fail', email: 'fail', verify: 'fail' });
+                setError(json.error || 'Send failed');
+                return;
+            }
+
+            // Read verification block to drive step indicators.
+            const v: CommitVerification | undefined = json.verification ?? json.details?.verification;
+            const committed = v?.committed ?? (json.status !== 'failed');
+            const emailSent = v?.emailSent ?? json.details?.finaleEmailSent ?? false;
+            const emailVerified = v?.emailVerified ?? emailSent;
+            setSendSteps({
+                commit: committed ? 'ok' : 'fail',
+                email: skipEmail ? 'skip' : (emailSent ? 'ok' : 'fail'),
+                verify: skipEmail ? (committed ? 'ok' : 'fail') : (emailVerified ? 'ok' : 'fail'),
+            });
+            if (v?.issues && v.issues.length > 0) setCommitIssues(v.issues);
+
             if (json.status === 'failed') {
                 setError(json.userMessage || json.error || 'Send failed');
                 return;
             }
             const details = json.details ?? {};
-            if (details.finaleEmailSent) {
+            if (details.finaleEmailSent || emailSent) {
                 setSentPOs(p => new Set(p).add(commitModal.review.orderId));
             }
             setCreatedPOs(prev => {
@@ -688,19 +729,36 @@ export default function PurchasingPanel() {
                 delete next[commitModal.review.vendorPartyId];
                 return next;
             });
+            setCreatedPODetails(prev => {
+                const next = { ...prev };
+                delete next[commitModal.review.vendorPartyId];
+                return next;
+            });
             setData(prev => prev
                 ? { ...prev, groups: prev.groups.filter(g => g.vendorPartyId !== commitModal.review.vendorPartyId) }
                 : prev);
-            setCommitModal(null);
+
+            // Auto-close only on a fully-clean result; otherwise leave modal open so
+            // Will can see which step failed.
+            const allClean = committed && (skipEmail || (emailSent && emailVerified)) && !(v?.issues?.length);
+            if (allClean) setCommitModal(null);
+
             if (json.status === 'partial_success') {
                 setError(json.userMessage || 'PO committed in Finale, but the vendor email still needs review.');
             }
             await load(true);
         } catch (e: any) {
+            setSendSteps({ commit: 'fail', email: 'fail', verify: 'fail' });
             setError(`Send failed: ${e.message}`);
         } finally {
             setSendingPO(false);
         }
+    }
+
+    function dismissCommitModal() {
+        setCommitModal(null);
+        setSendSteps({});
+        setCommitIssues([]);
     }
 
     async function handleCancelCommit() {
@@ -711,7 +769,7 @@ export default function PurchasingPanel() {
                 body: JSON.stringify({ action: 'cancel', sendId: commitModal.sendId }),
             }).catch(() => { });
         }
-        setCommitModal(null);
+        dismissCommitModal();
     }
 
     // ── ULINE direct ordering ──────────────────────────────────────────────
@@ -915,6 +973,11 @@ export default function PurchasingPanel() {
                             <div className="flex-1" />
                             <span className="text-[10px] font-mono text-zinc-600">{commitModal.review.vendorName}</span>
                         </div>
+                        {commitModal.warning && (
+                            <div className="px-4 py-2 text-[11px] font-mono text-amber-300 bg-amber-500/10 border-b border-amber-500/30">
+                                ⚠ {commitModal.warning}
+                            </div>
+                        )}
                         <div className="px-4 py-3 space-y-1 max-h-60 overflow-y-auto">
                             {commitModal.review.items.map(item => (
                                 <div key={item.productId} className="flex items-center gap-2 text-[11px] font-mono">
@@ -945,7 +1008,7 @@ export default function PurchasingPanel() {
                         <div className="px-4 py-3 border-t border-zinc-800 flex items-center justify-end gap-2">
                             <button onClick={handleCancelCommit}
                                 className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
-                                Cancel
+                                {Object.keys(sendSteps).length > 0 ? 'Close' : 'Cancel'}
                             </button>
                             <button
                                 onClick={() => handleConfirmSend(true)}
@@ -965,6 +1028,34 @@ export default function PurchasingPanel() {
                                 </button>
                             )}
                         </div>
+                        {/* Step status — appears once a send is in flight */}
+                        {Object.keys(sendSteps).length > 0 && (
+                            <div className="px-4 py-3 border-t border-zinc-800 bg-zinc-950/60 text-[11px] font-mono space-y-1">
+                                {([
+                                    { k: 'commit' as const, label: '1. Commit in Finale' },
+                                    { k: 'email' as const,  label: '2. Email vendor' },
+                                    { k: 'verify' as const, label: '3. Verify Finale state' },
+                                ]).map(s => {
+                                    const v = sendSteps[s.k];
+                                    const icon = v === 'ok' ? <span className="text-emerald-400">✓</span>
+                                        : v === 'fail' ? <span className="text-rose-400">✗</span>
+                                        : v === 'skip' ? <span className="text-zinc-600">—</span>
+                                        : v === 'pending' ? <span className="text-amber-300 animate-pulse">⏳</span>
+                                        : <span className="text-zinc-700">·</span>;
+                                    return (
+                                        <div key={s.k} className="flex items-center gap-2">
+                                            <span className="w-5 text-center">{icon}</span>
+                                            <span className={v === 'fail' ? 'text-rose-300' : v === 'ok' ? 'text-zinc-300' : 'text-zinc-500'}>{s.label}</span>
+                                        </div>
+                                    );
+                                })}
+                                {commitIssues.length > 0 && (
+                                    <div className="mt-2 p-2 rounded border border-rose-500/40 bg-rose-500/5 text-[10px] text-rose-300 space-y-0.5">
+                                        {commitIssues.map((iss, i) => <div key={i}>· {iss}</div>)}
+                                    </div>
+                                )}
+                            </div>
+                        )}
                     </div>
                 </div>
             )}
@@ -1312,6 +1403,28 @@ export default function PurchasingPanel() {
                                                                     className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300">
                                                                     PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
                                                                 </a>
+                                                                {(() => {
+                                                                    const det = createdPODetails[pid];
+                                                                    if (!det?.verification) return null;
+                                                                    if (det.verification.verified) {
+                                                                        return (
+                                                                            <span
+                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-300 border-emerald-500/40 shrink-0"
+                                                                                title={det.expectedDelivery?.label ?? 'verified'}
+                                                                            >
+                                                                                ✓ Verified{det.expectedDelivery?.date ? ` · ETA ${det.expectedDelivery.date.slice(5)}` : ''}
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    return (
+                                                                        <span
+                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0"
+                                                                            title={det.verification.mismatches.join('; ')}
+                                                                        >
+                                                                            ⚠ Verify failed
+                                                                        </span>
+                                                                    );
+                                                                })()}
                                                                 {sentPOs.has(po.orderId) ? (
                                                                     <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
                                                                 ) : (

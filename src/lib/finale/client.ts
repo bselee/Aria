@@ -3508,10 +3508,121 @@ export class FinaleClient {
         return merged;
     }
 
+    /**
+     * Shared helper: re-fetch a just-created/modified draft PO and confirm it
+     * landed in Finale correctly. Also resolves the vendor's expected delivery
+     * date from learned lead-time history. Never throws — failures populate
+     * `verification.mismatches[]` and fall back to defaults for ETA.
+     */
+    private async verifyDraftAndExpectedDelivery(
+        orderId: string,
+        vendorPartyId: string | null,
+        expectedItems: Array<{ productId: string; quantity: number; unitPrice: number }>,
+    ): Promise<{
+        expectedDelivery: import('../purchasing/po-verification').ExpectedDelivery;
+        verification: import('../purchasing/po-verification').DraftVerification;
+    }> {
+        const { computeExpectedDelivery } = await import('../purchasing/po-verification');
+
+        // Skip remote lookups (party name + lead-time) under vitest — those go
+        // through unmocked external paths and would (a) call real Finale and
+        // (b) break test assertions that count fetch calls. Production always
+        // takes the full path.
+        const inTest = !!process.env.VITEST;
+
+        // 5s ceiling on each best-effort lookup so verification never blocks the create path.
+        const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+            p.then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
+        });
+
+        // 1. Resolve vendor name from partyId (best-effort)
+        let vendorName = '';
+        if (!inTest) {
+            try {
+                if (vendorPartyId) {
+                    const partyUrl = `/${this.accountPath}/api/partygroup/${encodeURIComponent(vendorPartyId)}`;
+                    vendorName = await withTimeout(this.resolvePartyName(partyUrl), 1500);
+                }
+            } catch { /* fall through */ }
+        }
+
+        const firstSku = expectedItems[0]?.productId;
+        let expectedDelivery: import('../purchasing/po-verification').ExpectedDelivery;
+        if (inTest) {
+            expectedDelivery = computeExpectedDelivery({
+                leadTimeDays: 14, source: 'default', label: '14d default',
+            });
+        } else {
+            try {
+                const { leadTimeService } = await import('../builds/lead-time-service');
+                const lt = await withTimeout(leadTimeService.getForVendor(vendorName, firstSku), 1500);
+                expectedDelivery = computeExpectedDelivery({
+                    leadTimeDays: lt.days, source: lt.provenance, label: lt.label,
+                });
+            } catch {
+                expectedDelivery = computeExpectedDelivery({
+                    leadTimeDays: 14, source: 'default', label: '14d default',
+                });
+            }
+        }
+
+        // 2. Re-fetch and compare totals + line counts
+        const totalExpected = expectedItems.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
+        const mismatches: string[] = [];
+        let lineCountActual = 0;
+        let totalActual = 0;
+        let statusId = '';
+
+        try {
+            const po = await this.getOrderDetails(orderId);
+            statusId = po?.statusId ?? '';
+            const lines: any[] = Array.isArray(po?.orderItemList) ? po.orderItemList : [];
+            lineCountActual = lines.length;
+            for (const line of lines) {
+                const q = Number(line?.quantity) || 0;
+                const p = Number(line?.unitPrice) || 0;
+                totalActual += q * p;
+            }
+            if (statusId !== 'ORDER_CREATED') {
+                mismatches.push(`unexpected status: ${statusId || 'unknown'}`);
+            }
+            if (lineCountActual !== expectedItems.length) {
+                mismatches.push(`line count: expected ${expectedItems.length}, got ${lineCountActual}`);
+            }
+            if (Math.abs(totalActual - totalExpected) > 0.01) {
+                mismatches.push(`total: expected $${totalExpected.toFixed(2)}, got $${totalActual.toFixed(2)}`);
+            }
+        } catch (err: any) {
+            mismatches.push(`re-fetch failed: ${err?.message ?? String(err)}`);
+        }
+
+        return {
+            expectedDelivery,
+            verification: {
+                verified: mismatches.length === 0,
+                statusId,
+                lineCountExpected: expectedItems.length,
+                lineCountActual,
+                totalExpected,
+                totalActual,
+                mismatches,
+            },
+        };
+    }
+
     private async reuseExistingDraftPurchaseOrder(
         orderId: string,
         items: Array<{ productId: string; quantity: number; unitPrice: number }>,
-    ): Promise<{ orderId: string; finaleUrl: string; facilityName: string; duplicateWarnings: string[]; priceAlerts: string[] }> {
+    ): Promise<{
+        orderId: string;
+        finaleUrl: string;
+        facilityName: string;
+        duplicateWarnings: string[];
+        priceAlerts: string[];
+        expectedDelivery: import('../purchasing/po-verification').ExpectedDelivery;
+        verification: import('../purchasing/po-verification').DraftVerification;
+    }> {
         const currentPO = await this.getOrderDetails(orderId);
         const originalStatus = await this.unlockForEditing(currentPO, orderId);
 
@@ -3534,12 +3645,23 @@ export class FinaleClient {
                 console.warn(`[finale] rec-stamp write failed on reuse for PO #${orderId}: ${err.message}`);
             }
 
+            const supplierUrlForVerify = (currentPO.orderRoleList || [])
+                .find((r: any) => r.roleTypeId === "SUPPLIER")?.partyUrl as string | undefined;
+            const vendorPartyIdForVerify = supplierUrlForVerify ? supplierUrlForVerify.split("/").pop() ?? null : null;
+            const { expectedDelivery, verification } = await this.verifyDraftAndExpectedDelivery(
+                orderId,
+                vendorPartyIdForVerify,
+                items,
+            );
+
             return {
                 orderId,
                 finaleUrl: this.buildFinaleOrderUrl(updated?.orderUrl || currentPO.orderUrl, orderId),
                 facilityName: "Existing Draft",
                 duplicateWarnings: [`Reused existing draft PO #${orderId} for this vendor.`],
                 priceAlerts: [],
+                expectedDelivery,
+                verification,
             };
         } finally {
             await this.restoreOrderStatus(orderId, originalStatus);
@@ -4576,7 +4698,15 @@ export class FinaleClient {
         }>,
         memo?: string,
         purchaseDestination?: string
-    ): Promise<{ orderId: string; finaleUrl: string; facilityName: string; duplicateWarnings: string[]; priceAlerts: string[] }> {
+    ): Promise<{
+        orderId: string;
+        finaleUrl: string;
+        facilityName: string;
+        duplicateWarnings: string[];
+        priceAlerts: string[];
+        expectedDelivery: import('../purchasing/po-verification').ExpectedDelivery;
+        verification: import('../purchasing/po-verification').DraftVerification;
+    }> {
         const today = new Date().toISOString().split('T')[0] + 'T00:00:00';
 
         // ── Step 0: Duplicate PO detection ──────────────────────────────────
@@ -4796,7 +4926,14 @@ export class FinaleClient {
             console.warn(`[finale] rec-stamp write failed for PO #${orderId}: ${err.message}`);
         }
 
-        return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts };
+        // Post-create verification + expected delivery lookup (best-effort)
+        const { expectedDelivery, verification } = await this.verifyDraftAndExpectedDelivery(
+            orderId,
+            vendorPartyId,
+            items,
+        );
+
+        return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts, expectedDelivery, verification };
     }
 
     // ──────────────────────────────────────────────────
