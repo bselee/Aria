@@ -56,7 +56,10 @@ Confidence is high only when a clear, unambiguous date or weekday is present.`;
             schema: Schema,
             schemaName: 'VendorETA',
             temperature: 0.1,
-            tier: 'free',
+            // OpenRouter free chain ONLY — no paid fallback. ETA parse is
+            // a nice-to-have; if the free quota is out, return null and let
+            // the lead-time-median fallback handle the row.
+            tier: 'free_only',
         });
         return {
             etaDate: result.etaDate && /^\d{4}-\d{2}-\d{2}$/.test(result.etaDate) ? result.etaDate : null,
