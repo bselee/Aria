@@ -17,13 +17,17 @@
 
 import { getAuthenticatedClient } from "../gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import { WebClient } from "@slack/web-api";
 
+// First-contact templates: include the Friday payment cycle so the vendor
+// gets a real expectation, not a hollow "I'm looking into it." Five short
+// variants reduce template-fingerprint across vendors.
 const TEMPLATES: readonly string[] = [
-    "Got it, thanks — looking into this and will get back to you shortly.",
-    "Thanks for the note. Checking on this and will circle back.",
-    "Got the invoice. Will dig in and follow up soon.",
-    "Thanks — looking at this now, will be back to you.",
-    "Got it. Checking on payment status and will reply soon.",
+    "Got it — thanks. We typically run payments on Fridays, so you should see this in the next cycle. Will follow up if anything looks off.",
+    "Thanks for the note. Payments usually go out on Fridays, so this should be in the next run.",
+    "Got the invoice. We schedule payments on Fridays — should land shortly. Reach back out if you don't see it by next week.",
+    "Thanks — payments typically go out Fridays, so this should be in hand soon.",
+    "Got it. We run AP on Fridays, so this should be in the next batch. Will let you know if anything changes.",
 ];
 
 export function pickTemplate(): string {
@@ -100,5 +104,99 @@ export async function sendSimpleAck(input: SendSimpleAckInput): Promise<SendSimp
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return { ok: false, template: body, error: msg };
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Second-contact: vendor is pinging again on the same thread. They got the
+// "payments go out Friday" reply and are still asking — they need a real
+// answer. Aria can't read Bill.com, so we ping internal AP via Slack with
+// vendor + subject + thread link so the AP team can respond.
+// ──────────────────────────────────────────────────────────────────────────
+
+export interface NotifyInternalAPInput {
+    from: string;
+    subject: string;
+    gmailThreadId: string;
+    /** First-line snippet / quick body context for the Slack ping. */
+    snippet?: string;
+}
+
+export interface NotifyInternalAPResult {
+    ok: boolean;
+    error?: string;
+    slackTs?: string;
+}
+
+function apSlackChannel(): string {
+    return (
+        process.env.SLACK_AP_CHANNEL ||
+        process.env.SLACK_MORNING_CHANNEL ||
+        "#purchasing"
+    );
+}
+
+function gmailThreadUrl(threadId: string): string {
+    return `https://mail.google.com/mail/u/0/#all/${threadId}`;
+}
+
+/**
+ * Extract a likely invoice number from subject/snippet. Best-effort —
+ * looks for INV-/INVOICE-style tokens and bare 5+ digit runs. Returns
+ * undefined if nothing convincing is found; Slack message degrades to
+ * "see thread" in that case.
+ */
+function extractInvoiceNumber(...sources: (string | undefined)[]): string | undefined {
+    const haystack = sources.filter(Boolean).join(" ");
+    const explicit = haystack.match(/\b(?:inv(?:oice)?)[\s#:-]*([A-Z0-9\-]{3,})\b/i);
+    if (explicit) return explicit[1];
+    const digits = haystack.match(/#\s*([0-9]{4,})\b/);
+    if (digits) return digits[1];
+    return undefined;
+}
+
+export async function notifyInternalAPSlack(
+    input: NotifyInternalAPInput,
+): Promise<NotifyInternalAPResult> {
+    const token = process.env.SLACK_BOT_TOKEN;
+    if (!token) {
+        return { ok: false, error: "SLACK_BOT_TOKEN not configured" };
+    }
+    const invoiceNo = extractInvoiceNumber(input.subject, input.snippet);
+    const lines = [
+        `💸 *Payment chase — ${input.from}* is asking again`,
+        `*Subject:* ${input.subject}`,
+        `*Invoice #:* ${invoiceNo ? invoiceNo : "_see thread / attachment_"}`,
+        `*Thread:* ${gmailThreadUrl(input.gmailThreadId)}`,
+        ``,
+        `Aria auto-acknowledged the first ping (Fridays speech), but they're following up. Please review and reply with a real status.`,
+    ];
+    const text = lines.join("\n");
+    try {
+        const slack = new WebClient(token);
+        const res = await slack.chat.postMessage({
+            channel: apSlackChannel(),
+            text,
+            mrkdwn: true,
+        });
+        // Best-effort DM to Will so he sees the AP ping and can copy-paste
+        // relevant info if needed. Failure here does NOT fail the step —
+        // the AP channel post is the source of truth.
+        const willId = process.env.SLACK_OWNER_USER_ID;
+        if (willId) {
+            try {
+                await slack.chat.postMessage({
+                    channel: willId,
+                    text: `🔁 _Copy for review (AP ping just sent)_\n\n${text}`,
+                    mrkdwn: true,
+                });
+            } catch {
+                // swallow — Will DM is bonus visibility, not required
+            }
+        }
+        return { ok: true, slackTs: res.ts };
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: msg };
     }
 }
