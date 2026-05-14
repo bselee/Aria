@@ -2004,7 +2004,10 @@ export class FinaleClient {
             return isNaN(n) ? null : n;
         };
 
-        // 1. GraphQL for all stock/demand metrics
+        // 1. GraphQL for all stock/demand metrics. Also query unitsInStock
+        // because Finale frequently returns "--" for stockOnHand on components
+        // even when there is real stock (Build Demand Oracle bug 2026-05-14 —
+        // KMS101 showed CRITICAL · ORDER NOW with 55.88 actually on hand).
         try {
             const query = {
                 query: `{
@@ -2015,6 +2018,7 @@ export class FinaleClient {
                                 stockOnHand
                                 stockAvailable
                                 stockOnOrder
+                                unitsInStock
                                 stockoutDays
                                 demandQuantity
                                 consumptionQuantity
@@ -2029,7 +2033,8 @@ export class FinaleClient {
             const node = data?.productViewConnection?.edges?.[0]?.node;
             if (node) {
                 profile.productName = null;
-                profile.onHand = parseVal(node.stockOnHand);
+                // Fall back to unitsInStock when stockOnHand is missing/"--".
+                profile.onHand = parseVal(node.stockOnHand) ?? parseVal(node.unitsInStock);
                 profile.available = parseVal(node.stockAvailable);
                 profile.onOrder = parseVal(node.stockOnOrder);
                 profile.stockoutDays = parseVal(node.stockoutDays);
@@ -2046,6 +2051,20 @@ export class FinaleClient {
             }
         } catch (err: any) {
             console.warn(`[finale] getComponentStockProfile partial failure for ${productId}:`, err.message);
+        }
+
+        // 1b. REST fallback when GraphQL didn't return a usable stockOnHand /
+        // unitsInStock. Some components only show stock via REST (the same
+        // path getStockLevel() uses). Without this, the Oracle treats null
+        // as zero and labels well-stocked SKUs as ORDER NOW.
+        if (profile.onHand === null) {
+            try {
+                const restStock = await this.getStockLevel(productId);
+                if (restStock !== null) {
+                    profile.onHand = restStock;
+                    profile.hasFinaleData = true;
+                }
+            } catch { /* leave null */ }
         }
 
         // 2. Committed POs for this component
