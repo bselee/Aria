@@ -25,7 +25,8 @@ import { createClient } from "../supabase";
 
 export type VendorCommState =
     | "none"                       // PO sent, vendor silent
-    | "acknowledged_no_tracking"   // vendor ack'd but nothing about shipping
+    | "auto_acknowledged"          // ack'd by automated/system reply only
+    | "recent_human_reply"         // a real human at the vendor replied recently
     | "eta_stated_no_tracking"     // vendor gave an ETA but no tracking
     | "tracking_no_movement"       // tracking exists but no scan/movement
     | "shipped_past_eta";          // ETA passed, still not received
@@ -53,6 +54,7 @@ export interface AtRiskPO {
     facts: {
         poSentAt: string | null;
         vendorAcknowledgedAt: string | null;
+        humanReplyDetectedAt: string | null;
         vendorStatedEta: string | null;
         trackingNumbers: string[];
         lastMovementSummary: string | null;
@@ -86,12 +88,16 @@ function daysBetween(fromIso: string, toIso: string): number {
     return Math.round((b - a) / 86_400_000);
 }
 
+const RECENT_HUMAN_REPLY_WINDOW_DAYS = 7;
+
 /**
- * Classify the vendor's current communication state on a PO. Precedence:
- * ETA passed → tracking no movement → ETA stated → ack only → silent.
+ * Classify the vendor's current communication state on a PO. Precedence
+ * (highest urgency / strongest signal first):
+ *   shipped_past_eta → tracking_no_movement → eta_stated_no_tracking
+ *   → recent_human_reply → auto_acknowledged → none
  */
 export function classifyVendorCommState(
-    po: Pick<ActivePurchase, "vendorAcknowledgedAt" | "trackingNumbers" | "shipments" | "etaProfile" | "isReceived">,
+    po: Pick<ActivePurchase, "vendorAcknowledgedAt" | "humanReplyDetectedAt" | "trackingNumbers" | "shipments" | "etaProfile" | "isReceived">,
     todayDate: string = todayIso(),
 ): VendorCommState {
     const hasTracking = (po.trackingNumbers ?? []).length > 0;
@@ -109,7 +115,14 @@ export function classifyVendorCommState(
     if (etaPassed && !po.isReceived) return "shipped_past_eta";
     if (hasTracking && !hasMovement) return "tracking_no_movement";
     if (promisedEta && !hasTracking) return "eta_stated_no_tracking";
-    if (hasAck && !hasTracking) return "acknowledged_no_tracking";
+
+    // Real human reply trumps automated ack — Gayle@Coats replying explicitly
+    // about an invoice is qualitatively different from a system auto-ack.
+    if (po.humanReplyDetectedAt) {
+        const replyAge = (new Date(todayDate).getTime() - new Date(po.humanReplyDetectedAt).getTime()) / 86_400_000;
+        if (replyAge <= RECENT_HUMAN_REPLY_WINDOW_DAYS) return "recent_human_reply";
+    }
+    if (hasAck && !hasTracking) return "auto_acknowledged";
     return "none";
 }
 
@@ -121,11 +134,18 @@ export interface DetectAtRiskPOsInput {
     today?: string;
     /** Only flag SKUs that are at least N days short. Default 3 — cuts noise. */
     minDaysShort?: number;
+    /**
+     * PO numbers for which we already have an invoice in vendor_invoices.
+     * The vendor has billed us — they've shipped (or are shipping) on their
+     * side. Don't flag these as "at risk of late arrival"; they're moving.
+     */
+    poNumbersWithInvoice?: Set<string>;
 }
 
 export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
     const today = input.today ?? todayIso();
     const minDaysShort = input.minDaysShort ?? 3;
+    const invoiceMatched = input.poNumbersWithInvoice ?? new Set<string>();
 
     // Index per-SKU intelligence for O(1) lookup.
     const skuIntel = new Map<string, PurchasingItem>();
@@ -138,6 +158,12 @@ export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
     for (const po of input.activePOs) {
         if (!po.orderId || po.isReceived) continue;
         if (!po.expectedDate) continue;
+
+        // Vendor has shipped/delivered/billed on their side — not at risk.
+        // completionState moves past "in_transit" the moment tracking shows
+        // delivered, receipt is in Finale, OR an invoice match is logged.
+        if (po.completionState && po.completionState !== "in_transit") continue;
+        if (invoiceMatched.has(po.orderId)) continue;
 
         const atRiskItems: AtRiskItem[] = [];
         for (const line of po.items ?? []) {
@@ -177,6 +203,7 @@ export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
             facts: {
                 poSentAt: (po as any).sentVerification?.sentAt ?? po.orderDate ?? null,
                 vendorAcknowledgedAt: po.vendorAcknowledgedAt ?? null,
+                humanReplyDetectedAt: po.humanReplyDetectedAt ?? null,
                 vendorStatedEta: (po.etaProfile as any)?.vendorPromisedEta ?? null,
                 trackingNumbers: po.trackingNumbers ?? [],
                 lastMovementSummary: po.lastMovementSummary ?? null,
@@ -211,6 +238,32 @@ function summarizeAtRiskItems(items: AtRiskItem[]): string {
         `${i.sku} (${i.daysShort}d short)`,
     ).join(", ");
     return items.length > 3 ? `${head}, +${items.length - 3} more` : head;
+}
+
+/**
+ * Returns the set of PO numbers that already have a matched invoice in
+ * vendor_invoices. Used by the detector to skip POs whose vendors have
+ * already done their part (invoice = they shipped / are shipping).
+ *
+ * Looks back 90 days to keep the query bounded — older invoices wouldn't
+ * be relevant to currently-open POs anyway.
+ */
+export async function loadInvoiceMatchedPOs(poNumbers: string[]): Promise<Set<string>> {
+    if (poNumbers.length === 0) return new Set();
+    const sb = createClient();
+    if (!sb) return new Set();
+    const cutoff = new Date();
+    cutoff.setUTCDate(cutoff.getUTCDate() - 90);
+    const { data, error } = await sb
+        .from("vendor_invoices")
+        .select("po_number")
+        .in("po_number", poNumbers)
+        .gte("invoice_date", cutoff.toISOString().slice(0, 10));
+    if (error) {
+        console.warn(`[po-arrival-risk] vendor_invoices read failed: ${error.message}`);
+        return new Set();
+    }
+    return new Set((data ?? []).map((r) => r.po_number).filter(Boolean) as string[]);
 }
 
 export interface WriteAtRiskResult {

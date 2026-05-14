@@ -515,7 +515,7 @@ export class OpsManager {
      * Activity-first routing: no Slack/Gmail push from this method.
      */
     public async runPOArrivalRiskCheck(): Promise<void> {
-        const [{ detectAtRiskPOs, writeAtRiskActivityRows }, { loadActivePurchases }, { finaleClient }] = await Promise.all([
+        const [{ detectAtRiskPOs, writeAtRiskActivityRows, loadInvoiceMatchedPOs }, { loadActivePurchases }, { finaleClient }] = await Promise.all([
             import("../builds/po-arrival-risk"),
             import("../purchasing/active-purchases"),
             import("../finale/client"),
@@ -525,7 +525,17 @@ export class OpsManager {
             finaleClient.getPurchasingIntelligence(),
         ]);
         const items = intel.flatMap((g) => g.items);
-        const risks = detectAtRiskPOs({ activePOs, purchasingItems: items });
+        // Precision filter: skip POs the vendor has already invoiced for.
+        // For vendors like Axiom (invoice = paid + shipped) and any vendor
+        // who sends invoices on dispatch, the invoice IS the "they shipped"
+        // signal even if the PO completionState is still in_transit.
+        const poNumbers = activePOs.map((p) => p.orderId).filter(Boolean) as string[];
+        const poNumbersWithInvoice = await loadInvoiceMatchedPOs(poNumbers);
+        const risks = detectAtRiskPOs({
+            activePOs,
+            purchasingItems: items,
+            poNumbersWithInvoice,
+        });
         if (risks.length === 0) {
             console.log("[OpsManager] POArrivalRiskCheck: no at-risk POs");
             return;
