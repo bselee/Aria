@@ -156,7 +156,7 @@ export async function GET(req: NextRequest) {
         const { data: logRaw } = await supabase
             .from('ap_activity_log')
             .select('id, created_at, email_subject, action_taken, metadata, intent')
-            .in('intent', ['INVOICE', 'RECONCILIATION', 'HUMAN_INTERACTION'])
+            .in('intent', ['INVOICE', 'RECONCILIATION', 'HUMAN_INTERACTION', 'HUMAN_INTERACT', 'EYES_NEEDED'])
             .order('created_at', { ascending: false })
             .limit(200);
 

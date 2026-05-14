@@ -121,6 +121,8 @@ describe("invoice queue route", () => {
       "INVOICE",
       "RECONCILIATION",
       "HUMAN_INTERACTION",
+      "HUMAN_INTERACT",
+      "EYES_NEEDED",
     ]);
   });
 
