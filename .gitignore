@@ -110,8 +110,12 @@ AppData/
 .zencoder/
 
 # Local SQLite WAL/SHM (transient, change every write)
+aria-local.db
 aria-local.db-shm
 aria-local.db-wal
+
+# Playwright MCP logs
+.playwright-mcp/
 
 # Dev-server log dumps (developer-local, never useful in repo)
 tmp-next-dev-*.err.log

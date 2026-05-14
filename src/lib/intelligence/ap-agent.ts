@@ -228,7 +228,7 @@ export class APAgent {
     private async classifyEmailIntent(subject: string, from: string, snippet: string): Promise<string> {
         // reasoning omitted — we only need the label, dropping it saves output tokens on every call
         const schema = z.object({
-            intent: z.enum(["INVOICE", "PREPAYMENT_REQUIRED", "STATEMENT", "ADVERTISEMENT", "HUMAN_INTERACTION"]),
+            intent: z.enum(["INVOICE", "PREPAYMENT_REQUIRED", "STATEMENT", "ADVERTISEMENT", "EYES_NEEDED", "HUMAN_INTERACTION"]),
         });
 
         // Recall rules to see if this vendor has specific handling instructions.
@@ -256,7 +256,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         PREPAYMENT_REQUIRED - Proforma invoice or payment link indicating order will ship AFTER payment.
         STATEMENT - Account statement or aging summary.
             ADVERTISEMENT - Marketing, spam, or newsletter.
-                HUMAN_INTERACTION - Payment question, order issue, or anything requiring a human reply.`;
+                EYES_NEEDED - Payment question, order issue, or anything requiring a human reply.`;
 
         try {
             const res = await unifiedObjectGeneration({
@@ -268,8 +268,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             return res.intent;
         } catch (err) {
-            console.error("   Failed to classify intent, defaulting to HUMAN_INTERACTION", err);
-            return "HUMAN_INTERACTION";
+            console.error("   Failed to classify intent, defaulting to EYES_NEEDED", err);
+            return "EYES_NEEDED";
         }
     }
 
@@ -620,16 +620,28 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     continue;
                 }
 
-                if (intent === "HUMAN_INTERACTION") {
-                    // We archive it and mark it read to ensure the pipeline isn't stalled and humans are alerted appropriately
+                if (intent === "HUMAN_INTERACTION" || intent === "EYES_NEEDED") {
+                    // Keep the email visible in the inbox for Will, but mark it read
+                    // so the polling query does not repeatedly log the same message.
                     await gmail.users.messages.modify({
                         userId: "me",
                         id: m.id!,
                         requestBody: {
-                            removeLabelIds: ["INBOX", "UNREAD"]
+                            removeLabelIds: ["UNREAD"]
                         }
                     });
-                    // Do not logActivity to avoid dashboard clutter
+                    await this.logActivity(
+                        supabase,
+                        from,
+                        subject,
+                        "EYES_NEEDED",
+                        `Left email visible from ${from} - human reply needed`,
+                        {
+                            reasonCode: "human_interaction_manual_review",
+                            gmailMessageId: m.id!,
+                            sourceInbox: "ap",
+                        },
+                    );
                     continue;
                 }
 
