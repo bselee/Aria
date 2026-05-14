@@ -318,7 +318,28 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
     let updated = 0;
     let failed = 0;
 
+    // First: collect any rows currently snoozed (snoozed_until > now) so the
+    // writer skips them entirely. Snooze lives in metadata.snoozed_until and
+    // is set by /api/dashboard/po-risk/snooze.
+    const nowIso = new Date().toISOString();
+    const snoozedPoIds = new Set<string>();
+    try {
+        const { data: snoozedRows } = await sb
+            .from("ap_activity_log")
+            .select("metadata")
+            .eq("intent", ACTIVITY_INTENT_PO_AT_RISK)
+            .filter("metadata->>snoozed_until", "gt", nowIso)
+            .limit(500);
+        for (const r of (snoozedRows ?? []) as Array<{ metadata: any }>) {
+            const id = r.metadata?.poId;
+            if (id) snoozedPoIds.add(String(id));
+        }
+    } catch {
+        // best-effort — better to over-surface than to miss real risks
+    }
+
     for (const risk of risks) {
+        if (snoozedPoIds.has(risk.poId)) continue;
         try {
             // Look for an existing row from today for this PO.
             const { data: existing } = await sb
