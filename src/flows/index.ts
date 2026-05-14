@@ -53,16 +53,20 @@ defineFlow({
     firstStep: "check_first_contact",
     steps: {
         // ── Step 1 ────────────────────────────────────────────────────
-        // Was this thread already auto-replied? If yes → Mitzi is pouncing
-        // again; escalate to Will (he sees it on /tasks + UNREAD in inbox).
+        // Was this thread already auto-replied?
+        //   no  → next: send_first_ack (Friday-cycle reply)
+        //   yes → next: notify_internal_ap (Slack ping to AP team)
+        //
+        // Note: we only dedupe against Aria's own auto-replies
+        // (PAYMENT_INQUIRY_AUTOREPLY). If Will replied manually, Aria may
+        // still auto-ack the next ping on this thread. Acceptable for now;
+        // upgrade path is to query Gmail thread for our prior sends.
         check_first_contact: {
             run: async (ctx) => {
                 const sb = (await import("@/lib/supabase")).createClient();
                 if (!sb) return { kind: "retry", reason: "supabase unavailable" };
                 const threadId = ctx.inputs["gmail_thread_id"];
                 if (typeof threadId !== "string" || !threadId) {
-                    // No threadId — can't dedupe. Skip step 2 and escalate so
-                    // Will sees the inquiry rather than guessing.
                     return {
                         kind: "escalate",
                         reason: "payment inquiry missing gmail_thread_id; cannot dedupe — manual review",
@@ -75,21 +79,17 @@ defineFlow({
                     .filter("metadata->>gmailThreadId", "eq", threadId)
                     .limit(1);
                 if (data && data.length > 0) {
-                    return {
-                        kind: "escalate",
-                        reason: "vendor pinging again on same thread — already auto-replied once",
-                    };
+                    return { kind: "succeeded", next: "notify_internal_ap" };
                 }
-                return { kind: "succeeded", next: "send_simple_ack" };
+                return { kind: "succeeded", next: "send_first_ack" };
             },
         },
 
-        // ── Step 2 ────────────────────────────────────────────────────
-        // First-time human payment inquiry. Send a short non-robotic reply
-        // that buys Will time without committing to a date (Aria can't
-        // read Bill.com schedule). Gated by PAYMENT_INQUIRY_AUTOREPLY_ENABLED;
-        // default OFF so the flow escalates until Will flips the env.
-        send_simple_ack: {
+        // ── Step 2a (first contact) ───────────────────────────────────
+        // Reply with the Friday-cycle line. Gated by
+        // PAYMENT_INQUIRY_AUTOREPLY_ENABLED — default OFF, escalates
+        // until Will flips it on.
+        send_first_ack: {
             maxAttempts: 3,
             run: async (ctx) => {
                 const reply = await import("@/lib/intelligence/payment-inquiry-reply");
@@ -162,6 +162,66 @@ defineFlow({
                     stateUpdate: {
                         template: sent.template,
                         reply_gmail_id: sent.gmailMessageId,
+                    },
+                };
+            },
+        },
+
+        // ── Step 2b (second contact) ──────────────────────────────────
+        // Vendor pinged again on the same thread after our Friday-cycle
+        // reply. Aria can't read Bill.com schedules, so we ping internal
+        // AP via Slack with vendor + invoice # + Gmail thread link. The
+        // AP team replies with a real status. No agent_task — this lives
+        // in Slack so Will isn't pulled in unless AP can't resolve.
+        notify_internal_ap: {
+            maxAttempts: 3,
+            run: async (ctx) => {
+                const reply = await import("@/lib/intelligence/payment-inquiry-reply");
+                const from = String(ctx.inputs["from"] ?? "");
+                const subject = String(ctx.inputs["subject"] ?? "(no subject)");
+                const threadId = String(ctx.inputs["gmail_thread_id"] ?? "");
+                const snippet = typeof ctx.inputs["snippet"] === "string"
+                    ? (ctx.inputs["snippet"] as string)
+                    : undefined;
+                if (!threadId) {
+                    return {
+                        kind: "escalate",
+                        reason: "second-contact ping has no thread id — manual review",
+                    };
+                }
+                const slacked = await reply.notifyInternalAPSlack({
+                    from,
+                    subject,
+                    gmailThreadId: threadId,
+                    snippet,
+                });
+                if (!slacked.ok) {
+                    return { kind: "retry", reason: `slack post failed: ${slacked.error}` };
+                }
+
+                // Audit row so the second-contact path is queryable later.
+                const sb = (await import("@/lib/supabase")).createClient();
+                if (sb) {
+                    await sb.from("ap_activity_log").insert({
+                        email_from: from,
+                        email_subject: subject,
+                        intent: "PAYMENT_INQUIRY_AP_PING",
+                        action_taken: `Vendor pinged again — Slack message posted to AP channel`,
+                        metadata: {
+                            gmailThreadId: threadId,
+                            gmailMessageId: ctx.inputs["gmail_message_id"],
+                            slackTs: slacked.slackTs,
+                            reasonCode: "second_contact_ap_ping",
+                            sourceInbox: "ap",
+                        },
+                    });
+                }
+
+                return {
+                    kind: "succeeded",
+                    stateUpdate: {
+                        slack_ts: slacked.slackTs,
+                        outcome: "second_contact_ap_ping",
                     },
                 };
             },

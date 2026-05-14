@@ -13,10 +13,20 @@ describe("pickTemplate", () => {
     it("returns short non-robotic strings without templated boilerplate", () => {
         for (let i = 0; i < 20; i++) {
             const t = pickTemplate();
-            expect(t.length).toBeLessThan(200);
+            expect(t.length).toBeLessThan(280);
             expect(t).not.toMatch(/dear (sir|madam)/i);
             expect(t).not.toMatch(/your inquiry has been received/i);
             expect(t).not.toMatch(/accounts payable system/i);
+        }
+    });
+
+    it("every template mentions the Friday payment cycle", () => {
+        // Vendors need a real expectation, not a hollow ack. The Friday
+        // reference gives them concrete timing without naming a date.
+        const seen = new Set<string>();
+        for (let i = 0; i < 200; i++) seen.add(pickTemplate());
+        for (const t of seen) {
+            expect(t.toLowerCase()).toMatch(/friday/);
         }
     });
 });
