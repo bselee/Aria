@@ -9,10 +9,12 @@ function makePO(overrides: any = {}): any {
         expectedDate: "2026-05-30",
         leadProvenance: "14d (Finale)",
         isReceived: false,
+        completionState: "in_transit",
         items: [{ productId: "SKU-A", quantity: 100 }],
         trackingNumbers: [],
         shipments: [],
         vendorAcknowledgedAt: null,
+        humanReplyDetectedAt: null,
         etaProfile: {},
         ...overrides,
     };
@@ -36,11 +38,31 @@ describe("classifyVendorCommState", () => {
         expect(classifyVendorCommState(makePO(), today)).toBe("none");
     });
 
-    it("returns 'acknowledged_no_tracking' when ack but nothing else", () => {
+    it("returns 'auto_acknowledged' when system ack but no human reply", () => {
         expect(classifyVendorCommState(
             makePO({ vendorAcknowledgedAt: "2026-05-05" }),
             today,
-        )).toBe("acknowledged_no_tracking");
+        )).toBe("auto_acknowledged");
+    });
+
+    it("returns 'recent_human_reply' when a human at the vendor replied in last 7d", () => {
+        expect(classifyVendorCommState(
+            makePO({
+                vendorAcknowledgedAt: "2026-05-02",
+                humanReplyDetectedAt: "2026-05-12", // 2 days ago
+            }),
+            today,
+        )).toBe("recent_human_reply");
+    });
+
+    it("'auto_acknowledged' wins when human reply is older than 7d", () => {
+        expect(classifyVendorCommState(
+            makePO({
+                vendorAcknowledgedAt: "2026-04-20",
+                humanReplyDetectedAt: "2026-04-25", // ~19 days ago
+            }),
+            today,
+        )).toBe("auto_acknowledged");
     });
 
     it("returns 'eta_stated_no_tracking' when ETA present but no tracking", () => {
@@ -137,6 +159,26 @@ describe("detectAtRiskPOs", () => {
         const result = detectAtRiskPOs({
             today,
             activePOs: [makePO({ isReceived: true })],
+            purchasingItems: [makeIntel({ stockOnHand: 5, runwayDays: 5 })],
+        });
+        expect(result).toEqual([]);
+    });
+
+    it("skips POs whose vendor has already invoiced (vendor has shipped)", () => {
+        // Vendor sent an invoice — they've shipped or are about to. Not at risk.
+        const result = detectAtRiskPOs({
+            today,
+            activePOs: [makePO({ orderId: "PO-123", expectedDate: "2026-05-30" })],
+            purchasingItems: [makeIntel({ stockOnHand: 10, runwayDays: 10 })], // 6d short
+            poNumbersWithInvoice: new Set(["PO-123"]),
+        });
+        expect(result).toEqual([]);
+    });
+
+    it("skips POs whose completionState is past in_transit", () => {
+        const result = detectAtRiskPOs({
+            today,
+            activePOs: [makePO({ completionState: "delivered_awaiting_receipt" })],
             purchasingItems: [makeIntel({ stockOnHand: 5, runwayDays: 5 })],
         });
         expect(result).toEqual([]);

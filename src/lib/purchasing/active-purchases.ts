@@ -22,6 +22,7 @@ export interface ActivePurchase extends FullPO {
     trackingUnavailableAt?: string | null;
     trackingRequestedAt?: string | null;
     vendorAcknowledgedAt?: string | null;
+    humanReplyDetectedAt?: string | null;
     sentVerification: POSentVerification;
     etaProfile: VendorEtaProfile;
 }
@@ -195,6 +196,7 @@ export async function loadActivePurchases(
             trackingUnavailableAt: poLifecycle?.tracking_unavailable_at || null,
             trackingRequestedAt: poLifecycle?.tracking_requested_at || null,
             vendorAcknowledgedAt: poLifecycle?.vendor_acknowledged_at || null,
+            humanReplyDetectedAt: poLifecycle?.human_reply_detected_at || null,
             sentVerification,
             etaProfile,
         });
