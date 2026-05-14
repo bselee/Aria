@@ -50,15 +50,119 @@ defineFlow({
             correlationId: gmailId,
         };
     },
-    firstStep: "escalate_to_will",
+    firstStep: "check_first_contact",
     steps: {
-        escalate_to_will: {
+        // ── Step 1 ────────────────────────────────────────────────────
+        // Was this thread already auto-replied? If yes → Mitzi is pouncing
+        // again; escalate to Will (he sees it on /tasks + UNREAD in inbox).
+        check_first_contact: {
             run: async (ctx) => {
-                const from = String(ctx.inputs["from"] ?? "unknown sender");
+                const sb = (await import("@/lib/supabase")).createClient();
+                if (!sb) return { kind: "retry", reason: "supabase unavailable" };
+                const threadId = ctx.inputs["gmail_thread_id"];
+                if (typeof threadId !== "string" || !threadId) {
+                    // No threadId — can't dedupe. Skip step 2 and escalate so
+                    // Will sees the inquiry rather than guessing.
+                    return {
+                        kind: "escalate",
+                        reason: "payment inquiry missing gmail_thread_id; cannot dedupe — manual review",
+                    };
+                }
+                const { data } = await sb
+                    .from("ap_activity_log")
+                    .select("id")
+                    .eq("intent", "PAYMENT_INQUIRY_AUTOREPLY")
+                    .filter("metadata->>gmailThreadId", "eq", threadId)
+                    .limit(1);
+                if (data && data.length > 0) {
+                    return {
+                        kind: "escalate",
+                        reason: "vendor pinging again on same thread — already auto-replied once",
+                    };
+                }
+                return { kind: "succeeded", next: "send_simple_ack" };
+            },
+        },
+
+        // ── Step 2 ────────────────────────────────────────────────────
+        // First-time human payment inquiry. Send a short non-robotic reply
+        // that buys Will time without committing to a date (Aria can't
+        // read Bill.com schedule). Gated by PAYMENT_INQUIRY_AUTOREPLY_ENABLED;
+        // default OFF so the flow escalates until Will flips the env.
+        send_simple_ack: {
+            maxAttempts: 3,
+            run: async (ctx) => {
+                const reply = await import("@/lib/intelligence/payment-inquiry-reply");
+                if (!reply.autoReplyEnabled()) {
+                    return {
+                        kind: "escalate",
+                        reason: "auto-reply disabled (set PAYMENT_INQUIRY_AUTOREPLY_ENABLED=true to enable)",
+                    };
+                }
+                const from = String(ctx.inputs["from"] ?? "");
                 const subject = String(ctx.inputs["subject"] ?? "(no subject)");
+                const threadId = String(ctx.inputs["gmail_thread_id"] ?? "");
+                const messageIdHeader = String(ctx.inputs["message_id_header"] ?? "");
+                if (!from || !threadId || !messageIdHeader) {
+                    return {
+                        kind: "escalate",
+                        reason: `missing reply inputs (from=${!!from} thread=${!!threadId} mid=${!!messageIdHeader})`,
+                    };
+                }
+
+                const sent = await reply.sendSimpleAck({
+                    replyTo: from,
+                    originalSubject: subject,
+                    gmailThreadId: threadId,
+                    messageIdHeader,
+                });
+                if (!sent.ok) {
+                    return { kind: "retry", reason: `gmail send failed: ${sent.error}` };
+                }
+
+                // Log so the next inquiry on the same thread escalates.
+                const sb = (await import("@/lib/supabase")).createClient();
+                if (sb) {
+                    await sb.from("ap_activity_log").insert({
+                        email_from: from,
+                        email_subject: subject,
+                        intent: "PAYMENT_INQUIRY_AUTOREPLY",
+                        action_taken: `Auto-replied to ${from}: "${sent.template}"`,
+                        metadata: {
+                            gmailThreadId: threadId,
+                            gmailMessageId: ctx.inputs["gmail_message_id"],
+                            replyGmailMessageId: sent.gmailMessageId,
+                            template: sent.template,
+                            reasonCode: "first_contact_autoreply",
+                            sourceInbox: "ap",
+                        },
+                    });
+                }
+
+                // Mark the original message READ now that we've replied.
+                try {
+                    const { getAuthenticatedClient } = await import("@/lib/gmail/auth");
+                    const { gmail: GmailApi } = await import("@googleapis/gmail");
+                    const auth = await getAuthenticatedClient("ap");
+                    const gmail = GmailApi({ version: "v1", auth: auth as any });
+                    const originalId = String(ctx.inputs["gmail_message_id"] ?? "");
+                    if (originalId) {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: originalId,
+                            requestBody: { removeLabelIds: ["UNREAD"] },
+                        });
+                    }
+                } catch {
+                    // best-effort; reply already sent
+                }
+
                 return {
-                    kind: "escalate",
-                    reason: `Payment inquiry — ${from}: "${subject}"`,
+                    kind: "succeeded",
+                    stateUpdate: {
+                        template: sent.template,
+                        reply_gmail_id: sent.gmailMessageId,
+                    },
                 };
             },
         },

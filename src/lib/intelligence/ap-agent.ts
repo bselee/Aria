@@ -669,22 +669,31 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                     if (inquiryClass === "payment_inquiry") {
                         // Leave UNREAD in inbox so Will sees the count in Gmail.
-                        // The vendor_payment_inquiry flow's escalate step writes
-                        // the agent_task row so it also lands on /tasks.
+                        // The vendor_payment_inquiry flow either auto-replies
+                        // (if PAYMENT_INQUIRY_AUTOREPLY_ENABLED) or escalates
+                        // via agent_task on /tasks.
+                        const messageIdHeader =
+                            (payload?.headers || []).find(
+                                (h: any) => (h.name || "").toLowerCase() === "message-id",
+                            )?.value || "";
+                        const threadId = (m as any).threadId || "";
                         await this.logActivity(
                             supabase,
                             from,
                             subject,
                             "PAYMENT_INQUIRY",
-                            `Payment-status inquiry from ${from} — left UNREAD in inbox, escalating to /tasks`,
+                            `Payment-status inquiry from ${from} — left UNREAD in inbox`,
                             {
                                 reasonCode: "payment_inquiry",
                                 gmailMessageId: m.id!,
+                                gmailThreadId: threadId,
                                 sourceInbox: "ap",
                             },
                         );
                         void emitFlowEvent("vendor.payment_inquiry.received", {
                             gmail_message_id: m.id,
+                            gmail_thread_id: threadId,
+                            message_id_header: messageIdHeader,
                             from,
                             subject,
                             snippet,

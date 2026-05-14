@@ -128,9 +128,12 @@ function tallyOutcome(stats: TickStats, outcome: Outcome): void {
     else if (outcome === "retried") stats.retried++;
 }
 
+const MAX_STEPS_PER_TICK = 10;
+
 async function advance(
     run: FlowRunRow,
     event: FlowEventRow | null,
+    depth = 0,
 ): Promise<Outcome> {
     const sb = createClient();
     if (!sb) return "failed";
@@ -175,6 +178,18 @@ async function advance(
                 attempts: 0, // reset for new step
                 updated_at: nowIso,
             }).eq("id", run.id);
+            // Recurse within this tick so chained steps advance immediately
+            // instead of waiting for the next runner tick. MAX_STEPS_PER_TICK
+            // caps depth to prevent a runaway flow from monopolizing the tick.
+            if (depth + 1 < MAX_STEPS_PER_TICK) {
+                const nextRun: FlowRunRow = {
+                    ...run,
+                    current_step: result.next,
+                    state: stateNext,
+                    attempts: 0,
+                };
+                return advance(nextRun, null, depth + 1);
+            }
             return "succeeded";
         }
         await sb.from("flow_runs").update({
