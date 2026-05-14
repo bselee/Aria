@@ -508,6 +508,35 @@ export class OpsManager {
         }
     }
 
+    /**
+     * Detect open POs at risk of arriving after their line-item SKUs run out,
+     * and surface each as a PO_ARRIVAL_AT_RISK row in ap_activity_log. Builds
+     * panel + Activity feed render these for review and next-step actions.
+     * Activity-first routing: no Slack/Gmail push from this method.
+     */
+    public async runPOArrivalRiskCheck(): Promise<void> {
+        const [{ detectAtRiskPOs, writeAtRiskActivityRows }, { loadActivePurchases }, { finaleClient }] = await Promise.all([
+            import("../builds/po-arrival-risk"),
+            import("../purchasing/active-purchases"),
+            import("../finale/client"),
+        ]);
+        const [activePOs, intel] = await Promise.all([
+            loadActivePurchases(finaleClient),
+            finaleClient.getPurchasingIntelligence(),
+        ]);
+        const items = intel.flatMap((g) => g.items);
+        const risks = detectAtRiskPOs({ activePOs, purchasingItems: items });
+        if (risks.length === 0) {
+            console.log("[OpsManager] POArrivalRiskCheck: no at-risk POs");
+            return;
+        }
+        const result = await writeAtRiskActivityRows(risks);
+        console.log(
+            `[OpsManager] POArrivalRiskCheck: ${risks.length} at-risk POs ` +
+            `(inserted=${result.inserted} updated=${result.updated} failed=${result.failed})`,
+        );
+    }
+
     /** Phase 1 issue ledger: project recent tasks into agent_issue rows. */
     public async runIssueProjection(): Promise<void> {
         const { runIssueProjection } = await import("./issue-projection-cron");
