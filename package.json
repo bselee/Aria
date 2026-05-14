@@ -13,7 +13,7 @@
     "test:watch": "vitest",
     "reconcile:axiom": "node --import tsx src/cli/reconcile-axiom.ts",
     "typecheck:all": "npm run typecheck && npm run typecheck:cli",
-    "ship:bot": "npm run typecheck:cli && pm2 restart aria-bot",
+    "ship:bot": "pm2 restart aria-bot && npm run smoke:bot",
     "ship:dashboard": "npm run build && pm2 reload aria-dashboard && npm run smoke:dashboard",
     "smoke:bot": "bash scripts/smoke.sh aria-bot",
     "smoke:dashboard": "bash scripts/smoke.sh aria-dashboard"

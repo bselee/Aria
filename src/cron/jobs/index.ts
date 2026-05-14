@@ -265,6 +265,29 @@ defineJob({
     handler: async () => { await ops()?.runIssueProjection(); },
 });
 
+// Phase 1 backend agentic flow substrate. Drains flow_events, spawns and
+// advances flow_runs. Side-effect imports the flow registry on first tick.
+// Gated by FLOWS_ENABLED so a misbehaving runner can be disabled in one env.
+defineJob({
+    name: "flows-tick",
+    schedule: "* * * * *",
+    enabled: (process.env.FLOWS_ENABLED ?? "true").toLowerCase() !== "false",
+    onFail: "log",
+    description: "Flow runner: drain flow_events, spawn/advance flow_runs (every 1m).",
+    handler: async () => {
+        const [{ tick }] = await Promise.all([
+            import("@/flows/runner"),
+            import("@/flows"),
+        ]);
+        const r = await tick();
+        if (r.eventsProcessed > 0 || r.spawned > 0 || r.retried > 0 || r.escalated > 0) {
+            console.log(
+                `[flows-tick] events=${r.eventsProcessed} spawned=${r.spawned} advanced=${r.advanced} retried=${r.retried} failed=${r.failed} escalated=${r.escalated}`,
+            );
+        }
+    },
+});
+
 // Gated cron — preserved env flag from inline registration.
 defineJob({
     name: "issue-orchestrator",

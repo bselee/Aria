@@ -28,6 +28,7 @@ import {
 } from "../finale/reconciler";
 import { recordFeedback } from "./feedback-loop";
 import * as apIssue from "./ap-issue";
+import { emit as emitFlowEvent } from "@/flows/events";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
 import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
 import { withToolAudit } from "../agents/tool-registry";
@@ -506,6 +507,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 `${routingRule.label} — forwarded to Bill.com (${pdfNames}), no PO matching`,
                                 { attachments: pdfNames, dropship: true, vendor: routingRule.label });
                             console.log(`     ✅ Dropship complete: forwarded, marked read, no PO matching`);
+                            // Phase 1 flow canary: emit the trigger that spawns
+                            // the dropship_forward flow run. Best-effort — a
+                            // supabase failure here must not block AP polling.
+                            void emitFlowEvent("dropship.forwarded", {
+                                gmail_message_id: m.id,
+                                from,
+                                subject,
+                                vendor: routingRule.label,
+                                pdf_names: pdfNames,
+                            }, { correlationId: m.id ?? undefined });
                         } else {
                             console.error(`     ❌ Dropship forward FAILED for ${routingRule.label} — leaving in INBOX for retry`);
                             await this.logActivity(supabase, from, subject, "DROPSHIP_FAILED",
