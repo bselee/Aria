@@ -1643,9 +1643,19 @@ export class FinaleClient {
             if (err.message.includes("404")) {
                 // DECISION(2026-03-23): Finale REST /api/product/<sku> returns 404
                 // for some valid products. Fall back to product list scan.
-                const exists = await this.validateProductExists(sku.trim());
-                if (exists) {
-                    console.warn(`[finale] lookupProduct: ${sku} 404 on direct fetch but found in product list — Finale API quirk`);
+                // 2026-05-14: extended to actually RETURN product detail from
+                // the cached bulk-list response — supplier info, status, lead
+                // time, etc. all live there. Without this, ~50 components
+                // silently dropped from bom-demand / Purchasing Intelligence.
+                try {
+                    const synthetic = await this.lookupProductFromListCache(sku.trim());
+                    if (synthetic) {
+                        const product = await this.parseProductDetail(synthetic);
+                        product.openPOs = await this.findCommittedPOsForProduct(sku.trim());
+                        return product;
+                    }
+                } catch (cacheErr: any) {
+                    console.warn(`[finale] lookupProduct: ${sku} 404, list-cache fallback failed: ${cacheErr.message}`);
                 }
                 return null;
             }
@@ -1715,6 +1725,13 @@ export class FinaleClient {
      * fallback. We cache the product list for the lifetime of the client instance.
      */
     private productListCache: string[] | null = null;
+    /** Raw parallel-array response from /api/product. Allows reconstructing
+     *  a single-product-shaped object for any SKU even when the direct
+     *  /api/product/{sku} endpoint returns 404 — a real Finale API quirk
+     *  observed for a non-trivial slice of components (~50 SKUs as of
+     *  2026-05-14). Without this fallback, those components silently
+     *  drop out of bom-demand and Purchasing Intelligence. */
+    private productListBulkCache: Record<string, any[]> | null = null;
 
     async validateProductExists(sku: string): Promise<boolean> {
         const trimmed = sku.trim();
@@ -1727,18 +1744,47 @@ export class FinaleClient {
             // Direct endpoint 404s for some valid products — try list scan
         }
 
-        // Fallback: scan product list (cached per client instance)
         try {
-            if (!this.productListCache) {
-                const data = await this.get(`/${this.accountPath}/api/product`);
-                this.productListCache = data.productId || [];
-                console.log(`[finale] Product list cached: ${this.productListCache.length} products`);
-            }
-            return this.productListCache.includes(trimmed);
+            await this.ensureProductListCache();
+            return this.productListCache?.includes(trimmed) ?? false;
         } catch (err: any) {
             console.error(`[finale] validateProductExists failed for ${sku}:`, err.message);
             return false;
         }
+    }
+
+    /** Load + cache the bulk product list response on first use. Both
+     *  productListCache (just SKU IDs) and productListBulkCache (parallel
+     *  arrays for all fields) get populated together. */
+    private async ensureProductListCache(): Promise<void> {
+        if (this.productListCache && this.productListBulkCache) return;
+        const data = await this.get(`/${this.accountPath}/api/product`);
+        this.productListCache = data.productId || [];
+        // Strip the productId so we don't double-store it; the rest is
+        // parallel arrays we'll index by SKU position.
+        const { productId: _ignore, ...bulk } = data;
+        this.productListBulkCache = bulk as Record<string, any[]>;
+        console.log(`[finale] Product list cached: ${this.productListCache!.length} products (with details for 404-fallback)`);
+    }
+
+    /** Reconstruct a single-product-shaped object by pulling parallel-array
+     *  values at the requested SKU's index. Returns null if SKU not in the
+     *  cached list. The shape matches what /api/product/{sku} would have
+     *  returned — feed this straight to parseProductDetail. */
+    private async lookupProductFromListCache(sku: string): Promise<any | null> {
+        await this.ensureProductListCache();
+        const list = this.productListCache;
+        const bulk = this.productListBulkCache;
+        if (!list || !bulk) return null;
+        const idx = list.indexOf(sku);
+        if (idx < 0) return null;
+        const synthetic: Record<string, any> = { productId: sku };
+        for (const [field, arr] of Object.entries(bulk)) {
+            if (Array.isArray(arr) && idx < arr.length) {
+                synthetic[field] = arr[idx];
+            }
+        }
+        return synthetic;
     }
 
     /**
@@ -5251,8 +5297,25 @@ export class FinaleClient {
                     // Finale REST returns "--" for stockOnHand on every product —
                     // GraphQL productViewConnection (via getProductActivity) is the only
                     // reliable source. getProductActivity also gives us open POs for free.
+                    // 2026-05-14: wrap REST product fetch with the 404-list-cache
+                    // fallback. Finale's /api/product/{sku} 404s for ~50 valid
+                    // SKUs (QUE215BAG, PLQ102, WDG101, etc); the bulk
+                    // /api/product list has them with full supplier info.
+                    // Without this wrap those components were silently dropped
+                    // from Purchasing Intelligence with noisy error logs.
+                    const fetchProdDataWith404Fallback = async () => {
+                        try {
+                            return await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`);
+                        } catch (e: any) {
+                            if (typeof e?.message === "string" && /Finale API 404\b/.test(e.message)) {
+                                const synthetic = await this.lookupProductFromListCache(compSku);
+                                if (synthetic) return synthetic;
+                            }
+                            throw e;
+                        }
+                    };
                     const [prodData, compActivity] = await Promise.all([
-                        this.get(`/${this.accountPath}/api/product/${encodeURIComponent(compSku)}`),
+                        fetchProdDataWith404Fallback(),
                         this.getProductActivity(compSku, daysBack),
                     ]);
                     if (FinaleClient.isDoNotReorder(prodData)) continue;
