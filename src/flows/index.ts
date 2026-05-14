@@ -23,6 +23,48 @@ import { defineFlow } from "./registry";
 //           INBOX. If both are true, the flow SUCCEEDED — no human looks.
 // Escalate: row missing or wrong intent → escalate to Will via agent_task.
 
+// ── vendor_payment_inquiry ─────────────────────────────────────────────────
+//
+// Trigger:  ap-agent classifies an incoming HUMAN_INTERACTION email as a
+//           real human payment-status ask (Mitzi-style). Automated dunning
+//           and no-reply senders never reach this trigger — they are
+//           archived silently at the ap-agent level.
+// Goal (v1): surface the inquiry to Will in two places at once — UNREAD in
+//           Gmail inbox (done at emit time) AND on /tasks via the flow's
+//           escalate step → agent_task row.
+// Future:   add a `lookup_invoice` + `send_first_reply` step so the FIRST
+//           time a vendor pings about a given invoice we auto-reply with
+//           the Bill.com scheduled pay date. Repeat asks still escalate.
+
+defineFlow({
+    name: "vendor_payment_inquiry",
+    on: ["vendor.payment_inquiry.received"],
+    init: (event) => {
+        const payload = event.payload ?? {};
+        const gmailId =
+            typeof payload["gmail_message_id"] === "string"
+                ? (payload["gmail_message_id"] as string)
+                : undefined;
+        return {
+            inputs: payload,
+            correlationId: gmailId,
+        };
+    },
+    firstStep: "escalate_to_will",
+    steps: {
+        escalate_to_will: {
+            run: async (ctx) => {
+                const from = String(ctx.inputs["from"] ?? "unknown sender");
+                const subject = String(ctx.inputs["subject"] ?? "(no subject)");
+                return {
+                    kind: "escalate",
+                    reason: `Payment inquiry — ${from}: "${subject}"`,
+                };
+            },
+        },
+    },
+});
+
 defineFlow({
     name: "dropship_forward",
     on: ["dropship.forwarded"],
