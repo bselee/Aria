@@ -134,12 +134,12 @@ describe("detectAtRiskPOs", () => {
         expect(result[0].commState).toBe("none");
     });
 
-    it("does NOT flag a PO arriving before stockout", () => {
-        // runway 30 days → stockout 2026-06-13; PO arrival 2026-05-30 → no risk
+    it("does NOT flag a PO arriving before stockout with wide buffer", () => {
+        // runway 60 days → stockout 2026-07-13; PO arrival 2026-05-30 → -44d (plenty)
         const result = detectAtRiskPOs({
             today,
             activePOs: [makePO({ expectedDate: "2026-05-30" })],
-            purchasingItems: [makeIntel({ stockOnHand: 30, runwayDays: 30 })],
+            purchasingItems: [makeIntel({ stockOnHand: 60, runwayDays: 60 })],
         });
         expect(result).toEqual([]);
     });
@@ -151,6 +151,38 @@ describe("detectAtRiskPOs", () => {
             activePOs: [makePO({ expectedDate: "2026-06-12" })],
             purchasingItems: [makeIntel({ stockOnHand: 27, runwayDays: 27 })],
             minDaysShort: 3,
+        });
+        expect(result).toEqual([]);
+    });
+
+    it("tags severity=at_risk for >=3 days short", () => {
+        const result = detectAtRiskPOs({
+            today,
+            activePOs: [makePO({ expectedDate: "2026-05-30", items: [{ productId: "SKU-A", quantity: 1 }] })],
+            purchasingItems: [makeIntel({ stockOnHand: 10, runwayDays: 10 })],
+        });
+        expect(result[0].severity).toBe("at_risk");
+        expect(result[0].worstDaysShort).toBe(6);
+    });
+
+    it("tags severity=soon_at_risk when margin is thin but stockout hasn't crossed", () => {
+        // runway 30 days → stockout 2026-06-13; PO arrival 2026-06-08 → -5 days short (5d buffer)
+        const result = detectAtRiskPOs({
+            today,
+            activePOs: [makePO({ expectedDate: "2026-06-08", items: [{ productId: "SKU-A", quantity: 1 }] })],
+            purchasingItems: [makeIntel({ stockOnHand: 30, runwayDays: 30 })],
+        });
+        expect(result).toHaveLength(1);
+        expect(result[0].severity).toBe("soon_at_risk");
+        expect(result[0].worstDaysShort).toBe(-5);
+    });
+
+    it("excludes POs with buffer wider than PROACTIVE_WINDOW (14d)", () => {
+        // runway 60 days → stockout 2026-07-13; PO arrival 2026-06-08 → -35 days short (plenty of buffer)
+        const result = detectAtRiskPOs({
+            today,
+            activePOs: [makePO({ expectedDate: "2026-06-08" })],
+            purchasingItems: [makeIntel({ stockOnHand: 60, runwayDays: 60 })],
         });
         expect(result).toEqual([]);
     });

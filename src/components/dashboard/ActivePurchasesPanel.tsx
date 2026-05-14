@@ -1,8 +1,11 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X } from "lucide-react";
+import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X, AlertCircle } from "lucide-react";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
+import { createBrowserClient } from "@/lib/supabase";
+
+type AtRiskInfo = { severity: "at_risk" | "soon_at_risk"; worstDaysShort: number };
 
 type ActivePurchase = {
     orderId: string;
@@ -105,6 +108,11 @@ export default function ActivePurchasesPanel() {
     const [error, setError] = useState<string | null>(null);
     const [verifyingSent, setVerifyingSent] = useState<Set<string>>(new Set());
 
+    // PO_ARRIVAL_AT_RISK index from ap_activity_log (last 24h). Drives the
+    // rose/amber outline + AT-RISK pill on affected POs. Activity-first
+    // routing: the data lives in the Activity feed; this panel is a lens.
+    const [atRiskByPoId, setAtRiskByPoId] = useState<Map<string, AtRiskInfo>>(new Map());
+
     // Dismissal state
     const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
@@ -115,6 +123,35 @@ export default function ActivePurchasesPanel() {
                 setDismissed(new Set(JSON.parse(stored)));
             } catch (e) { }
         }
+    }, []);
+
+    // Load PO_ARRIVAL_AT_RISK rows once on mount + subscribe for live updates
+    // so the panel highlights stay current as the detector reruns (2h cron).
+    useEffect(() => {
+        const supabase = createBrowserClient();
+        const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+        const rebuild = (rows: Array<{ metadata: any }>): Map<string, AtRiskInfo> => {
+            const m = new Map<string, AtRiskInfo>();
+            for (const row of rows) {
+                const meta = row.metadata;
+                if (!meta?.poId) continue;
+                const severity: AtRiskInfo["severity"] = meta.severity === "soon_at_risk" ? "soon_at_risk" : "at_risk";
+                m.set(String(meta.poId), { severity, worstDaysShort: Number(meta.worstDaysShort ?? 0) });
+            }
+            return m;
+        };
+
+        supabase
+            .from("ap_activity_log")
+            .select("id, metadata")
+            .eq("intent", "PO_ARRIVAL_AT_RISK")
+            .gte("created_at", since24h)
+            .order("created_at", { ascending: false })
+            .limit(200)
+            .then((res: { data: Array<{ id: string; metadata: any }> | null }) => {
+                if (res.data) setAtRiskByPoId(rebuild(res.data));
+            });
     }, []);
 
     const dismissPurchase = (orderId: string) => {
@@ -409,13 +446,22 @@ export default function ActivePurchasesPanel() {
                                 const daysLate = overdue ? -1 * (dayDiff(expISO, new Date().toISOString().slice(0, 10)) ?? 0) : 0;
                                 const daysOut = daysSince(po.orderDate);
                                 const receivedDiff = po.isReceived && po.receiveDate ? dayDiff(po.receiveDate, expISO) : null;
+                                // Outline this row when the detector flagged the PO. Rose for
+                                // already-at-risk, amber for soon-at-risk. Pill renders the
+                                // severity inline next to the status pill.
+                                const atRisk = atRiskByPoId.get(po.orderId);
+                                const riskRing = atRisk
+                                    ? atRisk.severity === "at_risk"
+                                        ? "ring-1 ring-inset ring-rose-500/60 bg-rose-500/[.04]"
+                                        : "ring-1 ring-inset ring-amber-500/50 bg-amber-500/[.03]"
+                                    : "";
                                 return (
                                     <div
                                         key={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
                                         onClick={() => setTimelineOrderId(po.orderId)}
-                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : !atRisk ? "hover:bg-zinc-800/20" : ""} ${riskRing}`}
                                     >
                                         {/* Dismiss Button */}
                                         <button
@@ -450,6 +496,24 @@ export default function ActivePurchasesPanel() {
                                             <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${statusColor}`}>
                                                 {statusLabel}
                                             </span>
+                                            {atRisk && atRisk.severity === "at_risk" && (
+                                                <span
+                                                    className="inline-flex items-center gap-1 text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-rose-600/30 text-rose-200 border-rose-500/60 shrink-0"
+                                                    title={`Arrival ${atRisk.worstDaysShort}d after projected stockout`}
+                                                >
+                                                    <AlertCircle className="w-2.5 h-2.5" />
+                                                    BUILD AT RISK · {atRisk.worstDaysShort}d short
+                                                </span>
+                                            )}
+                                            {atRisk && atRisk.severity === "soon_at_risk" && (
+                                                <span
+                                                    className="inline-flex items-center gap-1 text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-amber-600/20 text-amber-200 border-amber-500/50 shrink-0"
+                                                    title={`Only ${Math.abs(atRisk.worstDaysShort)}d buffer before stockout`}
+                                                >
+                                                    <AlertCircle className="w-2.5 h-2.5" />
+                                                    MARGIN TIGHT · {Math.abs(atRisk.worstDaysShort)}d
+                                                </span>
+                                            )}
                                             {overdue && (
                                                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0">
                                                     ⚠ OVERDUE {daysLate}d

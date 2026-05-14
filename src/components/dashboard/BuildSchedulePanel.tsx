@@ -53,6 +53,7 @@ type AtRiskPOActivity = {
   metadata: {
     poId: string;
     vendorName: string;
+    severity?: "at_risk" | "soon_at_risk";
     expectedArrival: string;
     commState: string;
     worstDaysShort: number;
@@ -64,6 +65,7 @@ type AtRiskPOActivity = {
 type AtRiskBySku = Map<string, Array<{
   poId: string;
   vendorName: string;
+  severity: "at_risk" | "soon_at_risk";
   expectedArrival: string;
   daysShort: number;
 }>>;
@@ -155,8 +157,8 @@ function BuildRow({ b, risk, completed, components, atRiskBySku }: {
   // scheduled to arrive AFTER the build date. If the PO arrives before
   // the build, it's tight but not blocking.
   const blockingPOs = (() => {
-    if (!atRiskBySku || !components) return [] as Array<{ sku: string; poId: string; vendorName: string; expectedArrival: string; daysShort: number }>;
-    const out: Array<{ sku: string; poId: string; vendorName: string; expectedArrival: string; daysShort: number }> = [];
+    if (!atRiskBySku || !components) return [] as Array<{ sku: string; poId: string; vendorName: string; severity: "at_risk" | "soon_at_risk"; expectedArrival: string; daysShort: number }>;
+    const out: Array<{ sku: string; poId: string; vendorName: string; severity: "at_risk" | "soon_at_risk"; expectedArrival: string; daysShort: number }> = [];
     const seenPo = new Set<string>();
     const consumedSkus = components.filter(c => c.usedIn?.includes(b.sku)).map(c => c.componentSku);
     for (const sku of consumedSkus) {
@@ -174,6 +176,9 @@ function BuildRow({ b, risk, completed, components, atRiskBySku }: {
     return out;
   })();
   const hasBlockingPO = blockingPOs.length > 0;
+  const worstBlockSeverity: "at_risk" | "soon_at_risk" | null = !hasBlockingPO
+    ? null
+    : blockingPOs.some(p => p.severity === "at_risk") ? "at_risk" : "soon_at_risk";
   const desc = b.originalEvent
     ? b.originalEvent.replace(/^\d+\s*(x\s*)?(bags?|units?|lbs?|of\s+)?/i, "").trim().slice(0, 45) || null
     : null;
@@ -223,12 +228,20 @@ function BuildRow({ b, risk, completed, components, atRiskBySku }: {
             {showRisk && (
               <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
             )}
-            {!completed && hasBlockingPO && (
+            {!completed && hasBlockingPO && worstBlockSeverity === "at_risk" && (
               <span
                 className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-rose-600/30 text-rose-200 border-rose-500/60"
                 title={`Blocked by ${blockingPOs.length} late PO(s): ${blockingPOs.map(p => `${p.vendorName} #${p.poId}`).join(", ")}`}
               >
                 PO LATE
+              </span>
+            )}
+            {!completed && hasBlockingPO && worstBlockSeverity === "soon_at_risk" && (
+              <span
+                className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-amber-600/20 text-amber-200 border-amber-500/50"
+                title={`Tight margin on ${blockingPOs.length} PO(s): ${blockingPOs.map(p => `${p.vendorName} #${p.poId}`).join(", ")}`}
+              >
+                PO TIGHT
               </span>
             )}
             {completed && (
@@ -242,8 +255,8 @@ function BuildRow({ b, risk, completed, components, atRiskBySku }: {
           <div className="text-[11px] text-zinc-600 truncate mt-0.5 pl-5">{desc}</div>
         )}
         {!completed && hasBlockingPO && (
-          <div className="mt-1 pl-5 text-[11px] font-mono text-rose-300/90 truncate">
-            ⚠ {blockingPOs.slice(0, 2).map(p => `${p.vendorName} #${p.poId} (${p.sku}, ${p.daysShort}d short)`).join("  ·  ")}
+          <div className={`mt-1 pl-5 text-[11px] font-mono truncate ${worstBlockSeverity === "at_risk" ? "text-rose-300/90" : "text-amber-300/90"}`}>
+            ⚠ {blockingPOs.slice(0, 2).map(p => `${p.vendorName} #${p.poId} (${p.sku}, ${p.daysShort >= 0 ? `${p.daysShort}d short` : `${Math.abs(p.daysShort)}d buffer`})`).join("  ·  ")}
             {blockingPOs.length > 2 && <span> +{blockingPOs.length - 2} more</span>}
           </div>
         )}
@@ -399,6 +412,7 @@ export default function BuildSchedulePanel() {
     for (const row of atRiskRows) {
       const meta = row.metadata;
       if (!meta?.atRiskItems) continue;
+      const severity = meta.severity ?? "at_risk"; // legacy rows default to at_risk
       for (const item of meta.atRiskItems) {
         if (!item?.sku) continue;
         const list = m.get(item.sku) ?? [];
@@ -406,6 +420,7 @@ export default function BuildSchedulePanel() {
           list.push({
             poId: meta.poId,
             vendorName: meta.vendorName,
+            severity,
             expectedArrival: meta.expectedArrival,
             daysShort: item.daysShort,
           });
@@ -416,20 +431,39 @@ export default function BuildSchedulePanel() {
     return m;
   })();
 
-  // Count builds blocked by a late PO for the summary banner.
-  const buildsBlockedByLatePO = (() => {
-    if (atRiskBySku.size === 0 || allComponents.length === 0) return 0;
-    let count = 0;
+  // Split row counts by tier for the summary banner.
+  const atRiskRowsByTier = (() => {
+    let at = 0, soon = 0;
+    for (const row of atRiskRows) {
+      if ((row.metadata?.severity ?? "at_risk") === "at_risk") at++;
+      else soon++;
+    }
+    return { at, soon };
+  })();
+
+  // Count builds blocked, split by worst tier of any blocking PO.
+  const buildBlockCounts = (() => {
+    let at = 0, soon = 0;
+    if (atRiskBySku.size === 0 || allComponents.length === 0) return { at, soon };
     for (const b of allBuilds) {
       if (completionBySku.has(b.sku)) continue;
       const consumed = allComponents.filter(c => c.usedIn?.includes(b.sku)).map(c => c.componentSku);
-      const isBlocked = consumed.some(sku => {
+      let worst: "at_risk" | "soon_at_risk" | null = null;
+      for (const sku of consumed) {
         const pos = atRiskBySku.get(sku);
-        return pos?.some(p => p.expectedArrival > b.buildDate);
-      });
-      if (isBlocked) count++;
+        if (!pos) continue;
+        for (const p of pos) {
+          if (p.expectedArrival > b.buildDate) {
+            if (p.severity === "at_risk") { worst = "at_risk"; break; }
+            if (!worst) worst = "soon_at_risk";
+          }
+        }
+        if (worst === "at_risk") break;
+      }
+      if (worst === "at_risk") at++;
+      else if (worst === "soon_at_risk") soon++;
     }
-    return count;
+    return { at, soon };
   })();
 
   // Group into unified timeline by date
@@ -488,14 +522,30 @@ export default function BuildSchedulePanel() {
         <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full">
 
           {/* Late-PO alert banner. Hidden when 0 — drives Will's attention only
-              when something's actually wrong. Click jumps to Activity feed. */}
-          {buildsBlockedByLatePO > 0 && (
-            <div className="px-4 py-2 border-b border-rose-500/40 bg-rose-500/10 flex items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-              <span className="text-xs font-mono font-semibold text-rose-200">
-                {buildsBlockedByLatePO} {buildsBlockedByLatePO === 1 ? "build" : "builds"} at risk — {atRiskRows.length} late {atRiskRows.length === 1 ? "PO" : "POs"}
-              </span>
-              <span className="text-[10px] font-mono text-rose-300/70 ml-auto">see Activity feed</span>
+              when something's actually wrong. Two tiers:
+                rose  = builds blocked by a PO arriving AFTER stockout (at_risk)
+                amber = builds with a thin margin (soon_at_risk, within 2 weeks) */}
+          {(buildBlockCounts.at > 0 || buildBlockCounts.soon > 0) && (
+            <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/60 flex items-center gap-3 flex-wrap">
+              {buildBlockCounts.at > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                  <span className="text-xs font-mono font-semibold text-rose-200">
+                    {buildBlockCounts.at} {buildBlockCounts.at === 1 ? "build" : "builds"} at risk
+                  </span>
+                  <span className="text-[10px] font-mono text-rose-300/70">({atRiskRowsByTier.at} late {atRiskRowsByTier.at === 1 ? "PO" : "POs"})</span>
+                </div>
+              )}
+              {buildBlockCounts.soon > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span className="text-xs font-mono font-semibold text-amber-200">
+                    {buildBlockCounts.soon} {buildBlockCounts.soon === 1 ? "build" : "builds"} margin tight
+                  </span>
+                  <span className="text-[10px] font-mono text-amber-300/70">({atRiskRowsByTier.soon} {atRiskRowsByTier.soon === 1 ? "PO" : "POs"} within 2wk)</span>
+                </div>
+              )}
+              <span className="text-[10px] font-mono text-zinc-500 ml-auto">see Activity feed</span>
             </div>
           )}
 
