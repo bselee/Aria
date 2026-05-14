@@ -42,10 +42,21 @@ export interface AtRiskItem {
     affectedFGs?: string[];     // FGs that consume this SKU (best-effort)
 }
 
+/**
+ * Two severity tiers so the UI can split current pain from heads-up:
+ *   at_risk      — stockout already lands before arrival (daysShort >= AT_RISK_THRESHOLD)
+ *   soon_at_risk — margin is thin (daysShort within [-PROACTIVE_WINDOW, AT_RISK_THRESHOLD))
+ */
+export type AtRiskSeverity = "at_risk" | "soon_at_risk";
+
+export const AT_RISK_THRESHOLD_DAYS = 3;
+export const PROACTIVE_WINDOW_DAYS = 14;
+
 export interface AtRiskPO {
     poId: string;
     vendorName: string;
     vendorPartyId: string | null;
+    severity: AtRiskSeverity;
     orderDate: string | null;
     expectedArrival: string;       // ISO date
     leadProvenance: string;        // e.g. "14d (Finale)"
@@ -144,7 +155,10 @@ export interface DetectAtRiskPOsInput {
 
 export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
     const today = input.today ?? todayIso();
-    const minDaysShort = input.minDaysShort ?? 3;
+    // Lower bound: AT_RISK_THRESHOLD bumps a SKU to at_risk; anything in
+    // [-PROACTIVE_WINDOW, AT_RISK_THRESHOLD) is soon_at_risk. Caller can
+    // still override via minDaysShort to e.g. cut the proactive tier.
+    const minDaysShort = input.minDaysShort ?? -PROACTIVE_WINDOW_DAYS;
     const invoiceMatched = input.poNumbersWithInvoice ?? new Set<string>();
 
     // Index per-SKU intelligence for O(1) lookup.
@@ -192,10 +206,20 @@ export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
 
         if (atRiskItems.length === 0) continue;
 
+        // Negative daysShort means buffer remains (soon_at_risk tier); preserve
+        // the sign so the UI / writer can show "5d buffer" vs "6d short".
+        const worstDaysShort = atRiskItems.reduce(
+            (m, i) => (i.daysShort > m ? i.daysShort : m),
+            Number.NEGATIVE_INFINITY,
+        );
+        const severity: AtRiskSeverity =
+            worstDaysShort >= AT_RISK_THRESHOLD_DAYS ? "at_risk" : "soon_at_risk";
+
         out.push({
             poId: po.orderId,
             vendorName: po.vendorName ?? "Unknown Vendor",
             vendorPartyId: (po as any).vendorPartyId ?? null,
+            severity,
             orderDate: po.orderDate ?? null,
             expectedArrival: po.expectedDate,
             leadProvenance: po.leadProvenance ?? "unknown",
@@ -210,11 +234,12 @@ export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
                 lifecycleStage: po.lifecycleStage ?? null,
             },
             atRiskItems,
-            worstDaysShort: atRiskItems.reduce((m, i) => Math.max(m, i.daysShort), 0),
+            worstDaysShort,
         });
     }
 
-    // Worst-first so the dashboard / cron sees most urgent up top.
+    // Worst-first so the dashboard / cron sees most urgent up top. Severity
+    // is implicit in worstDaysShort (>=3 vs <3), so sort by it alone.
     out.sort((a, b) => b.worstDaysShort - a.worstDaysShort);
     return out;
 }
@@ -305,11 +330,15 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
                 .limit(1);
 
             const subject = `PO #${risk.poId} — ${commStateLabel(risk.commState)}`;
-            const action = `${risk.worstDaysShort}d short on arrival. ${summarizeAtRiskItems(risk.atRiskItems)}`;
+            const tierTag = risk.severity === "at_risk"
+                ? `${risk.worstDaysShort}d short on arrival`
+                : `margin tight (${Math.abs(risk.worstDaysShort)}d buffer)`;
+            const action = `${tierTag}. ${summarizeAtRiskItems(risk.atRiskItems)}`;
             const metadata = {
                 poId: risk.poId,
                 vendorName: risk.vendorName,
                 vendorPartyId: risk.vendorPartyId,
+                severity: risk.severity,
                 orderDate: risk.orderDate,
                 expectedArrival: risk.expectedArrival,
                 leadProvenance: risk.leadProvenance,
@@ -317,7 +346,7 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
                 facts: risk.facts,
                 atRiskItems: risk.atRiskItems,
                 worstDaysShort: risk.worstDaysShort,
-                detectorVersion: 1,
+                detectorVersion: 2,
             };
 
             if (existing && existing.length > 0) {

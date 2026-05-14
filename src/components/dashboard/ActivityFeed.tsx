@@ -687,10 +687,15 @@ export default function ActivityFeed() {
                 const isDismissed = log.reviewed_action === "dismissed";
                 const isRecon = log.intent === "RECONCILIATION";
                 const isPOAtRisk = log.intent === "PO_ARRIVAL_AT_RISK";
+                const poSeverity: "at_risk" | "soon_at_risk" = log.metadata?.severity === "soon_at_risk" ? "soon_at_risk" : "at_risk";
+                const isPOSoon = isPOAtRisk && poSeverity === "soon_at_risk";
                 const isExpanded = expandedId === log.id;
 
-                if (isPOAtRisk) {
+                if (isPOAtRisk && !isPOSoon) {
                     dotColor = "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.7)] ring-zinc-900";
+                    Icon = AlertCircle;
+                } else if (isPOSoon) {
+                    dotColor = "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.6)] ring-zinc-900";
                     Icon = AlertCircle;
                 } else if (isError) {
                     dotColor = "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.5)] ring-zinc-900";
@@ -721,8 +726,10 @@ export default function ActivityFeed() {
 
                         {/* Content Card */}
                         <div className={`w-[calc(100%-3rem)] md:w-[calc(50%-2rem)] ${isJunk ? "opacity-60" : ""}`}>
-                            <div className={`p-4 rounded-xl bg-zinc-900/40 backdrop-blur-sm border transition-all duration-300 ${isPOAtRisk
+                            <div className={`p-4 rounded-xl bg-zinc-900/40 backdrop-blur-sm border transition-all duration-300 ${isPOAtRisk && !isPOSoon
                                 ? "border-rose-500/40 hover:border-rose-500/60 bg-rose-500/[.05] border-l-2"
+                                : isPOSoon
+                                ? "border-amber-500/40 hover:border-amber-500/60 bg-amber-500/[.04] border-l-2"
                                 : isPaused
                                     ? "border-amber-500/30 hover:border-amber-500/50 bg-amber-500/[.03]"
                                     : isReviewed
@@ -761,44 +768,55 @@ export default function ActivityFeed() {
                                 {/* PO_ARRIVAL_AT_RISK: structured detail block. The intent-specific
                                     rendering matches the spine-first routing rule — Activity is the
                                     surface, no separate panel needed. */}
-                                {isPOAtRisk && log.metadata && (
-                                    <div className="mt-3 space-y-1 text-[11px] font-mono">
-                                        <div className="flex flex-wrap gap-x-3 gap-y-1">
-                                            <span className="text-zinc-500">PO</span>
-                                            {log.metadata.poId && (
-                                                <a
-                                                    href={buildFinaleUrl(log.metadata.poId)}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    className="text-rose-300 hover:text-rose-200 font-semibold"
-                                                >#{log.metadata.poId}</a>
-                                            )}
-                                            <span className="text-zinc-500">·</span>
-                                            <span className="text-zinc-300">{log.metadata.vendorName}</span>
-                                            <span className="text-zinc-500">·</span>
-                                            <span className="text-rose-300">{String(log.metadata.commState ?? "").replace(/_/g, " ")}</span>
-                                            <span className="text-zinc-500">·</span>
-                                            <span className="text-rose-200">arrives {log.metadata.expectedArrival}</span>
-                                        </div>
-                                        {Array.isArray(log.metadata.atRiskItems) && log.metadata.atRiskItems.length > 0 && (
-                                            <div className="mt-1 space-y-0.5">
-                                                {log.metadata.atRiskItems.slice(0, 5).map((it: any) => (
-                                                    <div key={it.sku} className="flex items-center gap-2 text-zinc-400">
-                                                        <span className="w-1 h-1 rounded-full bg-rose-500/70 shrink-0" />
-                                                        <span className="text-zinc-200 font-semibold">{it.sku}</span>
-                                                        {it.productName && (
-                                                            <span className="text-zinc-500 truncate max-w-[260px]" title={it.productName}>· {it.productName}</span>
-                                                        )}
-                                                        <span className="text-rose-300/80 ml-auto shrink-0">{it.daysShort}d short</span>
-                                                    </div>
-                                                ))}
-                                                {log.metadata.atRiskItems.length > 5 && (
-                                                    <div className="text-zinc-600 pl-3">+ {log.metadata.atRiskItems.length - 5} more</div>
+                                {isPOAtRisk && log.metadata && (() => {
+                                    const accent = isPOSoon ? "text-amber-300" : "text-rose-300";
+                                    const accentSoft = isPOSoon ? "text-amber-200" : "text-rose-200";
+                                    const accentDim = isPOSoon ? "text-amber-300/80" : "text-rose-300/80";
+                                    const dotBg = isPOSoon ? "bg-amber-400/70" : "bg-rose-500/70";
+                                    return (
+                                        <div className="mt-3 space-y-1 text-[11px] font-mono">
+                                            <div className="flex flex-wrap gap-x-3 gap-y-1">
+                                                <span className="text-zinc-500">PO</span>
+                                                {log.metadata.poId && (
+                                                    <a
+                                                        href={buildFinaleUrl(log.metadata.poId)}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className={`${accent} hover:opacity-80 font-semibold`}
+                                                    >#{log.metadata.poId}</a>
+                                                )}
+                                                <span className="text-zinc-500">·</span>
+                                                <span className="text-zinc-300">{log.metadata.vendorName}</span>
+                                                <span className="text-zinc-500">·</span>
+                                                <span className={accent}>{String(log.metadata.commState ?? "").replace(/_/g, " ")}</span>
+                                                <span className="text-zinc-500">·</span>
+                                                <span className={accentSoft}>arrives {log.metadata.expectedArrival}</span>
+                                                {isPOSoon && (
+                                                    <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-300 border-amber-500/40">SOON</span>
                                                 )}
                                             </div>
-                                        )}
-                                    </div>
-                                )}
+                                            {Array.isArray(log.metadata.atRiskItems) && log.metadata.atRiskItems.length > 0 && (
+                                                <div className="mt-1 space-y-0.5">
+                                                    {log.metadata.atRiskItems.slice(0, 5).map((it: any) => (
+                                                        <div key={it.sku} className="flex items-center gap-2 text-zinc-400">
+                                                            <span className={`w-1 h-1 rounded-full ${dotBg} shrink-0`} />
+                                                            <span className="text-zinc-200 font-semibold">{it.sku}</span>
+                                                            {it.productName && (
+                                                                <span className="text-zinc-500 truncate max-w-[260px]" title={it.productName}>· {it.productName}</span>
+                                                            )}
+                                                            <span className={`${accentDim} ml-auto shrink-0`}>
+                                                                {it.daysShort >= 0 ? `${it.daysShort}d short` : `${Math.abs(it.daysShort)}d buffer`}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                    {log.metadata.atRiskItems.length > 5 && (
+                                                        <div className="text-zinc-600 pl-3">+ {log.metadata.atRiskItems.length - 5} more</div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })()}
 
                                 {/* Actionable Ghost Buttons — PO link + INV toggle */}
                                 {log.metadata && (
