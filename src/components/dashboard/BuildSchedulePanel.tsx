@@ -765,6 +765,29 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
                   const affected = (comp.blocksFGs.length > 0 ? comp.blocksFGs : comp.usedIn).slice(0, 3);
                   const moreCount = Math.max(0, (comp.blocksFGs.length > 0 ? comp.blocksFGs.length : comp.usedIn.length) - 3);
                   const fullList = (comp.blocksFGs.length > 0 ? comp.blocksFGs : comp.usedIn).join(', ');
+
+                  // Fine-grained stock tier (refined 2026-05-14 after KMS101
+                  // showed "ORDER NOW" without context of what was actually on hand):
+                  //   STOCK_OUT      — nothing on hand, even one build fails
+                  //   PARTIAL_SHORT  — have stock but 30-day need exceeds it
+                  //   FULLY_COVERED  — onHand >= thirtyDayNeed
+                  const onHand = comp.onHand ?? 0;
+                  const need = comp.thirtyDayNeed;
+                  const incomingPOQty = (comp.incomingPOs ?? []).reduce((s, p) => s + p.quantity, 0);
+                  const coverageDays = comp.avgDailyConsumption > 0
+                    ? Math.floor((onHand + incomingPOQty) / comp.avgDailyConsumption)
+                    : null;
+                  const shortfall = need - onHand - incomingPOQty;
+                  const stockTier: 'STOCK_OUT' | 'PARTIAL_SHORT' | 'FULLY_COVERED' =
+                    onHand <= 0 ? 'STOCK_OUT'
+                    : (onHand + incomingPOQty) < need ? 'PARTIAL_SHORT'
+                    : 'FULLY_COVERED';
+                  const tierStyle = {
+                    STOCK_OUT:     { badge: 'bg-rose-600/30 text-rose-200 border-rose-500/60',     label: 'OUT' },
+                    PARTIAL_SHORT: { badge: 'bg-amber-600/20 text-amber-200 border-amber-500/50',  label: 'PARTIAL' },
+                    FULLY_COVERED: { badge: 'bg-emerald-600/15 text-emerald-200 border-emerald-500/40', label: 'OK' },
+                  }[stockTier];
+                  const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 0 });
                   return (
                     <div key={comp.componentSku} className="space-y-0.5">
                       <div className="flex items-center gap-2 text-[11px]">
@@ -773,11 +796,40 @@ function BuildDemandSection({ snapshot }: { snapshot: Snapshot | null }) {
                         {comp.productName && (
                           <span className="text-zinc-400 truncate max-w-[260px]" title={comp.productName}>· {comp.productName}</span>
                         )}
-                        <span className="text-zinc-500 font-mono ml-auto shrink-0">×{comp.thirtyDayNeed.toLocaleString()} need</span>
-                        <span className={`font-mono shrink-0 ${comp.gap < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                          {comp.gap < 0 ? `⚠ gap ${Math.abs(comp.gap).toLocaleString()}` : `${comp.onHand ?? 0} on hand`}
+                        <span
+                          className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border ml-auto shrink-0 ${tierStyle.badge}`}
+                          title={`Stock ${fmt(onHand)} + ${fmt(incomingPOQty)} on order = ${fmt(onHand + incomingPOQty)} supply vs ${fmt(need)} need`}
+                        >
+                          {tierStyle.label}
                         </span>
-                        <span className="font-mono text-zinc-600 text-[10px] shrink-0">{comp.leadTimeDays ?? 14}d LT</span>
+                      </div>
+                      <div className="flex items-center gap-2.5 text-[10px] font-mono pl-4 text-zinc-500">
+                        <span><span className="text-zinc-300">{fmt(onHand)}</span> on hand</span>
+                        {incomingPOQty > 0 && <span>+ <span className="text-cyan-300">{fmt(incomingPOQty)}</span> on order</span>}
+                        <span>·</span>
+                        <span><span className="text-zinc-300">{fmt(need)}</span> need (30d)</span>
+                        {shortfall > 0 ? (
+                          <>
+                            <span>·</span>
+                            <span className={stockTier === 'STOCK_OUT' ? 'text-rose-400' : 'text-amber-400'}>
+                              short <span className="font-semibold">{fmt(shortfall)}</span>
+                            </span>
+                          </>
+                        ) : null}
+                        {coverageDays !== null && (
+                          <>
+                            <span>·</span>
+                            <span title="Days of coverage at average daily consumption">
+                              <span className={coverageDays < (comp.leadTimeDays ?? 14) ? 'text-rose-400' : coverageDays < 30 ? 'text-amber-400' : 'text-emerald-400'}>
+                                {coverageDays}d
+                              </span> cover
+                            </span>
+                          </>
+                        )}
+                        {comp.orderQty > 0 && (
+                          <span className="ml-auto text-blue-300/80">→ order ~{fmt(comp.orderQty)}</span>
+                        )}
+                        <span className="text-zinc-600">{comp.leadTimeDays ?? 14}d LT</span>
                       </div>
                       {affected.length > 0 && (
                         <div className="text-[10px] font-mono text-zinc-500 pl-4 truncate" title={fullList}>
