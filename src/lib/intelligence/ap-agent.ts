@@ -29,6 +29,7 @@ import {
 import { recordFeedback } from "./feedback-loop";
 import * as apIssue from "./ap-issue";
 import { emit as emitFlowEvent } from "@/flows/events";
+import { classifyHumanInquiry } from "./payment-inquiry-classifier";
 import { upsertVendorInvoice } from "../storage/vendor-invoices";
 import { upsertInvoiceReviewSample } from "../storage/invoice-review-corpus";
 import { withToolAudit } from "../agents/tool-registry";
@@ -632,8 +633,66 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }
 
                 if (intent === "HUMAN_INTERACTION" || intent === "EYES_NEEDED") {
-                    // Keep the email visible in the inbox for Will, but mark it read
-                    // so the polling query does not repeatedly log the same message.
+                    // Tri-class sub-classifier (cheap, rule-based) decides:
+                    //   automated_noreply → archive silently (out of inbox)
+                    //   payment_inquiry   → leave UNREAD in inbox + emit flow trigger
+                    //                       (flow's escalate step writes agent_task)
+                    //   general_human     → existing behavior (mark read, keep visible)
+                    const inquiryClass = classifyHumanInquiry({
+                        from,
+                        subject,
+                        snippet: snippet || undefined,
+                    });
+
+                    if (inquiryClass === "automated_noreply") {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: {
+                                removeLabelIds: ["INBOX", "UNREAD"],
+                            },
+                        });
+                        await this.logActivity(
+                            supabase,
+                            from,
+                            subject,
+                            "AUTOMATED_NOREPLY",
+                            `Archived automated/no-reply email from ${from}`,
+                            {
+                                reasonCode: "automated_noreply",
+                                gmailMessageId: m.id!,
+                                sourceInbox: "ap",
+                            },
+                        );
+                        continue;
+                    }
+
+                    if (inquiryClass === "payment_inquiry") {
+                        // Leave UNREAD in inbox so Will sees the count in Gmail.
+                        // The vendor_payment_inquiry flow's escalate step writes
+                        // the agent_task row so it also lands on /tasks.
+                        await this.logActivity(
+                            supabase,
+                            from,
+                            subject,
+                            "PAYMENT_INQUIRY",
+                            `Payment-status inquiry from ${from} — left UNREAD in inbox, escalating to /tasks`,
+                            {
+                                reasonCode: "payment_inquiry",
+                                gmailMessageId: m.id!,
+                                sourceInbox: "ap",
+                            },
+                        );
+                        void emitFlowEvent("vendor.payment_inquiry.received", {
+                            gmail_message_id: m.id,
+                            from,
+                            subject,
+                            snippet,
+                        }, { correlationId: m.id ?? undefined });
+                        continue;
+                    }
+
+                    // general_human — existing behavior: mark read, leave visible
                     await gmail.users.messages.modify({
                         userId: "me",
                         id: m.id!,
