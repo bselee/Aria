@@ -602,6 +602,48 @@ export default function ActivityFeed() {
         };
     }, []);
 
+    // Per-row UI state for the PO_ARRIVAL_AT_RISK action buttons. Keyed by
+    // activity row id so independent rows don't share spinners or errors.
+    const [poRiskBusy, setPoRiskBusy] = useState<Record<string, "draft" | "snooze" | "followup" | null>>({});
+    const [poRiskError, setPoRiskError] = useState<Record<string, string | null>>({});
+    const [poRiskDraft, setPoRiskDraft] = useState<Record<string, { subject: string; body: string; vendorEmail: string }>>({});
+
+    const handlePOAction = useCallback(async (logId: string, action: "draft" | "snooze" | "followup") => {
+        setPoRiskBusy(b => ({ ...b, [logId]: action }));
+        setPoRiskError(e => ({ ...e, [logId]: null }));
+        try {
+            const route =
+                action === "draft" ? "/api/dashboard/po-risk/compose-draft" :
+                action === "snooze" ? "/api/dashboard/po-risk/snooze" :
+                "/api/dashboard/po-risk/followed-up";
+            const res = await fetch(route, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ activityId: logId, ...(action === "snooze" ? { hours: 48 } : {}) }),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.success) throw new Error(data.error ?? "Action failed");
+
+            if (action === "draft") {
+                setPoRiskDraft(d => ({
+                    ...d,
+                    [logId]: { subject: data.subject ?? "", body: data.body ?? "", vendorEmail: data.vendorEmail ?? "" },
+                }));
+            } else {
+                // Snooze / followup: optimistically mark reviewed.
+                setLogs(current => current.map(log => log.id === logId ? {
+                    ...log,
+                    reviewed_at: new Date().toISOString(),
+                    reviewed_action: action === "snooze" ? "paused" : "followed_up",
+                } : log));
+            }
+        } catch (err: any) {
+            setPoRiskError(e => ({ ...e, [logId]: err?.message ?? "Action failed" }));
+        } finally {
+            setPoRiskBusy(b => ({ ...b, [logId]: null }));
+        }
+    }, []);
+
     // Handle reconciliation actions from the card buttons
     const handleAction = useCallback(async (logId: string, action: string, extra?: any) => {
         const res = await fetch("/api/dashboard/reconciliation-action", {
@@ -773,6 +815,10 @@ export default function ActivityFeed() {
                                     const accentSoft = isPOSoon ? "text-amber-200" : "text-rose-200";
                                     const accentDim = isPOSoon ? "text-amber-300/80" : "text-rose-300/80";
                                     const dotBg = isPOSoon ? "bg-amber-400/70" : "bg-rose-500/70";
+                                    const busyAction = poRiskBusy[log.id] ?? null;
+                                    const errText = poRiskError[log.id] ?? null;
+                                    const draftPreview = poRiskDraft[log.id];
+                                    const isDoneAction = !!log.reviewed_at;
                                     return (
                                         <div className="mt-3 space-y-1 text-[11px] font-mono">
                                             <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -812,6 +858,68 @@ export default function ActivityFeed() {
                                                     {log.metadata.atRiskItems.length > 5 && (
                                                         <div className="text-zinc-600 pl-3">+ {log.metadata.atRiskItems.length - 5} more</div>
                                                     )}
+                                                </div>
+                                            )}
+
+                                            {/* Action row */}
+                                            {!isDoneAction && (
+                                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                                    <button
+                                                        onClick={() => handlePOAction(log.id, "draft")}
+                                                        disabled={!!busyAction}
+                                                        className="inline-flex items-center gap-1 text-[10px] font-mono font-medium uppercase tracking-wider px-2.5 py-1 rounded-md bg-neon-blue/10 text-neon-blue border border-neon-blue/30 hover:bg-neon-blue/20 disabled:opacity-40 disabled:cursor-wait transition-colors"
+                                                    >
+                                                        {busyAction === "draft" ? (
+                                                            <><Loader2 className="w-3 h-3 animate-spin" /> Drafting…</>
+                                                        ) : draftPreview ? (
+                                                            <><Sparkles className="w-3 h-3" /> Redraft</>
+                                                        ) : (
+                                                            <><Sparkles className="w-3 h-3" /> Compose ETA Draft</>
+                                                        )}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handlePOAction(log.id, "snooze")}
+                                                        disabled={!!busyAction}
+                                                        className="inline-flex items-center gap-1 text-[10px] font-mono font-medium uppercase tracking-wider px-2.5 py-1 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 disabled:opacity-40 disabled:cursor-wait transition-colors"
+                                                    >
+                                                        {busyAction === "snooze" ? (
+                                                            <><Loader2 className="w-3 h-3 animate-spin" /> Snoozing…</>
+                                                        ) : (
+                                                            <><Pause className="w-3 h-3" /> Snooze 48h</>
+                                                        )}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handlePOAction(log.id, "followup")}
+                                                        disabled={!!busyAction}
+                                                        className="inline-flex items-center gap-1 text-[10px] font-mono font-medium uppercase tracking-wider px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 disabled:opacity-40 disabled:cursor-wait transition-colors"
+                                                    >
+                                                        {busyAction === "followup" ? (
+                                                            <><Loader2 className="w-3 h-3 animate-spin" /> Marking…</>
+                                                        ) : (
+                                                            <><Check className="w-3 h-3" /> Followed Up</>
+                                                        )}
+                                                    </button>
+                                                    {errText && (
+                                                        <span className="text-[10px] font-mono text-rose-400 ml-1" title={errText}>⚠ {errText.slice(0, 40)}</span>
+                                                    )}
+                                                </div>
+                                            )}
+
+                                            {/* Draft preview drawer — appears after Compose ETA Draft succeeds. */}
+                                            {draftPreview && (
+                                                <div className="mt-3 rounded-md bg-zinc-950/70 border border-zinc-800 p-3 text-[11px] font-mono">
+                                                    <div className="flex items-center gap-2 text-zinc-400 mb-1.5">
+                                                        <Sparkles className="w-3 h-3 text-neon-blue" />
+                                                        <span>Draft saved to Gmail Drafts{draftPreview.vendorEmail ? ` (to ${draftPreview.vendorEmail})` : " — vendor email TBD"}</span>
+                                                        <a
+                                                            href="https://mail.google.com/mail/u/0/#drafts"
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="ml-auto text-neon-blue hover:text-blue-300"
+                                                        >open ↗</a>
+                                                    </div>
+                                                    <div className="text-zinc-300"><span className="text-zinc-500">Subject:</span> {draftPreview.subject}</div>
+                                                    <pre className="mt-1 whitespace-pre-wrap text-zinc-300 leading-relaxed">{draftPreview.body}</pre>
                                                 </div>
                                             )}
                                         </div>
