@@ -21,11 +21,32 @@ errors="$(
     || true
 )"
 
-if [ -z "$errors" ]; then
-    echo "smoke[$proc]: clean"
-    exit 0
+if [ -n "$errors" ]; then
+    echo "smoke[$proc]: errors detected in current-hour window:"
+    echo "$errors"
+    exit 1
 fi
 
-echo "smoke[$proc]: errors detected in current-hour window:"
-echo "$errors"
-exit 1
+# Dashboard-specific HTTP probe: catches the "200 OK with dead JS chunks" state
+# where .next/static/chunks was wiped but next start still serves stale HTML.
+# Without this, the broken page returns 200, logs nothing, smoke is "clean".
+if [ "$proc" = "aria-dashboard" ]; then
+    html="$(curl -s --max-time 10 http://localhost:3001/dashboard || true)"
+    if [ -z "$html" ]; then
+        echo "smoke[$proc]: dashboard did not respond on :3001"
+        exit 1
+    fi
+    chunk="$(echo "$html" | grep -oE '/_next/static/chunks/app/dashboard/page-[a-f0-9]+\.js' | head -1)"
+    if [ -z "$chunk" ]; then
+        echo "smoke[$proc]: served HTML has no dashboard page chunk reference"
+        exit 1
+    fi
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:3001${chunk}")"
+    if [ "$code" != "200" ]; then
+        echo "smoke[$proc]: chunk ${chunk} returned HTTP ${code} — stale HTML vs disk (rebuild .next)"
+        exit 1
+    fi
+fi
+
+echo "smoke[$proc]: clean"
+exit 0

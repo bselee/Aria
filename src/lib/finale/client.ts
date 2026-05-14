@@ -2011,7 +2011,7 @@ export class FinaleClient {
                     productViewConnection(first: 1, productId: "${productId}") {
                         edges {
                             node {
-                                internalName
+                                productId
                                 stockOnHand
                                 stockAvailable
                                 stockOnOrder
@@ -2028,9 +2028,7 @@ export class FinaleClient {
             const data = await this.graphql(query, `Stock Profile ${productId}`);
             const node = data?.productViewConnection?.edges?.[0]?.node;
             if (node) {
-                profile.productName = typeof node.internalName === 'string' && node.internalName.trim()
-                    ? node.internalName.trim()
-                    : null;
+                profile.productName = null;
                 profile.onHand = parseVal(node.stockOnHand);
                 profile.available = parseVal(node.stockAvailable);
                 profile.onOrder = parseVal(node.stockOnOrder);
@@ -2704,7 +2702,6 @@ export class FinaleClient {
                             edges {
                                 node {
                                     productId
-                                    internalName
                                     statusId
                                     stockOnHand
                                     stockAvailable
@@ -2730,7 +2727,7 @@ export class FinaleClient {
                     if (node) {
                         return {
                             productId: node.productId || id,
-                            name: node.internalName || id,
+                            name: node.productId || id,
                             status: node.statusId || 'PRODUCT_ACTIVE',
                             stockOnHand: node.stockOnHand || '--',
                             stockAvailable: node.stockAvailable || '--',
