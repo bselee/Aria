@@ -42,6 +42,32 @@ type Snapshot = {
   components: Record<string, SnapshotComponent>;
 };
 
+// PO arrival risk row from ap_activity_log (intent=PO_ARRIVAL_AT_RISK).
+// The detector cron writes one row per (PO, day). The atRiskItems list
+// drives the per-build "PO LATE" badge: any build that consumes a SKU
+// appearing here AND that's scheduled before the PO's expectedArrival
+// is at risk of running short.
+type AtRiskPOActivity = {
+  id: string;
+  created_at: string;
+  metadata: {
+    poId: string;
+    vendorName: string;
+    expectedArrival: string;
+    commState: string;
+    worstDaysShort: number;
+    atRiskItems: Array<{ sku: string; productName?: string; stockoutDate: string; daysShort: number }>;
+  };
+};
+
+/** Index built from at-risk rows: componentSku → list of POs blocking it. */
+type AtRiskBySku = Map<string, Array<{
+  poId: string;
+  vendorName: string;
+  expectedArrival: string;
+  daysShort: number;
+}>>;
+
 type Completion = {
   id: string;
   build_id: string;
@@ -120,10 +146,34 @@ function FulfillmentBadge({ scheduledQty, actualQty }: { scheduledQty: number; a
   );
 }
 
-function BuildRow({ b, risk, completed, components }: {
+function BuildRow({ b, risk, completed, components, atRiskBySku }: {
   b: Build; risk: string; completed?: Completion;
   components?: SnapshotComponent[];
+  atRiskBySku?: AtRiskBySku;
 }) {
+  // Find every PO that's late on a component this build needs and that's
+  // scheduled to arrive AFTER the build date. If the PO arrives before
+  // the build, it's tight but not blocking.
+  const blockingPOs = (() => {
+    if (!atRiskBySku || !components) return [] as Array<{ sku: string; poId: string; vendorName: string; expectedArrival: string; daysShort: number }>;
+    const out: Array<{ sku: string; poId: string; vendorName: string; expectedArrival: string; daysShort: number }> = [];
+    const seenPo = new Set<string>();
+    const consumedSkus = components.filter(c => c.usedIn?.includes(b.sku)).map(c => c.componentSku);
+    for (const sku of consumedSkus) {
+      const pos = atRiskBySku.get(sku);
+      if (!pos) continue;
+      for (const po of pos) {
+        // Only flag if PO arrives AFTER this build date — that's the
+        // "build won't complete because PO is late" condition.
+        if (po.expectedArrival > b.buildDate && !seenPo.has(po.poId)) {
+          seenPo.add(po.poId);
+          out.push({ sku, ...po });
+        }
+      }
+    }
+    return out;
+  })();
+  const hasBlockingPO = blockingPOs.length > 0;
   const desc = b.originalEvent
     ? b.originalEvent.replace(/^\d+\s*(x\s*)?(bags?|units?|lbs?|of\s+)?/i, "").trim().slice(0, 45) || null
     : null;
@@ -173,6 +223,14 @@ function BuildRow({ b, risk, completed, components }: {
             {showRisk && (
               <span className={`text-[10px] font-mono font-bold ${RISK_TEXT[risk]}`}>{risk}</span>
             )}
+            {!completed && hasBlockingPO && (
+              <span
+                className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-rose-600/30 text-rose-200 border-rose-500/60"
+                title={`Blocked by ${blockingPOs.length} late PO(s): ${blockingPOs.map(p => `${p.vendorName} #${p.poId}`).join(", ")}`}
+              >
+                PO LATE
+              </span>
+            )}
             {completed && (
               <span className="text-[10px] font-mono text-emerald-400">
                 ✓ {fmtCompletedAt(completed.completed_at)}
@@ -182,6 +240,12 @@ function BuildRow({ b, risk, completed, components }: {
         </div>
         {desc && (
           <div className="text-[11px] text-zinc-600 truncate mt-0.5 pl-5">{desc}</div>
+        )}
+        {!completed && hasBlockingPO && (
+          <div className="mt-1 pl-5 text-[11px] font-mono text-rose-300/90 truncate">
+            ⚠ {blockingPOs.slice(0, 2).map(p => `${p.vendorName} #${p.poId} (${p.sku}, ${p.daysShort}d short)`).join("  ·  ")}
+            {blockingPOs.length > 2 && <span> +{blockingPOs.length - 2} more</span>}
+          </div>
         )}
       </button>
       {open && canExpand && (
@@ -224,6 +288,7 @@ function CompletionRow({ c, noCalEvent }: { c: Completion; noCalEvent?: boolean 
 export default function BuildSchedulePanel() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [completions, setCompletions] = useState<Completion[]>([]);
+  const [atRiskRows, setAtRiskRows] = useState<AtRiskPOActivity[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Collapse state — persisted to localStorage
@@ -246,6 +311,21 @@ export default function BuildSchedulePanel() {
       .then((res: { data: Snapshot[] | null }) => {
         if (res.data && res.data.length > 0) setSnapshot(res.data[0]);
         setLoading(false);
+      });
+
+    // Load PO_ARRIVAL_AT_RISK rows from last 24h. These overlay the
+    // build schedule with "PO LATE" badges on affected builds + a
+    // summary banner so Will sees the supply-chain risk in context.
+    const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    supabase
+      .from("ap_activity_log")
+      .select("id, created_at, metadata")
+      .eq("intent", "PO_ARRIVAL_AT_RISK")
+      .gte("created_at", since24h)
+      .order("created_at", { ascending: false })
+      .limit(100)
+      .then((res: { data: AtRiskPOActivity[] | null }) => {
+        if (res.data) setAtRiskRows(res.data);
       });
 
     // Load completions from last 7 days
@@ -312,6 +392,46 @@ export default function BuildSchedulePanel() {
   const allComponents = snapshot ? Object.values(snapshot.components) : [];
   const atRiskComponents = allComponents.filter(c => c.riskLevel !== "OK");
 
+  // Index at-risk POs by SKU so BuildRow can overlay "PO LATE" badges.
+  // Dedup same PO+SKU across rows (cron may have updated multiple times).
+  const atRiskBySku: AtRiskBySku = (() => {
+    const m: AtRiskBySku = new Map();
+    for (const row of atRiskRows) {
+      const meta = row.metadata;
+      if (!meta?.atRiskItems) continue;
+      for (const item of meta.atRiskItems) {
+        if (!item?.sku) continue;
+        const list = m.get(item.sku) ?? [];
+        if (!list.some(x => x.poId === meta.poId)) {
+          list.push({
+            poId: meta.poId,
+            vendorName: meta.vendorName,
+            expectedArrival: meta.expectedArrival,
+            daysShort: item.daysShort,
+          });
+        }
+        m.set(item.sku, list);
+      }
+    }
+    return m;
+  })();
+
+  // Count builds blocked by a late PO for the summary banner.
+  const buildsBlockedByLatePO = (() => {
+    if (atRiskBySku.size === 0 || allComponents.length === 0) return 0;
+    let count = 0;
+    for (const b of allBuilds) {
+      if (completionBySku.has(b.sku)) continue;
+      const consumed = allComponents.filter(c => c.usedIn?.includes(b.sku)).map(c => c.componentSku);
+      const isBlocked = consumed.some(sku => {
+        const pos = atRiskBySku.get(sku);
+        return pos?.some(p => p.expectedArrival > b.buildDate);
+      });
+      if (isBlocked) count++;
+    }
+    return count;
+  })();
+
   // Group into unified timeline by date
   const timelineMap = new Map<string, { builds: Build[]; stockouts: SnapshotComponent[] }>();
   function getDayEntry(dateStr: string) {
@@ -367,6 +487,18 @@ export default function BuildSchedulePanel() {
       {!isCollapsed && (
         <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full">
 
+          {/* Late-PO alert banner. Hidden when 0 — drives Will's attention only
+              when something's actually wrong. Click jumps to Activity feed. */}
+          {buildsBlockedByLatePO > 0 && (
+            <div className="px-4 py-2 border-b border-rose-500/40 bg-rose-500/10 flex items-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span className="text-xs font-mono font-semibold text-rose-200">
+                {buildsBlockedByLatePO} {buildsBlockedByLatePO === 1 ? "build" : "builds"} at risk — {atRiskRows.length} late {atRiskRows.length === 1 ? "PO" : "POs"}
+              </span>
+              <span className="text-[10px] font-mono text-rose-300/70 ml-auto">see Activity feed</span>
+            </div>
+          )}
+
           {loading && (
             <div className="px-4 py-2 space-y-2.5">
               {[1, 2, 3].map(i => (
@@ -394,7 +526,7 @@ export default function BuildSchedulePanel() {
                 {todayCompletions.map(c => {
                   const build = allBuilds.find(b => b.sku === c.sku);
                   if (build) {
-                    return <BuildRow key={`b-${c.id}`} b={build} risk="OK" completed={c} components={allComponents} />;
+                    return <BuildRow key={`b-${c.id}`} b={build} risk="OK" completed={c} components={allComponents} atRiskBySku={atRiskBySku} />;
                   } else {
                     return <CompletionRow key={`c-${c.id}`} c={c} noCalEvent />;
                   }
@@ -426,6 +558,7 @@ export default function BuildSchedulePanel() {
                     risk={buildRisk(b.sku)}
                     completed={completionBySku.get(b.sku)}
                     components={allComponents}
+                    atRiskBySku={atRiskBySku}
                   />
                 ))}
 
@@ -477,6 +610,7 @@ export default function BuildSchedulePanel() {
                         risk="OK"
                         completed={completionBySku.get(b.sku)}
                         components={allComponents}
+                        atRiskBySku={atRiskBySku}
                       />
                     ))}
                   </section>
