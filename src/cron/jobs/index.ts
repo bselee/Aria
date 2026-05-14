@@ -265,6 +265,20 @@ defineJob({
     handler: async () => { await ops()?.runIssueProjection(); },
 });
 
+// Detect open POs at risk of arriving after stockout and surface them as
+// PO_ARRIVAL_AT_RISK rows in ap_activity_log. Builds panel + Activity feed
+// render them; "Compose ETA draft" and other next-step actions are
+// triggered from the Activity row, not pushed via Slack/Gmail.
+// Every 2h: arrival ETAs and runway both change slowly, no need for tighter.
+defineJob({
+    name: "po-arrival-risk-check",
+    schedule: "0 */2 * * *",
+    onFail: "log",
+    description: "Detect PO arrivals that will land after stockout (every 2h).",
+    handler: async () => { await ops()?.runPOArrivalRiskCheck(); },
+    budget: { durationMs: 180_000 },
+});
+
 // Phase 1 backend agentic flow substrate. Drains flow_events, spawns and
 // advances flow_runs. Side-effect imports the flow registry on first tick.
 // Gated by FLOWS_ENABLED so a misbehaving runner can be disabled in one env.
