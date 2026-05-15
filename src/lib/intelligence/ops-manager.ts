@@ -804,19 +804,93 @@ export class OpsManager {
 
     /**
      * Poll Finale for today's received POs.
+     *
+     * Activity-feed-backed dedup (2026-05-15): the in-memory Set was never
+     * hydrated on startup despite the original comment claiming so — every
+     * pm2 restart re-fired every PO received today, producing the "multiple
+     * Telegram alerts for same receiving" flood. New flow:
+     *   1. Skip POs that already have a PO_RECEIVED row in ap_activity_log
+     *      (last 48h, keyed by orderId in metadata).
+     *   2. Write the PO_RECEIVED row BEFORE sending Telegram — so any crash
+     *      after the row is written but before the alert fires doesn't get
+     *      a re-send on the next tick.
+     *   3. In-memory Set kept as a fast-path cache (avoid the DB read on
+     *      already-seen POs within the same process), but it's no longer
+     *      the source of truth.
      */
     async pollPOReceivings() {
         console.log("📦 Checking for PO receivings...");
         try {
             const received = await finaleClient.getTodaysReceivedPOs();
+            if (received.length === 0) return;
+
+            const supabase = createClient();
+            // Resolve POs already alerted in the last 48h via Activity.
+            // 48h window covers same-day cron ticks + the rare late-evening
+            // receipt that pages into the next morning.
+            const alreadyAlertedPoIds = new Set<string>();
+            if (supabase) {
+                try {
+                    const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+                    const ids = received.map(po => po.orderId);
+                    const { data } = await supabase
+                        .from("ap_activity_log")
+                        .select("metadata")
+                        .eq("intent", "PO_RECEIVED")
+                        .gte("created_at", since)
+                        .in("metadata->>poId", ids);
+                    for (const row of (data ?? []) as Array<{ metadata: any }>) {
+                        const id = row.metadata?.poId;
+                        if (id) alreadyAlertedPoIds.add(String(id));
+                    }
+                } catch (err: any) {
+                    console.warn("[pollPOReceivings] Activity lookup failed; proceeding with in-memory dedup only:", err.message);
+                }
+            }
+
             for (const po of received) {
                 if (this.seenReceivedPOIds.has(po.orderId)) continue;
+                if (alreadyAlertedPoIds.has(po.orderId)) {
+                    // Already alerted in a prior tick or before restart — cache locally and skip.
+                    this.seenReceivedPOIds.add(po.orderId);
+                    continue;
+                }
+
+                // Write Activity row FIRST so the dedup record exists even if
+                // the Telegram send fails midway. Subsequent ticks will see
+                // this row and skip.
+                if (supabase) {
+                    try {
+                        await supabase.from("ap_activity_log").insert({
+                            email_from: po.supplier,
+                            email_subject: `PO ${po.orderId} received`,
+                            intent: "PO_RECEIVED",
+                            action_taken: `PO #${po.orderId} from ${po.supplier} received — $${po.total.toFixed(2)}`,
+                            metadata: { poId: po.orderId, supplier: po.supplier, total: po.total },
+                        });
+                    } catch (err: any) {
+                        console.warn(`[pollPOReceivings] Activity write failed for PO ${po.orderId}:`, err.message);
+                        // Don't bail — still alert; the in-memory Set provides
+                        // soft dedup within this process.
+                    }
+                }
+
                 this.seenReceivedPOIds.add(po.orderId);
-                const msg = `✅ **PO Received**\n\nPO #${po.orderId} from ${po.supplier}\nValue: $${po.total.toFixed(2)}`;
-                await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
+                // 2026-05-15: Telegram per-receiving alert removed — Activity
+                // feed is the spine, daily summary rolls these up. Will's
+                // ask: "Only need errors and a summary at most." The Activity
+                // row written above is the audit trail; the morning summary
+                // (sendDailySummary) picks up today's PO_RECEIVED rows.
             }
         } catch (err: any) {
             console.error("PO Receiving error:", err.message);
+            // Errors still alert — Will explicitly kept "errors" on Telegram.
+            try {
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID || "",
+                    `⚠️ pollPOReceivings error: ${err.message}`,
+                );
+            } catch { /* swallow */ }
         }
     }
 
@@ -1046,6 +1120,33 @@ export class OpsManager {
         } catch (err: any) {
             console.warn("[OpsManager] POs-in-flight block failed:", err.message);
             blocks.push(`📦 POs in flight: error ${err.message}`);
+        }
+
+        // Block 2.5: PO receivings in last 24h (rolls up what used to be
+        // per-event Telegram pings — Activity is the spine, this block is
+        // the daily digest).
+        try {
+            const supabase = createClient();
+            if (supabase) {
+                const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+                const { data } = await supabase
+                    .from("ap_activity_log")
+                    .select("metadata")
+                    .eq("intent", "PO_RECEIVED")
+                    .gte("created_at", since)
+                    .limit(100);
+                const rows = (data ?? []) as Array<{ metadata: any }>;
+                if (rows.length === 0) {
+                    blocks.push("📦 *Received today*: none");
+                } else {
+                    const totalValue = rows.reduce((s, r) => s + (Number(r.metadata?.total) || 0), 0);
+                    const sample = rows.slice(0, 3).map(r => `  • PO #${r.metadata?.poId} — ${r.metadata?.supplier ?? "?"} ($${(Number(r.metadata?.total) || 0).toFixed(0)})`);
+                    const more = rows.length > 3 ? `\n  • …+${rows.length - 3} more` : "";
+                    blocks.push(`📦 *Received today* (${rows.length}, $${totalValue.toFixed(0)})\n${sample.join("\n")}${more}`);
+                }
+            }
+        } catch (err: any) {
+            console.warn("[OpsManager] Receivings block failed:", err.message);
         }
 
         // Block 3: Builds today (next 24h).
