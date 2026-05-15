@@ -265,6 +265,19 @@ defineJob({
     handler: async () => { await ops()?.runIssueProjection(); },
 });
 
+// Auto-complete POs that satisfy all eligibility gates AND have settled
+// for ≥48h. Default OFF behind PO_AUTO_COMPLETE_ENABLED — dry-runs log
+// candidates without writing. Runs every 4h: dwell is 48h, so 4h
+// granularity is plenty.
+defineJob({
+    name: "po-auto-complete-watcher",
+    schedule: "0 */4 * * *",
+    onFail: "log",
+    description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
+    handler: async () => { await ops()?.runPOAutoCompleteWatcher(); },
+    budget: { durationMs: 300_000 }, // 5min — fetches getOrderDetails per candidate
+});
+
 // Detect open POs at risk of arriving after stockout and surface them as
 // PO_ARRIVAL_AT_RISK rows in ap_activity_log. Builds panel + Activity feed
 // render them; "Compose ETA draft" and other next-step actions are
