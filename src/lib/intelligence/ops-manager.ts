@@ -509,6 +509,24 @@ export class OpsManager {
     }
 
     /**
+     * Watcher: identify Finale POs that satisfy all auto-complete gates AND
+     * have been settled for ≥48h, then mark them ORDER_COMPLETED. Default OFF
+     * via PO_AUTO_COMPLETE_ENABLED env — runs in dry-run mode otherwise.
+     * Activity row written only on actual completion (no chatter on skips).
+     */
+    public async runPOAutoCompleteWatcher(): Promise<void> {
+        const { runPOAutoCompleteWatcher } = await import("../purchasing/po-auto-complete");
+        const stats = await runPOAutoCompleteWatcher();
+        if (stats.scanned > 0) {
+            console.log(
+                `[po-auto-complete] scanned=${stats.scanned} eligible=${stats.eligible} ` +
+                `completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} ` +
+                `dryRun=${stats.dryRun}`,
+            );
+        }
+    }
+
+    /**
      * Detect open POs at risk of arriving after their line-item SKUs run out,
      * and surface each as a PO_ARRIVAL_AT_RISK row in ap_activity_log. Builds
      * panel + Activity feed render these for review and next-step actions.

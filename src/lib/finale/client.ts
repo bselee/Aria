@@ -3174,6 +3174,37 @@ export class FinaleClient {
     }
 
     /**
+     * Mark a PO as completed (ORDER_COMPLETED) in Finale.
+     *
+     * Added 2026-05-15 for the po-auto-complete watcher. Until now, our
+     * code path was strict "no reception, no complete" — every status
+     * write went to ORDER_LOCKED, never ORDER_COMPLETED. The auto-
+     * complete flow validates ALL conditions before calling this so
+     * the safety net is at the caller, not here.
+     *
+     * Idempotent: re-calling on a PO already at ORDER_COMPLETED is a
+     * no-op. Other status transitions get the standard unlock → modify
+     * → POST treatment.
+     *
+     * @param orderId - The order ID
+     * @returns The PO record after the update
+     */
+    async completeOrder(orderId: string): Promise<any> {
+        const encodedId = encodeURIComponent(orderId);
+        const currentPO = await this.getOrderDetails(orderId);
+        if (currentPO.statusId === "ORDER_COMPLETED") {
+            return currentPO; // idempotent no-op
+        }
+        // Unlock if needed (some POs require this even to set statusId).
+        await this.unlockForEditing(currentPO, orderId);
+        const afterUnlock = await this.getOrderDetails(orderId);
+        return await this.post(`/${this.accountPath}/api/order/${encodedId}`, {
+            ...afterUnlock,
+            statusId: "ORDER_COMPLETED",
+        });
+    }
+
+    /**
      * Restore a PO to committed (ORDER_LOCKED) status after editing.
      *
      * DECISION(2026-03-18): "No reception, no complete."
