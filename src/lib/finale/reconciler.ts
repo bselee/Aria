@@ -1629,23 +1629,37 @@ function validateVendorCorrelation(
     const wordsA = normalize(invoice.vendorName);
     const wordsB = new Set(normalize(poSummary.supplier));
     const sharedBrandWord = wordsA.find(w => w.length > 4 && wordsB.has(w) && !GENERIC_WORDS.has(w));
+
+    // Compute PO# match up front so Signal 1b can use it as a corroborating
+    // signal (brand word + PO# = "high" instead of "medium").
+    const invoicePORef = (invoice.poNumber ?? "").trim().toLowerCase();
+    const orderIdNorm = orderId.trim().toLowerCase();
+    const poNumberMatches = !!invoicePORef &&
+        (invoicePORef === orderIdNorm ||
+            invoicePORef.includes(orderIdNorm) ||
+            orderIdNorm.includes(invoicePORef));
+
     if (sharedBrandWord) {
+        // 2026-05-15: Promote to "high" when invoice PO# ALSO matches this
+        // order. Two independent signals (brand word + PO#) is as strong as
+        // a Jaccard name match — Faust PO #124694 was the canonical case:
+        // "Faust" shared brand word + invoice PO# "124694" matched. Without
+        // this, downstream gate (confidence !== high && impact >= $100) held
+        // the freight auto-apply.
+        const confidence: "high" | "medium" = poNumberMatches ? "high" : "medium";
         return {
             pass: true,
-            confidence: "medium",
-            note: `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed via shared brand word "${sharedBrandWord}".`,
+            confidence,
+            note: confidence === "high"
+                ? `Vendor confirmed: shared brand word "${sharedBrandWord}" + invoice PO# ${invoice.poNumber} matches this order.`
+                : `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed via shared brand word "${sharedBrandWord}".`,
         };
     }
 
-    // Signal 2: PO number on invoice explicitly references this order
-    const invoicePORef = (invoice.poNumber ?? "").trim().toLowerCase();
-    const orderIdNorm = orderId.trim().toLowerCase();
-    if (
-        invoicePORef &&
-        (invoicePORef === orderIdNorm ||
-            invoicePORef.includes(orderIdNorm) ||
-            orderIdNorm.includes(invoicePORef))
-    ) {
+    // Signal 2: PO number on invoice explicitly references this order (no
+    // brand word corroboration — stays medium since PO# alone can be wrong
+    // via vendor typo or OCR misread on a similar order number).
+    if (poNumberMatches) {
         return {
             pass: true,
             confidence: "medium",
