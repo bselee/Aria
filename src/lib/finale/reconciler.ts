@@ -1943,6 +1943,12 @@ export function reconcileFees(
             { invoiceField: "fuelSurcharge", feeType: "SHIPPING", label: "Fuel Surcharge" },
         ];
 
+    // PO subtotal for the disproportion sanity guard below.
+    // Sum of (unitPrice × quantity) across PO line items — using the PO's
+    // own truth rather than invoice subtotal, so an OCR'd invoice subtotal
+    // can't sneak a fee through by inflating itself.
+    const poSubtotal = po.items.reduce((s, i) => s + (i.unitPrice ?? 0) * (i.quantity ?? 0), 0);
+
     for (const mapping of feeMapping) {
         const invoiceAmount = invoice[mapping.invoiceField] as number | undefined;
         if (!invoiceAmount || invoiceAmount <= 0) continue;
@@ -1971,13 +1977,29 @@ export function reconcileFees(
             // charge on a PO that already has $280 freight is only a $20 change.
             const feeDelta = Math.abs(invoiceAmount - existingAmount);
             const cap = getFeeAutoApproveCap(mapping.feeType);
-            const verdict: "auto_approve" | "needs_approval" =
+            let verdict: "auto_approve" | "needs_approval" =
                 feeDelta > cap
                     ? "needs_approval"
                     : "auto_approve";
-            const reason = verdict === "needs_approval"
+            const reasonParts: string[] = [];
+            reasonParts.push(verdict === "needs_approval"
                 ? `Fee delta $${feeDelta.toFixed(2)} exceeds $${cap} ${mapping.feeType} auto-approve cap — requires approval`
-                : `Fee delta $${feeDelta.toFixed(2)} within $${cap} ${mapping.feeType} auto-approve cap`;
+                : `Fee delta $${feeDelta.toFixed(2)} within $${cap} ${mapping.feeType} auto-approve cap`);
+
+            // Guard 3b (2026-05-15): Disproportion sanity check. Existing per-fee
+            // caps are absolute ($4000 freight, etc) — they allow a $4000 freight
+            // on a $200 PO, which would be a 2000% ratio and almost certainly an
+            // OCR / vendor error. Cap the fee at 2× the PO subtotal; anything
+            // beyond that requires explicit approval regardless of absolute amount.
+            // 2× is the empirical upper bound for legitimate truckload freight on
+            // dense/bulky goods. Skipped when poSubtotal is <$1 (empty draft PO
+            // populated FROM invoice — no denominator to compare against).
+            const FEE_RATIO_OF_SUBTOTAL_CEILING = 2.0;
+            if (verdict === "auto_approve" && poSubtotal >= 1 && invoiceAmount > FEE_RATIO_OF_SUBTOTAL_CEILING * poSubtotal) {
+                verdict = "needs_approval";
+                const ratio = invoiceAmount / poSubtotal;
+                reasonParts.push(`${mapping.feeType} $${invoiceAmount.toFixed(2)} is ${(ratio * 100).toFixed(0)}% of PO subtotal $${poSubtotal.toFixed(2)} — disproportionate, manual review`);
+            }
 
             changes.push({
                 feeType: mapping.feeType,
@@ -1986,7 +2008,7 @@ export function reconcileFees(
                 existingAmount,
                 isNew: !existingFee,
                 verdict,
-                reason,
+                reason: reasonParts.join(" | "),
             });
         }
     }
