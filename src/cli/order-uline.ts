@@ -112,6 +112,11 @@ function parseArgs() {
         // (optionally) sync the PO to match the cart. Default behavior is
         // to PRINT the diff only; --sync-cart-to-po applies it.
         syncCartToPO: args.includes('--sync-cart-to-po'),
+        // 2026-05-15: ONLY scrape the cart and diff against the PO — no
+        // paste, no risk to an existing cart. Use when the cart already
+        // has items (manually added or from a prior order-uline run).
+        // Requires --po <id> to know what to diff against.
+        verifyOnly: args.includes('--verify-only'),
     };
 }
 
@@ -1046,6 +1051,59 @@ async function main() {
         if (confirmation) {
             console.log(`\n   📋 Order: #${confirmation.orderNumber} (${confirmation.orderDate})`);
             console.log('   You can now link this to your Finale PO.');
+        }
+        return;
+    }
+
+    // Special mode: ONLY scrape current cart and diff against PO. No paste.
+    if (args.verifyOnly) {
+        if (!args.singlePO) {
+            console.error('   ❌ --verify-only requires --po <orderId>');
+            process.exit(1);
+        }
+        const { launchUlineSession } = await import("../lib/purchasing/uline-session");
+        const finale = new FinaleClient();
+        console.log(`\n   🔍 VERIFY-ONLY — connecting to ULINE to scrape current cart...`);
+        const manifest = await gatherFromPO(finale, args.singlePO);
+        const session = await launchUlineSession({ headless: false });
+        try {
+            const page = session.page;
+            await page.goto("https://www.uline.com/Cart");
+            await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+            const observedRows = await scrapeObservedCartRows(page);
+            console.log(`\n   📦 Scraped ${observedRows.length} row(s) from cart.`);
+
+            const { verifyUlineCart } = await import("./order-uline-cart");
+            const verification = verifyUlineCart(
+                manifest.items.map(i => ({ ulineModel: i.ulineModel, quantity: i.quantity })),
+                observedRows,
+            );
+            const { planCartToPOSync, formatSyncPlanForCLI, applyCartToPOSync } = await import(
+                "../lib/purchasing/uline-cart-sync"
+            );
+            const expected = manifest.items.map(i => ({
+                finaleSku: i.finaleSku,
+                ulineModel: i.ulineModel,
+                quantity: i.quantity,
+                unitPrice: i.unitPrice,
+            }));
+            const plan = planCartToPOSync(expected, observedRows, verification);
+            console.log(formatSyncPlanForCLI(plan));
+
+            if (plan.hasDrift && args.syncCartToPO) {
+                console.log(`\n   🔧 --sync-cart-to-po set — applying plan to Finale PO #${args.singlePO}...`);
+                const syncResult = await applyCartToPOSync(finale, args.singlePO, plan);
+                if (syncResult.added.length > 0) console.log(`      added: ${syncResult.added.join(", ")}`);
+                if (syncResult.updated.length > 0) console.log(`      updated: ${syncResult.updated.join(", ")}`);
+                if (syncResult.errors.length > 0) {
+                    console.log(`      ⚠️  errors / manual review:`);
+                    for (const e of syncResult.errors) console.log(`         ${e}`);
+                }
+            } else if (plan.hasDrift) {
+                console.log(`\n   👉 To apply this plan to Finale PO #${args.singlePO}, re-run with --sync-cart-to-po`);
+            }
+        } finally {
+            await session.close();
         }
         return;
     }
