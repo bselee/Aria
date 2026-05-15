@@ -1947,7 +1947,10 @@ export function reconcileFees(
     // Sum of (unitPrice × quantity) across PO line items — using the PO's
     // own truth rather than invoice subtotal, so an OCR'd invoice subtotal
     // can't sneak a fee through by inflating itself.
-    const poSubtotal = po.items.reduce((s, i) => s + (i.unitPrice ?? 0) * (i.quantity ?? 0), 0);
+    // Defensive: callers historically have not always populated po.items;
+    // legacy fixtures use `lineItems`. Treat missing as 0 → disproportion
+    // check is skipped (poSubtotal < $1 floor), other guards still apply.
+    const poSubtotal = (po.items ?? []).reduce((s, i) => s + (i.unitPrice ?? 0) * (i.quantity ?? 0), 0);
 
     for (const mapping of feeMapping) {
         const invoiceAmount = invoice[mapping.invoiceField] as number | undefined;
