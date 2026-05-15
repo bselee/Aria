@@ -339,11 +339,54 @@ describe("reconcileInvoiceToPO guardrails", () => {
     });
 
     it("auto-approves freight-only truckload charges when product pricing is unchanged", async () => {
+        // 2026-05-15: tightened fixture. Original scenario (7× freight/product
+        // ratio) is correctly flagged by the new disproportion guard — that's
+        // not really "truckload" economics. Real truckload: bulk compost
+        // order with freight at ~50% of product cost (sane).
         const invoice = makeInvoice({
             vendorName: "Acme Soil",
             poNumber: "PO-001",
             lineItems: [
-                { sku: "SKU-1", description: "Organic Compost", qty: 10, unitPrice: 50, total: 500 },
+                { sku: "SKU-1", description: "Organic Compost (40lb bag)", qty: 200, unitPrice: 25, total: 5000 },
+            ],
+            subtotal: 5000,
+            freight: 2500,
+            total: 7500,
+            amountDue: 7500,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil",
+                supplierName: "Acme Soil",
+                status: "Open",
+                orderDate: "2026-03-10",
+                total: 5000,
+                subtotal: 5000,
+                adjustments: [],
+                items: [
+                    { productId: "SKU-1", quantity: 200, unitPrice: 25, description: "Organic Compost (40lb bag)" },
+                ],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+
+        expect(result.overallVerdict).toBe("auto_approve");
+        expect(result.feeChanges.find((fc) => fc.feeType === "FREIGHT")?.verdict).toBe("auto_approve");
+    });
+
+    // 2026-05-15: new test for the disproportion guard (Guard 3b).
+    it("escalates freight that exceeds 2× PO subtotal even under the $4000 cap", async () => {
+        // $3500 freight on a $500 product PO — 7× ratio. Old behavior was
+        // "auto-approve" because the absolute $4000 cap wasn't hit. New
+        // behavior surfaces this for review — almost always an OCR error
+        // or a freight typo from the vendor (e.g., misplaced decimal).
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil",
+            poNumber: "PO-001",
+            lineItems: [
+                { sku: "SKU-1", description: "Compost", qty: 10, unitPrice: 50, total: 500 },
             ],
             subtotal: 500,
             freight: 3500,
@@ -360,16 +403,14 @@ describe("reconcileInvoiceToPO guardrails", () => {
                 total: 500,
                 subtotal: 500,
                 adjustments: [],
-                items: [
-                    { productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Organic Compost" },
-                ],
+                items: [{ productId: "SKU-1", quantity: 10, unitPrice: 50, description: "Compost" }],
             }),
         } as any;
-
         const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
-
-        expect(result.overallVerdict).toBe("auto_approve");
-        expect(result.feeChanges.find((fc) => fc.feeType === "FREIGHT")?.verdict).toBe("auto_approve");
+        expect(result.overallVerdict).toBe("needs_approval");
+        const freight = result.feeChanges.find((fc) => fc.feeType === "FREIGHT");
+        expect(freight?.verdict).toBe("needs_approval");
+        expect(freight?.reason).toMatch(/disproportionate/);
     });
 
     it("still requires approval for non-trivial product price changes", async () => {
@@ -596,5 +637,187 @@ describe("reconcileInvoiceToPO guardrails", () => {
             invoiceNumber: "INV-1001",
             vendorName: "Acme Soil LLC",
         }));
+    });
+});
+
+// ──────────────────────────────────────────────────
+// AP auto-apply discipline (2026-05-15)
+//   - Vendor confidence promotion (brand word + PO#)
+//   - Plain Finale descriptions (no Aria/cheese/emoji)
+//   - 2× disproportion guard end-to-end
+//   - Faust PO #124694 regression scenario
+// ──────────────────────────────────────────────────
+
+describe("AP discipline — vendor confidence promotion (Faust fix)", () => {
+    it("Faust scenario: brand word + invoice PO# → auto-applies $375 freight", async () => {
+        // Mirrors live Faust PO #124694 / Invoice 26-4794:
+        //   - Vendor name: "Faust Bio-Agricultural Services, Inc" (invoice)
+        //   - PO supplier: "Faust Bio-Agricultural Services, Inc" (Finale)
+        //   - Invoice PO# field: "124694" (matches orderId)
+        //   - Line item: BASTM6-107 × 20 @ $247.50 (matches PO)
+        //   - Freight delta: $375 new (within $4000 cap, well below 2× ratio)
+        // Pre-fix: held at "Medium vendor confidence — manual confirmation
+        // required" because Jaccard came in below 0.5 and brand-word
+        // alone returned "medium".
+        // Post-fix: brand word "faust" + PO# 124694 match → "high" → auto.
+        const invoice = makeInvoice({
+            invoiceNumber: "26-4794",
+            vendorName: "Faust Bio-Agricultural Services, Inc",
+            poNumber: "124694",
+            lineItems: [
+                { sku: "BASTM6-107", description: "SPECIAL BLEND = BIG 6 = TM6 50lb bags", qty: 20, unitPrice: 247.5, total: 4950 },
+            ],
+            subtotal: 4950,
+            freight: 375,
+            total: 5325,
+            amountDue: 5325,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "124694",
+                supplier: "Faust Bio-Agricultural Services, Inc",
+                supplierName: "Faust Bio-Agricultural Services, Inc",
+                status: "Committed",
+                orderDate: "2026-04-28",
+                total: 4950,
+                subtotal: 4950,
+                adjustments: [],
+                items: [{ productId: "BASTM6-107", quantity: 20, unitPrice: 247.5, description: "SPECIAL BLEND" }],
+            }),
+        } as any;
+        const result = await reconcileInvoiceToPO(invoice, "124694", client);
+        expect(result.overallVerdict).toBe("auto_approve");
+        const freight = result.feeChanges.find(fc => fc.feeType === "FREIGHT");
+        expect(freight?.verdict).toBe("auto_approve");
+        expect(freight?.amount).toBe(375);
+        expect(freight?.description).toBe("Freight");
+    });
+
+    it("PO# alone (no brand word overlap) stays at medium — large impact still gates", async () => {
+        // Invoice references PO# 124694 but vendor name shares NO 4+ char
+        // brand word with the Finale supplier. PO# alone CAN be wrong
+        // (OCR misread, vendor typo on a similar order number), so we
+        // hold at medium confidence. Combined with $200 freight impact
+        // (> $100 gate), this requires manual approval.
+        const invoice = makeInvoice({
+            invoiceNumber: "26-4794",
+            vendorName: "Different Vendor Corp",
+            poNumber: "124694",
+            lineItems: [{ sku: "SKU-A", description: "Widget", qty: 10, unitPrice: 100, total: 1000 }],
+            subtotal: 1000, freight: 200, total: 1200, amountDue: 1200,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "124694",
+                supplier: "Faust Bio-Agricultural Services, Inc",
+                supplierName: "Faust Bio-Agricultural Services, Inc",
+                status: "Committed",
+                orderDate: "2026-04-28",
+                total: 1000,
+                subtotal: 1000,
+                adjustments: [],
+                items: [{ productId: "SKU-A", quantity: 10, unitPrice: 100, description: "Widget" }],
+            }),
+        } as any;
+        const result = await reconcileInvoiceToPO(invoice, "124694", client);
+        expect(result.overallVerdict).toBe("needs_approval");
+    });
+
+    it("Jaccard name match (≥0.5) stays at high — pre-existing path unbroken", async () => {
+        // Exact name match should still resolve as high without needing the
+        // brand-word+PO# path.
+        const invoice = makeInvoice({
+            vendorName: "Acme Soil Company",
+            poNumber: "PO-001",
+            lineItems: [{ sku: "SKU-A", description: "Compost", qty: 10, unitPrice: 50, total: 500 }],
+            subtotal: 500, freight: 100, total: 600, amountDue: 600,
+        });
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "PO-001",
+                supplier: "Acme Soil Company",
+                supplierName: "Acme Soil Company",
+                status: "Open",
+                orderDate: "2026-04-28",
+                total: 500,
+                subtotal: 500,
+                adjustments: [],
+                items: [{ productId: "SKU-A", quantity: 10, unitPrice: 50, description: "Compost" }],
+            }),
+        } as any;
+        const result = await reconcileInvoiceToPO(invoice, "PO-001", client);
+        expect(result.overallVerdict).toBe("auto_approve");
+    });
+});
+
+describe("AP discipline — Finale write hygiene (no agent attribution)", () => {
+    const PROHIBITED = /\b(aria|auto-applied|reconciled-by|agent|bot|claude)\b/i;
+    const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+
+    it("fee descriptions are plain Finale labels — no agent / cheese / emoji", () => {
+        const inv = makeInvoice({ freight: 100, tax: 50, tariff: 25, labor: 30, fuelSurcharge: 20 });
+        const po = {
+            orderId: "PO-001",
+            supplier: "Test",
+            status: "Open",
+            total: 1000,
+            subtotal: 1000,
+            items: [{ productId: "SKU-A", quantity: 10, unitPrice: 100, description: "x" }],
+            adjustments: [],
+        };
+        const changes = reconcileFees(inv, po as any);
+        for (const c of changes) {
+            expect(c.description, `description="${c.description}"`).not.toMatch(PROHIBITED);
+            expect(c.description, `description="${c.description}"`).not.toMatch(EMOJI);
+        }
+        // And the expected plain labels are present
+        const labels = changes.map(c => c.description);
+        expect(labels).toContain("Freight");
+        expect(labels).toContain("Tax");
+        expect(labels).toContain("Duties/Tariff");
+        expect(labels).toContain("Labor");
+        expect(labels).toContain("Fuel Surcharge");
+    });
+});
+
+describe("AP discipline — disproportion guard regression suite", () => {
+    function po(items: any[]) {
+        return {
+            orderId: "PO-001",
+            supplier: "Test",
+            status: "Open",
+            total: items.reduce((s: number, i: any) => s + i.unitPrice * i.quantity, 0),
+            subtotal: items.reduce((s: number, i: any) => s + i.unitPrice * i.quantity, 0),
+            items,
+            adjustments: [],
+        };
+    }
+
+    it("Faust ratio (7.6%) — well under 2×, passes", () => {
+        const inv = makeInvoice({ freight: 375 });
+        const changes = reconcileFees(inv, po([{ productId: "X", unitPrice: 247.5, quantity: 20, description: "" }]) as any);
+        expect(changes.find(c => c.feeType === "FREIGHT")!.verdict).toBe("auto_approve");
+    });
+
+    it("100% ratio (1× — heavy goods cross-country) — passes (below 2× ceiling)", () => {
+        const inv = makeInvoice({ freight: 500 });
+        const changes = reconcileFees(inv, po([{ productId: "X", unitPrice: 50, quantity: 10, description: "" }]) as any);
+        expect(changes.find(c => c.feeType === "FREIGHT")!.verdict).toBe("auto_approve");
+    });
+
+    it("250% ratio (2.5× — well over the 2× ceiling) — needs approval", () => {
+        const inv = makeInvoice({ freight: 1250 });
+        const changes = reconcileFees(inv, po([{ productId: "X", unitPrice: 50, quantity: 10, description: "" }]) as any);
+        const freight = changes.find(c => c.feeType === "FREIGHT")!;
+        expect(freight.verdict).toBe("needs_approval");
+        expect(freight.reason).toMatch(/disproportionate/);
+    });
+
+    it("OCR decimal disaster ($4000 freight on $50 PO) — needs approval", () => {
+        const inv = makeInvoice({ freight: 4000 });
+        const changes = reconcileFees(inv, po([{ productId: "X", unitPrice: 50, quantity: 1, description: "" }]) as any);
+        const freight = changes.find(c => c.feeType === "FREIGHT")!;
+        // Hits the $4000 absolute cap AND the 2× ratio (8000% here).
+        expect(freight.verdict).toBe("needs_approval");
     });
 });
