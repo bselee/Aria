@@ -108,6 +108,10 @@ function parseArgs() {
         autoReorder: args.includes('--auto-reorder'),
         createPO: args.includes('--create-po'),
         scrapeConfirmation: args.includes('--scrape-confirmation'),
+        // 2026-05-15: after the cart fill completes, diff cart-vs-PO and
+        // (optionally) sync the PO to match the cart. Default behavior is
+        // to PRINT the diff only; --sync-cart-to-po applies it.
+        syncCartToPO: args.includes('--sync-cart-to-po'),
     };
 }
 
@@ -1132,10 +1136,46 @@ async function main() {
 
     // Phase 2: Place on ULINE
     let result: string;
+    let pasteResult: Awaited<ReturnType<typeof placeViaQuickOrderPaste>> | null = null;
     if (args.useGrid) {
         result = await placeViaQuickOrderGrid(finalItems);
     } else {
-        result = (await placeViaQuickOrderPaste(finale, finalItems, { autonomous: false })).message;
+        pasteResult = await placeViaQuickOrderPaste(finale, finalItems, { autonomous: false });
+        result = pasteResult.message;
+    }
+
+    // Phase 3: Final-check — diff cart vs PO and (optionally) sync.
+    // This catches drift from: manual cart adds (pre-existing items in cart
+    // before script ran), Will reducing Aria's suggested qty, items ULINE
+    // dropped (out of stock). PO needs to mirror what's actually ordered
+    // so the incoming ULINE invoice reconciles cleanly.
+    if (pasteResult && pasteResult.observedRows.length > 0 && manifests.length === 1) {
+        const { planCartToPOSync, formatSyncPlanForCLI, applyCartToPOSync } = await import(
+            '../lib/purchasing/uline-cart-sync'
+        );
+        const expected = finalItems.map(i => ({
+            finaleSku: i.finaleSku,
+            ulineModel: i.ulineModel,
+            quantity: i.quantity,
+            unitPrice: i.unitPrice,
+        }));
+        const plan = planCartToPOSync(expected, pasteResult.observedRows, pasteResult.verification);
+        console.log(formatSyncPlanForCLI(plan));
+        if (plan.hasDrift) {
+            const orderId = manifests[0].sourcePO;
+            if (args.syncCartToPO && orderId) {
+                console.log(`\n   🔧 --sync-cart-to-po set — applying plan to Finale PO #${orderId}...`);
+                const syncResult = await applyCartToPOSync(finale, orderId, plan);
+                if (syncResult.added.length > 0) console.log(`      added: ${syncResult.added.join(', ')}`);
+                if (syncResult.updated.length > 0) console.log(`      updated: ${syncResult.updated.join(', ')}`);
+                if (syncResult.errors.length > 0) {
+                    console.log(`      ⚠️  errors / manual review:`);
+                    for (const e of syncResult.errors) console.log(`         ${e}`);
+                }
+            } else if (orderId) {
+                console.log(`\n   👉 To apply this plan to Finale PO #${orderId}, re-run with --sync-cart-to-po`);
+            }
+        }
     }
 
     console.log('╔══════════════════════════════════════════════════╗');
