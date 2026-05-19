@@ -141,9 +141,12 @@ export async function executePOSendAction(input: ExecutePOSendActionInput): Prom
             );
         }
 
+        const viaSuffix = (result as any).emailVia === 'gmail-fallback'
+            ? ' (via Gmail fallback — Finale native email unavailable)'
+            : '';
         return makeActionResult(
             "success",
-            `PO #${result.orderId} committed in Finale${result.sentTo ? ` and emailed to ${result.sentTo}` : ""}`,
+            `PO #${result.orderId} committed in Finale${result.sentTo ? ` and emailed to ${result.sentTo}${viaSuffix}` : ""}`,
             {
                 actionRef: input.sendId,
                 retryAllowed: false,

@@ -322,8 +322,10 @@ export async function commitAndSendPO(
 ): Promise<{
     orderId: string;
     sentTo: string | null;
-    gmailMessageId: null;
+    gmailMessageId: string | null;
     finaleEmailSent: boolean;
+    emailSent: boolean;
+    emailVia: 'finale-native' | 'gmail-fallback' | null;
     pdfAttached: boolean;
     emailSkipped: boolean;
     emailError?: string;
@@ -369,32 +371,65 @@ export async function commitAndSendPO(
         verificationIssues.push(`post-commit re-fetch failed: ${err?.message ?? String(err)}`);
     }
 
-    // 2. Send through Finale's native PO email action so the Finale PDF is attached.
-    let finaleEmailSent = false;
+    // 2. Send the PO. Try Finale's native email action first (it bundles the
+    //    Finale-rendered PDF). If that's unavailable — Finale REST does not
+    //    expose an email action URL on the order object — fall back to Gmail
+    //    with a self-rendered PDF so the vendor still receives the PO.
+    let emailSent = false;
     let pdfAttached = false;
     let sentAt: string | null = null;
     let finaleEmailActionUrl: string | undefined;
     let emailError: string | undefined;
+    let emailVia: 'finale-native' | 'gmail-fallback' | null = null;
+    let gmailMessageId: string | null = null;
+    let gmailFromAddress: string | null = null;
 
     if (!skipEmail && vendorEmail) {
         const { subject, body } = generatePOEmailBody(review);
+        let finaleErrorMsg: string | undefined;
         try {
             const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
                 toEmail: vendorEmail,
                 subject,
                 body,
             });
-            finaleEmailSent = sendResult.sent;
+            emailSent = sendResult.sent;
             pdfAttached = sendResult.pdfAttached;
             finaleEmailActionUrl = sendResult.actionUrl;
             sentAt = new Date().toISOString();
+            emailVia = 'finale-native';
         } catch (err: any) {
-            emailError = err?.message ?? String(err);
-            verificationIssues.push(`email send failed: ${emailError}`);
+            finaleErrorMsg = err?.message ?? String(err);
+            try {
+                const { sendPOViaGmail } = await import('./po-gmail-fallback');
+                const gmailResult = await sendPOViaGmail({
+                    review,
+                    toEmail: vendorEmail,
+                    subject,
+                    body,
+                });
+                emailSent = true;
+                pdfAttached = true;
+                emailVia = 'gmail-fallback';
+                gmailMessageId = gmailResult.messageId;
+                gmailFromAddress = gmailResult.fromAddress;
+                sentAt = new Date().toISOString();
+                verificationIssues.push(
+                    `Finale native email unavailable (${finaleErrorMsg}); sent via Gmail fallback from ${gmailResult.fromAddress ?? 'bill.selee@buildasoil.com'} with self-rendered PDF`,
+                );
+            } catch (fallbackErr: any) {
+                emailError = `Finale native: ${finaleErrorMsg}; Gmail fallback: ${fallbackErr?.message ?? String(fallbackErr)}`;
+                verificationIssues.push(`email send failed (both paths): ${emailError}`);
+            }
         }
     }
 
-    // 2b. Post-send verification — wait 8s for Finale to update, then check lastEmailedAt
+    const finaleEmailSent = emailVia === 'finale-native';
+
+    // 2b. Post-send verification.
+    //   - finale-native: poll Finale lastEmailedAt (8s settle window).
+    //   - gmail-fallback: Gmail's accepted send IS the verification (messageId
+    //     returned). No Finale lastEmailedAt update is expected on this path.
     let emailVerified = false;
     let lastEmailedAt: string | null = null;
     if (!skipEmail && finaleEmailSent) {
@@ -418,6 +453,9 @@ export async function commitAndSendPO(
         } catch (err: any) {
             verificationIssues.push(`post-send re-fetch failed: ${err?.message ?? String(err)}`);
         }
+    } else if (!skipEmail && emailVia === 'gmail-fallback' && gmailMessageId) {
+        emailVerified = true;
+        lastEmailedAt = sentAt;
     }
 
     const { subject } = generatePOEmailBody(review);
@@ -425,24 +463,36 @@ export async function commitAndSendPO(
     // 3. Log to Supabase
     const db = createClient();
     if (db) {
-        const lifecycleStage = finaleEmailSent ? 'sent' : 'committed';
+        const lifecycleStage = emailSent ? 'sent' : 'committed';
+        const intent = emailVia === 'finale-native'
+            ? 'PO_SEND_FINALE'
+            : emailVia === 'gmail-fallback'
+                ? 'PO_SEND_GMAIL'
+                : 'PO_COMMIT';
+        const actionTaken = emailVia === 'finale-native'
+            ? `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`
+            : emailVia === 'gmail-fallback'
+                ? `PO #${orderId} committed in Finale and emailed to ${vendorEmail} via Gmail fallback (self-rendered PDF) — Finale native email action is unavailable`
+                : `PO #${orderId} committed in Finale (Email skipped/unavailable)`;
         const writes: Array<PromiseLike<any>> = [
             db.from('ap_activity_log').insert({
-                email_from: 'bill.selee@buildasoil.com',
+                email_from: gmailFromAddress ?? 'bill.selee@buildasoil.com',
                 email_subject: subject,
-                intent: finaleEmailSent ? 'PO_SEND_FINALE' : 'PO_COMMIT',
-                action_taken: finaleEmailSent
-                    ? `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`
-                    : `PO #${orderId} committed in Finale (Email skipped/unavailable)`,
+                intent,
+                action_taken: actionTaken,
                 notified_slack: false,
                 metadata: {
                     orderId,
                     vendorEmail: vendorEmail ?? null,
-                    attemptedVendorEmail: !finaleEmailSent && vendorEmail ? vendorEmail : null,
+                    attemptedVendorEmail: !emailSent && vendorEmail ? vendorEmail : null,
                     triggeredBy,
+                    emailSent,
+                    emailVia,
                     finaleEmailSent,
                     pdfAttached,
                     finaleEmailActionUrl,
+                    gmailMessageId,
+                    gmailFromAddress,
                     itemCount: review.items.length,
                     emailSkipped: skipEmail || !vendorEmail,
                     emailError: emailError ?? null,
@@ -461,14 +511,16 @@ export async function commitAndSendPO(
                 item_count: review.items.length,
                 finale_url: review.finaleUrl,
                 committed_at: committed ? committedAt : null,
-                po_sent_at: finaleEmailSent ? sentAt : null,
-                po_email_message_id: finaleEmailSent ? finaleEmailActionUrl ?? null : null,
+                po_sent_at: emailSent ? sentAt : null,
+                po_email_message_id: emailSent
+                    ? (gmailMessageId ?? finaleEmailActionUrl ?? null)
+                    : null,
                 lifecycle_stage: lifecycleStage,
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'po_number' }),
         ];
 
-        if (finaleEmailSent && vendorEmail && sentAt) {
+        if (emailSent && vendorEmail && sentAt) {
             writes.push(db.from('po_sends').insert({
                 po_number: orderId,
                 vendor_name: review.vendorName,
@@ -479,14 +531,18 @@ export async function commitAndSendPO(
                 committed_at: committedAt,
                 sent_at: sentAt,
                 triggered_by: triggeredBy,
-                gmail_message_id: null,
+                gmail_message_id: gmailMessageId,
                 metadata: {
                     orderId,
                     vendorEmail,
                     triggeredBy,
+                    emailSent,
+                    emailVia,
                     finaleEmailSent,
                     pdfAttached,
                     finaleEmailActionUrl,
+                    gmailMessageId,
+                    gmailFromAddress,
                     itemCount: review.items.length,
                 },
             }));
@@ -498,16 +554,18 @@ export async function commitAndSendPO(
     await expirePendingPOSend(id, 'confirmed');
     return {
         orderId,
-        sentTo: finaleEmailSent ? vendorEmail : null,
-        gmailMessageId: null,
+        sentTo: emailSent ? vendorEmail : null,
+        gmailMessageId,
         finaleEmailSent,
+        emailSent,
+        emailVia,
         pdfAttached,
         emailSkipped: skipEmail || !vendorEmail,
         emailError,
         verification: {
             committed,
             finalStatus,
-            emailSent: finaleEmailSent,
+            emailSent,
             emailVerified,
             lastEmailedAt,
             issues: verificationIssues,
