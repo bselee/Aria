@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Zap, Eye, ShoppingCart, Loader2 } from "lucide-react";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Eye, ShoppingCart, Loader2 } from "lucide-react";
 import {
     canIncludeInDraftPO,
     canUseDirectOrdering,
@@ -642,30 +642,6 @@ export default function PurchasingPanel() {
         }
     }
 
-    async function handleCreateAll() {
-        const groups = visibleGroups.filter(g =>
-            !vendorSnoozed(g) &&
-            !createdPOs[g.vendorPartyId] &&
-            g.items.some(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId])
-        );
-        if (groups.length === 0) return;
-        setCreatingPO(new Set(groups.map(g => g.vendorPartyId)));
-        const results = await Promise.allSettled(groups.map(g => createVendorPO(g)));
-        const updates: Record<string, POResult> = {};
-        const errs: string[] = [];
-        results.forEach((r, idx) => {
-            if (r.status === "fulfilled" && r.value) updates[groups[idx].vendorPartyId] = r.value;
-            else if (r.status === "rejected") errs.push(`${groups[idx].vendorName}: ${r.reason?.message ?? "failed"}`);
-        });
-        if (Object.keys(updates).length) {
-            setCreatedPOs(p => ({ ...p, ...updates }));
-            setCreatedPODetails(p => ({ ...p, ...updates }));
-        }
-        if (errs.length) setError(errs.join(" | "));
-        setCreatingPO(new Set());
-        if (Object.keys(updates).length > 0) await load(true);
-    }
-
     async function handleReviewAndSend(orderId: string) {
         setCommitLoading(orderId);
         try {
@@ -921,10 +897,6 @@ export default function PurchasingPanel() {
     const sixtyCount = focusCount("60");
     const ninetyCount = focusCount("90");
     const allCount = focusCount("all");
-    const actionableVendors = focusGroups.filter(g =>
-        !createdPOs[g.vendorPartyId] &&
-        g.items.some(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId])
-    );
     const isLoading = loading || scanning;
     const anyCreating = creatingPO.size > 0;
 
@@ -1134,15 +1106,10 @@ export default function PurchasingPanel() {
                     <span className="text-xs font-mono text-zinc-600">all clear</span>
                 )}
 
-                {actionableVendors.length > 1 && !anyCreating && (
-                    <button onClick={handleCreateAll}
-                        className="flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors"
-                        title={`Create draft POs for all ${actionableVendors.length} selected vendors at once`}
-                    >
-                        <Zap className="w-2.5 h-2.5" />
-                        {actionableVendors.length} POs
-                    </button>
-                )}
+                {/* DECISION(2026-05-19, Will): bulk "Create all POs" button removed.
+                    Per-vendor "Draft PO" buttons stay — bulk creation hid which
+                    vendor was about to fire and made it too easy to accidentally
+                    queue every vendor at once. */}
                 {anyCreating && (
                     <span className="text-[10px] font-mono text-zinc-500 flex items-center gap-1">
                         <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />
@@ -1322,7 +1289,7 @@ export default function PurchasingPanel() {
                                             key={pid}
                                             onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds })}
                                             onMouseLeave={lifecycle.clearFocus}
-                                            className={`border-b border-zinc-800/60 ${vSnoozed ? "opacity-45" : ""} ${groupMatchesLifecycle ? "bg-cyan-500/5 ring-1 ring-inset ring-cyan-500/35" : ""}`}
+                                            className={`border-b border-zinc-800/60 ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupMatchesLifecycle ? "bg-cyan-500/5 ring-1 ring-inset ring-cyan-500/35" : ""}`}
                                         >
                                             {/* ── Vendor header ── */}
                                             <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-zinc-800/30 transition-colors">
@@ -1576,7 +1543,7 @@ export default function PurchasingPanel() {
                                                                 <div key={iKey}
                                                                     onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] })}
                                                                     onMouseLeave={lifecycle.clearFocus}
-                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 ${itemMatchesLifecycle ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35" : ""} ${itemSnoozed ? "opacity-35" : isChecked ? "" : "opacity-90"
+                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 ${itemMatchesLifecycle ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35" : ""} ${itemSnoozed ? "opacity-20 hover:opacity-40 transition-opacity" : isChecked ? "" : "opacity-90"
                                                                         }`}>
                                                                     <div className="flex items-start gap-3">
                                                                         {!itemSnoozed && (
@@ -1700,14 +1667,19 @@ export default function PurchasingPanel() {
 
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button
-                                                                                        onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === iKey ? null : iKey); }}
-                                                                                        className={`text-[11px] font-mono transition-colors ${itemSnoozed
-                                                                                            ? "text-zinc-600 hover:text-emerald-400"
+                                                                                        onClick={e => {
+                                                                                            e.stopPropagation();
+                                                                                            // Single click unsnoozes — no menu needed when the only action is "bring it back."
+                                                                                            if (itemSnoozed) { doUnsnooze(iKey); return; }
+                                                                                            setSnoozeMenu(snoozeMenu === iKey ? null : iKey);
+                                                                                        }}
+                                                                                        className={`text-[11px] font-mono px-1.5 py-0.5 rounded transition-colors ${itemSnoozed
+                                                                                            ? "text-emerald-400/80 hover:text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/10"
                                                                                             : "text-zinc-500 hover:text-zinc-300"
                                                                                             }`}
-                                                                                        title={itemSnoozed ? "Unsnooze" : "Snooze this item"}
-                                                                                    >{itemSnoozed ? "↩" : "···"}</button>
-                                                                                    {snoozeMenu === iKey && renderSnoozeMenu(iKey)}
+                                                                                        title={itemSnoozed ? "Unsnooze this item" : "Snooze this item"}
+                                                                                    >{itemSnoozed ? "↩ unsnooze" : "···"}</button>
+                                                                                    {!itemSnoozed && snoozeMenu === iKey && renderSnoozeMenu(iKey)}
                                                                                 </div>
                                                                             </div>
 
