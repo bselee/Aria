@@ -5844,6 +5844,14 @@ export class FinaleClient {
                     // Open PO supply
                     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
 
+                    // DECISION(2026-05-19, Will): once a PO is committed for this SKU it
+                    // moves to "Purchasing Watch" and exits the Ordering surface. Even if
+                    // velocity/runway math still says we'd want more, we surface that as
+                    // an arrival-risk in Active Purchases / build-risk — not as a fresh
+                    // reorder. The Ordering panel is "what do I need to buy" — if a PO
+                    // is already out the door, the answer is "nothing right now."
+                    if (activity.openPOs.length > 0) continue;
+
                     // Step 4: velocity + runway
                     const purchaseVelocity = activity.purchasedQty / daysBack;
                     const salesVelocity = activity.soldQty / daysBack;

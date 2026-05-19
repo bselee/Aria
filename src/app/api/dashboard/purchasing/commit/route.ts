@@ -6,6 +6,7 @@ import {
     lookupVendorOrderEmail,
 } from '@/lib/purchasing/po-sender';
 import { executePOSendAction } from '@/lib/copilot/actions';
+import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 
 /**
  * POST /api/dashboard/purchasing/commit
@@ -78,6 +79,17 @@ export async function POST(req: NextRequest) {
                 triggeredBy: 'dashboard',
                 skipEmail: body.skipEmail || false,
             });
+
+            // DECISION(2026-05-19, Will): once the PO is committed in Finale, the
+            // affected SKUs must drop out of the Ordering panel ("If PO is generated
+            // no more ordering"). getPurchasingIntelligence already skips items with
+            // any open ORDER_LOCKED PO — but the dashboard reads from a 30-min
+            // module cache. Invalidate it here so the next GET (which the panel
+            // fires via load(true)) actually re-fetches and the row disappears.
+            if (result.status !== 'failed') {
+                invalidatePurchasingCaches();
+            }
+
             // Bubble verification to top-level so dashboard doesn't need to dig into details
             const verification = (result as any)?.details?.verification ?? null;
             return NextResponse.json(
