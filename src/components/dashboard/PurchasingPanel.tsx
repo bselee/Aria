@@ -714,7 +714,15 @@ export default function PurchasingPanel() {
                 email: skipEmail ? 'skip' : (emailSent ? 'ok' : 'fail'),
                 verify: skipEmail ? (committed ? 'ok' : 'fail') : (emailVerified ? 'ok' : 'fail'),
             });
-            if (v?.issues && v.issues.length > 0) setCommitIssues(v.issues);
+            const issues: string[] = Array.isArray(v?.issues) ? [...v!.issues] : [];
+            const sendEmailError: string | undefined = json.details?.emailError;
+            if (sendEmailError && !issues.some(i => i.toLowerCase().includes('email send failed'))) {
+                issues.push(`email send failed: ${sendEmailError}`);
+            }
+            if (sendEmailError && commitModal.email) {
+                issues.push(`attempted recipient: ${commitModal.email}`);
+            }
+            if (issues.length > 0) setCommitIssues(issues);
 
             if (json.status === 'failed') {
                 setError(json.userMessage || json.error || 'Send failed');

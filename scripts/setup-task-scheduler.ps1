@@ -91,13 +91,13 @@ Register-NightshiftTask `
     -TaskName "NightshiftStart" `
     -ScriptPath $StartScript `
     -StartTime "18:05" `
-    -DaysOfWeek "Monday,Tuesday,Wednesday,Thursday,Friday"
+    -DaysOfWeek "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday"
 
 Register-NightshiftTask `
     -TaskName "NightshiftStop" `
     -ScriptPath $StopScript `
     -StartTime "07:00" `
-    -DaysOfWeek "Monday,Tuesday,Wednesday,Thursday,Friday"
+    -DaysOfWeek "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday"
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 

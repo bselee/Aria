@@ -68,9 +68,9 @@ defineJob({
 
 defineJob({
     name: "nightshift-enqueue",
-    schedule: "0 18 * * 1-5",
+    schedule: "0 18 * * *",
     onFail: "log",
-    description: "6 PM Mon-Fri: enqueue overnight email classification work.",
+    description: "6 PM daily: enqueue overnight email classification work. 7-day so Mon mornings aren't cold (weekend ads piled up unfiltered on Mon-Fri schedule).",
     handler: async () => { await ops()?.enqueueNightshiftWork(); },
 });
 
