@@ -390,6 +390,7 @@ export async function commitAndSendPO(
             sentAt = new Date().toISOString();
         } catch (err: any) {
             emailError = err?.message ?? String(err);
+            verificationIssues.push(`email send failed: ${emailError}`);
         }
     }
 
@@ -436,7 +437,8 @@ export async function commitAndSendPO(
                 notified_slack: false,
                 metadata: {
                     orderId,
-                    vendorEmail: finaleEmailSent ? vendorEmail : null,
+                    vendorEmail: vendorEmail ?? null,
+                    attemptedVendorEmail: !finaleEmailSent && vendorEmail ? vendorEmail : null,
                     triggeredBy,
                     finaleEmailSent,
                     pdfAttached,
