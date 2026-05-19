@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
     commitDraftPOMock,
     sendPurchaseOrderEmailMock,
+    sendPOViaGmailMock,
     fromMock,
     updateBySourceMock,
     upsertFromSourceMock,
 } = vi.hoisted(() => ({
     commitDraftPOMock: vi.fn(),
     sendPurchaseOrderEmailMock: vi.fn(),
+    sendPOViaGmailMock: vi.fn(),
     fromMock: vi.fn(),
     updateBySourceMock: vi.fn(),
     upsertFromSourceMock: vi.fn(),
@@ -21,6 +23,10 @@ vi.mock("../finale/client", () => ({
         sendPurchaseOrderEmail: sendPurchaseOrderEmailMock,
         };
     }),
+}));
+
+vi.mock("./po-gmail-fallback", () => ({
+    sendPOViaGmail: sendPOViaGmailMock,
 }));
 
 vi.mock("../supabase", () => ({
@@ -84,8 +90,9 @@ describe("commitAndSendPO", () => {
         fromMock.mockImplementation(() => makeTableMock());
     });
 
-    it("returns partial success when Finale commits but native vendor email fails", async () => {
+    it("returns partial success only when BOTH Finale native AND Gmail fallback fail", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValue(new Error("native email action missing"));
+        sendPOViaGmailMock.mockRejectedValue(new Error("Gmail token missing"));
         const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
             channel: "dashboard",
         });
@@ -93,12 +100,57 @@ describe("commitAndSendPO", () => {
         const result = await commitAndSendPO(sendId, "dashboard", false);
 
         expect(commitDraftPOMock).toHaveBeenCalledWith("124790");
+        expect(sendPOViaGmailMock).toHaveBeenCalledOnce();
         expect(result).toMatchObject({
             orderId: "124790",
+            emailSent: false,
             finaleEmailSent: false,
+            emailVia: null,
             pdfAttached: false,
             emailSkipped: false,
-            emailError: "native email action missing",
         });
+        expect(result.emailError).toMatch(/native email action missing/);
+        expect(result.emailError).toMatch(/Gmail token missing/);
+    });
+
+    it("falls back to Gmail when Finale native email action is unavailable", async () => {
+        sendPurchaseOrderEmailMock.mockRejectedValue(new Error("Finale native PO email action was not available"));
+        sendPOViaGmailMock.mockResolvedValue({
+            sent: true,
+            pdfAttached: true,
+            messageId: "gmail-msg-77",
+            threadId: "gmail-thread-77",
+            via: "gmail-fallback",
+            fromAddress: "bill.selee@buildasoil.com",
+        });
+        const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
+            channel: "dashboard",
+        });
+
+        const result = await commitAndSendPO(sendId, "dashboard", false);
+
+        expect(sendPurchaseOrderEmailMock).toHaveBeenCalledOnce();
+        expect(sendPOViaGmailMock).toHaveBeenCalledWith(expect.objectContaining({
+            toEmail: "orders@example.com",
+            review: expect.objectContaining({ orderId: "124790" }),
+        }));
+        expect(result).toMatchObject({
+            orderId: "124790",
+            emailSent: true,
+            finaleEmailSent: false,
+            emailVia: "gmail-fallback",
+            pdfAttached: true,
+            sentTo: "orders@example.com",
+            gmailMessageId: "gmail-msg-77",
+            emailSkipped: false,
+        });
+        expect(result.emailError).toBeUndefined();
+        // The fallback path appends a "sent via Gmail" note to verification issues
+        // so the dashboard's commitIssues panel surfaces that the path differed.
+        expect(result.verification.issues).toEqual(
+            expect.arrayContaining([expect.stringMatching(/Finale native email unavailable.*Gmail fallback/i)]),
+        );
+        expect(result.verification.emailSent).toBe(true);
+        expect(result.verification.emailVerified).toBe(true);
     });
 });
