@@ -14,6 +14,8 @@ import {
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
 import type { ExpectedDelivery, DraftVerification, CommitVerification } from "@/lib/purchasing/po-verification";
+import { CrystalBallDetail, type CrystalBallItem } from "./CrystalBallDetail";
+import { CrystalBallSearch } from "./CrystalBallSearch";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -23,6 +25,13 @@ type PurchasingItem = {
     productId: string; productName: string; supplierName: string; supplierPartyId: string;
     unitPrice: number; stockOnHand: number; stockOnOrder: number;
     purchaseVelocity: number; salesVelocity: number; demandVelocity: number; dailyRate: number;
+    draftPO?: {
+        orderId: string;
+        orderDate: string;
+        quantity: number;
+        supplierName: string;
+        finaleUrl: string;
+    } | null;
     dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
@@ -256,6 +265,7 @@ export default function PurchasingPanel() {
     // ULINE direct ordering
     const [ulineOrdering, setUlineOrdering] = useState(false);
     const [ulineResult, setUlineResult] = useState<UlineOrderResult | null>(null);
+    const [selectedItem, setSelectedItem] = useState<CrystalBallItem | null>(null);
 
     // collapse + resize
     const [isCollapsed, setIsCollapsed] = useState(false);
@@ -1108,6 +1118,7 @@ export default function PurchasingPanel() {
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
+                <CrystalBallSearch onSelect={setSelectedItem} />
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
                 {isLoading && data && (
@@ -1183,8 +1194,27 @@ export default function PurchasingPanel() {
 
             {!isCollapsed && (
                 <>
-                    {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
-                    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                    {selectedItem ? (
+                        <>
+                            <div
+                                className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full font-mono"
+                                style={{ height: bodyHeight }}
+                            >
+                                <CrystalBallDetail 
+                                    item={selectedItem} 
+                                    onClose={() => setSelectedItem(null)} 
+                                    onCommitPO={handleReviewAndSend}
+                                />
+                            </div>
+
+                            <div onMouseDown={startResize}
+                                className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"
+                                title="Drag to resize" />
+                        </>
+                    ) : (
+                        <>
+                            {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
+                            <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                         <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">show</span>
                         {([
                             { k: "need" as const, label: "Need Order", tone: "bg-red-500/15 text-red-300 border-red-500/40", inactive: "text-zinc-400 border-zinc-700 hover:text-zinc-200" },
@@ -1579,7 +1609,7 @@ export default function PurchasingPanel() {
                                                         .filter(item => showSnoozed || !isSnoozed(item.productId))
                                                         .map(item => {
                                                             const itemSnoozed = isSnoozed(item.productId);
-                                                            const draftBlocked = !canIncludeInDraftPO(item.reorderMethod);
+                                                            const draftBlocked = !canIncludeInDraftPO(item.reorderMethod) || !!item.draftPO;
                                                             const isChecked = !itemSnoozed && !draftBlocked && (groupChecked[item.productId] ?? false);
                                                             const qty = groupQtys[item.productId] ?? item.suggestedQty;
                                                             const rc = runwayColor(item.runwayDays);
@@ -1604,6 +1634,7 @@ export default function PurchasingPanel() {
                                                                             <input type="checkbox" checked={isChecked}
                                                                                 onChange={() => toggleItem(pid, iKey)}
                                                                                 disabled={draftBlocked}
+                                                                                title={item.draftPO ? `Draft PO #${item.draftPO.orderId} already exists` : undefined}
                                                                                 className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
                                                                                     : item.urgency === "warning" ? "accent-yellow-400"
                                                                                         : "accent-zinc-400"
@@ -1978,6 +2009,32 @@ export default function PurchasingPanel() {
                                                                                             )}
                                                                                         </div>
                                                                                     )}
+                                                                                    {!itemSnoozed && item.draftPO && (
+                                                                                        <div className="mt-2.5 bg-amber-500/10 border border-amber-500/30 text-amber-300 rounded p-2.5 font-mono text-[11px] space-y-1.5 animate-fadeIn">
+                                                                                            <div className="flex items-start gap-1.5">
+                                                                                                <span className="font-bold text-amber-400 block text-xs">⚠️ Draft PO Detected</span>
+                                                                                            </div>
+                                                                                            <p className="leading-normal text-zinc-300">
+                                                                                                Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
+                                                                                            </p>
+                                                                                            <div className="flex items-center gap-2 pt-1">
+                                                                                                <a 
+                                                                                                    href={item.draftPO.finaleUrl}
+                                                                                                    target="_blank"
+                                                                                                    rel="noopener noreferrer"
+                                                                                                    className="px-2 py-1 rounded border border-amber-500/40 hover:bg-amber-500/20 hover:text-amber-200 transition-all flex items-center gap-1 text-[10px] font-semibold"
+                                                                                                >
+                                                                                                    <span>View Draft ↗</span>
+                                                                                                </a>
+                                                                                                <button
+                                                                                                    onClick={(e) => { e.stopPropagation(); handleReviewAndSend(item.draftPO!.orderId); }}
+                                                                                                    className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[10px]"
+                                                                                                >
+                                                                                                    Commit & Send PO
+                                                                                                </button>
+                                                                                            </div>
+                                                                                        </div>
+                                                                                    )}
                                                                                 </div>
                                                                             )}
                                                                         </div>
@@ -2010,8 +2067,10 @@ export default function PurchasingPanel() {
                             )}
 
                             <div onMouseDown={startResize}
-                                className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"
-                                title="Drag to resize" />
+                                                                className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"
+                                                                title="Drag to resize" />
+                        </>
+                    )}
                         </>
                     )}
 
