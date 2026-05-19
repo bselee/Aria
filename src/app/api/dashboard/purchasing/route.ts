@@ -78,15 +78,48 @@ export async function GET(req: NextRequest) {
     }
 
     const assessment = assessPurchasingGroups(groups);
+
+    // Fetch recent POs from the past 180 days (6 months) to detect duplicate drafts
+    let recentPOs: any[] = [];
+    try {
+        recentPOs = await client.getRecentPurchaseOrders(180, 500);
+    } catch (err: any) {
+        console.error('[purchasing/route] Failed to fetch recent purchase orders:', err.message);
+    }
+
+    const isDraftPO = (po: any): boolean => {
+        const status = (po.status || '').toLowerCase();
+        return status.includes('draft') || status.includes('created') || status === 'order_created';
+    };
+
     const responseGroups = assessment.groups.map(group => ({
         vendorName: group.vendorName,
         vendorPartyId: group.vendorPartyId,
         urgency: group.urgency,
-        items: group.items.map(line => ({
-            ...line.item,
-            candidate: line.candidate,
-            assessment: line.assessment,
-        })),
+        items: group.items.map(line => {
+            const matchingDraftPO = recentPOs.find(po => 
+                isDraftPO(po) && 
+                po.items?.some((i: any) => i.productId === line.item.productId)
+            );
+            let draftPOInfo = null;
+            if (matchingDraftPO) {
+                const poLine = matchingDraftPO.items.find((i: any) => i.productId === line.item.productId);
+                draftPOInfo = {
+                    orderId: matchingDraftPO.orderId,
+                    orderDate: matchingDraftPO.orderDate,
+                    quantity: poLine ? poLine.quantity : 0,
+                    supplierName: matchingDraftPO.vendorName || group.vendorName,
+                    finaleUrl: matchingDraftPO.finaleUrl,
+                };
+            }
+
+            return {
+                ...line.item,
+                candidate: line.candidate,
+                assessment: line.assessment,
+                draftPO: draftPOInfo,
+            };
+        }),
     }));
 
     // ── Upcoming-builds digest (next 30 days from calendar forward-demand) ──

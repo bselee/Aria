@@ -141,6 +141,13 @@ export interface PurchasingItem {
     leadTimeDays: number;
     leadTimeProvenance: string;    // e.g. "14d (Finale)" | "14d default"
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
+    draftPO?: {
+        orderId: string;
+        orderDate: string;
+        quantity: number;
+        supplierName: string;
+        finaleUrl: string;
+    } | null;
     urgency: 'critical' | 'warning' | 'watch' | 'ok';
     explanation: string;           // natural language, computed server-side
     suggestedQty: number;
