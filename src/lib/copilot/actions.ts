@@ -131,7 +131,7 @@ export async function executePOSendAction(input: ExecutePOSendActionInput): Prom
         if (result.emailError) {
             return makeActionResult(
                 "partial_success",
-                `PO #${result.orderId} committed in Finale, but vendor email failed: ${result.emailError}`,
+                `PO #${result.orderId} committed in Finale — vendor email failed (${result.emailError}). Send the PO manually from Finale; Aria will not auto-retry with an alternate format.`,
                 {
                     actionRef: input.sendId,
                     retryAllowed: false,
@@ -141,12 +141,9 @@ export async function executePOSendAction(input: ExecutePOSendActionInput): Prom
             );
         }
 
-        const viaSuffix = (result as any).emailVia === 'gmail-fallback'
-            ? ' (via Gmail fallback — Finale native email unavailable)'
-            : '';
         return makeActionResult(
             "success",
-            `PO #${result.orderId} committed in Finale${result.sentTo ? ` and emailed to ${result.sentTo}${viaSuffix}` : ""}`,
+            `PO #${result.orderId} committed in Finale${result.sentTo ? ` and emailed to ${result.sentTo}` : ""}`,
             {
                 actionRef: input.sendId,
                 retryAllowed: false,

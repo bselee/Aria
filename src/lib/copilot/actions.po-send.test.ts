@@ -273,7 +273,7 @@ describe("PO send actions", () => {
         );
     });
 
-    it("returns partial_success when Finale commits but the native PO email action is unavailable", async () => {
+    it("returns partial_success and parks for manual send when the native PO email action is unavailable", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValueOnce(new Error("Finale native PO email action was not available"));
         const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
             channel: "dashboard",
@@ -284,14 +284,14 @@ describe("PO send actions", () => {
             triggeredBy: "dashboard",
         });
 
-        // Finale commit cannot be rolled back — partial_success surfaces the email failure
-        // with full context (emailError + attempted recipient) so Will can act.
+        // Will's rule: no funky-format fallback. If Finale native can't send,
+        // the PO is committed-but-unsent and the user is told to send manually.
         expect(result.status).toBe("partial_success");
         expect(result.userMessage).toMatch(/Finale native PO email action/i);
+        expect(result.userMessage).toMatch(/Send the PO manually from Finale/i);
         expect((result.details as any)?.emailError).toMatch(/Finale native PO email action/i);
-        expect((result.details as any)?.verification?.issues ?? []).toEqual(
-            expect.arrayContaining([expect.stringMatching(/email send failed.*Finale native PO email action/i)]),
-        );
+        expect((result.details as any)?.emailVia).toBeNull();
+        expect((result.details as any)?.retryable).toBe(true);
         expect(gmailSendMock).not.toHaveBeenCalled();
     });
 

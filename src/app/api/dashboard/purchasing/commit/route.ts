@@ -107,8 +107,8 @@ export async function POST(req: NextRequest) {
                 return NextResponse.json({
                     status: result.emailSent ? 'success' : 'partial_success',
                     userMessage: result.emailSent
-                        ? `PO #${result.orderId} emailed to ${result.sentTo} via ${result.emailVia === 'gmail-fallback' ? 'Gmail fallback' : 'Finale native'}`
-                        : `Retry failed for PO #${result.orderId}: ${result.emailError}`,
+                        ? `PO #${result.orderId} emailed to ${result.sentTo} via Finale native`
+                        : `Retry failed for PO #${result.orderId}: ${result.emailError}. Send manually from Finale.`,
                     details: result,
                 });
             } catch (err: any) {
