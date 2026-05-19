@@ -59,7 +59,9 @@ function serializePendingPOSend(entry: PendingPOSend) {
 }
 
 function rowToPendingPOSend(row: any): PendingPOSend | undefined {
-    if (row?.status && row.status !== 'pending') {
+    // Accept rows that are still active OR parked in 'email_failed' awaiting a
+    // retry. Anything terminal (confirmed/cancelled/expired) is gone.
+    if (row?.status && row.status !== 'pending' && row.status !== 'email_failed') {
         return undefined;
     }
     if (!row?.payload?.review || !row?.payload?.orderId) {
@@ -132,7 +134,7 @@ async function loadPendingPOSend(id: string): Promise<PendingPOSend | undefined>
 
 async function updatePendingPOSendStatus(
     id: string,
-    status: 'confirmed' | 'cancelled' | 'expired',
+    status: 'confirmed' | 'cancelled' | 'expired' | 'email_failed' | 'pending',
 ): Promise<void> {
     const db = createClient();
     if (!db) return;
@@ -145,6 +147,10 @@ async function updatePendingPOSendStatus(
         ? 'SUCCEEDED'
         : status === 'cancelled'
         ? 'CANCELLED'
+        : status === 'email_failed'
+        ? 'FAILED'
+        : status === 'pending'
+        ? 'NEEDS_APPROVAL'
         : 'EXPIRED';
 
     try {
@@ -224,12 +230,29 @@ export async function expirePendingPOSend(
 // VENDOR EMAIL LOOKUP
 // ──────────────────────────────────────────────────
 
+/** RFC-ish quick check — rejects obviously broken addresses before we ship. */
+function isPlausibleEmail(raw: string | null | undefined): raw is string {
+    if (!raw) return false;
+    const trimmed = raw.trim();
+    if (trimmed.length < 5 || trimmed.length > 254) return false;
+    // single @, non-empty local part, dotted domain with TLD of 2+ chars
+    return /^[^@\s]+@[^@\s.]+\.[^@\s]{2,}$/i.test(trimmed);
+}
+
+function normalizeEmail(raw: string): string {
+    return raw.trim().toLowerCase();
+}
+
 /**
  * Look up the best order-contact email for a vendor.
  * Priority:
- *   1. vendor_profiles.vendor_emails[] — built by po-correlator from outgoing PO history
- *   2. vendors.ar_email — populated by the enricher
+ *   1. vendor_profiles.orders_email — trusted, set by po-followup write-back or Will
+ *   2. vendor_profiles.vendor_emails[] — heuristic pick from po-correlator history
  *   3. null — caller should block send and ask Will to provide the email
+ *
+ * Addresses are validated (RFC-ish) and normalized to lowercase before return.
+ * An invalid stored address is treated as no match so we never ship a PO to
+ * "JOHN@VENDOR" or "salessomeonelse@example".
  */
 export async function lookupVendorOrderEmail(
     vendorName: string,
@@ -241,29 +264,92 @@ export async function lookupVendorOrderEmail(
     // Use first significant word for fuzzy match (avoids "Inc", "LLC", etc.)
     const firstWord = vendorName.split(/\s+/).find(w => w.length > 3) ?? vendorName.split(' ')[0];
 
-    // 1. vendor_profiles.vendor_emails[] (po-correlator built this)
     const { data: vp } = await db
         .from('vendor_profiles')
-        .select('vendor_emails')
+        .select('orders_email, orders_email_source, vendor_emails')
         .ilike('vendor_name', `%${firstWord}%`)
         .maybeSingle();
 
-    if (vp?.vendor_emails?.length > 0) {
-        return { email: vp.vendor_emails[0], source: 'vendor_profiles' };
+    // 1. Trusted orders_email (set by vendor_reply write-back or Will manually)
+    if (isPlausibleEmail(vp?.orders_email)) {
+        return {
+            email: normalizeEmail(vp!.orders_email!),
+            source: vp?.orders_email_source ? `orders_email:${vp.orders_email_source}` : 'orders_email',
+        };
     }
 
-    // 2. vendors.ar_email (enricher)
-    const { data: vendor } = await db
-        .from('vendors')
-        .select('ar_email')
-        .ilike('name', `%${firstWord}%`)
-        .maybeSingle();
-
-    if (vendor?.ar_email) {
-        return { email: vendor.ar_email, source: 'vendors_table' };
+    // 2. First plausible address from the historical PO-thread harvest. Skip
+    //    any malformed entries instead of trusting vendor_emails[0] blindly.
+    if (Array.isArray(vp?.vendor_emails) && vp.vendor_emails.length > 0) {
+        const picked = vp.vendor_emails.find((e: unknown) => typeof e === 'string' && isPlausibleEmail(e));
+        if (picked) return { email: normalizeEmail(picked), source: 'vendor_profiles' };
     }
 
     return { email: null, source: 'unknown' };
+}
+
+/**
+ * Record a vendor's reply address as the authoritative orders_email. Called by
+ * po-followup-watcher when it detects a human reply on a PO thread. The
+ * responder address is by definition the right contact for order matters —
+ * routing self-corrects over time.
+ *
+ * Skipped if (a) the address looks invalid, (b) it's our own outbound address
+ * (bill.selee@buildasoil.com / similar — don't write ourselves back), or
+ * (c) the same address was already confirmed within the last 24h (avoid
+ * thrashing on multi-reply threads).
+ */
+export async function recordVendorOrdersEmailFromReply(
+    vendorName: string,
+    replierEmail: string,
+): Promise<{ updated: boolean; reason: string }> {
+    const db = createClient();
+    if (!db) return { updated: false, reason: 'no_db' };
+    if (!isPlausibleEmail(replierEmail)) return { updated: false, reason: 'invalid_email' };
+
+    const normalized = normalizeEmail(replierEmail);
+
+    // Never write our own outbound addresses back as the vendor's address.
+    if (/@buildasoil\.com$/i.test(normalized)) {
+        return { updated: false, reason: 'self_address' };
+    }
+
+    const firstWord = vendorName.split(/\s+/).find(w => w.length > 3) ?? vendorName.split(' ')[0];
+    const { data: existing } = await db
+        .from('vendor_profiles')
+        .select('id, orders_email, orders_email_source, orders_email_confirmed_at')
+        .ilike('vendor_name', `%${firstWord}%`)
+        .maybeSingle();
+
+    if (!existing) return { updated: false, reason: 'no_profile' };
+
+    const sameAddress = existing.orders_email && normalizeEmail(existing.orders_email) === normalized;
+    const recentlyConfirmed = existing.orders_email_confirmed_at
+        && Date.now() - new Date(existing.orders_email_confirmed_at).getTime() < 24 * 60 * 60 * 1000;
+
+    if (sameAddress && recentlyConfirmed) {
+        return { updated: false, reason: 'already_confirmed_recently' };
+    }
+
+    // A manual entry by Will outranks an automatic write-back — never overwrite
+    // a manual source with a vendor_reply unless 30+ days have passed.
+    const manualLockout = existing.orders_email_source === 'manual'
+        && existing.orders_email_confirmed_at
+        && Date.now() - new Date(existing.orders_email_confirmed_at).getTime() < 30 * 24 * 60 * 60 * 1000;
+    if (manualLockout && !sameAddress) {
+        return { updated: false, reason: 'manual_lockout' };
+    }
+
+    await db
+        .from('vendor_profiles')
+        .update({
+            orders_email: normalized,
+            orders_email_source: 'vendor_reply',
+            orders_email_confirmed_at: new Date().toISOString(),
+        })
+        .eq('id', existing.id);
+
+    return { updated: true, reason: sameAddress ? 're_confirmed' : 'changed' };
 }
 
 // ──────────────────────────────────────────────────
@@ -329,6 +415,7 @@ export async function commitAndSendPO(
     pdfAttached: boolean;
     emailSkipped: boolean;
     emailError?: string;
+    retryable: boolean;
     verification: CommitVerification;
 }> {
     const pending = await getPendingPOSend(id);
@@ -349,15 +436,36 @@ export async function commitAndSendPO(
         }
     }
 
-    // 1. Commit in Finale
-    const finale = new FinaleClient();
-    await finale.commitDraftPO(orderId);
-    const committedAt = new Date().toISOString();
+    // Refuse empty PO renders — review.items.length === 0 would otherwise
+    // commit a $0/0-line PO in Finale and ship the vendor a blank PDF.
+    if (!Array.isArray(review.items) || review.items.length === 0) {
+        throw new Error(`PO #${orderId} has no line items — refusing to commit/send`);
+    }
 
-    // 1b. Post-commit verification — re-fetch and confirm status flipped to ORDER_LOCKED
+    // 1. Commit in Finale (idempotent: if the PO is already ORDER_LOCKED from
+    //    a previous attempt that crashed mid-send, skip the commit and proceed
+    //    directly to send. This is the retry path that turns a stuck "locked
+    //    but unsent" PO back into a recoverable state.)
+    const finale = new FinaleClient();
     const verificationIssues: string[] = [];
     let finalStatus = 'ORDER_LOCKED';
     let committed = true;
+    let committedAt = new Date().toISOString();
+    try {
+        await finale.commitDraftPO(orderId);
+    } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        // commitDraftPO throws when status is anything other than ORDER_CREATED.
+        // If it's already ORDER_LOCKED we treat that as success-equivalent —
+        // someone else (or a previous attempt) already committed.
+        if (/ORDER_LOCKED/.test(msg)) {
+            verificationIssues.push(`commit skipped: PO already ORDER_LOCKED (retrying email)`);
+        } else {
+            throw err;
+        }
+    }
+
+    // 1b. Post-commit verification — re-fetch and confirm status flipped to ORDER_LOCKED
     try {
         const postCommitPO = await finale.getOrderDetails(orderId);
         finalStatus = postCommitPO?.statusId ?? 'unknown';
@@ -551,7 +659,21 @@ export async function commitAndSendPO(
         await Promise.allSettled(writes);
     }
 
-    await expirePendingPOSend(id, 'confirmed');
+    // Session lifecycle: full success closes the session ('confirmed').
+    // Partial-success (commit landed, email failed both paths) parks the
+    // session in 'email_failed' so the dashboard can fire a retry without
+    // requiring Will to re-review from scratch. Skipping email entirely is
+    // still a clean confirm — there's nothing to retry.
+    if (emailError && !skipEmail) {
+        await updatePendingPOSendStatus(id, 'email_failed');
+        // Refresh the in-memory cache so getPendingPOSend returns the updated
+        // status without a round-trip to Supabase.
+        const cached = pendingPOSends.get(id);
+        if (cached) pendingPOSends.set(id, { ...cached });
+    } else {
+        await expirePendingPOSend(id, 'confirmed');
+    }
+
     return {
         orderId,
         sentTo: emailSent ? vendorEmail : null,
@@ -562,6 +684,9 @@ export async function commitAndSendPO(
         pdfAttached,
         emailSkipped: skipEmail || !vendorEmail,
         emailError,
+        // When the session is parked in 'email_failed', the same sendId can
+        // be passed to retrySendEmail() to retry just the email step.
+        retryable: Boolean(emailError && !skipEmail),
         verification: {
             committed,
             finalStatus,
@@ -570,5 +695,154 @@ export async function commitAndSendPO(
             lastEmailedAt,
             issues: verificationIssues,
         },
+    };
+}
+
+/**
+ * Retry the email step for a PO that already committed in Finale but failed
+ * to email on the prior attempt. Skips commit entirely (the PO is already
+ * ORDER_LOCKED) and runs both send paths fresh. On success the session
+ * closes; on another failure it stays parked for one more retry.
+ *
+ * This is the fix for the "stuck PO" problem: previously a partial-success
+ * burned the sendId via expirePendingPOSend('confirmed'), leaving the locked
+ * PO with no way for Aria to retry — Will had to email it manually.
+ */
+export async function retrySendEmail(
+    id: string,
+    triggeredBy: 'telegram' | 'dashboard',
+): Promise<{
+    orderId: string;
+    sentTo: string | null;
+    gmailMessageId: string | null;
+    emailSent: boolean;
+    emailVia: 'finale-native' | 'gmail-fallback' | null;
+    pdfAttached: boolean;
+    emailError?: string;
+    retryable: boolean;
+}> {
+    const pending = await getPendingPOSend(id);
+    if (!pending) throw new Error('No retryable PO send found for this id — start a fresh Review & Send');
+    const { orderId, review, vendorEmail } = pending;
+    if (!vendorEmail) throw new Error(`PO #${orderId} has no vendor email on file — cannot retry`);
+
+    // Confirm Finale state: must be ORDER_LOCKED for a retry to make sense.
+    const finale = new FinaleClient();
+    const postCommitPO = await finale.getOrderDetails(orderId);
+    if (postCommitPO?.statusId !== 'ORDER_LOCKED') {
+        throw new Error(
+            `Cannot retry email for PO #${orderId}: Finale status is "${postCommitPO?.statusId ?? 'unknown'}", expected ORDER_LOCKED`,
+        );
+    }
+
+    // Block double-send if a prior retry succeeded before this call.
+    const already = await findExistingPOSend(orderId);
+    if (already) throw new Error(`PO #${orderId} was already sent at ${already.sent_at}; retry blocked`);
+
+    const { subject, body } = generatePOEmailBody(review);
+
+    let emailSent = false;
+    let pdfAttached = false;
+    let emailVia: 'finale-native' | 'gmail-fallback' | null = null;
+    let gmailMessageId: string | null = null;
+    let gmailFromAddress: string | null = null;
+    let finaleEmailActionUrl: string | undefined;
+    let emailError: string | undefined;
+    let sentAt: string | null = null;
+
+    let finaleErrorMsg: string | undefined;
+    try {
+        const sendResult = await finale.sendPurchaseOrderEmail(orderId, { toEmail: vendorEmail, subject, body });
+        emailSent = sendResult.sent;
+        pdfAttached = sendResult.pdfAttached;
+        finaleEmailActionUrl = sendResult.actionUrl;
+        sentAt = new Date().toISOString();
+        emailVia = 'finale-native';
+    } catch (err: any) {
+        finaleErrorMsg = err?.message ?? String(err);
+        try {
+            const { sendPOViaGmail } = await import('./po-gmail-fallback');
+            const gmailResult = await sendPOViaGmail({ review, toEmail: vendorEmail, subject, body });
+            emailSent = true;
+            pdfAttached = true;
+            emailVia = 'gmail-fallback';
+            gmailMessageId = gmailResult.messageId;
+            gmailFromAddress = gmailResult.fromAddress;
+            sentAt = new Date().toISOString();
+        } catch (fallbackErr: any) {
+            emailError = `Finale native: ${finaleErrorMsg}; Gmail fallback: ${fallbackErr?.message ?? String(fallbackErr)}`;
+        }
+    }
+
+    // Best-effort writes: log the retry outcome to ap_activity_log + po_sends.
+    const db = createClient();
+    if (db && emailSent && sentAt) {
+        const writes: Array<PromiseLike<any>> = [
+            db.from('ap_activity_log').insert({
+                email_from: gmailFromAddress ?? 'bill.selee@buildasoil.com',
+                email_subject: subject,
+                intent: emailVia === 'finale-native' ? 'PO_SEND_FINALE' : 'PO_SEND_GMAIL',
+                action_taken: `PO #${orderId} email retry succeeded via ${emailVia} → ${vendorEmail}`,
+                notified_slack: false,
+                metadata: {
+                    orderId,
+                    vendorEmail,
+                    triggeredBy,
+                    emailSent,
+                    emailVia,
+                    pdfAttached,
+                    finaleEmailActionUrl,
+                    gmailMessageId,
+                    gmailFromAddress,
+                    isRetry: true,
+                },
+            }),
+            db.from('purchase_orders').upsert({
+                po_number: orderId,
+                vendor_name: review.vendorName,
+                vendor_party_id: review.vendorPartyId,
+                status: 'open',
+                order_date: review.orderDate,
+                total_amount: review.total,
+                item_count: review.items.length,
+                finale_url: review.finaleUrl,
+                po_sent_at: sentAt,
+                po_email_message_id: gmailMessageId ?? finaleEmailActionUrl ?? null,
+                lifecycle_stage: 'sent',
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'po_number' }),
+            db.from('po_sends').insert({
+                po_number: orderId,
+                vendor_name: review.vendorName,
+                vendor_party_id: review.vendorPartyId,
+                sent_to_email: vendorEmail,
+                total_amount: review.total,
+                item_count: review.items.length,
+                committed_at: null,
+                sent_at: sentAt,
+                triggered_by: triggeredBy,
+                gmail_message_id: gmailMessageId,
+                metadata: { orderId, vendorEmail, triggeredBy, emailSent, emailVia, pdfAttached, isRetry: true },
+            }),
+        ];
+        await Promise.allSettled(writes);
+    }
+
+    if (emailSent) {
+        await expirePendingPOSend(id, 'confirmed');
+    } else {
+        // Keep the session parked so a third retry is possible.
+        await updatePendingPOSendStatus(id, 'email_failed');
+    }
+
+    return {
+        orderId,
+        sentTo: emailSent ? vendorEmail : null,
+        gmailMessageId,
+        emailSent,
+        emailVia,
+        pdfAttached,
+        emailError,
+        retryable: Boolean(emailError),
     };
 }

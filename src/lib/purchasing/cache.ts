@@ -72,10 +72,21 @@ export async function readSWR(
     return { value: [], refreshing: true };
 }
 
+/**
+ * Mark caches stale without dropping their current values. SWR detects the
+ * stale slot (`at = 0` is older than TTL), kicks a background refresh, and
+ * keeps serving the cached groups until the fresh scan lands — so dashboard
+ * users keep seeing data with a "Refreshing…" badge instead of an empty list.
+ *
+ * DECISION(2026-05-19): Previously this also nulled slot.value, which made
+ * readSWR fall through to the cold-path branch (returns `{ value: [],
+ * refreshing: true }`). Right after a PO commit/send invalidation, the
+ * dashboard rendered an empty Ordering list — looked like a full reload.
+ * Keeping the stale value preserves continuity; the filter-out of newly-
+ * committed SKUs happens on the next successful refresh.
+ */
 export function invalidatePurchasingCaches(): void {
-    resaleSlot.value = null;
     resaleSlot.at = 0;
-    bomSlot.value = null;
     bomSlot.at = 0;
 }
 
