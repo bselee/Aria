@@ -236,6 +236,7 @@ export default function PurchasingPanel() {
     const [commitLoading, setCommitLoading] = useState<string | null>(null); // orderId being reviewed
     const [sendingPO, setSendingPO] = useState(false);
     const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
+    const [canRetryEmail, setCanRetryEmail] = useState(false);
 
     // snooze
     const [snooze, setSnooze] = useState<SnoozeMap>({});
@@ -729,6 +730,9 @@ export default function PurchasingPanel() {
 
             if (json.status === 'partial_success') {
                 setError(json.userMessage || 'PO committed in Finale, but the vendor email still needs review.');
+                setCanRetryEmail(Boolean(json.details?.retryable));
+            } else {
+                setCanRetryEmail(false);
             }
             await load(true);
         } catch (e: any) {
@@ -743,6 +747,42 @@ export default function PurchasingPanel() {
         setCommitModal(null);
         setSendSteps({});
         setCommitIssues([]);
+        setCanRetryEmail(false);
+    }
+
+    async function handleRetryEmail() {
+        if (!commitModal?.sendId) return;
+        setSendingPO(true);
+        setSendSteps(s => ({ ...s, email: 'pending', verify: 'pending' }));
+        try {
+            const res = await fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'retry-email', sendId: commitModal.sendId }),
+            });
+            const json = await res.json();
+            if (!res.ok || json.status === 'failed') {
+                setSendSteps(s => ({ ...s, email: 'fail', verify: 'fail' }));
+                setError(json.userMessage || json.error || 'Retry failed');
+                return;
+            }
+            const ok = json.status === 'success';
+            setSendSteps(s => ({ ...s, email: ok ? 'ok' : 'fail', verify: ok ? 'ok' : 'fail' }));
+            if (ok) {
+                setCanRetryEmail(false);
+                setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+                setCommitIssues([]);
+                setError(null);
+                await load(true);
+                setCommitModal(null);
+            } else {
+                setError(json.userMessage || 'Retry still failing — vendor email may be wrong or both delivery paths are down');
+            }
+        } catch (e: any) {
+            setError(`Retry failed: ${e.message}`);
+        } finally {
+            setSendingPO(false);
+        }
     }
 
     async function handleCancelCommit() {
@@ -990,22 +1030,36 @@ export default function PurchasingPanel() {
                                 className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
                                 {Object.keys(sendSteps).length > 0 ? 'Close' : 'Cancel'}
                             </button>
-                            <button
-                                onClick={() => handleConfirmSend(true)}
-                                disabled={sendingPO}
-                                className="text-[11px] font-mono px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors disabled:opacity-40"
-                            >
-                                Commit Only
-                            </button>
-                            {commitModal.email && (
+                            {canRetryEmail ? (
                                 <button
-                                    onClick={() => handleConfirmSend(false)}
+                                    onClick={handleRetryEmail}
                                     disabled={sendingPO}
-                                    className="text-[11px] font-mono px-4 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+                                    className="text-[11px] font-mono px-4 py-1.5 rounded bg-amber-700 hover:bg-amber-600 text-white border border-amber-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+                                    title="The PO is already committed in Finale; this retries just the vendor email step"
                                 >
                                     {sendingPO && <div className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />}
-                                    {sendingPO ? 'Sending…' : '✅ Commit & Email Vendor'}
+                                    {sendingPO ? 'Retrying…' : '↻ Retry Email'}
                                 </button>
+                            ) : (
+                                <>
+                                    <button
+                                        onClick={() => handleConfirmSend(true)}
+                                        disabled={sendingPO}
+                                        className="text-[11px] font-mono px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors disabled:opacity-40"
+                                    >
+                                        Commit Only
+                                    </button>
+                                    {commitModal.email && (
+                                        <button
+                                            onClick={() => handleConfirmSend(false)}
+                                            disabled={sendingPO}
+                                            className="text-[11px] font-mono px-4 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+                                        >
+                                            {sendingPO && <div className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />}
+                                            {sendingPO ? 'Sending…' : '✅ Commit & Email Vendor'}
+                                        </button>
+                                    )}
+                                </>
                             )}
                         </div>
                         {/* Step status — appears once a send is in flight */}

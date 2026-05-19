@@ -4,6 +4,7 @@ import {
     storePendingPOSend,
     getPendingPOSend,
     lookupVendorOrderEmail,
+    retrySendEmail,
 } from '@/lib/purchasing/po-sender';
 import { executePOSendAction } from '@/lib/copilot/actions';
 import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
@@ -96,6 +97,23 @@ export async function POST(req: NextRequest) {
                 { ...result, ...(verification ? { verification } : {}) },
                 { status: result.status === 'failed' ? 404 : 200 },
             );
+
+        } else if (action === 'retry-email') {
+            const { sendId } = body;
+            if (!sendId) return NextResponse.json({ error: 'sendId required' }, { status: 400 });
+            try {
+                const result = await retrySendEmail(sendId, 'dashboard');
+                if (result.emailSent) invalidatePurchasingCaches();
+                return NextResponse.json({
+                    status: result.emailSent ? 'success' : 'partial_success',
+                    userMessage: result.emailSent
+                        ? `PO #${result.orderId} emailed to ${result.sentTo} via ${result.emailVia === 'gmail-fallback' ? 'Gmail fallback' : 'Finale native'}`
+                        : `Retry failed for PO #${result.orderId}: ${result.emailError}`,
+                    details: result,
+                });
+            } catch (err: any) {
+                return NextResponse.json({ status: 'failed', error: err.message }, { status: 400 });
+            }
 
         } else if (action === 'cancel') {
             const { sendId } = body;

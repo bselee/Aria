@@ -1357,6 +1357,7 @@ export class OpsManager {
                 let lastVendorMsgAt: number | null = null;
                 let humanReplyDetectedAt: string | null = null;
                 let responseTimeMins: number | null = null;
+                let firstResponderAddress: string | null = null;
 
                 for (const msg of thread.messages.slice(1)) {
                     const from = msg.payload?.headers?.find(h => h.name === 'From')?.value || "";
@@ -1365,6 +1366,9 @@ export class OpsManager {
                         if (!responseAt) {
                             responseAt = msgTime;
                             responseTimeMins = Math.round((responseAt - sentAt) / 1000 / 60);
+                            // Pull just the address out of "Name <addr@host>" or "addr@host"
+                            const addrMatch = from.match(/<([^>]+)>/) ?? from.match(/([^\s<>"',]+@[^\s<>"',]+)/);
+                            if (addrMatch) firstResponderAddress = addrMatch[1].trim();
                         }
                         lastVendorMsgAt = msgTime;
                     } else if (lastVendorMsgAt && !humanReplyDetectedAt) {
@@ -1488,6 +1492,21 @@ export class OpsManager {
                         const willWrite = newOnes.length > 0 || (!alreadyHighConfidence && sentISO) || !!responseAt;
                         if (willWrite) {
                             await supabase.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
+                        }
+
+                        // Self-correcting routing: a vendor replied → trust the
+                        // responder address as the new orders_email. Skips noisy
+                        // re-confirms, self-addresses, manual overrides.
+                        if (responseAt && firstResponderAddress && vendorName) {
+                            try {
+                                const { recordVendorOrdersEmailFromReply } = await import("@/lib/purchasing/po-sender");
+                                const r = await recordVendorOrdersEmailFromReply(vendorName, firstResponderAddress);
+                                if (r.updated) {
+                                    console.log(`[po-sync] orders_email ${r.reason} for ${vendorName} → ${firstResponderAddress.toLowerCase()}`);
+                                }
+                            } catch (err: any) {
+                                console.warn(`[po-sync] orders_email write-back failed for ${vendorName}: ${err?.message ?? err}`);
+                            }
                         }
 
                         // Batch tracking updates into a single end-of-run message
