@@ -1,6 +1,6 @@
-/**
+﻿/**
  * @file    reconciler.ts
- * @purpose Core invoice → PO reconciliation engine.
+ * @purpose Core invoice â†’ PO reconciliation engine.
  *          Compares parsed invoice data against Finale PO details,
  *          identifies price/fee changes, applies them to Finale,
  *          and notifies Will of everything that changed.
@@ -12,12 +12,12 @@
  * DECISION(2026-05-20): Invoice is the source of truth.
  *   The Finale PO MUST match the invoice. Always. No approval queue.
  *   When an invoice arrives with a confirmed PO#:
- *     1. Apply ALL price changes — notify Will what changed, but apply it.
- *     2. Apply ALL fee/freight changes — same rule.
+ *     1. Apply ALL price changes â€” notify Will what changed, but apply it.
+ *     2. Apply ALL fee/freight changes â€” same rule.
  *     3. Notify loudly via Telegram with a full diff of what was applied.
  *   The ONLY hard blocks (needs_approval) are genuine data integrity failures:
- *     a. >10x magnitude price shift (decimal error: $2.60 → $26,000)
- *     b. OCR balance doesn't add up (invoice math is broken — don't trust it)
+ *     a. >10x magnitude price shift (decimal error: $2.60 â†’ $26,000)
+ *     b. OCR balance doesn't add up (invoice math is broken â€” don't trust it)
  *     c. No confirmed PO match (can't apply without knowing which PO)
  *     d. Vendor on invoice doesn't match vendor on PO (wrong PO matched)
  *
@@ -25,7 +25,7 @@
  *   were blocking all real work. Standard input vendors (Farm Fuel, Grassroots,
  *   Marion Ag, Ferticel, etc.) routinely have price changes >3% due to commodity
  *   pricing, seasonal rates, and freight variability. Holding PO updates for
- *   these is worse than applying them — mismatched POs cause receiving errors.
+ *   these is worse than applying them â€” mismatched POs cause receiving errors.
  */
 
 import * as agentTask from "../intelligence/agent-task";
@@ -41,9 +41,9 @@ import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
 import { writeReconciliationOutcome } from "../runtime/observability/reconciliation-outcomes";
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // PENDING APPROVAL STORE
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * In-memory store for reconciliation results awaiting Telegram bot approval.
@@ -75,7 +75,7 @@ export async function storePendingApproval(result: ReconciliationResult, client:
     // On reload after restart, we re-instantiate from env vars (stateless).
     // We omit ID for now since we'll get it from Supabase.
 
-    // Persist to Supabase — this is the durable source of truth.
+    // Persist to Supabase â€” this is the durable source of truth.
     let dbId = id; // Fallback or placeholder until SB returns it
     try {
         const supabase = createClient();
@@ -96,7 +96,7 @@ export async function storePendingApproval(result: ReconciliationResult, client:
         }
     } catch (err: any) {
         console.warn(`[reconciler] Failed to persist approval to Supabase: ${err.message}`);
-        // Non-fatal — will fallback to in-memory ID but won't survive restart
+        // Non-fatal â€” will fallback to in-memory ID but won't survive restart
     }
 
     pendingApprovals.set(dbId, {
@@ -128,7 +128,7 @@ export async function storePendingApproval(result: ReconciliationResult, client:
                 verdict_type: result.overallVerdict,
             },
             deadlineAt: expiresAt,
-            // Layer B: AP reconciliation approvals are human-only — no playbook
+            // Layer B: AP reconciliation approvals are human-only â€” no playbook
             // ever runs. Tag manual_only so the dashboard shows the amber
             // "manual" badge and the Layer C runner skips this row.
             playbookState: "manual_only",
@@ -142,7 +142,7 @@ export async function storePendingApproval(result: ReconciliationResult, client:
         // Phase 2 issue ledger: ensure the parent issue exists for this AP
         // flow, link the approval task to it, and block on
         // human_approval_required so the issue surfaces as Will-blocked on
-        // /issues and /dashboard. Best-effort — issue ledger failures must
+        // /issues and /dashboard. Best-effort â€” issue ledger failures must
         // never block the Telegram approval prompt.
         //
         // Handler ordering: ensure with `ap-reconciler` (the handler at the
@@ -244,7 +244,7 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
                 const expiresAt = new Date(row.expires_at);
                 const approvalId: string = row.id;
 
-                // Skip if already in memory (process didn't actually restart — just a race)
+                // Skip if already in memory (process didn't actually restart â€” just a race)
                 if (pendingApprovals.has(approvalId)) continue;
 
                 // Re-hydrate into in-memory cache with a fresh FinaleClient
@@ -257,7 +257,7 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
                     status: "pending",
                 });
 
-                // C3 FIX: No more setTimeout — expiry is column-based.
+                // C3 FIX: No more setTimeout â€” expiry is column-based.
                 // getPendingApproval() checks expires_at > now() on every read.
 
                 restored.push({
@@ -280,7 +280,7 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
 
 /**
  * Retrieve a pending approval by ID.
- * C3 FIX: Now async — reads from Supabase first, falls back to in-memory cache.
+ * C3 FIX: Now async â€” reads from Supabase first, falls back to in-memory cache.
  * On restart, in-memory cache is empty but Supabase has the row.
  */
 export async function getPendingApproval(id: string): Promise<PendingApproval | undefined> {
@@ -302,7 +302,7 @@ export async function getPendingApproval(id: string): Promise<PendingApproval | 
 
         if (!data) return undefined;
 
-        // Re-instantiate FinaleClient (stateless — reads creds from env)
+        // Re-instantiate FinaleClient (stateless â€” reads creds from env)
         const client = new FinaleClient();
         const entry: PendingApproval = {
             id: data.id,
@@ -357,17 +357,17 @@ export async function approvePendingReconciliation(id: string): Promise<{
             });
             const { data: pendingLog } = await sbPre.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
-                email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
+                email_subject: `Invoice ${entry.result.invoiceNumber} â†’ PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
-                action_taken: "Pending — applying approved changes to Finale...",
+                action_taken: "Pending â€” applying approved changes to Finale...",
                 metadata: { ...identity, status: "pending", approvalId: id },
             }).select("id").single();
             pendingLogId = pendingLog?.id ?? null;
         }
-    } catch { /* proceed — Finale write is still safe */ }
+    } catch { /* proceed â€” Finale write is still safe */ }
 
     // Phase 2: pass audit context so each Finale write lands in task_history
-    // attributed to the AP reconciler. Look up the linked issue lazily — if
+    // attributed to the AP reconciler. Look up the linked issue lazily â€” if
     // present, audit rows scope to it; if not, agent attribution is enough.
     const approvalIssueId = await apIssue.findApIssue({
         vendorName: entry.result.vendorName,
@@ -400,7 +400,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
     await agentTask.decideApprovalBySource("ap_pending_approvals", id, "approve", "reconciler");
 
     // Phase 2 issue ledger: clear the human_approval_required blocker and
-    // mark the issue complete. Best-effort — a missing issue (older
+    // mark the issue complete. Best-effort â€” a missing issue (older
     // approvals predating Phase 2) just no-ops.
     const approvedIssueId = await apIssue.findApIssue({
         vendorName: entry.result.vendorName,
@@ -439,7 +439,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
 
             await supabase.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
-                email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
+                email_subject: `Invoice ${entry.result.invoiceNumber} â†’ PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
                 action_taken: `Approved via Telegram: ${applyResult.applied.length} applied, ${applyResult.skipped.length} skipped, ${applyResult.errors.length} errors`,
                 metadata: {
@@ -468,8 +468,8 @@ export async function approvePendingReconciliation(id: string): Promise<{
                 .ilike("vendor_name", `%${entry.result.vendorName}%`);
         }
     } catch (logErr: any) {
-        console.warn(`⚠️ Failed to log approval to activity log: ${logErr.message}`);
-        // Fix 2: Alert Will — Finale was already updated but the audit log write failed.
+        console.warn(`âš ï¸ Failed to log approval to activity log: ${logErr.message}`);
+        // Fix 2: Alert Will â€” Finale was already updated but the audit log write failed.
         // Without this log entry, checkDuplicateReconciliation() will find nothing on the
         // next invoice poll and may attempt to reconcile the same invoice again.
         try {
@@ -477,7 +477,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
             await alertBot.telegram.sendMessage(
                 process.env.TELEGRAM_CHAT_ID!,
-                `🚨 AUDIT LOG FAILURE — approval for PO \`${entry.result.orderId}\` was applied to Finale but NOT logged to Supabase.\n⚠️ Risk of double-reconciliation on next invoice poll.\nManually verify PO in Finale and mark invoice as processed.`
+                `ðŸš¨ AUDIT LOG FAILURE â€” approval for PO \`${entry.result.orderId}\` was applied to Finale but NOT logged to Supabase.\nâš ï¸ Risk of double-reconciliation on next invoice poll.\nManually verify PO in Finale and mark invoice as processed.`
             );
         } catch { /* non-blocking */ }
     }
@@ -491,7 +491,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             // Build enriched content with price changes and fee breakdowns
             const priceDetail = entry.result.priceChanges
                 .filter(pc => pc.verdict !== "no_match")
-                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}`)
+                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)}`)
                 .join(", ");
             const feeDetail = entry.result.feeChanges
                 .map(fc => `${fc.feeType}: $${fc.amount.toFixed(2)}`)
@@ -511,10 +511,10 @@ export async function approvePendingReconciliation(id: string): Promise<{
                 relatedTo: entry.result.vendorName,
                 priority: "normal",
             });
-        } catch { /* non-blocking — never fail the approval flow */ }
+        } catch { /* non-blocking â€” never fail the approval flow */ }
     });
 
-    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    // Kaizen: record correction feedback (Pillar 1 â€” Correction Capture)
     recordFeedback({
         category: "correction",
         eventType: "reconciliation_approved",
@@ -532,8 +532,8 @@ export async function approvePendingReconciliation(id: string): Promise<{
         contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
     }).catch(() => { /* non-blocking */ });
 
-    // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
-    // runId: approvePendingReconciliation() has no ReconciliationRun in scope — random UUID is correct
+    // Observability: structured outcome â€” additive (parallel to ap_activity_log above), never throws
+    // runId: approvePendingReconciliation() has no ReconciliationRun in scope â€” random UUID is correct
     writeReconciliationOutcome({
         runId: crypto.randomUUID(),
         outcome: "approved_by_user",
@@ -554,7 +554,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
         success: true,
         applied: applyResult.applied,
         errors: applyResult.errors,
-        message: `✅ Applied ${applyResult.applied.length} change(s) to PO ${entry.result.orderId}.`,
+        message: `âœ… Applied ${applyResult.applied.length} change(s) to PO ${entry.result.orderId}.`,
     };
 }
 
@@ -578,8 +578,8 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
     await agentTask.decideApprovalBySource("ap_pending_approvals", id, "reject", "reconciler");
 
     // Phase 2 issue ledger: clear the blocker and mark complete with
-    // resolution=rejected. The issue IS resolved — Will made the decision
-    // (no changes apply) — so lifecycle moves to complete, not back to working.
+    // resolution=rejected. The issue IS resolved â€” Will made the decision
+    // (no changes apply) â€” so lifecycle moves to complete, not back to working.
     const rejectedIssueId = await apIssue.findApIssue({
         vendorName: entry.result.vendorName,
         invoiceNumber: entry.result.invoiceNumber,
@@ -595,7 +595,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
     }
 
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
-    // re-processing of the same invoice — rejections must be "sticky".
+    // re-processing of the same invoice â€” rejections must be "sticky".
     try {
         const supabase = createClient();
         if (supabase) {
@@ -613,9 +613,9 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
 
             await supabase.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
-                email_subject: `Invoice ${entry.result.invoiceNumber} → PO ${entry.result.orderId}`,
+                email_subject: `Invoice ${entry.result.invoiceNumber} â†’ PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
-                action_taken: "Rejected via Telegram — no changes applied",
+                action_taken: "Rejected via Telegram â€” no changes applied",
                 metadata: {
                     ...buildReconciliationIdentityMetadata({
                         invoiceNumber: entry.result.invoiceNumber,
@@ -636,8 +636,8 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
                 .ilike("vendor_name", `%${entry.result.vendorName}%`);
         }
     } catch (logErr: any) {
-        console.warn(`⚠️ Failed to log rejection to activity log: ${logErr.message}`);
-        // Fix 8: Alert Will — rejection was actioned but the audit log write failed.
+        console.warn(`âš ï¸ Failed to log rejection to activity log: ${logErr.message}`);
+        // Fix 8: Alert Will â€” rejection was actioned but the audit log write failed.
         // Without this log entry, checkDuplicateReconciliation() will find nothing on the
         // next invoice poll and may attempt to reconcile the same invoice again.
         try {
@@ -645,7 +645,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
             await alertBot.telegram.sendMessage(
                 process.env.TELEGRAM_CHAT_ID!,
-                `🚨 AUDIT LOG FAILURE — rejection for PO \`${entry.result.orderId}\` was actioned but NOT logged to Supabase.\n⚠️ Risk of duplicate reconciliation attempt on next invoice poll.\nNo Finale changes were made, but manually verify the invoice is not re-processed.`
+                `ðŸš¨ AUDIT LOG FAILURE â€” rejection for PO \`${entry.result.orderId}\` was actioned but NOT logged to Supabase.\nâš ï¸ Risk of duplicate reconciliation attempt on next invoice poll.\nNo Finale changes were made, but manually verify the invoice is not re-processed.`
             );
         } catch { /* non-blocking */ }
     }
@@ -658,7 +658,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
 
             const priceDetail = entry.result.priceChanges
                 .filter(pc => pc.verdict !== "no_match")
-                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}`)
+                .map(pc => `${pc.description}: $${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)}`)
                 .join(", ");
             const feeDetail = entry.result.feeChanges
                 .map(fc => `${fc.feeType}: $${fc.amount.toFixed(2)}`)
@@ -678,7 +678,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         } catch { /* non-blocking */ }
     });
 
-    // Kaizen: record correction feedback (Pillar 1 — Correction Capture)
+    // Kaizen: record correction feedback (Pillar 1 â€” Correction Capture)
     recordFeedback({
         category: "correction",
         eventType: "reconciliation_rejected",
@@ -696,8 +696,8 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         contextData: { invoiceNumber: entry.result.invoiceNumber, vendor: entry.result.vendorName },
     }).catch(() => { /* non-blocking */ });
 
-    // Observability: structured outcome — additive (parallel to ap_activity_log above), never throws
-    // runId: rejectPendingReconciliation() has no ReconciliationRun in scope — random UUID is correct
+    // Observability: structured outcome â€” additive (parallel to ap_activity_log above), never throws
+    // runId: rejectPendingReconciliation() has no ReconciliationRun in scope â€” random UUID is correct
     writeReconciliationOutcome({
         runId: crypto.randomUUID(),
         outcome: "rejected_by_user",
@@ -712,19 +712,19 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         resolvedAt: new Date(),
     }).catch(() => { /* never throws */ });
 
-    return `❌ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
+    return `âŒ Rejected changes to PO ${entry.result.orderId}. No updates applied.`;
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // DUPLICATE DETECTION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Check whether this invoice+PO combination has already been reconciled.
  * Queries ap_activity_log for a prior RECONCILIATION entry with matching
  * invoiceNumber and orderId in the metadata JSONB column.
  *
- * DECISION(2026-02-26): Fail-open on Supabase errors — if the check itself
+ * DECISION(2026-02-26): Fail-open on Supabase errors â€” if the check itself
  * fails we proceed rather than blocking a legitimate first-time reconciliation.
  * The trade-off: occasional double-process is safer than permanent blockage.
  *
@@ -796,18 +796,18 @@ async function checkDuplicateReconciliation(
 
 
     } catch (err: any) {
-        console.warn(`⚠️ Duplicate check failed, proceeding anyway: ${err.message}`);
+        console.warn(`âš ï¸ Duplicate check failed, proceeding anyway: ${err.message}`);
         return { isDuplicate: false };
     }
 }
 
-// ──────────────────────────────────────────────────
-// CONFIGURATION — Safety thresholds
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// CONFIGURATION â€” Safety thresholds
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * DECISION(2026-02-26): Safety thresholds for price changes.
- * These are intentionally conservative — better to ask than to auto-apply
+ * These are intentionally conservative â€” better to ask than to auto-apply
  * a catastrophic price change to Finale.
  */
 const RECONCILIATION_CONFIG = {
@@ -815,7 +815,7 @@ const RECONCILIATION_CONFIG = {
      * DECISION(2026-05-20): Invoice = source of truth.
      * All price changes are auto-approved and applied immediately.
      * Will is notified via Telegram with the full diff.
-     * Set to 1.0 (100%) — effectively no percentage cap.
+     * Set to 1.0 (100%) â€” effectively no percentage cap.
      * Only hard blocks: >10x magnitude errors and OCR balance failures.
      */
     AUTO_APPROVE_PERCENT: 1.0,
@@ -823,8 +823,8 @@ const RECONCILIATION_CONFIG = {
     /**
      * Maximum multiplier before outright rejection.
      * If new_price / old_price > 10 or < 0.1, it's almost certainly a
-     * decimal/UOM error (e.g., $2.60 → $26,000 or case-price → each-price).
-     * These are NEVER auto-applied — they require explicit correction.
+     * decimal/UOM error (e.g., $2.60 â†’ $26,000 or case-price â†’ each-price).
+     * These are NEVER auto-applied â€” they require explicit correction.
      * This is the ONLY price guardrail that blocks auto-apply.
      */
     MAGNITUDE_CEILING: 10,
@@ -832,7 +832,7 @@ const RECONCILIATION_CONFIG = {
     /**
      * DECISION(2026-05-20): Dollar aggregate cap REMOVED.
      * The previous $500 cap blocked every real invoice (Farm Fuel, Grassroots,
-     * Marion Ag, etc.). Aggregate dollar impact is not a useful signal —
+     * Marion Ag, etc.). Aggregate dollar impact is not a useful signal â€”
      * large invoices are normal. The per-line magnitude ceiling catches the
      * only real risk (decimal errors). No aggregate cap applied.
      */
@@ -841,7 +841,7 @@ const RECONCILIATION_CONFIG = {
     /**
      * High-value threshold: still log and call out in Telegram notification
      * for situational awareness, but DO NOT block auto-apply.
-     * $5,000/unit is still applied — just flagged prominently in the message.
+     * $5,000/unit is still applied â€” just flagged prominently in the message.
      */
     HIGH_VALUE_THRESHOLD: 5000,
 
@@ -860,12 +860,12 @@ const RECONCILIATION_CONFIG = {
         DISCOUNT_20:  Infinity,
     } as Record<string, number>,
 
-    /** Fallback cap for fee types not listed above — also no block. */
+    /** Fallback cap for fee types not listed above â€” also no block. */
     FEE_AUTO_APPROVE_DEFAULT: Infinity,
 
     /**
      * Balance check gating: if the invoice's own math doesn't add up,
-     * that's an OCR failure — don't apply garbage data to Finale.
+     * that's an OCR failure â€” don't apply garbage data to Finale.
      * Warn at $1 / 2% gap. BLOCK (needs_approval) at $25 / 10% gap.
      * DECISION(2026-05-20): Raised dollar gate from $5 to $25 so minor
      * rounding differences (cents) don't block real invoices.
@@ -883,9 +883,9 @@ const RECONCILIATION_CONFIG = {
     VENDOR_FUZZY_THRESHOLD: 0.5,
 } as const;
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // FEE AUTO-APPROVE HELPERS
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Look up the auto-approve dollar cap for a given fee type.
@@ -899,15 +899,15 @@ function getFeeAutoApproveCap(feeType: string): number {
         ?? RECONCILIATION_CONFIG.FEE_AUTO_APPROVE_DEFAULT;
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // TYPES
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export type ReconciliationVerdict =
-    | "auto_approve"      // ≤3% change, safe to apply automatically
+    | "auto_approve"      // â‰¤3% change, safe to apply automatically
     | "needs_approval"    // >3% change, send to Telegram for approval
     | "rejected"          // Magnitude error detected, do NOT apply
-    | "duplicate"         // Invoice already reconciled — do not re-apply
+    | "duplicate"         // Invoice already reconciled â€” do not re-apply
     | "no_change"         // Prices match, nothing to do
     | "no_match";         // Could not find matching line item
 
@@ -918,7 +918,7 @@ export interface PriceChange {
     invoicePrice: number;
     quantity: number;
     percentChange: number;
-    dollarImpact: number;       // (invoicePrice - poPrice) × quantity
+    dollarImpact: number;       // (invoicePrice - poPrice) Ã— quantity
     verdict: ReconciliationVerdict;
     reason: string;
 }
@@ -967,14 +967,14 @@ export function buildReconciliationIdentityMetadata(input: {
     };
 }
 
-// ──────────────────────────────────────────────────
-// RECONCILIATION REPORT — accounting audit trail
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// RECONCILIATION REPORT â€” accounting audit trail
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Structured audit report produced at the end of every reconcileInvoiceToPO() call.
  * Written into ap_activity_log.reconciliation_report (JSONB) for accounting compliance.
- * All fields map 1:1 to data already computed during reconciliation — no extra API calls.
+ * All fields map 1:1 to data already computed during reconciliation â€” no extra API calls.
  */
 export interface ReconciliationReport {
     generated_at: string;           // ISO timestamp
@@ -1042,32 +1042,32 @@ export interface ReconciliationResult {
     warnings: string[];         // Non-blocking issues (vendor fuzzy match, low-confidence match, etc.)
     vendorNote?: string;        // Set when vendor correlation used non-name signal to confirm
     notes?: string;             // Non-blocking informational notes (e.g., balance validation warning)
-    report?: ReconciliationReport;  // Structured audit report — populated at end of reconcileInvoiceToPO()
-    populateItems?: Array<{ productId: string; quantity: number; unitPrice: number; description: string }>;  // Set when PO is empty draft — items to add on approval
+    report?: ReconciliationReport;  // Structured audit report â€” populated at end of reconcileInvoiceToPO()
+    populateItems?: Array<{ productId: string; quantity: number; unitPrice: number; description: string }>;  // Set when PO is empty draft â€” items to add on approval
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // INVOICE BALANCE VALIDATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Validates that the extracted line items + fees sum to the invoice total.
  * A significant gap (>2% of total AND >$1.00) is a signal that OCR or LLM
  * extraction dropped a line item, misread a fee, or garbled the total.
  *
- * This is a NON-BLOCKING check — it returns a warning but never aborts
+ * This is a NON-BLOCKING check â€” it returns a warning but never aborts
  * reconciliation. The intent is to surface extraction unreliability early
  * so the reconciliation result can carry that context in `notes`.
  *
  * @param invoice  Parsed invoice data
- * @returns        { valid, gap, message } — valid=false means the balance gap
+ * @returns        { valid, gap, message } â€” valid=false means the balance gap
  *                 is material and the extraction may not be trustworthy.
  */
 export function validateInvoiceBalance(
     invoice: InvoiceData
 ): { valid: boolean; gap: number; message: string } {
     if (!invoice.total || invoice.total <= 0) {
-        return { valid: true, gap: 0, message: "Invoice total is zero — balance check skipped" };
+        return { valid: true, gap: 0, message: "Invoice total is zero â€” balance check skipped" };
     }
 
     // Sum only product lines (skip adjustment lines with qty=0 or unitPrice=0)
@@ -1088,13 +1088,13 @@ export function validateInvoiceBalance(
     const gap = Math.abs(computed - invoice.total);
     const gapPct = gap / invoice.total;
 
-    // M2 FIX: Two-tier gating — small gaps warn, large gaps block
+    // M2 FIX: Two-tier gating â€” small gaps warn, large gaps block
     if (gapPct > RECONCILIATION_CONFIG.BALANCE_GATE_PCT && gap > RECONCILIATION_CONFIG.BALANCE_GATE_DOLLARS) {
         return {
             valid: false,
             gap,
             severity: "gate" as const,
-            message: `⛔ Large balance gap — extraction unreliable (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%). Forcing manual approval.`,
+            message: `â›” Large balance gap â€” extraction unreliable (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%). Forcing manual approval.`,
         };
     }
     if (gapPct > RECONCILIATION_CONFIG.BALANCE_WARN_PCT && gap > RECONCILIATION_CONFIG.BALANCE_WARN_DOLLARS) {
@@ -1102,28 +1102,28 @@ export function validateInvoiceBalance(
             valid: false,
             gap,
             severity: "warn" as const,
-            message: `⚠️ Extraction may be unreliable — line items + fees don't balance to invoice total (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%)`,
+            message: `âš ï¸ Extraction may be unreliable â€” line items + fees don't balance to invoice total (computed $${computed.toFixed(2)} vs stated $${invoice.total.toFixed(2)}, gap $${gap.toFixed(2)} / ${(gapPct * 100).toFixed(1)}%)`,
         };
     }
 
     return { valid: true, gap, severity: "ok" as const, message: "Invoice balance checks out" };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CORE RECONCILIATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Compare an invoice against a Finale PO and determine what needs updating.
- * Does NOT mutate Finale — only produces a reconciliation plan.
+ * Does NOT mutate Finale â€” only produces a reconciliation plan.
  *
  * Guard sequence (fast-fail order):
- *   0. Duplicate detection   — already reconciled? Stop immediately.
- *   1. Vendor correlation    — does this invoice belong to this PO?
- *   2. Quantity overbill     — per-line check inside reconcileLineItems()
- *   3. Fee threshold         — per-fee check inside reconcileFees()
- *   4. Price % + magnitude   — existing guardrails in evaluatePriceChange()
- *   5. Total impact cap      — aggregate dollar check
+ *   0. Duplicate detection   â€” already reconciled? Stop immediately.
+ *   1. Vendor correlation    â€” does this invoice belong to this PO?
+ *   2. Quantity overbill     â€” per-line check inside reconcileLineItems()
+ *   3. Fee threshold         â€” per-fee check inside reconcileFees()
+ *   4. Price % + magnitude   â€” existing guardrails in evaluatePriceChange()
+ *   5. Total impact cap      â€” aggregate dollar check
  *
  * @param invoice   - Parsed invoice data from the LLM extractor
  * @param orderId   - The Finale PO orderId to reconcile against
@@ -1138,16 +1138,16 @@ export async function reconcileInvoiceToPO(
 ): Promise<ReconciliationResult> {
     const warnings: string[] = [];
 
-    // ── Defensive: lineItems is typed as required, but runtime callers (po-sweep,
+    // â”€â”€ Defensive: lineItems is typed as required, but runtime callers (po-sweep,
     // legacy DB rows missing raw_data, partial extractions) can pass invoices
     // with lineItems=null/undefined. Normalize once here so every downstream
     // consumer (validateInvoiceBalance, reconcileLineItems, subtotal helpers,
     // notes builder) can safely iterate. The field absence is itself a useful
-    // signal — surface it as a warning.
+    // signal â€” surface it as a warning.
     if (!Array.isArray(invoice.lineItems)) {
         warnings.push(
             `Invoice has no lineItems array (got ${invoice.lineItems === null ? "null" : typeof invoice.lineItems}). ` +
-            `Reconciling fees/totals only — line-item price changes cannot be computed.`
+            `Reconciling fees/totals only â€” line-item price changes cannot be computed.`
         );
         invoice = { ...invoice, lineItems: [] };
     }
@@ -1164,19 +1164,19 @@ export async function reconcileInvoiceToPO(
         invoice = { ...invoice, invoiceNumber: invoice.invoiceNumber == null ? "" : String(invoice.invoiceNumber) };
     }
 
-    // ── Balance validation ─────────────────────────────────────────────────────
-    // M2 FIX: Two tiers — "warn" is non-blocking, "gate" forces needs_approval.
+    // â”€â”€ Balance validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // M2 FIX: Two tiers â€” "warn" is non-blocking, "gate" forces needs_approval.
     // A large balance gap means OCR extraction is untrustworthy.
     const balanceCheck = validateInvoiceBalance(invoice);
     if (!balanceCheck.valid) {
-        console.warn(`[reconciler] ⚠️ Balance validation: ${balanceCheck.message}`);
+        console.warn(`[reconciler] âš ï¸ Balance validation: ${balanceCheck.message}`);
     }
     const balanceNote = balanceCheck.valid ? undefined : balanceCheck.message;
     // M2 FIX: If the gap is large enough to be unreliable, force manual review.
     const balanceGatesApproval = balanceCheck.severity === "gate";
 
-    // ── H2: Vendor memory fee label consult ────────────────────────────────────
-    // Fetch any vendor-specific fee label → Finale fee type mappings from Pinecone.
+    // â”€â”€ H2: Vendor memory fee label consult â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Fetch any vendor-specific fee label â†’ Finale fee type mappings from Pinecone.
     // Non-fatal: if vendor memory is unavailable, fall back to hardcoded defaults.
     let vendorFeeLabelMap: Record<string, string> = {};
     try {
@@ -1186,16 +1186,16 @@ export async function reconcileInvoiceToPO(
             console.log(`[reconciler] H2: Loaded ${Object.keys(vendorFeeLabelMap).length} vendor fee label mappings for ${invoice.vendorName}`);
         }
     } catch {
-        // Non-fatal — vendor memory is advisory only
+        // Non-fatal â€” vendor memory is advisory only
     }
 
-    // ── Guard 0: Duplicate detection ──────────────────────────────────────────
+    // â”€â”€ Guard 0: Duplicate detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Fast-fail before any Finale reads. If this invoice+PO combo was already
-    // reconciled, stop cold and alert loudly — do not re-apply anything.
+    // reconciled, stop cold and alert loudly â€” do not re-apply anything.
     const dupeCheck = await checkDuplicateReconciliation(invoice, orderId);
     if (dupeCheck.isDuplicate) {
         const dupeSummary =
-            `🔁 DUPLICATE INVOICE: Invoice #${invoice.invoiceNumber} was already ` +
+            `ðŸ” DUPLICATE INVOICE: Invoice #${invoice.invoiceNumber} was already ` +
             `reconciled against PO ${orderId} on ${dupeCheck.processedAt}. ` +
             `No changes applied.\nPrior action: ${dupeCheck.actionTaken}`;
         return {
@@ -1214,7 +1214,7 @@ export async function reconcileInvoiceToPO(
         };
     }
 
-    // ── Fetch PO ───────────────────────────────────────────────────────────────
+    // â”€â”€ Fetch PO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const poSummary = await client.getOrderSummary(orderId);
     if (!poSummary) {
         return {
@@ -1225,7 +1225,7 @@ export async function reconcileInvoiceToPO(
             feeChanges: [],
             trackingUpdate: null,
             overallVerdict: "no_match",
-            summary: `⚠️ Could not fetch PO ${orderId} from Finale`,
+            summary: `âš ï¸ Could not fetch PO ${orderId} from Finale`,
             totalDollarImpact: 0,
             autoApplicable: false,
             warnings: [],
@@ -1233,7 +1233,7 @@ export async function reconcileInvoiceToPO(
         };
     }
 
-    // ── Guard 0.5: Empty PO — try to populate from invoice items ──────────────
+    // â”€â”€ Guard 0.5: Empty PO â€” try to populate from invoice items â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Draft POs often have no items yet. Instead of surfacing a useless needs_approval
     // (where approving does nothing), try to resolve invoice SKUs in Finale and offer
     // to populate the PO on approval.
@@ -1254,7 +1254,7 @@ export async function reconcileInvoiceToPO(
                             description: li.description || sku,
                         });
                     }
-                } catch { /* unresolved SKU — skip */ }
+                } catch { /* unresolved SKU â€” skip */ }
             }
         }
 
@@ -1264,12 +1264,12 @@ export async function reconcileInvoiceToPO(
         if (populateItems.length > 0) {
             const lineTotal = populateItems.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
             const resolvedNote = `${populateItems.length}/${invoice.lineItems?.length ?? 0} invoice SKUs resolved in Finale`;
-            const itemLines = populateItems.map(i => `  • ${i.productId} × ${i.quantity} @ $${i.unitPrice.toFixed(2)} = $${(i.quantity * i.unitPrice).toFixed(2)}`).join('\n');
+            const itemLines = populateItems.map(i => `  â€¢ ${i.productId} Ã— ${i.quantity} @ $${i.unitPrice.toFixed(2)} = $${(i.quantity * i.unitPrice).toFixed(2)}`).join('\n');
             const feeLines = feeChanges.length > 0
                 ? `\nFees: ` + feeChanges.map(f => `${f.description} $${f.amount.toFixed(2)}`).join(', ')
                 : '';
             const populateSummary =
-                `📋 Draft PO ${orderId} has no items — approve to populate from invoice?\n` +
+                `ðŸ“‹ Draft PO ${orderId} has no items â€” approve to populate from invoice?\n` +
                 `${resolvedNote}\n${itemLines}${feeLines}\n` +
                 `Total: $${(lineTotal + feeTotal).toFixed(2)}`;
 
@@ -1291,10 +1291,10 @@ export async function reconcileInvoiceToPO(
             };
         }
 
-        // No SKUs resolved in Finale — can't auto-populate, flag for manual review
+        // No SKUs resolved in Finale â€” can't auto-populate, flag for manual review
         const emptyPoWarnings = [
             ...warnings,
-            `PO ${orderId} has 0 line items — ${invoice.lineItems?.length ?? 0} invoice SKUs could not be resolved in Finale. Manual review required.`
+            `PO ${orderId} has 0 line items â€” ${invoice.lineItems?.length ?? 0} invoice SKUs could not be resolved in Finale. Manual review required.`
         ];
         return {
             orderId,
@@ -1305,7 +1305,7 @@ export async function reconcileInvoiceToPO(
             feeChanges: [],
             trackingUpdate: null,
             overallVerdict: "needs_approval",
-            summary: `⚠️ PO ${orderId} has no line items and no invoice SKUs could be resolved in Finale. Manual review required.`,
+            summary: `âš ï¸ PO ${orderId} has no line items and no invoice SKUs could be resolved in Finale. Manual review required.`,
             totalDollarImpact: 0,
             autoApplicable: false,
             warnings: emptyPoWarnings,
@@ -1313,14 +1313,14 @@ export async function reconcileInvoiceToPO(
         };
     }
 
-    // ── Guard 1: Vendor correlation ────────────────────────────────────────────
+    // â”€â”€ Guard 1: Vendor correlation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Verify the invoice vendor plausibly matches this PO's supplier.
     // Falls back to PO# reference and SKU overlap when names diverge.
     const vendorCorrelation = validateVendorCorrelation(invoice, poSummary, orderId);
     let vendorNote: string | undefined;
 
     if (!vendorCorrelation.pass) {
-        // Low confidence — no name, PO#, or SKU evidence. Escalate for human review.
+        // Low confidence â€” no name, PO#, or SKU evidence. Escalate for human review.
         const vendorMismatchWarnings = [...warnings, vendorCorrelation.note];
         return {
             orderId,
@@ -1341,7 +1341,7 @@ export async function reconcileInvoiceToPO(
             report: buildReconciliationReport(invoice, poSummary, [], [], balanceCheck, "needs_approval", vendorMismatchWarnings),
         };
     } else if (vendorCorrelation.confidence !== "high") {
-        // Medium confidence — proceed but surface the mismatch in the summary.
+        // Medium confidence â€” proceed but surface the mismatch in the summary.
         // Dollar-impact escalation for medium confidence is applied after totalDollarImpact
         // is calculated (see step 5.5 below).
         warnings.push(vendorCorrelation.note);
@@ -1367,20 +1367,20 @@ export async function reconcileInvoiceToPO(
             .filter((fc) => fc.feeType !== "FREIGHT")
             .reduce((sum, fc) => sum + Math.abs(fc.amount - fc.existingAmount), 0);
 
-    // 5. Aggregate impact gate — REMOVED (2026-05-20).
+    // 5. Aggregate impact gate â€” REMOVED (2026-05-20).
     // DECISION: Invoice = source of truth. Dollar caps were blocking every real
     // invoice. TOTAL_IMPACT_CAP_DOLLARS is now Infinity. This block is a no-op
     // but kept so git history shows the intentional removal.
     // The only remaining hard block is the MAGNITUDE_CEILING (10x) per-line check.
 
-    // 5.5 Medium vendor confidence gate — REMOVED (2026-05-20).
+    // 5.5 Medium vendor confidence gate â€” REMOVED (2026-05-20).
     // DECISION: PO# on invoice is the primary match signal, not vendor name
     // Jaccard similarity. When PO# resolves cleanly in Finale, vendor confidence
-    // is irrelevant — the PO IS the right PO. Blocking on name confidence while
+    // is irrelevant â€” the PO IS the right PO. Blocking on name confidence while
     // PO# is confirmed was creating false holds. vendor_aliases migration already
     // normalises name variants. Remove this gate entirely.
 
-    // 6. Determine overall verdict — fee verdicts now count alongside price verdicts
+    // 6. Determine overall verdict â€” fee verdicts now count alongside price verdicts
     const priceVerdicts = priceChanges.map(pc => pc.verdict);
     const feeVerdicts = feeChanges.map(fc => fc.verdict);
     let overallVerdict: ReconciliationVerdict = "no_change";
@@ -1393,7 +1393,7 @@ export async function reconcileInvoiceToPO(
         overallVerdict = "auto_approve";
     }
 
-    // M2 FIX: If balance gap is large, override auto_approve → needs_approval.
+    // M2 FIX: If balance gap is large, override auto_approve â†’ needs_approval.
     // Large gap = OCR extraction is unreliable, don't apply changes silently.
     if (balanceGatesApproval && overallVerdict === "auto_approve") {
         overallVerdict = "needs_approval";
@@ -1408,13 +1408,13 @@ export async function reconcileInvoiceToPO(
         totalDollarImpact, overallVerdict, warnings
     );
 
-    // M3: Learn fee label → Finale fee type mappings after successful reconciliation.
+    // M3: Learn fee label â†’ Finale fee type mappings after successful reconciliation.
     // Fire-and-forget: don't block the return. Only learn from auto_approve or no_change
-    // verdicts — these are high-confidence and safe to learn from.
+    // verdicts â€” these are high-confidence and safe to learn from.
     if (overallVerdict === "auto_approve" || overallVerdict === "no_change") {
         setImmediate(async () => {
             try {
-                // Build a map of invoice charge labels → Finale fee types from this reconciliation
+                // Build a map of invoice charge labels â†’ Finale fee types from this reconciliation
                 const learnedMap: Record<string, string> = { ...vendorFeeLabelMap };
                 for (const fc of feeChanges) {
                     if (fc.description && fc.feeType) {
@@ -1437,7 +1437,7 @@ export async function reconcileInvoiceToPO(
                     console.log(`[reconciler] M3: Learned ${Object.keys(learnedMap).length} fee label mappings for ${invoice.vendorName}`);
                 }
             } catch {
-                // Non-fatal — learning is advisory only
+                // Non-fatal â€” learning is advisory only
             }
         });
     }
@@ -1461,16 +1461,16 @@ export async function reconcileInvoiceToPO(
     };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // UOM NORMALIZATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
- * UOM → multiplier to convert invoice qty to base countable units (EA).
+ * UOM â†’ multiplier to convert invoice qty to base countable units (EA).
  * Used for case/pack reconciliation where vendors bill per-case but
  * Finale tracks per-unit (or vice versa).
  *
- * DECISION: "case" defaults to 12 units; "bag" is weight-based → see UOM_TO_LB.
+ * DECISION: "case" defaults to 12 units; "bag" is weight-based â†’ see UOM_TO_LB.
  * Vendor-specific overrides (e.g., "case/24") are handled via explicit keys.
  */
 const UOM_TO_EA: Record<string, number> = {
@@ -1480,11 +1480,11 @@ const UOM_TO_EA: Record<string, number> = {
 };
 
 /**
- * UOM → multiplier to convert invoice qty to base weight units (LB).
+ * UOM â†’ multiplier to convert invoice qty to base weight units (LB).
  * Used for bulk material lines where weight-per-bag varies by product.
  *
  * DECISION: "bag" defaults to 50 lb; override with explicit "bag/40" etc.
- * "pallet" treated as ~2000 lb (approximate — always needs_approval via
+ * "pallet" treated as ~2000 lb (approximate â€” always needs_approval via
  * the existing magnitude guardrail anyway if the price swing is large).
  */
 const UOM_TO_LB: Record<string, number> = {
@@ -1501,7 +1501,7 @@ const UOM_TO_LB: Record<string, number> = {
  * Normalize a line item to a common base unit for apples-to-apples comparison.
  *
  * Returns `{ baseQty, normalizedPrice, normalized }` where:
- *   - baseQty       = qty × uom multiplier (e.g., 10 cases × 12 = 120 EA)
+ *   - baseQty       = qty Ã— uom multiplier (e.g., 10 cases Ã— 12 = 120 EA)
  *   - normalizedPrice = total / baseQty  (per base-unit price)
  *   - normalized    = true if a UOM conversion was applied
  *
@@ -1534,18 +1534,18 @@ export function normalizeLineTotal(
         return { baseQty, normalizedPrice, normalized: true };
     }
 
-    // EA=1 or LB=1 keys — already in base unit, no conversion needed
+    // EA=1 or LB=1 keys â€” already in base unit, no conversion needed
     return { baseQty: qty, normalizedPrice: unitPrice, normalized: false };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // VENDOR CORRELATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
- * Jaccard word-overlap similarity between two strings (0.0–1.0).
+ * Jaccard word-overlap similarity between two strings (0.0â€“1.0).
  * Normalizes to lowercase, strips punctuation, splits on whitespace.
- * "BuildASoil Organics" vs "BuildASoil Organics LLC" → ~0.67
+ * "BuildASoil Organics" vs "BuildASoil Organics LLC" â†’ ~0.67
  */
 function wordOverlapSimilarity(a: string | null | undefined, b: string | null | undefined): number {
     // Fix 7: Collapse dotted initials before stripping punctuation so that
@@ -1571,10 +1571,10 @@ function wordOverlapSimilarity(a: string | null | undefined, b: string | null | 
 /**
  * Validate that the invoice vendor plausibly belongs to this Finale PO.
  * Uses a three-signal waterfall:
- *   1. Vendor name similarity ≥ VENDOR_FUZZY_THRESHOLD  →  HIGH confidence
- *   2. Invoice PO# matches orderId                       →  MEDIUM confidence
- *   3. ≥50% of invoice SKUs found on PO lines           →  MEDIUM confidence
- *   None match                                           →  LOW → block auto-apply
+ *   1. Vendor name similarity â‰¥ VENDOR_FUZZY_THRESHOLD  â†’  HIGH confidence
+ *   2. Invoice PO# matches orderId                       â†’  MEDIUM confidence
+ *   3. â‰¥50% of invoice SKUs found on PO lines           â†’  MEDIUM confidence
+ *   None match                                           â†’  LOW â†’ block auto-apply
  *
  * Returning pass:false means the reconciliation becomes "needs_approval" so
  * Will sees the mismatch before anything touches Finale.
@@ -1590,12 +1590,12 @@ function validateVendorCorrelation(
         return {
             pass: true,
             confidence: "high",
-            note: `Vendor matched: "${invoice.vendorName}" ↔ "${poSummary.supplier}" (${(similarity * 100).toFixed(0)}% word overlap)`,
+            note: `Vendor matched: "${invoice.vendorName}" â†” "${poSummary.supplier}" (${(similarity * 100).toFixed(0)}% word overlap)`,
         };
     }
 
-    // Signal 1b: Brand word match — any significant shared word (>4 chars) is a brand indicator.
-    // Catches "Riceland Foods, Inc." ↔ "Riceland USA" where Jaccard is only 0.25
+    // Signal 1b: Brand word match â€” any significant shared word (>4 chars) is a brand indicator.
+    // Catches "Riceland Foods, Inc." â†” "Riceland USA" where Jaccard is only 0.25
     // but the distinctive brand name "Riceland" is shared.
     // Fix 4: Blocklist common generic words that appear across unrelated vendors and
     // would otherwise produce false-positive medium-confidence matches.
@@ -1626,7 +1626,7 @@ function validateVendorCorrelation(
     if (sharedBrandWord) {
         // 2026-05-15: Promote to "high" when invoice PO# ALSO matches this
         // order. Two independent signals (brand word + PO#) is as strong as
-        // a Jaccard name match — Faust PO #124694 was the canonical case:
+        // a Jaccard name match â€” Faust PO #124694 was the canonical case:
         // "Faust" shared brand word + invoice PO# "124694" matched. Without
         // this, downstream gate (confidence !== high && impact >= $100) held
         // the freight auto-apply.
@@ -1636,22 +1636,22 @@ function validateVendorCorrelation(
             confidence,
             note: confidence === "high"
                 ? `Vendor confirmed: shared brand word "${sharedBrandWord}" + invoice PO# ${invoice.poNumber} matches this order.`
-                : `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed via shared brand word "${sharedBrandWord}".`,
+                : `âš ï¸ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") â€” confirmed via shared brand word "${sharedBrandWord}".`,
         };
     }
 
     // Signal 2: PO number on invoice explicitly references this order (no
-    // brand word corroboration — stays medium since PO# alone can be wrong
+    // brand word corroboration â€” stays medium since PO# alone can be wrong
     // via vendor typo or OCR misread on a similar order number).
     if (poNumberMatches) {
         return {
             pass: true,
             confidence: "medium",
-            note: `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed via PO# reference on invoice (${invoice.poNumber}).`,
+            note: `âš ï¸ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") â€” confirmed via PO# reference on invoice (${invoice.poNumber}).`,
         };
     }
 
-    // Signal 3: SKU overlap — at least half the invoice SKUs appear on this PO
+    // Signal 3: SKU overlap â€” at least half the invoice SKUs appear on this PO
     const poSkus = new Set(poSummary.items.map(i => i.productId.toLowerCase()));
     const invoiceSkus = invoice.lineItems
         .map(l => l.sku?.toLowerCase())
@@ -1663,22 +1663,22 @@ function validateVendorCorrelation(
             return {
                 pass: true,
                 confidence: "medium",
-                note: `⚠️ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") — confirmed by ${matched}/${invoiceSkus.length} SKU matches.`,
+                note: `âš ï¸ Vendor name mismatch ("${invoice.vendorName}" vs PO supplier "${poSummary.supplier}") â€” confirmed by ${matched}/${invoiceSkus.length} SKU matches.`,
             };
         }
     }
 
-    // No signals matched — block and require manual review
+    // No signals matched â€” block and require manual review
     return {
         pass: false,
         confidence: "low",
-        note: `🚨 VENDOR MISMATCH: Invoice vendor "${invoice.vendorName}" does not correlate with PO supplier "${poSummary.supplier}". No PO# or SKU evidence to confirm. Manual review required.`,
+        note: `ðŸš¨ VENDOR MISMATCH: Invoice vendor "${invoice.vendorName}" does not correlate with PO supplier "${poSummary.supplier}". No PO# or SKU evidence to confirm. Manual review required.`,
     };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // LINE ITEM PRICE COMPARISON
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function reconcileLineItems(
     invoice: InvoiceData,
@@ -1688,7 +1688,7 @@ function reconcileLineItems(
     const matchedPoProductIds = new Set<string>(); // prevent double-matching the same PO product
 
     for (const invLine of invoice.lineItems) {
-        // Skip adjustment/credit lines — these have $0 unit price or 0 qty and are
+        // Skip adjustment/credit lines â€” these have $0 unit price or 0 qty and are
         // invoice metadata (e.g., "Pts Pr Adj", freight credits), not product lines.
         if (invLine.unitPrice === 0 || invLine.qty === 0) {
             console.log(`     [reconciler] Skipping adjustment line: "${invLine.description}" (qty=${invLine.qty}, unitPrice=${invLine.unitPrice})`);
@@ -1707,7 +1707,7 @@ function reconcileLineItems(
         if (poLine) matchedPoProductIds.add(poLine.productId);
 
         if (!poLine) {
-            // Invoice has a line item not found in PO — info only, don't block
+            // Invoice has a line item not found in PO â€” info only, don't block
             changes.push({
                 productId: invLine.sku || "UNKNOWN",
                 description: invLine.description,
@@ -1717,7 +1717,7 @@ function reconcileLineItems(
                 percentChange: 100,
                 dollarImpact: invLine.total,
                 verdict: "no_match",
-                reason: "Invoice line item not found in PO — may be a new item or SKU mismatch",
+                reason: "Invoice line item not found in PO â€” may be a new item or SKU mismatch",
             });
             continue;
         }
@@ -1755,7 +1755,7 @@ function reconcileLineItems(
             const lbMult = UOM_TO_LB[uomKey];
             const mult = eaMult ?? lbMult ?? 1;
             const baseUnit = eaMult !== undefined ? "EA" : "LB";
-            pReason += ` | UOM normalized: ${(invLine.unit ?? "").toUpperCase()} →${baseUnit !== "EA" ? " per " : " "}${baseUnit} (×${mult})`;
+            pReason += ` | UOM normalized: ${(invLine.unit ?? "").toUpperCase()} â†’${baseUnit !== "EA" ? " per " : " "}${baseUnit} (Ã—${mult})`;
 
             // Ambiguous case/bag keys: the multiplier was assumed, not stated explicitly
             // in the UOM string. Force needs_approval so Will can verify the pack size.
@@ -1764,19 +1764,19 @@ function reconcileLineItems(
 
             if (AMBIGUOUS_CASE_KEYS.has(uomKey)) {
                 pVerdict = "needs_approval";
-                pReason += " | case size assumed 12 — verify";
+                pReason += " | case size assumed 12 â€” verify";
             } else if (AMBIGUOUS_BAG_KEYS.has(uomKey)) {
                 pVerdict = "needs_approval";
-                pReason += " | bag weight assumed 50 lb — verify";
+                pReason += " | bag weight assumed 50 lb â€” verify";
             }
         }
 
-        // Guard 2: Quantity overbill — never auto-approve if invoice qty > PO qty.
+        // Guard 2: Quantity overbill â€” never auto-approve if invoice qty > PO qty.
         // Even a tiny price change is suspicious when the vendor is billing for
         // more units than were ordered.
         if (invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
             pVerdict = "needs_approval";
-            pReason += ` | ⚠️ OVERBILL: Invoice qty ${invLine.qty} > PO qty ${poLine.quantity} — may be billed for more units than ordered.`;
+            pReason += ` | âš ï¸ OVERBILL: Invoice qty ${invLine.qty} > PO qty ${poLine.quantity} â€” may be billed for more units than ordered.`;
         }
 
         changes.push({
@@ -1812,19 +1812,19 @@ function evaluatePriceChange(
     percentChange: number,
     dollarImpact: number
 ): { verdict: ReconciliationVerdict; reason: string } {
-    // No change — nothing to do
+    // No change â€” nothing to do
     if (Math.abs(poPrice - invoicePrice) < 0.01) {
         return { verdict: "no_change", reason: "Prices match" };
     }
 
-    // Layer 1: Magnitude check — catch decimal errors
-    // $2.60 → $26.00 is a 10x shift, $2.60 → $260.00 is a 100x shift
+    // Layer 1: Magnitude check â€” catch decimal errors
+    // $2.60 â†’ $26.00 is a 10x shift, $2.60 â†’ $260.00 is a 100x shift
     if (poPrice > 0 && invoicePrice > 0) {
         const ratio = invoicePrice / poPrice;
         if (ratio > RECONCILIATION_CONFIG.MAGNITUDE_CEILING || ratio < (1 / RECONCILIATION_CONFIG.MAGNITUDE_CEILING)) {
             return {
                 verdict: "rejected",
-                reason: `🚨 MAGNITUDE ERROR: Price changed from $${poPrice.toFixed(2)} → $${invoicePrice.toFixed(2)} (${ratio.toFixed(1)}x). This looks like a decimal error. NOT applied — requires manual correction.`,
+                reason: `ðŸš¨ MAGNITUDE ERROR: Price changed from $${poPrice.toFixed(2)} â†’ $${invoicePrice.toFixed(2)} (${ratio.toFixed(1)}x). This looks like a decimal error. NOT applied â€” requires manual correction.`,
             };
         }
     }
@@ -1841,7 +1841,7 @@ function evaluatePriceChange(
     if (invoicePrice > RECONCILIATION_CONFIG.HIGH_VALUE_THRESHOLD) {
         return {
             verdict: "needs_approval",
-            reason: `High-value item ($${invoicePrice.toFixed(2)}/unit) — requires manual review regardless of % change.`,
+            reason: `High-value item ($${invoicePrice.toFixed(2)}/unit) â€” requires manual review regardless of % change.`,
         };
     }
 
@@ -1850,15 +1850,15 @@ function evaluatePriceChange(
         const direction = dollarImpact > 0 ? "increase" : "decrease";
         return {
             verdict: "auto_approve",
-            reason: `${(percentChange * 100).toFixed(1)}% price ${direction} ($${poPrice.toFixed(2)} → $${invoicePrice.toFixed(2)}) — within ${RECONCILIATION_CONFIG.AUTO_APPROVE_PERCENT * 100}% auto-threshold.`,
+            reason: `${(percentChange * 100).toFixed(1)}% price ${direction} ($${poPrice.toFixed(2)} â†’ $${invoicePrice.toFixed(2)}) â€” within ${RECONCILIATION_CONFIG.AUTO_APPROVE_PERCENT * 100}% auto-threshold.`,
         };
     }
 
-    // >3% but within magnitude limits — needs human approval
+    // >3% but within magnitude limits â€” needs human approval
     const direction = dollarImpact > 0 ? "increase" : "decrease";
     return {
         verdict: "needs_approval",
-        reason: `${(percentChange * 100).toFixed(1)}% price ${direction} ($${poPrice.toFixed(2)} → $${invoicePrice.toFixed(2)}, impact: $${Math.abs(dollarImpact).toFixed(2)}) — exceeds ${RECONCILIATION_CONFIG.AUTO_APPROVE_PERCENT * 100}% auto-threshold.`,
+        reason: `${(percentChange * 100).toFixed(1)}% price ${direction} ($${poPrice.toFixed(2)} â†’ $${invoicePrice.toFixed(2)}, impact: $${Math.abs(dollarImpact).toFixed(2)}) â€” exceeds ${RECONCILIATION_CONFIG.AUTO_APPROVE_PERCENT * 100}% auto-threshold.`,
     };
 }
 
@@ -1903,14 +1903,14 @@ function findMatchingPOLine(
     return null;
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // FEE COMPARISON
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export function reconcileFees(
     invoice: InvoiceData,
     po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>,
-    vendorFeeLabelMap: Record<string, string> = {}   // H2: vendor-specific fee label→type mappings
+    vendorFeeLabelMap: Record<string, string> = {}   // H2: vendor-specific fee labelâ†’type mappings
 ): FeeChange[] {
     const changes: FeeChange[] = [];
 
@@ -1928,11 +1928,11 @@ export function reconcileFees(
         ];
 
     // PO subtotal for the disproportion sanity guard below.
-    // Sum of (unitPrice × quantity) across PO line items — using the PO's
+    // Sum of (unitPrice Ã— quantity) across PO line items â€” using the PO's
     // own truth rather than invoice subtotal, so an OCR'd invoice subtotal
     // can't sneak a fee through by inflating itself.
     // Defensive: callers historically have not always populated po.items;
-    // legacy fixtures use `lineItems`. Treat missing as 0 → disproportion
+    // legacy fixtures use `lineItems`. Treat missing as 0 â†’ disproportion
     // check is skipped (poSubtotal < $1 floor), other guards still apply.
     const poSubtotal = (po.items ?? []).reduce((s, i) => s + (i.unitPrice ?? 0) * (i.quantity ?? 0), 0);
 
@@ -1959,7 +1959,7 @@ export function reconcileFees(
 
         // Only add if it's new or materially different
         if (Math.abs(invoiceAmount - existingAmount) > 0.01) {
-            // Guard 3: Fee threshold — delta above per-type cap requires Telegram approval.
+            // Guard 3: Fee threshold â€” delta above per-type cap requires Telegram approval.
             // The delta (not the full fee amount) is what matters: a $300 freight
             // charge on a PO that already has $280 freight is only a $20 change.
             const feeDelta = Math.abs(invoiceAmount - existingAmount);
@@ -1970,22 +1970,22 @@ export function reconcileFees(
                     : "auto_approve";
             const reasonParts: string[] = [];
             reasonParts.push(verdict === "needs_approval"
-                ? `Fee delta $${feeDelta.toFixed(2)} exceeds $${cap} ${mapping.feeType} auto-approve cap — requires approval`
+                ? `Fee delta $${feeDelta.toFixed(2)} exceeds $${cap} ${mapping.feeType} auto-approve cap â€” requires approval`
                 : `Fee delta $${feeDelta.toFixed(2)} within $${cap} ${mapping.feeType} auto-approve cap`);
 
             // Guard 3b (2026-05-15): Disproportion sanity check. Existing per-fee
-            // caps are absolute ($4000 freight, etc) — they allow a $4000 freight
+            // caps are absolute ($4000 freight, etc) â€” they allow a $4000 freight
             // on a $200 PO, which would be a 2000% ratio and almost certainly an
-            // OCR / vendor error. Cap the fee at 2× the PO subtotal; anything
+            // OCR / vendor error. Cap the fee at 2Ã— the PO subtotal; anything
             // beyond that requires explicit approval regardless of absolute amount.
-            // 2× is the empirical upper bound for legitimate truckload freight on
+            // 2Ã— is the empirical upper bound for legitimate truckload freight on
             // dense/bulky goods. Skipped when poSubtotal is <$1 (empty draft PO
-            // populated FROM invoice — no denominator to compare against).
+            // populated FROM invoice â€” no denominator to compare against).
             const FEE_RATIO_OF_SUBTOTAL_CEILING = 2.0;
             if (verdict === "auto_approve" && poSubtotal >= 1 && invoiceAmount > FEE_RATIO_OF_SUBTOTAL_CEILING * poSubtotal) {
                 verdict = "needs_approval";
                 const ratio = invoiceAmount / poSubtotal;
-                reasonParts.push(`${mapping.feeType} $${invoiceAmount.toFixed(2)} is ${(ratio * 100).toFixed(0)}% of PO subtotal $${poSubtotal.toFixed(2)} — disproportionate, manual review`);
+                reasonParts.push(`${mapping.feeType} $${invoiceAmount.toFixed(2)} is ${(ratio * 100).toFixed(0)}% of PO subtotal $${poSubtotal.toFixed(2)} â€” disproportionate, manual review`);
             }
 
             changes.push({
@@ -2000,7 +2000,7 @@ export function reconcileFees(
         }
     }
 
-    // C5 FIX: Discount negation — invoice parser extracts discount as a positive number.
+    // C5 FIX: Discount negation â€” invoice parser extracts discount as a positive number.
     // Must write to Finale as NEGATIVE to subtract from PO total.
     // Uses DISCOUNT_20 fee type (id 10011) as the vehicle for flat-dollar discounts.
     const discountAmount = invoice.discount ?? 0;
@@ -2018,11 +2018,11 @@ export function reconcileFees(
                 feeDelta > discountCap
                     ? "needs_approval" : "auto_approve";
             const reason = verdict === "needs_approval"
-                ? `Discount delta $${feeDelta.toFixed(2)} exceeds $${discountCap} DISCOUNT auto-approve cap — requires approval`
+                ? `Discount delta $${feeDelta.toFixed(2)} exceeds $${discountCap} DISCOUNT auto-approve cap â€” requires approval`
                 : `Discount $${discountAmount.toFixed(2)} applied as -$${discountAmount.toFixed(2)}`;
             changes.push({
                 feeType: "DISCOUNT_20",
-                amount: negatedAmount,  // NEGATIVE — subtracts from PO total
+                amount: negatedAmount,  // NEGATIVE â€” subtracts from PO total
                 description: "Discount",
                 existingAmount,
                 isNew: !existingDiscount,
@@ -2074,7 +2074,7 @@ export function reconcileFees(
                         existingAmount,
                         isNew: !existingFee,
                         verdict,
-                        reason: `Derived freight: $${invoice.total.toFixed(2)} total − $${productSubtotal.toFixed(2)} product subtotal = $${derivedFreight.toFixed(2)}`,
+                        reason: `Derived freight: $${invoice.total.toFixed(2)} total âˆ’ $${productSubtotal.toFixed(2)} product subtotal = $${derivedFreight.toFixed(2)}`,
                     });
                 }
             }
@@ -2084,9 +2084,9 @@ export function reconcileFees(
     return changes;
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // TRACKING
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function reconcileTracking(invoice: InvoiceData): TrackingUpdate | null {
     const trackingNumbers = invoice.trackingNumbers?.filter(t => t.trim()) || [];
@@ -2099,9 +2099,9 @@ function reconcileTracking(invoice: InvoiceData): TrackingUpdate | null {
     };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // APPLY CHANGES TO FINALE
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Apply auto-approved changes to Finale.
@@ -2123,13 +2123,13 @@ export async function applyReconciliation(
     skipped: string[];
     errors: string[];
 }> {
-    // Make sure the Finale ops are registered in the catalog (idempotent —
+    // Make sure the Finale ops are registered in the catalog (idempotent â€”
     // first call wins). This is the only place the AP write path enters
     // the registry, so it's the natural seed point.
     ensureFinaleToolsRegistered();
 
     // Default audit context if caller didn't pass one. Every wrapped Finale
-    // call lands in task_history regardless — no agent attribution if the
+    // call lands in task_history regardless â€” no agent attribution if the
     // caller is anonymous, but the rest of the audit row is still useful.
     const auditCtx: ToolAuditContext = audit ?? { agent: "ap-reconciler" };
 
@@ -2181,13 +2181,13 @@ export async function applyReconciliation(
                 );
             }
 
-            applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
+            applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
         } catch (err: any) {
-            errors.push(`${pc.productId}: Failed — ${err.message}`);
+            errors.push(`${pc.productId}: Failed â€” ${err.message}`);
         }
     }
 
-    // 2. Apply fee changes — gated on per-fee verdict
+    // 2. Apply fee changes â€” gated on per-fee verdict
     // auto_approve fees apply immediately; needs_approval fees only apply
     // if the user explicitly approved them via Telegram button.
     for (const fc of result.feeChanges) {
@@ -2195,7 +2195,7 @@ export async function applyReconciliation(
             (fc.verdict === "needs_approval" && approvedFeeTypes?.includes(fc.feeType));
 
         if (!feeApproved) {
-            skipped.push(`Fee: ${fc.description} $${fc.amount.toFixed(2)} — ${fc.reason}`);
+            skipped.push(`Fee: ${fc.description} $${fc.amount.toFixed(2)} â€” ${fc.reason}`);
             continue;
         }
 
@@ -2209,17 +2209,17 @@ export async function applyReconciliation(
                 );
                 applied.push(`Fee added: ${fc.description} $${fc.amount.toFixed(2)}`);
             } else {
-                // Update existing fee (e.g. Freight sitting at $0 → actual amount)
+                // Update existing fee (e.g. Freight sitting at $0 â†’ actual amount)
                 await withToolAudit(
                     "finale_update_order_adjustment_amount",
                     auditCtx,
                     { orderId: result.orderId, feeType: fc.feeType, amount: fc.amount, description: fc.description },
                     () => client.updateOrderAdjustmentAmount(result.orderId, fc.feeType, fc.amount, fc.description),
                 );
-                applied.push(`Fee updated: ${fc.description} $${fc.existingAmount.toFixed(2)} → $${fc.amount.toFixed(2)}`);
+                applied.push(`Fee updated: ${fc.description} $${fc.existingAmount.toFixed(2)} â†’ $${fc.amount.toFixed(2)}`);
             }
         } catch (err: any) {
-            errors.push(`Fee ${fc.description}: Failed — ${err.message}`);
+            errors.push(`Fee ${fc.description}: Failed â€” ${err.message}`);
         }
     }
 
@@ -2282,7 +2282,7 @@ export async function applyReconciliation(
                                 });
                             }
                         } catch (e: any) {
-                            console.warn(`⚠️ [reconciler] Failed to persist tracking to purchase_orders: ${e.message}`);
+                            console.warn(`âš ï¸ [reconciler] Failed to persist tracking to purchase_orders: ${e.message}`);
                         }
                     }
                 } else {
@@ -2300,16 +2300,16 @@ export async function applyReconciliation(
     const approvedBy = approvedItems?.length ? "Will" : "system";
     setImmediate(() => {
         logPriceChangeAudit(result, approvedBy).catch((err: any) => {
-            console.warn(`⚠️ [reconciler] price_change_audit failed (non-fatal): ${err.message}`);
+            console.warn(`âš ï¸ [reconciler] price_change_audit failed (non-fatal): ${err.message}`);
         });
     });
 
     return { applied, skipped, errors };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // TRACKING NUMBER DEDUPLICATION
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Check which tracking numbers are new (not yet stored in Supabase).
@@ -2328,7 +2328,7 @@ async function deduplicateTrackingNumbers(
 
     try {
         const supabase = createClient();
-        if (!supabase) return trackingNumbers; // No Supabase → skip dedup, write all
+        if (!supabase) return trackingNumbers; // No Supabase â†’ skip dedup, write all
 
         // Check which tracking numbers already exist in any invoice record
         const { data: existingInvoices } = await supabase
@@ -2355,12 +2355,12 @@ async function deduplicateTrackingNumbers(
 
         if (newNumbers.length < trackingNumbers.length) {
             const dupeCount = trackingNumbers.length - newNumbers.length;
-            console.log(`   📋 Tracking dedup: ${dupeCount} duplicate(s) filtered, ${newNumbers.length} new`);
+            console.log(`   ðŸ“‹ Tracking dedup: ${dupeCount} duplicate(s) filtered, ${newNumbers.length} new`);
         }
 
         return newNumbers;
     } catch (err: any) {
-        console.warn(`⚠️ Tracking dedup failed, writing all: ${err.message}`);
+        console.warn(`âš ï¸ Tracking dedup failed, writing all: ${err.message}`);
         return trackingNumbers;
     }
 }
@@ -2385,13 +2385,13 @@ async function saveTrackingNumbers(
             .update({ tracking_numbers: trackingNumbers })
             .eq("invoice_number", invoiceNumber);
     } catch (err: any) {
-        console.warn(`⚠️ Failed to save tracking numbers: ${err.message}`);
+        console.warn(`âš ï¸ Failed to save tracking numbers: ${err.message}`);
     }
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // AUDIT METADATA
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Build a structured audit record for ap_activity_log.metadata.
@@ -2442,13 +2442,13 @@ export function buildAuditMetadata(
     };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // RECONCILIATION REPORT BUILDER
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Build a structured ReconciliationReport from data already computed in reconcileInvoiceToPO().
- * No extra API calls — all inputs are already in-scope at the call site.
+ * No extra API calls â€” all inputs are already in-scope at the call site.
  *
  * The report is written into ap_activity_log.reconciliation_report (JSONB) so that
  * accounting can query, filter, and export a full audit trail per invoice.
@@ -2475,7 +2475,7 @@ export function buildReconciliationReport(
     } else if (overallVerdict === "duplicate") {
         approvalMethod = "auto";
     } else {
-        // needs_approval, no_match — awaiting Will's Telegram decision
+        // needs_approval, no_match â€” awaiting Will's Telegram decision
         approvalMethod = "pending";
     }
 
@@ -2552,9 +2552,9 @@ export function buildReconciliationReport(
     };
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // DASHBOARD REVIEW ENQUEUE
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Enqueue a reconciliation result for dashboard review instead of Telegram approval.
@@ -2571,7 +2571,7 @@ export async function enqueueForDashboardReview(
         if (supabase) {
             const { data } = await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
-                email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId} - Dashboard Review Required`,
+                email_subject: `Invoice ${result.invoiceNumber} â†’ PO ${result.orderId} - Dashboard Review Required`,
                 intent: "RECONCILIATION",
                 action_taken: "Dashboard review required - awaiting approval",
                 metadata: {
@@ -2597,9 +2597,9 @@ export async function enqueueForDashboardReview(
     return activityLogId;
 }
 
-// ──────────────────────────────────────────────────
-// PRICE CHANGE AUDIT LOG — flat, queryable table
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// PRICE CHANGE AUDIT LOG â€” flat, queryable table
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Write every price change and fee change to `price_change_audit` as flat rows.
@@ -2680,20 +2680,20 @@ export async function logPriceChangeAudit(
         if (rows.length > 0) {
             const { error } = await supabase.from("price_change_audit").insert(rows);
             if (error) {
-                console.warn(`⚠️ [reconciler] price_change_audit insert failed: ${error.message}`);
+                console.warn(`âš ï¸ [reconciler] price_change_audit insert failed: ${error.message}`);
             } else {
-                console.log(`📊 [reconciler] Logged ${rows.length} row(s) to price_change_audit`);
+                console.log(`ðŸ“Š [reconciler] Logged ${rows.length} row(s) to price_change_audit`);
             }
         }
     } catch (err: any) {
-        // Non-blocking — never interrupt the reconciliation flow
-        console.warn(`⚠️ [reconciler] logPriceChangeAudit failed (non-fatal): ${err.message}`);
+        // Non-blocking â€” never interrupt the reconciliation flow
+        console.warn(`âš ï¸ [reconciler] logPriceChangeAudit failed (non-fatal): ${err.message}`);
     }
 }
 
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // SUMMARY FORMATTING
-// ──────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function buildReconciliationSummary(
     orderId: string,
@@ -2705,98 +2705,93 @@ function buildReconciliationSummary(
     overallVerdict: ReconciliationVerdict,
     warnings: string[] = []
 ): string {
-    const lines: string[] = [];
+    // DECISION(2026-05-20): Natural language Telegram notifications.
+    // Read like a smart bookkeeper texting Will â€” plain English, specific numbers,
+    // clear about what happened and what was applied to Finale. No markdown headers.
+    const parts: string[] = [];
 
-    // Header
-    const emoji = overallVerdict === "auto_approve" ? "✅"
-        : overallVerdict === "rejected" ? "🚨"
-            : overallVerdict === "duplicate" ? "🔁"
-                : overallVerdict === "needs_approval" ? "⚠️"
-                    : "ℹ️";
-
-    lines.push(`${emoji} **Invoice Reconciliation: ${invoice.invoiceNumber} → PO ${orderId}**`);
-    lines.push(`Vendor: ${invoice.vendorName} | Invoice Total: $${invoice.total.toFixed(2)}`);
-    lines.push("");
-
-    // Warnings (vendor mismatch, overbill, etc.)
-    if (warnings.length > 0) {
-        lines.push("**⚠️ Warnings:**");
-        for (const w of warnings) {
-            lines.push(`  ${w}`);
-        }
-        lines.push("");
-    }
-
-    // Duplicate — short-circuit the rest
     if (overallVerdict === "duplicate") {
-        lines.push("🔁 **DUPLICATE:** This invoice+PO combination has already been reconciled. No changes applied.");
-        return lines.join("\n");
+        return `ðŸ” Invoice #${invoice.invoiceNumber} from ${invoice.vendorName} â€” already reconciled against PO ${orderId}. No changes made.`;
     }
 
-    // Price changes
+    const headerEmoji = overallVerdict === "auto_approve" ? "âœ…"
+        : overallVerdict === "rejected" ? "ðŸš¨"
+        : overallVerdict === "needs_approval" ? "âš ï¸"
+        : "â„¹ï¸";
+
+    parts.push(`${headerEmoji} *${invoice.vendorName}* â€” Invoice #${invoice.invoiceNumber} â†’ PO ${orderId}`);
+
+    // Warnings in plain English
+    for (const w of warnings) {
+        const hw = w
+            .replace(/vendor name mismatch/i, "Note: vendor name on invoice does not exactly match Finale")
+            .replace(/OVERBILL/i, "invoice charges more than the PO expected")
+            .replace(/disproportionate/i, "freight seems high relative to the order â€” worth checking");
+        parts.push(`âš ï¸ ${hw}`);
+    }
+
+    // Price changes â€” tell Will what moved, by how much, and what it costs
     const meaningful = priceChanges.filter(pc => pc.verdict !== "no_change" && pc.verdict !== "no_match");
-    if (meaningful.length > 0) {
-        lines.push("**Price Changes:**");
-        for (const pc of meaningful) {
-            const icon = pc.verdict === "auto_approve" ? "✅"
-                : pc.verdict === "rejected" ? "🚨"
-                    : "⚠️";
-            lines.push(`${icon} ${pc.productId}: $${pc.poPrice.toFixed(2)} → $${pc.invoicePrice.toFixed(2)} (${(pc.percentChange * 100).toFixed(1)}%, $${Math.abs(pc.dollarImpact).toFixed(2)} impact)`);
-            // Surface overbill / reason details in summary
-            if (pc.reason.includes("OVERBILL")) {
-                lines.push(`  ⚠️ ${pc.reason.split("|").pop()?.trim()}`);
-            }
+    for (const pc of meaningful) {
+        const direction = pc.invoicePrice > pc.poPrice ? "up" : "down";
+        const pct = Math.abs(pc.percentChange * 100).toFixed(0);
+        const dollarDiff = Math.abs(pc.dollarImpact).toFixed(2);
+        const item = pc.productId || pc.description?.slice(0, 30) || "item";
+        const poFmt = pc.poPrice.toFixed(2);
+        const invFmt = pc.invoicePrice.toFixed(2);
+
+        if (pc.verdict === "rejected") {
+            parts.push(`ðŸš¨ ${item}: price jumped from $${poFmt} to $${invFmt} â€” ${pct}Ã— change, likely a decimal error. NOT applied. Needs manual fix.`);
+        } else if (Number(pct) < 2) {
+            parts.push(`${item}: minor adjustment $${poFmt} â†’ $${invFmt}. Applied.`);
+        } else {
+            parts.push(`${item} went ${direction} ${pct}% â€” $${poFmt} to $${invFmt}/unit ($${dollarDiff} total). Applied.`);
         }
-        lines.push("");
+        if (pc.reason.includes("OVERBILL")) {
+            parts.push(`   Invoice charges more than PO price on this item.`);
+        }
     }
 
     // Unmatched invoice lines
     const unmatched = priceChanges.filter(pc => pc.verdict === "no_match");
     if (unmatched.length > 0) {
-        lines.push("**Unmatched Invoice Lines:**");
-        for (const pc of unmatched) {
-            lines.push(`❓ ${pc.productId || pc.description.slice(0, 40)}: $${pc.invoicePrice.toFixed(2)} × ${pc.quantity}`);
-        }
-        lines.push("");
+        const names = unmatched.map(pc => pc.productId || pc.description?.slice(0, 25) || "unknown").join(", ");
+        parts.push(`â“ ${unmatched.length} line(s) not found in Finale PO: ${names}. Not applied â€” check manually.`);
     }
 
-    // Fee changes — now showing per-fee verdict
-    if (feeChanges.length > 0) {
-        lines.push("**Fee/Charge Updates:**");
-        for (const fc of feeChanges) {
-            const feeIcon = fc.verdict === "auto_approve" ? "✅" : "⚠️";
-            const label = fc.isNew ? "NEW" : `was $${fc.existingAmount.toFixed(2)}`;
-            lines.push(`${feeIcon} ${fc.description}: $${fc.amount.toFixed(2)} (${label})`);
-            if (fc.verdict === "needs_approval") {
-                lines.push(`  ⚠️ ${fc.reason}`);
-            }
+    // Fees â€” say what was added or changed and confirm it was applied
+    for (const fc of feeChanges) {
+        const amtFmt = fc.amount.toFixed(2);
+        const label = fc.description || fc.feeType;
+        if (fc.isNew) {
+            parts.push(`${label}: $${amtFmt} added to PO (was not on PO before). Applied.`);
+        } else if (fc.existingAmount !== fc.amount) {
+            parts.push(`${label} updated from $${fc.existingAmount.toFixed(2)} to $${amtFmt}. Applied.`);
         }
-        lines.push("");
     }
 
     // Tracking
-    if (trackingUpdate) {
-        lines.push("**Tracking:**");
-        if (trackingUpdate.trackingNumbers.length > 0) {
-            lines.push(`🚚 ${trackingUpdate.trackingNumbers.join(", ")}`);
-        }
-        if (trackingUpdate.shipDate) {
-            lines.push(`📅 Ship date: ${trackingUpdate.shipDate}`);
-        }
-        lines.push("");
+    if (trackingUpdate?.trackingNumbers?.length) {
+        const shipNote = trackingUpdate.shipDate ? ` (shipped ${trackingUpdate.shipDate})` : "";
+        parts.push(`Tracking: ${trackingUpdate.trackingNumbers.join(", ")}${shipNote}.`);
     }
 
-    // Total impact
-    lines.push(`**Total Dollar Impact:** $${totalDollarImpact.toFixed(2)}`);
+    // Footer â€” net impact and status
+    const impactFmt = totalDollarImpact.toFixed(2);
+    const totalFmt = invoice.total.toFixed(2);
 
-    // Verdict
     if (overallVerdict === "auto_approve") {
-        lines.push("✅ All changes within auto-approval thresholds. Applying automatically.");
-    } else if (overallVerdict === "rejected") {
-        lines.push("🚨 **BLOCKED:** Magnitude error detected. Manual correction required.");
+        if (totalDollarImpact === 0) {
+            parts.push(`Invoice matches PO exactly. No changes needed. Total: $${totalFmt}.`);
+        } else {
+            parts.push(`PO updated. Net change: +$${impactFmt}. Invoice total: $${totalFmt}.`);
+        }
     } else if (overallVerdict === "needs_approval") {
-        lines.push("⚠️ **Awaiting approval.** Some changes exceed auto-approval thresholds.");
+        parts.push(`Not applied yet â€” needs review. Check the AP panel. ($${impactFmt} impact.)`);
+    } else if (overallVerdict === "rejected") {
+        parts.push(`ðŸš¨ NOT applied â€” magnitude error. Manual correction required.`);
     }
 
-    return lines.join("\n");
+    return parts.join("\n");
 }
+
