@@ -575,36 +575,64 @@ describe("APAgent processInvoiceBuffer", () => {
         expect(retryLog?.metadata?.retryOutcome).toBe("improved");
     });
 
-    // ── Regression: Grassroots QuickBooks Sales Order # misidentified as Finale PO# ──
-    // PROBLEM(2026-05-20): Grassroots invoices are sent via QuickBooks and include
-    // their internal QB Sales Order number (e.g. "71486681-1124705") in a field
-    // that OCR reads as the PO#. The Finale probe correctly fails to find this number
-    // and clears it, but the result is "unmatched" (vendor+date fallback doesn't
-    // find a close-enough total). The invoice is in Bill.com but Finale PO is untouched.
-    // The fix: Grassroots must include the Finale PO# in a "Customer PO#" or "Reference"
-    // field on their QuickBooks invoice template. Meanwhile the pipeline correctly
-    // rejects the QB order# and does not make a false match.
-    it("does not falsely match a Grassroots QB Sales Order number as a Finale PO", async () => {
-        // First pass OCR: extracts QB order# as poNumber (the actual observed bug)
+    // ── Regression: Grassroots OCR column-collapse — tracking# concatenated with PO# ──
+    // ROOT CAUSE(2026-05-20): Grassroots invoices have a header row with columns:
+    //   SHIP DATE | SHIP VIA | TRACKING NO. | P.O. NUMBER
+    //   05/19/2026 | AAA Copper | 71486681-1 | 124705
+    // OCR reads the trailing columns together producing "71486681-1124705" as the
+    // PO# field. The Finale probe correctly rejects the full string, but before
+    // this fix it also rejected "124705" because it was never extracted as a
+    // separate candidate. Now the probe extracts trailing 5–6 digit groups from
+    // compound tokens and probes each — so "124705" is correctly resolved.
+    it("extracts Finale PO# from OCR column-collapsed tracking+PO compound token", async () => {
+        // First pass OCR: extracts collapsed tracking+PO as poNumber
         parseInvoiceMock.mockResolvedValue({
             documentType: "invoice",
             invoiceNumber: "33576",
-            poNumber: "71486681-1124705",  // QB Sales Order # — not a Finale PO
+            poNumber: "71486681-1124705",  // OCR collapsed TRACKING NO + P.O. NUMBER columns
             vendorName: "Grassroots Fabric Pots Inc.",
             invoiceDate: "2026-05-19",
             lineItems: [
-                { description: "5gal Living Soil Pot", qty: 100, unitPrice: 18.50, total: 1850.00 },
-                { description: "Shipping", qty: 1, unitPrice: 639.70, total: 639.70 },
+                { description: "Living Soil Pot 100g", qty: 50, unitPrice: 15.42, total: 771.00 },
+                { description: "Living Soil Pot 20g", qty: 50, unitPrice: 6.43, total: 321.50 },
+                { description: "4x8 Living Soil Beds", qty: 20, unitPrice: 59.86, total: 1197.20 },
             ],
-            subtotal: 1850.00,
-            freight: 639.70,
+            subtotal: 2289.70,
+            freight: 200.00,
             total: 2489.70,
             amountDue: 2489.70,
             confidence: "high",
         });
 
-        // Finale probe CANNOT find this QB order number — rejects all candidates
-        getOrderDetailsMock.mockRejectedValue(new Error("PO not found in Finale"));
+        // Finale rejects the full compound token and all naive variants,
+        // but ACCEPTS "124705" (the trailing 6-digit segment)
+        getOrderDetailsMock.mockImplementation(async (candidate: string) => {
+            if (candidate === "124705") return { orderId: "124705" };
+            throw new Error("PO not found in Finale");
+        });
+
+        const { reconcileInvoiceToPO } = await import("../finale/reconciler");
+        vi.mocked(reconcileInvoiceToPO).mockResolvedValueOnce({
+            orderId: "124705",
+            invoiceNumber: "33576",
+            vendorName: "Grassroots Fabric Pots",
+            invoiceTotal: 2489.70,
+            priceChanges: [],
+            feeChanges: [{ feeType: "SHIPPING", amount: 200.00, existingAmount: 0, verdict: "auto_approve", reason: "" }],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "Shipping $200 added",
+            totalDollarImpact: 200.00,
+            autoApplicable: true,
+            warnings: [],
+        } as any);
+
+        const { applyReconciliation } = await import("../finale/reconciler");
+        vi.mocked(applyReconciliation).mockResolvedValueOnce({
+            applied: ["SHIPPING: $200.00 added"],
+            skipped: [],
+            errors: [],
+        });
 
         const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
         const supabase = {
@@ -618,6 +646,7 @@ describe("APAgent processInvoiceBuffer", () => {
                         })),
                     };
                 }),
+                update: vi.fn(() => ({ eq: vi.fn().mockResolvedValue(undefined) })),
                 upsert: vi.fn().mockResolvedValue(undefined),
             })),
         };
@@ -627,6 +656,7 @@ describe("APAgent processInvoiceBuffer", () => {
         (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Grassroots Fabric Pots");
         (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
         (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
+        (agent as any).sendReconciliationNotification = vi.fn().mockResolvedValue(undefined);
 
         const result = await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
@@ -636,13 +666,12 @@ describe("APAgent processInvoiceBuffer", () => {
             supabase,
         );
 
-        // QB Sales Order # must NOT produce a false PO match
-        expect(result.matchedPO).toBe(false);
-        expect(result.poNumber).toBeNull();
-        expect(result.state).toBe("unmatched");
+        // Should have extracted "124705" from the compound token and matched PO
+        expect(result.matchedPO).toBe(true);
+        expect(result.poNumber).toBe("124705");
 
-        // The pipeline should have attempted Finale validation and failed cleanly
-        // (not thrown — unmatched is the correct outcome here)
-        expect(result.success).toBe(true);
+        // Finale probe must have been called with "124705" specifically
+        expect(getOrderDetailsMock).toHaveBeenCalledWith("124705");
     });
+
 });

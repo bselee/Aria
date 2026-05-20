@@ -1243,6 +1243,30 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 if (swapped !== digitsOnly) candidates.push(swapped);
                             }
                         }
+
+                        // Handle OCR column-collapse: when invoice table columns are read
+                        // sequentially without spacing, adjacent fields merge into one token.
+                        // e.g. Grassroots invoices: TRACKING NO "71486681-1" + P.O. "124705"
+                        //   → OCR reads "71486681-1124705" as a single PO# field.
+                        // Fix: extract all trailing 5–6 digit groups from compound tokens
+                        // (Finale PO IDs are 6 digits) and probe each independently.
+                        // DECISION(2026-05-20): Only extract 5–6 digit suffixes to avoid
+                        // false-probing long tracking numbers as POs. Keeps probes precise.
+                        if (t.length > 7) {
+                            // Remove hyphens and extract all 5–6 digit substrings from the end
+                            const stripped = t.replace(/-/g, "");
+                            const trailingMatches = stripped.match(/(\d{5,6})$/g);
+                            if (trailingMatches) {
+                                for (const m of trailingMatches) {
+                                    if (!candidates.includes(m)) candidates.push(m);
+                                }
+                            }
+                            // Also try every dash-separated segment individually
+                            const dashSegments = t.split("-").filter(s => /^\d{5,6}$/.test(s));
+                            for (const seg of dashSegments) {
+                                if (!candidates.includes(seg)) candidates.push(seg);
+                            }
+                        }
                     }
 
                     // Always validate candidates in Finale — even single-candidate cases.
