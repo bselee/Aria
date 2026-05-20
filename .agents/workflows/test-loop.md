@@ -32,14 +32,14 @@ Before touching anything:
 ### Phase 2 — RUN TESTS
 Execute the full test suite (or scoped path if provided):
 
-```bash
-# TypeScript type check
-npx tsc --noEmit 2>&1
+> [!IMPORTANT]
+> **BYPASS TYPECHECK BY DEFAULT**: Do NOT run the TypeScript type check (`tsc --noEmit`) unless the user explicitly requests it. It is a waste of tokens and takes forever. Focus on running unit/integration tests directly using vitest.
 
-# Unit + integration tests
+```bash
+# Unit + integration tests (primary)
 npx vitest run $SCOPE --reporter=verbose 2>&1
 
-# Lint
+# Lint (run only if requested)
 npx eslint $SCOPE --max-warnings=0 2>&1
 ```
 

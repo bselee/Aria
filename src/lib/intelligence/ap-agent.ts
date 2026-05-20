@@ -1182,124 +1182,134 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // 2. Find matching PO — Finale direct, no Supabase middle layer
             // If invoice has a PO# printed on it, use it. Otherwise query Finale by
             // vendor name + invoice date to find the most plausible open PO.
-            let finalePONumber: string | null = invoiceData.poNumber || null;
-            let matchSource = "PO# on invoice";
+            const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoiceData.vendorName || "") || /aaa\s*cooper/i.test(filename);
+            
+            let finalePONumber: string | null = null;
+            let matchSource = "none";
             let forceApproval = false;
 
-            // Subject-line PO is stored as a last-resort fallback only.
-            // Vendor invoice references (e.g., "B123402") are often THEIR internal PO,
-            // not BuildASoil's Finale PO. Only use it if no other candidates resolve.
-            const subjectPoMatch = subject.match(/\bPO\s*#?\s*([A-Za-z]?\d{5,})/i);
-            const subjectPoFallback = subjectPoMatch ? subjectPoMatch[1] : null;
-            if (subjectPoFallback && !finalePONumber) {
-                finalePONumber = subjectPoFallback;
-                matchSource = "PO# from email subject (no OCR PO found) — REQUIRES APPROVAL";
-                forceApproval = true; // Subject-line PO is unverified — require human confirmation
-            }
+            if (!isAAACooper) {
+                finalePONumber = invoiceData.poNumber || null;
+                matchSource = "PO# on invoice";
 
-            // If invoice printed multiple PO numbers (e.g., "B7732 B123402"), resolve
-            // to the first token that exists in Finale.
-            // Also try Finale's B(NNNN) parenthesized format — vendors often omit parens
-            // on their invoices (e.g., "B123402" → Finale ID "B(123402)").
-            // Single FinaleClient reused across both PO-resolution phases below
-            const probeClient = new FinaleClient();
+                // Subject-line PO is stored as a last-resort fallback only.
+                // Vendor invoice references (e.g., "B123402") are often THEIR internal PO,
+                // not BuildASoil's Finale PO. Only use it if no other candidates resolve.
+                const subjectPoMatch = subject.match(/\bPO\s*#?\s*([A-Za-z]?\d{5,})/i);
+                const subjectPoFallback = subjectPoMatch ? subjectPoMatch[1] : null;
+                if (subjectPoFallback && !finalePONumber) {
+                    finalePONumber = subjectPoFallback;
+                    matchSource = "PO# from email subject (no OCR PO found) — REQUIRES APPROVAL";
+                    forceApproval = true; // Subject-line PO is unverified — require human confirmation
+                }
 
-            if (finalePONumber) {
-                const tokens = finalePONumber.includes(" ")
-                    ? finalePONumber.split(/\s+/).filter(Boolean)
-                    : [finalePONumber];
-                const candidates: string[] = [];
-                for (const t of tokens) {
-                    candidates.push(t);
-                    // Try Finale's parenthesized format: "B123402" → "B(123402)"
-                    const withParens = t.replace(/^([A-Za-z]+)(\d+)$/, "$1($2)");
-                    if (withParens !== t) candidates.push(withParens);
-                    // Try just the numeric part and parens-only variant
-                    const digitsOnly = t.replace(/^[A-Za-z]+/, "");
-                    if (digitsOnly && digitsOnly !== t) {
-                        candidates.push(digitsOnly);
-                        candidates.push(`(${digitsOnly})`);
-                        // OCR commonly transposes adjacent digit pairs. Add all single-swap variants.
-                        for (let i = 0; i < digitsOnly.length - 1; i++) {
-                            const arr = digitsOnly.split("");
-                            [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
-                            const swapped = arr.join("");
-                            if (swapped !== digitsOnly) candidates.push(swapped);
+                // If invoice printed multiple PO numbers (e.g., "B7732 B123402"), resolve
+                // to the first token that exists in Finale.
+                // Also try Finale's B(NNNN) parenthesized format — vendors often omit parens
+                // on their invoices (e.g., "B123402" → Finale ID "B(123402)").
+                // Single FinaleClient reused across both PO-resolution phases below
+                const probeClient = new FinaleClient();
+
+                if (finalePONumber) {
+                    const tokens = finalePONumber.includes(" ")
+                        ? finalePONumber.split(/\s+/).filter(Boolean)
+                        : [finalePONumber];
+                    const candidates: string[] = [];
+                    for (const t of tokens) {
+                        candidates.push(t);
+                        // Try Finale's parenthesized format: "B123402" → "B(123402)"
+                        const withParens = t.replace(/^([A-Za-z]+)(\d+)$/, "$1($2)");
+                        if (withParens !== t) candidates.push(withParens);
+                        // Try just the numeric part and parens-only variant
+                        const digitsOnly = t.replace(/^[A-Za-z]+/, "");
+                        if (digitsOnly && digitsOnly !== t) {
+                            candidates.push(digitsOnly);
+                            candidates.push(`(${digitsOnly})`);
+                            // OCR commonly transposes adjacent digit pairs. Add all single-swap variants.
+                            for (let i = 0; i < digitsOnly.length - 1; i++) {
+                                const arr = digitsOnly.split("");
+                                [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+                                const swapped = arr.join("");
+                                if (swapped !== digitsOnly) candidates.push(swapped);
+                            }
                         }
                     }
-                }
 
-                // Always validate candidates in Finale — even single-candidate cases.
-                // If the printed PO# is the vendor's own order number (e.g. ULINE "S-144261"),
-                // none will resolve and we must clear finalePONumber so the vendor+date
-                // fallback below can run. Without this clear, the fallback is silently skipped.
-                const validCandidates: string[] = [];
-                for (const candidate of candidates) {
-                    try {
-                        await probeClient.getOrderDetails(candidate);
-                        validCandidates.push(candidate);
-                    } catch {
-                        // not found — try next
-                    }
-                }
-
-                if (validCandidates.length === 0) {
-                    // No candidate exists in Finale — vendor printed their own reference number.
-                    // Clear so vendor+date fallback can run.
-                    console.log(`     → PO "${finalePONumber}" not found in Finale — clearing for fallback lookup`);
-                    finalePONumber = null;
-                } else if (validCandidates.length === 1) {
-                    console.log(`     → Resolved PO "${finalePONumber}" to: ${validCandidates[0]}`);
-                    finalePONumber = validCandidates[0];
-                } else {
-                    // Multiple valid POs — disambiguate by vendor name similarity
-                    console.log(`     → Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
-                    let bestCandidate = validCandidates[0];
-                    let bestScore = -1;
-                    const invoiceVendorWords = (invoiceData.vendorName || "")
-                        .toLowerCase().split(/\s+/).filter(w => w.length > 2);
-                    for (const candidate of validCandidates) {
+                    // Always validate candidates in Finale — even single-candidate cases.
+                    // If the printed PO# is the vendor's own order number (e.g. ULINE "S-144261"),
+                    // none will resolve and we must clear finalePONumber so the vendor+date
+                    // fallback below can run. Without this clear, the fallback is silently skipped.
+                    const validCandidates: string[] = [];
+                    for (const candidate of candidates) {
                         try {
-                            const summary = await probeClient.getOrderSummary(candidate);
-                            if (!summary) continue;
-                            const supplierLower = summary.supplier.toLowerCase();
-                            const score = invoiceVendorWords.filter(w => supplierLower.includes(w)).length;
-                            console.log(`     ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
-                            if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+                            await probeClient.getOrderDetails(candidate);
+                            validCandidates.push(candidate);
                         } catch {
-                            /* leave current best */
+                            // not found — try next
                         }
                     }
-                    console.log(`     → Best vendor match: PO ${bestCandidate}`);
-                    finalePONumber = bestCandidate;
-                }
-            }
 
-            if (!finalePONumber) {
-                try {
-                    const candidates = await probeClient.findPOByVendorAndDate(
-                        invoiceData.vendorName,
-                        invoiceData.invoiceDate,
-                        30 // ±30-day window
-                    );
-                    // Filter to open/committed/draft POs within 10% of invoice total.
-                    // Draft POs (ORDER_CREATED) may have $0 total — skip variance check for those.
-                    const plausible = candidates.filter(c =>
-                        (c.status === "Committed" || c.status === "Open" || c.status === "ORDER_CREATED") &&
-                        invoiceData.total > 0 &&
-                        (c.total === 0 || Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10)
-                    );
-                    if (plausible.length > 0) {
-                        plausible.sort((a, b) =>
-                            Math.abs(a.total - invoiceData.total) - Math.abs(b.total - invoiceData.total)
-                        );
-                        finalePONumber = plausible[0].orderId;
-                        matchSource = `Finale vendor+date match (${plausible[0].supplier}, ${plausible[0].orderDate}) — REQUIRES APPROVAL`;
-                        console.log(`     → Finale fallback matched PO ${finalePONumber} for ${invoiceData.vendorName}`);
+                    if (validCandidates.length === 0) {
+                        // No candidate exists in Finale — vendor printed their own reference number.
+                        // Clear so vendor+date fallback can run.
+                        console.log(`     → PO "${finalePONumber}" not found in Finale — clearing for fallback lookup`);
+                        finalePONumber = null;
+                    } else if (validCandidates.length === 1) {
+                        console.log(`     → Resolved PO "${finalePONumber}" to: ${validCandidates[0]}`);
+                        finalePONumber = validCandidates[0];
+                    } else {
+                        // Multiple valid POs — disambiguate by vendor name similarity
+                        console.log(`     → Multiple POs found: ${validCandidates.join(", ")} — disambiguating by vendor...`);
+                        let bestCandidate = validCandidates[0];
+                        let bestScore = -1;
+                        const invoiceVendorWords = (invoiceData.vendorName || "")
+                            .toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                        for (const candidate of validCandidates) {
+                            try {
+                                const summary = await probeClient.getOrderSummary(candidate);
+                                if (!summary) continue;
+                                const supplierLower = summary.supplier.toLowerCase();
+                                const score = invoiceVendorWords.filter(w => supplierLower.includes(w)).length;
+                                console.log(`     ↳ PO ${candidate}: supplier="${summary.supplier}", score=${score}`);
+                                if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+                            } catch {
+                                /* leave current best */
+                            }
+                        }
+                        console.log(`     → Best vendor match: PO ${bestCandidate}`);
+                        finalePONumber = bestCandidate;
                     }
-                } catch (err: any) {
-                    console.warn(`     ⚠️ Finale fallback lookup failed: ${err.message}`);
                 }
+
+                if (!finalePONumber) {
+                    try {
+                        const candidates = await probeClient.findPOByVendorAndDate(
+                            invoiceData.vendorName,
+                            invoiceData.invoiceDate,
+                            30 // ±30-day window
+                        );
+                        // Filter to open/committed/draft POs within 10% of invoice total.
+                        // Draft POs (ORDER_CREATED) may have $0 total — skip variance check for those.
+                        const plausible = candidates.filter(c =>
+                            (c.status === "Committed" || c.status === "Open" || c.status === "ORDER_CREATED") &&
+                            invoiceData.total > 0 &&
+                            (c.total === 0 || Math.abs(c.total - invoiceData.total) / invoiceData.total < 0.10)
+                        );
+                        if (plausible.length > 0) {
+                            plausible.sort((a, b) =>
+                                Math.abs(a.total - invoiceData.total) - Math.abs(b.total - invoiceData.total)
+                            );
+                            finalePONumber = plausible[0].orderId;
+                            matchSource = `Finale vendor+date match (${plausible[0].supplier}, ${plausible[0].orderDate}) — REQUIRES APPROVAL`;
+                            console.log(`     → Finale fallback matched PO ${finalePONumber} for ${invoiceData.vendorName}`);
+                        }
+                    } catch (err: any) {
+                        console.warn(`     ⚠️ Finale fallback lookup failed: ${err.message}`);
+                    }
+                }
+            } else {
+                matchSource = "AAA Cooper outbound invoice - PO match bypassed";
+                console.log(`     → AAA Cooper outbound invoice: PO match bypassed silently`);
             }
 
             const matched = !!finalePONumber;
@@ -1316,7 +1326,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_from: from,
                 email_subject: subject,
                 raw_text: extracted.rawText,
-                action_required: !matched,
+                action_required: isAAACooper ? false : !matched,
                 action_summary: `Invoice from ${from} for $${invoiceData.total}`,
                 gmail_message_id: messageId || null,
             }).select("id").single();
@@ -1336,7 +1346,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
-                status: matched ? "matched_review" : "unmatched",
+                status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
                 document_id: docData?.id || null,
                 raw_data: invoiceData
             }, { onConflict: "invoice_number" });
@@ -1444,6 +1454,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 return outcome;
             }
 
+            if (isAAACooper) {
+                outcome.state = "unmatched";
+                outcome.error = null;
+                outcome.success = true;
+                return outcome;
+            }
+
             outcome.state = "unmatched";
             outcome.error = "No Finale PO match found";
             outcome.success = true;
@@ -1531,6 +1548,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         matchSource: string,
         from: string,
     ) {
+        const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoice.vendorName || "");
+        if (isAAACooper) {
+            console.log(`     → Suppressing Telegram notification for AAA Cooper`);
+            return;
+        }
+
         let msg = `🧾 *New Invoice Processed*\n`;
         msg += `From: ${from}\n`;
         msg += `Vendor: ${invoice.vendorName}\n`;

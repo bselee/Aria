@@ -23,6 +23,7 @@ description: Test loop agent rules — global rules for the self-healing test wo
 - If branch exists, append `-<N>` suffix
 
 ## Code Quality Rules
+- **BYPASS TYPECHECK BY DEFAULT**: Do NOT run full project typechecks (`tsc --noEmit` or `npm run typecheck`) unless explicitly requested. It is a waste of tokens and takes forever.
 - TypeScript strict mode is ON — do not disable it
 - No `@ts-ignore` without a comment explaining why
 - No `as any` unless truly unavoidable — add `// TODO: fix type` if used

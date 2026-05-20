@@ -41,7 +41,6 @@ import {
     queueStatementEmailIntake,
     queueStatementMetadataOnly,
 } from "@/lib/statements/email-intake";
-import { splitAAACooperStatementAttachments } from "../aaa-cooper-splitter";
 import { pickPrimaryInvoicePage } from "./invoice-page-selector";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
@@ -116,13 +115,7 @@ const MULTI_INVOICE_STATEMENT_VENDORS: Array<{
     senderMatch: RegExp;
     filenameMatch?: RegExp;
     label: string;
-}> = [
-    {
-        senderMatch: /aaa\s*cooper/i,
-        filenameMatch: /ACT_STMD/i,
-        label: 'AAA Cooper',
-    },
-];
+}> = [];
 
 type MultiInvoiceStatementResult =
     | { status: "handled"; queuedCount: number }
@@ -652,9 +645,13 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 const isReadyNotification = /\*\*READY\*\*/i.test(subject);
                 const isOrderAck = /acknowledgement|order\s*confirm/i.test(subject);
                 const isFedExInvoice = this.isFedExInvoiceEmail(from, subject, snippet, pdfFilenames);
+                const isAAACooper = /aaa\s*cooper/i.test(from);
 
                 let intent: string;
-                if (hasInvoicePdf && !isNonInvoicePdf) {
+                if (isAAACooper && hasPdfAttachment) {
+                    intent = "INVOICE";
+                    console.log(`     -> Forced INVOICE (AAA Cooper with attachment)`);
+                } else if (hasInvoicePdf && !isNonInvoicePdf) {
                     // Override: PDF filename clearly indicates an invoice document
                     intent = "INVOICE";
                     console.log(`     -> Forced INVOICE (PDF filename match: ${pdfFilenames.join(', ')})`);
@@ -966,11 +963,20 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             let queueBuffer = buffer;
                             const queueMetadata: Record<string, unknown> = {};
                             if (extractedPdf) {
-                                let pageSelection = await this.selectPrimaryInvoicePageNumber(
-                                    buffer,
-                                    extractedPdf.pages,
-                                    extractedPdf.metadata?.pageCount,
-                                );
+                                let pageSelection;
+                                if (isAAACooper) {
+                                    pageSelection = {
+                                        pageNumber: 1,
+                                        confidence: "strong" as const,
+                                        reason: "AAA Cooper outbound invoice - forced first page only",
+                                    };
+                                } else {
+                                    pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                        buffer,
+                                        extractedPdf.pages,
+                                        extractedPdf.metadata?.pageCount,
+                                    );
+                                }
 
                                 const multiPagePacket = (extractedPdf.metadata?.pageCount ?? 1) > 1;
                                 const needsFedExOcrRetry = isFedExInvoice
