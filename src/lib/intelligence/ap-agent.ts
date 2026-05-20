@@ -1839,9 +1839,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     if (pendingLogId) {
                         try {
                             await supabase.from("ap_activity_log").update({
-                                action_taken: result.autoApplicable
-                                    ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
-                                    : `Flagged for review: ${result.overallVerdict}`,
+                                // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
+                                // Both activity log and Telegram say the same plain English thing.
+                                action_taken: result.summary,
                                 notified_slack: !!this.slack,
                                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                                 reconciliation_report: result.report ?? null,
@@ -2067,9 +2067,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_from: result.vendorName,
                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                 intent: "RECONCILIATION",
-                action_taken: result.autoApplicable
-                    ? `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`
-                    : `Flagged for review: ${result.overallVerdict}`,
+                // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
+                // Both activity log and Telegram say the same plain English thing.
+                action_taken: result.summary,
                 notified_slack: !!this.slack,
                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                 reconciliation_report: reconciliationReport,
