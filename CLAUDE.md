@@ -293,7 +293,7 @@ node _run_migration.js supabase/migrations/<filename>.sql
 Full migration workflow: `.agents/workflows/migration.md`.
 
 ### Database Schema (Supabase)
-Key tables: `documents`, `vendors`, `vendor_profiles`, `invoices`, `vendor_invoices`, `purchase_orders`, `shipments`, `ap_activity_log`. See `supabase/migrations/` for schema.
+Key tables: `documents`, `vendors`, `vendor_profiles`, `invoices`, `vendor_invoices`, `purchase_orders`, `shipments`, `ap_activity_log`, `axiom_sku_mappings`. See `supabase/migrations/` for schema.
 
 **`vendor_invoices`** — Unified archive of every vendor invoice across all intake channels. Single source of truth for "What did we pay vendor X this year?" Dedup index on `(vendor_name, invoice_number)`. Sources: `email_attachment`, `portal_scrape`, `csv_import`, `sandbox_drop`, `payment_confirm`, `manual`.
 
