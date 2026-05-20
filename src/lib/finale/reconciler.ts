@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    reconciler.ts
  * @purpose Core invoice â†’ PO reconciliation engine.
  *          Compares parsed invoice data against Finale PO details,
@@ -909,9 +909,12 @@ export type ReconciliationVerdict =
     | "rejected"          // Magnitude error detected, do NOT apply
     | "duplicate"         // Invoice already reconciled â€” do not re-apply
     | "no_change"         // Prices match, nothing to do
-    | "no_match";         // Could not find matching line item
+    | "no_match"          // Could not find matching line item
+    | "short_shipment_hold";
 
 export interface PriceChange {
+    receivedQty?: number;       // Actual physical quantity received
+    receivingGap?: number;      // Gap between invoice quantity and received quantity
     productId: string;
     description: string;
     poPrice: number;
