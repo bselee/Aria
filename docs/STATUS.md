@@ -28,7 +28,7 @@
 
 ## Known Issues
 
-- **OOM on typecheck**: Use `typecheck:cli` for bot work. Heap bumped to 24GB via `--max-old-space-size`.
+- **OOM on typecheck (Token Burner)**: The full typecheck is a massive token burner. Running `typecheck:all` or standard typescript compile checking is highly discouraged for agents. Always bypass typecheck or use `typecheck:cli` if specifically testing. Heap bumped to 24GB via `--max-old-space-size`.
 - **finale/client.ts = 6,317 lines**: God Object — needs decomposition into products, orders, purchasing-intel, receivings modules.
 - **start-bot.ts = 131KB**: Needs tool handler extraction.
 - **Finale REST 404 quirk**: `GET /api/product/<sku>` returns 404 for ~50 valid products. Mitigated by `validateProductExists()` with product-list fallback (added 2026-03-23, expanded 2026-05-17).
