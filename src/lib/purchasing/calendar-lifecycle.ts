@@ -106,7 +106,8 @@ export function derivePurchasingLifecycle(
         is_intended_multi?: boolean | null;
         notes?: string | null;    // Internal notes (fallback)
         comments?: string | null; // External notes (primary for MULTI detection)
-    }
+    },
+    now: Date = new Date()
 ): PurchasingLifecycleState {
     const normalized = (status || "").toLowerCase();
     const isReceived = hasPurchaseOrderReceipt({ status: normalized, receiveDate, shipments });
@@ -252,7 +253,7 @@ export function derivePurchasingLifecycle(
     }
 
     const hasAnyTracking = trackingStatuses.length > 0;
-    const ageDays = daysSinceDate(expectedDeliveryDate || undefined) || 0;
+    const ageDays = daysSinceDate(expectedDeliveryDate || undefined, now) || 0;
 
     if (ageDays > 14 && hasAnyTracking) {
         return {
@@ -280,7 +281,18 @@ export function derivePurchasingLifecycle(
         };
     }
 
-    if (ageDays > 0) {
+    const trackingEta = trackingStatuses.length > 0
+        ? trackingStatuses.reduce((latest, current) => {
+            if (!current || !current.estimated_delivery_at) return latest;
+            if (!latest) return current.estimated_delivery_at;
+            return current.estimated_delivery_at > latest ? current.estimated_delivery_at : latest;
+        }, null as string | null)
+        : null;
+
+    const trackingAgeDays = trackingEta ? (daysSinceDate(trackingEta, now) || 0) : null;
+    const isTrackingPastDue = trackingAgeDays !== null && trackingAgeDays > 0;
+
+    if (ageDays > 0 && (!hasAnyTracking || isTrackingPastDue)) {
         return {
             calendarStatus: "past_due",
             completionState,
@@ -322,9 +334,10 @@ export function getPurchasingEventDate(
     expectedDate: string,
     actualReceiveDate: string | null,
     lifecycle: PurchasingLifecycleState,
-    latestETA?: string | null
+    latestETA?: string | null,
+    now: Date = new Date()
 ): string {
-    const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    const todayKey = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
     
     if (actualReceiveDate) {
         return toDateOnly(actualReceiveDate) || actualReceiveDate;

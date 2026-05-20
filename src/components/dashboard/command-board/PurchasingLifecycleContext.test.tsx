@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { PurchasingLifecycleProvider, usePurchasingLifecycle } from "./PurchasingLifecycleContext";
@@ -32,7 +32,7 @@ function Probe() {
 }
 
 describe("PurchasingLifecycleContext", () => {
-    it("matches related lifecycle rows by shared vendor and SKU", () => {
+    it("matches related lifecycle rows by shared vendor and SKU", async () => {
         render(
             <PurchasingLifecycleProvider>
                 <Probe />
@@ -41,6 +41,8 @@ describe("PurchasingLifecycleContext", () => {
 
         expect(screen.getByTestId("match").textContent).toBe("false");
         fireEvent.click(screen.getByRole("button", { name: "focus sku" }));
-        expect(screen.getByTestId("match").textContent).toBe("true");
+        await waitFor(() => {
+            expect(screen.getByTestId("match").textContent).toBe("true");
+        });
     });
 });

@@ -571,6 +571,18 @@ export default function PurchasingPanel() {
         /* eslint-disable-next-line react-hooks/exhaustive-deps */
     }, [data?.refreshing, data?.cachedAt]);
 
+    // Register BOM relationships for Option C highlighting
+    useEffect(() => {
+        if (!data?.groups) return;
+        for (const g of data.groups) {
+            for (const item of g.items) {
+                if (item.itemType === 'bom-component' && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0) {
+                    lifecycle.registerBOM(item.productId, item.feedsFinishedGoods.map(fg => fg.sku));
+                }
+            }
+        }
+    }, [data?.groups, lifecycle]);
+
     function toggleExpand(id: string) {
         setExpanded(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
     }
@@ -1342,7 +1354,7 @@ export default function PurchasingPanel() {
                                     const groupChecked = checked[pid] ?? {};
                                     const groupQtys = qtys[pid] ?? {};
                                     const activeItems = group.items.filter(i => !isSnoozed(i.productId));
-                                    const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
+                    const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
                                     const directOrderBlocked = selectedItems.some(i => !canUseDirectOrdering(group.vendorName, i.reorderMethod));
                                     const selectedCount = activeItems.filter(i => groupChecked[i.productId]).length;
                                     const selectedUnits = selectedItems.reduce((sum, item) => sum + (groupQtys[item.productId] ?? item.suggestedQty), 0);
@@ -1350,8 +1362,6 @@ export default function PurchasingPanel() {
                                         const qty = groupQtys[item.productId] ?? item.suggestedQty;
                                         return sum + qty * Math.max(0, item.unitPrice);
                                     }, 0);
-                                    // v2: use effective shortage (finaleStockout > adjustedRunway > rawRunway).
-                                    // Prefer actionable items so a row with a held SKU at 0d doesn't dominate the badge.
                                     const actionableForShortage = activeItems.filter(i =>
                                         i.assessment?.decision === "order" || i.assessment?.decision === "reduce",
                                     );
@@ -1361,19 +1371,32 @@ export default function PurchasingPanel() {
                                         : null;
                                     const diffCount = activeItems.filter(item => item.qtyDiverged).length;
                                     const allCheckedFlag = activeItems.length > 0 && activeItems.every(i => groupChecked[i.productId]);
-                                    const hasActionable = activeItems.some(i => i.urgency === "critical" || i.urgency === "warning");
                                     const groupProductIds = activeItems.map(item => item.productId);
-                                    const groupMatchesLifecycle = lifecycle.matchesFocus({
+                                    const groupMatch = lifecycle.checkMatchDetails({
                                         vendorName: group.vendorName,
                                         productIds: groupProductIds,
                                     });
+                                    const groupBg = groupMatch.isLockedDirect
+                                        ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                        : groupMatch.isLockedBom
+                                        ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                        : groupMatch.isDirect
+                                        ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                        : groupMatch.isBom
+                                        ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                        : "";
 
                                     return (
                                         <div
                                             key={pid}
+                                            onClick={(e) => {
+                                                const target = e.target as HTMLElement;
+                                                if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                                lifecycle.setLockedFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds });
+                                            }}
                                             onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds })}
                                             onMouseLeave={lifecycle.clearFocus}
-                                            className={`border-b border-zinc-800/60 ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupMatchesLifecycle ? "bg-cyan-500/5 ring-1 ring-inset ring-cyan-500/35" : ""}`}
+                                            className={`border-b border-zinc-800/60 cursor-pointer ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupBg}`}
                                         >
                                             {/* ── Vendor header ── */}
                                             <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-zinc-800/30 transition-colors">
@@ -1617,17 +1640,31 @@ export default function PurchasingPanel() {
                                                             const iKey = item.productId;
                                                             const methodBadge = reorderMethodBadge(item.reorderMethod);
                                                             const openOrderId = item.openPOs[0]?.orderId;
-                                                            const itemMatchesLifecycle = lifecycle.matchesFocus({
+                                                            const itemMatch = lifecycle.checkMatchDetails({
                                                                 vendorName: group.vendorName,
                                                                 orderId: openOrderId,
                                                                 productIds: [item.productId],
                                                             });
+                                                            const itemBg = itemMatch.isLockedDirect
+                                                                ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                                                : itemMatch.isLockedBom
+                                                                ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                                                : itemMatch.isDirect
+                                                                ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                                                : itemMatch.isBom
+                                                                ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                                                : "";
 
                                                             return (
                                                                 <div key={iKey}
+                                                                    onClick={(e) => {
+                                                                        const target = e.target as HTMLElement;
+                                                                        if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                                                        lifecycle.setLockedFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] });
+                                                                    }}
                                                                     onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] })}
                                                                     onMouseLeave={lifecycle.clearFocus}
-                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 ${itemMatchesLifecycle ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35" : ""} ${itemSnoozed ? "opacity-20 hover:opacity-40 transition-opacity" : isChecked ? "" : "opacity-90"
+                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 cursor-pointer ${itemBg} ${itemSnoozed ? "opacity-20 hover:opacity-40 transition-opacity" : isChecked ? "" : "opacity-90"
                                                                         }`}>
                                                                     <div className="flex items-start gap-3">
                                                                         {!itemSnoozed && (

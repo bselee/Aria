@@ -211,6 +211,12 @@ export interface PurchasingItem {
     triggerReason?: 'build-driven' | 'stockout-padded' | 'runway-short' | 'cadence' | null;
     /** Brief one-line context for the trigger ("Build 2026-05-19 short 50") */
     triggerDetail?: string;
+    stockAvailable?: number;
+    forwardDemandEntry?: {
+        requiredQty: number;
+        earliestBuildDate: string;
+        feedsBuilds: string[];
+    };
 }
 
 export interface PurchasingGroup {
@@ -5558,6 +5564,12 @@ export class FinaleClient {
                         itemType: 'bom-component',
                         feedsFinishedGoods,
                         totalBurnRate: dailyBurn,
+                        stockAvailable: compActivity.stockAvailable ?? stockOnHand,
+                        forwardDemandEntry: forward ? {
+                            requiredQty: forward.requiredQty,
+                            earliestBuildDate: forward.earliestBuildDate,
+                            feedsBuilds: forward.feedsBuilds
+                        } : undefined,
                         medianPOGapDays: medianPOGapDays ?? undefined,
                         projectedNextOrderDate,
                         receiptConfidence: chosen.source === 'receipts' ? confidence : undefined,
@@ -5808,6 +5820,9 @@ export class FinaleClient {
         const items: PurchasingItem[] = [];
         const queue = [...candidates];
 
+        const { readForwardDemand } = await import('@/lib/purchasing/forward-demand');
+        const forwardDemand = readForwardDemand(30);
+
         // 3 workers: keeps peak concurrency at ~3 simultaneous Finale requests.
         // 100ms inter-SKU pause spreads load to ~180 calls/min sustained — well within limits.
         await Promise.all(Array.from({ length: 3 }, async () => {
@@ -5923,6 +5938,7 @@ export class FinaleClient {
                     const reorderPolicy = reorderPolicyCache.get(partyId);
                     const reservation = reservationsMap.get(sku);
                     const distribution = await leadTimeService.getDistribution(party.groupName);
+                    const forward = forwardDemand.get(sku);
 
                     // v2.1 — vendor policy lead-time override flows through both the
                     // recommender input AND the surfaced item.leadTimeProvenance so the
@@ -6048,6 +6064,12 @@ export class FinaleClient {
                         velocityInflated: chosenVelocity.inflated,
                         velocityRawRate: chosenVelocity.rawRate,
                         velocityRealityCap: chosenVelocity.realityCap,
+                        stockAvailable: activity.stockAvailable ?? (stockOnHand as number),
+                        forwardDemandEntry: forward ? {
+                            requiredQty: forward.requiredQty,
+                            earliestBuildDate: forward.earliestBuildDate,
+                            feedsBuilds: forward.feedsBuilds
+                        } : undefined,
                         // v2.1 — vendor reorder policy + flags
                         vendorPolicy: reorderPolicy ? {
                             leadTimeOverrideDays: reorderPolicy.leadTimeOverrideDays,

@@ -276,17 +276,31 @@ export default function ReceivedItemsPanel() {
                                 const dollars = fmtDollars(po.total);
                                 const discrepancy = partialDiscrepancy(po);
                                 const poProductIds = po.items.map(item => item.productId);
-                                const matchesLifecycle = lifecycle.matchesFocus({
+                                const rcvMatch = lifecycle.checkMatchDetails({
                                     vendorName: po.supplier,
                                     orderId: po.orderId,
                                     productIds: poProductIds,
                                 });
+                                const rcvBg = rcvMatch.isLockedDirect
+                                    ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                    : rcvMatch.isLockedBom
+                                    ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                    : rcvMatch.isDirect
+                                    ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                    : rcvMatch.isBom
+                                    ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                    : "";
                                 return (
                                     <div
                                         key={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "rcv", vendorName: po.supplier, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
-                                        className={`px-4 py-2.5 border-b border-zinc-800/40 transition-colors ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : "hover:bg-zinc-800/20"}`}
+                                        onClick={(e) => {
+                                            const target = e.target as HTMLElement;
+                                            if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                            lifecycle.setLockedFocus({ source: "rcv", vendorName: po.supplier, orderId: po.orderId, productIds: poProductIds });
+                                        }}
+                                        className={`px-4 py-2.5 border-b border-zinc-800/40 cursor-pointer transition-colors ${rcvBg ? rcvBg : "hover:bg-zinc-800/20"}`}
                                     >
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
@@ -323,12 +337,24 @@ export default function ReceivedItemsPanel() {
                                                 </>
                                             )}
                                             <span className="text-zinc-700 text-xs">·</span>
-                                            {po.items.map((item, index) => (
-                                                <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${lifecycle.matchesFocus({ productIds: [item.productId] }) ? "text-cyan-100" : "text-zinc-200"}`}>
-                                                    {item.productId}
-                                                    <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
-                                                </span>
-                                            ))}
+                                            {po.items.map((item, index) => {
+                                                const badgeMatch = lifecycle.checkMatchDetails({ productIds: [item.productId] });
+                                                const badgeColor = badgeMatch.isLockedDirect
+                                                    ? "text-amber-300 font-bold"
+                                                    : badgeMatch.isLockedBom
+                                                    ? "text-amber-400/90 font-semibold"
+                                                    : badgeMatch.isDirect
+                                                    ? "text-cyan-300 font-semibold"
+                                                    : badgeMatch.isBom
+                                                    ? "text-cyan-400/90 font-medium"
+                                                    : "text-zinc-200";
+                                                return (
+                                                    <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${badgeColor}`}>
+                                                        {item.productId}
+                                                        <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
+                                                    </span>
+                                                );
+                                            })}
                                         </div>
                                         {hasPartialLineQuantities(po) && (
                                             <div className="mt-1.5 space-y-0.5">

@@ -12,6 +12,16 @@ vi.mock("@/lib/finale/client", () => ({
     FinaleClient: finaleCtorMock,
 }));
 
+vi.mock("@/lib/purchasing/cache", () => ({
+    resaleSlot: { value: null, at: 0, promise: null },
+    bomSlot: { value: null, at: 0, promise: null },
+    readSWR: vi.fn(async (slot, fetcher) => {
+        const val = await fetcher();
+        return { value: val, refreshing: false };
+    }),
+    invalidatePurchasingCaches: vi.fn(),
+}));
+
 vi.mock("@/lib/purchasing/assessment-service", () => ({
     assessPurchasingGroups: assessGroupsMock,
 }));
@@ -23,6 +33,7 @@ describe("dashboard purchasing route", () => {
         vi.clearAllMocks();
 
         finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
+            this.getBOMDemand = vi.fn().mockResolvedValue([]);
             this.getPurchasingIntelligence = vi.fn().mockResolvedValue([
                 {
                     vendorName: "ULINE",

@@ -106,7 +106,7 @@ function stubFetch() {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
         const url = String(input);
         let body: any = emptyPayload;
-        if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+        if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
             body = criticalPayload;
         } else if (url.includes("/api/dashboard/active-purchases")) {
             body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
@@ -162,7 +162,7 @@ function stubFetchWithMixedItems() {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
         const url = String(input);
         let body: any = emptyPayload;
-        if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+        if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
             body = criticalPayload;
         } else if (url.includes("/api/dashboard/active-purchases")) {
             body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
@@ -229,7 +229,7 @@ describe("PurchasingPanel - qty override dropdown", () => {
         vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
             const url = String(input);
             let body: any = empty;
-            if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
                 body = payload;
             } else if (url.includes("/api/dashboard/active-purchases")) {
                 body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
@@ -359,7 +359,7 @@ describe("PurchasingPanel - draft PO state", () => {
                 });
             }
             let body: any = empty;
-            if (url.includes("/api/dashboard/purchasing") && url.includes("urgency=critical")) {
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
                 body = payload;
             } else if (url.includes("/api/dashboard/active-purchases")) {
                 body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };

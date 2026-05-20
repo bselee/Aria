@@ -38,6 +38,8 @@ export interface CrystalBallProjection {
     dailyRateSource: string;
     dailyRateLabel: string;
     unitPrice: number;
+    salesVelocity: number;
+    demandVelocity: number;
     
     // Runway
     runwayDays: number;
@@ -98,6 +100,14 @@ export interface CrystalBallProjection {
         supplierName: string;
         finaleUrl: string;
     } | null;
+    
+    // Channel allocation and forward planned demands
+    stockAvailable?: number;
+    forwardDemandEntry?: {
+        requiredQty: number;
+        earliestBuildDate: string;
+        feedsBuilds: string[];
+    };
 }
 
 export interface ProjectionInput {
@@ -275,6 +285,8 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
         dailyRateSource: item.dailyRateSource || 'sales',
         dailyRateLabel: item.dailyRateSource === 'demand' ? 'demand burn' : item.dailyRateSource === 'receipts' ? 'receipt velocity' : 'sales rate',
         unitPrice: item.unitPrice ?? 0,
+        salesVelocity: item.salesVelocity ?? 0,
+        demandVelocity: item.demandVelocity ?? 0,
         
         runwayDays: item.runwayDays ?? 9999,
         adjustedRunwayDays: item.adjustedRunwayDays ?? 9999,
@@ -298,6 +310,8 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
         medianPOGapDays: item.medianPOGapDays,
         projectedNextOrderDate: item.projectedNextOrderDate,
         historicalPOs,
-        draftPO: item.draftPO ?? null
+        draftPO: item.draftPO ?? null,
+        stockAvailable: item.stockAvailable,
+        forwardDemandEntry: item.forwardDemandEntry
     };
 }

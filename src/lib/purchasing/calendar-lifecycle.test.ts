@@ -62,7 +62,10 @@ describe("calendar lifecycle", () => {
     });
 
     it("does not infer received from completed alone without receipt evidence", () => {
-        const lifecycle = derivePurchasingLifecycle("completed", [], null, "2026-03-25", null);
+        const pastDate = new Date();
+        pastDate.setDate(pastDate.getDate() - 5);
+        const pastDateStr = pastDate.toISOString().split("T")[0];
+        const lifecycle = derivePurchasingLifecycle("completed", [], null, pastDateStr, null);
         expect(lifecycle.isReceived).toBe(false);
         expect(lifecycle.calendarStatus).toBe("past_due");
         expect(lifecycle.statusLabel).toBe("Past Due - Needs Review");

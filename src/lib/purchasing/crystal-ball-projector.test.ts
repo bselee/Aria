@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeProjections } from './crystal-ball-projector';
+import { computeProjections, buildCrystalBallProjection } from './crystal-ball-projector';
 
 describe('crystal-ball-projector computeProjections', () => {
     it('should return correct projection values when stock is fully positive and no stockout happens', () => {
@@ -94,5 +94,30 @@ describe('crystal-ball-projector computeProjections', () => {
         const p30 = res.find(p => p.daysOut === 30);
         expect(p30?.projectedStock).toBe(450);
         expect(p30?.incoming).toBe(500);
+    });
+});
+
+describe('crystal-ball-projector buildCrystalBallProjection', () => {
+    it('should map salesVelocity and demandVelocity correctly', () => {
+        const mockItem = {
+            productId: 'TEST-SKU',
+            productName: 'Test Item',
+            supplierName: 'Test Vendor',
+            supplierPartyId: 'PARTY-1',
+            itemType: 'bom-component',
+            stockOnHand: 100,
+            stockOnOrder: 0,
+            dailyRate: 5,
+            leadTimeDays: 14,
+            salesVelocity: 1.25,
+            demandVelocity: 5.0,
+            unitPrice: 10.0,
+            openPOs: []
+        };
+        
+        const res = buildCrystalBallProjection(mockItem);
+        expect(res.productId).toBe('TEST-SKU');
+        expect(res.salesVelocity).toBe(1.25);
+        expect(res.demandVelocity).toBe(5.0);
     });
 });
