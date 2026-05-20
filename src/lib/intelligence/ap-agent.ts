@@ -44,7 +44,7 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  *          Downloads attached PDF invoices, parses data, correlates with POs,
  *          and notifies the team of discrepancies or matching statuses.
  * @author  Antigravity / Aria
- * @updated 2026-03-18
+ * @updated 2026-05-20
  */
 
 // ─── Vendor Routing Rules ────────────────────────────────────────────────────
@@ -1060,15 +1060,25 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         lineItemCount: countMeaningfulLineItems(retryInvoice),
                         total: retryInvoice.total,
                     };
-                    // Accept retry if it produced a materially better result
-                    const retryBetter = getInvoiceParseScore(retryInvoice) > getInvoiceParseScore(invoiceData);
+                    // Accept retry if it produced a materially better result.
+                    // DECISION(2026-05-20): Use >= (not >) on score AND prefer retry
+                    // when it produces more line items on a score tie. This handles the
+                    // case where both passes know vendor+total but only the LLM retry
+                    // succeeds in extracting line items (common for QuickBooks PDFs
+                    // where the text layer is present but table parsing fails on first pass).
+                    const firstScore = getInvoiceParseScore(invoiceData);
+                    const retryScore = getInvoiceParseScore(retryInvoice);
+                    const firstLines = countMeaningfulLineItems(invoiceData);
+                    const retryLines = countMeaningfulLineItems(retryInvoice);
+                    // Accept if: strictly better score, OR same score but more line items
+                    const retryBetter = retryScore > firstScore || (retryScore === firstScore && retryLines > firstLines);
                     if (retryBetter) {
                         console.log(`     ✅ LLM OCR retry improved — PO: ${retryInvoice.poNumber || "none"}, lines: ${retryInvoice.lineItems?.length || 0}, total: $${retryInvoice.total}`);
                         extracted = retryExtracted;
                         invoiceData = retryInvoice;
                         retryOutcome = "improved";
                     } else {
-                        console.log(`     ℹ️ LLM OCR retry did not improve — keeping original parse`);
+                        console.log(`     ℹ️ LLM OCR retry did not improve — keeping original parse (score: ${firstScore} lines: ${firstLines} → retry score: ${retryScore} lines: ${retryLines})`);
                     }
                 } catch (retryErr: any) {
                     console.warn(`     ⚠️ LLM OCR retry failed: ${retryErr.message} — continuing with original`);
@@ -1289,6 +1299,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             30 // ±30-day window
                         );
                         // Filter to open/committed/draft POs within 10% of invoice total.
+                        // DECISION(2026-05-20): Keeping this cap tight — all standard vendors
+                        // (Farm Fuel, Grassroots, Marion Ag, etc.) must have the Finale PO#
+                        // on the invoice. The vendor+date fallback is last-resort only and a
+                        // wide variance window creates false-match risk when multiple open POs
+                        // exist for the same supplier. If this fallback fires without a clear
+                        // PO# it will always be forceApproval=true regardless.
                         // Draft POs (ORDER_CREATED) may have $0 total — skip variance check for those.
                         const plausible = candidates.filter(c =>
                             (c.status === "Committed" || c.status === "Open" || c.status === "ORDER_CREATED") &&
