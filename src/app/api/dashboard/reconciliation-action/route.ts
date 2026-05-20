@@ -114,7 +114,7 @@ export async function POST(req: Request) {
 
             // Approve ALL changes — same as Telegram approve flow
             const approvedPriceItems = reconResult.priceChanges
-                .filter(pc => pc.verdict === "needs_approval" || pc.verdict === "auto_approve")
+                .filter(pc => pc.verdict === "needs_approval" || pc.verdict === "auto_approve" || pc.verdict === "short_shipment_hold")
                 .map(pc => pc.productId);
             const approvedFeeTypes = reconResult.feeChanges
                 .filter(fc => fc.verdict === "needs_approval" || fc.verdict === "auto_approve")
@@ -184,7 +184,7 @@ export async function POST(req: Request) {
 
             // Phase 3: Update vendor profile stats + auto-approve threshold
             const maxVariance = reconResult.priceChanges
-                .filter(pc => pc.verdict === "auto_approve" || pc.verdict === "needs_approval")
+                .filter(pc => pc.verdict === "auto_approve" || pc.verdict === "needs_approval" || pc.verdict === "short_shipment_hold")
                 .reduce((max, pc) => Math.max(max, Math.abs(pc.percentChange * 100)), 0);
             updateVendorProfile(
                 supabase, reconResult.vendorName, "approved",

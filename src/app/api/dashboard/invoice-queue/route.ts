@@ -63,8 +63,26 @@ const CACHE_TTL = 60 * 1000; // 60 seconds
  */
 function resolveStatus(
     invoiceStatus: string | null,
-    actionTaken: string | null
+    actionTaken: string | null,
+    metadata: any = null
 ): string {
+    const verdict = metadata?.overallVerdict ?? metadata?.verdict ?? null;
+    if (verdict === 'short_shipment_hold') {
+        return 'short_shipment_hold';
+    }
+    if (verdict === 'needs_approval') {
+        return 'needs_approval';
+    }
+    if (verdict === 'auto_approve' || verdict === 'auto_approved') {
+        return 'auto_approved';
+    }
+    if (verdict === 'rejected') {
+        return 'rejected';
+    }
+    if (verdict === 'duplicate') {
+        return 'duplicate';
+    }
+
     const a = (actionTaken ?? '').toLowerCase();
     const s = (invoiceStatus ?? '').toLowerCase();
 
@@ -197,16 +215,16 @@ export async function GET(req: NextRequest) {
                 return [];
             }
 
-            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null);
+            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null, matchedLog?.metadata);
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
             const balanceWarning = extractBalanceWarning(matchedLog?.metadata ?? null);
 
             const hasActivityLog = !!matchedLog?.id;
             // Items with no activity log can't be acted on — demote to unmatched
-            const resolvedStatus = hasActivityLog ? status : (status === 'needs_approval' ? 'unmatched' : status);
+            const resolvedStatus = hasActivityLog ? status : (status === 'needs_approval' || status === 'short_shipment_hold' ? 'unmatched' : status);
 
-            // Filter items that can't be acted on (no activityLogId for needs_approval)
-            if (resolvedStatus === 'needs_approval' && !hasActivityLog) {
+            // Filter items that can't be acted on (no activityLogId for needs_approval or short_shipment_hold)
+            if ((resolvedStatus === 'needs_approval' || resolvedStatus === 'short_shipment_hold') && !hasActivityLog) {
                 return [];
             }
 
@@ -215,7 +233,7 @@ export async function GET(req: NextRequest) {
             // Only count stats for items that actually appear in the queue
             if (new Date(processedAt) >= todayStart) totalToday++;
             if (resolvedStatus === 'auto_approved') autoApproved++;
-            if (resolvedStatus === 'needs_approval') needsApproval++;
+            if (resolvedStatus === 'needs_approval' || resolvedStatus === 'short_shipment_hold') needsApproval++;
             if (resolvedStatus === 'unmatched') unmatched++;
             if (dollarImpact !== null) totalDollarImpact += dollarImpact;
 
