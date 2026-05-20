@@ -119,6 +119,8 @@ const AXIOM_TO_FINALE: Record<string, SkuMapping> = {
 
     // ── Single Labels (1:1 mapping) ──────────────────────────────────
     // Note: Some SKUs may need a LABEL suffix or different naming. Run with --dry-run first.
+    'APL102':            { skus: ['APL102'], qtyFraction: 1.0, description: '3.0 Soil Cubic Foot Label' },
+    'APL105':            { skus: ['APL105'], qtyFraction: 1.0, description: 'B.A.F. 8.5x11 Label' },
     'BBL101':            { skus: ['BBL101'], qtyFraction: 1.0, description: 'BuildASoil Big Label' },
     'BBL101 124469':     { skus: ['BBL101'], qtyFraction: 1.0, description: 'BuildASoil Big Label (reorder)' },
     'BABL101':           { skus: ['BABL101'], qtyFraction: 1.0, description: 'BuildASoil Big-ish Label' },
