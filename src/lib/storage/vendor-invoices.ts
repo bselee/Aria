@@ -142,6 +142,7 @@ export async function upsertVendorInvoice(
 
 export interface InvoiceLookupFilters {
     vendor?: string;
+    invoice_number?: string | null;
     year?: number;
     month?: number;
     status?: InvoiceStatus;
@@ -164,6 +165,9 @@ export async function lookupVendorInvoices(filters: InvoiceLookupFilters) {
 
     if (filters.vendor) {
         query = query.ilike("vendor_name", `%${filters.vendor}%`);
+    }
+    if (filters.invoice_number) {
+        query = query.eq("invoice_number", filters.invoice_number);
     }
     if (filters.year) {
         query = query
