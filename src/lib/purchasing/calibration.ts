@@ -316,6 +316,18 @@ export interface VendorReorderPolicy {
      * cognitive ladder.
      */
     favoriteBatches: number[] | null;
+    /**
+     * v2.3 — bulk shipment leg support (po_shipment_legs table).
+     * When true, the recommender uses per-leg expected dates to credit
+     * incoming supply rather than crediting the full PO quantity at once.
+     * Enables accurate stock-on-order calculation for Covico (CWP101),
+     * Plantae (quillaja), and any other vendor with multi-truck bulk orders.
+     */
+    isBulkVendor: boolean;
+    /** Typical number of delivery legs per bulk order (pre-fills /legs UI). */
+    typicalLegCount: number | null;
+    /** Typical days between consecutive legs (pre-fills /legs suggested dates). */
+    typicalLegIntervalDays: number | null;
 }
 
 /**
@@ -337,7 +349,7 @@ export async function loadVendorReorderPolicies(
     try {
         const { data } = await db
             .from("vendor_reorder_policies")
-            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches")
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days")
             .in("vendor_party_id", vendorPartyIds);
         for (const row of data ?? []) {
             map.set(row.vendor_party_id, {
@@ -352,12 +364,186 @@ export async function loadVendorReorderPolicies(
                 favoriteBatches: Array.isArray(row.favorite_batches) && row.favorite_batches.length > 0
                     ? row.favorite_batches.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n) && n > 0)
                     : null,
+                isBulkVendor: Boolean(row.is_bulk_vendor),
+                typicalLegCount: row.typical_leg_count ?? null,
+                typicalLegIntervalDays: row.typical_leg_interval_days ?? null,
             });
         }
     } catch (err: any) {
         console.warn(`[calibration] loadVendorReorderPolicies failed: ${err.message}`);
     }
     return map;
+}
+
+// ──────────────────────────────────────────────────
+// SHIPMENT LEGS (bulk PO per-leg delivery schedule)
+// ──────────────────────────────────────────────────
+
+/**
+ * One delivery leg within a bulk purchase order.
+ * Maps 1:1 to a row in po_shipment_legs.
+ */
+export interface ShipmentLeg {
+    id: string;
+    poNumber: string;
+    vendorPartyId: string | null;
+    vendorName: string | null;
+    legNumber: number;
+    expectedQty: number;
+    receivedQty: number | null;          // null = not yet received
+    expectedDate: string;                 // ISO date YYYY-MM-DD
+    actualDate: string | null;            // null = pending
+    trackingNumber: string | null;
+    carrierName: string | null;
+    notes: string | null;
+    createdAt: string;
+    updatedAt: string;
+}
+
+/**
+ * Load all shipment legs for the given PO numbers, grouped by PO.
+ *
+ * Returns an empty map for any PO with no leg rows — callers should
+ * fall back to single-leg (full qty) behavior in that case, preserving
+ * the default-unchanged invariant for non-bulk vendors.
+ *
+ * Best-effort: a Supabase outage returns an empty map and the recommender
+ * degrades to the old full-qty credit approach.
+ *
+ * @param   poNumbers  - Finale PO order IDs to query
+ * @returns Map of poNumber → ShipmentLeg[]
+ */
+export async function loadShipmentLegs(
+    poNumbers: string[],
+): Promise<Map<string, ShipmentLeg[]>> {
+    const map = new Map<string, ShipmentLeg[]>();
+    if (poNumbers.length === 0) return map;
+    const db = createClient();
+    if (!db) return map;
+    try {
+        const { data, error } = await db
+            .from("po_shipment_legs")
+            .select("id, po_number, vendor_party_id, vendor_name, leg_number, expected_qty, received_qty, expected_date, actual_date, tracking_number, carrier_name, notes, created_at, updated_at")
+            .in("po_number", poNumbers)
+            .order("leg_number", { ascending: true });
+
+        if (error) {
+            console.warn(`[calibration] loadShipmentLegs failed: ${error.message}`);
+            return map;
+        }
+
+        for (const row of data ?? []) {
+            const leg: ShipmentLeg = {
+                id: row.id,
+                poNumber: row.po_number,
+                vendorPartyId: row.vendor_party_id ?? null,
+                vendorName: row.vendor_name ?? null,
+                legNumber: Number(row.leg_number),
+                expectedQty: Number(row.expected_qty),
+                receivedQty: row.received_qty != null ? Number(row.received_qty) : null,
+                expectedDate: row.expected_date,
+                actualDate: row.actual_date ?? null,
+                trackingNumber: row.tracking_number ?? null,
+                carrierName: row.carrier_name ?? null,
+                notes: row.notes ?? null,
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+            };
+            const existing = map.get(row.po_number);
+            if (existing) {
+                existing.push(leg);
+            } else {
+                map.set(row.po_number, [leg]);
+            }
+        }
+    } catch (err: any) {
+        console.warn(`[calibration] loadShipmentLegs exception: ${err.message}`);
+    }
+    return map;
+}
+
+/**
+ * Upsert shipment legs for a PO.
+ * Inserts or updates by (po_number, leg_number) — the unique constraint.
+ *
+ * @param   poNumber       - Finale PO order ID
+ * @param   vendorPartyId  - Finale party ID (optional)
+ * @param   vendorName     - Vendor display name (optional)
+ * @param   legs           - Array of leg data to upsert
+ * @returns Number of legs upserted, or 0 on failure
+ */
+export async function upsertShipmentLegs(
+    poNumber: string,
+    vendorPartyId: string | null,
+    vendorName: string | null,
+    legs: Array<{
+        legNumber: number;
+        expectedQty: number;
+        expectedDate: string;
+        notes?: string | null;
+    }>,
+): Promise<number> {
+    if (legs.length === 0) return 0;
+    const db = createClient();
+    if (!db) return 0;
+    try {
+        const now = new Date().toISOString();
+        const rows = legs.map(l => ({
+            po_number: poNumber,
+            vendor_party_id: vendorPartyId,
+            vendor_name: vendorName,
+            leg_number: l.legNumber,
+            expected_qty: l.expectedQty,
+            expected_date: l.expectedDate,
+            notes: l.notes ?? null,
+            updated_at: now,
+        }));
+        const { error } = await db
+            .from("po_shipment_legs")
+            .upsert(rows, { onConflict: "po_number,leg_number" });
+        if (error) {
+            console.warn(`[calibration] upsertShipmentLegs failed: ${error.message}`);
+            return 0;
+        }
+        return rows.length;
+    } catch (err: any) {
+        console.warn(`[calibration] upsertShipmentLegs exception: ${err.message}`);
+        return 0;
+    }
+}
+
+/**
+ * Mark a shipment leg as received.
+ *
+ * @param   poNumber    - Finale PO order ID
+ * @param   legNumber   - 1-based leg number
+ * @param   receivedQty - Quantity actually received
+ * @param   actualDate  - ISO date when received (defaults to today)
+ */
+export async function markLegReceived(
+    poNumber: string,
+    legNumber: number,
+    receivedQty: number,
+    actualDate?: string,
+): Promise<boolean> {
+    const db = createClient();
+    if (!db) return false;
+    try {
+        const date = actualDate ?? new Date().toISOString().slice(0, 10);
+        const { error } = await db
+            .from("po_shipment_legs")
+            .update({ received_qty: receivedQty, actual_date: date, updated_at: new Date().toISOString() })
+            .eq("po_number", poNumber)
+            .eq("leg_number", legNumber);
+        if (error) {
+            console.warn(`[calibration] markLegReceived failed: ${error.message}`);
+            return false;
+        }
+        return true;
+    } catch (err: any) {
+        console.warn(`[calibration] markLegReceived exception: ${err.message}`);
+        return false;
+    }
 }
 
 // ──────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X, AlertCircle } from "lucide-react";
+import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X, AlertCircle, Truck } from "lucide-react";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import { createBrowserClient } from "@/lib/supabase";
 
@@ -51,6 +51,20 @@ type ApiResponse = {
     purchases: ActivePurchase[];
     cachedAt: string;
     error?: string;
+};
+
+/** One delivery leg from po_shipment_legs. */
+type ShipmentLeg = {
+    id: string;
+    poNumber: string;
+    legNumber: number;
+    expectedQty: number;
+    receivedQty: number | null;
+    expectedDate: string;          // YYYY-MM-DD
+    actualDate: string | null;
+    trackingNumber: string | null;
+    carrierName: string | null;
+    notes: string | null;
 };
 
 // Build clickable carrier tracking URL (mirrors ops-manager.ts logic)
@@ -107,6 +121,9 @@ export default function ActivePurchasesPanel() {
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [verifyingSent, setVerifyingSent] = useState<Set<string>>(new Set());
+    // legsMap: poNumber → legs[]. Populated whenever a purchase has legs.
+    const [legsMap, setLegsMap] = useState<Map<string, ShipmentLeg[]>>(new Map());
+    const [expandedLegs, setExpandedLegs] = useState<Set<string>>(new Set());
 
     // PO_ARRIVAL_AT_RISK index from ap_activity_log (last 24h). Drives the
     // rose/amber outline + AT-RISK pill on affected POs. Activity-first
@@ -211,8 +228,23 @@ export default function ActivePurchasesPanel() {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data: ApiResponse = await res.json();
             if (data.error) throw new Error(data.error);
-            setPurchases(data.purchases || []);
+            const fetched = data.purchases || [];
+            setPurchases(fetched);
             setCachedAt(data.cachedAt || "");
+
+            // Fetch legs for all active POs in one call
+            if (fetched.length > 0) {
+                const poList = fetched.map(p => p.orderId).join(",");
+                fetch(`/api/dashboard/po-shipment-legs?po=${encodeURIComponent(poList)}`)
+                    .then(r => r.ok ? r.json() : null)
+                    .then((j: { legs: Record<string, ShipmentLeg[]> } | null) => {
+                        if (!j?.legs) return;
+                        const m = new Map<string, ShipmentLeg[]>();
+                        for (const [po, legs] of Object.entries(j.legs)) m.set(po, legs);
+                        setLegsMap(m);
+                    })
+                    .catch(() => undefined);
+            }
         } catch (e: any) {
             setError(e.message);
         } finally {
@@ -653,6 +685,81 @@ export default function ActivePurchasesPanel() {
                                                 );
                                             })}
                                         </div>
+
+                                        {/* Bulk shipment leg timeline (only renders if legs exist) */}
+                                        {legsMap.has(po.orderId) && (() => {
+                                            const legs = legsMap.get(po.orderId)!;
+                                            const isExpanded = expandedLegs.has(po.orderId);
+                                            const pendingCount = legs.filter(l => !l.actualDate).length;
+                                            const receivedCount = legs.filter(l => l.actualDate).length;
+                                            return (
+                                                <div className="mt-2">
+                                                    {/* Toggle header */}
+                                                    <button
+                                                        onClick={e => {
+                                                            e.stopPropagation();
+                                                            setExpandedLegs(prev => {
+                                                                const next = new Set(prev);
+                                                                next.has(po.orderId) ? next.delete(po.orderId) : next.add(po.orderId);
+                                                                return next;
+                                                            });
+                                                        }}
+                                                        className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-500 hover:text-cyan-400 transition-colors group/legs"
+                                                    >
+                                                        <Truck className="w-3 h-3" />
+                                                        <span>BULK · {legs.length} legs</span>
+                                                        {receivedCount > 0 && <span className="text-emerald-500">{receivedCount} received</span>}
+                                                        {pendingCount > 0 && <span className="text-zinc-600">{pendingCount} pending</span>}
+                                                        <ChevronDown className={`w-2.5 h-2.5 ml-0.5 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                                    </button>
+
+                                                    {/* Expanded leg rows */}
+                                                    {isExpanded && (
+                                                        <div className="mt-1.5 space-y-1 pl-1 border-l border-zinc-800">
+                                                            {legs.map(leg => {
+                                                                const isReceived = Boolean(leg.actualDate);
+                                                                const today = new Date().toISOString().slice(0, 10);
+                                                                const isOverdueLeg = !isReceived && leg.expectedDate < today;
+                                                                const statusColor = isReceived
+                                                                    ? "text-emerald-400"
+                                                                    : isOverdueLeg
+                                                                    ? "text-rose-400"
+                                                                    : "text-zinc-500";
+                                                                const statusLabel = isReceived
+                                                                    ? `Rcvd ${fmtDate(leg.actualDate)}`
+                                                                    : isOverdueLeg
+                                                                    ? `Overdue (exp ${fmtDate(leg.expectedDate)})`
+                                                                    : `Exp ${fmtDate(leg.expectedDate)}`;
+                                                                return (
+                                                                    <div key={leg.id} className="flex items-center gap-2 text-[10px] font-mono py-0.5">
+                                                                        {/* Leg indicator dot */}
+                                                                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isReceived ? 'bg-emerald-500' : isOverdueLeg ? 'bg-rose-500' : 'bg-zinc-700'}`} />
+                                                                        <span className="text-zinc-600 shrink-0 w-10">Leg {leg.legNumber}</span>
+                                                                        <span className="text-zinc-300 shrink-0">{leg.expectedQty.toLocaleString()}</span>
+                                                                        <span className={`shrink-0 ${statusColor}`}>{statusLabel}</span>
+                                                                        {leg.trackingNumber && (
+                                                                            <a
+                                                                                href={`https://parcelsapp.com/en/tracking/${leg.trackingNumber}`}
+                                                                                target="_blank"
+                                                                                rel="noopener noreferrer"
+                                                                                onClick={e => e.stopPropagation()}
+                                                                                className="text-cyan-500 hover:text-cyan-300 hover:underline inline-flex items-center gap-0.5 shrink-0"
+                                                                            >
+                                                                                {leg.carrierName ? `${leg.carrierName} ` : ''}{leg.trackingNumber.slice(-8)}
+                                                                                <ExternalLink className="w-2 h-2" />
+                                                                            </a>
+                                                                        )}
+                                                                        {leg.notes && (
+                                                                            <span className="text-zinc-600 truncate" title={leg.notes}>{leg.notes}</span>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
                                 );
                             })}
