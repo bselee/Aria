@@ -87,6 +87,12 @@ type PurchasingItem = {
     receiptConfidence?: 'high' | 'medium' | 'low';
     triggerReason?: 'build-driven' | 'stockout-padded' | 'runway-short' | 'cadence' | null;
     triggerDetail?: string;
+    /** Most recent completed PO order date (YYYY-MM-DD). */
+    lastPurchaseDate?: string | null;
+    /** Qty from that PO line. */
+    lastPurchaseQty?: number | null;
+    /** True when vendor ships in bulk multi-leg deliveries. */
+    isBulkVendor?: boolean;
 };
 type AssessmentData = {
     groups: PurchasingGroup[];
@@ -1787,6 +1793,16 @@ export default function PurchasingPanel() {
                                                                                     </span>
                                                                                 )}
 
+                                                                                {/* 🚛 BULK badge — shown when vendor is flagged as a bulk multi-leg shipper */}
+                                                                                {!itemSnoozed && item.isBulkVendor && (
+                                                                                    <span
+                                                                                        className="text-[9px] font-mono px-1 py-0.5 rounded border border-violet-500/40 bg-violet-500/10 text-violet-300 shrink-0"
+                                                                                        title="Bulk vendor — shipments arrive in multiple legs over time"
+                                                                                    >
+                                                                                        🚛 BULK
+                                                                                    </span>
+                                                                                )}
+
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button
                                                                                         onClick={e => {
@@ -1853,6 +1869,58 @@ export default function PurchasingPanel() {
                                                                                     })}
                                                                                 </div>
                                                                             )}
+
+                                                                            {/* ── Bulk last-receipt + order-needed row ── */}
+                                                                            {/* DECISION(2026-05-21): Shown for all isBulkVendor items so the
+                                                                                ordering surface always answers: when did we last buy, and when
+                                                                                must we place the next order? Removes need to cross-reference
+                                                                                Active Purchases or Finale for bulk vendors. */}
+                                                                            {!itemSnoozed && item.isBulkVendor && (() => {
+                                                                                const lastDate = item.lastPurchaseDate;
+                                                                                const lastQty  = item.lastPurchaseQty;
+                                                                                // "Order by" = today + (runwayDays - leadTimeDays).
+                                                                                // Positive = days until we MUST place the order.
+                                                                                // Zero/negative = already past the order window.
+                                                                                const orderByDays = Math.round(item.runwayDays - item.leadTimeDays);
+                                                                                const orderByDate = orderByDays > -90
+                                                                                    ? new Date(Date.now() + orderByDays * 86400000)
+                                                                                        .toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+                                                                                    : null;
+                                                                                const hasOpenPO = (item.openPOs?.length ?? 0) > 0;
+                                                                                return (
+                                                                                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] font-mono text-zinc-500 px-0.5">
+                                                                                        {lastDate && lastQty != null ? (
+                                                                                            <span title="Most recent completed PO order date + qty for this SKU">
+                                                                                                Last rcvd:
+                                                                                                <span className="text-zinc-300 ml-1">
+                                                                                                    {lastQty.toLocaleString()} · {new Date(lastDate + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' })}
+                                                                                                </span>
+                                                                                            </span>
+                                                                                        ) : (
+                                                                                            <span className="text-zinc-600 italic">no receipt history</span>
+                                                                                        )}
+                                                                                        <span className="text-zinc-700">·</span>
+                                                                                        {hasOpenPO ? (
+                                                                                            <span className="text-emerald-400/80 font-semibold">
+                                                                                                ✓ PO committed
+                                                                                            </span>
+                                                                                        ) : orderByDate ? (
+                                                                                            <span
+                                                                                                className={`font-semibold ${
+                                                                                                    orderByDays <= 0  ? 'text-red-400' :
+                                                                                                    orderByDays <= 14 ? 'text-amber-400' :
+                                                                                                    'text-zinc-400'
+                                                                                                }`}
+                                                                                                title={`Place order by ${orderByDate} so it arrives before stockout (runway ${Math.round(item.runwayDays)}d − lead ${item.leadTimeDays}d = ${orderByDays}d remaining)`}
+                                                                                            >
+                                                                                                {orderByDays <= 0 ? '⚠ ORDER NOW — window closed' : `order by ${orderByDate}`}
+                                                                                            </span>
+                                                                                        ) : (
+                                                                                            <span className="text-zinc-600">order timing unknown</span>
+                                                                                        )}
+                                                                                    </div>
+                                                                                );
+                                                                            })()}
 
                                                                             {/* Row 2: Description & Amount */}
                                                                             {!itemSnoozed && (

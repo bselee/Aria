@@ -219,6 +219,15 @@ export interface PurchasingItem {
         earliestBuildDate: string;
         feedsBuilds: string[];
     };
+    /** Most recent completed PO order date for this SKU (YYYY-MM-DD).
+     *  Used on bulk-vendor rows to show when the last shipment was ordered
+     *  and to compute when the next order is due. */
+    lastPurchaseDate?: string | null;
+    /** Qty received in the most recent completed PO line for this SKU. */
+    lastPurchaseQty?: number | null;
+    /** True when the supplying vendor is flagged as a bulk multi-leg shipper.
+     *  Drives the 🚛 BULK badge and last-receipt context row in the ordering panel. */
+    isBulkVendor?: boolean;
 }
 
 export interface PurchasingGroup {
@@ -6208,6 +6217,13 @@ export class FinaleClient {
                             rawNeededEaches: rec.rawNeededEaches,
                             provenance: rec.provenance,
                         },
+                        // Bulk-vendor context — drives BULK badge + last-receipt row in ordering panel.
+                        // lastPurchaseDate: most recent completed PO order date (already fetched by getProductActivity).
+                        // lastPurchaseQty:  qty from that PO line (purchaseQtys[] is desc-sorted by date).
+                        // isBulkVendor:     true when vendor_reorder_policies.is_bulk_vendor = true.
+                        lastPurchaseDate: activity.lastPurchaseDate ?? null,
+                        lastPurchaseQty:  activity.purchaseQtys[0] ?? null,
+                        isBulkVendor:     reorderPolicy?.isBulkVendor ?? false,
                     });
                 } catch {
                     // Skip products that error — non-fatal
