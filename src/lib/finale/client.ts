@@ -3786,6 +3786,8 @@ export class FinaleClient {
                 items,
             );
 
+            await this.recordAxiomDraftLifecycleIfApplicable(orderId, vendorPartyIdForVerify, items);
+
             return {
                 orderId,
                 finaleUrl: this.buildFinaleOrderUrl(updated?.orderUrl || currentPO.orderUrl, orderId),
@@ -5104,7 +5106,39 @@ export class FinaleClient {
             items,
         );
 
+        await this.recordAxiomDraftLifecycleIfApplicable(orderId, vendorPartyId, items);
+
         return { orderId, finaleUrl, facilityName, duplicateWarnings, priceAlerts, expectedDelivery, verification };
+    }
+
+    private async recordAxiomDraftLifecycleIfApplicable(
+        orderId: string,
+        vendorPartyId: string | null | undefined,
+        items: Array<{ productId: string; quantity: number; unitPrice?: number | null }>,
+    ): Promise<void> {
+        if (!vendorPartyId || items.length === 0) return;
+
+        try {
+            const partyId = vendorPartyId.split('/').pop() || vendorPartyId;
+            const partyUrl = `/${this.accountPath}/api/partygroup/${encodeURIComponent(partyId)}`;
+            const vendorName = await this.resolvePartyName(partyUrl);
+            const { recordAxiomDraftPOCreated, isAxiomVendorName } = await import("@/lib/axiom/lifecycle");
+
+            if (!isAxiomVendorName(vendorName)) return;
+
+            await recordAxiomDraftPOCreated({
+                poNumber: orderId,
+                vendorName,
+                vendorPartyId: partyId,
+                items: items.map(item => ({
+                    productId: item.productId,
+                    quantity: item.quantity,
+                    unitPrice: item.unitPrice ?? null,
+                })),
+            });
+        } catch (err: any) {
+            console.warn(`[finale] Axiom lifecycle trigger failed for PO #${orderId}: ${err?.message ?? err}`);
+        }
     }
 
     // ──────────────────────────────────────────────────
