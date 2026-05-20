@@ -84,6 +84,11 @@ Google Calendar events related to purchasing/builds.
 ### `sys_chat_logs`
 Dashboard chat session logs.
 
+### `axiom_sku_mappings`
+Dynamic SKU mappings from Axiom Print Job Names to Finale SKUs.
+- Primary key: `axiom_job_name` (Text)
+- Columns: `finale_skus TEXT[]` NOT NULL, `qty_fraction NUMERIC` default 1.0, `description TEXT`
+
 ## Bot Query Tools (in `start-bot.ts`)
 Four built-in Supabase tools available to GPT-4o:
 - `query_vendors` — vendor lookups by name, SKU, payment terms
