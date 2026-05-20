@@ -60,6 +60,17 @@ function isActionable(item: FocusItem): boolean {
 }
 
 /**
+ * Hard ceiling on "Order Now" — even a genuinely critical item (runway < lead time)
+ * is NOT an immediate-action item if it still has >120 days of stock. It belongs in
+ * a planning bucket, not the execution queue. This prevents automation from touching
+ * items that don't need action this week and avoids severe over-ordering.
+ *
+ * Calibration note: 120d gives a comfortable buffer above the 90d planning horizon
+ * while still catching vendors with up to ~100d lead times.
+ */
+const ORDER_NOW_CEILING_DAYS = 120;
+
+/**
  * Returns the ordering bucket this item belongs in. Used for *count display*
  * — what number sits on each filter pill. The cumulative match for a given
  * filter goes through `itemMatchesOrderingFocus`.
@@ -70,7 +81,14 @@ export function getOrderingFocusBucket(item: FocusItem): OrderingFocusBucket {
   const shortageDays = getEffectiveShortageDays(item);
   const leadTimeDays = item.leadTimeDays && item.leadTimeDays > 0 ? item.leadTimeDays : 7;
 
-  if (item.urgency === "critical" || shortageDays <= leadTimeDays) return "order_now";
+  // DECISION(2026-05-20): Cap order_now at ORDER_NOW_CEILING_DAYS (120d).
+  // Previously urgency=critical bypassed all shortage checks, landing items with
+  // 347d, 417d, 429d runway in the execution queue alongside true emergencies.
+  // Rule: you only appear in Order Now if your shortage will materialise within
+  // 120 days — regardless of how large your lead time is. Items beyond that
+  // threshold are planning items; automation must never autonomously touch them.
+  const effectiveCeiling = Math.min(leadTimeDays, ORDER_NOW_CEILING_DAYS);
+  if (shortageDays <= effectiveCeiling) return "order_now";
   if (shortageDays <= 30) return "30";
   if (shortageDays <= 60) return "60";
   if (shortageDays <= 90) return "90";
@@ -92,7 +110,10 @@ export function itemMatchesOrderingFocus(item: FocusItem, filter: OrderingFocusF
   const leadTimeDays = item.leadTimeDays && item.leadTimeDays > 0 ? item.leadTimeDays : 7;
 
   if (filter === "order_now") {
-    return item.urgency === "critical" || shortageDays <= leadTimeDays;
+    // Apply the same 120d ceiling as getOrderingFocusBucket — consistent bucketing
+    // ensures count on the pill matches what actually renders in the list.
+    const effectiveCeiling = Math.min(leadTimeDays, ORDER_NOW_CEILING_DAYS);
+    return shortageDays <= effectiveCeiling;
   }
   return shortageDays <= Number(filter);
 }

@@ -63,13 +63,34 @@ describe("getEffectiveShortageDays", () => {
 });
 
 describe("getOrderingFocusBucket — buckets by effective shortage", () => {
-  it("treats critical items as order_now regardless of shortage", () => {
+  it("places critical items with short runway in order_now (true emergency)", () => {
+    // runway 12d < lead 14d → critical and within 120d ceiling → order_now
     expect(getOrderingFocusBucket({
       ...baseItem,
       urgency: "critical",
       runwayDays: 12,
       leadTimeDays: 14,
     })).toBe("order_now");
+  });
+
+  it("does NOT place critical items with >120d runway in order_now (long-lead planning item)", () => {
+    // Real scenario: vendor lead time 450d, runway 417d → critical but NOT order_now.
+    // Automation must never touch these — they are planning items, not execution items.
+    expect(getOrderingFocusBucket({
+      ...baseItem,
+      urgency: "critical",
+      runwayDays: 417,
+      leadTimeDays: 450,
+    })).toBe("later"); // 417d > 90d threshold → later
+  });
+
+  it("does NOT place 347d-runway long-lead item in order_now", () => {
+    expect(getOrderingFocusBucket({
+      ...baseItem,
+      urgency: "critical",
+      runwayDays: 347,
+      leadTimeDays: 400,
+    })).toBe("later");
   });
 
   it("returns order_now when shortage <= leadTime", () => {
@@ -177,14 +198,28 @@ describe("itemMatchesOrderingFocus — cumulative windows", () => {
     expect(itemMatchesOrderingFocus(item, "all")).toBe(true);
   });
 
-  it("order_now matches when urgency=critical regardless of shortage", () => {
+  it("order_now matches when urgency=critical AND shortage is within 120d ceiling", () => {
+    // critical with 12d shortage and 14d lead → within ceiling → order_now
     const item = {
       ...baseItem,
       urgency: "critical" as const,
-      runwayDays: 60,  // shortage > leadTime
+      runwayDays: 12,
       leadTimeDays: 14,
     };
     expect(itemMatchesOrderingFocus(item, "order_now")).toBe(true);
+  });
+
+  it("order_now does NOT match when urgency=critical but shortage > 120d", () => {
+    // This was the bug: 417d shortage landing in order_now because urgency=critical.
+    // After the 120d ceiling fix, it correctly falls to 'later'.
+    const item = {
+      ...baseItem,
+      urgency: "critical" as const,
+      runwayDays: 417,
+      leadTimeDays: 450,
+    };
+    expect(itemMatchesOrderingFocus(item, "order_now")).toBe(false);
+    expect(itemMatchesOrderingFocus(item, "all")).toBe(true); // still visible in All
   });
 
   it("order_now matches when shortage <= leadTime even if urgency != critical", () => {
