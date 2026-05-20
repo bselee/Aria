@@ -1035,6 +1035,32 @@ async function main() {
     const changes: ChangeSet = [];
     const poFreightMap: Record<string, { invNums: string[]; totalFreight: number }> = {};
 
+    // DECISION(2026-05-20): Load mappings dynamically from the Supabase table `axiom_sku_mappings`.
+    // This removes the need to hardcode new Axiom-to-Finale SKU pairs in this file, allowing
+    // non-developers to manage them directly from the Next.js Dashboard.
+    try {
+        const { createClient: createSb } = await import('../lib/supabase');
+        const sb = createSb();
+        const { data: dbMappings, error: sbErr } = await sb
+            .from('axiom_sku_mappings')
+            .select('axiom_job_name, finale_skus, qty_fraction, description');
+
+        if (sbErr) {
+            console.warn('⚠️  Could not load dynamic SKU mappings from Supabase:', sbErr.message);
+        } else if (dbMappings && dbMappings.length > 0) {
+            console.log(`🔌 Loaded ${dbMappings.length} dynamic SKU mappings from Supabase.`);
+            for (const map of dbMappings) {
+                AXIOM_TO_FINALE[map.axiom_job_name] = {
+                    skus: map.finale_skus,
+                    qtyFraction: Number(map.qty_fraction) || 1.0,
+                    description: map.description || undefined
+                };
+            }
+        }
+    } catch (err: any) {
+        console.warn('⚠️  Failed to query dynamic SKU mappings from Supabase (falling back to static rules):', err.message);
+    }
+
     try {
         run = await ReconciliationRun.start('Axiom', args.dryRun ? 'dry-run' : 'live', {
             discover: args.discover,
