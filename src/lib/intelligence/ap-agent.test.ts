@@ -490,4 +490,159 @@ describe("APAgent processInvoiceBuffer", () => {
         // 5. Telegram notification must be suppressed
         expect(sendMessageMock).not.toHaveBeenCalled();
     });
+
+    // ── Regression: OCR retry tie-breaking ───────────────────────────────────
+    // PROBLEM(2026-05-20): When first-pass PDF parse returns 0 line items but
+    // knows vendor name + total (score=4), and LLM retry ALSO knows vendor+total
+    // AND extracts line items (score=4 but more lines), the old ">" comparison
+    // discarded the retry because scores were equal. Grassroots invoice #33790
+    // from quickbooks@notification.intuit.com hit this exact case.
+    it("accepts LLM OCR retry when it extracts line items even if overall parse score is equal", async () => {
+        // First pass: knows vendor + total but 0 line items
+        parseInvoiceMock
+            .mockResolvedValueOnce({
+                documentType: "invoice",
+                invoiceNumber: "33790",
+                poNumber: null,
+                vendorName: "Grassroots Fabric Pots",
+                invoiceDate: "2026-05-19",
+                lineItems: [],          // <-- problem: no line items
+                subtotal: 0,
+                total: 2489.70,
+                amountDue: 2489.70,
+                confidence: "medium",  // score = vendorName(+2) + total(+2) + confidence(+1) = 5
+            })
+            // LLM retry: same vendor + total + line items — score also 5 but more lines
+            .mockResolvedValueOnce({
+                documentType: "invoice",
+                invoiceNumber: "33790",
+                poNumber: null,
+                vendorName: "Grassroots Fabric Pots",
+                invoiceDate: "2026-05-19",
+                lineItems: [
+                    { description: "30gal Living Soil Pot", qty: 100, unitPrice: 20.00, total: 2000.00 },
+                    { description: "Shipping", qty: 1, unitPrice: 489.70, total: 489.70 },
+                ],
+                subtotal: 2000.00,
+                freight: 489.70,
+                total: 2489.70,
+                amountDue: 2489.70,
+                confidence: "medium",  // same score, but retryLines(2) > firstLines(0)
+            });
+
+        const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
+        const supabase = {
+            from: vi.fn((table: string) => ({
+                insert: vi.fn((payload: any) => {
+                    inserts[table] ||= [];
+                    inserts[table].push(payload);
+                    return {
+                        select: vi.fn(() => ({
+                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
+                        })),
+                    };
+                }),
+                upsert: vi.fn().mockResolvedValue(undefined),
+            })),
+        };
+
+        const bot = { telegram: { sendMessage: sendMessageMock } } as any;
+        const agent = new APAgent(bot);
+        (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Grassroots Fabric Pots");
+        (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
+        (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
+
+        const result = await agent.processInvoiceBuffer(
+            Buffer.from("pdf"),
+            "Invoice_33790_from_Grassroots_Fabric_Pots_Inc.pdf",
+            "Grassroots Invoice 33790",
+            "quickbooks@notification.intuit.com",
+            supabase,
+        );
+
+        // Retry should have been used — NOT the zero-line-item first pass
+        expect(extractPDFWithLLMMock).toHaveBeenCalledTimes(1);
+
+        // With no PO# and no matching PO, result should be unmatched — but NOT
+        // skipped_zero_line_items (the critical regression guard).
+        expect(result.state).not.toBe("skipped_zero_line_items");
+        expect(result.state).toBe("unmatched");
+
+        // The OCR_RETRY log entry should indicate "improved"
+        const retryLog = inserts.ap_activity_log.find(
+            (r: any) => r.intent === "OCR_RETRY"
+        );
+        expect(retryLog?.metadata?.retryOutcome).toBe("improved");
+    });
+
+    // ── Regression: Grassroots QuickBooks Sales Order # misidentified as Finale PO# ──
+    // PROBLEM(2026-05-20): Grassroots invoices are sent via QuickBooks and include
+    // their internal QB Sales Order number (e.g. "71486681-1124705") in a field
+    // that OCR reads as the PO#. The Finale probe correctly fails to find this number
+    // and clears it, but the result is "unmatched" (vendor+date fallback doesn't
+    // find a close-enough total). The invoice is in Bill.com but Finale PO is untouched.
+    // The fix: Grassroots must include the Finale PO# in a "Customer PO#" or "Reference"
+    // field on their QuickBooks invoice template. Meanwhile the pipeline correctly
+    // rejects the QB order# and does not make a false match.
+    it("does not falsely match a Grassroots QB Sales Order number as a Finale PO", async () => {
+        // First pass OCR: extracts QB order# as poNumber (the actual observed bug)
+        parseInvoiceMock.mockResolvedValue({
+            documentType: "invoice",
+            invoiceNumber: "33576",
+            poNumber: "71486681-1124705",  // QB Sales Order # — not a Finale PO
+            vendorName: "Grassroots Fabric Pots Inc.",
+            invoiceDate: "2026-05-19",
+            lineItems: [
+                { description: "5gal Living Soil Pot", qty: 100, unitPrice: 18.50, total: 1850.00 },
+                { description: "Shipping", qty: 1, unitPrice: 639.70, total: 639.70 },
+            ],
+            subtotal: 1850.00,
+            freight: 639.70,
+            total: 2489.70,
+            amountDue: 2489.70,
+            confidence: "high",
+        });
+
+        // Finale probe CANNOT find this QB order number — rejects all candidates
+        getOrderDetailsMock.mockRejectedValue(new Error("PO not found in Finale"));
+
+        const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
+        const supabase = {
+            from: vi.fn((table: string) => ({
+                insert: vi.fn((payload: any) => {
+                    inserts[table] ||= [];
+                    inserts[table].push(payload);
+                    return {
+                        select: vi.fn(() => ({
+                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
+                        })),
+                    };
+                }),
+                upsert: vi.fn().mockResolvedValue(undefined),
+            })),
+        };
+
+        const bot = { telegram: { sendMessage: sendMessageMock } } as any;
+        const agent = new APAgent(bot);
+        (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("Grassroots Fabric Pots");
+        (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
+        (agent as any).sendNotification = vi.fn().mockResolvedValue(undefined);
+
+        const result = await agent.processInvoiceBuffer(
+            Buffer.from("pdf"),
+            "Invoice_33576_from_Grassroots_Fabric_Pots_Inc.pdf",
+            "Grassroots Invoice 33576",
+            "quickbooks@notification.intuit.com",
+            supabase,
+        );
+
+        // QB Sales Order # must NOT produce a false PO match
+        expect(result.matchedPO).toBe(false);
+        expect(result.poNumber).toBeNull();
+        expect(result.state).toBe("unmatched");
+
+        // The pipeline should have attempted Finale validation and failed cleanly
+        // (not thrown — unmatched is the correct outcome here)
+        expect(result.success).toBe(true);
+    });
 });
