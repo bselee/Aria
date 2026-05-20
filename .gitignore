@@ -28,6 +28,7 @@ yarn-debug.log*
 yarn-error.log*
 output.log
 output*.txt
+dev.log
 
 # ─── PM2 ──────────────────────────────────────────
 .pm2/

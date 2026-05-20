@@ -4504,6 +4504,7 @@ export class FinaleClient {
                         ) {
                             edges {
                                 node {
+                                    orderId
                                     status
                                     orderDate
                                     receiveDate
@@ -4515,6 +4516,13 @@ export class FinaleClient {
                 `
             };
 
+            // Load po_sent_verified_at from Supabase so we can use the verified
+            // send timestamp as the lead-time anchor instead of Finale's orderDate
+            // (which is the draft-creation time and inflates lead times when POs
+            // sit in draft for a day or more before being emailed).
+            const { loadPOSentTimestamps, resolveLeadTimeAnchor } = await import('../purchasing/lead-time-enricher');
+            const sentAtMap = await loadPOSentTimestamps(daysBack).catch(() => new Map<string, string>());
+
             const data = await this.graphql(query, 'Vendor Lead Time History');
             const edges = data?.orderViewConnection?.edges || [];
             // Group lead times by vendor
@@ -4525,7 +4533,10 @@ export class FinaleClient {
                 if (!po.orderDate || !po.receiveDate) continue;
                 const vendor = po.supplier?.name;
                 if (!vendor) continue;
-                const orderMs = new Date(po.orderDate).getTime();
+                // Use po_sent_verified_at when available — more accurate than Finale's
+                // orderDate (which is draft-creation time, not the email-sent time).
+                const anchorDate = resolveLeadTimeAnchor(po.orderDate, po.orderId, sentAtMap);
+                const orderMs = new Date(anchorDate).getTime();
                 const receiveMs = new Date(po.receiveDate).getTime();
                 if (isNaN(orderMs) || isNaN(receiveMs)) continue;
                 const days = Math.round((receiveMs - orderMs) / 86_400_000);
@@ -5512,7 +5523,9 @@ export class FinaleClient {
                         : `${compActivity.purchaseCount} PO${compActivity.purchaseCount === 1 ? '' : 's'}`;
                     const trendLabel = trend.trendingUp && chosen.source === 'receipts'
                         ? ` ↑ trending up`
-                        : '';
+                        : trend.trendingDown && chosen.source === 'receipts'
+                            ? ` ↓ trending down`
+                            : '';
                     const onTimeLabel = onTimeRate < 0.85 && rawStockOnOrder > 0
                         ? ` On-order discounted ${Math.round((1 - onTimeRate) * 100)}% (vendor late ${Math.round((1 - onTimeRate) * 100)}% historically).`
                         : '';
@@ -5605,7 +5618,7 @@ export class FinaleClient {
                                 {
                                     step: 'Daily burn',
                                     detail: chosen.source === 'receipts'
-                                        ? `${dailyBurn.toFixed(2)}/d from receipts · ${compActivity.purchaseCount} POs · ${confidence} confidence${trend.trendingUp ? ' · trending up' : ''}`
+                                        ? `${dailyBurn.toFixed(2)}/d from receipts · ${compActivity.purchaseCount} POs · ${confidence} confidence${trend.trendingUp ? ' · trending up' : trend.trendingDown ? ' · trending down (using recent half-window rate)' : ''}`
                                         : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`,
                                     value: dailyBurn,
                                 },
@@ -5822,6 +5835,10 @@ export class FinaleClient {
 
         const { readForwardDemand } = await import('@/lib/purchasing/forward-demand');
         const forwardDemand = readForwardDemand(30);
+        // DECISION(2026-05-20): Import recordStockoutEvent here (same lazy-import
+        // pattern as getBOMDemand) so resale-path near-stockouts are also tracked.
+        // Before this, only BOM components accumulated stockout_events history.
+        const { recordStockoutEvent: recordResaleStockout } = await import('@/lib/purchasing/stockout-history');
 
         // 3 workers: keeps peak concurrency at ~3 simultaneous Finale requests.
         // 100ms inter-SKU pause spreads load to ~180 calls/min sustained — well within limits.
@@ -6007,6 +6024,21 @@ export class FinaleClient {
                     const urgency = rec.urgency;
                     const explanation = rec.explanation;
                     const suggestedQty = rec.suggestedQty;
+
+                    // Record stockout event if adjusted runway dropped below lead time.
+                    // Idempotent per SKU per day via upsert on (product_id, detected_on).
+                    // Fire-and-forget — never blocks the scan.
+                    if (adjustedRunwayDays < effectiveLeadTimeDays && dailyRate > 0) {
+                        void recordResaleStockout({
+                            productId: sku,
+                            vendorPartyId: partyId || null,
+                            stockOnHand: effectiveStock,
+                            stockOnOrder,
+                            dailyBurn: dailyRate,
+                            runwayDays: adjustedRunwayDays,
+                            leadTimeDays: effectiveLeadTimeDays,
+                        });
+                    }
 
                     // Qty divergence: compare our velocity-based suggestion vs Finale's reorderQuantityToOrder
                     const finaleReorderQty = candidate.finaleReorderQty;
