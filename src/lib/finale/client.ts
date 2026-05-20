@@ -228,6 +228,10 @@ export interface PurchasingItem {
     /** True when the supplying vendor is flagged as a bulk multi-leg shipper.
      *  Drives the 🚛 BULK badge and last-receipt context row in the ordering panel. */
     isBulkVendor?: boolean;
+    /** Fraction of past POs the vendor delivered on or before the expected date (0.0–1.0).
+     *  Sourced from _vendorOnTimeRateCache (populated by ensureLeadTimeServiceWarm).
+     *  Undefined = no historical data yet (treated as 1.0 / fully on time). */
+    vendorOnTimeRate?: number;
 }
 
 export interface PurchasingGroup {
@@ -6224,6 +6228,10 @@ export class FinaleClient {
                         lastPurchaseDate: activity.lastPurchaseDate ?? null,
                         lastPurchaseQty:  activity.purchaseQtys[0] ?? null,
                         isBulkVendor:     reorderPolicy?.isBulkVendor ?? false,
+                        // vendorOnTimeRate: populated from _vendorOnTimeRateCache — warmed by
+                        // ensureLeadTimeServiceWarm() called earlier in getPurchasingIntelligence.
+                        // Zero extra API calls: getVendorOnTimeRate() reads the in-process cache.
+                        vendorOnTimeRate: this.getVendorOnTimeRate(party.groupName),
                     });
                 } catch {
                     // Skip products that error — non-fatal

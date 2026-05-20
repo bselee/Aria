@@ -23,7 +23,7 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
-type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched";
+type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched" | "short_shipment_hold";
 
 const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
   auto_approved: { dot: "bg-emerald-500", label: "AUTO", pulse: false },
@@ -31,6 +31,7 @@ const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean
   rejected: { dot: "bg-red-500", label: "REJECT", pulse: false },
   duplicate: { dot: "bg-zinc-600", label: "DUP", pulse: false },
   unmatched: { dot: "bg-rose-500", label: "NO PO", pulse: false },
+  short_shipment_hold: { dot: "bg-orange-500", label: "SHORT SHIP", pulse: true },
 };
 
 function statusCfg(status: string) {
@@ -52,28 +53,85 @@ function ReconciliationDetail({ metadata }: { metadata: Record<string, unknown> 
     const totalImpact = (metadata.totalDollarImpact ?? metadata.totalImpact ?? 0) as number;
     const verdict = metadata.verdict as string | undefined;
 
+    const shortShipmentImpact = priceChanges
+        .filter((pc: any) => pc.verdict === "short_shipment_hold")
+        .reduce((acc: number, pc: any) => {
+            const gap = pc.receivingGap ?? Math.max(0, pc.quantity - (pc.receivedQty ?? 0));
+            return acc + gap * (pc.invoicePrice ?? 0);
+        }, 0);
+
     const meaningfulPrices = priceChanges.filter(
-        (pc: any) => pc.verdict !== "no_change" && pc.verdict !== "no_match"
+        (pc: any) => pc.verdict !== "no_change" && pc.verdict !== "no_match" && pc.verdict !== "short_shipment_hold"
     );
 
-    if (meaningfulPrices.length === 0 && feeChanges.length === 0 && !tracking) {
+    if (meaningfulPrices.length === 0 && feeChanges.length === 0 && !tracking && shortShipmentImpact === 0) {
         return null;
     }
 
     return (
         <div className="mt-3 space-y-2 font-mono text-xs border-t border-zinc-700/40 pt-2">
             {verdict && (
-                <div className="flex items-center gap-1.5">
-                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${verdict === "auto_approve" ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
+                <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${
+                        verdict === "auto_approve" ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
                             : verdict === "needs_approval" ? "text-amber-400 bg-amber-500/10 border-amber-500/20"
-                                : verdict === "rejected" ? "text-rose-400 bg-rose-500/10 border-rose-500/20"
-                                    : "text-zinc-400 bg-zinc-700/20 border-zinc-700/30"
-                        }`}>
+                            : verdict === "short_shipment_hold" ? "text-orange-400 bg-orange-500/10 border-orange-500/20 animate-pulse"
+                            : verdict === "rejected" ? "text-rose-400 bg-rose-500/10 border-rose-500/20"
+                            : "text-zinc-400 bg-zinc-700/20 border-zinc-700/30"
+                    }`}>
                         {verdict.replace(/_/g, " ")}
                     </span>
                     <span className="text-zinc-500">
                         Impact: <span className={totalImpact > 0 ? "text-amber-400" : "text-zinc-400"}>{fmtDollars(totalImpact)}</span>
                     </span>
+                    {shortShipmentImpact > 0 && (
+                        <span className="text-zinc-500">
+                            | Short Qty Impact: <span className="text-orange-400 font-semibold">{fmtDollars(shortShipmentImpact)}</span>
+                        </span>
+                    )}
+                </div>
+            )}
+
+            {/* Dedicated Short Shipments Section */}
+            {priceChanges.some((pc: any) => pc.verdict === "short_shipment_hold") && (
+                <div className="space-y-1">
+                    <div className="text-orange-400 uppercase tracking-wider text-[10px] mb-1 font-semibold flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse" />
+                        Quantity Discrepancies (Short Shipments)
+                    </div>
+                    <div className="space-y-1">
+                        {priceChanges
+                            .filter((pc: any) => pc.verdict === "short_shipment_hold")
+                            .map((pc: any, i: number) => {
+                                const gap = pc.receivingGap ?? Math.max(0, pc.quantity - (pc.receivedQty ?? 0));
+                                const costImpact = gap * (pc.invoicePrice ?? 0);
+                                return (
+                                    <div key={i} className="flex flex-col gap-0.5 bg-orange-500/5 border border-orange-500/10 rounded p-1.5">
+                                        <div className="flex items-center justify-between text-zinc-200">
+                                            <span className="font-semibold text-orange-300 truncate max-w-[180px]" title={pc.description || pc.productId}>
+                                                {pc.productId}
+                                            </span>
+                                            <span className="text-rose-400 font-medium">
+                                                -{gap} unit{gap !== 1 ? "s" : ""}
+                                            </span>
+                                        </div>
+                                        <div className="flex items-center justify-between text-[10px] text-zinc-400">
+                                            <span>
+                                                Invoiced: {pc.quantity} units | Received: {pc.receivedQty ?? 0}
+                                            </span>
+                                            <span>
+                                                Unit: {fmtDollars(pc.invoicePrice ?? 0)} | Impact: <span className="text-orange-400 font-semibold">{fmtDollars(costImpact)}</span>
+                                            </span>
+                                        </div>
+                                        {pc.reason && (
+                                            <div className="text-[10px] text-zinc-500 italic mt-0.5">
+                                                {pc.reason.replace(/^[\s|]*SHORT SHIPMENT:\s*/i, "").replace(/^[\s|]*SHORT\s*SHIPMENT\s*HOLD:\s*/i, "")}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                    </div>
                 </div>
             )}
 
@@ -107,7 +165,7 @@ function ReconciliationDetail({ metadata }: { metadata: Record<string, unknown> 
                     <div className="space-y-0.5">
                         {feeChanges.map((fc: any, i: number) => (
                             <div key={i} className="flex items-center gap-2">
-                                <span className={`text-[10px] ${fc.verdict === "auto_approve" ? "text-emerald-500" : "text-amber-500"}`}>
+                                <span className={`text-[10px] ${fc.verdict === "auto_approve" ? "text-emerald-500" : fc.verdict === "amber" || fc.verdict === "needs_approval" ? "text-amber-500" : "text-zinc-400"}`}>
                                     {fc.verdict === "auto_approve" ? "✅" : "⚠️"}
                                 </span>
                                 <span className="text-zinc-300 truncate max-w-[120px]">{fc.description || fc.type}</span>
@@ -145,6 +203,20 @@ function pendingGuidance(inv: InvoiceQueueItem): { text: string; suggestion: "ap
   const v = inv.vendorName.toLowerCase();
   const num = (inv.invoiceNumber ?? "").toLowerCase();
   const impact = Math.abs(inv.dollarImpact ?? 0);
+
+  // Short shipment case
+  if (inv.status === "short_shipment_hold") {
+    const priceChanges = (inv.metadata?.priceChanges as any[]) || [];
+    const shortLines = priceChanges.filter((pc: any) => pc.verdict === "short_shipment_hold");
+    const gapSum = shortLines.reduce((acc: number, pc: any) => {
+      const gap = pc.receivingGap ?? Math.max(0, pc.quantity - (pc.receivedQty ?? 0));
+      return acc + gap;
+    }, 0);
+    return {
+      text: `⚠️ SHORT SHIPMENT: ${shortLines.length} item(s) short by ${gapSum} units total. Hold for credit memo or manual override.`,
+      suggestion: "review",
+    };
+  }
 
   // OCR failure — nothing to reconcile
   if (v === "error" || v === "unknown" || num === "error" || num === "") {
@@ -264,8 +336,8 @@ export default function InvoiceQueuePanel() {
   }, [fetchData]);
 
   // Partition into pending vs rest
-  const pending = invoices.filter(i => i.status === "needs_approval");
-  const rest = invoices.filter(i => i.status !== "needs_approval");
+  const pending = invoices.filter(i => i.status === "needs_approval" || i.status === "short_shipment_hold");
+  const rest = invoices.filter(i => i.status !== "needs_approval" && i.status !== "short_shipment_hold");
 
   // Identify stale pending items (older than threshold)
   const stalePending = pending.filter(i => daysOld(i.processedAt) > STALE_THRESHOLD_DAYS);
@@ -413,11 +485,15 @@ export default function InvoiceQueuePanel() {
               ((inv.metadata as any).feeChanges?.length > 0) ||
               (inv.metadata as any).tracking
             );
+            const isShortShip = inv.status === "short_shipment_hold";
+            const borderLeftColor = isShortShip ? "rgb(249 115 22)" : "var(--dash-accent-pending)";
+            const rowBgClass = isShortShip ? "border-b border-orange-500/10 bg-orange-500/5 border-l-2" : "border-b border-amber-500/10 bg-amber-500/5 border-l-2";
+
             return (
               <div
                 key={inv.id}
-                className="border-b border-amber-500/10 bg-amber-500/5 border-l-2"
-                style={{ borderLeftColor: "var(--dash-accent-pending)" }}
+                className={rowBgClass}
+                style={{ borderLeftColor }}
               >
                 <div className="flex items-start gap-2.5 px-4 py-2">
                   <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot} animate-pulse`} />

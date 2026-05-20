@@ -20,6 +20,7 @@ import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
+import AxiomSkuMappingPanel from "./AxiomSkuMappingPanel";
 import { PANEL_BY_ID } from "./panelRegistry";
 import type { PanelId } from "./useDashboardLayout";
 import type {
@@ -56,6 +57,7 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
 type TabId =
     | "lifecycle"
     | "builds"
+    | "axiom-skus"
     | "activity";
 
 type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
@@ -215,6 +217,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                     </div>
                 ),
             },
+            { id: "axiom-skus", label: "Axiom SKUs", render: () => <AxiomSkuMappingPanel /> },
             { id: "activity", label: "Activity", render: () => panelById("activity") },
         ],
         [panelById],

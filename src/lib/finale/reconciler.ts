@@ -2213,7 +2213,8 @@ export async function applyReconciliation(
     // 1. Apply price changes
     for (const pc of result.priceChanges) {
         const isApproved = pc.verdict === "auto_approve" ||
-            (pc.verdict === "needs_approval" && approvedItems?.includes(pc.productId));
+            ((pc.verdict === "needs_approval" || pc.verdict === "short_shipment_hold") &&
+                approvedItems?.includes(pc.productId));
 
         if (!isApproved) {
             skipped.push(`${pc.productId}: ${pc.reason}`);

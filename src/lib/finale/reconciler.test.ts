@@ -20,6 +20,7 @@ import {
     normalizeLineTotal,
     reconcileFees,
     reconcileInvoiceToPO,
+    applyReconciliation,
     buildAuditMetadata,
 } from "./reconciler";
 import type { InvoiceData } from "../pdf/invoice-parser";
@@ -645,6 +646,48 @@ describe("reconcileInvoiceToPO guardrails", () => {
             invoiceNumber: "INV-1001",
             vendorName: "Acme Soil LLC",
         }));
+    });
+});
+
+describe("applyReconciliation", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        createClientMock.mockReturnValue(null);
+    });
+
+    it("applies a short shipment hold line when the dashboard explicitly approves it", async () => {
+        const client = {
+            updateOrderItemPrice: vi.fn().mockResolvedValue({ supplierPartyUrl: null }),
+            updateProductSupplierPrice: vi.fn(),
+        };
+
+        const result = await applyReconciliation({
+            orderId: "PO-001",
+            invoiceNumber: "INV-001",
+            vendorName: "Acme Soil",
+            invoiceTotal: 100,
+            priceChanges: [{
+                productId: "SKU-1",
+                description: "Short item",
+                poPrice: 8,
+                invoicePrice: 10,
+                percentChange: 0.25,
+                dollarImpact: 20,
+                verdict: "short_shipment_hold",
+                reason: "SHORT SHIPMENT: Invoice qty 10 > Received qty 8",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "short_shipment_hold",
+            summary: "Short shipment hold",
+            totalDollarImpact: 20,
+            autoApplicable: false,
+            warnings: [],
+        } as any, client as any, ["SKU-1"]);
+
+        expect(client.updateOrderItemPrice).toHaveBeenCalledWith("PO-001", "SKU-1", 10);
+        expect(result.applied).toHaveLength(1);
+        expect(result.skipped).toEqual([]);
     });
 });
 

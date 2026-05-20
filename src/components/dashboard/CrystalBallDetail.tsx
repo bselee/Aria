@@ -108,6 +108,12 @@ export interface CrystalBallItem {
         earliestBuildDate: string;
         feedsBuilds: string[];
     };
+
+    /** Fraction of past POs this vendor delivered on or before the expected date
+     *  (0.0 – 1.0).  Computed by getVendorOnTimeRate() and stored on the item
+     *  so the Crystal Ball drawer can surface a lateness risk badge without an
+     *  extra API call.  Undefined = not yet measured (treat as 1.0 / on time). */
+    vendorOnTimeRate?: number;
 }
 
 interface CrystalBallDetailProps {
@@ -305,6 +311,22 @@ export function CrystalBallDetail({ item, onClose, onCommitPO }: CrystalBallDeta
                         }`}>
                             Urgency: {item.recommendation.urgency}
                         </span>
+                        {/* Vendor on-time rate badge — shown when below 90%.
+                            DECISION(2026-05-21): Threshold of 0.9 chosen because a vendor
+                            delivering late >10% of the time materially risks the lead-time
+                            assumption the recommender is built on. Below 0.75 = danger. */}
+                        {item.vendorOnTimeRate != null && item.vendorOnTimeRate < 0.9 && (
+                            <span
+                                className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                                    item.vendorOnTimeRate < 0.75
+                                        ? 'text-red-400 border-red-500/30 bg-red-500/5'
+                                        : 'text-amber-400 border-amber-500/30 bg-amber-500/5'
+                                }`}
+                                title={`Vendor on-time delivery rate: ${Math.round(item.vendorOnTimeRate * 100)}%. Lead-time estimates may be optimistic — actual arrival risk is higher than the runway numbers suggest.`}
+                            >
+                                ⏱ Late {Math.round((1 - item.vendorOnTimeRate) * 100)}%
+                            </span>
+                        )}
                     </div>
                     <h2 className="text-sm text-zinc-400 font-sans tracking-wide leading-tight max-w-xl">
                         {item.productName}
