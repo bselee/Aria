@@ -33,7 +33,7 @@ import * as apIssue from "../intelligence/ap-issue";
 import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
 import { ensureFinaleToolsRegistered } from "../agents/register-finale-tools";
 
-import { FinaleClient } from "./client";
+import { FinaleClient, getShipmentReceiptItems } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../supabase";
 import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
@@ -1236,6 +1236,23 @@ export async function reconcileInvoiceToPO(
         };
     }
 
+    // Fetch and aggregate shipment receipts to sum physical received quantities by SKU
+    const shipmentDetails = await Promise.all(
+        (poSummary.shipmentUrls || []).map((url) => client.getShipmentDetails(url).catch(() => null))
+    );
+
+    const receivedQtyMap = new Map<string, number>();
+    let totalReceived = 0;
+    for (const shipment of shipmentDetails) {
+        if (!shipment) continue;
+        const receiptItems = getShipmentReceiptItems(shipment);
+        for (const item of receiptItems) {
+            const current = receivedQtyMap.get(item.productId) || 0;
+            receivedQtyMap.set(item.productId, current + item.quantity);
+            totalReceived += item.quantity;
+        }
+    }
+
     // â”€â”€ Guard 0.5: Empty PO â€” try to populate from invoice items â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Draft POs often have no items yet. Instead of surfacing a useless needs_approval
     // (where approving does nothing), try to resolve invoice SKUs in Finale and offer
@@ -1352,7 +1369,7 @@ export async function reconcileInvoiceToPO(
     }
 
     // 1. Compare line item prices (includes Guard 2: overbill check)
-    const priceChanges = reconcileLineItems(invoice, poSummary);
+    const priceChanges = reconcileLineItems(invoice, poSummary, receivedQtyMap, totalReceived);
 
     // 2. Compare fees (includes Guard 3: fee dollar threshold)
     const feeChanges = reconcileFees(invoice, poSummary, vendorFeeLabelMap);
