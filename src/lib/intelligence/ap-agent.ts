@@ -1790,11 +1790,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             if (result.overallVerdict === "auto_approve") {
                 // Safe to auto-apply
+                let pendingLogId: string | null = null;
                 if (result.priceChanges.length > 0 || result.feeChanges.length > 0 || result.trackingUpdate) {
                     // C1 FIX: Write "pending" audit entry BEFORE Finale writes.
                     // If applyReconciliation() succeeds but logReconciliation() fails,
                     // checkDuplicateReconciliation() still finds this entry and stops re-processing.
-                    let pendingLogId: string | null = null;
                     try {
                         const identity = buildReconciliationIdentityMetadata({
                             invoiceNumber: result.invoiceNumber,
@@ -1923,6 +1923,65 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     },
                     resolvedAt: new Date(),
                 }).catch(() => { /* never throws */ });
+                return { success: true, verdict: result.overallVerdict };
+
+            } else if (result.overallVerdict === "short_shipment_hold") {
+                // Short shipment detected — hold for manual review / credit memo
+                const balanceCheck = validateInvoiceBalance(invoice);
+                const dashboardReviewActivityLogId = await enqueueForDashboardReview(result, balanceCheck);
+                writeReconciliationMemory("short_shipment_hold");
+
+                // Construct Telegram message detailing the exact quantity mismatch
+                const skuDiscrepancies = result.priceChanges
+                    .filter(pc => pc.verdict === "short_shipment_hold")
+                    .map(pc => {
+                        const gap = pc.receivingGap || 0;
+                        const costImpact = gap * pc.invoicePrice;
+                        return `  • ${pc.productId}: Invoiced ${pc.quantity}, received ${pc.receivedQty || 0}. Gap: ${gap} units ($${costImpact.toFixed(2)} impact).`;
+                    })
+                    .join("\n");
+
+                await this.bot.telegram.sendMessage(
+                    process.env.TELEGRAM_CHAT_ID!,
+                    `⚠️ *Short Shipment Detected — Held for Review*\n\n` +
+                    `PO: \`${result.orderId}\`\n` +
+                    `Vendor: ${result.vendorName}\n` +
+                    `Invoice: #${result.invoiceNumber}\n\n` +
+                    `Discrepancies:\n${skuDiscrepancies}\n\n` +
+                    `Check the AP / Invoices dashboard panel to resolve with credit memo or warehouse.`,
+                    { parse_mode: "Markdown" }
+                );
+
+                if (issueId) {
+                    await apIssue.recordApHandoff(
+                        issueId,
+                        apIssue.HANDLER.AP_RECONCILER,
+                        apIssue.HANDLER.WILL,
+                        apIssue.HANDOFF_REASON.NEEDS_APPROVAL_DASHBOARD,
+                    );
+                    await apIssue.blockApIssue(
+                        issueId,
+                        "short_shipment_hold",
+                        `Short shipment detected ($${result.totalDollarImpact.toFixed(2)} impact)`,
+                    );
+                }
+
+                writeReconciliationOutcome({
+                    runId: crypto.randomUUID(),
+                    outcome: "short_shipment_hold" as any,
+                    invoiceId: result.invoiceNumber ?? undefined,
+                    poId: result.orderId ?? undefined,
+                    vendorName: result.vendorName ?? undefined,
+                    outcomeMeta: {
+                        total_dollar_impact: result.totalDollarImpact,
+                        price_change_count: result.priceChanges.length,
+                        short_shipment_count: result.priceChanges.filter(pc => pc.verdict === "short_shipment_hold").length,
+                        force_approval_was_set: forceApproval,
+                        match_strategy: matchStrategy,
+                        ...(dashboardReviewActivityLogId ? { source_activity_log_id: dashboardReviewActivityLogId } : {}),
+                    },
+                }).catch(() => { /* never throws */ });
+
                 return { success: true, verdict: result.overallVerdict };
 
             } else if (result.overallVerdict === "needs_approval") {
@@ -2146,6 +2205,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     ): Promise<void> {
         if (result.overallVerdict === "no_change") return;
 
+        const supabase = createClient();
         const hasDifferences = result.totalDollarImpact !== 0
             || result.priceChanges.some(pc => pc.verdict !== "no_change" && pc.verdict !== "no_match")
             || result.feeChanges.length > 0;
@@ -2158,8 +2218,18 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             if (logId && hasDifferences) {
                 // Mark row so daily digest cron can GROUP BY vendor and surface it
                 try {
-                    await supabase?.from("ap_activity_log").update({
-                        metadata: { routine: true, autonomy_phase: autonomyPhase },
+                    const { data: logRow } = await supabase
+                        .from("ap_activity_log")
+                        .select("metadata")
+                        .eq("id", logId)
+                        .single();
+                    const existingMetadata = logRow?.metadata || {};
+                    await supabase.from("ap_activity_log").update({
+                        metadata: {
+                            ...existingMetadata,
+                            routine: true,
+                            autonomy_phase: autonomyPhase
+                        },
                     }).eq("id", logId);
                 } catch { /* non-blocking */ }
             }

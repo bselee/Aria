@@ -49,10 +49,69 @@ vi.mock("../finale/reconciler", () => ({
 }));
 
 vi.mock("./feedback-loop", () => ({
-    recordFeedback: vi.fn(),
+    recordFeedback: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { APAgent } from "./ap-agent";
+
+function createMockSupabase(inserts: Record<string, any[]> = {}) {
+    const queryBuilder: any = {};
+
+    queryBuilder.select = vi.fn(() => queryBuilder);
+    queryBuilder.eq = vi.fn(() => queryBuilder);
+    queryBuilder.ilike = vi.fn(() => queryBuilder);
+    queryBuilder.gte = vi.fn(() => queryBuilder);
+    queryBuilder.order = vi.fn(() => queryBuilder);
+    queryBuilder.limit = vi.fn(() => queryBuilder);
+    queryBuilder.single = vi.fn().mockResolvedValue({
+        data: {
+            id: "doc-1",
+            autonomy_phase: 1,
+            metadata: { test_mock: true }
+        }
+    });
+
+    queryBuilder.insert = vi.fn((payload: any) => {
+        return queryBuilder;
+    });
+
+    queryBuilder.update = vi.fn((payload: any) => queryBuilder);
+    queryBuilder.upsert = vi.fn().mockResolvedValue(undefined);
+
+    const fromMock = vi.fn((table: string) => {
+        const tableQuery = { ...queryBuilder };
+        tableQuery.insert = vi.fn((payload: any) => {
+            inserts[table] ||= [];
+            if (Array.isArray(payload)) {
+                inserts[table].push(...payload);
+            } else {
+                inserts[table].push(payload);
+            }
+            return {
+                select: vi.fn(() => ({
+                    single: vi.fn().mockResolvedValue({ data: { id: `${table}-1` } }),
+                })),
+            };
+        });
+
+        tableQuery.upsert = vi.fn((payload: any) => {
+            inserts[table] ||= [];
+            if (Array.isArray(payload)) {
+                inserts[table].push(...payload);
+            } else {
+                inserts[table].push(payload);
+            }
+            return Promise.resolve(undefined);
+        });
+
+        return tableQuery;
+    });
+
+    return {
+        from: fromMock,
+    };
+}
+
 
 describe("APAgent processInvoiceBuffer", () => {
     beforeEach(() => {
@@ -119,16 +178,7 @@ describe("APAgent processInvoiceBuffer", () => {
             verdict: "auto_approve",
         });
 
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                        single: vi.fn().mockResolvedValue({ data: null }),
-                    })),
-                })),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase();
 
         const result = await agent.processInvoiceBuffer(
             Buffer.from("pdf"),
@@ -179,20 +229,7 @@ describe("APAgent processInvoiceBuffer", () => {
             });
 
         const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [] };
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return {
-                        select: vi.fn(() => ({
-                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
-                        })),
-                    };
-                }),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase(inserts);
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -254,24 +291,7 @@ describe("APAgent processInvoiceBuffer", () => {
             });
 
         const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return {
-                        select: vi.fn(() => ({
-                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
-                        })),
-                    };
-                }),
-                upsert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return Promise.resolve(undefined);
-                }),
-            })),
-        };
+        const supabase = createMockSupabase(inserts);
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -329,16 +349,7 @@ describe("APAgent processInvoiceBuffer", () => {
             confidence: "low",
         });
 
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                        single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
-                    })),
-                })),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase();
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -383,16 +394,7 @@ describe("APAgent processInvoiceBuffer", () => {
             confidence: "medium",
         });
 
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                        single: vi.fn().mockResolvedValue({ data: { id: `${table}-1` } }),
-                    })),
-                })),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase();
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -434,24 +436,7 @@ describe("APAgent processInvoiceBuffer", () => {
         });
 
         const inserts: Record<string, any[]> = { documents: [], invoices: [] };
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return {
-                        select: vi.fn(() => ({
-                            single: vi.fn().mockResolvedValue({ data: { id: `${table}-1` } }),
-                        })),
-                    };
-                }),
-                upsert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return Promise.resolve(undefined);
-                }),
-            })),
-        };
+        const supabase = createMockSupabase(inserts);
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -531,20 +516,7 @@ describe("APAgent processInvoiceBuffer", () => {
             });
 
         const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return {
-                        select: vi.fn(() => ({
-                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
-                        })),
-                    };
-                }),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase(inserts);
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
@@ -635,21 +607,7 @@ describe("APAgent processInvoiceBuffer", () => {
         });
 
         const inserts: Record<string, any[]> = { ap_activity_log: [], documents: [], invoices: [] };
-        const supabase = {
-            from: vi.fn((table: string) => ({
-                insert: vi.fn((payload: any) => {
-                    inserts[table] ||= [];
-                    inserts[table].push(payload);
-                    return {
-                        select: vi.fn(() => ({
-                            single: vi.fn().mockResolvedValue({ data: { id: "doc-1" } }),
-                        })),
-                    };
-                }),
-                update: vi.fn(() => ({ eq: vi.fn().mockResolvedValue(undefined) })),
-                upsert: vi.fn().mockResolvedValue(undefined),
-            })),
-        };
+        const supabase = createMockSupabase(inserts);
 
         const bot = { telegram: { sendMessage: sendMessageMock } } as any;
         const agent = new APAgent(bot);
