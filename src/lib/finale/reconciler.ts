@@ -1702,7 +1702,9 @@ function validateVendorCorrelation(
 
 function reconcileLineItems(
     invoice: InvoiceData,
-    po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>
+    po: NonNullable<Awaited<ReturnType<FinaleClient["getOrderSummary"]>>>,
+    receivedQtyMap: Map<string, number>,
+    totalReceived: number
 ): PriceChange[] {
     const changes: PriceChange[] = [];
     const matchedPoProductIds = new Set<string>(); // prevent double-matching the same PO product
@@ -1794,12 +1796,17 @@ function reconcileLineItems(
         // Guard 2: Quantity overbill â€” never auto-approve if invoice qty > PO qty.
         // Even a tiny price change is suspicious when the vendor is billing for
         // more units than were ordered.
-        if (invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
+        if (false && invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
             pVerdict = "needs_approval";
             pReason += ` | âš ï¸ OVERBILL: Invoice qty ${invLine.qty} > PO qty ${poLine.quantity} â€” may be billed for more units than ordered.`;
         }
 
-        changes.push({
+        const receivedQty = receivedQtyMap.get(poLine.productId) || 0;
+        const invoiceQty = invLine.qty;
+        const poQty = poLine.quantity;
+
+        // Populate physical receiving metrics on PriceChange
+        const changeItem: PriceChange = {
             productId: poLine.productId,
             description: invLine.description,
             poPrice: poLine.unitPrice,
@@ -1809,7 +1816,36 @@ function reconcileLineItems(
             dollarImpact,
             verdict: pVerdict,
             reason: pReason,
-        });
+            receivedQty,
+            receivingGap: Math.max(0, invoiceQty - receivedQty),
+        };
+
+        // 3-Way Quantity Verification
+        if (totalReceived === 0) {
+            // State A: PO is Unreceived — "invoice RCV on purchase prior to receiving" bypass.
+            // Check if invoice line quantity perfectly matches PO ordered quantity.
+            if (invoiceQty === poQty) {
+                // Perfect ordered quantity match — let price/fee guards stand
+                console.log(`     [reconciler] Bypass: clean unreceived match for ${poLine.productId} (qty=${invoiceQty})`);
+            } else {
+                // Quantity mismatch and no receiving records to back it up
+                changeItem.verdict = "needs_approval";
+                changeItem.reason += ` | QTY MISMATCH (Unreceived): Invoice qty ${invoiceQty} != PO qty ${poQty} and PO has no receipt records.`;
+            }
+        } else {
+            // State B: PO is Partially/Fully Received — Enforce physical receipt verification.
+            if (invoiceQty > receivedQty) {
+                // Short shipment or overbill relative to physical receipt — hold for review or credit memo
+                changeItem.verdict = "short_shipment_hold";
+                changeItem.reason += ` | SHORT SHIPMENT: Invoice qty ${invoiceQty} > Received qty ${receivedQty} (Gap: ${invoiceQty - receivedQty} units).`;
+            } else if (invoiceQty > poQty) {
+                // Overbill relative to ordered quantity (even if physically received)
+                changeItem.verdict = "needs_approval";
+                changeItem.reason += ` | OVERBILL: Invoice qty ${invoiceQty} > PO qty ${poQty}.`;
+            }
+        }
+
+        changes.push(changeItem);
     }
 
     return changes;
