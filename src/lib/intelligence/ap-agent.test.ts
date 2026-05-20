@@ -418,4 +418,76 @@ describe("APAgent processInvoiceBuffer", () => {
             poNumber: null,
         }));
     });
+
+    it("bypasses PO matching, inserts with completed status, and suppresses notifications for AAA Cooper invoices", async () => {
+        parseInvoiceMock.mockResolvedValue({
+            documentType: "invoice",
+            invoiceNumber: "AAA-300300",
+            poNumber: null,
+            vendorName: "AAA Cooper",
+            invoiceDate: "2026-03-26",
+            lineItems: [{ description: "freight charges", qty: 1, unitPrice: 150, total: 150 }],
+            subtotal: 150,
+            total: 150,
+            amountDue: 150,
+            confidence: "high",
+        });
+
+        const inserts: Record<string, any[]> = { documents: [], invoices: [] };
+        const supabase = {
+            from: vi.fn((table: string) => ({
+                insert: vi.fn((payload: any) => {
+                    inserts[table] ||= [];
+                    inserts[table].push(payload);
+                    return {
+                        select: vi.fn(() => ({
+                            single: vi.fn().mockResolvedValue({ data: { id: `${table}-1` } }),
+                        })),
+                    };
+                }),
+                upsert: vi.fn((payload: any) => {
+                    inserts[table] ||= [];
+                    inserts[table].push(payload);
+                    return Promise.resolve(undefined);
+                }),
+            })),
+        };
+
+        const bot = { telegram: { sendMessage: sendMessageMock } } as any;
+        const agent = new APAgent(bot);
+        (agent as any).resolveVendorAlias = vi.fn().mockResolvedValue("AAA Cooper");
+        (agent as any).logActivity = vi.fn().mockResolvedValue(undefined);
+
+        const result = await agent.processInvoiceBuffer(
+            Buffer.from("pdf"),
+            "aaa-cooper.pdf",
+            "AAA Cooper Invoice",
+            "billing@aaacooper.com",
+            supabase,
+        );
+
+        // 1. Check outcome details: success: true, state: "unmatched" (bypassed), no error
+        expect(result).toEqual(expect.objectContaining({
+            success: true,
+            state: "unmatched",
+            matchedPO: false,
+            poNumber: null,
+        }));
+
+        // 2. PO lookup should NOT have been performed for AAA Cooper
+        expect(getOrderDetailsMock).not.toHaveBeenCalled();
+
+        // 3. Document insert should set action_required to false
+        const docInsert = inserts.documents[0];
+        expect(docInsert).toBeDefined();
+        expect(docInsert.action_required).toBe(false);
+
+        // 4. Invoice insert should set status to "completed"
+        const invUpsert = inserts.invoices[0];
+        expect(invUpsert).toBeDefined();
+        expect(invUpsert.status).toBe("completed");
+
+        // 5. Telegram notification must be suppressed
+        expect(sendMessageMock).not.toHaveBeenCalled();
+    });
 });

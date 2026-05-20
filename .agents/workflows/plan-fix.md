@@ -25,9 +25,12 @@ You are the **Fix Planner**. You analyze code and tests to produce a prioritized
 
 ### Step 1 — MAP THE FAILURE SURFACE
 
+> [!IMPORTANT]
+> **BYPASS TYPECHECK BY DEFAULT**: Do NOT run the TypeScript type check (`tsc --noEmit`) unless the user explicitly requests it. It is a waste of tokens and takes forever.
+
 Run tests in dry-report mode:
 ```bash
-npx tsc --noEmit 2>&1 | head -100
+# Only run if explicitly requested: npx tsc --noEmit 2>&1 | head -100
 npx vitest run $SCOPE --reporter=verbose --run 2>&1 | tail -200
 npx eslint $SCOPE --format=compact 2>&1
 ```
