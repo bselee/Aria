@@ -2627,8 +2627,19 @@ export async function enqueueForDashboardReview(
     try {
         const supabase = createClient();
         if (supabase) {
+            const shortShipmentDetected = result.overallVerdict === "short_shipment_hold";
+            const shortShipmentLines = result.priceChanges
+                .filter(pc => pc.verdict === "short_shipment_hold")
+                .map(pc => pc.productId);
+            const receivingGapTotal = result.priceChanges
+                .filter(pc => pc.verdict === "short_shipment_hold")
+                .reduce((sum, pc) => sum + (pc.receivingGap || 0), 0);
+
             const { data } = await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
+                short_shipment_detected: shortShipmentDetected,
+                short_shipment_lines: shortShipmentLines.length > 0 ? shortShipmentLines : null,
+                receiving_gap_total: receivingGapTotal,
                                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId} — needs review`,
                 intent: "RECONCILIATION",
                 action_taken: result.summary,
