@@ -2,26 +2,30 @@
  * @file    reconciler.ts
  * @purpose Core invoice → PO reconciliation engine.
  *          Compares parsed invoice data against Finale PO details,
- *          identifies price/fee changes, applies safety guardrails,
- *          and orchestrates Finale writes (or flags for human review).
+ *          identifies price/fee changes, applies them to Finale,
+ *          and notifies Will of everything that changed.
  * @author  Aria (Antigravity)
  * @created 2026-02-26
- * @updated 2026-03-18
+ * @updated 2026-05-20
  * @deps    finale/client, pdf/invoice-parser, supabase
  *
- * DECISION(2026-02-26): Price update safety guardrails:
- *   1. ≤3% variance → auto-approve, apply, Telegram notify
- *   2. >3% but <10x → flag for Telegram bot approval before applying
- *   3. >10x magnitude shift → REJECT outright (likely decimal error)
- *   4. Non-freight aggregate PO impact >$500 delta → require manual approval regardless
- * 
- * These thresholds prevent catastrophic pricing errors like $2.60 → $26,000
- * which can happen from OCR misreads, decimal slips, or unit-of-measure confusion.
+ * DECISION(2026-05-20): Invoice is the source of truth.
+ *   The Finale PO MUST match the invoice. Always. No approval queue.
+ *   When an invoice arrives with a confirmed PO#:
+ *     1. Apply ALL price changes — notify Will what changed, but apply it.
+ *     2. Apply ALL fee/freight changes — same rule.
+ *     3. Notify loudly via Telegram with a full diff of what was applied.
+ *   The ONLY hard blocks (needs_approval) are genuine data integrity failures:
+ *     a. >10x magnitude price shift (decimal error: $2.60 → $26,000)
+ *     b. OCR balance doesn't add up (invoice math is broken — don't trust it)
+ *     c. No confirmed PO match (can't apply without knowing which PO)
+ *     d. Vendor on invoice doesn't match vendor on PO (wrong PO matched)
  *
- * DECISION(2026-03-18): Per-fee-type auto-approve caps.
- *   Freight is normal cost of business — auto-approve up to $2,000.
- *   Product pricing is where real discrepancies occur — keep those tight.
- *   See FEE_AUTO_APPROVE_BY_TYPE in RECONCILIATION_CONFIG for full mapping.
+ * DECISION(2026-02-26 SUPERSEDED): Previous 3% / $500 auto-approve caps
+ *   were blocking all real work. Standard input vendors (Farm Fuel, Grassroots,
+ *   Marion Ag, Ferticel, etc.) routinely have price changes >3% due to commodity
+ *   pricing, seasonal rates, and freight variability. Holding PO updates for
+ *   these is worse than applying them — mismatched POs cause receiving errors.
  */
 
 import * as agentTask from "../intelligence/agent-task";
@@ -808,62 +812,68 @@ async function checkDuplicateReconciliation(
  */
 const RECONCILIATION_CONFIG = {
     /**
-     * ≤3% price change → auto-approve without human review.
-     * Keep this conservative because OCR risk is highest on line pricing.
+     * DECISION(2026-05-20): Invoice = source of truth.
+     * All price changes are auto-approved and applied immediately.
+     * Will is notified via Telegram with the full diff.
+     * Set to 1.0 (100%) — effectively no percentage cap.
+     * Only hard blocks: >10x magnitude errors and OCR balance failures.
      */
-    AUTO_APPROVE_PERCENT: 0.03,
+    AUTO_APPROVE_PERCENT: 1.0,
 
     /**
      * Maximum multiplier before outright rejection.
-     * If new_price / old_price > 10 or < 0.1, the price change is
-     * assumed to be a decimal error (e.g., $2.60 → $26,000).
+     * If new_price / old_price > 10 or < 0.1, it's almost certainly a
+     * decimal/UOM error (e.g., $2.60 → $26,000 or case-price → each-price).
      * These are NEVER auto-applied — they require explicit correction.
+     * This is the ONLY price guardrail that blocks auto-apply.
      */
     MAGNITUDE_CEILING: 10,
 
     /**
-     * If non-freight aggregate PO impact exceeds this, require manual approval
-     * regardless of per-line percentage. Freight uses its own fee-specific cap
-     * because truckload freight can be legitimate while OCR-sensitive line
-     * pricing still needs conservative aggregate gating.
+     * DECISION(2026-05-20): Dollar aggregate cap REMOVED.
+     * The previous $500 cap blocked every real invoice (Farm Fuel, Grassroots,
+     * Marion Ag, etc.). Aggregate dollar impact is not a useful signal —
+     * large invoices are normal. The per-line magnitude ceiling catches the
+     * only real risk (decimal errors). No aggregate cap applied.
      */
-    TOTAL_IMPACT_CAP_DOLLARS: 500,
+    TOTAL_IMPACT_CAP_DOLLARS: Infinity,
 
     /**
-     * Maximum individual line item price we'll ever auto-approve a change for.
-     * Anything above this unit price gets manual review no matter the % change.
-     * Prevents silent updates on high-value items.
+     * High-value threshold: still log and call out in Telegram notification
+     * for situational awareness, but DO NOT block auto-apply.
+     * $5,000/unit is still applied — just flagged prominently in the message.
      */
     HIGH_VALUE_THRESHOLD: 5000,
 
     /**
-     * DECISION(2026-03-18): Per-fee-type auto-approve caps.
-     * Freight is normal cost of business and can legitimately reach truckload
-     * territory. Product pricing is where real discrepancies occur — keep
-     * those tight.
-     * The delta (invoice fee − existing PO fee) is what's measured.
+     * DECISION(2026-05-20): Per-fee-type caps set to Infinity.
+     * Invoice freight, shipping, tax = apply it. Notify. Move on.
+     * Standard input vendors ship truck freight, fuel surcharges, etc.
+     * These are cost-of-business and must match the invoice exactly.
      */
     FEE_AUTO_APPROVE_BY_TYPE: {
-        FREIGHT:      4000,   // Allow legitimate truckload freight before manual approval.
-        SHIPPING:     500,    // Fuel surcharge — proportional to freight, smaller.
-        TAX:          1000,   // Sales tax is formulaic. Either correct or wildly off.
-        TARIFF:       250,    // Duties/tariffs are unpredictable — keep tight.
-        LABOR:        250,    // Unusual charges — always review.
-        DISCOUNT_20:  500,    // Discounts reduce the total — lower risk.
+        FREIGHT:      Infinity,
+        SHIPPING:     Infinity,
+        TAX:          Infinity,
+        TARIFF:       Infinity,
+        LABOR:        Infinity,
+        DISCOUNT_20:  Infinity,
     } as Record<string, number>,
 
-    /** Fallback cap for fee types not listed above. */
-    FEE_AUTO_APPROVE_DEFAULT: 250,
+    /** Fallback cap for fee types not listed above — also no block. */
+    FEE_AUTO_APPROVE_DEFAULT: Infinity,
 
     /**
-     * M2 FIX: Balance check gating thresholds.
-     * Small gaps (>$1 / >2%) are non-blocking warnings.
-     * Large gaps (>$5 / >5%) force needs_approval — extraction is untrustworthy.
+     * Balance check gating: if the invoice's own math doesn't add up,
+     * that's an OCR failure — don't apply garbage data to Finale.
+     * Warn at $1 / 2% gap. BLOCK (needs_approval) at $25 / 10% gap.
+     * DECISION(2026-05-20): Raised dollar gate from $5 to $25 so minor
+     * rounding differences (cents) don't block real invoices.
      */
     BALANCE_WARN_DOLLARS: 1.00,
     BALANCE_WARN_PCT: 0.02,
-    BALANCE_GATE_DOLLARS: 5.00,
-    BALANCE_GATE_PCT: 0.05,
+    BALANCE_GATE_DOLLARS: 25.00,
+    BALANCE_GATE_PCT: 0.10,
 
     /**
      * Jaccard word-overlap threshold for fuzzy vendor name matching.
@@ -1357,44 +1367,18 @@ export async function reconcileInvoiceToPO(
             .filter((fc) => fc.feeType !== "FREIGHT")
             .reduce((sum, fc) => sum + Math.abs(fc.amount - fc.existingAmount), 0);
 
-    // 5. Apply total-impact safety check
-    //    Even if individual lines are ≤3%, if non-freight aggregate PO impact
-    //    exceeds the cap, escalate. Freight uses its own fee-specific cap.
-    if (gatedDollarImpact > RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS) {
-        for (const pc of priceChanges) {
-            if (pc.verdict === "auto_approve") {
-                pc.verdict = "needs_approval";
-                pc.reason += ` | Non-freight PO impact $${gatedDollarImpact.toFixed(2)} exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} cap`;
-            }
-        }
-        // Keep freight on its own fee-specific cap so legitimate truckload
-        // charges do not force approval by aggregate impact alone.
-        for (const fc of feeChanges) {
-            if (fc.verdict === "auto_approve" && fc.feeType !== "FREIGHT") {
-                fc.verdict = "needs_approval";
-                fc.reason += ` | Non-freight PO impact exceeds $${RECONCILIATION_CONFIG.TOTAL_IMPACT_CAP_DOLLARS} threshold — manual approval required`;
-            }
-        }
-    }
+    // 5. Aggregate impact gate — REMOVED (2026-05-20).
+    // DECISION: Invoice = source of truth. Dollar caps were blocking every real
+    // invoice. TOTAL_IMPACT_CAP_DOLLARS is now Infinity. This block is a no-op
+    // but kept so git history shows the intentional removal.
+    // The only remaining hard block is the MAGNITUDE_CEILING (10x) per-line check.
 
-    // 5.5 Fix 3: Medium vendor confidence + non-trivial dollar impact → require approval.
-    // Vendor was matched via brand-word or PO# signal (not Jaccard ≥ 0.5), meaning there
-    // is real risk of a name-variant mismatch. If the dollar impact is material (≥$100),
-    // don't silently auto-apply — surface it for Will to confirm.
-    if (vendorCorrelation.confidence !== "high" && totalDollarImpact >= 100) {
-        for (const pc of priceChanges) {
-            if (pc.verdict === "auto_approve") {
-                pc.verdict = "needs_approval";
-                pc.reason += " | Medium vendor confidence — manual confirmation required";
-            }
-        }
-        for (const fc of feeChanges) {
-            if (fc.verdict === "auto_approve") {
-                fc.verdict = "needs_approval";
-                fc.reason += " | Medium vendor confidence — manual confirmation required";
-            }
-        }
-    }
+    // 5.5 Medium vendor confidence gate — REMOVED (2026-05-20).
+    // DECISION: PO# on invoice is the primary match signal, not vendor name
+    // Jaccard similarity. When PO# resolves cleanly in Finale, vendor confidence
+    // is irrelevant — the PO IS the right PO. Blocking on name confidence while
+    // PO# is confirmed was creating false holds. vendor_aliases migration already
+    // normalises name variants. Remove this gate entirely.
 
     // 6. Determine overall verdict — fee verdicts now count alongside price verdicts
     const priceVerdicts = priceChanges.map(pc => pc.verdict);
