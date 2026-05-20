@@ -104,7 +104,9 @@ export async function GET(req: NextRequest) {
                     };
                 }
 
-                // Enrich items with their context from the assessment and the group
+                // Enrich items with their context from the assessment and the group.
+                // DECISION(2026-05-20): Include vendorOnTimeRate so buildCrystalBallProjection
+                // can discount open-PO credit the same way the main purchasing engine does.
                 const enrichedItem = {
                     ...item,
                     supplierName: group.vendorName,
@@ -112,7 +114,8 @@ export async function GET(req: NextRequest) {
                     candidate: assessedLine.candidate,
                     assessment: assessedLine.assessment,
                     urgency: item.urgency || assessedLine.candidate?.urgency || 'ok',
-                    draftPO: draftPOInfo
+                    draftPO: draftPOInfo,
+                    vendorOnTimeRate: client.getVendorOnTimeRate(group.vendorName),
                 };
                 matchedItems.push(enrichedItem);
             }

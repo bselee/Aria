@@ -108,6 +108,11 @@ export interface CrystalBallProjection {
         earliestBuildDate: string;
         feedsBuilds: string[];
     };
+    // Vendor reliability signal — on-time delivery rate from historical POs (0..1).
+    // When < 1.0 the projector discounts stockOnOrder accordingly (same logic as
+    // the main purchasing engine) so Crystal Ball projections are not over-optimistic
+    // for vendors that frequently deliver late.
+    vendorOnTimeRate: number;
 }
 
 export interface ProjectionInput {
@@ -248,10 +253,16 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
     status: string;
 }>): CrystalBallProjection {
     const stockOnHand = item.stockOnHand ?? 0;
-    const stockOnOrder = item.stockOnOrder ?? 0;
+    const rawStockOnOrder = item.stockOnOrder ?? 0;
     const dailyRate = item.dailyRate ?? 0;
     const leadTimeDays = item.leadTimeDays ?? 14;
     const openPOs = item.openPOs ?? [];
+    // DECISION(2026-05-20): Apply vendor on-time rate discount to stockOnOrder.
+    // A 100% on-time vendor passes through at full credit; a vendor that delivers
+    // on time 70% of the time only gets 70% credit for open PO supply. Default 1.0
+    // (no discount) when the on-time rate has not been computed yet.
+    const onTimeRate: number = typeof item.vendorOnTimeRate === 'number' ? Math.min(1, Math.max(0, item.vendorOnTimeRate)) : 1;
+    const stockOnOrder = Math.round(rawStockOnOrder * onTimeRate);
     
     const projections = computeProjections({
         stockOnHand,
@@ -312,6 +323,7 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
         historicalPOs,
         draftPO: item.draftPO ?? null,
         stockAvailable: item.stockAvailable,
-        forwardDemandEntry: item.forwardDemandEntry
+        forwardDemandEntry: item.forwardDemandEntry,
+        vendorOnTimeRate: onTimeRate,
     };
 }

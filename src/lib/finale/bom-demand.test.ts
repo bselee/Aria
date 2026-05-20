@@ -180,6 +180,41 @@ describe('computeTrendAdjustedVelocity', () => {
         // Falls back to full-window rate
         expect(r.velocity).toBeCloseTo(20 / 90, 5);
     });
+    it('flags trending down when recent half <=0.75x prior half', () => {
+        // Prior 45d: 80 units (heavy buying). Recent 45d: 20 units (winding down).
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-02-15', '2026-03-01', '2026-05-05'],
+            purchaseQtys: [40, 40, 20],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingDown).toBe(true);
+        expect(r.trendingUp).toBe(false);
+        expect(r.velocity).toBeLessThan((40 + 40 + 20) / 90);
+        expect(r.velocity).toBeCloseTo(r.recentRate, 5);
+    });
+    it('does not flag trendingDown when prior rate is zero (no baseline)', () => {
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-04-20', '2026-05-01'],
+            purchaseQtys: [50, 50],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingDown).toBe(false);
+        expect(r.priorRate).toBe(0);
+    });
+    it('does not flag trendingDown when decline is within 0.75 threshold', () => {
+        // recentRate/priorRate = 0.8 -- above threshold
+        const r = computeTrendAdjustedVelocity({
+            purchaseDates: ['2026-02-15', '2026-03-01', '2026-04-25', '2026-05-01'],
+            purchaseQtys: [50, 50, 40, 40],
+            daysBack: 90,
+            now,
+        });
+        expect(r.trendingDown).toBe(false);
+        expect(r.trendingUp).toBe(false);
+        expect(r.velocity).toBeCloseTo(180 / 90, 5);
+    });
     it('falls back to full rate with too little data', () => {
         const r = computeTrendAdjustedVelocity({
             purchaseDates: ['2026-05-01'],

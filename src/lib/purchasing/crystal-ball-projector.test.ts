@@ -120,4 +120,48 @@ describe('crystal-ball-projector buildCrystalBallProjection', () => {
         expect(res.salesVelocity).toBe(1.25);
         expect(res.demandVelocity).toBe(5.0);
     });
+
+    it('should pass stockOnOrder through at full value when vendorOnTimeRate is 1.0', () => {
+        const item = {
+            productId: 'A', productName: 'A', supplierName: 'V', supplierPartyId: 'p1',
+            stockOnHand: 100, stockOnOrder: 200, dailyRate: 5, leadTimeDays: 10,
+            openPOs: [], vendorOnTimeRate: 1.0,
+        };
+        const res = buildCrystalBallProjection(item);
+        expect(res.stockOnOrder).toBe(200);
+        expect(res.vendorOnTimeRate).toBe(1.0);
+    });
+
+    it('should discount stockOnOrder by the vendor on-time rate (70%)', () => {
+        const item = {
+            productId: 'A', productName: 'A', supplierName: 'V', supplierPartyId: 'p1',
+            stockOnHand: 100, stockOnOrder: 200, dailyRate: 5, leadTimeDays: 10,
+            openPOs: [], vendorOnTimeRate: 0.7,
+        };
+        const res = buildCrystalBallProjection(item);
+        // round(200 * 0.7) = 140
+        expect(res.stockOnOrder).toBe(140);
+        expect(res.vendorOnTimeRate).toBe(0.7);
+    });
+
+    it('should zero out stockOnOrder when vendorOnTimeRate is 0', () => {
+        const item = {
+            productId: 'A', productName: 'A', supplierName: 'V', supplierPartyId: 'p1',
+            stockOnHand: 100, stockOnOrder: 500, dailyRate: 5, leadTimeDays: 10,
+            openPOs: [], vendorOnTimeRate: 0,
+        };
+        const res = buildCrystalBallProjection(item);
+        expect(res.stockOnOrder).toBe(0);
+    });
+
+    it('should default vendorOnTimeRate to 1.0 when not provided (no discount)', () => {
+        const item = {
+            productId: 'A', productName: 'A', supplierName: 'V', supplierPartyId: 'p1',
+            stockOnHand: 100, stockOnOrder: 200, dailyRate: 5, leadTimeDays: 10,
+            openPOs: [],
+        };
+        const res = buildCrystalBallProjection(item);
+        expect(res.stockOnOrder).toBe(200);
+        expect(res.vendorOnTimeRate).toBe(1.0);
+    });
 });

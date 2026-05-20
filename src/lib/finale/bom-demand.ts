@@ -165,7 +165,7 @@ export function computeTrendAdjustedVelocity(input: {
     purchaseQtys?: number[];
     daysBack: number;
     now?: Date;
-}): { velocity: number; trendingUp: boolean; recentRate: number; priorRate: number } {
+}): { velocity: number; trendingUp: boolean; trendingDown: boolean; recentRate: number; priorRate: number } {
     const purchaseDates = input.purchaseDates ?? [];
     const purchaseQtys = input.purchaseQtys ?? [];
     const { daysBack } = input;
@@ -174,7 +174,7 @@ export function computeTrendAdjustedVelocity(input: {
     const fullRate = daysBack > 0 ? total / daysBack : 0;
 
     if (purchaseDates.length !== purchaseQtys.length || purchaseDates.length < 2) {
-        return { velocity: fullRate, trendingUp: false, recentRate: fullRate, priorRate: fullRate };
+        return { velocity: fullRate, trendingUp: false, trendingDown: false, recentRate: fullRate, priorRate: fullRate };
     }
 
     const halfMs = (daysBack / 2) * 86_400_000;
@@ -194,9 +194,17 @@ export function computeTrendAdjustedVelocity(input: {
     // Trending up = recent rate at least 1.25x prior, AND prior is non-trivial
     // (otherwise a single recent burst would dominate from zero baseline).
     const trendingUp = priorRate > 0 && recentRate >= priorRate * 1.25;
+
+    // DECISION(2026-05-20): Symmetric decay — when recent rate is ≤75% of prior
+    // (and prior is non-trivial), use the lower recent rate so we don't over-order
+    // on seasonal or EOL items. Same priorRate > 0 guard as trendingUp to avoid
+    // noise from components with a zero prior-half baseline.
+    const trendingDown = priorRate > 0 && recentRate <= priorRate * 0.75;
+
     return {
-        velocity: trendingUp ? recentRate : fullRate,
+        velocity: trendingUp ? recentRate : trendingDown ? recentRate : fullRate,
         trendingUp,
+        trendingDown,
         recentRate,
         priorRate,
     };
