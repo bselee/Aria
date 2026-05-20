@@ -2328,7 +2328,7 @@ async function deduplicateTrackingNumbers(
 
     try {
         const supabase = createClient();
-        if (!supabase) return trackingNumbers; // No Supabase â†’ skip dedup, write all
+        if (!supabase) return trackingNumbers; // No Supabase → skip dedup, write all
 
         // Check which tracking numbers already exist in any invoice record
         const { data: existingInvoices } = await supabase
@@ -2571,9 +2571,9 @@ export async function enqueueForDashboardReview(
         if (supabase) {
             const { data } = await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
-                email_subject: `Invoice ${result.invoiceNumber} â†’ PO ${result.orderId} - Dashboard Review Required`,
+                                email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId} — needs review`,
                 intent: "RECONCILIATION",
-                action_taken: "Dashboard review required - awaiting approval",
+                action_taken: result.summary,
                 metadata: {
                     invoiceNumber: result.invoiceNumber,
                     orderId: result.orderId,
