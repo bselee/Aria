@@ -25,6 +25,8 @@ import {
     loadVendorMOQs,
     loadVendorReorderPolicies,
     loadVendorRecentLineQtys,
+    loadShipmentLegs,
+    type ShipmentLeg,
     type VendorReorderPolicy,
     recordRecommendationSnapshots,
     type RecommendationSnapshot,
@@ -5827,6 +5829,11 @@ export class FinaleClient {
         const recentLineQtysCache = new Map<string, number[]>();
         const seenVendorIds = new Set<string>();
         const recommendationSnapshots: RecommendationSnapshot[] = [];
+        // DECISION(2026-05-21): vendorLegsCache maps vendorPartyId → (poNumber → ShipmentLeg[]).
+        // Populated lazily on first-encounter per vendor (same pattern as calibration/MOQ caches).
+        // Used to credit only legs landing in the reorder horizon for bulk vendors (isBulkVendor).
+        // Non-bulk vendors never touch this cache — zero behavioral change for standard vendors.
+        const vendorLegsCache = new Map<string, Map<string, ShipmentLeg[]>>();
 
         // ── Step 2-8: 5x concurrent workers per candidate SKU ──
         // Vendors excluded from purchasing intelligence:
@@ -5913,8 +5920,9 @@ export class FinaleClient {
                     const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
                     const stockOnHand = activity.stockOnHand ?? restStock;
 
-                    // Open PO supply
-                    const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
+                    // Open PO supply — raw sum used as a preliminary value.
+                    // For bulk vendors the effective value is computed below after policy lookup.
+                    const rawStockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
 
                     // DECISION(2026-05-19, Will): once a PO is committed for this SKU it
                     // moves to "Purchasing Watch" and exits the Ordering surface. Even if
@@ -5969,11 +5977,14 @@ export class FinaleClient {
                     // ── Phase 2/3/v2.2 lookups: calibration, MOQ, vendor policy, recent line qtys ──
                     if (!seenVendorIds.has(partyId)) {
                         seenVendorIds.add(partyId);
-                        const [calMap, moqMap, policyMap, recentQtys] = await Promise.all([
+                        const [calMap, moqMap, policyMap, recentQtys, poLegsMap] = await Promise.all([
                             loadCalibrationStats([partyId]),
                             loadVendorMOQs([partyId]),
                             loadVendorReorderPolicies([partyId]),
                             loadVendorRecentLineQtys(this.authHeader, this.apiBase, this.accountPath, partyId, 8),
+                            // Load shipment legs for all open POs from this vendor in one Supabase call.
+                            // Only used when isBulkVendor = true; harmless no-op for standard vendors.
+                            loadShipmentLegs(activity.openPOs.map(p => p.orderId)),
                         ]);
                         const cal = calMap.get(partyId);
                         if (cal) calibrationCache.set(partyId, cal);
@@ -5982,6 +5993,7 @@ export class FinaleClient {
                         const policy = policyMap.get(partyId);
                         if (policy) reorderPolicyCache.set(partyId, policy);
                         recentLineQtysCache.set(partyId, recentQtys);
+                        vendorLegsCache.set(partyId, poLegsMap);
                     }
                     const calibration = calibrationCache.get(partyId);
                     const moq = moqCache.get(partyId);
@@ -5997,8 +6009,42 @@ export class FinaleClient {
                     const effectiveLeadTimeProvenance = reorderPolicy?.leadTimeOverrideDays
                         ? `${reorderPolicy.leadTimeOverrideDays}d vendor policy override`
                         : leadTimeProvenance;
+                    // DECISION(2026-05-21): Leg-aware stock-on-order for bulk vendors.
+                    // For vendors with isBulkVendor=true and explicit po_shipment_legs rows,
+                    // credit only legs arriving within the reorder horizon instead of the full
+                    // PO quantity. This prevents the recommender from believing 120,000 units
+                    // of CWP101 (Covico) are all available tomorrow when they arrive in 3 trucks
+                    // over 90 days. For non-bulk vendors, behavior is identical to before.
+                    const horizonDays = (reorderPolicy?.leadTimeOverrideDays ?? leadTimeDays) + 60;
+                    const horizonDate = new Date(Date.now() + horizonDays * 86400000).toISOString().slice(0, 10);
+                    const vendorPoLegs = vendorLegsCache.get(partyId);
 
-                    // ── Canonical reorder calculation ────────────────────────────
+                    const stockOnOrder = (() => {
+                        if (!reorderPolicy?.isBulkVendor) {
+                            // Standard path: full PO qty credited immediately — unchanged.
+                            return rawStockOnOrder;
+                        }
+                        // Bulk path: credit received qty + pending legs landing inside horizon.
+                        // Fall back to full PO qty for any PO that has no leg records yet
+                        // (prevents under-crediting when legs haven't been entered yet).
+                        let credited = 0;
+                        for (const po of activity.openPOs) {
+                            const legs = vendorPoLegs?.get(po.orderId);
+                            if (!legs || legs.length === 0) {
+                                // No legs registered — fall back to full qty (safe over-credit
+                                // is better than triggering a false reorder recommendation).
+                                credited += po.quantity;
+                            } else {
+                                const receivedQty    = legs.reduce((s, l) => s + (l.receivedQty ?? 0), 0);
+                                const pendingCredit  = legs
+                                    .filter(l => !l.actualDate && l.expectedDate <= horizonDate)
+                                    .reduce((s, l) => s + l.expectedQty, 0);
+                                credited += receivedQty + pendingCredit;
+                            }
+                        }
+                        return credited;
+                    })();
+
                     // All reorder math runs through the pure recommender so every
                     // qty, runway, and urgency comes with an auditable trace the
                     // dashboard can render in a "Why X?" drawer.
