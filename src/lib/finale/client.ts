@@ -477,7 +477,13 @@ function getShipmentLineQuantity(line: any): number {
     return 0;
 }
 
-function getShipmentReceiptItems(shipment: any): Array<{ productId: string; quantity: number }> {
+/**
+ * Aggregates and extracts product quantities received from a physical shipment object.
+ *
+ * @param shipment - The raw shipment details returned from the Finale API
+ * @returns Array of objects representing product IDs and their received physical quantities
+ */
+export function getShipmentReceiptItems(shipment: any): Array<{ productId: string; quantity: number }> {
     return getShipmentLineContainers(shipment)
         .map((line) => {
             const productId = getShipmentLineProductId(line);
