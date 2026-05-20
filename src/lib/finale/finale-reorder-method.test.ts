@@ -35,7 +35,7 @@ describe("normalizeFinaleReorderMethod", () => {
     expect(chooseVelocitySignal({
       reorderMethod: "default",
       demandVelocity: 4,
-      salesVelocity: 1,
+      salesVelocity: 2,
       consumptionQty: 20,
     })).toEqual({ dailyRate: 4, signal: "demand" });
   });

@@ -266,13 +266,13 @@ describe("CommandBoardShell", () => {
         expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
     });
 
-    it("clicking the Tasks tab swaps in the task lanes", async () => {
+    it("clicking the Activity tab swaps in the activity panel", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const tasksTab = await screen.findByTestId("shell-tab-tasks");
-        fireEvent.click(tasksTab);
-        expect(tasksTab.getAttribute("aria-selected")).toBe("true");
+        const activityTab = await screen.findByTestId("shell-tab-activity");
+        fireEvent.click(activityTab);
+        expect(activityTab.getAttribute("aria-selected")).toBe("true");
     });
 });
 

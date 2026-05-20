@@ -403,11 +403,20 @@ export default function ActivePurchasesPanel() {
                                     ? "text-cyan-300"
                                     : "text-zinc-500";
                                 const poProductIds = po.items.map(item => item.productId);
-                                const matchesLifecycle = lifecycle.matchesFocus({
+                                const poMatch = lifecycle.checkMatchDetails({
                                     vendorName: po.vendorName,
                                     orderId: po.orderId,
                                     productIds: poProductIds,
                                 });
+                                const poBg = poMatch.isLockedDirect
+                                    ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                    : poMatch.isLockedBom
+                                    ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                    : poMatch.isDirect
+                                    ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                    : poMatch.isBom
+                                    ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                    : "";
 
                                 let statusLabel = "In Transit";
                                 let statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
@@ -460,8 +469,13 @@ export default function ActivePurchasesPanel() {
                                         key={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
-                                        onClick={() => setTimelineOrderId(po.orderId)}
-                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${matchesLifecycle ? "bg-cyan-500/10 ring-1 ring-inset ring-cyan-500/40" : !atRisk ? "hover:bg-zinc-800/20" : ""} ${riskRing}`}
+                                        onClick={(e) => {
+                                            const target = e.target as HTMLElement;
+                                            if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                            lifecycle.setLockedFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds });
+                                            setTimelineOrderId(po.orderId);
+                                        }}
+                                        className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${poBg ? poBg : !atRisk ? "hover:bg-zinc-800/20" : ""} ${riskRing}`}
                                     >
                                         {/* Dismiss Button */}
                                         <button
@@ -621,11 +635,23 @@ export default function ActivePurchasesPanel() {
 
                                         {/* Line 3: Line Items */}
                                         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-                                            {po.items.map((item, idx) => (
-                                                <span key={item.productId + idx} className={`text-[11px] font-mono px-1.5 py-px rounded border ${lifecycle.matchesFocus({ productIds: [item.productId] }) ? "text-cyan-100 bg-cyan-500/15 border-cyan-500/40" : "text-zinc-300 bg-zinc-800/40 border-zinc-700/50"}`}>
-                                                    {item.productId} <span className="text-zinc-500">×{item.quantity.toLocaleString()}</span>
-                                                </span>
-                                            ))}
+                                            {po.items.map((item, idx) => {
+                                                const badgeMatch = lifecycle.checkMatchDetails({ productIds: [item.productId] });
+                                                const badgeBg = badgeMatch.isLockedDirect
+                                                    ? "text-amber-100 bg-amber-500/20 border-amber-500/50"
+                                                    : badgeMatch.isLockedBom
+                                                    ? "text-amber-200/90 bg-amber-500/10 border-amber-500/30 border-dashed"
+                                                    : badgeMatch.isDirect
+                                                    ? "text-cyan-100 bg-cyan-500/15 border-cyan-500/40"
+                                                    : badgeMatch.isBom
+                                                    ? "text-cyan-200/95 bg-cyan-500/5 border-cyan-500/25 border-dashed"
+                                                    : "text-zinc-300 bg-zinc-800/40 border-zinc-700/50";
+                                                return (
+                                                    <span key={item.productId + idx} className={`text-[11px] font-mono px-1.5 py-px rounded border ${badgeBg}`}>
+                                                        {item.productId} <span className="text-zinc-500">×{item.quantity.toLocaleString()}</span>
+                                                    </span>
+                                                );
+                                            })}
                                         </div>
                                     </div>
                                 );
