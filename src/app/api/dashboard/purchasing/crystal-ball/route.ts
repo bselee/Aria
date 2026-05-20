@@ -49,6 +49,14 @@ export async function GET(req: NextRequest) {
         console.error('[crystal-ball-route] Failed to read SWR caches:', err.message);
     }
     
+    // Warm the on-time rate cache if needed.
+    // getVendorOnTimeRate() reads a module-level cache populated by getVendorLeadTimeHistory(),
+    // which runs as part of getPurchasingIntelligence(). On a cold process start (e.g. direct
+    // Crystal Ball request before the main purchasing route has run), the cache is empty and all
+    // vendors would silently receive onTimeRate=1.0 (no open-PO discount). This call is a no-op
+    // when the cache is already fresh (< 4h old) — typically sub-millisecond overhead.
+    await client.ensureVendorLeadTimeHistoryWarm(365).catch(() => {});
+
     // Merge resale and BOM groups
     const allGroups = mergeIntoGroups(resaleGroups, bomGroups);
     

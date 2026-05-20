@@ -16,15 +16,18 @@ export interface StockoutCount {
 }
 
 /**
- * Load the rolling 180-day event counts for every SKU. Used to pad lead time
- * for SKUs with prior stockouts.
+ * Load the rolling stockout event counts per SKU. Used to pad lead time for SKUs
+ * with prior stockouts — they've already proven that static defaults aren't enough.
+ *
+ * @param windowDays  Rolling look-back window in days. Defaults to 180 (6 months).
+ *                    Pass 365 to catch annual seasonal patterns in an auto-order context.
  */
-export async function loadStockoutCounts(): Promise<Map<string, StockoutCount>> {
+export async function loadStockoutCounts(windowDays = 180): Promise<Map<string, StockoutCount>> {
     const map = new Map<string, StockoutCount>();
     const db = createClient();
     if (!db) return map;
     try {
-        const since = new Date(Date.now() - 180 * 86_400_000).toISOString();
+        const since = new Date(Date.now() - windowDays * 86_400_000).toISOString();
         const { data, error } = await db
             .from('stockout_events')
             .select('product_id, detected_at')

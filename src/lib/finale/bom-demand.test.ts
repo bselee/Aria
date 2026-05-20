@@ -154,10 +154,11 @@ describe('computeTrendAdjustedVelocity', () => {
             now,
         });
         expect(r.trendingUp).toBe(false);
+        expect(r.trendingDown).toBe(false);
         expect(r.velocity).toBeCloseTo(100 / 90, 5);
     });
-    it('flags trending up when recent half ≥1.25× prior half', () => {
-        // Prior 45d: 20 units. Recent 45d: 50 units. Ratio 2.5×.
+    it('flags trending up when recent half >=1.25x prior half', () => {
+        // Prior 45d: 20 units. Recent 45d: 50 units. Ratio 2.5x.
         const r = computeTrendAdjustedVelocity({
             purchaseDates: ['2026-03-01', '2026-04-15', '2026-05-01'],
             purchaseQtys: [20, 25, 25],
@@ -165,8 +166,9 @@ describe('computeTrendAdjustedVelocity', () => {
             now,
         });
         expect(r.trendingUp).toBe(true);
+        expect(r.trendingDown).toBe(false);
         expect(r.recentRate).toBeGreaterThan(r.priorRate);
-        // Velocity should be recent rate (50 / 45 ≈ 1.11)
+        // Velocity should be recent rate (50 / 45)
         expect(r.velocity).toBeGreaterThan(20 / 90);
     });
     it('does not flag trend when only recent data exists (no baseline)', () => {
@@ -177,11 +179,13 @@ describe('computeTrendAdjustedVelocity', () => {
             now,
         });
         expect(r.trendingUp).toBe(false);
+        expect(r.trendingDown).toBe(false);
         // Falls back to full-window rate
         expect(r.velocity).toBeCloseTo(20 / 90, 5);
     });
     it('flags trending down when recent half <=0.75x prior half', () => {
         // Prior 45d: 80 units (heavy buying). Recent 45d: 20 units (winding down).
+        // recentRate/priorRate = (20/45)/(80/45) = 0.25 -- below 0.75 threshold.
         const r = computeTrendAdjustedVelocity({
             purchaseDates: ['2026-02-15', '2026-03-01', '2026-05-05'],
             purchaseQtys: [40, 40, 20],
@@ -190,10 +194,12 @@ describe('computeTrendAdjustedVelocity', () => {
         });
         expect(r.trendingDown).toBe(true);
         expect(r.trendingUp).toBe(false);
+        // Velocity should be the lower recent rate, not the full-window average.
         expect(r.velocity).toBeLessThan((40 + 40 + 20) / 90);
         expect(r.velocity).toBeCloseTo(r.recentRate, 5);
     });
-    it('does not flag trendingDown when prior rate is zero (no baseline)', () => {
+    it('does not flag trendingDown when prior rate is zero (no baseline to compare)', () => {
+        // All purchases in the recent half -- priorRate=0, guard must prevent false trendingDown.
         const r = computeTrendAdjustedVelocity({
             purchaseDates: ['2026-04-20', '2026-05-01'],
             purchaseQtys: [50, 50],
@@ -203,8 +209,8 @@ describe('computeTrendAdjustedVelocity', () => {
         expect(r.trendingDown).toBe(false);
         expect(r.priorRate).toBe(0);
     });
-    it('does not flag trendingDown when decline is within 0.75 threshold', () => {
-        // recentRate/priorRate = 0.8 -- above threshold
+    it('does not flag trendingDown when decline is within the 0.75 threshold', () => {
+        // Prior 45d: 100 units. Recent 45d: 80 units. Ratio = 0.8 -- above threshold.
         const r = computeTrendAdjustedVelocity({
             purchaseDates: ['2026-02-15', '2026-03-01', '2026-04-25', '2026-05-01'],
             purchaseQtys: [50, 50, 40, 40],
@@ -213,6 +219,7 @@ describe('computeTrendAdjustedVelocity', () => {
         });
         expect(r.trendingDown).toBe(false);
         expect(r.trendingUp).toBe(false);
+        // Full-window rate used when neither flag fires.
         expect(r.velocity).toBeCloseTo(180 / 90, 5);
     });
     it('falls back to full rate with too little data', () => {
@@ -224,6 +231,7 @@ describe('computeTrendAdjustedVelocity', () => {
         });
         expect(r.velocity).toBeCloseTo(42000 / 90, 5);
         expect(r.trendingUp).toBe(false);
+        expect(r.trendingDown).toBe(false);
     });
 });
 

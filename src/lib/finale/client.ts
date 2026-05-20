@@ -776,8 +776,13 @@ let _vendorLeadTimeRawCache: Map<string, number[]> | null = null;
 let _vendorLeadTimeRawCacheAt = 0;
 const VENDOR_LEAD_TIME_RAW_TTL = 4 * 60 * 60 * 1000;
 // Vendor on-time arrival rate (0..1) — computed alongside lead-time history.
-// Read by getBOMDemand to discount stockOnOrder for chronically-late vendors.
+// Read by getBOMDemand and crystal-ball projector to discount stockOnOrder for
+// chronically-late vendors. Shares the same 4-hour TTL as the raw lead-time cache.
 let _vendorOnTimeRateCache: Map<string, number> = new Map();
+let _vendorOnTimeRateCacheAt = 0;
+// Maximum plausible vendor lead time — used to extend the sentAtMap look-back so
+// POs sent before the receiveDate window opens still get their anchor corrected.
+const MAX_VENDOR_LEAD_TIME_DAYS = 90;
 
 export class FinaleClient {
     private authHeader: string;
@@ -4433,34 +4438,56 @@ export class FinaleClient {
 
     /**
      * Compute median actual lead time per vendor from the last N days of completed POs.
-     * Only includes vendors with ≥ 3 completed POs (insufficient data otherwise).
+     * Only includes vendors with ≥ 2 completed POs.
      *
-     * Used by the purchasing calendar sync to estimate expected arrival dates when
-     * Finale's deliverDate is absent or unreliable.
+     * Also populates `_vendorOnTimeRateCache` (vendors on-time within median + 7d)
+     * and `_vendorLeadTimeRawCache` (P50/P90 distribution).
      *
-     * Returns Map<vendorName, medianDays>.
-     * Never throws — returns empty Map on any error.
-     */
-    /**
-     * Lead-time distribution per vendor — median (P50), P90, and sample count.
-     * Reads the raw days[] array stashed by `getVendorLeadTimeHistory`. Call
-     * `getVendorLeadTimeHistory()` first (the LeadTimeService warm cache does
-     * this) — this method is a cheap derived view, not a fresh API call.
+     * Returns Map<vendorName, medianDays>. Never throws — returns empty Map on error.
      */
     /**
      * Vendor on-time arrival rate (0..1). Computed from the same data as
      * lead-time history — a PO is "on-time" if it arrived within the vendor's
-     * median + 7d buffer. Fuzzy name match (same logic as LeadTimeService).
-     * Returns 1.0 (assume on-time) when no history exists for the vendor.
+     * median + 7d buffer. Fuzzy name match.
+     *
+     * Returns 1.0 (assume on-time) when no history exists for the vendor, or
+     * when the cache is cold (call ensureVendorLeadTimeHistoryWarm() first in
+     * any code path that does not go through getPurchasingIntelligence).
      */
     getVendorOnTimeRate(vendorName: string): number {
         if (!vendorName) return 1;
+        // If the cache is stale (> 4h), treat as empty — avoids serving very old
+        // data in long-running processes between scheduled refreshes.
+        if (_vendorOnTimeRateCacheAt > 0 && Date.now() - _vendorOnTimeRateCacheAt > VENDOR_LEAD_TIME_RAW_TTL) {
+            return 1;
+        }
         const key = vendorName.trim().toLowerCase();
         for (const [cacheKey, rate] of _vendorOnTimeRateCache.entries()) {
             const ck = cacheKey.toLowerCase();
             if (ck === key || ck.includes(key) || key.includes(ck)) return rate;
         }
         return 1;
+    }
+
+    /**
+     * Ensures the vendor lead-time history cache (and the derived on-time rate
+     * cache) is warm. No-op when the cache is fresh (< 4h old). Call this before
+     * any code path that reads getVendorOnTimeRate() or getVendorLeadTimeDistribution()
+     * but does NOT go through getPurchasingIntelligence() first.
+     *
+     * Example: the Crystal Ball route reads SWR-cached purchasing data and then
+     * calls getVendorOnTimeRate() — on a cold process start it would get 1.0 for
+     * every vendor without this guard.
+     *
+     * @param daysBack  Look-back window passed to getVendorLeadTimeHistory(). Defaults to 365.
+     */
+    async ensureVendorLeadTimeHistoryWarm(daysBack = 365): Promise<void> {
+        const cacheAge = _vendorOnTimeRateCacheAt > 0 ? Date.now() - _vendorOnTimeRateCacheAt : Infinity;
+        if (cacheAge < VENDOR_LEAD_TIME_RAW_TTL) return; // already fresh — no-op
+        // DECISION(2026-05-20): Warm the cache on cold process start so callers like
+        // the Crystal Ball route always get real on-time rates, not the 1.0 default.
+        // getVendorLeadTimeHistory() is idempotent and handles its own error suppression.
+        await this.getVendorLeadTimeHistory(daysBack).catch(() => {});
     }
 
     getVendorLeadTimeDistribution(): Map<string, { p50: number; p90: number; sampleCount: number }> {
@@ -4521,7 +4548,12 @@ export class FinaleClient {
             // (which is the draft-creation time and inflates lead times when POs
             // sit in draft for a day or more before being emailed).
             const { loadPOSentTimestamps, resolveLeadTimeAnchor } = await import('../purchasing/lead-time-enricher');
-            const sentAtMap = await loadPOSentTimestamps(daysBack).catch(() => new Map<string, string>());
+            // DECISION(2026-05-20): Load sentAtMap with a wider window than daysBack.
+            // A PO sent 300 days ago but received 100 days ago would be inside the
+            // receiveDate window but outside a 180d sentAt window — the anchor would
+            // silently fall back to orderDate. Adding MAX_VENDOR_LEAD_TIME_DAYS (90d)
+            // ensures any PO we might receive during this window has its sentAt available.
+            const sentAtMap = await loadPOSentTimestamps(daysBack + MAX_VENDOR_LEAD_TIME_DAYS).catch(() => new Map<string, string>());
 
             const data = await this.graphql(query, 'Vendor Lead Time History');
             const edges = data?.orderViewConnection?.edges || [];
@@ -4569,6 +4601,7 @@ export class FinaleClient {
             _vendorLeadTimeRawCache = byVendor;
             _vendorLeadTimeRawCacheAt = Date.now();
             _vendorOnTimeRateCache = onTimeMap;
+            _vendorOnTimeRateCacheAt = Date.now();
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
