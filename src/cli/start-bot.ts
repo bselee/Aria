@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    start-bot.ts
  * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
  *          Gemini (primary chat) with automatic OpenRouter fallback, and
@@ -835,8 +835,167 @@ bot.on('text', async (ctx) => {
             : message);
     });
 
-    // ──────────────────────────────────────────────────────────────────────
-    // /tasks  — unified Aria task queue (control-plane phase 2.5 surface)
+    // ──────────────────────────────────────────────────────────────────────────
+    // INVOICE DIFF ACKNOWLEDGMENT — Noted / Flag
+    // ──────────────────────────────────────────────────────────────────────────
+    // After an invoice is auto-applied and prices differed from the PO, Will sees
+    // a Telegram message with [✅ Noted] [⚠️ Flag] buttons.
+    //
+    // Noted → records acknowledgment, increments vendor learning counter.
+    //         After 5 consecutive Noteds → vendor graduates to Phase 2 (daily digest).
+    // Flag  → resets counter, vendor reverts to Phase 1, alerts Will to review.
+    //
+    // DECISION(2026-05-20): This is the learning loop. Every "Noted" tap teaches
+    // ARIA that this vendor's price changes are routine. No action from Will for
+    // 5 invoices = "I trust this pattern, stop pinging me about it."
+    // Any "Flag" = "something was wrong — keep showing me this vendor's diffs."
+
+    const NOTED_THRESHOLD = 5; // taps before graduating to Phase 2
+
+    bot.action(/^noted_(.+)$/, async (ctx) => {
+        const logId = ctx.match[1];
+        await ctx.answerCbQuery('Noted ✓');
+
+        const { createClient } = await import('../lib/supabase');
+        const supabase = createClient();
+        if (!supabase) {
+            await ctx.editMessageText((ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text : '') + '\n\n✅ Noted.');
+            return;
+        }
+
+        try {
+            // 1. Mark the activity log row as acknowledged
+            await supabase.from('ap_activity_log').update({
+                metadata: { acknowledged: true, acknowledged_at: new Date().toISOString() },
+            }).eq('id', logId);
+
+            // 2. Get vendor name from the log row so we can update vendor_profiles
+            const { data: logRow } = await supabase
+                .from('ap_activity_log')
+                .select('email_from')
+                .eq('id', logId)
+                .single();
+
+            const vendorName = logRow?.email_from;
+
+            if (vendorName) {
+                // 3. Upsert vendor_profiles — increment noted_count, update last_noted_at
+                const { data: vp } = await supabase
+                    .from('vendor_profiles')
+                    .select('noted_count, autonomy_phase, vendor_name')
+                    .ilike('vendor_name', `%${vendorName.split(' ')[0]}%`)
+                    .limit(1)
+                    .single();
+
+                if (vp) {
+                    const newCount = (vp.noted_count ?? 0) + 1;
+                    const currentPhase = vp.autonomy_phase ?? 1;
+
+                    if (newCount >= NOTED_THRESHOLD && currentPhase === 1) {
+                        // Graduate to Phase 2 — daily digest only
+                        await supabase.from('vendor_profiles').update({
+                            noted_count: newCount,
+                            autonomy_phase: 2,
+                            phase_upgraded_at: new Date().toISOString(),
+                            last_noted_at: new Date().toISOString(),
+                        }).eq('vendor_name', vp.vendor_name);
+
+                        // One-time "graduated" notification
+                        await ctx.reply(
+                            `🤖 *${vendorName}* price differences are now routine.\n` +
+                            `After ${NOTED_THRESHOLD} confirmations, I'll stop pinging you and just log them.\n` +
+                            `They'll appear in your daily digest. Tap ⚠️ Flag on any future invoice to revert.`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    } else {
+                        await supabase.from('vendor_profiles').update({
+                            noted_count: newCount,
+                            last_noted_at: new Date().toISOString(),
+                        }).eq('vendor_name', vp.vendor_name);
+                    }
+                }
+            }
+
+            // 4. Edit the original message to show it was noted
+            const originalText = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text : '';
+            await ctx.editMessageText(originalText + '\n\n✅ Noted.');
+
+        } catch (err: any) {
+            console.error('noted_ handler error:', err.message);
+            await ctx.reply(`⚠️ Could not record acknowledgment: ${err.message}`);
+        }
+    });
+
+    bot.action(/^flag_(.+)$/, async (ctx) => {
+        const logId = ctx.match[1];
+        await ctx.answerCbQuery('Flagged ⚠️');
+
+        const { createClient } = await import('../lib/supabase');
+        const supabase = createClient();
+        if (!supabase) {
+            await ctx.editMessageText((ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text : '') + '\n\n⚠️ Flagged for review.');
+            return;
+        }
+
+        try {
+            // 1. Mark the activity log row as flagged
+            await supabase.from('ap_activity_log').update({
+                metadata: { flagged: true, flagged_at: new Date().toISOString() },
+            }).eq('id', logId);
+
+            // 2. Get vendor name from the log row
+            const { data: logRow } = await supabase
+                .from('ap_activity_log')
+                .select('email_from, email_subject')
+                .eq('id', logId)
+                .single();
+
+            const vendorName = logRow?.email_from;
+
+            if (vendorName) {
+                // 3. Reset noted_count, increment flag_count, revert to Phase 1
+                const { data: vp } = await supabase
+                    .from('vendor_profiles')
+                    .select('flag_count, autonomy_phase, vendor_name')
+                    .ilike('vendor_name', `%${vendorName.split(' ')[0]}%`)
+                    .limit(1)
+                    .single();
+
+                if (vp) {
+                    const wasPhase2Plus = (vp.autonomy_phase ?? 1) >= 2;
+                    await supabase.from('vendor_profiles').update({
+                        noted_count: 0,           // reset the learning counter
+                        flag_count: (vp.flag_count ?? 0) + 1,
+                        autonomy_phase: 1,         // revert to Surface (always show diffs)
+                        phase_upgraded_at: null,
+                    }).eq('vendor_name', vp.vendor_name);
+
+                    if (wasPhase2Plus) {
+                        await ctx.reply(
+                            `⚠️ *${vendorName}* flagged and reverted to Phase 1.\n` +
+                            `You'll see all future diffs from this vendor with Noted/Flag buttons again.`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    }
+                }
+            }
+
+            // 4. Edit the original message + follow-up
+            const originalText = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+                ? ctx.callbackQuery.message.text : '';
+            const subject = logRow?.email_subject ?? 'this invoice';
+            await ctx.editMessageText(originalText + '\n\n⚠️ Flagged. Review manually — check the PO in Finale.');
+            await ctx.reply(`📋 Flagged: _${subject}_\nOpen the AP panel or Finale to correct the PO.`, { parse_mode: 'Markdown' });
+
+        } catch (err: any) {
+            console.error('flag_ handler error:', err.message);
+            await ctx.reply(`⚠️ Could not record flag: ${err.message}`);
+        }
+    });
+
     // ──────────────────────────────────────────────────────────────────────
     // Reads from agent_task. Mobile-first paginated list: 5 rows per page,
     // sorted "blocking me first" (NEEDS_APPROVAL/owner=will → FAILED → PENDING),

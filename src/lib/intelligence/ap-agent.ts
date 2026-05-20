@@ -1873,7 +1873,23 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     }
                 }
                 writeReconciliationMemory("auto_approve");
-                await this.sendReconciliationNotification(result);
+
+                // Look up vendor autonomy phase before deciding how to notify.
+                // Phase 1 → real-time Telegram with Noted/Flag buttons.
+                // Phase 2 → daily digest only (no real-time ping).
+                // Phase 3 → silent (log only).
+                let autonomyPhase = 1;
+                try {
+                    const { data: vp } = await supabase
+                        .from("vendor_profiles")
+                        .select("autonomy_phase")
+                        .ilike("vendor_name", `%${result.vendorName.split(" ")[0]}%`)
+                        .limit(1)
+                        .single();
+                    if (vp?.autonomy_phase) autonomyPhase = vp.autonomy_phase;
+                } catch { /* non-blocking — default to phase 1 (most visible) */ }
+
+                await this.sendReconciliationNotification(result, pendingLogId, autonomyPhase);
                 if (issueId) {
                     // Re-fetch applyResult counts when a write happened. The
                     // `if (priceChanges || feeChanges || trackingUpdate)` guard
@@ -2112,31 +2128,81 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     /**
-     * Send reconciliation summary to Slack and Telegram.
+     * Send reconciliation summary to Telegram (and Slack).
+     *
+     * DECISION(2026-05-20): Phase-aware notification.
+     *   Phase 1 (Surface): real-time Telegram with [✅ Noted] [⚠️ Flag] buttons when
+     *     prices or fees differ from the PO. Exact match → no ping (nothing to note).
+     *   Phase 2 (Routine): no real-time ping; entry tagged for daily digest.
+     *   Phase 3 (Silent):  log only, not even in daily digest.
+     *
+     * The logId is the ap_activity_log row ID so the Noted/Flag handlers can
+     * update the right row and increment the vendor learning counter.
      */
-    private async sendReconciliationNotification(result: ReconciliationResult): Promise<void> {
+    private async sendReconciliationNotification(
+        result: ReconciliationResult,
+        logId: string | null = null,
+        autonomyPhase: number = 1,
+    ): Promise<void> {
         if (result.overallVerdict === "no_change") return;
 
+        const hasDifferences = result.totalDollarImpact !== 0
+            || result.priceChanges.some(pc => pc.verdict !== "no_change" && pc.verdict !== "no_match")
+            || result.feeChanges.length > 0;
+
+        const chatId = process.env.TELEGRAM_CHAT_ID || "";
         const msg = result.summary;
 
-        // Telegram
+        // Phase 2/3: tag for daily digest, skip real-time ping
+        if (autonomyPhase >= 2) {
+            if (logId && hasDifferences) {
+                // Mark row so daily digest cron can GROUP BY vendor and surface it
+                try {
+                    await supabase?.from("ap_activity_log").update({
+                        metadata: { routine: true, autonomy_phase: autonomyPhase },
+                    }).eq("id", logId);
+                } catch { /* non-blocking */ }
+            }
+            console.log(`   📬 Phase ${autonomyPhase}: ${result.vendorName} diff queued for daily digest (not pinging Telegram)`);
+            return;
+        }
+
+        // Phase 1: send real-time Telegram message
+        if (!hasDifferences) {
+            // Invoice matched PO exactly — nothing to note, no noise
+            console.log(`   ✅ No differences — skipping Telegram ping for ${result.vendorName}`);
+            return;
+        }
+
         try {
-            await this.bot.telegram.sendMessage(
-                process.env.TELEGRAM_CHAT_ID || "",
-                msg,
-                { parse_mode: "Markdown" }
-            );
+            if (logId) {
+                // Send with Noted / Flag inline buttons
+                await this.bot.telegram.sendMessage(
+                    chatId,
+                    msg,
+                    {
+                        parse_mode: "Markdown",
+                        ...Markup.inlineKeyboard([
+                            Markup.button.callback("✅ Noted", `noted_${logId}`),
+                            Markup.button.callback("⚠️ Flag", `flag_${logId}`),
+                        ]),
+                    }
+                );
+            } else {
+                // No logId available (rejected path etc.) — send without buttons
+                await this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+            }
         } catch (err: any) {
             console.error("Telegram reconciliation notification failed:", err.message);
         }
 
-        // Slack
+        // Slack (always plain text, no buttons)
         if (this.slack) {
             try {
                 await this.slack.chat.postMessage({
                     channel: this.slackChannel,
                     text: msg,
-                    mrkdwn: true
+                    mrkdwn: true,
                 });
             } catch (err: any) {
                 console.error("Slack reconciliation notification failed:", err.message);
