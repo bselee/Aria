@@ -1407,6 +1407,8 @@ export async function reconcileInvoiceToPO(
 
     if (priceVerdicts.includes("rejected")) {
         overallVerdict = "rejected";
+    } else if (priceVerdicts.includes("short_shipment_hold")) {
+        overallVerdict = "short_shipment_hold";
     } else if (priceVerdicts.includes("needs_approval") || feeVerdicts.includes("needs_approval")) {
         overallVerdict = "needs_approval";
     } else if (priceVerdicts.includes("auto_approve") || feeChanges.length > 0 || trackingUpdate) {
