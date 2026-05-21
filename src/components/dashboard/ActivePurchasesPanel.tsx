@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X, AlertCircle, Truck } from "lucide-react";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import { createBrowserClient } from "@/lib/supabase";
+import { POStepper } from "./POStepper";
 
 type AtRiskInfo = { severity: "at_risk" | "soon_at_risk"; worstDaysShort: number };
 
@@ -45,6 +46,10 @@ type ActivePurchase = {
         confidence: "high" | "medium" | "low";
         label: string;
     };
+    trackingPaused?: boolean;
+    trackingSource?: string | null;
+    typicalTrackingSource?: string | null;
+    vendorOrdersEmail?: string | null;
 };
 
 type ApiResponse = {
@@ -125,6 +130,15 @@ export default function ActivePurchasesPanel() {
     // legsMap: poNumber → legs[]. Populated whenever a purchase has legs.
     const [legsMap, setLegsMap] = useState<Map<string, ShipmentLeg[]>>(new Map());
     const [expandedLegs, setExpandedLegs] = useState<Set<string>>(new Set());
+
+    // Tracking and email poke states
+    const [addingTrackingPo, setAddingTrackingPo] = useState<string | null>(null);
+    const [newTrackingNum, setNewTrackingNum] = useState("");
+    const [newTrackingSource, setNewTrackingSource] = useState("");
+    const [pokingPo, setPokingPo] = useState<string | null>(null);
+    const [pokeEmail, setPokeEmail] = useState("");
+    const [pokeBody, setPokeBody] = useState("");
+    const [actionLoading, setActionLoading] = useState<string | null>(null);
 
     // PO_ARRIVAL_AT_RISK index from ap_activity_log (last 24h). Drives the
     // rose/amber outline + AT-RISK pill on affected POs. Activity-first
@@ -282,6 +296,100 @@ export default function ActivePurchasesPanel() {
                 next.delete(orderId);
                 return next;
             });
+        }
+    }
+
+    async function toggleTrackingPaused(orderId: string) {
+        setActionLoading(orderId + "-toggle");
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "toggle_tracking_paused", orderId }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "Toggle failed");
+            setPurchases((prev) => prev.map((po) => po.orderId === orderId
+                ? { ...po, trackingPaused: json.trackingPaused }
+                : po));
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setActionLoading(null);
+        }
+    }
+
+    async function saveTrackingNumber(orderId: string, vendorName: string) {
+        if (!newTrackingNum) return;
+        setActionLoading(orderId + "-tracking");
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    action: "add_tracking_number",
+                    orderId,
+                    trackingNumber: newTrackingNum,
+                    trackingSource: newTrackingSource,
+                    vendorName
+                }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "Failed to add tracking number");
+            setPurchases((prev) => prev.map((po) => po.orderId === orderId
+                ? {
+                    ...po,
+                    trackingNumbers: json.trackingNumbers,
+                    trackingSource: json.trackingSource,
+                    typicalTrackingSource: json.trackingSource || po.typicalTrackingSource,
+                    lifecycleStage: "moving_with_tracking"
+                  }
+                : po));
+            setAddingTrackingPo(null);
+            setNewTrackingNum("");
+            setNewTrackingSource("");
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setActionLoading(null);
+        }
+    }
+
+    async function sendPokeEmail(orderId: string) {
+        if (!pokeEmail || !pokeBody) return;
+        setActionLoading(orderId + "-poke");
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    action: "send_follow_up_email",
+                    orderId,
+                    recipientEmail: pokeEmail,
+                    emailBody: pokeBody
+                }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "Failed to send follow up email");
+            
+            // update local status
+            setPurchases((prev) => prev.map((po) => po.orderId === orderId
+                ? {
+                    ...po,
+                    trackingRequestedAt: new Date().toISOString(),
+                    lifecycleStage: "ap_follow_up"
+                  }
+                : po));
+            setPokingPo(null);
+            setPokeEmail("");
+            setPokeBody("");
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setActionLoading(null);
         }
     }
 
@@ -686,6 +794,193 @@ export default function ActivePurchasesPanel() {
                                                 );
                                             })}
                                         </div>
+
+                                         {/* Active Purchases Controls & Toolbar */}
+                                         <div className="mt-2.5 flex items-center justify-between flex-wrap gap-2 text-[10px] font-mono border-t border-zinc-800/40 pt-2 bg-zinc-950/20 px-2 py-1 rounded border border-zinc-800/30">
+                                             <div className="flex items-center gap-2">
+                                                 <button
+                                                     onClick={(e) => {
+                                                         e.stopPropagation();
+                                                         toggleTrackingPaused(po.orderId);
+                                                     }}
+                                                     disabled={actionLoading === po.orderId + "-toggle"}
+                                                     className={`px-1.5 py-0.5 rounded border text-[9px] uppercase font-bold transition-all ${
+                                                         po.trackingPaused
+                                                             ? "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20"
+                                                             : "bg-zinc-800/60 border-zinc-700/60 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+                                                     }`}
+                                                 >
+                                                     {actionLoading === po.orderId + "-toggle"
+                                                         ? "updating..."
+                                                         : po.trackingPaused
+                                                         ? "⏸ PAUSED"
+                                                         : "▶ ACTIVE"}
+                                                 </button>
+
+                                                 {po.trackingSource ? (
+                                                     <span className="text-zinc-500">
+                                                         Found: <span className="text-zinc-300 font-bold">{po.trackingSource}</span>
+                                                     </span>
+                                                 ) : po.typicalTrackingSource ? (
+                                                     <span className="text-zinc-500">
+                                                         Typically: <span className="text-zinc-300 font-bold">{po.typicalTrackingSource}</span>
+                                                     </span>
+                                                 ) : (
+                                                     <span className="text-zinc-600 italic">No tracking source pattern yet</span>
+                                                 )}
+                                             </div>
+
+                                             <div className="flex items-center gap-1.5">
+                                                 <button
+                                                     onClick={(e) => {
+                                                         e.stopPropagation();
+                                                         if (addingTrackingPo === po.orderId) {
+                                                             setAddingTrackingPo(null);
+                                                         } else {
+                                                             setAddingTrackingPo(po.orderId);
+                                                             setNewTrackingNum("");
+                                                             setNewTrackingSource(po.typicalTrackingSource || "");
+                                                             setPokingPo(null);
+                                                         }
+                                                     }}
+                                                     className={`px-1.5 py-0.5 rounded border transition-colors ${
+                                                         addingTrackingPo === po.orderId
+                                                             ? "bg-cyan-500/20 border-cyan-500/40 text-cyan-300"
+                                                             : "bg-zinc-800/40 border-zinc-700/40 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+                                                     }`}
+                                                 >
+                                                     + Add Tracking
+                                                 </button>
+
+                                                 {!po.isReceived && (
+                                                     <button
+                                                         onClick={(e) => {
+                                                             e.stopPropagation();
+                                                             if (pokingPo === po.orderId) {
+                                                                 setPokingPo(null);
+                                                             } else {
+                                                                 setPokingPo(po.orderId);
+                                                                 setPokeEmail(po.vendorOrdersEmail || "");
+                                                                 setPokeBody(
+                                                                     `Hey we just need to hear back from you. Tracking is very important so we can keep up with production and once we have tracking we need to be able to really find it. It needs to be in the invoice. It needs to be accessible. Sometimes it takes a little sleuthing to figure out but we have to really really surface that.`
+                                                                 );
+                                                                 setAddingTrackingPo(null);
+                                                             }
+                                                         }}
+                                                         className={`px-1.5 py-0.5 rounded border transition-colors ${
+                                                             pokingPo === po.orderId
+                                                                 ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
+                                                                 : "bg-zinc-800/40 border-zinc-700/40 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+                                                         }`}
+                                                     >
+                                                         ✉ Poke Vendor
+                                                     </button>
+                                                 )}
+                                             </div>
+                                         </div>
+
+                                         {/* Inline Form: Add Tracking */}
+                                         {addingTrackingPo === po.orderId && (
+                                             <div
+                                                 className="mt-2 p-2.5 rounded border border-cyan-500/25 bg-cyan-950/10 backdrop-blur-md space-y-2 text-[11px] font-mono"
+                                                 onClick={(e) => e.stopPropagation()}
+                                             >
+                                                 <div className="text-[9px] text-cyan-400 font-bold uppercase tracking-wider">Manual Tracking Entry</div>
+                                                 <div className="flex gap-2 flex-wrap">
+                                                     <div className="flex-1 min-w-[180px]">
+                                                         <label className="block text-[8px] text-zinc-500 uppercase">Tracking Number / PRO</label>
+                                                         <input
+                                                             type="text"
+                                                             value={newTrackingNum}
+                                                             onChange={(e) => setNewTrackingNum(e.target.value)}
+                                                             placeholder="e.g. 1Z12345E0205271688"
+                                                             className="w-full mt-1 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-cyan-500 text-[10px]"
+                                                         />
+                                                     </div>
+                                                     <div className="flex-1 min-w-[180px]">
+                                                         <label className="block text-[8px] text-zinc-500 uppercase">Where was it found? (Pattern)</label>
+                                                         <input
+                                                             type="text"
+                                                             value={newTrackingSource}
+                                                             onChange={(e) => setNewTrackingSource(e.target.value)}
+                                                             placeholder="e.g. Email Body, Invoice PDF Page 2"
+                                                             className="w-full mt-1 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-cyan-500 text-[10px]"
+                                                         />
+                                                     </div>
+                                                 </div>
+                                                 <div className="flex justify-end gap-2 pt-1">
+                                                     <button
+                                                         onClick={() => setAddingTrackingPo(null)}
+                                                         className="px-2 py-0.5 text-zinc-500 hover:text-zinc-300 border border-transparent rounded hover:bg-zinc-800/50"
+                                                     >
+                                                         Cancel
+                                                     </button>
+                                                     <button
+                                                         onClick={() => saveTrackingNumber(po.orderId, po.vendorName)}
+                                                         disabled={actionLoading === po.orderId + "-tracking" || !newTrackingNum}
+                                                         className="px-2.5 py-0.5 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded transition-colors disabled:opacity-40"
+                                                     >
+                                                         {actionLoading === po.orderId + "-tracking" ? "Saving..." : "Save Tracking"}
+                                                     </button>
+                                                 </div>
+                                             </div>
+                                         )}
+
+                                         {/* Inline Form: Poke Vendor */}
+                                         {pokingPo === po.orderId && (
+                                             <div
+                                                 className="mt-2 p-2.5 rounded border border-purple-500/25 bg-purple-950/10 backdrop-blur-md space-y-2 text-[11px] font-mono"
+                                                 onClick={(e) => e.stopPropagation()}
+                                             >
+                                                 <div className="text-[9px] text-purple-400 font-bold uppercase tracking-wider">Poke Vendor via Threaded Reply</div>
+                                                 <div className="space-y-2">
+                                                     <div>
+                                                         <label className="block text-[8px] text-zinc-500 uppercase">Recipient Email</label>
+                                                         <input
+                                                             type="email"
+                                                             value={pokeEmail}
+                                                             onChange={(e) => setPokeEmail(e.target.value)}
+                                                             placeholder="vendor@email.com"
+                                                             className="w-full mt-1 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-purple-500 text-[10px]"
+                                                         />
+                                                     </div>
+                                                     <div>
+                                                         <label className="block text-[8px] text-zinc-500 uppercase">Email Body</label>
+                                                         <textarea
+                                                             rows={4}
+                                                             value={pokeBody}
+                                                             onChange={(e) => setPokeBody(e.target.value)}
+                                                             className="w-full mt-1 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-purple-500 text-[10px] resize-y"
+                                                         />
+                                                     </div>
+                                                 </div>
+                                                 <div className="flex justify-between items-center pt-1 gap-2">
+                                                     <span className="text-[8px] text-zinc-500 italic max-w-[60%] truncate">
+                                                         {po.sentVerification?.evidence?.some(ev => ev.detail.includes("po_send") || ev.detail.includes("Gmail")) 
+                                                             ? "✓ Threading under original PO Send email" 
+                                                             : "⚠️ New thread will be created."}
+                                                     </span>
+                                                     <div className="flex gap-2">
+                                                         <button
+                                                             onClick={() => setPokingPo(null)}
+                                                             className="px-2 py-0.5 text-zinc-500 hover:text-zinc-300 border border-transparent rounded hover:bg-zinc-800/50"
+                                                         >
+                                                             Cancel
+                                                         </button>
+                                                         <button
+                                                             onClick={() => sendPokeEmail(po.orderId)}
+                                                             disabled={actionLoading === po.orderId + "-poke" || !pokeEmail || !pokeBody}
+                                                             className="px-2.5 py-0.5 bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 rounded transition-colors disabled:opacity-40"
+                                                         >
+                                                             {actionLoading === po.orderId + "-poke" ? "Sending..." : "Send Poke"}
+                                                         </button>
+                                                     </div>
+                                                 </div>
+                                             </div>
+                                         )}
+
+                                        {/* PO Stepper visual lifecycle track */}
+                                        <POStepper po={po} />
 
                                         {/* Bulk shipment leg timeline (only renders if legs exist) */}
                                         {legsMap.has(po.orderId) && (() => {

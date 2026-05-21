@@ -29,6 +29,8 @@ import {
 } from "lucide-react";
 
 import type { CommandBoardTaskDetail, CommandBoardTaskEvent } from "./types";
+import { AxiomLifecycleTaskDetail } from "./AxiomLifecycleTaskDetail";
+
 
 type ActionKind = "approve" | "reject" | "dismiss" | "claim" | "retry" | "cancel";
 
@@ -313,7 +315,23 @@ export function TaskDetailPanel({
                             </div>
                         </div>
 
-                        {detail.body ? (
+                        {detail.source_table === "axiom_order_lifecycle" ? (
+                            // DECISION(2026-05-20): Render the premium Axiom lifecycle management component
+                            // if the task originates from 'axiom_order_lifecycle' instead of the generic
+                            // pre-formatted JSON detail summary, keeping actions fully interactive.
+                            <AxiomLifecycleTaskDetail
+                                detail={detail}
+                                onActionComplete={() => {
+                                    if (selectedTaskId) {
+                                        fx(`/api/command-board/tasks/${selectedTaskId}?bust=1`, { cache: "no-store" })
+                                            .then(res => res.json())
+                                            .then(json => setDetail(json as CommandBoardTaskDetail))
+                                            .catch(() => {});
+                                    }
+                                    onActionComplete?.(selectedTaskId!, "dismiss");
+                                }}
+                            />
+                        ) : detail.body ? (
                             <details className="rounded border border-zinc-800/60 bg-zinc-900/40 p-2">
                                 <summary className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 cursor-pointer">
                                     Body
