@@ -42,6 +42,8 @@ interface ChangeSetItem {
     pageNumber: number;
     amount: number | null;
     filename: string;
+    pdfBuffer: Buffer;
+    date: string | null;
 }
 type ChangeSet = ChangeSetItem[];
 
@@ -252,6 +254,8 @@ async function main() {
                         pageNumber: invoice.pageNumber,
                         amount: invoice.amount || null,
                         filename: invoice.filename,
+                        pdfBuffer: invoice.pdfBuffer,
+                        date: invoice.date,
                     });
                     console.log("       Would send to Bill.com (dry-run or collected for Phase 2)");
                 } else {
@@ -277,9 +281,9 @@ async function main() {
                         const extInvoice: ExtractedInvoice = {
                             pageNumber: change.pageNumber,
                             invoiceNumber: change.invoiceNumber,
-                            date: null,
+                            date: change.date,
                             amount: change.amount,
-                            pdfBuffer: Buffer.from([]), // placeholder; actual buffer was used in Phase 1
+                            pdfBuffer: change.pdfBuffer,
                             filename: change.filename,
                         };
 
@@ -303,7 +307,9 @@ async function main() {
                         status: 'reconciled',
                         source: 'email_attachment',
                         source_ref: `reconcile-aaa-batch-${new Date().toISOString().slice(0, 10)}`,
-                        raw_data: { changes } as any,
+                        raw_data: {
+                            changes: changes.map(({ pdfBuffer, ...rest }) => rest)
+                        } as any,
                     });
                 } catch { /* dedup collision or non-critical */ }
             }

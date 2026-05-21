@@ -42,6 +42,7 @@ import {
     queueStatementMetadataOnly,
 } from "@/lib/statements/email-intake";
 import { pickPrimaryInvoicePage } from "./invoice-page-selector";
+import { splitAAACooperStatementAttachments } from "../aaa-cooper-splitter";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -115,7 +116,13 @@ const MULTI_INVOICE_STATEMENT_VENDORS: Array<{
     senderMatch: RegExp;
     filenameMatch?: RegExp;
     label: string;
-}> = [];
+}> = [
+    {
+        senderMatch: /aaa\s*cooper/i,
+        filenameMatch: /ACT_STMD/i,
+        label: "AAA Cooper",
+    },
+];
 
 type MultiInvoiceStatementResult =
     | { status: "handled"; queuedCount: number }
