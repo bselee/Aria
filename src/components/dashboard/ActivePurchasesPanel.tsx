@@ -80,6 +80,7 @@ function carrierUrl(trackingNumber: string): string {
     if (carrier.includes("dayton")) return `https://www.daytonfreight.com/tracking/?pro=${raw}`;
     if (carrier.includes("fedex freight")) return `https://www.fedex.com/fedextrack/?tracknumbers=${raw}`;
     if (carrier.includes("r&l") || carrier.includes("r+l")) return `https://www.rlcarriers.com/freight/shipping/shipment-tracing?pro=${raw}`;
+    if (carrier.includes("oak harbor") || carrier.includes("oakharbor") || carrier.includes("oakh")) return `https://www.oakh.com/tracking?pro=${raw}`;
 
     // Parcel carriers — detect from number format
     if (/^1Z[A-Z0-9]{16}$/i.test(raw)) return `https://www.ups.com/track?tracknum=${raw}`;

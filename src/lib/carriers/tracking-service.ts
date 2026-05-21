@@ -51,7 +51,9 @@ export const TRACKING_PATTERNS = {
     pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
     bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
     // Oak Harbor explicitly
-    oakharbor: /\b(?:Oak\s+Harbor(?:\s+Freight(?:\s+Lines)?)?.*?)?\b(\d{8,12})\b/i,
+    // DECISION(2026-05-21): Refined oakharbor regex prefix to be strictly mandatory, preventing
+    // raw 8-12 digit numbers from matching as Oak Harbor tracking numbers. Added support for OAKH abbreviation.
+    oakharbor: /\b(?:Oak\s+Harbor(?:\s+Freight(?:\s+Lines)?)?|OAKH)(?:[\s\-\#\:]*(?:PRO|BOL)?[\s\-\#\:]*)+(\d{8,12})\b/i,
 };
 
 // ──────────────────────────────────────────────────
