@@ -12,6 +12,10 @@ import { extractPDF } from "../pdf/extractor";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
+import {
+    TRACKING_PATTERNS as CENTRAL_TRACKING_PATTERNS,
+    extractTrackingNumbers as extractTrackingNumbersCentral
+} from "../carriers/tracking-service";
 
 /**
  * Return type for TrackingAgent.processUnreadEmails().
@@ -70,25 +74,18 @@ export class TrackingAgent {
             }
         }
 
+        // DECISION(2026-05-21): Using centralized extractTrackingNumbers to ensure regex definitions
+        // are unified and consistent across the application.
+        const foundCarrierNumbers = extractTrackingNumbersCentral(combinedText);
         const extracted: string[] = [];
-        for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-            regex.lastIndex = 0;
-            let match;
-            while ((match = regex.exec(combinedText)) !== null) {
-                let trackingNum = match[0];
-                if (["generic", "pro", "bol"].includes(carrier) && match[1]) {
-                    trackingNum = match[1];
-                } else if (carrier === "usps" || carrier === "fedex") {
-                    trackingNum = match[0];
-                }
-
-                if (trackingNum && isValidTrackingNum(trackingNum) && !extracted.some(t => t.includes(trackingNum))) {
-                    extracted.push(trackingNum);
-                }
+        for (const item of foundCarrierNumbers) {
+            const trackingNum = item.trackingNumber;
+            if (trackingNum && isValidTrackingNum(trackingNum) && !extracted.some(t => t.includes(trackingNum))) {
+                extracted.push(trackingNum);
             }
         }
 
-        const ltlKeywords = ["pro #", "pro-", "pro number", "bol", "bill of lading", "freight", "ltl", "pallet", "saia", "odfl", "dominion", "estes", "xpo"];
+        const ltlKeywords = ["pro #", "pro-", "pro number", "bol", "bill of lading", "freight", "ltl", "pallet", "saia", "odfl", "dominion", "estes", "xpo", "oak harbor", "oakharbor", "oakh"];
         const lowerBody = combinedText.toLowerCase();
 
         if (ltlKeywords.some(kw => lowerBody.includes(kw))) {
@@ -296,15 +293,7 @@ export class TrackingAgent {
     }
 }
 
-const TRACKING_PATTERNS = {
-    ups: /\b1Z[A-Z0-9]{16}\b/gi,
-    fedex: /\b(96\d{18}|\d{15}|\d{12})\b/g,
-    usps: /\b(94|92|93|95)\d{20}\b/g,
-    dhl: /\bJD\d{18}\b/gi,
-    generic: /\b(?:tracking|track(?:\s+your)?\s+shipment|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi,
-    pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi,
-    bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/gi,
-};
+
 
 function isValidTrackingNum(num: string): boolean {
     return (num.match(/\d/g)?.length ?? 0) >= 2;

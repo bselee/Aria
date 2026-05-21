@@ -421,4 +421,43 @@ describe('TRACKING_PATTERNS', () => {
     it('should match PRO pattern', () => {
         expect(TRACKING_PATTERNS.pro.test('PRO #1234567890')).toBe(true);
     });
+
+    describe('oakharbor pattern precision', () => {
+        it('should match valid Oak Harbor tracking numbers with keywords', () => {
+            const pattern = TRACKING_PATTERNS.oakharbor;
+            
+            expect(pattern.test('Oak Harbor 12345678')).toBe(true);
+            expect(pattern.test('Oak Harbor Freight Lines: PRO# 12345678')).toBe(true);
+            expect(pattern.test('Oak Harbor PRO-12345678')).toBe(true);
+            expect(pattern.test('OAKH-12345678')).toBe(true);
+            expect(pattern.test('OAKH PRO 12345678')).toBe(true);
+            expect(pattern.test('Oak Harbor Freight Lines 123456789012')).toBe(true);
+        });
+
+        it('should NOT match standalone 8-12 digit numbers or other labels', () => {
+            const pattern = TRACKING_PATTERNS.oakharbor;
+            
+            expect(pattern.test('12345678')).toBe(false);
+            expect(pattern.test('123456789012')).toBe(false);
+            expect(pattern.test('Invoice # 12345678')).toBe(false);
+            expect(pattern.test('Phone 3031234567')).toBe(false);
+            expect(pattern.test('QTY: 12345678')).toBe(false);
+        });
+        
+        it('should capture the exact tracking digits', () => {
+            const pattern = new RegExp(TRACKING_PATTERNS.oakharbor.source, 'i');
+            
+            const match1 = 'Oak Harbor 12345678'.match(pattern);
+            expect(match1).not.toBeNull();
+            expect(match1![1]).toBe('12345678');
+
+            const match2 = 'Oak Harbor Freight Lines: PRO# 9876543210'.match(pattern);
+            expect(match2).not.toBeNull();
+            expect(match2![1]).toBe('9876543210');
+
+            const match3 = 'OAKH PRO 1701387444'.match(pattern);
+            expect(match3).not.toBeNull();
+            expect(match3![1]).toBe('1701387444');
+        });
+    });
 });
