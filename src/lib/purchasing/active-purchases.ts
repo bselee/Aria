@@ -25,6 +25,10 @@ export interface ActivePurchase extends FullPO {
     humanReplyDetectedAt?: string | null;
     sentVerification: POSentVerification;
     etaProfile: VendorEtaProfile;
+    trackingPaused?: boolean;
+    trackingSource?: string | null;
+    typicalTrackingSource?: string | null;
+    vendorOrdersEmail?: string | null;
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -46,6 +50,21 @@ export async function loadActivePurchases(
     await Promise.all(uniqueVendors.map(v => leadTimeService.getForVendor(v)));
 
     const supabase = createClient();
+    const vendorMap = new Map<string, { typical_tracking_source?: string; orders_email?: string; vendor_emails?: string[] }>();
+    if (supabase && uniqueVendors.length > 0) {
+        try {
+            const { data: vData } = await supabase
+                .from("vendor_profiles")
+                .select("vendor_name, typical_tracking_source, orders_email, vendor_emails")
+                .in("vendor_name", uniqueVendors);
+            for (const v of vData || []) {
+                vendorMap.set(v.vendor_name.toLowerCase(), v);
+            }
+        } catch (e) {
+            console.warn("Failed to load vendor profiles in loadActivePurchases:", e);
+        }
+    }
+
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
     const trackingMap = new Map<string, string[]>();
     const shipmentMap = new Map<string, ShipmentRecord[]>();
@@ -64,7 +83,7 @@ export async function loadActivePurchases(
                             "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
                             "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
                             "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
-                            "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence"
+                            "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence, tracking_paused, tracking_source"
                         )
                         .in("po_number", chunk),
                     supabase
@@ -182,6 +201,8 @@ export async function loadActivePurchases(
             hasTracking: (trackingMap.get(po.orderId)?.length || 0) > 0 || shipments.length > 0,
         });
 
+        const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
+
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
@@ -199,6 +220,10 @@ export async function loadActivePurchases(
             humanReplyDetectedAt: poLifecycle?.human_reply_detected_at || null,
             sentVerification,
             etaProfile,
+            trackingPaused: poLifecycle?.tracking_paused || false,
+            trackingSource: poLifecycle?.tracking_source || null,
+            typicalTrackingSource: vendorProfile?.typical_tracking_source || null,
+            vendorOrdersEmail: vendorProfile?.orders_email || vendorProfile?.vendor_emails?.[0] || null,
         });
     }
 

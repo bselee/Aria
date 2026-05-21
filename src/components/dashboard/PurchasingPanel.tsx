@@ -1360,7 +1360,10 @@ export default function PurchasingPanel() {
                                     const groupChecked = checked[pid] ?? {};
                                     const groupQtys = qtys[pid] ?? {};
                                     const activeItems = group.items.filter(i => !isSnoozed(i.productId));
-                    const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
+                                    const hasActionable = activeItems.some(i =>
+                                        i.assessment?.decision === "order" || i.assessment?.decision === "reduce",
+                                    );
+                                    const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
                                     const directOrderBlocked = selectedItems.some(i => !canUseDirectOrdering(group.vendorName, i.reorderMethod));
                                     const selectedCount = activeItems.filter(i => groupChecked[i.productId]).length;
                                     const selectedUnits = selectedItems.reduce((sum, item) => sum + (groupQtys[item.productId] ?? item.suggestedQty), 0);

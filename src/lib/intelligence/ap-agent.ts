@@ -3,7 +3,6 @@ import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
 import * as agentTask from "./agent-task";
 import { Telegraf, Markup } from "telegraf";
-import { WebClient } from "@slack/web-api";
 import { z } from "zod";
 import { unifiedObjectGeneration } from "./llm";
 import { extractPDF, extractPDFWithLLM } from "../pdf/extractor";
@@ -162,14 +161,9 @@ function getOCRRetryReasons(invoice: InvoiceData): string[] {
 }
 export class APAgent {
     private bot: Telegraf;
-    private slack: WebClient | null;
-    private slackChannel: string;
 
     constructor(bot: Telegraf) {
         this.bot = bot;
-        const slackToken = process.env.SLACK_BOT_TOKEN;
-        this.slack = slackToken ? new WebClient(slackToken) : null;
-        this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
     }
 
     /**
@@ -736,9 +730,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     const warnMsg = `🚨 *Prepayment Required*\n*From:* ${from}\n*Subject:* _${subject}_\n\nThis vendor requires prepayment before shipping. Please review this email, click any payment links, or pay via credit card.${urlSnippets}`;
                     try {
                         await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" });
-                        if (this.slack) {
-                            await this.slack.chat.postMessage({ channel: this.slackChannel, text: warnMsg.replace(/\*/g, "*"), mrkdwn: true });
-                        }
                     } catch { /* swallow */ }
                     
                     // Archive and mark read, team was alerted via Telegram
@@ -1842,7 +1833,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                                 // Both activity log and Telegram say the same plain English thing.
                                 action_taken: result.summary,
-                                notified_slack: !!this.slack,
+                                notified_slack: false,
                                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                                 reconciliation_report: result.report ?? null,
                             }).eq("id", pendingLogId);
@@ -2145,7 +2136,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                 // Both activity log and Telegram say the same plain English thing.
                 action_taken: result.summary,
-                notified_slack: !!this.slack,
+                notified_slack: false,
                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                 reconciliation_report: reconciliationReport,
             });
@@ -2266,18 +2257,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             console.error("Telegram reconciliation notification failed:", err.message);
         }
 
-        // Slack (always plain text, no buttons)
-        if (this.slack) {
-            try {
-                await this.slack.chat.postMessage({
-                    channel: this.slackChannel,
-                    text: msg,
-                    mrkdwn: true,
-                });
-            } catch (err: any) {
-                console.error("Slack reconciliation notification failed:", err.message);
-            }
-        }
+        // Slack cross-posting disabled: AP/reconciliation review lives in Telegram and the dashboard.
     }
 
     /**

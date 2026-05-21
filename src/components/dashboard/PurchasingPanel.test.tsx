@@ -176,6 +176,49 @@ describe("PurchasingPanel - vendor policy badges", () => {
         vi.restoreAllMocks();
     });
 
+    it("expands a vendor that includes watch items without crashing", async () => {
+        stubLocalStorage();
+
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Colorful Packaging Ltd",
+                    vendorPartyId: "10918",
+                    urgency: "critical",
+                    items: [
+                        makeFixtureItem(),
+                        makeWatchItem({
+                            productId: "CP-LABEL-WATCH",
+                            productName: "Colorful replenishment watch SKU",
+                            supplierName: "Colorful Packaging Ltd",
+                            supplierPartyId: "10918",
+                        }),
+                    ],
+                },
+            ],
+            cachedAt: "2026-05-05T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+            const url = String(input);
+            let body: any = emptyPayload;
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        fireEvent.click(await screen.findByText(/Colorful Packaging Ltd/i));
+
+        await waitFor(() => expect(screen.getByText(/Colorful replenishment watch SKU/i)).toBeTruthy());
+    });
+
     it("renders cover/lead/MOQ-warn/Review badges and review reasons block", async () => {
         stubLocalStorage();
         stubFetch();

@@ -173,7 +173,7 @@ export async function GET(req: NextRequest) {
         // invoice number extracted from metadata.invoiceNumber.
         const { data: logRaw } = await supabase
             .from('ap_activity_log')
-            .select('id, created_at, email_subject, action_taken, metadata, intent')
+            .select('id, created_at, email_subject, action_taken, reviewed_at, reviewed_action, metadata, intent')
             .in('intent', ['INVOICE', 'RECONCILIATION', 'HUMAN_INTERACTION', 'HUMAN_INTERACT', 'EYES_NEEDED'])
             .order('created_at', { ascending: false })
             .limit(200);

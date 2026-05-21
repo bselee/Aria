@@ -41,6 +41,11 @@ import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor
 import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
 import { assertPriceReasonable, assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
+import {
+    FINALE_FREIGHT_PROMO_URL,
+    buildFinaleFreightAdjustment,
+    mergeInvoiceCorrelationNote,
+} from '../lib/finale/freight-adjustment';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -68,7 +73,7 @@ const PROCESSED_DIR = path.join(SANDBOX_DIR, 'processed');
 const JSON_PATH = path.join(PROCESSED_DIR, 'axiom-order-details.json');
 const DISCOVER_DIR = path.join(SANDBOX_DIR, 'axiom-discovery');
 const CHROME_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
-const FREIGHT_PROMO = '/buildasoilorganics/api/productpromo/10007';
+const FREIGHT_PROMO = FINALE_FREIGHT_PROMO_URL;
 
 // ── SKU Mapping ───────────────────────────────────────────────────────────────
 
@@ -1002,22 +1007,18 @@ async function reconcilePO(
             .reduce((s: number, a: any) => s + a.amount, 0);
 
         if (totalFreight > 0 && Math.abs(existingFreight - totalFreight) > 0.01) {
-            const label = `Freight - Axiom Print ${invNums.join('+')}`;
-            const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('Axiom Print'));
-            if (!alreadyLabeled) {
-                console.log(`     + Freight: $${totalFreight} (${label})`);
+            console.log(`     + Freight: $${totalFreight}`);
 
-                changes.push({
-                    type: 'freight_add',
-                    poId,
-                    freightCents: Math.round(totalFreight * 100),
-                    invoiceNumber: invNums.join('+'),
-                });
+            changes.push({
+                type: 'freight_add',
+                poId,
+                freightCents: Math.round(totalFreight * 100),
+                invoiceNumber: invNums.join('+'),
+            });
 
-                if (!poFreightMap[poId]) poFreightMap[poId] = { invNums, totalFreight };
+            if (!poFreightMap[poId]) poFreightMap[poId] = { invNums, totalFreight };
 
-                result.freightAdded = totalFreight;
-            }
+            result.freightAdded = totalFreight;
         }
     } catch (err: any) {
         result.errors.push(err.message);
@@ -1402,14 +1403,15 @@ async function main() {
                     const freightInfo = poFreightMap[poId];
                     if (freightInfo) {
                         const existingAdj = unlocked.orderAdjustmentList || [];
-                        existingAdj.push({
-                            amount: freightInfo.totalFreight,
-                            description: `Freight - Axiom Print ${freightInfo.invNums.join('+')}`,
-                            productPromoUrl: FREIGHT_PROMO,
-                        });
-                        unlocked.orderAdjustmentList = existingAdj;
+                        unlocked.orderAdjustmentList = [
+                            ...existingAdj.filter((adj: any) => adj.productPromoUrl !== FREIGHT_PROMO),
+                            buildFinaleFreightAdjustment(freightInfo.totalFreight),
+                        ];
                         run.recordFreight(Math.round(freightInfo.totalFreight * 100));
                     }
+
+                    const invoiceNumbers = Array.from(new Set(poChanges.map(change => change.invoiceNumber).filter(Boolean)));
+                    unlocked.privateNotes = mergeInvoiceCorrelationNote(unlocked.privateNotes, invoiceNumbers);
 
                     // Save
                     await post(`/buildasoilorganics/api/order/${encodeURIComponent(poId)}`, unlocked);
@@ -1527,12 +1529,11 @@ async function main() {
                         if (inv.shipping > 0) {
                             try {
                                 const poDetail = await finale.getOrderDetails(result.orderId);
-                                const adjs = poDetail.orderAdjustmentList || [];
-                                adjs.push({
-                                    amount: inv.shipping,
-                                    description: `Freight - Axiom Print ${inv.invoiceNumber}`,
-                                    productPromoUrl: FREIGHT_PROMO,
-                                });
+                                const adjs = (poDetail.orderAdjustmentList || []).filter(
+                                    (adj: any) => adj.productPromoUrl !== FREIGHT_PROMO
+                                );
+                                adjs.push(buildFinaleFreightAdjustment(inv.shipping));
+                                poDetail.privateNotes = mergeInvoiceCorrelationNote(poDetail.privateNotes, [inv.invoiceNumber]);
                                 await post(`/buildasoilorganics/api/order/${encodeURIComponent(result.orderId)}`, poDetail);
                                 console.log(`      + Freight: $${inv.shipping.toFixed(2)}`);
                             } catch (freightErr: any) {
