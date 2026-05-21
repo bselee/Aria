@@ -435,35 +435,35 @@ bot.on('document', async (ctx) => {
             }
 
             let reply = `${fileLabel}\n`;
-            reply += `Ã°Å¸â€œÅ½ File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
-            reply += `Ã°Å¸â€œÂ Lines: ${lineCount}\n`;
-            if (finaleContext) reply += `Ã°Å¸â€â€” _Enriched with live Finale inventory data_\n`;
-            reply += `\nÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€Â\n`;
+            reply += `🔗 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+            reply += `📄 Lines: ${lineCount}\n`;
+            if (finaleContext) reply += `🔭 _Enriched with live Finale inventory data_\n`;
+            reply += `\n————————————————————\n`;
 
             ctx.sendChatAction('typing');
             const analysis = await unifiedTextGeneration({
-                system: `You are Aria, an operations assistant for BuildASoil Ã¢â‚¬â€ a soil and growing supply manufacturer. You know this business deeply. Analyze uploaded data files and give DECISIVE, ACTIONABLE answers. Be specific with numbers, SKUs, and recommendations. Format for Telegram (markdown).
+                system: `You are Aria, an operations assistant for BuildASoil — a soil and growing supply manufacturer. You know this business deeply. Analyze uploaded data files and give DECISIVE, ACTIONABLE answers. Be specific with numbers, SKUs, and recommendations. Format for Telegram (markdown).
 
 CRITICAL RULES:
 1. **ANSWER THE QUESTION DIRECTLY.** Never say "you would need to check records" or "refer to purchase orders." YOU are the one who checks. If you have data, CALCULATE and ANSWER. If the data supports an estimate, give it clearly labeled as an estimate.
 
 2. **ALWAYS DO THE MATH.** When consumption data is available:
-   - If you have 90-day consumption, extrapolate: annual = (90-day value / 90) Ãƒâ€” 365
-   - If asked about "last year" purchases, estimate from consumption rate: items consumed Ã¢â€°Ë† items purchased for BOM components
+   - If you have 90-day consumption, extrapolate: annual = (90-day value / 90) × 365
+   - If asked about "last year" purchases, estimate from consumption rate: items consumed ≈ items purchased for BOM components
    - Show your calculation so Will can verify
 
 3. **BOM Components**: If a product shows 0 sales velocity but has stock, it IS a BOM input consumed through production builds. State this as fact.
-   - For BOM items, purchasing Ã¢â€°Ë† consumption over time (what goes in must be bought)
+   - For BOM items, purchasing ≈ consumption over time (what goes in must be bought)
    - Use the FINALE INVENTORY DATA section (if present) for real consumption rates
 
 4. **Be specific, not generic**: Use actual SKUs, quantities, and product names. Never give vague summaries when you have real numbers.
 
 5. **Format answers as direct responses.** Example of GOOD response:
-   "PLQ101 - Quillaja Extract Powder 20: Purchased ~223 kg last year (based on 55 kg consumed over 90 days Ã¢â€ â€™ 0.61 kg/day Ãƒâ€” 365 days)"
+   "PLQ101 - Quillaja Extract Powder 20: Purchased ~223 kg last year (based on 55 kg consumed over 90 days → 0.61 kg/day × 365 days)"
    
    Example of BAD response:
    "To determine purchases, you would need to check purchase records."`,
-                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above Ã¢â‚¬â€ do NOT ask for the complete data. Give the best answer possible from what you have.`,
+                prompt: `User's request: ${caption || 'Analyze this file'}\n\nFile: ${filename}\nData (${textContent.length} chars total, showing up to 60,000 chars):\n${textContent.slice(0, 60000)}${finaleContext}\n\nNOTE: If data appears truncated, work with what's available above — do NOT ask for the complete data. Give the best answer possible from what you have.`,
                 // KAIZEN #1: ~800-token system prompt (CRITICAL RULES + persona) re-sent on every file upload.
                 cacheControl: "ephemeral",
             });
@@ -475,7 +475,7 @@ CRITICAL RULES:
             const chatId = ctx.from?.id || ctx.chat.id;
             if (!chatHistory[chatId]) chatHistory[chatId] = [];
             chatLastActive[chatId] = Date.now();
-            chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' Ã¢â‚¬â€ ' + caption : ''}` });
+            chatHistory[chatId].push({ role: "user", content: `[Uploaded file: ${filename}]${caption ? ' — ' + caption : ''}` });
             chatHistory[chatId].push({ role: "assistant", content: reply });
             if (chatHistory[chatId].length > 20) chatHistory[chatId] = chatHistory[chatId].slice(-20);
 
@@ -497,7 +497,7 @@ CRITICAL RULES:
             return;
         }
 
-        // Ã¢â€â‚¬Ã¢â€â‚¬ PDF / Image / Word pipeline Ã¢â€â‚¬Ã¢â€â‚¬
+        // ——— PDF / Image / Word pipeline ———
         const { extractPDF } = await import('../lib/pdf/extractor');
         const { classifyDocument } = await import('../lib/pdf/classifier');
         const { pdfEditor } = await import('../lib/pdf/editor');
@@ -509,22 +509,22 @@ CRITICAL RULES:
         const classification = await classifyDocument(extraction);
 
         const typeEmoji: Record<string, string> = {
-            INVOICE: 'Ã°Å¸Â§Â¾', PURCHASE_ORDER: 'Ã°Å¸â€œâ€¹', VENDOR_STATEMENT: 'Ã°Å¸â€œÅ ',
-            BILL_OF_LADING: 'Ã°Å¸Å¡Å¡', PACKING_SLIP: 'Ã°Å¸â€œÂ¦', FREIGHT_QUOTE: 'Ã°Å¸ÂÂ·Ã¯Â¸Â',
-            CREDIT_MEMO: 'Ã°Å¸â€™Â³', COA: 'Ã°Å¸â€Â¬', SDS: 'Ã¢Å¡Â Ã¯Â¸Â', CONTRACT: 'Ã°Å¸â€œÅ“',
-            PRODUCT_SPEC: 'Ã°Å¸â€œÂ', TRACKING_NOTIFICATION: 'Ã°Å¸â€œÂ', UNKNOWN: 'Ã°Å¸â€œâ€ž',
+            INVOICE: '💳', PURCHASE_ORDER: '📋', VENDOR_STATEMENT: '📊',
+            BILL_OF_LADING: '🚚', PACKING_SLIP: '📦', FREIGHT_QUOTE: '🦦',
+            CREDIT_MEMO: '💴', COA: '🧪', SDS: '⚠️', CONTRACT: '📜',
+            PRODUCT_SPEC: '📄', TRACKING_NOTIFICATION: '📄', UNKNOWN: '📄',
         };
-        const emoji = typeEmoji[classification.type] || 'Ã°Å¸â€œâ€ž';
+        const emoji = typeEmoji[classification.type] || '📄';
         const typeLabel = classification.type.replace(/_/g, ' ');
 
-        let reply = `${emoji} *${typeLabel}* Ã¢â‚¬â€ _${classification.confidence} confidence_\n`;
-        reply += `Ã°Å¸â€œÅ½ File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
-        reply += `Ã°Å¸â€œâ€ž Pages: ${extraction.metadata.pageCount}\n`;
+        let reply = `${emoji} *${typeLabel}* — _${classification.confidence} confidence_\n`;
+        reply += `🔗 File: \`${filename}\` (${(buffer.length / 1024).toFixed(0)} KB)\n`;
+        reply += `📄 Pages: ${extraction.metadata.pageCount}\n`;
         if (extraction.tables.length > 0) {
-            reply += `Ã°Å¸â€œÅ  Tables detected: ${extraction.tables.length}\n`;
+            reply += `📊 Tables detected: ${extraction.tables.length}\n`;
         }
 
-        // Ã¢â€â‚¬Ã¢â€â‚¬ CHECK MEMORY: Do we know this vendor's pattern? Ã¢â€â‚¬Ã¢â€â‚¬
+        // ——— CHECK MEMORY: Do we know this vendor's pattern? ———
         const docPreview = extraction.rawText.slice(0, 500);
         let vendorMemories: Awaited<ReturnType<typeof recall>> = [];
         try {
@@ -542,10 +542,10 @@ CRITICAL RULES:
             vendorMemories[0].content.toLowerCase().includes('split');
 
         if (hasVendorPattern) {
-            reply += `\nÃ°Å¸Â§Â  _Memory: ${vendorMemories[0].content.slice(0, 100)}..._\n`;
+            reply += `\n🧠 _Memory: ${vendorMemories[0].content.slice(0, 100)}..._\n`;
         }
 
-        // Ã¢â€â‚¬Ã¢â€â‚¬ Analyze pages with LLM Ã¢â€â‚¬Ã¢â€â‚¬
+        // ——— Analyze pages with LLM ———
         const isInvoiceWorkflow = classification.type === 'VENDOR_STATEMENT'
             || classification.type === 'INVOICE'
             || caption.toLowerCase().includes('invoice')
@@ -557,29 +557,29 @@ CRITICAL RULES:
             ctx.sendChatAction('typing');
 
             // Use physical per-page extraction for accurate page text
-            // (form-feed splitting often fails Ã¢â‚¬â€ this splits via pdf-lib)
+            // (form-feed splitting often fails — this splits via pdf-lib)
             let analysisPages = extraction.pages;
             if (extraction.metadata.pageCount > 1 && extraction.pages.length < extraction.metadata.pageCount * 0.8) {
                 const { extractPerPage } = await import('../lib/pdf/extractor');
                 analysisPages = await extractPerPage(buffer);
-                reply += `Ã°Å¸â€Â¬ Using per-page extraction (${analysisPages.length} pages)...\n`;
+                reply += `Ã°Å¸â€ Â¬ Using per-page extraction (${analysisPages.length} pages)...\n`;
             }
 
             // Per-page analysis
             const pageAnalysis = await unifiedTextGeneration({
                 system: `You analyze business documents page by page. For each page, determine:
-- INVOICE: An individual invoice with line items, quantities, amounts, invoice number
+- INVOICE: An individual invoice with line items, quantities, amounts, invoice number, and invoice date
 - STATEMENT: An account statement summary showing list of invoices, aging, balances
 - OTHER: Cover page, terms, remittance slip, etc.
 
-Return ONLY a JSON array: [{"page":1,"type":"INVOICE","invoiceNumber":"INV-123"}]
-If no invoice number found, use null for invoiceNumber.`,
+Return ONLY a JSON array: [{"page":1,"type":"INVOICE","invoiceNumber":"INV-123","date":"2026-05-13"}]
+If no invoice number found, use null for invoiceNumber. If no date found, use null for date.`,
                 prompt: `${analysisPages.length} pages:\n\n${analysisPages.map(p =>
                     `=== PAGE ${p.pageNumber} ===\n${p.text.slice(0, 800)}\n`
                 ).join('\n')}`
             });
 
-            let pages: Array<{ page: number; type: string; invoiceNumber?: string | null }> = [];
+            let pages: Array<{ page: number; type: string; invoiceNumber?: string | null; date?: string | null }> = [];
             try {
                 const jsonMatch = pageAnalysis.match(/\[[\s\S]*?\]/);
                 if (jsonMatch) pages = JSON.parse(jsonMatch[0]);
@@ -610,13 +610,15 @@ If no invoice number found, use null for invoiceNumber.`,
 
                         const pageBuffer = splitBuffers[pageIdx];
                         const invNum = invPage.invoiceNumber || `page${invPage.page}`;
-                        const invFilename = `${invNum.replace(/[^a-zA-Z0-9-]/g, '_')}.pdf`;
+                        const safeInvoiceNumber = invNum.replace(/[^a-zA-Z0-9-]/g, "_");
+                        const safeDate = (invPage.date || "unknown-date").replace(/[^0-9-]/g, "_");
+                        const invFilename = `Invoice_${safeInvoiceNumber}_${safeDate}.pdf`;
 
                         // Send each invoice PDF back to chat
                         await ctx.replyWithDocument({
                             source: pageBuffer,
                             filename: invFilename,
-                        }, { caption: `Ã°Å¸Â§Â¾ Invoice ${invNum}` });
+                        }, { caption: `📄 Invoice ${invNum}` });
 
                         // Email each to bill.com
                         try {
@@ -674,7 +676,12 @@ If no invoice number found, use null for invoiceNumber.`,
 
                 // Single invoice Ã¢â‚¬â€ forward as-is
                 if (invoicePages.length === 1 && statementPages.length === 0) {
-                    const invNum = invoiceNums[0] || 'unknown';
+                    const invPage = invoicePages[0];
+                    const invNum = invPage.invoiceNumber || 'unknown';
+                    const safeInvoiceNumber = invNum.replace(/[^a-zA-Z0-9-]/g, "_");
+                    const safeDate = (invPage.date || "unknown-date").replace(/[^0-9-]/g, "_");
+                    const invFilename = `Invoice_${safeInvoiceNumber}_${safeDate}.pdf`;
+
                     reply += `\nÃ°Å¸â€œÂ§ Forwarding to bill.com...`;
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
@@ -684,11 +691,11 @@ If no invoice number found, use null for invoiceNumber.`,
                             `Invoice ${invNum}`,
                             `Invoice ${invNum} attached.\nFile: ${filename}`,
                             buffer,
-                            filename,
+                            invFilename,
                         );
-                        await ctx.reply(`Ã°Å¸â€œÂ§ Ã¢Å“â€¦ Sent to \`buildasoilap@bill.com\` Ã¢â‚¬â€ Invoice ${invNum}`, { parse_mode: 'Markdown' });
+                        await ctx.reply(`Ã°Å¸â€œÂ§ Ã¢Å“â€¦ Sent to \`buildasoilap@bill.com\` Ã¢â‚¬â€  Invoice ${invNum}`, { parse_mode: 'Markdown' });
                     } catch (emailErr: any) {
-                        await ctx.reply(`Ã¢Å¡Â Ã¯Â¸Â Email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
+                        await ctx.reply(`Ã¢Å¡Â Ã¯Â¸Â  Email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
                     }
 
                     return;
