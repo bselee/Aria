@@ -12,51 +12,10 @@ import { createClient } from "@/lib/supabase";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
-function unauthorized() {
-    return NextResponse.json(
-        { error: "dashboard authentication required" },
-        {
-            status: 401,
-            headers: {
-                ...NO_STORE,
-                "WWW-Authenticate": 'Basic realm="ARIA Dashboard"',
-            },
-        },
-    );
-}
-
-function isDashboardAuthorized(req: NextRequest): boolean {
-    const expectedUser = process.env.DASHBOARD_BASIC_AUTH_USER;
-    const expectedPassword = process.env.DASHBOARD_BASIC_AUTH_PASSWORD;
-
-    if (!expectedUser || !expectedPassword) {
-        return false;
-    }
-
-    const auth = req.headers.get("authorization") ?? "";
-    if (!auth.toLowerCase().startsWith("basic ")) {
-        return false;
-    }
-
-    const decoded = Buffer.from(auth.slice("basic ".length), "base64").toString("utf8");
-    const separator = decoded.indexOf(":");
-    if (separator < 0) {
-        return false;
-    }
-
-    const user = decoded.slice(0, separator);
-    const password = decoded.slice(separator + 1);
-    return user === expectedUser && password === expectedPassword;
-}
-
 /**
  * Fetches all Axiom-to-Finale SKU mappings ordered by Axiom Job Name.
  */
 export async function GET(req: NextRequest) {
-    if (!isDashboardAuthorized(req)) {
-        return unauthorized();
-    }
-
     const supabase = createClient();
     if (!supabase) {
         return NextResponse.json(
@@ -89,10 +48,6 @@ export async function GET(req: NextRequest) {
  * Upserts (creates or updates) an Axiom-to-Finale SKU mapping.
  */
 export async function POST(req: NextRequest) {
-    if (!isDashboardAuthorized(req)) {
-        return unauthorized();
-    }
-
     const supabase = createClient();
     if (!supabase) {
         return NextResponse.json(
@@ -157,10 +112,6 @@ export async function POST(req: NextRequest) {
  * Deletes an Axiom SKU mapping.
  */
 export async function DELETE(req: NextRequest) {
-    if (!isDashboardAuthorized(req)) {
-        return unauthorized();
-    }
-
     const supabase = createClient();
     if (!supabase) {
         return NextResponse.json(

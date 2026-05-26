@@ -1,24 +1,23 @@
 /**
  * @file    AxiomSkuMappingPanel.tsx
- * @purpose Premium CRUD dashboard panel to manage dynamic Axiom-to-Finale SKU mappings.
- * @author  Will
- * @created 2026-05-20
- * @updated 2026-05-20
- * @deps    react, lucide-react
+ * @purpose Finale-SKU-first Axiom order completion gate.
  */
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
     AlertCircle,
     CheckCircle2,
-    Edit2,
+    CircleDashed,
+    ClipboardCheck,
+    FileSearch,
     Loader2,
+    PackageCheck,
     Plus,
     RefreshCw,
     Search,
-    Trash2,
-    X
+    ShieldCheck,
+    X,
 } from "lucide-react";
 
 export type AxiomSkuMapping = {
@@ -30,512 +29,451 @@ export type AxiomSkuMapping = {
     updated_at?: string;
 };
 
+export type AxiomOrderTemplate = {
+    finale_sku: string;
+    axiom_job_name: string | null;
+    spec: Record<string, unknown> | null;
+    auto_order_allowed: boolean;
+    approved: boolean;
+    approved_by?: string | null;
+    approved_at?: string | null;
+    updated_at?: string | null;
+};
+
+type CompletionStatus = "ready" | "manual_ready" | "needs_spec" | "reconciliation_only";
+
+type CompletionRow = {
+    finaleSku: string;
+    axiomJobName: string;
+    status: CompletionStatus;
+    statusLabel: string;
+    statusTone: string;
+    description: string;
+    specSummary: string;
+    qtyFraction: number | null;
+    approved: boolean;
+    autoOrderAllowed: boolean;
+    source: "template" | "mapping";
+};
+
+const DEFAULT_SPEC = `{
+  "size": "",
+  "material": "",
+  "finish": "",
+  "roll_direction": "",
+  "turnaround": ""
+}`;
+
 export function AxiomSkuMappingPanel() {
-    // State lists
+    const [templates, setTemplates] = useState<AxiomOrderTemplate[]>([]);
     const [mappings, setMappings] = useState<AxiomSkuMapping[]>([]);
-    const [loading, setLoading] = useState<boolean>(true);
+    const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [successMessage, setSuccessMessage] = useState<string | null>(null);
+    const [searchQuery, setSearchQuery] = useState("");
 
-    // Filter/Search state
-    const [searchQuery, setSearchQuery] = useState<string>("");
+    const [showForm, setShowForm] = useState(false);
+    const [formSubmitting, setFormSubmitting] = useState(false);
+    const [finaleSku, setFinaleSku] = useState("");
+    const [axiomJobName, setAxiomJobName] = useState("");
+    const [specJson, setSpecJson] = useState(DEFAULT_SPEC);
+    const [approved, setApproved] = useState(false);
+    const [autoOrderAllowed, setAutoOrderAllowed] = useState(false);
 
-    // Form/Editor state
-    const [showForm, setShowForm] = useState<boolean>(false);
-    const [isEditing, setIsEditing] = useState<boolean>(false);
-    const [formSubmitting, setFormSubmitting] = useState<boolean>(false);
-    const [deleteConfirmJob, setDeleteConfirmJob] = useState<string | null>(null);
-    const [deletingJob, setDeletingJob] = useState<boolean>(false);
-
-    // Form Fields
-    const [axiomJobName, setAxiomJobName] = useState<string>("");
-    const [finaleSkusText, setFinaleSkusText] = useState<string>("");
-    const [qtyFraction, setQtyFraction] = useState<string>("1.0");
-    const [description, setDescription] = useState<string>("");
-
-    // Fetch mappings from next API
-    const fetchMappings = useCallback(async () => {
+    const fetchData = useCallback(async () => {
         setLoading(true);
         setError(null);
         try {
-            const res = await fetch("/api/axiom-sku-mappings");
-            if (!res.ok) {
-                throw new Error(`HTTP Error ${res.status}`);
-            }
-            const data = await res.json();
-            setMappings(data.mappings ?? []);
-        } catch (err: any) {
-            console.error("Error fetching mappings:", err);
-            setError("Failed to load mappings. Please try again.");
+            const [templateRes, mappingRes] = await Promise.all([
+                fetch("/api/axiom-templates"),
+                fetch("/api/axiom-sku-mappings"),
+            ]);
+
+            if (!templateRes.ok) throw new Error(`Templates HTTP ${templateRes.status}`);
+            if (!mappingRes.ok) throw new Error(`Mappings HTTP ${mappingRes.status}`);
+
+            const templateData = await templateRes.json();
+            const mappingData = await mappingRes.json();
+            setTemplates(templateData.templates ?? []);
+            setMappings(mappingData.mappings ?? []);
+        } catch (err) {
+            console.error("[axiom-skus] load failed", err);
+            setError(err instanceof Error ? err.message : "Failed to load Axiom order gate data.");
         } finally {
             setLoading(false);
         }
     }, []);
 
     useEffect(() => {
-        fetchMappings();
-    }, [fetchMappings]);
+        fetchData();
+    }, [fetchData]);
 
-    // Handle Form Submit (Upsert)
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
+    const rows = useMemo(() => buildCompletionRows(templates, mappings), [templates, mappings]);
+    const filteredRows = useMemo(() => {
+        const query = searchQuery.trim().toLowerCase();
+        if (!query) return rows;
+        return rows.filter(row => [
+            row.finaleSku,
+            row.axiomJobName,
+            row.description,
+            row.statusLabel,
+            row.specSummary,
+        ].some(value => value.toLowerCase().includes(query)));
+    }, [rows, searchQuery]);
+
+    const counts = useMemo(() => ({
+        ready: rows.filter(row => row.status === "ready").length,
+        manualReady: rows.filter(row => row.status === "manual_ready").length,
+        needsSpec: rows.filter(row => row.status === "needs_spec").length,
+        reconciliationOnly: rows.filter(row => row.status === "reconciliation_only").length,
+    }), [rows]);
+
+    const resetForm = () => {
+        setFinaleSku("");
+        setAxiomJobName("");
+        setSpecJson(DEFAULT_SPEC);
+        setApproved(false);
+        setAutoOrderAllowed(false);
+        setShowForm(false);
+        setError(null);
+    };
+
+    const handleSubmitTemplate = async (event: React.FormEvent) => {
+        event.preventDefault();
         setError(null);
         setSuccessMessage(null);
 
-        // Validation
-        if (!axiomJobName.trim()) {
-            setError("Axiom Job Name is required.");
+        const cleanSku = finaleSku.trim();
+        if (!cleanSku) {
+            setError("Finale SKU is required.");
             return;
         }
 
-        const skus = finaleSkusText
-            .split(",")
-            .map(s => s.trim())
-            .filter(s => s.length > 0);
-
-        if (skus.length === 0) {
-            setError("At least one Finale SKU must be specified.");
-            return;
-        }
-
-        const fraction = parseFloat(qtyFraction);
-        if (isNaN(fraction) || fraction <= 0) {
-            setError("Quantity Fraction must be a positive number.");
+        let spec: Record<string, unknown>;
+        try {
+            spec = specJson.trim() ? JSON.parse(specJson) : {};
+        } catch {
+            setError("Spec JSON is not valid.");
             return;
         }
 
         setFormSubmitting(true);
-
         try {
-            const res = await fetch("/api/axiom-sku-mappings", {
+            const payload = {
+                finale_sku: cleanSku,
+                axiom_job_name: axiomJobName.trim() || cleanSku,
+                spec,
+                approved,
+                auto_order_allowed: autoOrderAllowed,
+                approved_by: approved ? "dashboard" : null,
+            };
+
+            const res = await fetch("/api/axiom-templates", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    axiom_job_name: axiomJobName.trim(),
-                    finale_skus: skus,
-                    qty_fraction: fraction,
-                    description: description.trim() || null,
-                }),
+                body: JSON.stringify(payload),
             });
-
             const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to save Axiom template.");
 
-            if (!res.ok) {
-                throw new Error(data.error || "Failed to save mapping");
-            }
-
-            setSuccessMessage(
-                isEditing
-                    ? `Mapping for '${axiomJobName}' updated successfully.`
-                    : `Mapping for '${axiomJobName}' created successfully.`
-            );
-
-            // Reset form
+            setSuccessMessage(`Template for ${cleanSku} saved.`);
             resetForm();
-            // Refresh list
-            await fetchMappings();
-
-            // Auto-dismiss success message
-            setTimeout(() => setSuccessMessage(null), 4000);
-        } catch (err: any) {
-            console.error("Submit error:", err);
-            setError(err.message || "Failed to save the mapping rules.");
+            await fetchData();
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to save Axiom template.");
         } finally {
             setFormSubmitting(false);
         }
     };
 
-    // Open editor with populated data
-    const handleEdit = (mapping: AxiomSkuMapping) => {
-        setError(null);
-        setSuccessMessage(null);
-        setIsEditing(true);
-        setAxiomJobName(mapping.axiom_job_name);
-        setFinaleSkusText(mapping.finale_skus.join(", "));
-        setQtyFraction(mapping.qty_fraction.toString());
-        setDescription(mapping.description ?? "");
-        setShowForm(true);
-
-        // Scroll to form nicely
-        window.scrollTo({ top: 0, behavior: "smooth" });
-    };
-
-    // Delete mapping rules
-    const handleDelete = async (jobName: string) => {
-        setError(null);
-        setSuccessMessage(null);
-        setDeletingJob(true);
-
-        try {
-            const res = await fetch(`/api/axiom-sku-mappings?axiom_job_name=${encodeURIComponent(jobName)}`, {
-                method: "DELETE",
-            });
-            const data = await res.json();
-
-            if (!res.ok) {
-                throw new Error(data.error || "Failed to delete mapping");
-            }
-
-            setSuccessMessage(`Mapping for '${jobName}' deleted successfully.`);
-            setDeleteConfirmJob(null);
-            await fetchMappings();
-
-            setTimeout(() => setSuccessMessage(null), 4000);
-        } catch (err: any) {
-            console.error("Delete error:", err);
-            setError(err.message || "Failed to delete mapping.");
-        } finally {
-            setDeletingJob(false);
-        }
-    };
-
-    const resetForm = () => {
-        setAxiomJobName("");
-        setFinaleSkusText("");
-        setQtyFraction("1.0");
-        setDescription("");
-        setIsEditing(false);
-        setShowForm(false);
-    };
-
-    // Search and filter mappings list
-    const filteredMappings = mappings.filter(m => {
-        const query = searchQuery.toLowerCase().trim();
-        if (!query) return true;
-
-        const matchesJobName = m.axiom_job_name.toLowerCase().includes(query);
-        const matchesDescription = (m.description ?? "").toLowerCase().includes(query);
-        const matchesSkus = m.finale_skus.some(sku => sku.toLowerCase().includes(query));
-
-        return matchesJobName || matchesDescription || matchesSkus;
-    });
-
     return (
-        <div className="flex flex-col h-full bg-[#09090b] text-zinc-100 p-4 space-y-4 overflow-y-auto">
-            {/* Top Section */}
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-zinc-800/80 pb-4">
-                <div>
-                    <h2 className="text-base font-semibold tracking-tight text-zinc-100 flex items-center gap-2">
-                        <span>Axiom-to-Finale SKU Correlations</span>
-                        {loading && <Loader2 className="w-4 h-4 animate-spin text-blue-400" />}
+        <div className="flex h-full flex-col overflow-y-auto bg-[#09090b] p-4 text-zinc-100">
+            <div className="flex flex-col gap-3 border-b border-zinc-800/80 pb-4 lg:flex-row lg:items-start lg:justify-between">
+                <div className="space-y-1">
+                    <h2 className="flex items-center gap-2 text-base font-semibold tracking-tight text-zinc-100">
+                        <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                        <span>Axiom Order Completion Gate</span>
+                        {loading && <Loader2 className="h-4 w-4 animate-spin text-zinc-500" />}
                     </h2>
-                    <p className="text-xs text-zinc-400 mt-0.5">
-                        Manage dynamic job mapping definitions. Changes are immediately applied to new invoice processes.
+                    <p className="max-w-3xl text-xs text-zinc-400">
+                        Finale SKU is the order reference. Axiom job names, print specs, and auto-order permission attach to that SKU before any website/API order can be trusted.
                     </p>
                 </div>
                 <div className="flex items-center gap-2">
                     <button
                         type="button"
-                        onClick={fetchMappings}
+                        onClick={fetchData}
                         disabled={loading}
-                        className="p-1.5 rounded border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/80 text-zinc-300 disabled:opacity-50 transition-all focus:outline-none focus:ring-1 focus:ring-zinc-700"
-                        title="Reload Mappings"
+                        className="rounded border border-zinc-800 bg-zinc-900/70 p-1.5 text-zinc-300 transition-colors hover:bg-zinc-800 disabled:opacity-50"
+                        title="Refresh Axiom gate"
                     >
-                        <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
+                        <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
                     </button>
-                    {!showForm && (
-                        <button
-                            type="button"
-                            onClick={() => {
-                                resetForm();
-                                setShowForm(true);
-                            }}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-blue-500 hover:bg-blue-600 active:scale-[0.98] text-white font-semibold text-xs transition-all shadow-md shadow-blue-500/10 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                        >
-                            <Plus className="w-3.5 h-3.5" />
-                            Add Mapping
-                        </button>
-                    )}
+                    <button
+                        type="button"
+                        onClick={() => {
+                            resetForm();
+                            setShowForm(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded border border-emerald-500/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
+                    >
+                        <Plus className="h-3.5 w-3.5" />
+                        Add Template
+                    </button>
                 </div>
             </div>
 
-            {/* Notification / Toast Toasts */}
+            <div className="grid grid-cols-1 gap-2 border-b border-zinc-900 py-3 md:grid-cols-4">
+                <FlowStep icon={<FileSearch className="h-3.5 w-3.5" />} label="Finale SKU demand" detail="Ordering says SKU needs Axiom." />
+                <FlowStep icon={<ClipboardCheck className="h-3.5 w-3.5" />} label="Approved template" detail="Size/material/options are verified." />
+                <FlowStep icon={<PackageCheck className="h-3.5 w-3.5" />} label="Create Axiom order" detail="Only approved SKUs can proceed." />
+                <FlowStep icon={<CheckCircle2 className="h-3.5 w-3.5" />} label="Invoice updates PO" detail="Invoice and shipment close the loop." />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 py-3 lg:grid-cols-4">
+                <Metric label="Ready to order" value={counts.ready} tone="text-emerald-300 border-emerald-500/25 bg-emerald-500/10" />
+                <Metric label="Manual ready" value={counts.manualReady} tone="text-sky-300 border-sky-500/25 bg-sky-500/10" />
+                <Metric label="Needs spec approval" value={counts.needsSpec} tone="text-amber-300 border-amber-500/25 bg-amber-500/10" />
+                <Metric label="Reconciliation only" value={counts.reconciliationOnly} tone="text-zinc-300 border-zinc-700 bg-zinc-900/60" />
+            </div>
+
             {successMessage && (
-                <div className="flex items-center gap-2.5 px-3 py-2 rounded-md border border-emerald-500/20 bg-emerald-500/10 text-emerald-300 text-xs font-mono animate-in fade-in slide-in-from-top-2 duration-200">
-                    <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+                <div className="mb-3 flex items-center gap-2 rounded border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
                     <span>{successMessage}</span>
                 </div>
             )}
 
             {error && (
-                <div className="flex items-center gap-2.5 px-3 py-2 rounded-md border border-rose-500/20 bg-rose-500/10 text-rose-300 text-xs font-mono animate-in fade-in slide-in-from-top-2 duration-200">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                <div className="mb-3 flex items-center gap-2 rounded border border-rose-500/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                    <AlertCircle className="h-4 w-4 shrink-0" />
                     <span className="flex-1">{error}</span>
-                    <button type="button" onClick={() => setError(null)} className="text-rose-400 hover:text-rose-300 p-0.5">
-                        <X className="w-3.5 h-3.5" />
+                    <button type="button" onClick={() => setError(null)} className="rounded p-0.5 hover:bg-rose-500/10">
+                        <X className="h-3.5 w-3.5" />
                     </button>
                 </div>
             )}
 
-            {/* Creation / Editing Form (Collapsible Card) */}
             {showForm && (
-                <form
-                    onSubmit={handleSubmit}
-                    className="border border-zinc-800/80 rounded-lg bg-zinc-950/60 p-4 space-y-3.5 shadow-xl animate-in fade-in slide-in-from-top-3 duration-300 relative overflow-hidden"
-                >
-                    <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-blue-500/20 via-blue-500/60 to-blue-500/20" />
-
-                    <div className="flex items-center justify-between border-b border-zinc-900 pb-2">
-                        <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 font-mono">
-                            {isEditing ? "Modify Mapping Definition" : "Register New SKU Correlation"}
-                        </span>
-                        <button
-                            type="button"
-                            onClick={resetForm}
-                            className="p-1 rounded-md text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/60 transition-colors focus:outline-none"
-                        >
-                            <X className="w-4 h-4" />
+                <form onSubmit={handleSubmitTemplate} className="mb-3 space-y-3 rounded border border-zinc-800 bg-zinc-950/70 p-3">
+                    <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-emerald-300">Approve Finale SKU Template</span>
+                        <button type="button" onClick={resetForm} className="rounded p-1 text-zinc-500 hover:bg-zinc-900 hover:text-zinc-200">
+                            <X className="h-4 w-4" />
                         </button>
                     </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {/* Axiom Job Name */}
-                        <div className="space-y-1">
-                            <label htmlFor="axiom_job_name" className="block text-[11px] font-medium text-zinc-400 uppercase font-mono tracking-wider">
-                                Axiom Job Name <span className="text-rose-400">*</span>
-                            </label>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                        <label className="space-y-1 text-[11px] uppercase tracking-wider text-zinc-400">
+                            <span>Finale SKU</span>
                             <input
-                                id="axiom_job_name"
-                                type="text"
-                                disabled={isEditing}
+                                value={finaleSku}
+                                onChange={event => {
+                                    setFinaleSku(event.target.value);
+                                    if (!axiomJobName.trim()) setAxiomJobName(event.target.value);
+                                }}
+                                className="w-full rounded border border-zinc-800 bg-zinc-900/70 px-2.5 py-1.5 text-xs normal-case text-zinc-100 outline-none focus:border-emerald-500/60"
+                                placeholder="FM104"
+                            />
+                        </label>
+                        <label className="space-y-1 text-[11px] uppercase tracking-wider text-zinc-400">
+                            <span>Axiom Job / Template</span>
+                            <input
                                 value={axiomJobName}
-                                onChange={e => setAxiomJobName(e.target.value)}
-                                placeholder="e.g. APL102"
-                                className="w-full px-3 py-1.5 rounded-md border border-zinc-800 bg-zinc-900/40 text-zinc-200 text-xs font-mono placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 disabled:opacity-50 disabled:bg-zinc-900/20 disabled:cursor-not-allowed transition-all"
+                                onChange={event => setAxiomJobName(event.target.value)}
+                                className="w-full rounded border border-zinc-800 bg-zinc-900/70 px-2.5 py-1.5 text-xs normal-case text-zinc-100 outline-none focus:border-emerald-500/60"
+                                placeholder="FM104"
                             />
-                            {isEditing && (
-                                <p className="text-[10px] text-zinc-500 font-mono">
-                                    Primary key cannot be modified. Delete and recreate if renaming is required.
-                                </p>
-                            )}
-                        </div>
-
-                        {/* Finale SKUs */}
-                        <div className="space-y-1">
-                            <label htmlFor="finale_skus" className="block text-[11px] font-medium text-zinc-400 uppercase font-mono tracking-wider">
-                                Target Finale SKU(s) <span className="text-rose-400">*</span>
-                            </label>
-                            <input
-                                id="finale_skus"
-                                type="text"
-                                value={finaleSkusText}
-                                onChange={e => setFinaleSkusText(e.target.value)}
-                                placeholder="e.g. GNS11, GNS21 (comma separated)"
-                                className="w-full px-3 py-1.5 rounded-md border border-zinc-800 bg-zinc-900/40 text-zinc-200 text-xs font-mono placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                            />
-                            <p className="text-[10px] text-zinc-500 font-mono">
-                                List multiple SKUs separated by commas for splits (e.g. Front/Back designs).
-                              </p>
-                        </div>
-
-                        {/* Quantity Fraction */}
-                        <div className="space-y-1">
-                            <label htmlFor="qty_fraction" className="block text-[11px] font-medium text-zinc-400 uppercase font-mono tracking-wider">
-                                Quantity Fraction / Multiplier <span className="text-rose-400">*</span>
-                            </label>
-                            <input
-                                id="qty_fraction"
-                                type="number"
-                                step="0.01"
-                                min="0.01"
-                                value={qtyFraction}
-                                onChange={e => setQtyFraction(e.target.value)}
-                                placeholder="e.g. 1.0 (Full), 0.5 (Half/Split)"
-                                className="w-full px-3 py-1.5 rounded-md border border-zinc-800 bg-zinc-900/40 text-zinc-200 text-xs font-mono placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                            />
-                            <p className="text-[10px] text-zinc-500 font-mono">
-                                Use 1.0 for standard mapping. Use 0.5 for F+B labels matching separate front and back SKUs.
-                            </p>
-                        </div>
-
-                        {/* Description */}
-                        <div className="space-y-1">
-                            <label htmlFor="description" className="block text-[11px] font-medium text-zinc-400 uppercase font-mono tracking-wider">
-                                Description / Notes
-                            </label>
-                            <input
-                                id="description"
-                                type="text"
-                                value={description}
-                                onChange={e => setDescription(e.target.value)}
-                                placeholder="e.g. 3.0 Soil Cubic Foot Label"
-                                className="w-full px-3 py-1.5 rounded-md border border-zinc-800 bg-zinc-900/40 text-zinc-200 text-xs placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                            />
-                        </div>
+                        </label>
                     </div>
-
-                    <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-zinc-900">
-                        <button
-                            type="button"
-                            onClick={resetForm}
-                            className="px-3 py-1.5 rounded bg-zinc-900 hover:bg-zinc-850 border border-zinc-800 text-zinc-300 text-xs font-mono font-medium transition-colors"
-                        >
-                            Cancel
-                        </button>
+                    <label className="block space-y-1 text-[11px] uppercase tracking-wider text-zinc-400">
+                        <span>Spec JSON</span>
+                        <textarea
+                            value={specJson}
+                            onChange={event => setSpecJson(event.target.value)}
+                            rows={6}
+                            className="w-full rounded border border-zinc-800 bg-zinc-900/70 px-2.5 py-2 font-mono text-xs normal-case text-zinc-100 outline-none focus:border-emerald-500/60"
+                        />
+                    </label>
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-zinc-900 pt-3">
+                        <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-300">
+                            <label className="inline-flex items-center gap-2">
+                                <input type="checkbox" checked={approved} onChange={event => setApproved(event.target.checked)} />
+                                Approved
+                            </label>
+                            <label className="inline-flex items-center gap-2">
+                                <input type="checkbox" checked={autoOrderAllowed} onChange={event => setAutoOrderAllowed(event.target.checked)} />
+                                Auto-order allowed
+                            </label>
+                        </div>
                         <button
                             type="submit"
                             disabled={formSubmitting}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white text-xs font-semibold transition-all focus:outline-none"
+                            className="inline-flex items-center gap-1.5 rounded bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
                         >
-                            {formSubmitting && <Loader2 className="w-3 h-3 animate-spin text-zinc-100" />}
-                            Save Mapping
+                            {formSubmitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                            Save Template
                         </button>
                     </div>
                 </form>
             )}
 
-            {/* Search and Table Grid Container */}
-            <div className="flex-1 min-h-[350px] border border-zinc-800/60 rounded-lg bg-zinc-950/40 flex flex-col overflow-hidden">
-                {/* Search Bar */}
-                <div className="p-3 border-b border-zinc-850 bg-zinc-950/60 flex items-center gap-2">
-                    <Search className="w-4 h-4 text-zinc-500 shrink-0 ml-1" />
+            <div className="flex min-h-[360px] flex-1 flex-col overflow-hidden rounded border border-zinc-800/70 bg-zinc-950/40">
+                <div className="flex items-center gap-2 border-b border-zinc-800/80 bg-zinc-950/70 px-3 py-2">
+                    <Search className="h-4 w-4 shrink-0 text-zinc-500" />
                     <input
-                        type="text"
                         value={searchQuery}
-                        onChange={e => setSearchQuery(e.target.value)}
-                        placeholder="Search mappings by Job Name, SKUs, or Notes..."
-                        className="w-full bg-transparent text-zinc-200 placeholder-zinc-600 text-xs focus:outline-none"
+                        onChange={event => setSearchQuery(event.target.value)}
+                        placeholder="Search Finale SKU, Axiom job, status, or spec..."
+                        className="w-full bg-transparent text-xs text-zinc-100 placeholder-zinc-600 outline-none"
                     />
                     {searchQuery && (
-                        <button
-                            type="button"
-                            onClick={() => setSearchQuery("")}
-                            className="p-0.5 rounded hover:bg-zinc-900/60 text-zinc-400 hover:text-zinc-200"
-                        >
-                            <X className="w-3.5 h-3.5" />
+                        <button type="button" onClick={() => setSearchQuery("")} className="rounded p-0.5 text-zinc-500 hover:bg-zinc-900 hover:text-zinc-200">
+                            <X className="h-3.5 w-3.5" />
                         </button>
                     )}
                 </div>
 
-                {/* Table Data */}
                 <div className="flex-1 overflow-auto">
-                    {loading && mappings.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-20 space-y-3">
-                            <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
-                            <span className="text-xs font-mono text-zinc-500">Retrieving mapping tables...</span>
+                    {loading && rows.length === 0 ? (
+                        <div className="flex h-full min-h-[260px] flex-col items-center justify-center gap-2 text-xs text-zinc-500">
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                            <span>Loading Axiom order gate...</span>
                         </div>
-                    ) : filteredMappings.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-20 text-center px-4">
-                            <span className="text-3xl">🗂️</span>
-                            <h3 className="text-xs font-semibold text-zinc-300 mt-2.5">No mappings found</h3>
-                            <p className="text-[11px] text-zinc-500 max-w-xs mt-1">
-                                {searchQuery
-                                    ? "No mappings match your current query. Try refining your spelling or keyword search."
-                                    : "No Axiom SKU mapping records currently exist in the database. Use the Add button to create your first mapping rule."}
+                    ) : filteredRows.length === 0 ? (
+                        <div className="flex h-full min-h-[260px] flex-col items-center justify-center gap-2 px-4 text-center">
+                            <CircleDashed className="h-7 w-7 text-zinc-600" />
+                            <h3 className="text-xs font-semibold text-zinc-300">No Axiom order templates yet</h3>
+                            <p className="max-w-md text-[11px] leading-relaxed text-zinc-500">
+                                Add a Finale SKU template here when Ordering flags an Axiom SKU. The SKU stays blocked until specs are approved.
                             </p>
                         </div>
                     ) : (
-                        <table className="w-full text-left border-collapse table-auto">
+                        <table className="w-full min-w-[980px] border-collapse text-left text-xs">
                             <thead>
-                                <tr className="border-b border-zinc-900 bg-zinc-950/80 text-[10px] uppercase font-mono tracking-wider text-zinc-400">
-                                    <th className="px-4 py-2 font-medium">Axiom Job Name</th>
-                                    <th className="px-4 py-2 font-medium">Target Finale SKUs</th>
-                                    <th className="px-4 py-2 font-medium text-center">Multiplier</th>
-                                    <th className="px-4 py-2 font-medium">Description</th>
-                                    <th className="px-4 py-2 font-medium text-right pr-5">Actions</th>
+                                <tr className="border-b border-zinc-800 bg-zinc-950/90 text-[10px] uppercase tracking-wider text-zinc-500">
+                                    <th className="px-3 py-2 font-medium">Finale SKU</th>
+                                    <th className="px-3 py-2 font-medium">Order Gate</th>
+                                    <th className="px-3 py-2 font-medium">Axiom Job / Template</th>
+                                    <th className="px-3 py-2 font-medium">Spec</th>
+                                    <th className="px-3 py-2 font-medium">Auto</th>
+                                    <th className="px-3 py-2 font-medium">Source</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-zinc-900 text-xs">
-                                {filteredMappings.map(m => {
-                                    const isDeleting = deleteConfirmJob === m.axiom_job_name;
-
-                                    return (
-                                        <tr
-                                            key={m.axiom_job_name}
-                                            className="hover:bg-zinc-900/30 transition-colors group"
-                                        >
-                                            {/* Job Name */}
-                                            <td className="px-4 py-2.5 font-mono font-medium text-zinc-200">
-                                                {m.axiom_job_name}
-                                            </td>
-
-                                            {/* Finale SKUs */}
-                                            <td className="px-4 py-2.5">
-                                                <div className="flex flex-wrap gap-1">
-                                                    {m.finale_skus.map(sku => (
-                                                        <span
-                                                            key={sku}
-                                                            className="px-1.5 py-0.5 rounded border border-blue-500/25 bg-blue-500/10 text-blue-400 font-mono text-[10px] uppercase tracking-wide"
-                                                        >
-                                                            {sku}
-                                                        </span>
-                                                    ))}
-                                                </div>
-                                            </td>
-
-                                            {/* Quantity Fraction */}
-                                            <td className="px-4 py-2.5 text-center font-mono text-zinc-400">
-                                                <span className="px-1.5 py-0.5 rounded border border-zinc-800 bg-zinc-900/60 text-[10px] text-zinc-300 font-medium">
-                                                    {m.qty_fraction}
-                                                </span>
-                                            </td>
-
-                                            {/* Description */}
-                                            <td className="px-4 py-2.5 text-zinc-400 max-w-xs truncate" title={m.description ?? ""}>
-                                                {m.description || <span className="text-zinc-600 font-mono italic">no description</span>}
-                                            </td>
-
-                                            {/* Actions */}
-                                            <td className="px-4 py-2.5 text-right pr-4">
-                                                {isDeleting ? (
-                                                    <div className="flex items-center justify-end gap-1.5 animate-in fade-in duration-150">
-                                                        <span className="text-[10px] text-rose-400 font-mono mr-1">Confirm delete?</span>
-                                                        <button
-                                                            type="button"
-                                                            disabled={deletingJob}
-                                                            onClick={() => handleDelete(m.axiom_job_name)}
-                                                            className="px-1.5 py-0.5 rounded bg-rose-500 hover:bg-rose-600 text-white text-[10px] font-semibold transition-colors disabled:opacity-50"
-                                                        >
-                                                            Delete
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            disabled={deletingJob}
-                                                            onClick={() => setDeleteConfirmJob(null)}
-                                                            className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[10px] font-medium transition-colors"
-                                                        >
-                                                            Cancel
-                                                        </button>
-                                                    </div>
-                                                ) : (
-                                                    <div className="flex items-center justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => handleEdit(m)}
-                                                            className="p-1 rounded bg-zinc-900 border border-zinc-800/80 hover:border-blue-500/50 hover:bg-zinc-800 text-zinc-400 hover:text-blue-400 transition-all focus:outline-none"
-                                                            title="Edit Mapping"
-                                                        >
-                                                            <Edit2 className="w-3.5 h-3.5" />
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => setDeleteConfirmJob(m.axiom_job_name)}
-                                                            className="p-1 rounded bg-zinc-900 border border-zinc-800/80 hover:border-rose-500/50 hover:bg-zinc-800 text-zinc-400 hover:text-rose-400 transition-all focus:outline-none"
-                                                            title="Delete Mapping"
-                                                        >
-                                                            <Trash2 className="w-3.5 h-3.5" />
-                                                        </button>
-                                                    </div>
-                                                )}
-                                            </td>
-                                        </tr>
-                                    );
-                                })}
+                            <tbody className="divide-y divide-zinc-900">
+                                {filteredRows.map(row => (
+                                    <tr key={`${row.source}:${row.finaleSku}:${row.axiomJobName}`} className="hover:bg-zinc-900/35">
+                                        <td className="px-3 py-2.5 font-mono font-semibold text-zinc-100">{row.finaleSku}</td>
+                                        <td className="px-3 py-2.5">
+                                            <span className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-semibold ${row.statusTone}`}>
+                                                {row.statusLabel}
+                                            </span>
+                                        </td>
+                                        <td className="px-3 py-2.5 font-mono text-zinc-300">{row.axiomJobName || row.finaleSku}</td>
+                                        <td className="max-w-sm px-3 py-2.5 text-zinc-400">{row.specSummary}</td>
+                                        <td className="px-3 py-2.5 text-zinc-400">{row.autoOrderAllowed ? "Allowed" : "No"}</td>
+                                        <td className="px-3 py-2.5 text-zinc-500">
+                                            {row.source === "template" ? "Order template" : "Reconciliation only"}
+                                        </td>
+                                    </tr>
+                                ))}
                             </tbody>
                         </table>
                     )}
                 </div>
 
-                {/* Footer status summary */}
-                <div className="px-4 py-2 border-t border-zinc-850 bg-zinc-950/60 flex items-center justify-between text-[10px] font-mono text-zinc-500">
-                    <span>
-                        Showing {filteredMappings.length} of {mappings.length} mappings
-                    </span>
-                    <span>
-                        Active correlations override local fallback values
-                    </span>
+                <div className="flex items-center justify-between border-t border-zinc-800/80 bg-zinc-950/70 px-3 py-2 text-[10px] text-zinc-500">
+                    <span>Showing {filteredRows.length} of {rows.length} Finale SKU rows</span>
+                    <span>Automation gate: approved template + auto-order allowed</span>
                 </div>
             </div>
+        </div>
+    );
+}
+
+function buildCompletionRows(templates: AxiomOrderTemplate[], mappings: AxiomSkuMapping[]): CompletionRow[] {
+    const rows = new Map<string, CompletionRow>();
+
+    for (const template of templates) {
+        const status = getTemplateStatus(template);
+        rows.set(template.finale_sku, {
+            finaleSku: template.finale_sku,
+            axiomJobName: template.axiom_job_name || template.finale_sku,
+            status,
+            ...statusPresentation(status),
+            description: "",
+            specSummary: summarizeSpec(template.spec),
+            qtyFraction: null,
+            approved: template.approved,
+            autoOrderAllowed: template.auto_order_allowed,
+            source: "template",
+        });
+    }
+
+    for (const mapping of mappings) {
+        for (const sku of mapping.finale_skus) {
+            if (rows.has(sku)) continue;
+            rows.set(sku, {
+                finaleSku: sku,
+                axiomJobName: mapping.axiom_job_name,
+                status: "reconciliation_only",
+                ...statusPresentation("reconciliation_only"),
+                description: mapping.description ?? "",
+                specSummary: mapping.description || "Invoice reconciliation mapping exists, but no order template is approved.",
+                qtyFraction: mapping.qty_fraction,
+                approved: false,
+                autoOrderAllowed: false,
+                source: "mapping",
+            });
+        }
+    }
+
+    return Array.from(rows.values()).sort((a, b) => a.finaleSku.localeCompare(b.finaleSku));
+}
+
+function getTemplateStatus(template: AxiomOrderTemplate): CompletionStatus {
+    if (template.approved && template.auto_order_allowed) return "ready";
+    if (template.approved) return "manual_ready";
+    return "needs_spec";
+}
+
+function statusPresentation(status: CompletionStatus): Pick<CompletionRow, "statusLabel" | "statusTone"> {
+    switch (status) {
+        case "ready":
+            return { statusLabel: "Ready to order", statusTone: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" };
+        case "manual_ready":
+            return { statusLabel: "Manual ready", statusTone: "border-sky-500/30 bg-sky-500/10 text-sky-300" };
+        case "needs_spec":
+            return { statusLabel: "Needs spec approval", statusTone: "border-amber-500/30 bg-amber-500/10 text-amber-300" };
+        case "reconciliation_only":
+            return { statusLabel: "Reconciliation only", statusTone: "border-zinc-700 bg-zinc-900 text-zinc-300" };
+    }
+}
+
+function summarizeSpec(spec: Record<string, unknown> | null): string {
+    if (!spec || Object.keys(spec).length === 0) return "No verified Axiom print spec yet.";
+    const parts = Object.entries(spec)
+        .filter(([, value]) => value !== null && value !== "")
+        .map(([key, value]) => `${key}: ${String(value)}`);
+    return parts.length > 0 ? parts.join(" | ") : "No verified Axiom print spec yet.";
+}
+
+function FlowStep({ icon, label, detail }: { icon: React.ReactNode; label: string; detail: string }) {
+    return (
+        <div className="rounded border border-zinc-800 bg-zinc-950/55 px-3 py-2">
+            <div className="flex items-center gap-2 text-xs font-semibold text-zinc-200">
+                <span className="text-emerald-400">{icon}</span>
+                <span>{label}</span>
+            </div>
+            <div className="mt-1 text-[10px] leading-relaxed text-zinc-500">{detail}</div>
+        </div>
+    );
+}
+
+function Metric({ label, value, tone }: { label: string; value: number; tone: string }) {
+    return (
+        <div className={`rounded border px-3 py-2 ${tone}`}>
+            <div className="text-[10px] uppercase tracking-wider opacity-80">{label}</div>
+            <div className="mt-1 text-lg font-semibold">{value}</div>
         </div>
     );
 }

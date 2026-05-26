@@ -1144,7 +1144,7 @@ export class FinaleClient {
                     orderViewConnection(
                         first: ${limit}
                         type: ["PURCHASE_ORDER"]
-                        statusId: [${statuses.map(s => `"${s}"`).join(", ")}]
+                        status: [${statuses.map(s => `"${s}"`).join(", ")}]
                         orderDate: { begin: "${beginStr}", end: "${endStr}" }
                         sort: [{ field: "orderDate", mode: "desc" }]
                     ) {
@@ -1231,7 +1231,7 @@ export class FinaleClient {
                     orderViewConnection(
                         first: ${limit}
                         type: ["PURCHASE_ORDER"]
-                        statusId: ["ORDER_COMPLETED"]
+                        status: ["ORDER_COMPLETED"]
                         sort: [{ field: "receiveDate", mode: "desc" }]
                     ) {
                         edges { node {
@@ -1292,7 +1292,7 @@ export class FinaleClient {
                         first: 20
                         type: ["PURCHASE_ORDER"]
                         product: ["${productUrl}"]
-                        statusId: ["ORDER_COMMITTED", "ORDER_COMPLETED"]
+                        status: ["ORDER_COMMITTED", "ORDER_COMPLETED"]
                         sort: [{ field: "orderDate", mode: "desc" }]
                     ) {
                         edges { node {
@@ -1356,7 +1356,7 @@ export class FinaleClient {
                     orderViewConnection(
                         first: 100
                         type: ["PURCHASE_ORDER"]
-                        statusId: ["ORDER_CREATED"]
+                        status: ["ORDER_CREATED"]
                         sort: [{ field: "orderDate", mode: "asc" }]
                     ) {
                         edges { node {
@@ -4219,7 +4219,7 @@ export class FinaleClient {
                     orderViewConnection(
                         first: 200
                         type: ["PURCHASE_ORDER"]
-                        statusId: ["ORDER_CREATED", "ORDER_COMMITTED"]
+                        status: ["ORDER_CREATED", "ORDER_COMMITTED"]
                     ) {
                         edges { node {
                             supplier { name partyUrl }

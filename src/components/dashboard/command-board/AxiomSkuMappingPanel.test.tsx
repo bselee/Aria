@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 
 import React from "react";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import AxiomSkuMappingPanel, { type AxiomSkuMapping } from "./AxiomSkuMappingPanel";
+import AxiomSkuMappingPanel, { type AxiomOrderTemplate, type AxiomSkuMapping } from "./AxiomSkuMappingPanel";
 
 afterEach(cleanup);
 
@@ -18,12 +18,6 @@ beforeEach(() => {
 
 const sampleMappings: AxiomSkuMapping[] = [
     {
-        axiom_job_name: "APL102",
-        finale_skus: ["APL102"],
-        qty_fraction: 1.0,
-        description: "3.0 Soil Cubic Foot Label",
-    },
-    {
         axiom_job_name: "GNS11_12",
         finale_skus: ["GNS11", "GNS21"],
         qty_fraction: 0.5,
@@ -31,94 +25,113 @@ const sampleMappings: AxiomSkuMapping[] = [
     },
 ];
 
-function mockMappingsResponse(mappings: AxiomSkuMapping[]) {
-    fetchMock.mockImplementation((url: string) => {
+const sampleTemplates: AxiomOrderTemplate[] = [
+    {
+        finale_sku: "APL102",
+        axiom_job_name: "APL102",
+        spec: {
+            size: "8.5x11",
+            material: "White matte",
+            finish: "Standard",
+        },
+        approved: true,
+        auto_order_allowed: true,
+        approved_by: "Will",
+        approved_at: "2026-05-26T15:00:00.000Z",
+    },
+    {
+        finale_sku: "GNS11",
+        axiom_job_name: "GNS11_12",
+        spec: {},
+        approved: false,
+        auto_order_allowed: false,
+    },
+];
+
+function mockAxiomResponses(options: {
+    mappings?: AxiomSkuMapping[];
+    templates?: AxiomOrderTemplate[];
+}) {
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url.startsWith("/api/axiom-templates")) {
+            if (init?.method === "POST") {
+                return Promise.resolve({
+                    ok: true,
+                    json: async () => ({ template: JSON.parse(String(init.body)) }),
+                });
+            }
+            return Promise.resolve({
+                ok: true,
+                json: async () => ({ templates: options.templates ?? [] }),
+            });
+        }
         if (url.startsWith("/api/axiom-sku-mappings")) {
             return Promise.resolve({
                 ok: true,
-                json: async () => ({ mappings }),
+                json: async () => ({ mappings: options.mappings ?? [] }),
             });
         }
         return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
     });
 }
 
-describe("AxiomSkuMappingPanel — general rendering", () => {
-    it("should render mapping records fetched from the Next.js API route successfully", async () => {
-        mockMappingsResponse(sampleMappings);
+describe("AxiomSkuMappingPanel — order completion gate", () => {
+    it("renders Finale-SKU-first template status and the intended order workflow", async () => {
+        mockAxiomResponses({ mappings: sampleMappings, templates: sampleTemplates });
+
         render(<AxiomSkuMappingPanel />);
 
         await waitFor(() => {
-            expect(screen.getByText("3.0 Soil Cubic Foot Label")).toBeTruthy();
-            expect(screen.getByText("GNS11_12")).toBeTruthy();
+            expect(screen.getByText("Axiom Order Completion Gate")).toBeTruthy();
+            expect(screen.getByText("Finale SKU demand")).toBeTruthy();
         });
 
-        expect(screen.getAllByText("APL102").length).toBe(2);
-        expect(screen.getByText("GnarBar-Whole 2lb F+B")).toBeTruthy();
-        expect(screen.getByText("GNS11")).toBeTruthy();
+        expect(screen.getAllByText("APL102").length).toBeGreaterThan(0);
+        expect(screen.getAllByText("Ready to order").length).toBeGreaterThan(0);
+        expect(screen.getAllByText("GNS11_12").length).toBeGreaterThan(0);
+        expect(screen.getAllByText("Needs spec approval").length).toBeGreaterThan(0);
         expect(screen.getByText("GNS21")).toBeTruthy();
+        expect(screen.getAllByText("Reconciliation only").length).toBeGreaterThan(0);
     });
 
-    it("should filter the mapping items matching search query inputs correctly", async () => {
-        mockMappingsResponse(sampleMappings);
+    it("searches by Finale SKU, not only by Axiom job name", async () => {
+        mockAxiomResponses({ mappings: sampleMappings, templates: sampleTemplates });
+
         render(<AxiomSkuMappingPanel />);
+        await waitFor(() => expect(screen.getAllByText("APL102").length).toBeGreaterThan(0));
 
-        await waitFor(() => screen.getByText("3.0 Soil Cubic Foot Label"));
-
-        const searchInput = screen.getByPlaceholderText(/Search mappings by Job Name, SKUs, or Notes.../i);
-        fireEvent.change(searchInput, { target: { value: "GnarBar" } });
-
-        // GNS11_12 matches "GnarBar" in description; APL102 does not match.
-        expect(screen.getByText("GNS11_12")).toBeTruthy();
-        expect(screen.queryByText("3.0 Soil Cubic Foot Label")).toBeNull();
-    });
-
-    it("should open the creation form card when Clicking the Add Mapping button", async () => {
-        mockMappingsResponse([]);
-        render(<AxiomSkuMappingPanel />);
-
-        await waitFor(() => {
-            expect(screen.getByText(/No mappings found/i)).toBeTruthy();
+        fireEvent.change(screen.getByPlaceholderText(/Search Finale SKU/i), {
+            target: { value: "GNS21" },
         });
 
-        const addBtn = screen.getByRole("button", { name: /Add Mapping/i });
-        fireEvent.click(addBtn);
-
-        expect(screen.getByText("Register New SKU Correlation")).toBeTruthy();
-        expect(screen.getByLabelText(/Axiom Job Name/i)).toBeTruthy();
-        expect(screen.getByLabelText(/Target Finale SKU\(s\)/i)).toBeTruthy();
+        expect(screen.getByText("GNS21")).toBeTruthy();
+        expect(screen.queryAllByText("APL102")).toHaveLength(0);
     });
 
-    it("should open the form populated with values when Edit is clicked on a row", async () => {
-        mockMappingsResponse(sampleMappings);
+    it("saves approved order templates through the template endpoint", async () => {
+        mockAxiomResponses({ mappings: [], templates: [] });
+
         render(<AxiomSkuMappingPanel />);
+        await waitFor(() => screen.getByText(/No Axiom order templates/i));
 
-        await waitFor(() => screen.getByText("3.0 Soil Cubic Foot Label"));
+        fireEvent.click(screen.getByRole("button", { name: /Add Template/i }));
+        fireEvent.change(screen.getByLabelText(/Finale SKU/i), { target: { value: "FM104" } });
+        fireEvent.change(screen.getByLabelText(/Axiom Job \/ Template/i), { target: { value: "FM104" } });
+        fireEvent.change(screen.getByLabelText(/Spec JSON/i), {
+            target: { value: '{"size":"4x6","material":"BOPP"}' },
+        });
+        fireEvent.click(screen.getByLabelText(/Approved/i));
+        fireEvent.click(screen.getByLabelText(/Auto-order allowed/i));
+        fireEvent.click(screen.getByRole("button", { name: /Save Template/i }));
 
-        const editBtns = screen.getAllByTitle("Edit Mapping");
-        expect(editBtns.length).toBe(2);
-
-        fireEvent.click(editBtns[0]); // Edit APL102 row
-
-        expect(screen.getByText("Modify Mapping Definition")).toBeTruthy();
-        const nameInput = screen.getByLabelText(/Axiom Job Name/i) as HTMLInputElement;
-        expect(nameInput.value).toBe("APL102");
-        expect(nameInput.disabled).toBe(true); // Should be disabled during edit
-    });
-
-    it("should prompt with confirmation buttons when Delete is clicked on a row", async () => {
-        mockMappingsResponse(sampleMappings);
-        render(<AxiomSkuMappingPanel />);
-
-        await waitFor(() => screen.getByText("3.0 Soil Cubic Foot Label"));
-
-        const deleteBtns = screen.getAllByTitle("Delete Mapping");
-        expect(deleteBtns.length).toBe(2);
-
-        fireEvent.click(deleteBtns[0]); // Click delete APL102
-
-        expect(screen.getByText("Confirm delete?")).toBeTruthy();
-        expect(screen.getByRole("button", { name: /^Delete$/i })).toBeTruthy();
-        expect(screen.getByRole("button", { name: /Cancel/i })).toBeTruthy();
+        await waitFor(() => {
+            expect(fetchMock).toHaveBeenCalledWith(
+                "/api/axiom-templates",
+                expect.objectContaining({
+                    method: "POST",
+                    body: expect.stringContaining('"finale_sku":"FM104"'),
+                }),
+            );
+        });
     });
 });
