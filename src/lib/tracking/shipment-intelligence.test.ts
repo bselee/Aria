@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
     buildTodayShipmentSummary,
     buildBestTrackingAnswer,
+    classifyShipmentEvidence,
     getShipmentBoardBuckets,
     getShipmentsDueForRefresh,
     mergeShipmentEvidence,
@@ -85,6 +86,39 @@ describe("mergeShipmentEvidence", () => {
             { source: "email_tracking", sourceRef: "gmail:abc", seenAt: "2026-04-02T13:00:00.000Z" },
             { source: "invoice_reconciliation", sourceRef: "inv:9001", seenAt: expect.any(String), confidence: 0.7 },
         ]);
+    });
+});
+
+describe("classifyShipmentEvidence", () => {
+    it("keeps weak inferred email tracking as a candidate", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            status_category: null,
+            status_display: null,
+            last_checked_at: null,
+            source_confidence: 0.55,
+            source_refs: [
+                {
+                    source: "email_tracking_inferred_po",
+                    sourceRef: "gmail:weak",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.55,
+                },
+            ],
+        }))).toMatchObject({
+            level: "candidate",
+            reason: expect.stringContaining("weak"),
+        });
+    });
+
+    it("confirms carrier-checked tracking even when the original source was email", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            last_checked_at: "2026-04-02T14:00:00.000Z",
+            status_category: "in_transit",
+            source_confidence: 0.55,
+        }))).toMatchObject({
+            level: "confirmed",
+            reason: expect.stringContaining("carrier"),
+        });
     });
 });
 

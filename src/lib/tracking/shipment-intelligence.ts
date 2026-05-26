@@ -43,6 +43,13 @@ export interface ShipmentRecord {
     updated_at: string;
 }
 
+export type ShipmentEvidenceLevel = "confirmed" | "candidate";
+
+export interface ShipmentEvidenceClassification {
+    level: ShipmentEvidenceLevel;
+    reason: string;
+}
+
 export interface ShipmentUpsertInput {
     trackingNumber: string;
     poNumber?: string | null;
@@ -276,6 +283,42 @@ function statusCategoryOrUnknown(status: string | null | undefined): TrackingCat
         return status;
     }
     return "unknown";
+}
+
+export function classifyShipmentEvidence(record: ShipmentRecord): ShipmentEvidenceClassification {
+    if (record.last_checked_at && record.status_category) {
+        return {
+            level: "confirmed",
+            reason: "carrier status checked",
+        };
+    }
+
+    const sourceRefs = record.source_refs || [];
+    const sourceConfidence = record.source_confidence ?? Math.max(
+        0,
+        ...sourceRefs.map((ref) => ref.confidence ?? 0),
+    );
+    const hasStrongSource = sourceConfidence >= 0.85;
+    const hasMultipleSources = new Set(sourceRefs.map((ref) => `${ref.source}:${ref.sourceRef || ""}`)).size >= 2;
+    const hasExplicitDocumentSource = sourceRefs.some((ref) =>
+        ["ap_invoice", "invoice_reconciliation", "bol_pdf", "carrier_api", "po_thread_sync"].includes(ref.source),
+    );
+
+    if (hasStrongSource || hasMultipleSources || hasExplicitDocumentSource) {
+        return {
+            level: "confirmed",
+            reason: hasStrongSource
+                ? "strong source correlation"
+                : hasMultipleSources
+                ? "multiple sources agree"
+                : "document evidence",
+        };
+    }
+
+    return {
+        level: "candidate",
+        reason: "weak source correlation",
+    };
 }
 
 function rollupShipment(record: ShipmentRecord, nowIso: string): ShipmentRollup {
@@ -814,9 +857,9 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
         throw new Error(`Shipment upsert failed: ${error.message}`);
     }
 
-    if (input.poNumber) {
+    if (input.poNumber && classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
         await syncLegacyPurchaseOrderTracking(input.poNumber);
-        await syncPOLifecycleFromShipment(input.poNumber, merged);
+        await syncPOLifecycleFromShipment(input.poNumber, data as ShipmentRecord);
     }
 
     return data as ShipmentRecord;
@@ -1004,7 +1047,8 @@ export async function getHighConfidenceTrackingForPOs(poNumbers: string[]): Prom
 }>> {
     const allShipments = await listActiveShipmentsForRead();
     return allShipments
-        .filter((shipment) => isHighConfidenceTracking(shipment) && 
+        .filter((shipment) => classifyShipmentEvidence(shipment).level === "confirmed" &&
+            isHighConfidenceTracking(shipment) &&
             shipment.po_numbers && 
             shipment.po_numbers.some((po: string) => poNumbers.includes(po)))
         .map((shipment) => {

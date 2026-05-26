@@ -10,14 +10,15 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Search, X, Loader2, Package, Clock } from "lucide-react";
+import { Search, X, Loader2, Package, Store } from "lucide-react";
 import type { CrystalBallItem } from "./CrystalBallDetail";
 
 interface CrystalBallSearchProps {
     onSelect: (item: CrystalBallItem) => void;
+    onVendorSelect?: (vendor: { vendorName: string; vendorPartyId: string }) => void;
 }
 
-export function CrystalBallSearch({ onSelect }: CrystalBallSearchProps) {
+export function CrystalBallSearch({ onSelect, onVendorSelect }: CrystalBallSearchProps) {
     const [query, setQuery] = useState("");
     const [results, setResults] = useState<CrystalBallItem[]>([]);
     const [loading, setLoading] = useState(false);
@@ -105,12 +106,38 @@ export function CrystalBallSearch({ onSelect }: CrystalBallSearchProps) {
         setResults([]);
         setOpen(false);
     };
+
+    const handleSelectVendor = (vendor: { vendorName: string; vendorPartyId: string }) => {
+        onVendorSelect?.(vendor);
+        setQuery("");
+        setResults([]);
+        setOpen(false);
+    };
     
     const handleClear = () => {
         setQuery("");
         setResults([]);
         setOpen(false);
     };
+
+    const vendorMatches = (() => {
+        if (!onVendorSelect || results.length === 0) return [];
+        const normalizedQuery = query.trim().toLowerCase();
+        const byVendor = new Map<string, { vendorName: string; vendorPartyId: string; count: number }>();
+        for (const item of results) {
+            const vendorName = item.vendorName || "Unknown supplier";
+            const vendorPartyId = item.vendorPartyId || vendorName;
+            const haystack = `${vendorName} ${vendorPartyId}`.toLowerCase();
+            if (!haystack.includes(normalizedQuery)) continue;
+            const existing = byVendor.get(vendorPartyId);
+            if (existing) {
+                existing.count += 1;
+            } else {
+                byVendor.set(vendorPartyId, { vendorName, vendorPartyId, count: 1 });
+            }
+        }
+        return Array.from(byVendor.values());
+    })();
     
     return (
         <div ref={containerRef} className="relative w-full max-w-[260px] md:max-w-[320px] z-30 font-mono">
@@ -159,6 +186,32 @@ export function CrystalBallSearch({ onSelect }: CrystalBallSearchProps) {
                         </div>
                     ) : (
                         <div className="divide-y divide-zinc-900/60 bg-zinc-950/80">
+                            {vendorMatches.length > 0 && (
+                                <div className="bg-zinc-900/40 border-b border-zinc-800/80">
+                                    {vendorMatches.map(vendor => (
+                                        <button
+                                            key={vendor.vendorPartyId}
+                                            onClick={() => handleSelectVendor({
+                                                vendorName: vendor.vendorName,
+                                                vendorPartyId: vendor.vendorPartyId,
+                                            })}
+                                            className="w-full text-left p-2.5 hover:bg-zinc-800/60 focus:bg-zinc-800/60 focus:outline-none transition-colors flex items-center gap-2.5 group"
+                                        >
+                                            <div className="p-1 rounded border border-emerald-900/50 bg-emerald-950/25 text-emerald-400 shrink-0">
+                                                <Store className="w-3.5 h-3.5" />
+                                            </div>
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-xs font-bold text-zinc-200 group-hover:text-zinc-50 truncate">
+                                                    View supplier: {vendor.vendorName}
+                                                </div>
+                                                <div className="text-[9px] text-zinc-500 truncate">
+                                                    Pull up this vendor only ({vendor.count} SKU{vendor.count !== 1 ? "s" : ""} matched)
+                                                </div>
+                                            </div>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
                             {results.map(item => {
                                 const R = Number.isFinite(item.adjustedRunwayDays) ? item.adjustedRunwayDays : item.runwayDays;
                                 let runwayColor = "text-emerald-500";

@@ -94,7 +94,7 @@ module.exports = {
             max_restarts: 10,
             min_uptime: "30s",
             restart_delay: 5000,
-            max_memory_restart: "768M",
+            max_memory_restart: "1200M",
             exp_backoff_restart_delay: 5000,
             log_date_format: "YYYY-MM-DD HH:mm:ss Z",
             error_file: path.join(__dirname, "logs", "aria-dashboard-error.log"),

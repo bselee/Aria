@@ -136,12 +136,52 @@ describe("TrackingAgent", () => {
         expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(expect.objectContaining({
             poNumber: "124503",
             trackingNumber: "8051904063",
-            source: "email_tracking",
+            source: "email_tracking_inferred_po",
             sourceRef: "gmail-thirsty-earth",
+            confidence: 0.55,
         }));
         expect(result).toEqual([
             { poNumber: "124503", trackingNumbers: ["8051904063"], statusCategory: null },
         ]);
+    });
+
+    it("stores explicit PO tracking as high-confidence evidence", async () => {
+        queueState.messages = [
+            {
+                id: 3,
+                gmail_message_id: "gmail-explicit-po",
+                from_email: "shipping@example.com",
+                subject: "Tracking for PO 124600",
+                body_snippet: "PO 124600 shipped via UPS 1Z22YV580360436423",
+                source_inbox: "default",
+            },
+        ];
+
+        purchaseOrdersState.rows = [
+            {
+                po_number: "124600",
+                vendor_name: "Example Vendor",
+                created_at: "2026-04-01T19:00:00.000Z",
+            },
+        ];
+
+        gmailGetMock.mockResolvedValue({
+            data: {
+                payload: {
+                    body: {
+                        data: encodeBody("PO 124600 shipped. Tracking: 1Z22YV580360436423"),
+                    },
+                },
+            },
+        });
+
+        await new TrackingAgent().processUnreadEmails();
+
+        expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(expect.objectContaining({
+            poNumber: "124600",
+            trackingNumber: "1Z22YV580360436423",
+            confidence: 0.95,
+        }));
     });
 
     it("matches dropship tracking only when the embedded order id maps to the dropship PO prefix", async () => {

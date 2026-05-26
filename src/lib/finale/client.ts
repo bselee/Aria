@@ -1603,6 +1603,41 @@ export class FinaleClient {
     }
 
     /**
+     * Formats today's received POs as a readable Slack/Telegram digest message.
+     *
+     * @param   receivedPOs - Array of received PO objects from Finale
+     * @returns A markdown-formatted digest string of today's receivings
+     */
+    formatReceivingsDigest(receivedPOs: ReceivedPO[]): string {
+        if (receivedPOs.length === 0) {
+            return ":package: *No receivings today* — nothing received yet.";
+        }
+
+        const totalValue = receivedPOs.reduce((sum, po) => sum + (po.total || 0), 0);
+        const totalItems = receivedPOs.reduce((sum, po) =>
+            sum + po.items.reduce((s, i) => s + (i.quantity || 0), 0), 0
+        );
+
+        let msg = `:package: *Today's Receivings* — ${receivedPOs.length} PO${receivedPOs.length > 1 ? "s" : ""}`;
+        msg += ` · ${totalItems.toLocaleString()} units · $${totalValue.toLocaleString()}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const po of receivedPOs) {
+            const itemCount = po.items.reduce((s, i) => s + (i.quantity || 0), 0);
+            const skuList = po.items.map(i => `\`${i.productId}\``).join(", ");
+            const truncatedSkus = skuList.length > 80
+                ? skuList.substring(0, 77) + "..."
+                : skuList;
+
+            msg += `\n:white_check_mark: *<${po.finaleUrl}|PO ${po.orderId}>*`;
+            msg += ` — _${po.supplier}_\n`;
+            msg += `      ${itemCount} units · $${po.total.toLocaleString()} · ${truncatedSkus}\n`;
+        }
+
+        return msg;
+    }
+
+    /**
      * Fetch line items and Finale deep-link for a PO by its order number.
      * Queries the last 30 days of POs via GraphQL and filters client-side by orderId.
      * Only called when new tracking is detected — infrequent, cost is fine.

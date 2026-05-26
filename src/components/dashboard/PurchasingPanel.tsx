@@ -1009,6 +1009,18 @@ export default function PurchasingPanel() {
     const measuredBottom = estimatedGroupHeights.slice(virtualStart, virtualEnd).reduce((sum, h) => sum + h, 0);
     const virtualBottomPad = Math.max(0, totalVirtualHeight - measuredTop - measuredBottom);
 
+    const handleVendorSearchSelect = useCallback((vendor: { vendorPartyId: string; vendorName: string }) => {
+        setSelectedItem(null);
+        setFocusFilter("all");
+        setLifecycleFilter("all");
+        setVendorTab(vendor.vendorPartyId);
+        setExpanded(prev => {
+            const next = new Set(prev);
+            next.add(vendor.vendorPartyId);
+            return next;
+        });
+    }, []);
+
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className="border-b border-zinc-800 shrink-0">
@@ -1136,7 +1148,7 @@ export default function PurchasingPanel() {
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
-                <CrystalBallSearch onSelect={setSelectedItem} />
+                <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
                 {isLoading && data && (
