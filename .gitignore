@@ -45,6 +45,7 @@ Thumbs.db
 
 # ─── Scratch / Temp Files ─────────────────────────
 # All temp scratch files and one-off debugging scripts
+scratch/
 tmp/
 tmp_*
 test-*.ts
