@@ -294,6 +294,10 @@ export function projectNextOrderDate(input: {
 /**
  * Merge BOM groups into resale groups by vendorPartyId.
  * Same vendor → one group with both item types; urgency = worst of merged.
+ * 
+ * Consolidates duplicate products across resale and BOM pipelines into a single
+ * 'resale-bom' item with combined daily rates, feedsFinishedGoods, and max suggested qty
+ * to prevent duplicate rows in the dashboard reorder queue.
  */
 export function mergeIntoGroups(
     resaleGroups: PurchasingGroup[],
@@ -309,12 +313,62 @@ export function mergeIntoGroups(
     for (const g of bomGroups) {
         const existing = merged.get(g.vendorPartyId);
         if (existing) {
-            existing.items.push(...g.items.map(it => ({ ...it })));
+            for (const bomItem of g.items) {
+                const dupIndex = existing.items.findIndex(it => it.productId === bomItem.productId);
+                if (dupIndex >= 0) {
+                    const resaleItem = existing.items[dupIndex];
+                    
+                    // DECISION(2026-05-26): Consolidate duplicate products across resale
+                    // and BOM pipelines into a single 'resale-bom' item with combined rate,
+                    // feedsFinishedGoods, and max suggested qty. Recalculate runway dynamically.
+                    const combinedItem: any = {
+                        ...resaleItem,
+                        urgency: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.urgency : resaleItem.urgency,
+                        dailyRate: (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0),
+                        purchaseVelocity: Math.max(resaleItem.purchaseVelocity ?? 0, bomItem.purchaseVelocity ?? 0),
+                        salesVelocity: Math.max(resaleItem.salesVelocity ?? 0, bomItem.salesVelocity ?? 0),
+                        demandVelocity: Math.max(resaleItem.demandVelocity ?? 0, bomItem.demandVelocity ?? 0),
+                        itemType: 'resale-bom' as const,
+                        explanation: `${resaleItem.explanation || ''} (BOM: ${bomItem.explanation || ''})`,
+                        suggestedQty: Math.max(resaleItem.suggestedQty ?? 0, bomItem.suggestedQty ?? 0),
+                        feedsFinishedGoods: [
+                            ...(resaleItem.feedsFinishedGoods || []),
+                            ...(bomItem.feedsFinishedGoods || [])
+                        ],
+                        totalBurnRate: (resaleItem.totalBurnRate ?? 0) + (bomItem.totalBurnRate ?? 0),
+                        triggerReason: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerReason : resaleItem.triggerReason,
+                        triggerDetail: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerDetail : resaleItem.triggerDetail,
+                    };
+
+                    if (combinedItem.candidate && bomItem.candidate) {
+                        combinedItem.candidate = {
+                            ...combinedItem.candidate,
+                            directDemand: Math.max(combinedItem.candidate.directDemand ?? 0, bomItem.candidate.directDemand ?? 0),
+                            bomDemand: Math.max(combinedItem.candidate.bomDemand ?? 0, bomItem.candidate.bomDemand ?? 0),
+                        };
+                    } else {
+                        combinedItem.candidate = combinedItem.candidate || bomItem.candidate;
+                    }
+
+                    if (combinedItem.dailyRate > 0) {
+                        combinedItem.runwayDays = combinedItem.stockOnHand / combinedItem.dailyRate;
+                        combinedItem.adjustedRunwayDays = (combinedItem.stockOnHand + combinedItem.stockOnOrder) / combinedItem.dailyRate;
+                    }
+
+                    existing.items[dupIndex] = combinedItem;
+                } else {
+                    existing.items.push({ ...bomItem, itemType: 'bom-component' as const });
+                }
+            }
+
             if (urgencyRank[g.urgency] < urgencyRank[existing.urgency]) {
                 existing.urgency = g.urgency;
             }
         } else {
-            merged.set(g.vendorPartyId, { ...g, items: g.items.map(it => ({ ...it })) });
+            merged.set(g.vendorPartyId, {
+                ...g,
+                items: g.items.map(it => ({ ...it, itemType: 'bom-component' as const })),
+            });
         }
     }
 
