@@ -325,7 +325,7 @@ const notifyCommand: BotCommand = {
             // Mark as notified
             await supabase
                 .from('slack_requests')
-                .update({ notified_at: new Date().toISOString() })
+.update({ notified_at: new Date().toISOString() })
                 .eq('id', requestId);
 
             await ctx.reply(`Sent to ${req.requester_name} in Slack.`);
@@ -337,63 +337,454 @@ const notifyCommand: BotCommand = {
 
  /**
   * /purchases — Run purchasing intelligence pipeline on-demand.
-  * Scrapes basauto dashboard → assesses SKUs → shows new HIGH_NEED items and pending requests.
+  * Runs the separate run-purchase-assessment.ts subprocess.
   */
  const purchasesCommand: BotCommand = {
      name: 'purchases',
-     description: 'Run purchasing intelligence pipeline (scrape→assess)',
-     handler: async (ctx, deps) => {
-         ctx.sendChatAction('typing');
-         await ctx.reply('🛒 Starting purchasing intelligence run...\nThis will scrape the dashboard and assess all items.');
+     description: 'Run purchasing intelligence pipeline on-demand',
+     handler: async (ctx, _deps) => {
+         await ctx.reply('🔍 Starting purchase assessment pipeline... This may take a few minutes.');
+         const { exec } = await import('child_process');
+         const { promisify } = await import('util');
+         const execAsync = promisify(exec);
+         try {
+             await execAsync('node --import tsx src/cli/run-purchase-assessment.ts', { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+             await ctx.reply('✅ Pipeline triggered. You will receive a Telegram digest when complete.');
+         } catch (err: any) {
+             await ctx.reply(`❌ Failed to start pipeline: ${err.message}`);
+         }
+     },
+ };
+
+ /**
+  * /vendor — Run vendor-specific sync/reconcile commands.
+  */
+ const vendorCommand: BotCommand = {
+     name: 'vendor',
+     description: 'Reconcile vendor order confirmations against Finale POs',
+     handler: async (ctx, _deps) => {
+         const { exec: _exec } = await import('child_process');
+         const { promisify: _promisify } = await import('util');
+         const execAsync = _promisify(_exec);
+
+         const args = getCmdText(ctx).split(' ').slice(1);
+         const [vendor, ...flags] = args;
+         const dryRun = flags.includes('--dry-run');
+         const scrapeOnly = flags.includes('--scrape-only');
+         const updateOnly = flags.includes('--update-only');
+         const poFlag = flags.includes('--po') ? flags[flags.indexOf('--po') + 1] : null;
+         const csvFlag = flags.includes('--csv') ? flags[flags.indexOf('--csv') + 1] : null;
+         const limitFlag = flags.includes('--limit') ? flags[flags.indexOf('--limit') + 1] : null;
+
+         const VENDORS: Record<string, { script: string; label: string; needsChrome?: boolean; needsCsv?: boolean }> = {
+             uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
+             axiom:     { script: 'src/cli/reconcile-axiom.ts',      label: 'Axiom Print', needsChrome: true },
+             fedex:     { script: 'src/cli/reconcile-fedex.ts',       label: 'FedEx', needsCsv: true },
+             teraganix: { script: 'src/cli/reconcile-teraganix.ts',   label: 'TeraGanix' },
+             aaa:       { script: 'src/cli/reconcile-aaa.ts',         label: 'AAA Cooper' },
+         };
+
+         const FLAG_HINTS: Record<string, string> = {
+             uline:     '--dry-run --scrape-only --update-only --po <id>',
+             axiom:     '--dry-run --scrape-only --update-only --po <id>',
+             fedex:     '--dry-run --csv <path>',
+             teraganix: '--dry-run',
+             aaa:       '--dry-run --scrape-only --limit <N>',
+         };
+
+         if (!vendor) {
+             const rows = Object.entries(VENDORS).map(([key, v]) => {
+                 return `/vendor ${key.padEnd(10)} — ${v.label.padEnd(12)} [${FLAG_HINTS[key]}]`;
+             }).join('\n');
+             await ctx.reply(
+                 `🛒 <b>Vendor Commands</b>\n\n` +
+                 `${rows}\n\n` +
+                 `Also: <code>/received</code> — sweep received POs for invoice matches\n` +
+                 `Also: <code>/uline</code> — ULINE pre-check + order\n` +
+                 `Also: <code>/ulinetest &lt;po&gt;</code> — test ULINE flow against a specific PO\n\n` +
+                 `<i>Flags: --dry-run | --scrape-only | --update-only | --po &lt;id&gt; | --csv &lt;path&gt;</i>`,
+                 { parse_mode: 'HTML' }
+             );
+             return;
+         }
+
+         const key = vendor.toLowerCase();
+         const entry = VENDORS[key];
+         if (!entry) {
+             await ctx.reply(`❌ Unknown vendor: <b>${vendor}</b>\n\nTry: <code>/vendor</code> to see available vendors.`, { parse_mode: 'HTML' });
+             return;
+         }
+
+         // AAA Cooper — extract invoices from ap@ Gmail, forward each to Bill.com
+         if (key === 'aaa') {
+             const extraFlags: string[] = [];
+             if (dryRun) extraFlags.push('--dry-run');
+             if (scrapeOnly) extraFlags.push('--scrape-only');
+             if (limitFlag) extraFlags.push('--limit', limitFlag);
+             const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
+             const cmd = `node --import tsx src/cli/reconcile-aaa.ts${flagStr}`;
+             await ctx.reply('🔄 Running <b>AAA Cooper</b> invoice extraction…\n<i>Scans ap@buildasoil.com, splits statement PDFs, forwards invoices to Bill.com.</i>', { parse_mode: 'HTML' });
+             try {
+                 const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+                 const out = (stdout || '').slice(-2000);
+                 const errOut = (stderr || '').slice(-500);
+                 const summary = out || errOut || 'No output';
+                 await ctx.reply(`✅ <b>AAA Cooper Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`, { parse_mode: 'HTML', disable_web_page_preview: true });
+             } catch (err: any) {
+                 const out = (err.stdout || '').slice(-1500);
+                 const errOut = (err.stderr || '').slice(-500);
+                 await ctx.reply(`⚠️ <b>AAA Cooper Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`, { parse_mode: 'HTML', disable_web_page_preview: true });
+             }
+             return;
+         }
+
+         // Build flags list per vendor
+         const extraFlags: string[] = [];
+         if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix', 'aaa'].includes(key)) extraFlags.push('--dry-run');
+         if (scrapeOnly && ['uline', 'axiom', 'aaa'].includes(key)) extraFlags.push('--scrape-only');
+         if (updateOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--update-only');
+         if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
+         if (csvFlag && key === 'fedex') extraFlags.push('--csv', csvFlag);
+
+         const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
+         const cmd = `node --import tsx ${entry.script}${flagStr}`;
+
+         const chromeNote = entry.needsChrome ? '\n⚠️ <i>Close Chrome before running (Playwright).</i>' : '';
+         const csvNote = entry.needsCsv ? '\n📎 <i>Auto-finds latest CSV in Sandbox if --csv omitted.</i>' : '';
+
+         await ctx.reply(`🔄 Running <b>${entry.label}</b>…${chromeNote}${csvNote}`, { parse_mode: 'HTML' });
 
          try {
-             const { runPurchasingIntelligence } = await import('../../lib/intelligence/purchasing-intelligence');
-             const result = await runPurchasingIntelligence({
-                 source: 'manual',
-                 triggeredBy: ctx.from?.username || 'telegram',
-             });
-
-             // Send the full Telegram report (already sent via bot if new alerts)
-             // But for manual, we also want to show the summary in the command reply.
-             await ctx.reply(result.telegramMessage, { parse_mode: 'HTML' });
+             const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+             const out = (stdout || '').slice(-2000);
+             const errOut = (stderr || '').slice(-500);
+             const summary = out || errOut || 'No output';
+             await ctx.reply(
+                 `✅ <b>${entry.label} Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`,
+                 { parse_mode: 'HTML', disable_web_page_preview: true }
+             );
          } catch (err: any) {
-             console.error('Purchasing command error:', err);
-             await ctx.reply(`❌ Purchasing intelligence failed: ${err.message}`);
+             const out = (err.stdout || '').slice(-1500);
+             const errOut = (err.stderr || '').slice(-500);
+             await ctx.reply(
+                 `⚠️ <b>${entry.label} Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`,
+                 { parse_mode: 'HTML', disable_web_page_preview: true }
+             );
          }
-      },
-  };
+     }
+ };
 
-  /**
-   * /scrape_purchasing_dashboard — Run purchasing intelligence pipeline on-demand.
-   * Scrapes basauto dashboard, assesses SKUs, sends alerts if needed.
-   */
-  const scrapePurchasingDashboardCommand: BotCommand = {
-      name: 'scrape_purchasing_dashboard',
-      description: 'Run purchasing intelligence pipeline (scrape dashboard + assess)',
-      handler: async (ctx, deps) => {
-          ctx.sendChatAction('typing');
-          await ctx.reply('🛒 Starting purchasing dashboard scrape & assessment run...\nThis will scrape the dashboard and assess all items.');
+ /**
+  * /uline — Run ULINE precheck.
+  */
+ const ulineCommand: BotCommand = {
+     name: 'uline',
+     description: 'Check ULINE Friday pre-checks and show manifest',
+     handler: async (ctx, deps) => {
+         await ctx.reply('🔍 Checking ULINE status…');
+         const ops = deps.opsManager;
+         if (!ops) {
+             await ctx.reply('OpsManager not initialized.');
+             return;
+         }
+         const { runFridayUlinePreCheck } = await import('../order-uline');
+         const { FinaleClient } = await import('../../lib/finale/client');
+         const finale = new FinaleClient();
 
-          try {
-              const { runPurchasingIntelligence } = await import('../../lib/intelligence/purchasing-pipeline');
-              const result = await runPurchasingIntelligence({
-                  source: 'manual',
-                  triggeredBy: ctx.from?.username || 'telegram',
-              });
+         let preCheck: Awaited<ReturnType<typeof runFridayUlinePreCheck>>;
+         try {
+              preCheck = await runFridayUlinePreCheck(finale);
+         } catch (err: any) {
+              await ctx.reply(`❌ Pre-check failed: ${err.message}`);
+              return;
+         }
 
-              // Send the full Telegram report
-              await ctx.reply(result.telegramMessage, { parse_mode: 'HTML' });
-          } catch (err: any) {
-              console.error('Purchasing command error:', err);
-              await ctx.reply(`❌ Purchasing intelligence failed: ${err.message}`);
-          }
-      },
-  };
+         const account = process.env.FINALE_ACCOUNT_PATH || 'buildasoilorganics';
 
-  export const operationsCommands: BotCommand[] = [
-      buildriskCommand,
-      requestsCommand,
-      alertsCommand,
-      correlateCommand,
-      notifyCommand,
-  ];
+         if (preCheck.reason === 'recent_po_exists') {
+              const po = preCheck.recentDraftPO!;
+              const poUrl = `https://app.finaleinventory.com/${account}/purchaseOrder?orderId=${po.orderId}`;
+              await ctx.reply(
+                  `✅ <b>ULINE Status</b>\n\n` +
+                  `Draft PO <a href="${poUrl}">#${po.orderId}</a> ` +
+                  `created ${new Date(po.orderDate).toLocaleDateString('en-US', { timeZone: 'America/Denver' })}.\n` +
+                  `A ULINE order may already be in progress — review the PO and cart.`,
+                  { parse_mode: 'HTML' }
+              );
+              return;
+         }
+
+         if (preCheck.reason === 'no_items_needed') {
+              await ctx.reply(
+                  `✅ <b>ULINE Status</b>\n\n` +
+                  `All ULINE items are above reorder threshold.\n` +
+                  `No order needed.`,
+                  { parse_mode: 'HTML' }
+              );
+              return;
+         }
+
+         const manifest = preCheck.manifest;
+         const itemLines = manifest.items
+              .slice(0, 15)
+              .map((i: any) => {
+                  const qtyLabel = i.finaleEachQuantity === i.effectiveEachQuantity
+                      ? `${i.quantity}`
+                      : `${i.quantity} <i>(→ ${i.effectiveEachQuantity} ea)</i>`;
+                  return `  <code>${i.ulineModel}</code> × ${qtyLabel}  ($${(i.quantity * i.unitPrice).toFixed(2)})`;
+              })
+              .join('\n');
+         const more = manifest.items.length > 15 ? `\n  <i>…and ${manifest.items.length - 15} more items</i>` : '';
+
+         const skippedNote = manifest.skippedLowVelocity && manifest.skippedLowVelocity.length > 0
+              ? `\n<i>⚠️ ${manifest.skippedLowVelocity.length} low-velocity items skipped</i>\n`
+              : '';
+
+         const msg = `🛒 <b>ULINE Order — Approval Needed</b>\n\n` +
+              `${skippedNote}` +
+              `📦 ${manifest.items.length} item${manifest.items.length === 1 ? '' : 's'} needing reorder\n` +
+              `💰 Est. Total: <b>$${manifest.totalEstimate.toFixed(2)}</b>\n\n` +
+              `${itemLines}${more}\n\n` +
+              `<i>Create draft PO and fill ULINE cart?</i>`;
+
+         const sentMsg = await ctx.reply(msg, {
+              parse_mode: 'HTML',
+              reply_markup: {
+                  inline_keyboard: [[
+                      { text: '✅ Approve & Fill Cart', callback_data: 'approve_uline_friday' },
+                      { text: '⏭️ Skip', callback_data: 'skip_uline_friday' },
+                  ]],
+              },
+         });
+
+         (ops as any).pendingUlineFriday = {
+              messageId: sentMsg.message_id,
+              manifest,
+              manifestJson: JSON.stringify(manifest),
+         };
+     }
+ };
+
+ /**
+  * /ulinetest — Run ULINE flow test.
+  */
+ const ulineTestCommand: BotCommand = {
+     name: 'ulinetest',
+     description: 'Test ULINE flow against specific or latest PO',
+     handler: async (ctx, _deps) => {
+         const args = getCmdText(ctx).split(' ').slice(1);
+         const poId = args[0];
+
+         await ctx.reply(poId
+             ? `🔍 Testing ULINE flow with PO #${poId}…`
+             : '🔍 Testing ULINE flow with most recent draft PO…');
+
+         const { gatherFromPO, executeUlineFridayApproval, gatherAllUlineDraftPOs } = await import('../order-uline');
+         const { FinaleClient } = await import('../../lib/finale/client');
+         const finale = new FinaleClient();
+
+         let manifest: any;
+         if (poId) {
+             manifest = await gatherFromPO(finale, poId);
+         } else {
+             const allDrafts = await gatherAllUlineDraftPOs(finale);
+             if (allDrafts.length === 0) {
+                 await ctx.reply('❌ No ULINE draft POs found in Finale.');
+                 return;
+             }
+             manifest = allDrafts[0];
+         }
+
+         if (manifest.items.length === 0) {
+             await ctx.reply(`❌ No ULINE items found in PO #${poId || 'latest draft'}.`);
+             return;
+         }
+
+         const result = await executeUlineFridayApproval(manifest);
+
+         if (!result.success) {
+             await ctx.reply(
+                 `🚨 <b>ULINE Test Failed</b>\n\n` +
+                 `<b>Error:</b> ${result.error || 'Unknown error'}\n` +
+                 `Items: ${result.itemCount} | Total: $${result.estimatedTotal.toFixed(2)}`,
+                 { parse_mode: 'HTML' }
+             );
+             return;
+         }
+
+         const itemLines = result.items
+             .slice(0, 10)
+             .map((i: any) => `  <code>${i.ulineModel}</code> × ${i.qty}  ($${(i.qty * i.unitPrice).toFixed(2)})`)
+             .join('\n');
+         const more = result.items.length > 10 ? `\n  <i>…and ${result.items.length - 10} more</i>` : '';
+
+         const poLine = result.finalePO && result.finaleUrl
+             ? `<a href="${result.finaleUrl}">Finale PO #${result.finalePO}</a>`
+             : result.finalePO ? `Finale PO #${result.finalePO}` : '⚠️ PO creation skipped';
+
+         const cartIcon = result.cartVerificationStatus === 'verified' ? '🛒'
+             : result.cartVerificationStatus === 'partial' ? '⚠️' : '🟡';
+
+         await ctx.reply(
+             `🛒 <b>ULINE Test — Done</b>\n\n` +
+             `📄 ${poLine}\n` +
+             `💰 Est. Total: <b>$${result.estimatedTotal.toFixed(2)}</b>\n` +
+             `📦 ${result.itemCount} item${result.itemCount === 1 ? '' : 's'}:\n\n` +
+             `${itemLines}${more}\n\n` +
+             `${cartIcon} Cart: ${result.cartResult}\n` +
+             (result.cartUrl
+                 ? `Cart link: <a href="${result.cartUrl}">Load in browser</a>`
+                 : `<a href="https://www.uline.com/Ordering/QuickOrder">ULINE Quick Order</a>`),
+             { parse_mode: 'HTML', disable_web_page_preview: true }
+         );
+     }
+ };
+
+ /**
+  * /received — Sweep received POs.
+  */
+ const receivedCommand: BotCommand = {
+     name: 'received',
+     description: 'Sweep received POs for invoice matches',
+     handler: async (ctx, _deps) => {
+         const args = getCmdText(ctx).split(' ').slice(1);
+         const dryRun = args.includes('--dry-run');
+         const daysArg = args.find((a: string) => a.startsWith('--days='));
+         const days = daysArg ? daysArg.split('=')[1] : '60';
+         const flagStr = dryRun ? ' --dry-run' : '';
+
+         await ctx.reply(`🔄 Running PO sweep (last ${days} days)…`);
+
+         const { exec: _exec } = await import('child_process');
+         const { promisify: _promisify } = await import('util');
+         const execAsync = _promisify(_exec);
+
+         try {
+             const { stdout, stderr } = await execAsync(
+                 `node --import tsx src/cli/reconcile-received-pos.ts --days=${days}${flagStr}`,
+                 { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 }
+             );
+             const out = (stdout || '').slice(-2000);
+             const errOut = (stderr || '').slice(-500);
+             const summary = out || errOut || 'No output';
+             await ctx.reply(
+                 `✅ <b>PO Sweep Done</b>\n\n<pre>${summary.slice(0, 2000)}</pre>`,
+                 { parse_mode: 'HTML', disable_web_page_preview: true }
+             );
+         } catch (err: any) {
+             const out = (err.stdout || '').slice(-1500);
+             const errOut = (err.stderr || '').slice(-500);
+             await ctx.reply(
+                 `⚠️ <b>PO Sweep Finished</b>\n\n<pre>${out || errOut || err.message.slice(0, 500)}</pre>`,
+                 { parse_mode: 'HTML', disable_web_page_preview: true }
+             );
+         }
+     }
+ };
+
+ /**
+  * /qty-status — Calibration health.
+  */
+ const qtyStatusCommand: BotCommand = {
+     name: ['qty-status', 'qtystatus', 'qty'],
+     description: 'Show calibration health and safety parameters',
+     handler: async (ctx, _deps) => {
+         try {
+             const { createClient } = await import('../../lib/supabase');
+             const { summarizeAriaVsFinale } = await import('../../lib/purchasing/calibration-engine');
+             const db = createClient();
+             if (!db) {
+                 await ctx.reply("⚠️ Supabase not configured");
+                 return;
+             }
+
+             const since30 = new Date();
+             since30.setDate(since30.getDate() - 30);
+
+             const [{ data: vendorStats }, summary, { count: openReservations }, { count: pendingRecs }] = await Promise.all([
+                 db.from('vendor_calibration_stats')
+                     .select('vendor_name, sample_count, median_error_pct, bias_pct, safety_multiplier')
+                     .gte('sample_count', 5)
+                     .order('sample_count', { ascending: false })
+                     .limit(8),
+                 summarizeAriaVsFinale(30),
+                 db.from('qty_reservations').select('id', { count: 'exact', head: true }).is('released_at', null),
+                 db.from('qty_recommendations').select('id', { count: 'exact', head: true }).is('calibrated_at', null).gte('recommended_at', since30.toISOString()),
+             ]);
+
+             const lines: string[] = [];
+             lines.push("📊 *Qty Calibration Status*\n");
+             lines.push(`Open draft reservations: ${openReservations ?? 0}`);
+             lines.push(`Uncalibrated recs (30d): ${pendingRecs ?? 0}`);
+             lines.push(`Calibrated samples (30d): ${summary.totalSamples}`);
+             if (summary.medianAriaErrorPct != null) {
+                 lines.push(`Aria median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);
+             }
+             if (summary.medianFinaleErrorPct != null) {
+                 lines.push(`Finale median error: ${summary.medianFinaleErrorPct >= 0 ? "+" : ""}${summary.medianFinaleErrorPct.toFixed(0)}%`);
+             }
+
+             if (vendorStats && vendorStats.length > 0) {
+                 lines.push("\n*Top vendors (by sample count):*");
+                 for (const v of vendorStats) {
+                     const med = v.median_error_pct != null ? `${v.median_error_pct >= 0 ? '+' : ''}${Number(v.median_error_pct).toFixed(0)}%` : 'n/a';
+                     const mul = Number(v.safety_multiplier).toFixed(2);
+                     lines.push(`  • ${v.vendor_name ?? '?'} — n=${v.sample_count}, med ${med}, ×${mul}`);
+                  }
+             } else {
+                 lines.push("\n_No vendor stats yet — need ≥5 calibrated samples per vendor._");
+             }
+
+             await ctx.reply(lines.join("\n"), { parse_mode: 'Markdown' });
+         } catch (err: any) {
+             console.error('[qty-status] error:', err.message);
+             await ctx.reply(`⚠️ /qty-status failed: ${err.message ?? String(err)}`);
+         }
+     }
+ };
+
+ /**
+  * /recon-status — AP reconciliation outcomes.
+  */
+ const reconStatusCommand: BotCommand = {
+     name: ['recon-status', 'reconstatus', 'recon'],
+     description: 'AP reconciliation outcomes status',
+     handler: async (ctx, _deps) => {
+         try {
+             const reconStatusModule = await import('../../lib/runtime/observability/recon-status');
+             const reconStatusAny = reconStatusModule as any;
+             const getReconStatus =
+                 reconStatusModule.getReconStatus ??
+                 reconStatusAny.default?.getReconStatus ??
+                 reconStatusAny["module.exports"]?.getReconStatus;
+             const formatReconStatus =
+                 reconStatusModule.formatReconStatus ??
+                 reconStatusAny.default?.formatReconStatus ??
+                 reconStatusAny["module.exports"]?.formatReconStatus;
+             if (typeof getReconStatus !== "function" || typeof formatReconStatus !== "function") {
+                 throw new Error("recon-status exports unavailable");
+             }
+             const status = await getReconStatus();
+             const text = formatReconStatus(status);
+             await ctx.reply(text, { parse_mode: 'Markdown' });
+         } catch (err: any) {
+             console.error('[recon-status] error:', err.message);
+             await ctx.reply(`⚠️ /recon-status failed: ${err.message ?? String(err)}`);
+         }
+     }
+ };
+
+ export const operationsCommands: BotCommand[] = [
+     buildriskCommand,
+     requestsCommand,
+     alertsCommand,
+     correlateCommand,
+     notifyCommand,
+     purchasesCommand,
+     vendorCommand,
+     ulineCommand,
+     ulineTestCommand,
+     receivedCommand,
+     qtyStatusCommand,
+     reconStatusCommand,
+ ];

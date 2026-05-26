@@ -147,16 +147,17 @@ describe('Bot Command Modularization', () => {
             expect(inventoryCommands.length).toBe(5);
         });
 
-        it('operations module should export exactly 5 commands', () => {
-            expect(operationsCommands.length).toBe(5);
+        it('operations module should export exactly 12 commands', () => {
+            expect(operationsCommands.length).toBe(12);
         });
 
         it('memory module should export exactly 4 commands', () => {
             expect(memoryCommands.length).toBe(4);
         });
 
-        it('kaizen module should export exactly 4 commands', () => {
-            expect(kaizenCommands.length).toBe(4);
+        it('kaizen module should export exactly 3 commands', () => {
+            expect(kaizenCommands.length).toBe(3);
         });
     });
+
 });
