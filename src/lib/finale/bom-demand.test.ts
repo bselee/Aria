@@ -319,6 +319,53 @@ describe('mergeIntoGroups', () => {
         expect(merged[0].urgency).toBe('critical');
     });
 
+    it('consolidates duplicate items inside vendor group', () => {
+        const resaleGroups = [{
+            vendorName: 'Acme Corp', vendorPartyId: 'p1', urgency: 'warning' as const,
+            items: [{
+                productId: 'FM104',
+                supplierPartyId: 'p1',
+                itemType: 'resale' as const,
+                dailyRate: 0.8,
+                stockOnHand: 31,
+                stockOnOrder: 0,
+                suggestedQty: 40,
+                urgency: 'warning' as const,
+                explanation: 'Direct sales reorder needed.',
+                feedsFinishedGoods: [],
+                candidate: { directDemand: 0.8, bomDemand: 0 },
+            } as any],
+        }];
+        const bomGroups = [{
+            vendorName: 'Acme Corp', vendorPartyId: 'p1', urgency: 'critical' as const,
+            items: [{
+                productId: 'FM104',
+                supplierPartyId: 'p1',
+                itemType: 'bom-component' as const,
+                dailyRate: 0.1,
+                stockOnHand: 31,
+                stockOnOrder: 0,
+                suggestedQty: 30,
+                urgency: 'critical' as const,
+                explanation: 'BOM builds coverage low.',
+                feedsFinishedGoods: [{ sku: 'BLEND', name: 'Craft Blend', buildsWorth: 20 }],
+                candidate: { directDemand: 0, bomDemand: 0.1 },
+            } as any],
+        }];
+        const merged = mergeIntoGroups(resaleGroups, bomGroups);
+        expect(merged).toHaveLength(1);
+        expect(merged[0].items).toHaveLength(1); // Condensed into 1 row!
+        
+        const mergedItem = merged[0].items[0];
+        expect(mergedItem.itemType).toBe('resale-bom');
+        expect(mergedItem.dailyRate).toBe(0.9); // Combined rate!
+        expect(mergedItem.suggestedQty).toBe(40); // Max of 30 and 40!
+        expect(mergedItem.urgency).toBe('critical'); // Worst urgency wins!
+        expect(mergedItem.feedsFinishedGoods).toHaveLength(1);
+        expect(mergedItem.feedsFinishedGoods[0].sku).toBe('BLEND');
+        expect(mergedItem.runwayDays).toBeCloseTo(31 / 0.9, 1); // Recalculated runway!
+    });
+
     it('keeps vendor groups separate when different vendors', () => {
         const resaleGroups = [{ vendorName: 'A', vendorPartyId: 'p1', urgency: 'ok' as const, items: [] }];
         const bomGroups = [{ vendorName: 'B', vendorPartyId: 'p2', urgency: 'warning' as const, items: [] }];
