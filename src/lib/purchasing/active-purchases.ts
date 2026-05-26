@@ -4,7 +4,7 @@ import { createClient } from "../supabase";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "./calendar-lifecycle";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
-import { listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
+import { classifyShipmentEvidence, listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
 import { derivePOSentVerification, type POSentVerification } from "./po-sent-verification";
 import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
@@ -13,7 +13,7 @@ export interface ActivePurchase extends FullPO {
     expectedDate: string;
     leadProvenance: string;
     trackingNumbers: string[];
-    shipments: ShipmentRecord[];
+    shipments: Array<ShipmentRecord & { evidenceLevel: "confirmed" | "candidate"; evidenceReason: string }>;
     isReceived: boolean;
     completionState: POCompletionState;
     lifecycleStage?: string;
@@ -127,7 +127,15 @@ export async function loadActivePurchases(
         const status = (po.status || "").toLowerCase();
         if (!["committed", "completed"].includes(status)) continue;
 
-        const shipments = shipmentMap.get(po.orderId) || [];
+        const shipments = (shipmentMap.get(po.orderId) || []).map((shipment) => {
+            const classification = classifyShipmentEvidence(shipment);
+            return {
+                ...shipment,
+                evidenceLevel: classification.level,
+                evidenceReason: classification.reason,
+            };
+        });
+        const confirmedShipments = shipments.filter((shipment) => shipment.evidenceLevel === "confirmed");
         const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
             status: po.status,
             receiveDate: po.receiveDate,
@@ -141,7 +149,7 @@ export async function loadActivePurchases(
         const completionSignal = completionSignals.get(po.orderId);
         const completionState = derivePOCompletionState({
             finaleReceived: isReceived,
-            trackingDelivered: shipments.length > 0 && shipments.every((shipment) => shipment.status_category === "delivered"),
+            trackingDelivered: confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered"),
             hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
             reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
             freightResolved: completionSignal?.freightResolved || false,
@@ -188,7 +196,7 @@ export async function loadActivePurchases(
             fallbackLabel: lt?.label ?? "14d default",
             fallbackSource: lt?.provenance ?? "default",
             vendorPromisedEta,
-            shipments: shipments.map((shipment) => ({
+            shipments: confirmedShipments.map((shipment) => ({
                 estimated_delivery_at: shipment.estimated_delivery_at,
                 delivered_at: shipment.delivered_at,
                 created_at: shipment.created_at,

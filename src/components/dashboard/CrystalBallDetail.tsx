@@ -292,6 +292,29 @@ export function CrystalBallDetail({ item, onClose, onCommitPO }: CrystalBallDeta
         // Color transition green -> red at the stockout mark
         depletionGradient = `linear-gradient(to right, #10b981 0%, #10b981 ${stockoutPositionPct}%, #ef4444 ${stockoutPositionPct}%, #ef4444 100%)`;
     }
+
+    const firstTriggerProjection = item.projections.find(proj => proj.needsOrder || proj.surplus < 0);
+    const lastCoveredProjection = [...item.projections]
+        .filter(proj => !proj.needsOrder && proj.surplus >= 0)
+        .sort((a, b) => a.daysOut - b.daysOut)
+        .pop();
+    const nextOrderByDate = firstTriggerProjection?.orderByDate ?? item.projectedNextOrderDate ?? null;
+    const leadTimeRisk = Number.isFinite(runway) && runway < leadTime;
+    const orderNow = leadTimeRisk || item.recommendation.urgency === "critical";
+    const allocationShortageUnits = Math.max(0, totalSimDemand - stockPool);
+    const hasAllocationShortage = allocationShortageUnits > 0;
+    const historyCount = item.historicalPOs?.length ?? 0;
+    const historyConfidence =
+        historyCount >= 4 ? "high history confidence" :
+        historyCount >= 2 ? "medium history confidence" :
+        historyCount === 1 ? "low history confidence" :
+        "no recent PO history";
+    const verdictTitle = orderNow ? "Order now" : nextOrderByDate ? "No PO needed today" : "Covered";
+    const nextActionLabel = orderNow
+        ? (nextOrderByDate ? `Next action: order now, target ${nextOrderByDate}` : "Next action: order now")
+        : (nextOrderByDate ? `Next action: order by ${nextOrderByDate}` : "Next action: monitor");
+    const coveredWindowLabel = lastCoveredProjection ? `Covered for ${lastCoveredProjection.daysOut}d` : "No covered milestone";
+    const suggestedQtyLabel = `Recommended PO qty: ${Math.round(item.recommendation.suggestedQty).toLocaleString()}`;
     
     return (
         <div className="p-4 space-y-6 bg-zinc-900 border-t border-zinc-800 animate-fadeIn">
@@ -346,6 +369,59 @@ export function CrystalBallDetail({ item, onClose, onCommitPO }: CrystalBallDeta
                         <span className="text-[10px] font-mono uppercase tracking-wider">Close</span>
                     </div>
                 </button>
+            </div>
+
+            {/* Action Verdict */}
+            <div className={`border rounded-lg p-3.5 font-mono ${
+                orderNow
+                    ? "bg-red-500/10 border-red-500/30"
+                    : hasAllocationShortage
+                        ? "bg-amber-500/10 border-amber-500/30"
+                        : "bg-emerald-500/10 border-emerald-500/25"
+            }`}>
+                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                    <div className="space-y-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                            {orderNow ? (
+                                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                            ) : (
+                                <CheckCircle2 className={`w-4 h-4 shrink-0 ${hasAllocationShortage ? "text-amber-400" : "text-emerald-400"}`} />
+                            )}
+                            <span className={`text-sm font-bold ${orderNow ? "text-red-300" : hasAllocationShortage ? "text-amber-300" : "text-emerald-300"}`}>
+                                {verdictTitle}
+                            </span>
+                            <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                                {coveredWindowLabel}
+                            </span>
+                        </div>
+                        <div className="text-xs text-zinc-300 leading-relaxed">
+                            {nextActionLabel}. {suggestedQtyLabel}. {historyConfidence}.
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 lg:min-w-[420px]">
+                        <div className="rounded border border-zinc-800/80 bg-zinc-950/45 px-2.5 py-2">
+                            <span className="block text-[9px] uppercase tracking-wider text-zinc-500">Runway</span>
+                            <span className={`block text-sm font-semibold ${runwayColor}`}>
+                                {Number.isFinite(runway) ? `${Math.round(runway)}d` : "Infinite"}
+                            </span>
+                        </div>
+                        <div className="rounded border border-zinc-800/80 bg-zinc-950/45 px-2.5 py-2">
+                            <span className="block text-[9px] uppercase tracking-wider text-zinc-500">Lead Time</span>
+                            <span className="block text-sm font-semibold text-zinc-200">{leadTime}d</span>
+                        </div>
+                        <div className="rounded border border-zinc-800/80 bg-zinc-950/45 px-2.5 py-2">
+                            <span className="block text-[9px] uppercase tracking-wider text-zinc-500">Allocation</span>
+                            <span className={`block text-sm font-semibold ${hasAllocationShortage ? "text-amber-300" : "text-emerald-300"}`}>
+                                {hasAllocationShortage ? "Build risk" : "Balanced"}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                {hasAllocationShortage && (
+                    <div className="mt-3 rounded border border-amber-500/20 bg-zinc-950/35 px-3 py-2 text-[11px] text-amber-100 leading-relaxed">
+                        Allocation risk is build-plan based: daily demand is satisfied first, but scheduled builds are short by {Math.round(allocationShortageUnits).toLocaleString()} units inside the 30-day allocation window.
+                    </div>
+                )}
             </div>
             
             {/* Draft PO Warning Banner */}
@@ -622,15 +698,15 @@ export function CrystalBallDetail({ item, onClose, onCommitPO }: CrystalBallDeta
                         <div className="bg-red-500/10 border border-red-550/30 text-red-300 rounded-lg p-3.5 font-mono text-xs flex gap-3 items-start shadow-[0_0_15px_rgba(239,68,68,0.08)]">
                             <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
                             <div className="space-y-1 leading-relaxed">
-                                <span className="font-bold text-red-400 block text-[11px] tracking-wider uppercase">ALLOCATION SHORTAGE DETECTED</span>
+                                <span className="font-bold text-red-400 block text-[11px] tracking-wider uppercase">BUILD-ALLOCATION SHORTAGE DETECTED</span>
                                 <p className="text-zinc-200">
-                                    Current inventory + incoming PO receipts (<strong className="text-zinc-100">{stockPool.toLocaleString()}</strong> units) cannot fully satisfy both the 30-day daily customer demand and scheduled calendar builds (<strong className="text-zinc-100">{Math.round(totalSimDemand).toLocaleString()}</strong> units). 
+                                    Current inventory + incoming PO receipts (<strong className="text-zinc-100">{stockPool.toLocaleString()}</strong> units) cover the daily-runway model first, but cannot fully satisfy scheduled calendar builds inside the 30-day allocation window (<strong className="text-zinc-100">{Math.round(totalSimDemand).toLocaleString()}</strong> units requested).
                                 </p>
                                 <div className="text-zinc-400 text-[11px] leading-relaxed">
-                                    👉 Daily Resale Orders and BOM consumption consume stock first, leaving a deficit of <strong className="text-red-400">{Math.round(totalSimDemand - stockPool).toLocaleString()} units</strong> for scheduled builds.
+                                    Daily resale orders and BOM consumption consume stock first, leaving a build-plan deficit of <strong className="text-red-400">{Math.round(allocationShortageUnits).toLocaleString()} units</strong>. This is separate from the headline stockout/runway date.
                                     {feedsBuilds.length > 0 && (
                                         <span className="block mt-1">
-                                            ⚠ Scheduled manufacturing runs at risk: <strong className="text-zinc-200">{feedsBuilds.join(', ')}</strong> on <strong className="text-zinc-200">{earliestBuildDate ? new Date(earliestBuildDate).toLocaleDateString() : 'N/A'}</strong>.
+                                            Scheduled manufacturing runs at risk: <strong className="text-zinc-200">{feedsBuilds.join(', ')}</strong> on <strong className="text-zinc-200">{earliestBuildDate ? new Date(earliestBuildDate).toLocaleDateString() : 'N/A'}</strong>.
                                         </span>
                                     )}
                                 </div>

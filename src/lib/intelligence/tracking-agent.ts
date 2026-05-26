@@ -184,6 +184,8 @@ export class TrackingAgent {
                 const subject = m.subject || "";
                 const bodyMsg = m.body_snippet || "";
                 let poMatch = subject.match(/PO\s*#?\s*(\d+)/i) || bodyMsg.match(/PO\s*#?\s*(\d+)/i);
+                let poCorrelationConfidence = poMatch ? 0.95 : 0;
+                let evidenceSource = "email_tracking";
 
                 if (!poMatch) {
                     try {
@@ -196,7 +198,11 @@ export class TrackingAgent {
                         }) as { poNumber: string | null };
                         if (res?.poNumber) {
                             const llmMatch = res.poNumber.match(/(\d+)/);
-                            if (llmMatch) poMatch = llmMatch;
+                            if (llmMatch) {
+                                poMatch = llmMatch;
+                                poCorrelationConfidence = 0.7;
+                                evidenceSource = "email_tracking_llm_po";
+                            }
                         }
                     } catch (_) { /* ignore, will skip below */ }
                 }
@@ -217,6 +223,8 @@ export class TrackingAgent {
 
                     if (inferredPO) {
                         poMatch = [inferredPO, inferredPO.match(/(\d+)/)?.[1] || inferredPO];
+                        poCorrelationConfidence = 0.55;
+                        evidenceSource = "email_tracking_inferred_po";
                     }
                 }
 
@@ -255,9 +263,9 @@ export class TrackingAgent {
                         const record = await upsertShipmentEvidence({
                             trackingNumber: tracking,
                             poNumber,
-                            source: "email_tracking",
+                            source: evidenceSource,
                             sourceRef: m.gmail_message_id,
-                            confidence: 0.9,
+                            confidence: poCorrelationConfidence || 0.5,
                         });
 
                         if (record) {

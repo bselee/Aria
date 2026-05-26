@@ -27,6 +27,11 @@ type ActivePurchase = {
         public_tracking_url: string | null;
         status_display: string | null;
         estimated_delivery_at: string | null;
+        last_checked_at?: string | null;
+        last_source?: string | null;
+        source_confidence?: number | null;
+        evidenceLevel?: "confirmed" | "candidate";
+        evidenceReason?: string;
     }>;
     lifecycleStage?: string;
     lifecycleSummary?: string;
@@ -537,6 +542,7 @@ export default function ActivePurchasesPanel() {
                                 const sentVerified = po.sentVerification?.verified;
                                 const sentSource = po.sentVerification?.source;
                                 const sentAt = po.sentVerification?.sentAt;
+                                const confirmedShipments = (po.shipments || []).filter((shipment) => shipment.evidenceLevel === "confirmed");
                                 const etaConfidence = po.etaProfile?.confidence ?? "low";
                                 const etaTone = etaConfidence === "high"
                                     ? "text-emerald-300"
@@ -580,13 +586,16 @@ export default function ActivePurchasesPanel() {
                                 } else if (po.lifecycleStage === 'ap_follow_up') {
                                     statusLabel = "AP Review";
                                     statusColor = "text-purple-400 bg-purple-500/10 border-purple-500/30";
-                                } else if (po.lifecycleStage === 'moving_with_tracking') {
+                                } else if (po.lifecycleStage === 'moving_with_tracking' && confirmedShipments.length > 0) {
                                     statusLabel = po.lastMovementSummary ? `Moving — ${po.lastMovementSummary}` : "In Transit";
                                     statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
-                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
+                                } else if (po.lifecycleStage === 'moving_with_tracking') {
+                                    statusLabel = "Candidate Tracking";
+                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
+                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
                                     statusLabel = "Out Today";
                                     statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
-                                } else if (po.shipments?.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
+                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
                                     statusLabel = "Delivered";
                                     statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
                                 }
@@ -746,26 +755,49 @@ export default function ActivePurchasesPanel() {
                                                             url: shipment.public_tracking_url || carrierUrl(shipment.tracking_number),
                                                             status: shipment.status_display,
                                                             eta: shipment.estimated_delivery_at,
+                                                            evidenceLevel: shipment.evidenceLevel || "candidate" as const,
+                                                            evidenceReason: shipment.evidenceReason || shipment.last_source || "source not verified",
+                                                            sourceConfidence: shipment.source_confidence,
+                                                            lastCheckedAt: shipment.last_checked_at,
                                                         }))
                                                         : (po.trackingNumbers || []).map((tracking) => ({
                                                             tracking,
                                                             url: carrierUrl(tracking),
                                                             status: null,
                                                             eta: null,
+                                                            evidenceLevel: "candidate" as const,
+                                                            evidenceReason: "legacy tracking number without shipment evidence",
+                                                            sourceConfidence: null,
+                                                            lastCheckedAt: null,
                                                         }))).map((entry, i) => {
                                                         const t = entry.tracking;
                                                         const display = t.includes(":::") ? t.replace(":::", " ") : t;
+                                                        const isCandidate = entry.evidenceLevel === "candidate";
+                                                        const title = [
+                                                            isCandidate ? "Candidate tracking evidence" : "Confirmed tracking evidence",
+                                                            entry.evidenceReason,
+                                                            entry.sourceConfidence != null ? `confidence ${Math.round(entry.sourceConfidence * 100)}%` : null,
+                                                            entry.lastCheckedAt ? `carrier checked ${fmtDateTime(entry.lastCheckedAt)}` : null,
+                                                        ].filter(Boolean).join("\n");
                                                         return (
-                                                            <span key={i} className="inline-flex items-center gap-1 shrink-0">
+                                                            <span key={i} className="inline-flex items-center gap-1 shrink-0" title={title}>
+                                                                {isCandidate && (
+                                                                    <span className="text-[9px] uppercase tracking-wide px-1 py-px rounded border border-amber-500/30 text-amber-300 bg-amber-500/10">
+                                                                        candidate
+                                                                    </span>
+                                                                )}
                                                                 <a href={entry.url} target="_blank" rel="noopener noreferrer"
                                                                     onClick={e => e.stopPropagation()}
-                                                                    className="text-cyan-400 hover:text-cyan-300 hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5">
+                                                                    className={`${isCandidate ? "text-amber-300 hover:text-amber-200" : "text-cyan-400 hover:text-cyan-300"} hover:underline transition-colors shrink-0 inline-flex items-center gap-0.5`}>
                                                                     {display}<ExternalLink className="w-2 h-2 opacity-60" />
                                                                 </a>
-                                                                {(entry.status || entry.eta) && (
+                                                                {!isCandidate && (entry.status || entry.eta) && (
                                                                     <span className="text-zinc-500">
                                                                         {entry.status || "In transit"}{entry.eta ? ` • ${fmtDateTime(entry.eta)}` : ""}
                                                                     </span>
+                                                                )}
+                                                                {isCandidate && (
+                                                                    <span className="text-zinc-600">not driving ETA</span>
                                                                 )}
                                                             </span>
                                                         );
