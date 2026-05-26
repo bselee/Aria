@@ -23,7 +23,7 @@ describe("axiom SKU mappings route", () => {
         });
     });
 
-    it("rejects unauthenticated mapping writes before using the service-role client", async () => {
+    it("accepts dashboard-local mapping writes without a separate basic-auth prompt", async () => {
         const response = await POST(new Request("http://localhost/api/axiom-sku-mappings", {
             method: "POST",
             body: JSON.stringify({
@@ -33,7 +33,7 @@ describe("axiom SKU mappings route", () => {
             }),
         }) as any);
 
-        expect(response.status).toBe(401);
-        expect(fromMock).not.toHaveBeenCalled();
+        expect(response.status).toBe(200);
+        expect(fromMock).toHaveBeenCalledWith("axiom_sku_mappings");
     });
 });

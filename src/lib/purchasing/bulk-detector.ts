@@ -337,7 +337,7 @@ async function fetchCompletedPOs(
                 orderViewConnection(
                     first: 200
                     type: ["PURCHASE_ORDER"]
-                    statusId: ["ORDER_COMPLETED"]
+                    status: ["ORDER_COMPLETED"]
                     orderDate: { begin: "${beginStr}", end: "${endStr}" }
                     sort: [{ field: "orderDate", mode: "asc" }]
                     ${afterArg}

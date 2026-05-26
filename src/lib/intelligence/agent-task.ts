@@ -179,6 +179,7 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
     if (!supabase) return null;
 
     let previousStatus: AgentTaskStatus | null = null;
+    let existingId: string | null = null;
     try {
         const { data: existing } = await supabase
             .from("agent_task")
@@ -186,6 +187,7 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
             .eq("source_table", args.sourceTable)
             .eq("source_id", args.sourceId)
             .maybeSingle();
+        existingId = existing?.id ?? null;
         previousStatus = (existing?.status as AgentTaskStatus | undefined) ?? null;
     } catch {
         previousStatus = null;
@@ -208,11 +210,19 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
         playbook_state: args.playbookState ?? null,
     };
 
-    const { data, error } = await supabase
-        .from("agent_task")
-        .upsert(row, { onConflict: "source_table,source_id" })
-        .select("id")
-        .single();
+    let query;
+    if (existingId) {
+        query = supabase
+            .from("agent_task")
+            .update(row)
+            .eq("id", existingId);
+    } else {
+        query = supabase
+            .from("agent_task")
+            .insert(row);
+    }
+
+    const { data, error } = await query.select("id").single();
 
     if (error) {
         console.warn("[agent-task] upsertFromSource failed:", error.message);

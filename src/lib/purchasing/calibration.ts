@@ -252,7 +252,7 @@ export async function loadVendorRecentLineQtys(
                 orderViewConnection(
                     first: ${Math.max(limit * 2, 16)}
                     type: ["PURCHASE_ORDER"]
-                    statusId: ["ORDER_COMPLETED"]
+                    status: ["ORDER_COMPLETED"]
                     orderDate: { begin: "${beginStr}", end: "${endStr}" }
                     sort: [{ field: "orderDate", mode: "desc" }]
                 ) {
