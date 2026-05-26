@@ -37,6 +37,7 @@
 
 | Date | What Changed | Key Files |
 |---|---|---|
+| 2026-05-26 | **Dashboard Schema Fixes** — Corrected statusId GraphQL queries and agent-task unique constraint conflicts | finale/client, intelligence/agent-task |
 | 2026-05-21 | **Tracking Precision Hardening** — Hardened Oak Harbor regex prefix, centralized all tracking extraction to eliminate duplicate regexes, verified all unit + integration tests green | carriers/tracking-service, intelligence/tracking-agent |
 | 2026-05-19 | **PO Send revert** — fail-closed; dropped Gmail fallback + homemade PDF | purchasing/po-send |
 | 2026-05-19 | **Ordering UI** — drop bulk Create All; subtler snoozed rows + 1-click unsnooze | dashboard/page.tsx |
