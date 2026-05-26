@@ -47,67 +47,6 @@ const kaizenCommand: BotCommand = {
 };
 
 /**
- * /vendor <name> — Show vendor reliability scorecard.
- * Analyzes correction rates, reconciliation outcomes, and response patterns.
- */
-const vendorCommand: BotCommand = {
-    name: 'vendor',
-    description: 'Show vendor reliability scorecard',
-    handler: async (ctx, _deps) => {
-        const vendorName = getCmdText(ctx).replace(/^\/vendor\s*/, '').trim();
-        if (!vendorName) {
-            return ctx.reply(
-                '📊 *Vendor Reliability Scorecard*\n\n' +
-                'Usage: `/vendor Mountain Rose Herbs`\n\n' +
-                '_Analyzes correction rates, reconciliation outcomes, and response patterns for a specific vendor._',
-                { parse_mode: 'Markdown' }
-            );
-        }
-
-        ctx.sendChatAction('typing');
-        try {
-            const { getVendorReliability } = await import('../../lib/intelligence/feedback-loop');
-            const score = await getVendorReliability(vendorName);
-
-            if (!score) {
-                return ctx.reply(`❌ Could not retrieve vendor data — Supabase unavailable.`);
-            }
-
-            if (score.eventCount === 0) {
-                return ctx.reply(
-                    `📊 *Vendor: ${vendorName}*\n\n` +
-                    `No feedback data collected yet for this vendor.\n` +
-                    `_Data accumulates as invoices are processed and reconciled._`,
-                    { parse_mode: 'Markdown' }
-                );
-            }
-
-            const pct = score.overallScore >= 0 ? score.overallScore : 0;
-            const emoji = pct >= 85 ? '🟢' : pct >= 60 ? '🟡' : '🔴';
-            let msg = `📊 *Vendor: ${vendorName}*\n`;
-            msg += `${emoji} Overall Score: *${pct}%*\n`;
-            msg += `Based on ${score.eventCount} events (last 90 days)\n`;
-            msg += `Trend: ${score.trend === 'improving' ? '⬆️ Improving' : score.trend === 'declining' ? '⬇️ Declining' : '➡️ Stable'}\n\n`;
-            if (score.onTimePercent >= 0) msg += `• On-Time Delivery: ${score.onTimePercent}%\n`;
-            if (score.invoiceAccuracy >= 0) msg += `• Invoice Accuracy: ${score.invoiceAccuracy}%\n`;
-            if (score.documentQuality >= 0) msg += `• Document Quality: ${score.documentQuality}%\n`;
-            if (score.avgResponseDays >= 0) msg += `• Avg Response: ${score.avgResponseDays} days\n`;
-            if (score.recentIssues.length > 0) {
-                msg += `\n⚠️ Recent Issues:\n`;
-                for (const issue of score.recentIssues) {
-                    msg += `  • ${issue}\n`;
-                }
-            }
-            msg += `\n_Scores update as reconciliations and corrections accumulate._`;
-
-            await ctx.reply(msg, { parse_mode: 'Markdown' });
-        } catch (err: any) {
-            await ctx.reply(`❌ Vendor lookup failed: ${err.message}`);
-        }
-    },
-};
-
-/**
  * /housekeeping — Manually trigger data cleanup (feedback events, chat logs, etc.).
  */
 const housekeepingCommand: BotCommand = {
@@ -196,7 +135,8 @@ const voiceCommand: BotCommand = {
 
 export const kaizenCommands: BotCommand[] = [
     kaizenCommand,
-    vendorCommand,
     housekeepingCommand,
     voiceCommand,
 ];
+
+
