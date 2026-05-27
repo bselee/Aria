@@ -7,6 +7,8 @@ const {
     commitDraftPOMock,
     sendPurchaseOrderEmailMock,
     getOrderDetailsMock,
+    renderPurchaseOrderPdfMock,
+    sendGmailPdfEmailMock,
     fromMock,
     updateBySourceMock,
     upsertFromSourceMock,
@@ -14,6 +16,8 @@ const {
     commitDraftPOMock: vi.fn(),
     sendPurchaseOrderEmailMock: vi.fn(),
     getOrderDetailsMock: vi.fn(),
+    renderPurchaseOrderPdfMock: vi.fn(),
+    sendGmailPdfEmailMock: vi.fn(),
     fromMock: vi.fn(),
     updateBySourceMock: vi.fn(),
     upsertFromSourceMock: vi.fn(),
@@ -38,6 +42,14 @@ vi.mock("../supabase", () => ({
 vi.mock("../intelligence/agent-task", () => ({
     updateBySource: updateBySourceMock,
     upsertFromSource: upsertFromSourceMock,
+}));
+
+vi.mock("./po-email-pdf", () => ({
+    renderPurchaseOrderPdf: renderPurchaseOrderPdfMock,
+}));
+
+vi.mock("../gmail/send-email", () => ({
+    sendGmailPdfEmail: sendGmailPdfEmailMock,
 }));
 
 import {
@@ -86,6 +98,12 @@ describe("commitAndSendPO", () => {
             actionUrl: "/email",
         });
         getOrderDetailsMock.mockResolvedValue({ statusId: "ORDER_LOCKED", lastEmailedAt: new Date().toISOString() });
+        renderPurchaseOrderPdfMock.mockResolvedValue(Buffer.from("%PDF-1.4 test"));
+        sendGmailPdfEmailMock.mockResolvedValue({
+            messageId: "gmail-po-1",
+            threadId: "thread-1",
+            fromAddress: "bill.selee@buildasoil.com",
+        });
         updateBySourceMock.mockResolvedValue(undefined);
         upsertFromSourceMock.mockResolvedValue(null);
         fromMock.mockImplementation(() => makeTableMock());
@@ -105,20 +123,28 @@ describe("commitAndSendPO", () => {
 
         expect(commitDraftPOMock).toHaveBeenCalledWith("124790");
         expect(sendPurchaseOrderEmailMock).toHaveBeenCalledOnce();
+        expect(renderPurchaseOrderPdfMock).toHaveBeenCalledWith(makeReview());
+        expect(sendGmailPdfEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+            to: "orders@example.com",
+            subject: "BuildASoil PO # 124790 - Colorful Packaging Ltd - 5/6/2026",
+            pdfFilename: "BuildASoil-PO-124790.pdf",
+        }));
         expect(result).toMatchObject({
             orderId: "124790",
-            emailSent: false,
+            sentTo: "orders@example.com",
+            gmailMessageId: "gmail-po-1",
+            emailSent: true,
             finaleEmailSent: false,
-            emailVia: null,
-            pdfAttached: false,
+            emailVia: "gmail-fallback",
+            pdfAttached: true,
             emailSkipped: false,
-            retryable: true,
+            retryable: false,
         });
-        expect(result.emailError).toMatch(/Finale native PO email action was not available/);
-        // The verification issue list spells out what Will should do
+        expect(result.emailError).toBeUndefined();
         expect(result.verification.issues).toEqual(
             expect.arrayContaining([
-                expect.stringMatching(/Finale native email unavailable.*send manually from there/i),
+                expect.stringMatching(/Finale native email unavailable/i),
+                expect.stringMatching(/Gmail fallback sent/i),
             ]),
         );
     });

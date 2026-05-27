@@ -10,6 +10,8 @@ import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
 import * as agentTask from '../intelligence/agent-task';
 import type { CommitVerification } from './po-verification';
+import { renderPurchaseOrderPdf } from './po-email-pdf';
+import { sendGmailPdfEmail } from '../gmail/send-email';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -511,8 +513,30 @@ export async function commitAndSendPO(
             sentAt = new Date().toISOString();
             emailVia = 'finale-native';
         } catch (err: any) {
-            emailError = err?.message ?? String(err);
-            verificationIssues.push(`Finale native email unavailable: ${emailError} — PO is committed in Finale; send manually from there.`);
+            const finaleNativeError = err?.message ?? String(err);
+            emailError = finaleNativeError;
+            verificationIssues.push(`Finale native email unavailable: ${finaleNativeError}`);
+            try {
+                const pdfBuffer = await renderPurchaseOrderPdf(review);
+                const gmailResult = await sendGmailPdfEmail({
+                    to: vendorEmail,
+                    subject,
+                    body,
+                    pdfBuffer,
+                    pdfFilename: `BuildASoil-PO-${orderId}.pdf`,
+                });
+                emailSent = true;
+                pdfAttached = true;
+                sentAt = new Date().toISOString();
+                emailVia = 'gmail-fallback';
+                gmailMessageId = gmailResult.messageId;
+                gmailFromAddress = gmailResult.fromAddress;
+                emailError = undefined;
+                verificationIssues.push(`Gmail fallback sent PO PDF to ${vendorEmail}`);
+            } catch (gmailErr: any) {
+                emailError = `Finale native failed (${finaleNativeError}); Gmail fallback failed (${gmailErr?.message ?? String(gmailErr)})`;
+                verificationIssues.push(`Gmail fallback failed: ${gmailErr?.message ?? String(gmailErr)} — PO is committed in Finale; send manually from there.`);
+            }
         }
     }
 
@@ -551,9 +575,15 @@ export async function commitAndSendPO(
     const db = createClient();
     if (db) {
         const lifecycleStage = emailSent ? 'sent' : 'committed';
-        const intent = emailVia === 'finale-native' ? 'PO_SEND_FINALE' : 'PO_COMMIT';
+        const intent = emailVia === 'finale-native'
+            ? 'PO_SEND_FINALE'
+            : emailVia === 'gmail-fallback'
+                ? 'PO_SEND_GMAIL'
+                : 'PO_COMMIT';
         const actionTaken = emailVia === 'finale-native'
             ? `PO #${orderId} committed in Finale and emailed with native PDF attachment to ${vendorEmail}`
+            : emailVia === 'gmail-fallback'
+                ? `PO #${orderId} committed in Finale and emailed with Gmail PDF attachment to ${vendorEmail}`
             : emailError
                 ? `PO #${orderId} committed in Finale — vendor email failed (${emailError}). Send manually from Finale.`
                 : `PO #${orderId} committed in Finale (Email skipped/unavailable)`;
@@ -733,7 +763,25 @@ export async function retrySendEmail(
         sentAt = new Date().toISOString();
         emailVia = 'finale-native';
     } catch (err: any) {
-        emailError = err?.message ?? String(err);
+        const finaleNativeError = err?.message ?? String(err);
+        try {
+            const pdfBuffer = await renderPurchaseOrderPdf(review);
+            const gmailResult = await sendGmailPdfEmail({
+                to: vendorEmail,
+                subject,
+                body,
+                pdfBuffer,
+                pdfFilename: `BuildASoil-PO-${orderId}.pdf`,
+            });
+            emailSent = true;
+            pdfAttached = true;
+            sentAt = new Date().toISOString();
+            emailVia = 'gmail-fallback';
+            gmailMessageId = gmailResult.messageId;
+            gmailFromAddress = gmailResult.fromAddress;
+        } catch (gmailErr: any) {
+            emailError = `Finale native failed (${finaleNativeError}); Gmail fallback failed (${gmailErr?.message ?? String(gmailErr)})`;
+        }
     }
 
     // Best-effort writes: log the retry outcome to ap_activity_log + po_sends.
@@ -741,9 +789,9 @@ export async function retrySendEmail(
     if (db && emailSent && sentAt) {
         const writes: Array<PromiseLike<any>> = [
             db.from('ap_activity_log').insert({
-                email_from: 'bill.selee@buildasoil.com',
+                email_from: gmailFromAddress ?? 'bill.selee@buildasoil.com',
                 email_subject: subject,
-                intent: 'PO_SEND_FINALE',
+                intent: emailVia === 'gmail-fallback' ? 'PO_SEND_GMAIL' : 'PO_SEND_FINALE',
                 action_taken: `PO #${orderId} email retry succeeded via Finale native → ${vendorEmail}`,
                 notified_slack: false,
                 metadata: {
@@ -754,6 +802,8 @@ export async function retrySendEmail(
                     emailVia,
                     pdfAttached,
                     finaleEmailActionUrl,
+                    gmailMessageId,
+                    gmailFromAddress,
                     isRetry: true,
                 },
             }),
