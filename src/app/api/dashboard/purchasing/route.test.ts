@@ -31,10 +31,17 @@ vi.mock("@/lib/purchasing/assessment-service", () => ({
 }));
 
 import { GET, POST } from "./route";
+import { resaleSlot, bomSlot } from "@/lib/purchasing/cache";
 
 describe("dashboard purchasing route", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        resaleSlot.value = null;
+        resaleSlot.at = 0;
+        resaleSlot.promise = null;
+        bomSlot.value = null;
+        bomSlot.at = 0;
+        bomSlot.promise = null;
 
         finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
             this.getBOMDemand = vi.fn().mockResolvedValue([]);
@@ -272,5 +279,62 @@ describe("dashboard purchasing route", () => {
             blockingPO: { orderId: "124832" },
         });
         expect(createDraftMock).not.toHaveBeenCalled();
+    });
+
+    it("uses warm purchasing cache for draft creation instead of rescanning Finale", async () => {
+        const cachedGroup = {
+            vendorName: "FedEx Supplies",
+            vendorPartyId: "party-2",
+            urgency: "warning" as const,
+            items: [
+                {
+                    productId: "LABEL-200",
+                    productName: "Thermal Label",
+                    supplierName: "FedEx Supplies",
+                    supplierPartyId: "party-2",
+                    unitPrice: 0.08,
+                    stockOnHand: 200,
+                    stockOnOrder: 0,
+                    purchaseVelocity: 0.8,
+                    salesVelocity: 0.8,
+                    demandVelocity: 0.8,
+                    dailyRate: 0.8,
+                    runwayDays: 250,
+                    adjustedRunwayDays: 250,
+                    leadTimeDays: 7,
+                    leadTimeProvenance: "7d default",
+                    openPOs: [],
+                    urgency: "warning" as const,
+                    explanation: "Routine reorder.",
+                    suggestedQty: 100,
+                    orderIncrementQty: 1,
+                    isBulkDelivery: false,
+                    finaleReorderQty: 100,
+                    finaleStockoutDays: 250,
+                    finaleConsumptionQty: 0,
+                    finaleDemandQty: 24,
+                    reorderMethod: "demand_velocity" as const,
+                },
+            ],
+        };
+        resaleSlot.value = [cachedGroup];
+        resaleSlot.at = Date.now();
+
+        const response = await POST({
+            json: async () => ({
+                vendorPartyId: "party-2",
+                items: [{ productId: "LABEL-200", quantity: 100, unitPrice: 0.08 }],
+            }),
+        } as any);
+
+        expect(response.status).toBe(200);
+        const client = (finaleCtorMock as any).mock.results[0].value;
+        expect(client.getPurchasingIntelligence).not.toHaveBeenCalled();
+        expect(createDraftMock).toHaveBeenCalledWith(
+            "party-2",
+            [{ productId: "LABEL-200", quantity: 100, unitPrice: 0.08 }],
+            undefined,
+            undefined,
+        );
     });
 });

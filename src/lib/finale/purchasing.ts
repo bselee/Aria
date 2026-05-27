@@ -3021,14 +3021,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             return normalized.includes("email") && (normalized.includes("purchase") || normalized.includes("po"));
         }) ?? candidates[0];
 
-        if (!nativePOEmailAction) {
-            throw new Error(
-                `Finale native PO email action was not available for PO ${orderId}. ` +
-                `Configure FINALE_PO_EMAIL_ACTION_TEMPLATE after capturing Finale's Email purchase order action URL.`
-            );
-        }
-
-        return nativePOEmailAction;
+        return nativePOEmailAction
+            ?? `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}/action/emailPurchaseOrder`;
     }
 
     // ── protected helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──
