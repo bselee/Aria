@@ -4,7 +4,7 @@ import { FinaleClient } from '../lib/finale/client';
 
 async function test() {
     const client = new FinaleClient();
-    await client.testConnection();
+    // testConnection is not a method on the decomposed client
 
     console.log("\n═══ Today's Received POs ═══\n");
     const received = await client.getTodaysReceivedPOs();

@@ -6,6 +6,7 @@
  */
 
 import { recommendQty } from "@/lib/purchasing/qty-recommender";
+import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import {
     loadActiveReservations,
@@ -2861,6 +2862,56 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
         const groups: PurchasingGroup[] = [];
         for (const groupItems of byVendor.values()) {
+            const partyId = groupItems[0].supplierPartyId;
+            const moq = moqCache.get(partyId);
+            
+            // If there's an MOQ and we have a critical item triggering a purchase
+            const hasCriticalTrigger = groupItems.some(item => item.urgency === "critical" && item.suggestedQty > 0);
+            
+            if (moq && (moq.minimumOrderDollars || moq.minimumOrderEaches) && hasCriticalTrigger) {
+                const topUps = applySmartMOQTopUp(
+                    groupItems.map(item => ({
+                        productId: item.productId,
+                        suggestedQty: item.suggestedQty,
+                        unitPrice: item.unitPrice,
+                        orderIncrementQty: item.orderIncrementQty,
+                        dailyRate: item.dailyRate,
+                        stockOnHand: item.stockOnHand,
+                        stockOnOrder: item.stockOnOrder,
+                        reservedQty: item.recommendation?.reservedQty ?? 0,
+                        adjustedRunwayDays: item.adjustedRunwayDays,
+                        urgency: item.urgency,
+                        productName: item.productName,
+                    })),
+                    {
+                        minimumOrderDollars: moq.minimumOrderDollars,
+                        minimumOrderEaches: moq.minimumOrderEaches,
+                    },
+                    180 // max cover days
+                );
+                
+                for (const tu of topUps) {
+                    if (tu.topUpQty > 0) {
+                        const item = groupItems.find(i => i.productId === tu.productId);
+                        if (item) {
+                            item.suggestedQty = tu.suggestedQty;
+                            item.explanation += ` [Smart MOQ Top-up: +${tu.topUpQty} units to satisfy vendor order minimums]`;
+                            
+                            if (item.recommendation) {
+                                if (!item.recommendation.provenance) {
+                                    item.recommendation.provenance = [];
+                                }
+                                item.recommendation.provenance.push({
+                                    step: "smart_moq_topup",
+                                    detail: `Added ${tu.topUpQty} units as top-up (runway was ${Math.round(item.adjustedRunwayDays)}d) to meet MOQ requirement`,
+                                    value: tu.suggestedQty,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             groupItems.sort((a, b) =>
                 urgencyRank[a.urgency] - urgencyRank[b.urgency] || a.runwayDays - b.runwayDays
             );

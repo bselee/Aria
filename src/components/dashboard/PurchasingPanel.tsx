@@ -175,9 +175,12 @@ type OpenPODetail = {
     trackingNumbers?: string[];
     lifecycleStage?: string;
     vendorAcknowledgedAt?: string | null;
+    humanReplyDetectedAt?: string | null;
+    trackingRequestedAt?: string | null;
     sentVerification?: { verified?: boolean; sentAt?: string | null; source?: string | null };
     isReceived?: boolean;
     recLinks?: RecLink[];
+    vendorOrdersEmail?: string | null;
 };
 
 // ── constants ──────────────────────────────────────────────────────────────
@@ -350,11 +353,14 @@ export default function PurchasingPanel() {
                         trackingNumbers: Array.isArray(p.trackingNumbers) ? p.trackingNumbers : [],
                         lifecycleStage: p.lifecycleStage,
                         vendorAcknowledgedAt: p.vendorAcknowledgedAt ?? null,
+                        humanReplyDetectedAt: p.humanReplyDetectedAt ?? null,
+                        trackingRequestedAt: p.trackingRequestedAt ?? null,
                         sentVerification: p.sentVerification
                             ? { verified: p.sentVerification.verified, sentAt: p.sentVerification.sentAt, source: p.sentVerification.source }
                             : undefined,
                         isReceived: p.isReceived,
                         recLinks: Array.isArray(p.recLinks) ? p.recLinks : [],
+                        vendorOrdersEmail: p.vendorOrdersEmail ?? null,
                     });
                 }
                 setOpenPosDetail(m);
@@ -2107,6 +2113,8 @@ export default function PurchasingPanel() {
                                                                                         const pieces: string[] = [];
                                                                                         if (detail?.sentVerification?.verified) pieces.push(`sent ✓`);
                                                                                         if (detail?.vendorAcknowledgedAt) pieces.push(`acked ${new Date(detail.vendorAcknowledgedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
+                                                                                        if (detail?.humanReplyDetectedAt) pieces.push(`reply 💬`);
+                                                                                        if (detail?.trackingRequestedAt) pieces.push(`poke ✉️`);
                                                                                         if ((detail?.trackingNumbers?.length ?? 0) > 0) pieces.push(`📦 ${detail!.trackingNumbers![0].slice(-6)}`);
                                                                                         if (detail?.expectedDate) pieces.push(`ETA ${new Date(detail.expectedDate).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
                                                                                         // Phase C — find the rec link for THIS sku (the one being recommended).
