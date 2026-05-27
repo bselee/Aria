@@ -15,7 +15,14 @@ type ReceivedPO = {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    items: Array<{
+        productId: string;
+        quantity: number;
+        orderedQuantity?: number;
+        receivedQuantity?: number;
+        receivedInWindow?: number;
+        openQuantity?: number;
+    }>;
     receiptHistory?: Array<{
         shipmentId: string;
         receiveDate: string;
@@ -56,11 +63,24 @@ function fmtDollars(n: number): string {
     return '$' + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
+function getDynamicReceiptStatus(po: ReceivedPO): "full" | "partial" | "received" {
+    if (!po.items || po.items.length === 0) {
+        return po.receiptStatus || "received";
+    }
+    const hasDetails = po.items.some(i => i.receivedQuantity !== undefined);
+    if (!hasDetails) {
+        return po.receiptStatus || "received";
+    }
+    const isFull = po.items.every(i => (i.receivedQuantity ?? 0) >= (i.orderedQuantity ?? i.quantity));
+    return isFull ? "full" : "partial";
+}
+
 function receiptBadge(po: ReceivedPO): { label: string; cls: string } | null {
-    if (po.receiptStatus === "full") {
+    const status = getDynamicReceiptStatus(po);
+    if (status === "full") {
         return { label: "FULL", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" };
     }
-    if (po.receiptStatus === "partial") {
+    if (status === "partial") {
         return { label: "PARTIAL", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" };
     }
     return null;
@@ -72,7 +92,8 @@ function receiveSortValue(po: ReceivedPO): number {
 }
 
 function partialDiscrepancy(po: ReceivedPO): string | null {
-    if (po.receiptStatus !== "partial" || po.items.length === 0) return null;
+    const status = getDynamicReceiptStatus(po);
+    if (status !== "partial" || po.items.length === 0) return null;
     const skuList = po.items
         .filter(item => item.openQuantity == null || item.openQuantity > 0)
         .map(item => item.productId)
@@ -87,7 +108,7 @@ function fmtQty(n: number | null | undefined): string {
 }
 
 function hasPartialLineQuantities(po: ReceivedPO): boolean {
-    return po.receiptStatus === "partial" && po.items.some(item => item.receivedQuantity != null || item.openQuantity != null);
+    return po.items.some(item => item.receivedQuantity !== undefined || item.receivedInWindow !== undefined);
 }
 
 function receiptItemsText(items: Array<{ productId: string; quantity: number }>): string {
@@ -348,10 +369,11 @@ export default function ReceivedItemsPanel() {
                                                     : badgeMatch.isBom
                                                     ? "text-cyan-400/90 font-medium"
                                                     : "text-zinc-200";
+                                                const displayQty = item.receivedInWindow !== undefined ? item.receivedInWindow : (item.receivedQuantity ?? item.quantity);
                                                 return (
                                                     <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${badgeColor}`}>
                                                         {item.productId}
-                                                        <span className="text-zinc-400 ml-0.5">×{item.quantity.toLocaleString()}</span>
+                                                        <span className="text-zinc-400 ml-0.5">×{displayQty.toLocaleString()}</span>
                                                     </span>
                                                 );
                                             })}
@@ -365,27 +387,75 @@ export default function ReceivedItemsPanel() {
                                                     return (
                                                         <div key={`${po.orderId}-${item.productId}-partial`} className="text-[10.5px] font-mono text-amber-200/90">
                                                             {item.productId} ordered {fmtQty(ordered)}
-                                                            <span className="text-zinc-500"> Â· </span>
+                                                            <span className="text-zinc-500"> · </span>
                                                             received {fmtQty(received)}
-                                                            <span className="text-zinc-500"> Â· </span>
+                                                            <span className="text-zinc-500"> · </span>
                                                             open {fmtQty(open)}
                                                         </div>
                                                     );
                                                 })}
                                             </div>
                                         )}
-                                        {po.receiptStatus === "partial" && po.receiptHistory && po.receiptHistory.length > 0 && (
+                                        {po.receiptHistory && po.receiptHistory.length > 0 && (
                                             <div className="mt-1 space-y-0.5 border-l border-amber-500/30 pl-2">
                                                 {po.receiptHistory.map((receipt, index) => (
                                                     <div key={`${po.orderId}-${receipt.shipmentId || index}`} className="text-[10.5px] font-mono text-zinc-400">
                                                         <span className="text-amber-300">rcv{index + 1} {fmtDateTime(receipt.receiveDateTime || receipt.receiveDate)}</span>
                                                         {receipt.receivedBy && <span className="text-cyan-300/70"> by {receipt.receivedBy}</span>}
-                                                        <span className="text-zinc-600"> Â· </span>
+                                                        <span className="text-zinc-600"> · </span>
                                                         <span className="text-zinc-300">{receiptItemsText(receipt.items)}</span>
                                                     </div>
                                                 ))}
                                             </div>
                                         )}
+                                        {/* Review checklist and fulfillment indicators */}
+                                        <div className="mt-2.5 pt-2 border-t border-zinc-800/50 flex flex-col md:flex-row md:items-center justify-between gap-3 bg-zinc-900/10 p-2 rounded">
+                                            {/* Left: What is left to receive or if fully fulfilled */}
+                                            <div className="text-[11px] font-mono shrink-0">
+                                                {(() => {
+                                                    const status = getDynamicReceiptStatus(po);
+                                                    if (status === "full") {
+                                                        return (
+                                                            <div className="flex items-center gap-1.5 text-emerald-400">
+                                                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                                                                <span>PO Fulfilled</span>
+                                                            </div>
+                                                        );
+                                                    } else {
+                                                        const openLines = po.items.filter(item => (item.openQuantity ?? 0) > 0);
+                                                        if (openLines.length === 0) {
+                                                            return <span className="text-zinc-500">Fully Received</span>;
+                                                        }
+                                                        return (
+                                                            <div className="space-y-0.5">
+                                                                <span className="text-amber-300 font-semibold">Remaining to Receive:</span>
+                                                                {openLines.map(item => (
+                                                                    <div key={item.productId} className="text-zinc-400 text-[10px]">
+                                                                        {item.productId}: <span className="text-amber-200">-{fmtQty(item.openQuantity)}</span> left
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        );
+                                                    }
+                                                })()}
+                                            </div>
+
+                                            {/* Right: Manual Verification Checklist prior to Autocomplete */}
+                                            <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-zinc-500 bg-zinc-950/40 px-2 py-1 rounded border border-zinc-800/40">
+                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none">
+                                                    <input type="checkbox" className="accent-cyan-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
+                                                    <span>Needs Shipping?</span>
+                                                </label>
+                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none">
+                                                    <input type="checkbox" className="accent-cyan-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
+                                                    <span>Adjust per Invoice?</span>
+                                                </label>
+                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none text-amber-400/90 font-semibold">
+                                                    <input type="checkbox" className="accent-amber-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
+                                                    <span>Final Check?</span>
+                                                </label>
+                                            </div>
+                                        </div>
                                     </div>
                                 );
                             })}

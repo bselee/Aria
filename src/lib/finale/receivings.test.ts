@@ -208,6 +208,7 @@ describe("receivings helpers", () => {
                 quantity: 300,
                 orderedQuantity: 300,
                 receivedQuantity: 225,
+                receivedInWindow: 225,
                 openQuantity: 75,
             },
         ]);
