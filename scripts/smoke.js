@@ -24,23 +24,37 @@ execSync('node -e "setTimeout(() => {}, 5000)"');
 try {
     const logOutput = execSync(`pm2 logs ${proc} --lines 200 --nostream`, { encoding: 'utf8' });
     const lines = logOutput.split('\n');
-    
-    // Find the sequential log boundary representing the latest PM2 restart/reload
-    let startingIndex = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i];
-        if (
-            line.includes('starting in') || 
-            line.includes('online') || 
-            (line.includes('PM2') && line.includes(proc))
-        ) {
-            startingIndex = i;
-            break;
-        }
-    }
-    const linesAfterRestart = lines.slice(startingIndex);
 
-    const errorLines = linesAfterRestart.filter(line => {
+    const errorLines = lines.filter(line => {
+        // Match timestamp format: YYYY-MM-DD HH:MM:SS [-+]HH:MM
+        const match = line.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([-+]\d{2}:\d{2})/);
+        if (match) {
+            const datePart = match[1];
+            const timePart = match[2];
+            const tzPart = match[3];
+            const logTime = new Date(`${datePart}T${timePart}${tzPart}`).getTime();
+            
+            // Only inspect lines printed in the last 45 seconds (post-restart window)
+            if (Date.now() - logTime > 45000) {
+                return false;
+            }
+        } else {
+            // Match simple timestamp format: YYYY-MM-DD HH:MM:SS
+            const simpleMatch = line.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+            if (simpleMatch) {
+                const datePart = simpleMatch[1];
+                const timePart = simpleMatch[2];
+                const logTime = new Date(`${datePart}T${timePart}`).getTime();
+                
+                if (Date.now() - logTime > 45000) {
+                    return false;
+                }
+            } else {
+                // If there's no recognizable timestamp, ignore it (historic or system noise)
+                return false;
+            }
+        }
+
         const hasError = /error|failed|unhandled|ECONNREFUSED/i.test(line);
         const isExcluded = /openrouter.*falling back|info\s/i.test(line);
         return hasError && !isExcluded;
