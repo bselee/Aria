@@ -171,7 +171,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo, purchaseDestination } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -226,16 +226,18 @@ export async function POST(req: NextRequest) {
         const missingSkus = items
             .map((item: any) => String(item.productId))
             .filter((sku: string) => !guards.some(guard => guard.productId === sku));
-        const nonCommitGuards = guards.filter(guard => guard.decision !== 'commit');
-        if (missingSkus.length > 0 || nonCommitGuards.length > 0) {
-            return NextResponse.json(
-                {
-                    error: 'Draft blocked: requested lines must satisfy lead time plus 30 days before autonomous PO creation.',
-                    missingSkus,
-                    guards,
-                },
-                { status: 409 },
-            );
+        if (!ignoreCommitGuards) {
+            const nonCommitGuards = guards.filter(guard => guard.decision !== 'commit');
+            if (missingSkus.length > 0 || nonCommitGuards.length > 0) {
+                return NextResponse.json(
+                    {
+                        error: 'Draft blocked: requested lines must satisfy lead time plus 30 days before autonomous PO creation.',
+                        missingSkus,
+                        guards,
+                    },
+                    { status: 409 },
+                );
+            }
         }
 
         let recentPOs: any[] = [];
