@@ -69,24 +69,22 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                 }
             }
 
-            // 2. Fetch the vendor autonomy level
-            const autonomyLevel = await getVendorAutonomyLevel(draft.vendorName);
-            if (autonomyLevel === 0) {
-                // Level 0: Manual — do not automate
-                continue;
-            }
-
-            // 2.5 Safety Check: has this PO already been manually sent by email?
+            // 2. Safety Check: has this PO already been manually sent by email?
+            // This is a status-healing/sync step that runs for ALL vendors (even manual Level 0).
             const alreadyEmailed = await isPOAlreadyEmailed(draft.orderId);
             if (alreadyEmailed) {
                 console.log(`[autonomy] PO #${draft.orderId} has already been emailed. Auto-marking as sent.`);
                 
                 try {
+                    // Commit in Finale so that its status changes to ORDER_LOCKED/ORDER_COMMITTED and stock is officially marked on order
+                    await finale.commitDraftPO(draft.orderId);
+                    console.log(`[autonomy] PO #${draft.orderId} committed successfully in Finale`);
+
                     await db.from('ap_activity_log').insert({
                         email_from: draft.vendorName,
                         email_subject: `PO #${draft.orderId} manually sent detection`,
                         intent: 'PO_RECEIVED',
-                        action_taken: `PO #${draft.orderId} manually sent — detected via Gmail search. Marking as sent in database.`,
+                        action_taken: `PO #${draft.orderId} manually sent — detected via Gmail search. Marking as sent in database & committing in Finale.`,
                         metadata: { poId: draft.orderId, supplier: draft.vendorName, source: 'gmail_search_proof' },
                     });
 
@@ -110,17 +108,22 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 
                     await bot.telegram.sendMessage(
                         chatId,
-                        `ℹ️ *Draft PO #${draft.orderId} Detected!*
-` +
-                        `*Vendor*: ${draft.vendorName}
-` +
-                        `*Status*: Already manually sent (proven via Gmail search). Auto-marked as sent in database.`,
+                        `ℹ️ *Draft PO #${draft.orderId} Detected!*\n` +
+                        `*Vendor*: ${draft.vendorName}\n` +
+                        `*Status*: Already manually sent (proven via Gmail search). Auto-committed in Finale and marked sent in database.`,
                         { parse_mode: 'Markdown' }
                     );
                     processed++;
                 } catch (dbErr: any) {
                     console.warn(`[autonomy] Failed to write manual sent state for PO #${draft.orderId}:`, dbErr.message);
                 }
+                continue;
+            }
+
+            // 3. Fetch the vendor autonomy level for new purchases
+            const autonomyLevel = await getVendorAutonomyLevel(draft.vendorName);
+            if (autonomyLevel === 0) {
+                // Level 0: Manual — do not automate
                 continue;
             }
 
