@@ -293,6 +293,49 @@ export interface ProductConsumptionAnalysis {
 // ──────────────────────────────────────────────────────────────────────────
 
 export class FinaleCoreClient {
+    // Process-wide static queue and rate-limiting to throttle API requests globally across all instances
+    private static requestQueue: (() => Promise<void>)[] = [];
+    private static isProcessingQueue = false;
+    private static lastRequestTime = 0;
+    private static readonly REQUEST_INTERVAL_MS = 500; // Throttle to 2 requests per second (120 requests/minute max recommended by Descartes)
+
+    private static async enqueueRequest<T>(fn: () => Promise<T>): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            FinaleCoreClient.requestQueue.push(async () => {
+                try {
+                    const res = await fn();
+                    resolve(res);
+                } catch (err) {
+                    reject(err);
+                }
+            });
+            FinaleCoreClient.processQueue();
+        });
+    }
+
+    private static async processQueue(): Promise<void> {
+        if (FinaleCoreClient.isProcessingQueue) return;
+        FinaleCoreClient.isProcessingQueue = true;
+
+        while (FinaleCoreClient.requestQueue.length > 0) {
+            const now = Date.now();
+            const timeSinceLast = now - FinaleCoreClient.lastRequestTime;
+            const waitTime = Math.max(0, FinaleCoreClient.REQUEST_INTERVAL_MS - timeSinceLast);
+
+            if (waitTime > 0) {
+                await new Promise(r => setTimeout(r, waitTime));
+            }
+
+            const nextReq = FinaleCoreClient.requestQueue.shift();
+            if (nextReq) {
+                FinaleCoreClient.lastRequestTime = Date.now();
+                nextReq().catch(() => {});
+            }
+        }
+
+        FinaleCoreClient.isProcessingQueue = false;
+    }
+
     protected authHeader: string;
     protected apiBase: string;
     protected accountPath: string;
@@ -309,9 +352,17 @@ export class FinaleCoreClient {
 
     /**
      * Retries on: 5xx server errors, network failures, 429 rate limits.
-     * Does NOT retry: 4xx client errors (bad request, not found, auth failure).
+     * Gated by process-wide global rate-limiting queue (max 120 reqs/min).
      */
     protected async fetchWithRetry<T>(
+        fn: () => Promise<Response>,
+        label: string,
+        maxRetries = 3
+    ): Promise<T> {
+        return FinaleCoreClient.enqueueRequest(() => this.executeFetchWithRetry<T>(fn, label, maxRetries));
+    }
+
+    private async executeFetchWithRetry<T>(
         fn: () => Promise<Response>,
         label: string,
         maxRetries = 3
