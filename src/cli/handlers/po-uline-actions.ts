@@ -92,6 +92,7 @@ export async function handlePoReview(ctx: Context, finale: FinaleClient, orderId
  */
 export async function handlePoConfirmSend(ctx: Context, sendId: string): Promise<void> {
     await ctx.answerCbQuery('Committing and sending…');
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
     const { pending, action: result } = await handleTelegramPOSendCallback({ sendId });
 
     if (!pending) {
@@ -159,6 +160,7 @@ export async function handlePoConfirmSend(ctx: Context, sendId: string): Promise
  */
 export async function handlePoCancelSend(ctx: Context, sendId: string): Promise<void> {
     await ctx.answerCbQuery('Cancelled');
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
     await expirePendingPOSend(sendId);
     const original = ctx.callbackQuery && ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
         ? ctx.callbackQuery.message.text : '';
@@ -170,6 +172,7 @@ export async function handlePoCancelSend(ctx: Context, sendId: string): Promise<
  */
 export async function handlePoSkip(ctx: Context, orderId: string): Promise<void> {
     await ctx.answerCbQuery('Skipped');
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
     const original = ctx.callbackQuery && ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
         ? ctx.callbackQuery.message.text : '';
     await ctx.editMessageText(original + '\n\n_Skipped — PO stays as draft in Finale._', { parse_mode: 'Markdown' });

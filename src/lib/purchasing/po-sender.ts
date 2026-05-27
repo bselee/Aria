@@ -256,6 +256,24 @@ function normalizeEmail(raw: string): string {
  * An invalid stored address is treated as no match so we never ship a PO to
  * "JOHN@VENDOR" or "salessomeonelse@example".
  */
+/**
+ * Resolves the autonomy level of a vendor from vendor_profiles.
+ * 0 = Manual (default), 1 = Auto-Draft, 2 = Auto-Commit & Send
+ */
+export async function getVendorAutonomyLevel(vendorName: string): Promise<number> {
+    const db = createClient();
+    if (!db) return 0;
+
+    const firstWord = vendorName.split(/\s+/).find(w => w.length > 3) ?? vendorName.split(' ')[0];
+    const { data: vp } = await db
+        .from('vendor_profiles')
+        .select('autonomy_level')
+        .ilike('vendor_name', `%${firstWord}%`)
+        .maybeSingle();
+
+    return vp?.autonomy_level ?? 0;
+}
+
 export async function lookupVendorOrderEmail(
     vendorName: string,
     vendorPartyId: string
