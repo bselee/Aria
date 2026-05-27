@@ -23,25 +23,31 @@ execSync('node -e "setTimeout(() => {}, 5000)"');
 // 2. Check PM2 logs for current-hour errors
 try {
     const logOutput = execSync(`pm2 logs ${proc} --lines 200 --nostream`, { encoding: 'utf8' });
-    const now = new Date();
-    // format as YYYY-MM-DD HH:
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const date = String(now.getDate()).padStart(2, '0');
-    const hour = String(now.getHours()).padStart(2, '0');
-    const hourPrefix = `${year}-${month}-${date} ${hour}:`;
-
     const lines = logOutput.split('\n');
-    const errorLines = lines.filter(line => {
-        // filter for current hour, check error keywords, exclude openrouter fallback warnings
-        const hasHour = line.includes(hourPrefix);
+    
+    // Find the sequential log boundary representing the latest PM2 restart/reload
+    let startingIndex = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (
+            line.includes('starting in') || 
+            line.includes('online') || 
+            (line.includes('PM2') && line.includes(proc))
+        ) {
+            startingIndex = i;
+            break;
+        }
+    }
+    const linesAfterRestart = lines.slice(startingIndex);
+
+    const errorLines = linesAfterRestart.filter(line => {
         const hasError = /error|failed|unhandled|ECONNREFUSED/i.test(line);
         const isExcluded = /openrouter.*falling back|info\s/i.test(line);
-        return hasHour && hasError && !isExcluded;
+        return hasError && !isExcluded;
     });
 
     if (errorLines.length > 0) {
-        console.error(`[smoke][${proc}] Errors detected in current-hour window:`);
+        console.error(`[smoke][${proc}] Errors detected post-restart:`);
         console.error(errorLines.join('\n'));
         process.exit(1);
     }
