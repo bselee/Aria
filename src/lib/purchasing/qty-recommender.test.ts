@@ -62,6 +62,24 @@ describe("recommendQty — basic math", () => {
         expect(result.suggestedQty).toBe(100);
     });
 
+    it("defaults to lead time plus 30 days when no cover buffer is provided", () => {
+        const result = recommendQty({
+            sku: "BOX-101",
+            dailyRate: 2,
+            dailyRateSource: "demand",
+            dailyRateLabel: "90d demand",
+            stockOnHand: 50,
+            stockOnOrder: 0,
+            openPOCount: 0,
+            leadTimeDays: 14,
+            leadTimeProvenance: "14d (vendor median)",
+            orderIncrementQty: null,
+        });
+
+        expect(result.coverDays).toBe(44);
+        expect(result.rawNeededEaches).toBe(38);
+    });
+
     it("returns zero when stock + on-order already covers cover window", () => {
         // 2/d × 74d = 148 target; 200 on hand covers it
         const result = recommendQty(baseInput({ dailyRate: 2, stockOnHand: 200, leadTimeDays: 14 }));

@@ -49,10 +49,10 @@ describe("gatherAutoReorderItems", () => {
                             openPOs: [],
                             urgency: "critical",
                             explanation: "Need reorder now.",
-                            suggestedQty: 4,
+                            suggestedQty: 12,
                             orderIncrementQty: 1,
                             isBulkDelivery: false,
-                            finaleReorderQty: 4,
+                            finaleReorderQty: 12,
                             finaleStockoutDays: 6,
                             finaleConsumptionQty: 0,
                             finaleDemandQty: 27,
@@ -69,7 +69,7 @@ describe("gatherAutoReorderItems", () => {
         expect(manifest.items).toHaveLength(1);
         expect(manifest.items[0]).toMatchObject({
             finaleSku: "H-4987",
-            quantity: 4,
+            quantity: 12,
         });
     });
 });

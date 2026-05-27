@@ -255,7 +255,7 @@ async function gatherAllUlineDraftPOs(finale: FinaleClient): Promise<OrderManife
  *
  * DECISION(2026-03-16): This connects getPurchasingIntelligence() directly to the
  * ULINE ordering pipeline. Only items from the ULINE vendor with urgency 'critical'
- * or 'warning' are included. Quantities use Finale's suggestedQty (velocity × (leadTime + 60d)).
+ * or 'warning' are included. Quantities use Finale's suggestedQty (velocity × (leadTime + 30d)).
  *
  * @param finale - FinaleClient instance
  * @returns OrderManifest with auto-detected items (sourceType='auto_reorder')
@@ -433,8 +433,13 @@ export async function gatherAutoReorderItems(finale: FinaleClient): Promise<Orde
             continue;
         }
 
+        const commitReadySkus = new Set(plan.commitReadyItems.map(item => item.productId));
+
         for (const line of plan.assessedItems) {
             const item = line.item;
+            if (!commitReadySkus.has(item.productId)) {
+                continue;
+            }
             if (!(line.assessment.decision === 'order' || line.assessment.decision === 'reduce')) {
                 continue;
             }

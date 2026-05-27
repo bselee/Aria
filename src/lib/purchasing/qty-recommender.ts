@@ -262,7 +262,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // v2.1 — vendor policy targetCoverDays takes precedence over lead+buffer×multiplier.
     // When targetCoverDays is set, safetyMultiplier is intentionally bypassed: Will
     // set the cover deliberately, calibration shouldn't dampen it.
-    const buffer = input.coverBufferDays ?? 60;
+    const buffer = input.coverBufferDays ?? 30;
     const safetyMultiplier = Math.max(0.5, Math.min(2.5, input.safetyMultiplier ?? 1));
     const targetCoverDays = input.targetCoverDays ?? null;
     let coverDays: number;

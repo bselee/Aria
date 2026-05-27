@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
     finaleCtorMock,
     assessGroupsMock,
+    createDraftMock,
 } = vi.hoisted(() => ({
     finaleCtorMock: vi.fn(),
     assessGroupsMock: vi.fn(),
+    createDraftMock: vi.fn(),
 }));
 
 vi.mock("@/lib/finale/client", () => ({
@@ -26,7 +28,7 @@ vi.mock("@/lib/purchasing/assessment-service", () => ({
     assessPurchasingGroups: assessGroupsMock,
 }));
 
-import { GET } from "./route";
+import { GET, POST } from "./route";
 
 describe("dashboard purchasing route", () => {
     beforeEach(() => {
@@ -34,6 +36,8 @@ describe("dashboard purchasing route", () => {
 
         finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
             this.getBOMDemand = vi.fn().mockResolvedValue([]);
+            this.getRecentPurchaseOrders = vi.fn().mockResolvedValue([]);
+            this.createDraftPurchaseOrder = createDraftMock;
             this.getPurchasingIntelligence = vi.fn().mockResolvedValue([
                 {
                     vendorName: "ULINE",
@@ -156,6 +160,11 @@ describe("dashboard purchasing route", () => {
             reorderMethod: "demand_velocity",
             assessment: { decision: "order", recommendedQty: 300 },
             candidate: { directDemand: 9, bomDemand: 0 },
+            commitGuard: {
+                decision: "draft_only",
+                targetCoverDays: 44,
+                blockReasons: ["recommended_qty_below_lead_plus_30"],
+            },
         });
     });
 
@@ -190,5 +199,32 @@ describe("dashboard purchasing route", () => {
         expect(response.status).toBe(200);
         const body = await response.json();
         expect(body.groups).toHaveLength(2);
+    });
+
+    it("rejects draft creation when requested lines fail the commit guard", async () => {
+        const response = await POST({
+            json: async () => ({
+                vendorPartyId: "party-1",
+                items: [
+                    {
+                        productId: "BOX-101",
+                        quantity: 300,
+                        unitPrice: 1.15,
+                        orderIncrementQty: 25,
+                        isBulkDelivery: false,
+                    },
+                ],
+            }),
+        } as any);
+
+        expect(response.status).toBe(409);
+        const body = await response.json();
+        expect(body.error).toContain("lead time plus 30");
+        expect(body.guards[0]).toMatchObject({
+            productId: "BOX-101",
+            decision: "draft_only",
+            blockReasons: ["recommended_qty_below_lead_plus_30"],
+        });
+        expect(createDraftMock).not.toHaveBeenCalled();
     });
 });
