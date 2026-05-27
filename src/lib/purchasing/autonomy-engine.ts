@@ -1,0 +1,169 @@
+/**
+ * @file    autonomy-engine.ts
+ * @purpose Periodically processes draft POs in Finale based on vendor autonomy levels (0/1/2)
+ * @author  Will / Antigravity
+ * @created 2026-05-27
+ * @updated 2026-05-27
+ * @deps    supabase/client, finale/client, po-sender, telegraf
+ */
+
+import { createClient } from '../supabase';
+import { FinaleClient } from '../finale/client';
+import {
+    storePendingPOSend,
+    commitAndSendPO,
+    getVendorAutonomyLevel,
+    lookupVendorOrderEmail
+} from './po-sender';
+import type { Telegraf } from 'telegraf';
+
+/**
+ * Scans Finale Inventory for draft POs and processes them according to autonomy rules:
+ * - Level 0: Manual (No action)
+ * - Level 1: Auto-Draft (Send interactive review prompt on Telegram)
+ * - Level 2: Auto-Commit & Send (Commit and email automatically, report receipt)
+ */
+export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ processed: number; errors: number }> {
+    const db = createClient();
+    if (!db) {
+        console.warn('[autonomy] Database connection unavailable — skipping scan');
+        return { processed: 0, errors: 0 };
+    }
+
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (!chatId) {
+        console.warn('[autonomy] TELEGRAM_CHAT_ID not configured — skipping scan');
+        return { processed: 0, errors: 0 };
+    }
+
+    console.log('[autonomy] Scanning for draft POs to process...');
+    let processed = 0;
+    let errors = 0;
+
+    try {
+        const finale = new FinaleClient();
+        // Fetch recent POs (last 7 days) to identify active drafts
+        const pos = await finale.getRecentPurchaseOrders(7, 100);
+        const drafts = pos.filter(po => 
+            (po.status || '').toLowerCase() === 'created' || 
+            (po.statusId || '') === 'ORDER_CREATED'
+        );
+
+        console.log(`[autonomy] Found ${drafts.length} draft PO(s) in Finale`);
+
+        for (const draft of drafts) {
+            if (!draft.orderId) continue;
+
+            // 1. Prevent duplicate processing — check if this orderId already has a session
+            const { data: existingSession } = await db
+                .from('copilot_action_sessions')
+                .select('session_id, status')
+                .eq('action_type', 'po_send')
+                .eq('payload->>orderId', draft.orderId)
+                .maybeSingle();
+
+            if (existingSession) {
+                // If it exists and succeeded or is pending, skip it
+                if (existingSession.status === 'confirmed' || existingSession.status === 'pending') {
+                    continue;
+                }
+            }
+
+            // 2. Fetch the vendor autonomy level
+            const autonomyLevel = await getVendorAutonomyLevel(draft.vendorName);
+            if (autonomyLevel === 0) {
+                // Level 0: Manual — do not automate
+                continue;
+            }
+
+            console.log(`[autonomy] Processing draft PO #${draft.orderId} for ${draft.vendorName} at Autonomy Level ${autonomyLevel}`);
+
+            try {
+                // 3. Resolve PO details and vendor order email
+                const review = await finale.getDraftPOForReview(draft.orderId);
+                const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
+
+                if (!email) {
+                    console.warn(`[autonomy] Missing email for vendor ${review.vendorName} on PO #${draft.orderId}`);
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `⚠️ *Autonomy Blocked on PO #${draft.orderId}*\n` +
+                        `*Vendor*: ${review.vendorName}\n` +
+                        `*Reason*: No order contact email on file. Update vendor\\_profiles or vendors table.`,
+                        { parse_mode: 'Markdown' }
+                    );
+                    errors++;
+                    continue;
+                }
+
+                // 4. Act according to autonomy levels
+                if (autonomyLevel === 1) {
+                    // Level 1: Auto-Draft Review Prompter
+                    const sendId = await storePendingPOSend(draft.orderId, review, email, source, {
+                        channel: 'telegram',
+                        telegramChatId: chatId,
+                    });
+
+                    const msg = `📦 *Draft PO #${draft.orderId} Generated (Level 1)*\n` +
+                                `*Vendor*: ${review.vendorName}\n` +
+                                `*Total*: $${review.total.toFixed(2)}\n\n` +
+                                `☝️ _Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
+
+                    await bot.telegram.sendMessage(chatId, msg, {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '🔍 Review & Send', callback_data: `po_review_${draft.orderId}` },
+                                { text: '⏭️ Skip', callback_data: `po_skip_${draft.orderId}` }
+                            ]]
+                        }
+                    });
+
+                    processed++;
+                    console.log(`[autonomy] Level 1 enqueued and Telegram review sent for PO #${draft.orderId}`);
+
+                } else if (autonomyLevel === 2) {
+                    // Level 2: Auto-Commit & Send
+                    const sendId = await storePendingPOSend(draft.orderId, review, email, source, {
+                        channel: 'telegram',
+                        telegramChatId: chatId,
+                    });
+
+                    // Execute autonomous commit + email send via fallback
+                    const outcome = await commitAndSendPO(sendId, 'telegram');
+
+                    const link = `https://app.finaleinventory.com/buildasoilorganics/purchaseOrder?orderId=${draft.orderId}`;
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `✅ *PO #${draft.orderId} Auto-Sent (Level 2)*\n` +
+                        `*Vendor*: ${review.vendorName}\n` +
+                        `*Total*: $${review.total.toFixed(2)}\n` +
+                        `*Sent To*: ${email} (via active Gmail fallback)\n` +
+                        `🔗 [View in Finale](${link})`,
+                        { parse_mode: 'Markdown', disable_web_page_preview: true }
+                    );
+
+                    processed++;
+                    console.log(`[autonomy] Level 2 completed and sent PO #${draft.orderId}`);
+                }
+
+            } catch (innerErr: any) {
+                console.error(`[autonomy] Error processing PO #${draft.orderId}:`, innerErr);
+                await bot.telegram.sendMessage(
+                    chatId,
+                    `🚨 *Autonomous PO #${draft.orderId} Failed*\n` +
+                    `*Vendor*: ${draft.vendorName}\n` +
+                    `*Error*: ${innerErr.message || innerErr}`,
+                    { parse_mode: 'Markdown' }
+                );
+                errors++;
+            }
+        }
+
+    } catch (err: any) {
+        console.error('[autonomy] Scan failed:', err);
+        errors++;
+    }
+
+    return { processed, errors };
+}

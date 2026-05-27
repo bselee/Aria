@@ -324,3 +324,16 @@ defineJob({
     description: "Issue orchestrator (every 5m, gated by ISSUE_ORCHESTRATOR_ENABLED).",
     handler: async () => { await ops()?.runIssueOrchestrator(); },
 });
+
+defineJob({
+    name: "autonomy-scan",
+    schedule: "*/10 * * * *", // every 10 minutes
+    onFail: "log",
+    description: "Scan for draft POs and process Level 1 & Level 2 vendor autonomy actions.",
+    handler: async () => {
+        const o = ops();
+        if (!o || !o.bot) return;
+        const { autoProcessAutonomyDrafts } = await import("../../lib/purchasing/autonomy-engine");
+        await autoProcessAutonomyDrafts(o.bot);
+    },
+});
