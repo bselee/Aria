@@ -410,6 +410,66 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         expect(thirtyBtn?.textContent).toMatch(/1\s+30/);
     });
 
+    it("shows same-vendor 30-day add-ons when Order Now triggers that vendor", async () => {
+        stubLocalStorage();
+        localStorage.setItem("aria-dash-purchasing-focus", "order_now");
+
+        const immediate = makeWatchItem({
+            productId: "BLM212",
+            productName: "Blumat Digital Moisture Meter",
+            supplierName: "Sustainable Village",
+            supplierPartyId: "10809",
+            runwayDays: 13,
+            adjustedRunwayDays: 13,
+            finaleStockoutDays: 13,
+            leadTimeDays: 14,
+            urgency: "critical",
+        });
+        const addOn = makeWatchItem({
+            productId: "BLM219",
+            productName: "Blumat 9 inch Pre-set Carrot",
+            supplierName: "Sustainable Village",
+            supplierPartyId: "10809",
+            urgency: "warning",
+            runwayDays: 24,
+            adjustedRunwayDays: 24,
+            finaleStockoutDays: null,
+            leadTimeDays: 14,
+            suggestedQty: 100,
+        });
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Sustainable Village",
+                    vendorPartyId: "10809",
+                    urgency: "critical",
+                    items: [immediate, addOn],
+                },
+            ],
+            cachedAt: "2026-05-05T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+            const url = String(input);
+            let body: any = emptyPayload;
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        fireEvent.click(await screen.findByText(/Sustainable Village/i));
+
+        expect(await screen.findByText(/Blumat Digital Moisture Meter/i)).toBeTruthy();
+        expect(await screen.findByText(/Blumat 9 inch Pre-set Carrot/i)).toBeTruthy();
+    });
+
     it("migrates legacy localStorage 'today' to order_now (active = red tint)", async () => {
         stubLocalStorage();
         localStorage.setItem("aria-dash-purchasing-focus", "today");
