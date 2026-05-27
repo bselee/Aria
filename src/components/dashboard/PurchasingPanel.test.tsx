@@ -60,6 +60,19 @@ function makeFixtureItem() {
             reasonCodes: [],
             explanation: "Order recommended — runway low, vendor cover policy applies.",
         },
+        commitGuard: {
+            productId: "CP-LABEL-1",
+            decision: "draft_only",
+            targetCoverDays: 75,
+            minimumPostLeadCoverageDays: 30,
+            recommendedQty: 200,
+            dailyRate: 1,
+            leadTimeDays: 45,
+            projectedCoverageDays: 244,
+            projectedPostReceiptCoverageDays: 199,
+            blockReasons: ["recommendation_requires_review", "moq_warn_only"],
+            summary: "Draft only: recommendation_requires_review, moq_warn_only",
+        },
         vendorPolicy: {
             leadTimeOverrideDays: 45,
             targetCoverDays: 180,
@@ -237,6 +250,7 @@ describe("PurchasingPanel - vendor policy badges", () => {
         expect(screen.getByText("45d lead")).toBeTruthy();
         expect(screen.getByText("MOQ warn")).toBeTruthy();
         expect(screen.getByText("Review")).toBeTruthy();
+        expect(screen.getByText("Draft only")).toBeTruthy();
         expect(
             screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
         ).toBeTruthy();

@@ -4,6 +4,7 @@ import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
 import { mergeIntoGroups } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
+import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
@@ -117,6 +118,7 @@ export async function GET(req: NextRequest) {
                 ...line.item,
                 candidate: line.candidate,
                 assessment: line.assessment,
+                commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
             };
         }),
@@ -167,6 +169,55 @@ export async function POST(req: NextRequest) {
         }
 
         const client = new FinaleClient();
+        const groups = await client.getPurchasingIntelligence(365);
+        const vendorGroup = groups.find(group => group.vendorPartyId === vendorPartyId);
+        if (!vendorGroup) {
+            return NextResponse.json(
+                { error: `No current purchasing intelligence found for vendor ${vendorPartyId}` },
+                { status: 409 },
+            );
+        }
+
+        const assessment = assessPurchasingGroups([vendorGroup]);
+        const assessedLines = assessment.groups[0]?.items ?? [];
+        const requestedBySku = new Map<string, any>(
+            items.map((item: any) => [String(item.productId), item]),
+        );
+        const guards = assessedLines
+            .filter(line => requestedBySku.has(line.item.productId))
+            .map(line => {
+                const requested = requestedBySku.get(line.item.productId);
+                return assessPOCommitGuard({
+                    ...line,
+                    item: {
+                        ...line.item,
+                        suggestedQty: requested.quantity,
+                    },
+                    candidate: {
+                        ...line.candidate,
+                        suggestedQty: requested.quantity,
+                    },
+                    assessment: {
+                        ...line.assessment,
+                        recommendedQty: requested.quantity,
+                    },
+                });
+            });
+        const missingSkus = items
+            .map((item: any) => String(item.productId))
+            .filter((sku: string) => !guards.some(guard => guard.productId === sku));
+        const nonCommitGuards = guards.filter(guard => guard.decision !== 'commit');
+        if (missingSkus.length > 0 || nonCommitGuards.length > 0) {
+            return NextResponse.json(
+                {
+                    error: 'Draft blocked: requested lines must satisfy lead time plus 30 days before autonomous PO creation.',
+                    missingSkus,
+                    guards,
+                },
+                { status: 409 },
+            );
+        }
+
         const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
 
         // Invalidate caches so the next GET shows the new PO. The next read

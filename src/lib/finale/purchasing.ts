@@ -2691,7 +2691,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance: effectiveLeadTimeProvenance,
                         leadTimeP90: distribution?.p90 ?? null,
-                        coverBufferDays: 60,
+                        coverBufferDays: 30,
                         orderIncrementQty,
                         safetyMultiplier: calibration?.safetyMultiplier ?? 1,
                         calibrationSampleCount: calibration?.sampleCount ?? 0,

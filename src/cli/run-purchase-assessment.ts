@@ -25,7 +25,7 @@ function formatHighNeedItem(item: any): string {
     const dr = item.dailyRate ?? item.daily_rate ?? 0;
     const ltd = item.leadTimeDays ?? item.lead_time_days ?? 14;
     const runway = item.adjustedRunwayDays ?? item.adjusted_runway_days ?? 0;
-    const suggest = Math.max(1, Math.ceil(dr * (ltd + 60)));
+    const suggest = Math.max(1, Math.ceil(dr * (ltd + 30)));
     return `<b>${item.sku}</b> — ${item.description}\n` +
            `Stock: ${item.stockOnHand ?? item.stock_on_hand ?? 0} | Daily rate: ${dr.toFixed(2)} | Runway: ${runway}d\n` +
            `→ Suggest ordering ~${suggest}\n` +

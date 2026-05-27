@@ -702,7 +702,7 @@ export function printAssessment(result: AssessmentResult, jsonOutput: boolean = 
             if (highItems.length === 0) continue;
             console.log(`    ${va.vendor}:`);
             for (const item of highItems) {
-                const suggest = Math.max(1, Math.ceil(item.dailyRate * (item.leadTimeDays + 60)));
+                const suggest = Math.max(1, Math.ceil(item.dailyRate * (item.leadTimeDays + 30)));
                 console.log(`      ${item.sku.padEnd(14)} stock=${Math.round(item.stockOnHand)} runway=${item.adjustedRunwayDays}d → suggest ordering ~${suggest}`);
             }
         }

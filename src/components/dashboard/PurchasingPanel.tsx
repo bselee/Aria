@@ -61,6 +61,19 @@ type PurchasingItem = {
         reasonCodes: string[];
         explanation: string;
     };
+    commitGuard?: {
+        productId: string;
+        decision: "commit" | "draft_only" | "block";
+        targetCoverDays: number;
+        minimumPostLeadCoverageDays: number;
+        recommendedQty: number;
+        dailyRate: number;
+        leadTimeDays: number;
+        projectedCoverageDays: number;
+        projectedPostReceiptCoverageDays: number;
+        blockReasons: string[];
+        summary: string;
+    };
     vendorPolicy?: {
         leadTimeOverrideDays: number | null;
         targetCoverDays: number | null;
@@ -74,7 +87,7 @@ type PurchasingItem = {
     reviewReasons?: string[];
     roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
     roundingAlternatives?: number[];
-    itemType?: 'resale' | 'bom-component';
+    itemType?: 'resale' | 'bom-component' | 'resale-bom';
     feedsFinishedGoods?: Array<{
         sku: string;
         name: string;
@@ -1783,6 +1796,24 @@ export default function PurchasingPanel() {
                                                                                         title="Recommendation flagged for review — see reasons below"
                                                                                     >
                                                                                         Review
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.commitGuard && (
+                                                                                    <span
+                                                                                        className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
+                                                                                            item.commitGuard.decision === "commit"
+                                                                                                ? "text-emerald-300 border-emerald-500/35 bg-emerald-500/10"
+                                                                                                : item.commitGuard.decision === "draft_only"
+                                                                                                    ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                                                                                                    : "text-red-300 border-red-500/40 bg-red-500/10"
+                                                                                        }`}
+                                                                                        title={`${item.commitGuard.summary} Target: ${item.commitGuard.targetCoverDays}d total (${item.commitGuard.leadTimeDays}d lead + ${item.commitGuard.minimumPostLeadCoverageDays}d supply).`}
+                                                                                    >
+                                                                                        {item.commitGuard.decision === "commit"
+                                                                                            ? "Commit ready"
+                                                                                            : item.commitGuard.decision === "draft_only"
+                                                                                                ? "Draft only"
+                                                                                                : "Blocked"}
                                                                                     </span>
                                                                                 )}
 

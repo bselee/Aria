@@ -29,10 +29,10 @@ describe("buildVendorDraftPlans", () => {
                         openPOs: [],
                         urgency: "critical",
                         explanation: "Demand exceeds runway.",
-                        suggestedQty: 300,
+                        suggestedQty: 400,
                         orderIncrementQty: 25,
                         isBulkDelivery: false,
-                        finaleReorderQty: 300,
+                        finaleReorderQty: 400,
                         finaleStockoutDays: 3,
                         finaleConsumptionQty: 0,
                         finaleDemandQty: 270,
@@ -47,11 +47,109 @@ describe("buildVendorDraftPlans", () => {
             actionableItems: [
                 {
                     productId: "BOX-101",
-                    quantity: 300,
+                    quantity: 400,
+                },
+            ],
+            commitReadyItems: [
+                {
+                    productId: "BOX-101",
+                    quantity: 400,
                 },
             ],
         });
         expect(result[0].blockedLines).toHaveLength(0);
+        expect(result[0].guardSummary.commitReadyCount).toBe(1);
+    });
+
+    it("keeps undercovered lines manual-only when they do not cover lead time plus 30 days", () => {
+        const result = buildVendorDraftPlans([
+            {
+                vendorName: "ULINE",
+                vendorPartyId: "party-1",
+                urgency: "critical",
+                items: [
+                    {
+                        productId: "BOX-UNDER",
+                        productName: "Undercovered Box",
+                        supplierName: "ULINE",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1.15,
+                        stockOnHand: 10,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 0,
+                        salesVelocity: 2,
+                        demandVelocity: 2,
+                        dailyRate: 2,
+                        runwayDays: 5,
+                        adjustedRunwayDays: 5,
+                        leadTimeDays: 14,
+                        leadTimeProvenance: "14d (Finale)",
+                        openPOs: [],
+                        urgency: "critical",
+                        explanation: "Demand exceeds runway.",
+                        suggestedQty: 50,
+                        orderIncrementQty: 1,
+                        isBulkDelivery: false,
+                        finaleReorderQty: 50,
+                        finaleStockoutDays: 5,
+                        finaleConsumptionQty: 0,
+                        finaleDemandQty: 180,
+                    },
+                ],
+            },
+        ]);
+
+        expect(result[0].actionableItems).toEqual([
+            expect.objectContaining({ productId: "BOX-UNDER", quantity: 50 }),
+        ]);
+        expect(result[0].commitReadyItems).toEqual([]);
+        expect(result[0].guardedLines[0].guard.blockReasons).toContain("recommended_qty_below_lead_plus_30");
+        expect(result[0].autoDraftEligible).toBe(false);
+    });
+
+    it("keeps commit-ready lines out of autonomous creation during vendor cooldown", () => {
+        const result = buildVendorDraftPlans([
+            {
+                vendorName: "ULINE",
+                vendorPartyId: "party-1",
+                urgency: "critical",
+                items: [
+                    {
+                        productId: "BOX-COOLDOWN",
+                        productName: "Cooldown Box",
+                        supplierName: "ULINE",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1.15,
+                        stockOnHand: 20,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 0,
+                        salesVelocity: 9,
+                        demandVelocity: 9,
+                        dailyRate: 9,
+                        runwayDays: 2.2,
+                        adjustedRunwayDays: 2.2,
+                        leadTimeDays: 14,
+                        leadTimeProvenance: "14d (Finale)",
+                        openPOs: [],
+                        urgency: "critical",
+                        explanation: "Demand exceeds runway.",
+                        suggestedQty: 400,
+                        orderIncrementQty: 25,
+                        isBulkDelivery: false,
+                        finaleReorderQty: 400,
+                        finaleStockoutDays: 3,
+                        finaleConsumptionQty: 0,
+                        finaleDemandQty: 270,
+                    },
+                ],
+            },
+        ], {
+            vendorCooldowns: { "party-1": true },
+        });
+
+        expect(result[0].commitReadyItems).toHaveLength(1);
+        expect(result[0].autoDraftEligible).toBe(false);
+        expect(result[0].guardSummary.cooldownActive).toBe(true);
     });
 
     it("keeps blocked lines out of draft items while preserving their explanations", () => {
