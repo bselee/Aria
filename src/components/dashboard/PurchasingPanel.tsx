@@ -280,6 +280,9 @@ export default function PurchasingPanel() {
     const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
     const [canRetryEmail, setCanRetryEmail] = useState(false);
 
+    // validation modal for PO quantity and case rounding guardrails
+    const [validationModal, setValidationModal] = useState<any | null>(null);
+
     // snooze
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
