@@ -10,6 +10,8 @@ const {
     commitDraftPOMock,
     sendPurchaseOrderEmailMock,
     gmailSendMock,
+    renderPurchaseOrderPdfMock,
+    sendGmailPdfEmailMock,
     createClientMock,
     upsertFromSourceMock,
     updateBySourceMock,
@@ -23,6 +25,12 @@ const {
         actionUrl: "/buildasoil/api/order/PO-1001/action/emailPurchaseOrder",
     });
     const gmailSendMock = vi.fn().mockResolvedValue({ data: { id: "gmail-1" } });
+    const renderPurchaseOrderPdfMock = vi.fn().mockResolvedValue(Buffer.from("%PDF-1.4 test"));
+    const sendGmailPdfEmailMock = vi.fn().mockResolvedValue({
+        messageId: "gmail-po-1",
+        threadId: "thread-1",
+        fromAddress: "bill.selee@buildasoil.com",
+    });
     const upsertFromSourceMock = vi.fn().mockResolvedValue("task-1");
     const updateBySourceMock = vi.fn().mockResolvedValue(undefined);
 
@@ -92,6 +100,8 @@ const {
         commitDraftPOMock,
         sendPurchaseOrderEmailMock,
         gmailSendMock,
+        renderPurchaseOrderPdfMock,
+        sendGmailPdfEmailMock,
         createClientMock,
         upsertFromSourceMock,
         updateBySourceMock,
@@ -114,6 +124,14 @@ vi.mock("@googleapis/gmail", () => ({
             },
         },
     })),
+}));
+
+vi.mock("../purchasing/po-email-pdf", () => ({
+    renderPurchaseOrderPdf: renderPurchaseOrderPdfMock,
+}));
+
+vi.mock("../gmail/send-email", () => ({
+    sendGmailPdfEmail: sendGmailPdfEmailMock,
 }));
 
 vi.mock("../finale/client", () => ({
@@ -169,6 +187,12 @@ describe("PO send actions", () => {
             actionUrl: "/buildasoil/api/order/PO-1001/action/emailPurchaseOrder",
         });
         gmailSendMock.mockResolvedValue({ data: { id: "gmail-1" } });
+        renderPurchaseOrderPdfMock.mockResolvedValue(Buffer.from("%PDF-1.4 test"));
+        sendGmailPdfEmailMock.mockResolvedValue({
+            messageId: "gmail-po-1",
+            threadId: "thread-1",
+            fromAddress: "bill.selee@buildasoil.com",
+        });
         upsertFromSourceMock.mockResolvedValue("task-1");
         updateBySourceMock.mockResolvedValue(undefined);
         clearPendingPOSendCache();
@@ -273,7 +297,7 @@ describe("PO send actions", () => {
         );
     });
 
-    it("returns partial_success and parks for manual send when the native PO email action is unavailable", async () => {
+    it("falls back to Gmail PDF send when the native PO email action is unavailable", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValueOnce(new Error("Finale native PO email action was not available"));
         const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
             channel: "dashboard",
@@ -284,15 +308,16 @@ describe("PO send actions", () => {
             triggeredBy: "dashboard",
         });
 
-        // Will's rule: no funky-format fallback. If Finale native can't send,
-        // the PO is committed-but-unsent and the user is told to send manually.
-        expect(result.status).toBe("partial_success");
-        expect(result.userMessage).toMatch(/Finale native PO email action/i);
-        expect(result.userMessage).toMatch(/Send the PO manually from Finale/i);
-        expect((result.details as any)?.emailError).toMatch(/Finale native PO email action/i);
-        expect((result.details as any)?.emailVia).toBeNull();
-        expect((result.details as any)?.retryable).toBe(true);
-        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(result.status).toBe("success");
+        expect(result.userMessage).toMatch(/emailed to vendor@example.com/i);
+        expect(renderPurchaseOrderPdfMock).toHaveBeenCalledWith(makeReview("PO-1004"));
+        expect(sendGmailPdfEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+            to: "vendor@example.com",
+            pdfFilename: "BuildASoil-PO-PO-1004.pdf",
+        }));
+        expect((result.details as any)?.emailError).toBeUndefined();
+        expect((result.details as any)?.emailVia).toBe("gmail-fallback");
+        expect((result.details as any)?.retryable).toBe(false);
     });
 
     it("blocks duplicate vendor emails when a PO has already been sent", async () => {

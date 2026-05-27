@@ -7,7 +7,7 @@
  * Ordering screen can consume. SWR-style: serves stale data immediately,
  * refreshes in background. 4-hour TTL since this hits the LLM.
  */
-import { runBuildRiskAnalysis, type ComponentDemand } from '@/lib/builds/build-risk';
+import type { ComponentDemand } from '@/lib/builds/build-risk';
 
 export interface ForwardDemandEntry {
     componentSku: string;
@@ -36,6 +36,7 @@ const TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 async function runScan(daysOut: number): Promise<ForwardDemandMap> {
     try {
+        const { runBuildRiskAnalysis } = await import('@/lib/builds/build-risk');
         const report = await runBuildRiskAnalysis(daysOut);
         const out: ForwardDemandMap = new Map();
         for (const [sku, demand] of report.components.entries()) {
