@@ -181,8 +181,15 @@ export async function POST(req: NextRequest) {
         }
 
         const client = new FinaleClient();
-        const groups = await client.getPurchasingIntelligence(365);
-        const vendorGroup = groups.find(group => group.vendorPartyId === vendorPartyId);
+        const cachedGroups = (resaleSlot.value || bomSlot.value)
+            ? mergeIntoGroups(resaleSlot.value ?? [], bomSlot.value ?? [])
+            : null;
+        let groups = cachedGroups ?? await client.getPurchasingIntelligence(365);
+        let vendorGroup = groups.find(group => group.vendorPartyId === vendorPartyId);
+        if (!vendorGroup && cachedGroups) {
+            groups = await client.getPurchasingIntelligence(365);
+            vendorGroup = groups.find(group => group.vendorPartyId === vendorPartyId);
+        }
         if (!vendorGroup) {
             return NextResponse.json(
                 { error: `No current purchasing intelligence found for vendor ${vendorPartyId}` },

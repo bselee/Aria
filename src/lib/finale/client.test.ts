@@ -353,19 +353,43 @@ describe("FinaleClient native PO email", () => {
         });
     });
 
-    it("fails closed when no Finale native PO email action exists", async () => {
-        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
-            orderId: "124790",
-            statusId: "ORDER_LOCKED",
-            actionUrlEdit: "/buildasoil/api/order/124790/edit",
-        }) as any);
+    it("does not mistake a generic edit action for the native PO email action", async () => {
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                orderId: "124790",
+                statusId: "ORDER_LOCKED",
+                actionUrlEdit: "/buildasoil/api/order/124790/edit",
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({ ok: true, messageId: "finale-email-1" }) as any);
 
         const client = new FinaleClient();
-        await expect(client.sendPurchaseOrderEmail("124790", {
+        await client.sendPurchaseOrderEmail("124790", {
             toEmail: "vendor@example.com",
             subject: "BuildASoil PO # 124790 - Clarke - 5/1/2026",
             body: "Please see our attached PO.",
-        })).rejects.toThrow(/native PO email action/i);
+        });
+
+        expect(String(vi.mocked(global.fetch).mock.calls[1][0]))
+            .toBe("https://finale.example/buildasoil/api/order/124790/action/emailPurchaseOrder");
+    });
+
+    it("uses Finale's default emailPurchaseOrder action when the order payload omits action URLs", async () => {
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                orderId: "124790",
+                statusId: "ORDER_LOCKED",
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({ ok: true, messageId: "finale-email-1" }) as any);
+
+        const client = new FinaleClient();
+        await client.sendPurchaseOrderEmail("124790", {
+            toEmail: "vendor@example.com",
+            subject: "BuildASoil PO # 124790 - Clarke - 5/1/2026",
+            body: "Please see our attached PO.",
+        });
+
+        expect(String(vi.mocked(global.fetch).mock.calls[1][0]))
+            .toBe("https://finale.example/buildasoil/api/order/124790/action/emailPurchaseOrder");
     });
 });
 
