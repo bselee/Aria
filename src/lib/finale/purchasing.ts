@@ -2710,6 +2710,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         // v2.2 — cognitive rounding inputs
                         historicalLineQtys: recentLineQtysCache.get(partyId) ?? [],
                         favoriteBatches: reorderPolicy?.favoriteBatches ?? null,
+                        // v2.4 — actual quantity ordered last time for exact SKU deviation check
+                        lastPurchaseQty: activity.purchaseQtys[0] ?? null,
                     } as const;
                     const rec = recommendQty(recInputs);
 
@@ -2979,6 +2981,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
     ): Promise<SendPurchaseOrderEmailResult> {
         const po = await (this as any).getOrderDetails(orderId);
         const actionUrl = this.resolvePurchaseOrderEmailActionUrl(orderId, po);
+        if (!actionUrl) {
+            throw new Error(
+                `Finale order ${orderId} does not expose a native PO email action URL; configure FINALE_PO_EMAIL_ACTION_TEMPLATE or use Gmail fallback`,
+            );
+        }
 
         const result = await this.post(actionUrl, {
             toEmail: input.toEmail,
@@ -2997,7 +3004,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         };
     }
 
-    protected resolvePurchaseOrderEmailActionUrl(orderId: string, po: any): string {
+    protected resolvePurchaseOrderEmailActionUrl(orderId: string, po: any): string | undefined {
         const template = process.env.FINALE_PO_EMAIL_ACTION_TEMPLATE;
         if (template) {
             return template
@@ -3021,8 +3028,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             return normalized.includes("email") && (normalized.includes("purchase") || normalized.includes("po"));
         }) ?? candidates[0];
 
-        return nativePOEmailAction
-            ?? `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}/action/emailPurchaseOrder`;
+        return nativePOEmailAction;
     }
 
     // ── protected helper: parse Finale numeric strings like "24 d", "1,200", null, "--" ──

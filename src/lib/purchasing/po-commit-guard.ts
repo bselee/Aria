@@ -86,6 +86,10 @@ export function assessPOCommitGuard(
     if (projectedPostReceiptCoverageDays + 0.0001 < minimumPostLeadCoverageDays) {
         blockReasons.push("recommended_qty_below_lead_plus_30");
     }
+    const min30DaySupply = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
+    if (recommendedQty > 0 && dailyRate > 0 && recommendedQty < min30DaySupply) {
+        blockReasons.push("recommended_qty_below_30_day_supply");
+    }
 
     const hardBlockReasons = new Set(["assessment_not_order", "no_recommended_qty", "daily_rate_missing"]);
     const decision: POCommitGuardDecision = blockReasons.some(reason => hardBlockReasons.has(reason))

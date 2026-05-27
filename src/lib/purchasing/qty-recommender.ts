@@ -87,6 +87,8 @@ export interface RecommenderInput {
      * Used by cognitive rounding to detect favorite-batch clusters.
      */
     historicalLineQtys?: number[];
+    /** v2.4 — actual quantity ordered last time for this exact SKU. */
+    lastPurchaseQty?: number | null;
     /**
      * v2.2 — explicit per-vendor favorite batches from
      * vendor_reorder_policies.favorite_batches. When set (non-empty), overrides
@@ -310,22 +312,35 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         value: Math.round(rawNeededEaches),
     });
 
-    // ── Step 7: pack rounding ─────────────────────────────────────────────
+    // ── Step 7: pack rounding & 30-day supply minimum floor ───────────────
     const { increment: orderIncrementQty, source: orderIncrementSource } = effectiveOrderIncrement(input);
     let suggestedQty = 0;
+    const min30DaySupply = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
     if (rawNeededEaches > 0) {
-        const snapped = snapToIncrement(rawNeededEaches, orderIncrementQty);
-        suggestedQty = Math.ceil(snapped);
+        let snapped = snapToIncrement(rawNeededEaches, orderIncrementQty);
+        let snappedQty = Math.ceil(snapped);
         const fallbackVendor = input.vendorName ?? "vendor";
-        trace.push({
-            step: "pack_round",
-            detail: orderIncrementSource === "finale"
-                ? `Rounded up to nearest ${orderIncrementQty}-pack → ${suggestedQty}`
-                : orderIncrementSource === "vendor_fallback"
-                    ? `No Finale pack increment registered; ${fallbackVendor} fallback rounds to ${orderIncrementQty}s → ${suggestedQty}`
-                    : `No pack increment registered → rounded up to ${suggestedQty}`,
-            value: suggestedQty,
-        });
+
+        if (snappedQty < min30DaySupply) {
+            snapped = snapToIncrement(min30DaySupply, orderIncrementQty);
+            snappedQty = Math.ceil(snapped);
+            trace.push({
+                step: "pack_round",
+                detail: `Bumped to meet 30-day supply minimum of ${min30DaySupply} and rounded to nearest ${orderIncrementQty || 1}-pack → ${snappedQty}`,
+                value: snappedQty,
+            });
+        } else {
+            trace.push({
+                step: "pack_round",
+                detail: orderIncrementSource === "finale"
+                    ? `Rounded up to nearest ${orderIncrementQty}-pack → ${snappedQty}`
+                    : orderIncrementSource === "vendor_fallback"
+                        ? `No Finale pack increment registered; ${fallbackVendor} fallback rounds to ${orderIncrementQty}s → ${snappedQty}`
+                        : `No pack increment registered → rounded up to ${snappedQty}`,
+                value: snappedQty,
+            });
+        }
+        suggestedQty = snappedQty;
     } else {
         trace.push({
             step: "pack_round",
@@ -450,6 +465,21 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             });
         }
     }
+    // ── Step 8.7: historical purchase deviation check ──────────────────────
+    const lastPurchaseQty = input.lastPurchaseQty ?? null;
+    if (suggestedQty > 0 && lastPurchaseQty !== null && lastPurchaseQty > 0) {
+        const deviationPct = Math.round(((suggestedQty - lastPurchaseQty) / lastPurchaseQty) * 100);
+        if (Math.abs(deviationPct) >= 50) {
+            const reason = `Quantity deviates significantly from last order (${lastPurchaseQty.toLocaleString()} units): ${deviationPct > 0 ? '+' : ''}${deviationPct}%`;
+            reviewReasons.push(reason);
+            trace.push({
+                step: "historical_deviation",
+                detail: reason,
+                value: deviationPct,
+            });
+        }
+    }
+
     const reviewRequired = reviewReasons.length > 0;
 
     // ── Step 9: urgency ───────────────────────────────────────────────────

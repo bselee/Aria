@@ -103,18 +103,18 @@ describe("recommendQty — basic math", () => {
     it("uses a 10-each fallback increment for Miles Filippelli when Finale has no pack info", () => {
         const seven = recommendQty(baseInput({
             vendorName: "Miles Filippelli",
-            dailyRate: 1,
+            dailyRate: 0.2, // 30d floor is 6, does not collide with 10 snap
             stockOnHand: 0,
-            leadTimeDays: 7,
+            leadTimeDays: 35, // 0.2 * 35 = 7 raw eaches
             coverBufferDays: 0,
             orderIncrementQty: null,
         }));
         const twentyTwo = recommendQty(baseInput({
             vendorName: "Miles Filippelli",
-            dailyRate: 1,
+            dailyRate: 0.2, // 30d floor is 6, does not collide with 30 snap
             stockOnHand: 0,
-            leadTimeDays: 14,
-            coverBufferDays: 8,
+            leadTimeDays: 110, // 0.2 * 110 = 22 raw eaches
+            coverBufferDays: 0,
             orderIncrementQty: null,
         }));
 
@@ -129,10 +129,10 @@ describe("recommendQty — basic math", () => {
     it("does not override Finale pack info for Miles Filippelli", () => {
         const result = recommendQty(baseInput({
             vendorName: "Miles Filippelli",
-            dailyRate: 1,
+            dailyRate: 0.2, // 30d floor is 6
             stockOnHand: 0,
-            leadTimeDays: 14,
-            coverBufferDays: 8,
+            leadTimeDays: 110, // 0.2 * 110 = 22 raw eaches
+            coverBufferDays: 0,
             orderIncrementQty: 12,
         }));
 
@@ -506,7 +506,7 @@ describe("recommendQty — cognitive rounding integration", () => {
 
     it("no history + no explicit → cognitive ladder", () => {
         const result = recommendQty(baseInput({
-            dailyRate: 1, stockOnHand: 0, leadTimeDays: 14, coverBufferDays: 8,  // 1/d × 22d = 22 raw
+            dailyRate: 0.5, stockOnHand: 0, leadTimeDays: 14, coverBufferDays: 30, // 0.5/d × 44d = 22 raw, 30d floor is 15
         }));
         expect(result.suggestedQty).toBe(25);
         expect(result.roundingMethod).toBe("cognitive");
@@ -537,3 +537,45 @@ describe("recommendQty — cognitive rounding integration", () => {
         expect(result.roundingAlternatives!.length).toBeGreaterThan(0);
     });
 });
+
+describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation checks", () => {
+    it("enforces at least a 30-day supply floor", () => {
+        // Daily rate = 5. CoverDays would normal suggest small but we want a 30d supply (150 units).
+        const result = recommendQty(baseInput({
+            dailyRate: 5,
+            stockOnHand: 140, // very close to lead time + cover target
+            leadTimeDays: 14,
+            coverBufferDays: 16, // total target = 5 * 30 = 150 target eaches. rawNeed = 10 eaches.
+        }));
+        // 30d supply floor: 5 * 30 = 150.
+        // raw needed is 10, but floor bumps it to 150!
+        expect(result.suggestedQty).toBe(150);
+        const packStep = result.provenance.find(p => p.step === "pack_round");
+        expect(packStep?.detail).toContain("30-day supply minimum");
+    });
+
+    it("snaps 30-day supply floor UP to nearest pack multiple", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 5,
+            stockOnHand: 140,
+            leadTimeDays: 14,
+            coverBufferDays: 16,
+            orderIncrementQty: 24, // Case pack = 24
+        }));
+        // 30d floor = 150. Snap to nearest 24-pack >= 150 is 168.
+        expect(result.suggestedQty).toBe(168);
+    });
+
+    it("adds a review flag when suggested quantity deviates by more than 50% from last order", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2,
+            stockOnHand: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 16, // raw needed = 60
+            lastPurchaseQty: 10, // last purchase was tiny (10 units), suggestion is 60 (+500% deviation)
+        }));
+        expect(result.reviewRequired).toBe(true);
+        expect(result.reviewReasons.join(" ")).toContain("deviates significantly from last order");
+    });
+});
+

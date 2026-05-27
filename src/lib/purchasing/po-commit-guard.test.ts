@@ -131,6 +131,19 @@ describe("assessPOCommitGuard", () => {
         expect(guard.decision).toBe("block");
         expect(guard.blockReasons).toContain("assessment_not_order");
     });
+
+    it("downgrades to draft_only when quantity is below absolute 30-day supply floor", () => {
+        // dailyRate = 2. 30d floor = 60 units. 
+        // recommendedQty = 10 (< 60), even though stockOnHand = 10, stockOnOrder = 100, which might technically cover "lead plus 30" (14+30 = 44d).
+        const guard = assessPOCommitGuard(line({
+            item: { stockOnHand: 10, stockOnOrder: 100, suggestedQty: 10 },
+            candidate: { stockOnHand: 10, stockOnOrder: 100, suggestedQty: 10 },
+            assessment: { recommendedQty: 10 },
+        }));
+
+        expect(guard.decision).toBe("draft_only");
+        expect(guard.blockReasons).toContain("recommended_qty_below_30_day_supply");
+    });
 });
 
 describe("assessPOCommitGuardsForLines", () => {

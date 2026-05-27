@@ -635,7 +635,7 @@ export default function PurchasingPanel() {
         });
     }
 
-    async function createVendorPO(group: PurchasingGroup): Promise<POResult | null> {
+    async function createVendorPO(group: PurchasingGroup, ignoreCommitGuards?: boolean): Promise<POResult | null> {
         const pid = group.vendorPartyId;
         const items = group.items
             .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod))
@@ -644,15 +644,55 @@ export default function PurchasingPanel() {
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale" }),
+            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale", ignoreCommitGuards }),
         });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Failed");
         return json as POResult;
     }
 
-    async function handleCreateOne(group: PurchasingGroup) {
+    async function handleCreateOne(group: PurchasingGroup, ignoreCommitGuards?: boolean) {
         const pid = group.vendorPartyId;
+
+        // Strict Guard: check for 30-day supply minimum and exact case multiple snaps
+        if (!ignoreCommitGuards) {
+            const violations: Array<{
+                productId: string;
+                productName: string;
+                currentQty: number;
+                min30dQty: number;
+                increment: number | null;
+                lastPurchaseQty: number | null;
+            }> = [];
+
+            group.items
+                .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod))
+                .forEach(i => {
+                    const currentQty = qtys[pid]?.[i.productId] ?? i.suggestedQty;
+                    const dailyRate = i.dailyRate ?? 0;
+                    const min30dQty = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
+                    const increment = i.orderIncrementQty ?? null;
+
+                    const under30d = currentQty < min30dQty;
+                    const notCaseMultiple = increment && increment > 1 && (currentQty % increment !== 0);
+
+                    if (under30d || notCaseMultiple) {
+                        violations.push({
+                            productId: i.productId,
+                            productName: i.productName,
+                            currentQty,
+                            min30dQty,
+                            increment,
+                            lastPurchaseQty: i.lastPurchaseQty ?? null,
+                        });
+                    }
+                });
+
+            if (violations.length > 0) {
+                setValidationModal({ group, violations });
+                return;
+            }
+        }
 
         // Soft guard: warn if any selected SKU already has open POs covering it.
         // Catches the muscle-memory double-order on rows where Aria is suggesting
@@ -682,7 +722,7 @@ export default function PurchasingPanel() {
 
         setCreatingPO(p => new Set(p).add(pid));
         try {
-            const result = await createVendorPO(group);
+            const result = await createVendorPO(group, ignoreCommitGuards);
             if (result) {
                 setCreatedPOs(p => ({ ...p, [pid]: result }));
                 setCreatedPODetails(p => ({ ...p, [pid]: result }));
@@ -1048,6 +1088,129 @@ export default function PurchasingPanel() {
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className="border-b border-zinc-800 shrink-0">
+            {/* PO Quantity & Case Rounding Validation Loop Modal */}
+            {validationModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md">
+                    <div className="bg-zinc-950 border border-red-500/30 rounded-xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden">
+                        <div className="px-5 py-4 border-b border-zinc-800 bg-red-500/5 flex items-center gap-3">
+                            <span className="text-xl">🛡️</span>
+                            <div>
+                                <h3 className="text-sm font-semibold font-mono text-zinc-100">PO Quantity Guardrail Alert</h3>
+                                <p className="text-[10px] text-zinc-400 font-mono">Ensuring a minimum 30-day supply & exacting case pack multiples</p>
+                            </div>
+                            <div className="flex-1" />
+                            <span className="text-[10px] font-mono text-zinc-500 bg-zinc-900 px-2 py-1 rounded border border-zinc-800">
+                                {validationModal.group.vendorName}
+                            </span>
+                        </div>
+                        
+                        <div className="p-5 max-h-[380px] overflow-y-auto space-y-4">
+                            <p className="text-xs text-zinc-300">
+                                The following items in this order do not meet the safe inventory guardrails. Review the history and auto-round to ensure you do not order too frequently.
+                            </p>
+
+                            <div className="space-y-2.5">
+                                {validationModal.violations.map(v => {
+                                    const incrementLabel = v.increment && v.increment > 1 ? `${v.increment} units/case` : 'No case limit';
+                                    const under30d = v.currentQty < v.min30dQty;
+                                    const notMultiple = v.increment && v.increment > 1 && (v.currentQty % v.increment !== 0);
+
+                                    return (
+                                        <div key={v.productId} className="p-3 rounded-lg bg-zinc-900/60 border border-zinc-800/80 font-mono text-xs">
+                                            <div className="flex justify-between items-start gap-4 mb-2">
+                                                <div>
+                                                    <span className="text-zinc-200 font-semibold">{v.productId}</span>
+                                                    <span className="text-[10px] text-zinc-500 block truncate max-w-[400px]">{v.productName}</span>
+                                                </div>
+                                                <div className="flex flex-col items-end gap-1">
+                                                    {under30d && (
+                                                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-red-500/20 text-red-400 border border-red-500/30">
+                                                            Under 30d Supply
+                                                        </span>
+                                                    )}
+                                                    {notMultiple && (
+                                                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                                                            Not Case Multiple
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[10px] text-zinc-400 bg-zinc-950 p-2 rounded border border-zinc-900">
+                                                <div>
+                                                    <span className="text-zinc-500 block">Current Qty</span>
+                                                    <span className="text-zinc-300 font-semibold">{v.currentQty.toLocaleString()} units</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-zinc-500 block">30d Supply Floor</span>
+                                                    <span className="text-zinc-300 font-semibold">{v.min30dQty.toLocaleString()} units</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-zinc-500 block">Case Standard</span>
+                                                    <span className="text-zinc-300 font-semibold">{incrementLabel}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-zinc-500 block">Last Ordered Qty</span>
+                                                    <span className="text-zinc-300 font-semibold">
+                                                        {v.lastPurchaseQty ? `${v.lastPurchaseQty.toLocaleString()} units` : 'No PO history'}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        <div className="px-5 py-4 border-t border-zinc-800 bg-zinc-950 flex flex-wrap gap-2 justify-end">
+                            <button
+                                onClick={() => setValidationModal(null)}
+                                className="px-3 py-1.5 text-xs font-mono font-medium rounded text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900 border border-transparent transition-colors"
+                            >
+                                Back to Queue
+                            </button>
+                            <button
+                                onClick={async () => {
+                                    const pid = validationModal.group.vendorPartyId;
+                                    setQtys(prev => {
+                                        const next = { ...prev };
+                                        if (!next[pid]) next[pid] = {};
+                                        validationModal.violations.forEach(v => {
+                                            const increment = v.increment ?? 1;
+                                            const targetQty = Math.ceil(v.min30dQty / increment) * increment;
+                                            next[pid][v.productId] = Math.max(increment, targetQty);
+                                        });
+                                        return next;
+                                    });
+                                    setValidationModal(null);
+                                    // Let state updates batch then execute creation using the rounded values
+                                    setTimeout(() => {
+                                        // Re-evaluate group quantities with corrected values
+                                        const correctedGroup = {
+                                            ...validationModal.group,
+                                        };
+                                        handleCreateOne(correctedGroup, true);
+                                    }, 100);
+                                }}
+                                className="px-3.5 py-1.5 text-xs font-mono font-semibold rounded text-zinc-950 bg-emerald-400 hover:bg-emerald-300 transition-colors shadow-lg shadow-emerald-950/20"
+                            >
+                                ⚡ Auto-Round Up & Create Draft
+                            </button>
+                            <button
+                                onClick={() => {
+                                    const group = validationModal.group;
+                                    setValidationModal(null);
+                                    handleCreateOne(group, true);
+                                }}
+                                className="px-3.5 py-1.5 text-xs font-mono font-medium rounded text-red-300 hover:text-red-200 border border-red-500/20 hover:border-red-500/40 hover:bg-red-500/5 transition-colors"
+                            >
+                                Force Draft Only
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Commit & Send modal */}
             {commitModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
