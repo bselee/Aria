@@ -349,8 +349,16 @@ export function getAriaTools(opts: {
             execute: async ({ vendor_filter }) => {
                 try {
                     const { buildVendorDraftPlans } = await import('../lib/purchasing/vendor-draft-plans');
+                    const { buildVendorCycleMapForGroups } = await import('../lib/purchasing/vendor-order-cycle');
                     const groups = await finale.getPurchasingIntelligence();
-                    const plans = buildVendorDraftPlans(groups, {}, vendor_filter);
+                    let recentPOs: any[] = [];
+                    try {
+                        recentPOs = await finale.getRecentPurchaseOrders(45, 500);
+                    } catch (err: any) {
+                        console.warn(`[create_draft_pos] vendor-cycle history unavailable: ${err.message}`);
+                    }
+                    const vendorCycles = buildVendorCycleMapForGroups(groups, recentPOs);
+                    const plans = buildVendorDraftPlans(groups, { vendorCycles }, vendor_filter);
                     if (plans.length === 0) {
                         return vendor_filter
                             ? `No reorder items found for vendor matching "${vendor_filter}".`

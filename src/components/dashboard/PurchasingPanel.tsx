@@ -107,8 +107,19 @@ type PurchasingItem = {
     /** True when vendor ships in bulk multi-leg deliveries. */
     isBulkVendor?: boolean;
 };
+type VendorCycle = {
+    decision: "clear" | "reuse_draft" | "routine_locked" | "exception_allowed";
+    cycleDays: number;
+    lockedUntil: string | null;
+    blockingPO: { orderId: string; status: string; orderDate: string } | null;
+    exceptionEvidence?: Array<{ productId: string; reason: string; detail: string }>;
+    summary: string;
+};
+type PurchasingDisplayGroup = PurchasingGroup & {
+    vendorCycle?: VendorCycle;
+};
 type AssessmentData = {
-    groups: PurchasingGroup[];
+    groups: PurchasingDisplayGroup[];
     cachedAt: string;
     vendorSummaries?: Array<{
         vendorName: string; vendorPartyId: string;
@@ -1419,6 +1430,21 @@ export default function PurchasingPanel() {
                                         : groupMatch.isBom
                                         ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
                                         : "";
+                                    const vendorCycle = group.vendorCycle;
+                                    const vendorCycleBadge = vendorCycle && vendorCycle.decision !== "clear"
+                                        ? {
+                                            text: vendorCycle.decision === "routine_locked"
+                                                ? `cycle locked${vendorCycle.blockingPO?.orderId ? ` - PO ${vendorCycle.blockingPO.orderId}` : ""}`
+                                                : vendorCycle.decision === "exception_allowed"
+                                                ? `exception allowed${vendorCycle.exceptionEvidence?.[0]?.reason ? ` - ${vendorCycle.exceptionEvidence[0].reason.replace(/_/g, " ")}` : ""}`
+                                                : `reuse draft${vendorCycle.blockingPO?.orderId ? ` - PO ${vendorCycle.blockingPO.orderId}` : ""}`,
+                                            className: vendorCycle.decision === "routine_locked"
+                                                ? "text-amber-200 border-amber-500/40 bg-amber-500/10"
+                                                : vendorCycle.decision === "exception_allowed"
+                                                ? "text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
+                                                : "text-emerald-200 border-emerald-500/40 bg-emerald-500/10",
+                                        }
+                                        : null;
 
                                     return (
                                         <div
@@ -1475,6 +1501,14 @@ export default function PurchasingPanel() {
                                                     {!vSnoozed && diffCount > 0 && (
                                                         <span className="text-[11px] font-mono text-amber-300 border border-amber-500/30 rounded px-1 shrink-0">
                                                             {diffCount} qty diff
+                                                        </span>
+                                                    )}
+                                                    {!vSnoozed && vendorCycleBadge && (
+                                                        <span
+                                                            className={`text-[10px] font-mono border rounded px-1 py-0.5 shrink-0 ${vendorCycleBadge.className}`}
+                                                            title={vendorCycle?.summary}
+                                                        >
+                                                            {vendorCycleBadge.text}
                                                         </span>
                                                     )}
                                                     {/* Affected FGs across this vendor's BOM items (collapsed view) */}

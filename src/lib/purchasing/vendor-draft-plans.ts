@@ -3,6 +3,7 @@ import { assessPurchasingGroups, type AssessPurchasingGroupsOptions } from "./as
 import { buildDraftPOItemsFromAssessment } from "./draft-po-policy";
 import { assessPOCommitGuardsForLines, type POCommitGuardBatchResult } from "./po-commit-guard";
 import { shouldAutoCreateDraftPO } from "./vendor-automation-policy";
+import type { VendorOrderCycleResult } from "./vendor-order-cycle";
 
 export interface VendorDraftPlan {
     vendorName: string;
@@ -19,11 +20,13 @@ export interface VendorDraftPlan {
         blockedCount: number;
         cooldownActive: boolean;
     };
+    vendorCycle?: VendorOrderCycleResult;
     autoDraftEligible: boolean;
 }
 
 export interface VendorDraftPlanOptions extends AssessPurchasingGroupsOptions {
     vendorCooldowns?: Record<string, boolean>;
+    vendorCycles?: Record<string, VendorOrderCycleResult>;
 }
 
 export function buildVendorDraftPlans(
@@ -47,7 +50,9 @@ export function buildVendorDraftPlans(
         const commitReadyItems = draftPolicy.items.filter(item =>
             commitReadyProductIds.has(item.productId),
         );
-        const cooldownActive = options.vendorCooldowns?.[group.vendorPartyId] === true;
+        const vendorCycle = options.vendorCycles?.[group.vendorPartyId];
+        const cooldownActive = options.vendorCooldowns?.[group.vendorPartyId] === true
+            || vendorCycle?.decision === "routine_locked";
         const highestConfidence = group.items.reduce<"high" | "medium" | "low" | null>((best, item) => {
             if (!best) return item.assessment.confidence;
             const rank = { high: 3, medium: 2, low: 1 } as const;
@@ -69,12 +74,13 @@ export function buildVendorDraftPlans(
                 blockedCount: guardBatch.blockedLines.length,
                 cooldownActive,
             },
+            vendorCycle,
             autoDraftEligible: shouldAutoCreateDraftPO({
                 vendorName: group.vendorName,
                 actionableCount: commitReadyItems.length,
                 blockedCount: draftPolicy.items.length - commitReadyItems.length + draftPolicy.blockedLines.length,
                 highestConfidence,
-                cooldownActive,
+                cooldownActive: cooldownActive && vendorCycle?.decision !== "exception_allowed",
             }),
         };
     });
