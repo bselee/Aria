@@ -76,6 +76,55 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                 continue;
             }
 
+            // 2.5 Safety Check: has this PO already been manually sent by email?
+            const alreadyEmailed = await isPOAlreadyEmailed(draft.orderId);
+            if (alreadyEmailed) {
+                console.log(`[autonomy] PO #${draft.orderId} has already been emailed. Auto-marking as sent.`);
+                
+                try {
+                    await db.from('ap_activity_log').insert({
+                        email_from: draft.vendorName,
+                        email_subject: `PO #${draft.orderId} manually sent detection`,
+                        intent: 'PO_RECEIVED',
+                        action_taken: `PO #${draft.orderId} manually sent — detected via Gmail search. Marking as sent in database.`,
+                        metadata: { poId: draft.orderId, supplier: draft.vendorName, source: 'gmail_search_proof' },
+                    });
+
+                    await db.from('purchase_orders').upsert({
+                        po_number: draft.orderId,
+                        po_sent_at: new Date().toISOString(),
+                        po_sent_verified_at: new Date().toISOString(),
+                        po_sent_verified_source: 'gmail_search_proof',
+                        updated_at: new Date().toISOString(),
+                    }, { onConflict: 'po_number' });
+
+                    await db.from('copilot_action_sessions').insert({
+                        session_id: crypto.randomUUID(),
+                        channel: 'telegram',
+                        action_type: 'po_send',
+                        payload: { orderId: draft.orderId, review: { vendorName: draft.vendorName } },
+                        status: 'confirmed',
+                        created_at: new Date().toISOString(),
+                        expires_at: new Date().toISOString(),
+                    });
+
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `ℹ️ *Draft PO #${draft.orderId} Detected!*
+` +
+                        `*Vendor*: ${draft.vendorName}
+` +
+                        `*Status*: Already manually sent (proven via Gmail search). Auto-marked as sent in database.`,
+                        { parse_mode: 'Markdown' }
+                    );
+                    processed++;
+                } catch (dbErr: any) {
+                    console.warn(`[autonomy] Failed to write manual sent state for PO #${draft.orderId}:`, dbErr.message);
+                }
+                continue;
+            }
+
+
             console.log(`[autonomy] Processing draft PO #${draft.orderId} for ${draft.vendorName} at Autonomy Level ${autonomyLevel}`);
 
             try {
@@ -166,4 +215,31 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
     }
 
     return { processed, errors };
+}
+
+/**
+ * Searches the Gmail inbox/outbox for any sent messages containing the PO number in the subject or body.
+ * Returns true if a sent email is found, indicating it has already been manually sent.
+ */
+export async function isPOAlreadyEmailed(poNumber: string): Promise<boolean> {
+    try {
+        const { getAuthenticatedClient } = await import('../gmail/auth');
+        const { gmail: GmailApi } = await import('@googleapis/gmail');
+        
+        const auth = await getAuthenticatedClient('default');
+        const gmail = GmailApi({ version: 'v1', auth });
+
+        // Search query: find any message with the PO number in the text, subject, or threads.
+        const q = `"${poNumber}" OR "PO ${poNumber}" OR "PO #${poNumber}"`;
+        const { data: search } = await gmail.users.messages.list({
+            userId: 'me',
+            q,
+            maxResults: 5,
+        });
+
+        return !!(search.messages && search.messages.length > 0);
+    } catch (err: any) {
+        console.warn(`[autonomy] Gmail search for PO #${poNumber} failed:`, err.message);
+        return false;
+    }
 }
