@@ -13,6 +13,7 @@ import * as poSender from './po-sender';
 
 const mockGetRecentPurchaseOrders = vi.fn();
 const mockGetDraftPOForReview = vi.fn();
+const mockGmailList = vi.fn();
 
 // Mock dependencies
 vi.mock('../supabase', () => ({
@@ -25,6 +26,8 @@ vi.mock('../supabase', () => ({
                     })),
                 })),
             })),
+            insert: vi.fn().mockResolvedValue({ data: {} }),
+            upsert: vi.fn().mockResolvedValue({ data: {} }),
         })),
     })),
 }));
@@ -38,6 +41,20 @@ vi.mock('../finale/client', () => {
         FinaleClient: MockFinaleClient,
     };
 });
+
+vi.mock('@googleapis/gmail', () => ({
+    gmail: vi.fn(() => ({
+        users: {
+            messages: {
+                list: mockGmailList,
+            },
+        },
+    })),
+}));
+
+vi.mock('../gmail/auth', () => ({
+    getAuthenticatedClient: vi.fn().mockResolvedValue({}),
+}));
 
 vi.mock('./po-sender', () => ({
     storePendingPOSend: vi.fn().mockResolvedValue('session-abc'),
@@ -70,6 +87,9 @@ describe('autoProcessAutonomyDrafts', () => {
             total: 1725.00,
             items: [{ productId: 'RWBP104', productName: 'Rootwise', quantity: 15, unitPrice: 115.00, lineTotal: 1725.00 }],
         });
+
+        // Default: no matching emails found in Gmail search
+        mockGmailList.mockResolvedValue({ data: { messages: [] } });
     });
 
     it('should ignore vendors at autonomy level 0', async () => {
@@ -125,6 +145,24 @@ describe('autoProcessAutonomyDrafts', () => {
         expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
             '12345',
             expect.stringContaining('No order contact email'),
+            expect.any(Object)
+        );
+    });
+
+    it('should automatically mark PO as sent and skip dispatch if Gmail search proves it was already sent manually', async () => {
+        vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(2);
+        vi.mocked(poSender.lookupVendorOrderEmail).mockResolvedValue({ email: 'sales@rootwise.com', source: 'vendor_profiles' });
+        
+        // Gmail list mock returns a matching sent message
+        mockGmailList.mockResolvedValue({ data: { messages: [{ id: 'msg-123' }] } });
+
+        const result = await autoProcessAutonomyDrafts(mockBot);
+
+        expect(result.processed).toBe(2); // Auto-marked both
+        expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // Safe check: didn't send again!
+        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
+            '12345',
+            expect.stringContaining('Already manually sent'),
             expect.any(Object)
         );
     });
