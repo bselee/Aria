@@ -152,6 +152,72 @@ describe("buildVendorDraftPlans", () => {
         expect(result[0].guardSummary.cooldownActive).toBe(true);
     });
 
+    it("allows commit-ready lines when a vendor cycle exception is allowed", () => {
+        const result = buildVendorDraftPlans([
+            {
+                vendorName: "ULINE",
+                vendorPartyId: "party-1",
+                urgency: "critical",
+                items: [
+                    {
+                        productId: "BOX-SURGE",
+                        productName: "Surge Box",
+                        supplierName: "ULINE",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1.15,
+                        stockOnHand: 20,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 0,
+                        salesVelocity: 9,
+                        demandVelocity: 9,
+                        dailyRate: 9,
+                        runwayDays: 2.2,
+                        adjustedRunwayDays: 2.2,
+                        leadTimeDays: 14,
+                        leadTimeProvenance: "14d (Finale)",
+                        openPOs: [],
+                        urgency: "critical",
+                        explanation: "Demand exceeds runway.",
+                        suggestedQty: 400,
+                        orderIncrementQty: 25,
+                        isBulkDelivery: false,
+                        finaleReorderQty: 400,
+                        finaleStockoutDays: 3,
+                        finaleConsumptionQty: 0,
+                        finaleDemandQty: 270,
+                    },
+                ],
+            },
+        ], {
+            vendorCycles: {
+                "party-1": {
+                    decision: "exception_allowed",
+                    cycleDays: 30,
+                    lockedUntil: "2026-06-18",
+                    blockingPO: {
+                        orderId: "124832",
+                        vendorName: "ULINE",
+                        vendorPartyId: "party-1",
+                        status: "Committed",
+                        orderDate: "2026-05-19",
+                        receiveDate: null,
+                        skus: ["BOX-OLD"],
+                    },
+                    ignoredPOs: [],
+                    exceptionEvidence: [{
+                        productId: "BOX-SURGE",
+                        reason: "stockout_before_cycle_end",
+                        detail: "Stockout before existing cycle ends.",
+                    }],
+                    summary: "Exception allowed despite vendor cycle lock from PO 124832.",
+                },
+            },
+        });
+
+        expect(result[0].autoDraftEligible).toBe(true);
+        expect(result[0].vendorCycle?.decision).toBe("exception_allowed");
+    });
+
     it("keeps blocked lines out of draft items while preserving their explanations", () => {
         const result = buildVendorDraftPlans([
             {

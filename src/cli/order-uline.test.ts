@@ -61,16 +61,76 @@ describe("gatherAutoReorderItems", () => {
                     ],
                 },
             ]),
+            getRecentPurchaseOrders: vi.fn().mockResolvedValue([]),
         } as any;
 
         const manifest = await gatherAutoReorderItems(finale);
 
         expect(finale.getPurchasingIntelligence).toHaveBeenCalledWith(365, "ULINE");
+        expect(finale.getRecentPurchaseOrders).toHaveBeenCalledWith(45, 500);
         expect(manifest.items).toHaveLength(1);
         expect(manifest.items[0]).toMatchObject({
             finaleSku: "H-4987",
             quantity: 12,
         });
+    });
+
+    it("skips routine ULINE cart building when the vendor cycle is locked by a recent PO", async () => {
+        convertMock.mockClear();
+        const finale = {
+            getPurchasingIntelligence: vi.fn().mockResolvedValue([
+                {
+                    vendorName: "ULINE",
+                    vendorPartyId: "party-1",
+                    urgency: "warning",
+                    items: [
+                        {
+                            productId: "H-ROUTINE",
+                            productName: "Routine ULINE item",
+                            supplierName: "ULINE",
+                            supplierPartyId: "party-1",
+                            unitPrice: 8.5,
+                            stockOnHand: 60,
+                            stockOnOrder: 0,
+                            purchaseVelocity: 0.2,
+                            salesVelocity: 0.2,
+                            demandVelocity: 0.2,
+                            dailyRate: 0.2,
+                            runwayDays: 300,
+                            adjustedRunwayDays: 300,
+                            leadTimeDays: 14,
+                            leadTimeProvenance: "14d (Finale)",
+                            openPOs: [],
+                            urgency: "warning",
+                            explanation: "Routine replenishment.",
+                            suggestedQty: 20,
+                            orderIncrementQty: 1,
+                            isBulkDelivery: false,
+                            finaleReorderQty: 20,
+                            finaleStockoutDays: 300,
+                            finaleConsumptionQty: 0,
+                            finaleDemandQty: 6,
+                            reorderMethod: "demand_velocity",
+                        },
+                    ],
+                },
+            ]),
+            getRecentPurchaseOrders: vi.fn().mockResolvedValue([
+                {
+                    orderId: "124900",
+                    vendorName: "ULINE",
+                    vendorPartyId: "party-1",
+                    status: "Committed",
+                    orderDate: "2026-05-20",
+                    items: [{ productId: "H-OLD" }],
+                },
+            ]),
+        } as any;
+
+        const manifest = await gatherAutoReorderItems(finale);
+
+        expect(manifest.items).toHaveLength(0);
+        expect(convertMock).not.toHaveBeenCalled();
     });
 });
 

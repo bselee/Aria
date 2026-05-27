@@ -53,6 +53,7 @@ import {
     emailUlineCart,
 } from '../lib/purchasing/uline-session';
 import { buildVendorDraftPlans } from '../lib/purchasing/vendor-draft-plans';
+import { buildVendorCycleMapForGroups } from '../lib/purchasing/vendor-order-cycle';
 import {
     formatCartVerificationMessage,
     planDraftPOPriceUpdates,
@@ -407,7 +408,9 @@ export async function gatherAutoReorderItems(finale: FinaleClient): Promise<Orde
     console.log('   🤖 Running purchasing intelligence scan for ULINE items...');
     console.log('   ⏳ Using Finale vendor-scoped purchasing intelligence for ULINE...\n');
     const groups = await finale.getPurchasingIntelligence(365, 'ULINE');
-    const plans = buildVendorDraftPlans(groups, {}, 'uline');
+    const recentPOs = await finale.getRecentPurchaseOrders(45, 500);
+    const vendorCycles = buildVendorCycleMapForGroups(groups, recentPOs);
+    const plans = buildVendorDraftPlans(groups, { vendorCycles }, 'uline');
 
     if (plans.length === 0) {
         console.log('   ℹ️  No ULINE vendor group found in purchasing intelligence');
@@ -429,7 +432,10 @@ export async function gatherAutoReorderItems(finale: FinaleClient): Promise<Orde
 
     for (const plan of plans) {
         if (!plan.autoDraftEligible) {
-            console.log(`   ⏸️  Skipping ${plan.vendorName}: shared purchasing policy marked this vendor plan as manual review only.`);
+            const cycleSummary = plan.vendorCycle?.decision === 'routine_locked'
+                ? ` ${plan.vendorCycle.summary}`
+                : '';
+            console.log(`   ⏸️  Skipping ${plan.vendorName}: shared purchasing policy marked this vendor plan as manual review only.${cycleSummary}`);
             continue;
         }
 

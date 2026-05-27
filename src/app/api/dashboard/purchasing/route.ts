@@ -5,6 +5,7 @@ import { mergeIntoGroups } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
+import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
 
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
@@ -93,11 +94,21 @@ export async function GET(req: NextRequest) {
         return status.includes('draft') || status.includes('created') || status === 'order_created';
     };
 
-    const responseGroups = assessment.groups.map(group => ({
-        vendorName: group.vendorName,
-        vendorPartyId: group.vendorPartyId,
-        urgency: group.urgency,
-        items: group.items.map(line => {
+    const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+    const responseGroups = assessment.groups.map(group => {
+        const vendorCycle = classifyVendorOrderCycle({
+            vendorPartyId: group.vendorPartyId,
+            vendorName: group.vendorName,
+            recentPOs: vendorCyclePOs,
+            requestedLines: group.items,
+        });
+
+        return {
+            vendorName: group.vendorName,
+            vendorPartyId: group.vendorPartyId,
+            urgency: group.urgency,
+            vendorCycle,
+            items: group.items.map(line => {
             const matchingDraftPO = recentPOs.find(po => 
                 isDraftPO(po) && 
                 po.items?.some((i: any) => i.productId === line.item.productId)
@@ -122,7 +133,8 @@ export async function GET(req: NextRequest) {
                 draftPO: draftPOInfo,
             };
         }),
-    }));
+        };
+    });
 
     // ── Upcoming-builds digest (next 30 days from calendar forward-demand) ──
     // Compact list for the header panel. Same data the morning Telegram pulls.
@@ -183,11 +195,11 @@ export async function POST(req: NextRequest) {
         const requestedBySku = new Map<string, any>(
             items.map((item: any) => [String(item.productId), item]),
         );
-        const guards = assessedLines
+        const requestedLines = assessedLines
             .filter(line => requestedBySku.has(line.item.productId))
             .map(line => {
                 const requested = requestedBySku.get(line.item.productId);
-                return assessPOCommitGuard({
+                return {
                     ...line,
                     item: {
                         ...line.item,
@@ -201,8 +213,9 @@ export async function POST(req: NextRequest) {
                         ...line.assessment,
                         recommendedQty: requested.quantity,
                     },
-                });
+                };
             });
+        const guards = requestedLines.map(line => assessPOCommitGuard(line));
         const missingSkus = items
             .map((item: any) => String(item.productId))
             .filter((sku: string) => !guards.some(guard => guard.productId === sku));
@@ -212,6 +225,29 @@ export async function POST(req: NextRequest) {
                 {
                     error: 'Draft blocked: requested lines must satisfy lead time plus 30 days before autonomous PO creation.',
                     missingSkus,
+                    guards,
+                },
+                { status: 409 },
+            );
+        }
+
+        let recentPOs: any[] = [];
+        try {
+            recentPOs = await client.getRecentPurchaseOrders(45, 500);
+        } catch (err: any) {
+            console.error('[purchasing/route] Failed to fetch recent purchase orders for vendor cycle:', err.message);
+        }
+        const vendorCycle = classifyVendorOrderCycle({
+            vendorPartyId,
+            vendorName: vendorGroup.vendorName,
+            recentPOs: mapRecentPOsToVendorCyclePOs(recentPOs),
+            requestedLines,
+        });
+        if (vendorCycle.decision === 'routine_locked') {
+            return NextResponse.json(
+                {
+                    error: vendorCycle.summary,
+                    vendorCycle,
                     guards,
                 },
                 { status: 409 },

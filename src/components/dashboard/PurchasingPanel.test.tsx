@@ -255,6 +255,55 @@ describe("PurchasingPanel - vendor policy badges", () => {
             screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
         ).toBeTruthy();
     });
+
+    it("shows vendor-cycle lock state on the vendor header", async () => {
+        stubLocalStorage();
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Colorful Packaging Ltd",
+                    vendorPartyId: "10918",
+                    urgency: "warning",
+                    vendorCycle: {
+                        decision: "routine_locked",
+                        cycleDays: 30,
+                        lockedUntil: "2026-06-18",
+                        blockingPO: {
+                            orderId: "124832",
+                            vendorName: "Colorful Packaging Ltd",
+                            vendorPartyId: "10918",
+                            status: "Committed",
+                            orderDate: "2026-05-19",
+                            receiveDate: null,
+                            skus: ["CP-LABEL-OLD"],
+                        },
+                        ignoredPOs: [],
+                        exceptionEvidence: [],
+                        summary: "Routine cycle locked by PO 124832 until 2026-06-18.",
+                    },
+                    items: [makeFixtureItem()],
+                },
+            ],
+            cachedAt: "2026-05-05T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+            const url = String(input);
+            let body: any = emptyPayload;
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+
+        expect(await screen.findByText(/cycle locked/i)).toBeTruthy();
+        expect(screen.getByText(/PO 124832/i)).toBeTruthy();
+    });
 });
 
 describe("PurchasingPanel - qty override dropdown", () => {

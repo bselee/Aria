@@ -4,10 +4,12 @@ const {
     finaleCtorMock,
     assessGroupsMock,
     createDraftMock,
+    recentPurchaseOrdersMock,
 } = vi.hoisted(() => ({
     finaleCtorMock: vi.fn(),
     assessGroupsMock: vi.fn(),
     createDraftMock: vi.fn(),
+    recentPurchaseOrdersMock: vi.fn(),
 }));
 
 vi.mock("@/lib/finale/client", () => ({
@@ -36,7 +38,7 @@ describe("dashboard purchasing route", () => {
 
         finaleCtorMock.mockImplementation(function MockFinaleClient(this: any) {
             this.getBOMDemand = vi.fn().mockResolvedValue([]);
-            this.getRecentPurchaseOrders = vi.fn().mockResolvedValue([]);
+            this.getRecentPurchaseOrders = recentPurchaseOrdersMock;
             this.createDraftPurchaseOrder = createDraftMock;
             this.getPurchasingIntelligence = vi.fn().mockResolvedValue([
                 {
@@ -112,6 +114,14 @@ describe("dashboard purchasing route", () => {
                     ],
                 },
             ]);
+        });
+        recentPurchaseOrdersMock.mockResolvedValue([]);
+        createDraftMock.mockResolvedValue({
+            orderId: "125000",
+            finaleUrl: "https://example.com/po/125000",
+            facilityName: "Shipping",
+            duplicateWarnings: [],
+            priceAlerts: [],
         });
 
         assessGroupsMock.mockImplementation((groups: any[]) => ({
@@ -224,6 +234,42 @@ describe("dashboard purchasing route", () => {
             productId: "BOX-101",
             decision: "draft_only",
             blockReasons: ["recommended_qty_below_lead_plus_30"],
+        });
+        expect(createDraftMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects routine draft creation when the vendor cycle is locked by a recent PO", async () => {
+        recentPurchaseOrdersMock.mockResolvedValue([
+            {
+                orderId: "124832",
+                vendorName: "FedEx",
+                status: "Committed",
+                orderDate: "2026-05-19",
+                receiveDate: null,
+                items: [{ productId: "OTHER-SKU", quantity: 1 }],
+            },
+        ]);
+
+        const response = await POST({
+            json: async () => ({
+                vendorPartyId: "party-2",
+                items: [
+                    {
+                        productId: "LABEL-200",
+                        quantity: 100,
+                        unitPrice: 0.25,
+                        orderIncrementQty: null,
+                        isBulkDelivery: false,
+                    },
+                ],
+            }),
+        } as any);
+
+        expect(response.status).toBe(409);
+        const body = await response.json();
+        expect(body.vendorCycle).toMatchObject({
+            decision: "routine_locked",
+            blockingPO: { orderId: "124832" },
         });
         expect(createDraftMock).not.toHaveBeenCalled();
     });
