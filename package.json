@@ -15,8 +15,8 @@
     "typecheck:all": "npm run typecheck && npm run typecheck:cli",
     "ship:bot": "pm2 restart aria-bot && npm run smoke:bot",
     "ship:dashboard": "npm run build && pm2 reload aria-dashboard && npm run smoke:dashboard",
-    "smoke:bot": "bash scripts/smoke.sh aria-bot",
-    "smoke:dashboard": "bash scripts/smoke.sh aria-dashboard"
+    "smoke:bot": "node scripts/smoke.js aria-bot",
+    "smoke:dashboard": "node scripts/smoke.js aria-dashboard"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.49",
