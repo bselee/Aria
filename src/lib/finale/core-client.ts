@@ -683,6 +683,8 @@ export function deriveReceivedPurchaseOrders(
 export function enrichReceivedPurchaseOrdersWithShipmentDetails(
     orders: ReceivedPO[],
     shipmentDetailsByOrderId: Record<string, any[]>,
+    windowStart?: string,
+    windowEnd?: string,
 ): ReceivedPO[] {
     return orders.map((order) => {
         const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
@@ -710,9 +712,16 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
             }));
 
         const receivedBySku = new Map<string, number>();
+        const windowReceivedBySku = new Map<string, number>();
         for (const receipt of receiptHistory) {
+            const rcvDate = receipt.receiveDate;
+            const inWindow = !windowStart || !windowEnd || (rcvDate >= windowStart && rcvDate <= windowEnd);
+            
             for (const item of receipt.items) {
                 receivedBySku.set(item.productId, (receivedBySku.get(item.productId) ?? 0) + item.quantity);
+                if (inWindow) {
+                    windowReceivedBySku.set(item.productId, (windowReceivedBySku.get(item.productId) ?? 0) + item.quantity);
+                }
             }
         }
         const hasLineReceiptQuantities = receivedBySku.size > 0;
@@ -729,10 +738,12 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
                     return { ...item, orderedQuantity };
                 }
                 const receivedQuantity = receivedBySku.get(item.productId) ?? 0;
+                const receivedInWindow = windowReceivedBySku.get(item.productId) ?? 0;
                 return {
                     ...item,
                     orderedQuantity,
                     receivedQuantity,
+                    receivedInWindow,
                     openQuantity: Math.max(0, orderedQuantity - receivedQuantity),
                 };
             }),

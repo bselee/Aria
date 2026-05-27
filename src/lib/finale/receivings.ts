@@ -138,7 +138,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 shipmentDetailsByOrderId[po.orderId] = details.filter(Boolean);
             }));
 
-            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId);
+            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId, today, tomorrowStr);
         } catch (err: any) {
             console.error("Failed to fetch received POs:", err.message);
             return [];
