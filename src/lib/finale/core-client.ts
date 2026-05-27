@@ -166,7 +166,7 @@ export interface PurchasingItem {
         rawNeededEaches: number;
         provenance: Array<{ step: string; detail: string; value?: number | string }>;
     };
-    itemType?: 'resale' | 'bom-component';
+    itemType?: 'resale' | 'bom-component' | 'resale-bom';
     feedsFinishedGoods?: Array<{
         sku: string;
         name: string;

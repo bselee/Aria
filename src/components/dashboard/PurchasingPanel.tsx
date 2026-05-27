@@ -74,7 +74,7 @@ type PurchasingItem = {
     reviewReasons?: string[];
     roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
     roundingAlternatives?: number[];
-    itemType?: 'resale' | 'bom-component' | 'resale-bom';
+    itemType?: 'resale' | 'bom-component';
     feedsFinishedGoods?: Array<{
         sku: string;
         name: string;
@@ -410,200 +410,6 @@ export default function PurchasingPanel() {
     function reorderMethodTone(method?: FinaleReorderMethod): string {
         if (method === "do_not_reorder") return "text-rose-300/80 border-rose-500/20";
         if (method === "manual" || method === "on_site_order") return "text-amber-300/80 border-amber-500/20";
-// ── component ──────────────────────────────────────────────────────────────
-export default function PurchasingPanel() {
-    const lifecycle = usePurchasingLifecycle();
-    const [data, setData] = useState<AssessmentData | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [loadingTiers, setLoadingTiers] = useState<Set<UrgencyTier>>(new Set());
-    const [scanning, setScanning] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-
-    const [vendorTab, setVendorTab] = useState<string>("all");
-    const [expanded, setExpanded] = useState<Set<string>>(new Set());
-    const [whyOpen, setWhyOpen] = useState<Set<string>>(new Set());
-    const toggleWhy = useCallback((id: string) => {
-        setWhyOpen(prev => {
-            const next = new Set(prev);
-            if (next.has(id)) next.delete(id);
-            else next.add(id);
-            return next;
-        });
-    }, []);
-    const [checked, setChecked] = useState<Record<string, Record<string, boolean>>>({});
-    const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
-    const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
-    const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
-    // Full POResult per vendor (for verification + ETA display on the success pill).
-    const [createdPODetails, setCreatedPODetails] = useState<Record<string, POResult>>({});
-    // Per-modal step state for the Commit & Send flow.
-    const [sendSteps, setSendSteps] = useState<SendSteps>({});
-    const [commitIssues, setCommitIssues] = useState<string[]>([]);
-
-    // commit & send modal
-    const [commitModal, setCommitModal] = useState<CommitReview | null>(null);
-    const [commitLoading, setCommitLoading] = useState<string | null>(null); // orderId being reviewed
-    const [sendingPO, setSendingPO] = useState(false);
-    const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
-    const [canRetryEmail, setCanRetryEmail] = useState(false);
-
-    // snooze
-    const [snooze, setSnooze] = useState<SnoozeMap>({});
-    const [showSnoozed, setShowSnoozed] = useState(false);
-    const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
-    const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
-    // Default to "all" so every item is visible, sorted most-needed-first.
-    // Will: "We just want items in ordering to be staged from most needed to least always."
-    const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
-    const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
-    type ItemMode = 'all' | 'resale' | 'bom';
-    // Both resale and BOM items visible together (no UI toggle — the BOM
-    // treatment renders cleanly for BOM rows, resale rows show their own data).
-    const [itemMode] = useState<ItemMode>('all');
-    const [openPosDetail, setOpenPosDetail] = useState<Map<string, OpenPODetail>>(new Map());
-
-    // ULINE direct ordering
-    const [ulineOrdering, setUlineOrdering] = useState(false);
-    const [ulineResult, setUlineResult] = useState<UlineOrderResult | null>(null);
-    const [selectedItem, setSelectedItem] = useState<CrystalBallItem | null>(null);
-
-    // collapse + resize
-    const [isCollapsed, setIsCollapsed] = useState(false);
-    useEffect(() => { if (localStorage.getItem("aria-dash-purchasing-collapsed") === "true") setIsCollapsed(true); }, []);
-    useEffect(() => { localStorage.setItem("aria-dash-purchasing-collapsed", String(isCollapsed)); }, [isCollapsed]);
-
-    const [bodyHeight, setBodyHeight] = useState(620);
-    const [listScrollTop, setListScrollTop] = useState(0);
-    const dragRef = useRef<{ startY: number; startH: number } | null>(null);
-    useEffect(() => {
-        const s = localStorage.getItem("aria-dash-purchasing-h");
-        if (s) setBodyHeight(Math.max(420, Math.min(1000, parseInt(s))));
-    }, []);
-    useEffect(() => { localStorage.setItem("aria-dash-purchasing-h", String(bodyHeight)); }, [bodyHeight]);
-    useEffect(() => {
-        // v2 migration: legacy 'today' -> 'order_now', 'week' -> '30'.
-        // Anything unrecognized falls through to the default (order_now).
-        const savedFocus = localStorage.getItem(FOCUS_FILTER_LS);
-        if (savedFocus === "today") setFocusFilter("order_now");
-        else if (savedFocus === "week") setFocusFilter("30");
-        else if (savedFocus === "order_now" || savedFocus === "30" || savedFocus === "60" || savedFocus === "90" || savedFocus === "all") {
-            setFocusFilter(savedFocus);
-        }
-    }, []);
-    useEffect(() => { localStorage.setItem(FOCUS_FILTER_LS, focusFilter); }, [focusFilter]);
-    useEffect(() => {
-        const saved = localStorage.getItem(LIFECYCLE_FILTER_LS) as LifecycleFilter | null;
-        if (saved === "need" || saved === "topping" || saved === "on_order" || saved === "other" || saved === "all") {
-            setLifecycleFilter(saved);
-        }
-    }, []);
-    useEffect(() => { localStorage.setItem(LIFECYCLE_FILTER_LS, lifecycleFilter); }, [lifecycleFilter]);
-
-    // Fetch open-PO detail (ETA, tracking, lifecycle) once per panel load. Best-effort —
-    // missing detail just means the lifecycle ribbon falls back to PO# + qty + orderDate.
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                const res = await fetch("/api/dashboard/active-purchases");
-                if (!res.ok) return;
-                const json: { purchases?: any[] } = await res.json();
-                if (cancelled || !json.purchases) return;
-                const m = new Map<string, OpenPODetail>();
-                for (const p of json.purchases) {
-                    if (!p.orderId) continue;
-                    const id = String(p.orderId);
-                    m.set(id, {
-                        orderId: id,
-                        expectedDate: p.expectedDate,
-                        leadProvenance: p.leadProvenance,
-                        trackingNumbers: Array.isArray(p.trackingNumbers) ? p.trackingNumbers : [],
-                        lifecycleStage: p.lifecycleStage,
-                        vendorAcknowledgedAt: p.vendorAcknowledgedAt ?? null,
-                        sentVerification: p.sentVerification
-                            ? { verified: p.sentVerification.verified, sentAt: p.sentVerification.sentAt, source: p.sentVerification.source }
-                            : undefined,
-                        isReceived: p.isReceived,
-                        recLinks: Array.isArray(p.recLinks) ? p.recLinks : [],
-                    });
-                }
-                setOpenPosDetail(m);
-            } catch { /* best-effort */ }
-        })();
-        return () => { cancelled = true; };
-    }, []);
-
-    // Load snooze state from localStorage; purge expired entries on mount
-    useEffect(() => {
-        const raw = localStorage.getItem(SNOOZE_LS);
-        if (!raw) return;
-        try {
-            const parsed: SnoozeMap = JSON.parse(raw);
-            const now = Date.now();
-            const cleaned: SnoozeMap = {};
-            for (const [k, v] of Object.entries(parsed)) {
-                if (v.until === "forever" || (typeof v.until === "number" && v.until > now)) {
-                    cleaned[k] = v;
-                }
-            }
-            setSnooze(cleaned);
-            localStorage.setItem(SNOOZE_LS, JSON.stringify(cleaned));
-        } catch { }
-    }, []);
-
-    const startResize = useCallback((e: React.MouseEvent) => {
-        e.preventDefault();
-        dragRef.current = { startY: e.clientY, startH: bodyHeight };
-        const onMove = (ev: MouseEvent) => {
-            if (!dragRef.current) return;
-            setBodyHeight(Math.max(420, Math.min(1000, dragRef.current.startH + ev.clientY - dragRef.current.startY)));
-        };
-        const onUp = () => { dragRef.current = null; window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
-        window.addEventListener("mousemove", onMove);
-        window.addEventListener("mouseup", onUp);
-    }, [bodyHeight]);
-
-    // ── snooze helpers ─────────────────────────────────────────────────────
-    function isSnoozed(key: string): boolean {
-        const e = snooze[key];
-        if (!e) return false;
-        return e.until === "forever" || (typeof e.until === "number" && Date.now() < e.until);
-    }
-    function doSnooze(key: string, days: number | "forever") {
-        const entry: SnoozeEntry = days === "forever"
-            ? { until: "forever" }
-            : { until: Date.now() + (days as number) * 86400000 };
-        const updated = { ...snooze, [key]: entry };
-        setSnooze(updated);
-        localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
-        setSnoozeMenu(null);
-    }
-    function doUnsnooze(key: string) {
-        const updated = { ...snooze };
-        delete updated[key];
-        setSnooze(updated);
-        localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
-        setSnoozeMenu(null);
-    }
-    function snoozeLabel(key: string): string {
-        const e = snooze[key];
-        if (!e) return "";
-        if (e.until === "forever") return "always skip";
-        const days = Math.ceil(((e.until as number) - Date.now()) / 86400000);
-        return `snoozed ${days}d`;
-    }
-    function reorderMethodBadge(method?: FinaleReorderMethod): string | null {
-        if (!method) return null;
-        if (method === "do_not_reorder") return "DNR";
-        if (method === "manual") return "MANUAL";
-        if (method === "sales_velocity") return "SALES";
-        if (method === "demand_velocity") return "DEMAND";
-        if (method === "on_site_order") return "ON SITE";
-        return "DEFAULT";
-    }
-    function reorderMethodTone(method?: FinaleReorderMethod): string {
-        if (method === "do_not_reorder") return "text-rose-300/80 border-rose-500/20";
-        if (method === "manual" || method === "on_site_order") return "text-amber-300/80 border-amber-500/20";
         if (method === "sales_velocity" || method === "demand_velocity") return "text-cyan-300/80 border-cyan-500/20";
         return "text-zinc-400 border-zinc-700/60";
     }
@@ -618,8 +424,8 @@ export default function PurchasingPanel() {
     }
     function itemMatchesMode(item: PurchasingItem): boolean {
         if (itemMode === "all") return true;
-        if (itemMode === "bom") return item.itemType === "bom-component" || item.itemType === "resale-bom";
-        return item.itemType !== "bom-component" && item.itemType !== "resale-bom";
+        if (itemMode === "bom") return item.itemType === "bom-component";
+        return item.itemType !== "bom-component";
     }
     function itemMatchesLifecycle(item: PurchasingItem): boolean {
         if (lifecycleFilter === "all") return true;
@@ -776,7 +582,7 @@ export default function PurchasingPanel() {
         if (!data?.groups) return;
         for (const g of data.groups) {
             for (const item of g.items) {
-                if ((item.itemType === 'bom-component' || item.itemType === 'resale-bom') && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0) {
+                if (item.itemType === 'bom-component' && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0) {
                     lifecycle.registerBOM(item.productId, item.feedsFinishedGoods.map(fg => fg.sku));
                 }
             }
@@ -1570,13 +1376,610 @@ export default function PurchasingPanel() {
                                         i.assessment?.decision === "order" || i.assessment?.decision === "reduce",
                                     );
                                     const selectedItems = activeItems.filter(i => groupChecked[i.productId]);
-                                                                                            <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 ml-1">
-                                                                                                BOM
+                                    const directOrderBlocked = selectedItems.some(i => !canUseDirectOrdering(group.vendorName, i.reorderMethod));
+                                    const selectedCount = activeItems.filter(i => groupChecked[i.productId]).length;
+                                    const selectedUnits = selectedItems.reduce((sum, item) => sum + (groupQtys[item.productId] ?? item.suggestedQty), 0);
+                                    const selectedValue = selectedItems.reduce((sum, item) => {
+                                        const qty = groupQtys[item.productId] ?? item.suggestedQty;
+                                        return sum + qty * Math.max(0, item.unitPrice);
+                                    }, 0);
+                                    const actionableForShortage = activeItems.filter(i =>
+                                        i.assessment?.decision === "order" || i.assessment?.decision === "reduce",
+                                    );
+                                    const shortageCandidates = actionableForShortage.length > 0 ? actionableForShortage : activeItems;
+                                    const earliestRunway = shortageCandidates.length > 0
+                                        ? Math.min(...shortageCandidates.map(getEffectiveShortageDays))
+                                        : null;
+                                    const diffCount = activeItems.filter(item => item.qtyDiverged).length;
+                                    const allCheckedFlag = activeItems.length > 0 && activeItems.every(i => groupChecked[i.productId]);
+                                    const groupProductIds = activeItems.map(item => item.productId);
+                                    const groupMatch = lifecycle.checkMatchDetails({
+                                        vendorName: group.vendorName,
+                                        productIds: groupProductIds,
+                                    });
+                                    const groupBg = groupMatch.isLockedDirect
+                                        ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                        : groupMatch.isLockedBom
+                                        ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                        : groupMatch.isDirect
+                                        ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                        : groupMatch.isBom
+                                        ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                        : "";
+
+                                    return (
+                                        <div
+                                            key={pid}
+                                            onClick={(e) => {
+                                                const target = e.target as HTMLElement;
+                                                if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                                lifecycle.setLockedFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds });
+                                            }}
+                                            onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds })}
+                                            onMouseLeave={lifecycle.clearFocus}
+                                            className={`border-b border-zinc-800/60 cursor-pointer ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupBg}`}
+                                        >
+                                            {/* ── Vendor header ── */}
+                                            <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-zinc-800/30 transition-colors">
+                                                <span className={`w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
+                                                <button
+                                                    onClick={() => !vSnoozed && toggleExpand(pid)}
+                                                    className="flex-1 text-left flex items-center gap-2 min-w-0"
+                                                >
+                                                    <span className={`text-base font-mono font-semibold truncate ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
+                                                        {group.vendorName}
+                                                    </span>
+                                                    <span className="text-xs font-mono text-zinc-200 shrink-0">
+                                                        {vSnoozed
+                                                            ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
+                                                            : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
+                                                    </span>
+                                                    {!vSnoozed && earliestRunway != null && Number.isFinite(earliestRunway) && (() => {
+                                                        // Show the lead time of the most-urgent item so the shortage number is
+                                                        // self-explanatory: "shortage 21d · lead 25d" = we're already late.
+                                                        const critItem = activeItems.find(i => i.urgency === 'critical');
+                                                        const shortageLeadTime = critItem?.leadTimeDays ?? null;
+                                                        return (
+                                                            <span
+                                                                className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}
+                                                                title={shortageLeadTime != null
+                                                                    ? `Runway ${Math.round(earliestRunway)}d < lead time ${shortageLeadTime}d → order window already closed. Stock will hit zero before the next delivery arrives.`
+                                                                    : "Earliest effective shortage among actionable items"}
+                                                            >
+                                                                shortage {Math.round(earliestRunway)}d
+                                                                {shortageLeadTime != null && (
+                                                                    <span className="text-zinc-500 font-normal"> · lead {shortageLeadTime}d</span>
+                                                                )}
+                                                            </span>
+                                                        );
+                                                    })()}
+                                                    {!vSnoozed && selectedCount > 0 && (
+                                                        <span className="text-xs font-mono text-emerald-300 shrink-0">
+                                                            selected {selectedCount} / {selectedUnits} units
+                                                            {selectedValue > 0 ? ` / $${selectedValue.toFixed(0)}` : ""}
+                                                        </span>
+                                                    )}
+                                                    {!vSnoozed && diffCount > 0 && (
+                                                        <span className="text-[11px] font-mono text-amber-300 border border-amber-500/30 rounded px-1 shrink-0">
+                                                            {diffCount} qty diff
+                                                        </span>
+                                                    )}
+                                                    {/* Affected FGs across this vendor's BOM items (collapsed view) */}
+                                                    {!vSnoozed && (() => {
+                                                        const fgs = new Map<string, string>();
+                                                        for (const it of activeItems) {
+                                                            for (const fg of it.feedsFinishedGoods ?? []) {
+                                                                if (!fgs.has(fg.sku)) fgs.set(fg.sku, fg.name);
+                                                            }
+                                                        }
+                                                        if (fgs.size === 0) return null;
+                                                        const list = Array.from(fgs.entries());
+                                                        const shown = list.slice(0, 3);
+                                                        return (
+                                                            <span
+                                                                className="text-[10px] font-mono text-purple-300/80 truncate max-w-[420px] shrink"
+                                                                title={list.map(([sku, name]) => `${sku} · ${name}`).join('\n')}
+                                                            >
+                                                                affects {shown.map(([sku]) => sku).join(', ')}
+                                                                {list.length > shown.length && ` · +${list.length - shown.length}`}
+                                                            </span>
+                                                        );
+                                                    })()}
+                                                </button>
+
+                                                {!vSnoozed && cfg.label && (() => {
+                                                    // DECISION(2026-05-27): CRIT badge gets an explanatory tooltip so humans
+                                                    // understand why CRIT ≠ just "it's bad" — it means the order window is closed.
+                                                    // The tooltip exposes the runway < lead time math that defines critical.
+                                                    const critItems = group.urgency === 'critical'
+                                                        ? activeItems.filter(i => i.urgency === 'critical')
+                                                        : [];
+                                                    const critTooltip = critItems.length > 0
+                                                        ? `CRITICAL: stock runway (${Math.round(Math.min(...critItems.map(i => i.adjustedRunwayDays)))}d) is less than vendor lead time (${Math.round(Math.min(...critItems.map(i => i.leadTimeDays)))}d). The order window has closed — you will stock out before the next delivery arrives. Order immediately.`
+                                                        : cfg.label;
+                                                    return (
+                                                        <span
+                                                            className={`text-[10px] font-mono shrink-0 ${group.urgency === "critical"
+                                                                ? (po ? `px-1 py-0.5 rounded border ${cfg.badgeOutline}` : `px-1 py-0.5 rounded border ${cfg.badge}`)
+                                                                : cfg.badge
+                                                            }`}
+                                                            title={critTooltip}
+                                                        >
+                                                            {cfg.label}
+                                                        </span>
+                                                    );
+                                                })()}
+                                                {vSnoozed ? (
+                                                    /* Restore entire snoozed vendor */
+                                                    <button
+                                                        onClick={() => {
+                                                            const updated = { ...snooze };
+                                                            delete updated[vSnoozeKey];
+                                                            group.items.forEach(i => delete updated[i.productId]);
+                                                            setSnooze(updated);
+                                                            localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
+                                                        }}
+                                                        className="text-[10px] font-mono text-zinc-600 hover:text-emerald-400 shrink-0 transition-colors"
+                                                    >
+                                                        ↩ restore
+                                                    </button>
+                                                ) : (
+                                                    <>
+                                                        {po ? (
+                                                            <div className="flex items-center gap-1 shrink-0">
+                                                                <a href={po.finaleUrl} target="_blank" rel="noreferrer"
+                                                                    className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300">
+                                                                    PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
+                                                                </a>
+                                                                {(() => {
+                                                                    const det = createdPODetails[pid];
+                                                                    if (!det?.verification) return null;
+                                                                    if (det.verification.verified) {
+                                                                        return (
+                                                                            <span
+                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-300 border-emerald-500/40 shrink-0"
+                                                                                title={det.expectedDelivery?.label ?? 'verified'}
+                                                                            >
+                                                                                ✓ Verified{det.expectedDelivery?.date ? ` · ETA ${det.expectedDelivery.date.slice(5)}` : ''}
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    return (
+                                                                        <span
+                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0"
+                                                                            title={det.verification.mismatches.join('; ')}
+                                                                        >
+                                                                            ⚠ Verify failed
+                                                                        </span>
+                                                                    );
+                                                                })()}
+                                                                {sentPOs.has(po.orderId) ? (
+                                                                    <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
+                                                                ) : (
+                                                                    <button
+                                                                        onClick={() => handleReviewAndSend(po.orderId)}
+                                                                        disabled={commitLoading === po.orderId}
+                                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
+                                                                        title="Commit in Finale and email vendor"
+                                                                    >
+                                                                        {commitLoading === po.orderId ? '…' : 'Commit & Send'}
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                        ) : (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
+                                                                    disabled={anyCreating}
+                                                                    className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
+                                                                        ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
+                                                                        : "bg-transparent text-zinc-600 border-zinc-800"
+                                                                        }`}
+                                                                >
+                                                                    {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
+                                                                    {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
+                                                                </button>
+                                                                {/* ULINE: Order Now button — fires items directly to ULINE cart */}
+                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && !directOrderBlocked && (
+                                                                    <button
+                                                                        onClick={() => handleOrderOnUline(group)}
+                                                                        disabled={ulineOrdering}
+                                                                        className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-700/80 hover:bg-amber-600 text-amber-100 border-amber-600 transition-colors disabled:opacity-40 shrink-0"
+                                                                        title="Add selected items to ULINE cart via Quick Order"
+                                                                    >
+                                                                        {ulineOrdering
+                                                                            ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
+                                                                            : <ShoppingCart className="w-2.5 h-2.5" />}
+                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                    </button>
+                                                                )}
+                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && directOrderBlocked && (
+                                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/20 text-amber-300/80 shrink-0">
+                                                                        {directOrderBlockReason(selectedItems)}
+                                                                    </span>
+                                                                )}
+                                                            </>
+                                                        )}
+                                                        {/* Vendor-level snooze menu */}
+                                                        <div className="relative shrink-0">
+                                                            <button
+                                                                onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === vSnoozeKey ? null : vSnoozeKey); }}
+                                                                className="px-1 py-0.5 text-[11px] font-mono text-zinc-700 hover:text-zinc-400 transition-colors"
+                                                                title="Snooze this vendor"
+                                                            >···</button>
+                                                            {snoozeMenu === vSnoozeKey && renderSnoozeMenu(vSnoozeKey)}
+                                                        </div>
+                                                        <ChevronDown
+                                                            onClick={() => toggleExpand(pid)}
+                                                            className={`w-3.5 h-3.5 text-zinc-700 transition-transform shrink-0 cursor-pointer ${isExpanded ? "" : "-rotate-90"}`}
+                                                        />
+                                                    </>
+                                                )}
+                                            </div>
+
+                                            {/* ── Item rows ── */}
+                                            {isExpanded && (
+                                                <div className="bg-zinc-950/40 border-t border-zinc-800/30">
+                                                    {/* Select-all bar */}
+                                                    <div className="flex items-center gap-2 px-4 py-1 border-b border-zinc-800/20">
+                                                        <input type="checkbox" checked={allCheckedFlag}
+                                                            onChange={e => selectAll(group, e.target.checked)}
+                                                            className="w-3 h-3 rounded accent-zinc-400 shrink-0" />
+                                                        <span className="text-[11px] font-mono text-zinc-400">
+                                                            {allCheckedFlag ? "Deselect all" : "Select all"}
+                                                        </span>
+                                                        <div className="flex-1" />
+                                                        {po ? (
+                                                            <div className="flex items-center gap-2">
+                                                                <a href={po.finaleUrl} target="_blank" rel="noreferrer"
+                                                                    className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
+                                                                    ✓ PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
+                                                                </a>
+                                                                {sentPOs.has(po.orderId) ? (
+                                                                    <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
+                                                                ) : (
+                                                                    <button
+                                                                        onClick={() => handleReviewAndSend(po.orderId)}
+                                                                        disabled={commitLoading === po.orderId}
+                                                                        className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40"
+                                                                    >
+                                                                        {commitLoading === po.orderId ? 'Loading…' : 'Commit & Send'}
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                        ) : selectedCount > 0 ? (
+                                                            <div className="flex items-center gap-1.5">
+                                                                <button onClick={() => handleCreateOne(group)} disabled={anyCreating}
+                                                                    className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40">
+                                                                    {isCreatingThis ? "Creating…" : `→ Draft PO (${selectedCount} item${selectedCount !== 1 ? "s" : ""})`}
+                                                                </button>
+                                                                {isUlineVendor(group.vendorName) && !directOrderBlocked && (
+                                                                    <button
+                                                                        onClick={() => handleOrderOnUline(group)}
+                                                                        disabled={ulineOrdering}
+                                                                        className="flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-amber-700/80 hover:bg-amber-600 text-amber-100 border border-amber-600 transition-colors disabled:opacity-40"
+                                                                    >
+                                                                        {ulineOrdering
+                                                                            ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
+                                                                            : <ShoppingCart className="w-2.5 h-2.5" />}
+                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                    </button>
+                                                                )}
+                                                                {isUlineVendor(group.vendorName) && directOrderBlocked && (
+                                                                    <span className="text-[10px] font-mono px-2 py-0.5 rounded border border-amber-500/20 text-amber-300/80">
+                                                                        {directOrderBlockReason(selectedItems)}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        ) : null}
+                                                    </div>
+
+                                                    {sortItemsByNeed(group.items)
+                                                        .filter(item => showSnoozed || !isSnoozed(item.productId))
+                                                        .map(item => {
+                                                            const itemSnoozed = isSnoozed(item.productId);
+                                                            const draftBlocked = !canIncludeInDraftPO(item.reorderMethod) || !!item.draftPO;
+                                                            const isChecked = !itemSnoozed && !draftBlocked && (groupChecked[item.productId] ?? false);
+                                                            const qty = groupQtys[item.productId] ?? item.suggestedQty;
+                                                            const rc = runwayColor(item.runwayDays);
+                                                            const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
+                                                            const iKey = item.productId;
+                                                            const methodBadge = reorderMethodBadge(item.reorderMethod);
+                                                            const openOrderId = item.openPOs[0]?.orderId;
+                                                            const itemMatch = lifecycle.checkMatchDetails({
+                                                                vendorName: group.vendorName,
+                                                                orderId: openOrderId,
+                                                                productIds: [item.productId],
+                                                            });
+                                                            const itemBg = itemMatch.isLockedDirect
+                                                                ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
+                                                                : itemMatch.isLockedBom
+                                                                ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
+                                                                : itemMatch.isDirect
+                                                                ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
+                                                                : itemMatch.isBom
+                                                                ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
+                                                                : "";
+
+                                                            return (
+                                                                <div key={iKey}
+                                                                    onClick={(e) => {
+                                                                        const target = e.target as HTMLElement;
+                                                                        if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
+                                                                        lifecycle.setLockedFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] });
+                                                                    }}
+                                                                    onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] })}
+                                                                    onMouseLeave={lifecycle.clearFocus}
+                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 cursor-pointer ${itemBg} ${itemSnoozed ? "opacity-20 hover:opacity-40 transition-opacity" : isChecked ? "" : "opacity-90"
+                                                                        }`}>
+                                                                    <div className="flex items-start gap-3">
+                                                                        {!itemSnoozed && (
+                                                                            <input type="checkbox" checked={isChecked}
+                                                                                onChange={() => toggleItem(pid, iKey)}
+                                                                                disabled={draftBlocked}
+                                                                                title={item.draftPO ? `Draft PO #${item.draftPO.orderId} already exists` : undefined}
+                                                                                className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
+                                                                                    : item.urgency === "warning" ? "accent-yellow-400"
+                                                                                        : "accent-zinc-400"
+                                                                                    } disabled:opacity-40`} />
+                                                                        )}
+                                                                        {itemSnoozed && <div className="mt-1 w-3.5 h-3.5" />}
+
+                                                                        <div className="flex-1 min-w-0">
+                                                                            {/* Row 1: Dot · SKU · Badges · Runway · Snooze */}
+                                                                            <div className="flex items-center gap-2">
+                                                                                <span className={`w-2 h-2 rounded-full shrink-0 ${itemSnoozed ? "bg-zinc-700" : URGENCY[item.urgency].dot}`} />
+                                                                                <span className={`text-base font-mono font-bold truncate ${itemSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
+                                                                                    {item.productId}
+                                                                                </span>
+
+                                                                                {itemSnoozed && (
+                                                                                    <span className="text-[9px] font-mono text-zinc-600 shrink-0">
+                                                                                        {snoozeLabel(iKey)}
+                                                                                    </span>
+                                                                                )}
+                                                                                {isBundle && (
+                                                                                    <span className="text-[9px] font-mono text-blue-500/70 border border-blue-500/20 rounded px-1 shrink-0">
+                                                                                        bundle?
+                                                                                    </span>
+                                                                                )}
+                                                                                {methodBadge && !itemSnoozed && (
+                                                                                    <span className={`text-[9px] font-mono border rounded px-1 shrink-0 ${reorderMethodTone(item.reorderMethod)}`}>
+                                                                                        {methodBadge}
+                                                                                    </span>
+                                                                                )}
+                                                                                {item.packSize && !itemSnoozed && (
+                                                                                    <span className="text-[10px] font-mono text-zinc-400 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
+                                                                                        {item.packSize.unitsPerPack}/{item.packSize.packUnit}
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.vendorPolicy?.targetCoverDays != null && item.vendorPolicy.targetCoverDays > 0 && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-emerald-300 border border-emerald-500/30 bg-emerald-500/5 rounded px-1 shrink-0"
+                                                                                        title={item.vendorPolicy.notes ?? "Vendor policy target cover window"}
+                                                                                    >
+                                                                                        {item.vendorPolicy.targetCoverDays}d cover
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.vendorPolicy?.leadTimeOverrideDays != null && item.vendorPolicy.leadTimeOverrideDays > 0 && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-zinc-300 border border-zinc-600/50 bg-zinc-800/40 rounded px-1 shrink-0"
+                                                                                        title="Vendor policy lead-time override"
+                                                                                    >
+                                                                                        {item.vendorPolicy.leadTimeOverrideDays}d lead
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.moqWarning && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded px-1 shrink-0"
+                                                                                        title="Vendor MOQ not met (warn-only — qty not bumped)"
+                                                                                    >
+                                                                                        MOQ warn
+                                                                                    </span>
+                                                                                )}
+                                                                                {!itemSnoozed && item.reviewRequired && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono text-red-300 border border-red-500/40 bg-red-500/10 rounded px-1 shrink-0"
+                                                                                        title="Recommendation flagged for review — see reasons below"
+                                                                                    >
+                                                                                        Review
+                                                                                    </span>
+                                                                                )}
+
+                                                                                <div className="flex-1" />
+
+                                                                                {!itemSnoozed && (() => {
+                                                                                    // v2: shortage label uses effective shortage, not raw runway.
+                                                                                    // Refinement A: when the lifecycle ribbon below will render
+                                                                                    // (item has open POs), drop the "→Xd adjusted" tail since the
+                                                                                    // ribbon shows the same coverage in more detail.
+                                                                                    const effective = getEffectiveShortageDays(item);
+                                                                                    const ribbonBelow = (item.openPOs?.length ?? 0) > 0;
+                                                                                    const rawIsZero = item.runwayDays === 0 && item.adjustedRunwayDays > 0;
+                                                                                    if (rawIsZero && !ribbonBelow) {
+                                                                                        return (
+                                                                                            <span className={`text-xs font-mono shrink-0 ${rc}`}>
+                                                                                                on hand out · covered <span className="text-zinc-300">{Math.round(item.adjustedRunwayDays)}d</span>
+                                                                                            </span>
+                                                                                        );
+                                                                                    }
+                                                                                    return (
+                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`} title="Effective shortage: finaleStockoutDays > adjustedRunwayDays > runwayDays">
+                                                                                            shortage {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
+                                                                                            {!ribbonBelow && item.stockOnOrder > 0 && (
+                                                                                                <span className="text-zinc-400 font-normal text-[10px]">
+                                                                                                    {" "}(raw {Math.round(item.runwayDays)}d)
+                                                                                                </span>
+                                                                                            )}
+                                                                                        </span>
+                                                                                    );
+                                                                                })()}
+
+                                                                                {/* Per-row trigger reason badge */}
+                                                                                {!itemSnoozed && item.triggerReason && (
+                                                                                    <span
+                                                                                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${
+                                                                                            item.triggerReason === 'build-driven' ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
+                                                                                            : item.triggerReason === 'stockout-padded' ? 'bg-rose-500/15 text-rose-300 border-rose-500/40'
+                                                                                            : item.triggerReason === 'runway-short' ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                                                                                            : 'bg-zinc-700/40 text-zinc-400 border-zinc-700'
+                                                                                        }`}
+                                                                                        title={item.triggerDetail ?? ''}
+                                                                                    >
+                                                                                        {item.triggerReason === 'build-driven' ? '📅 build' :
+                                                                                         item.triggerReason === 'stockout-padded' ? '🔁 stockout' :
+                                                                                         item.triggerReason === 'runway-short' ? '⏱ runway' :
+                                                                                         '🗓 cadence'}
+                                                                                    </span>
+                                                                                )}
+
+                                                                                {/* 🚛 BULK badge — shown when vendor is flagged as a bulk multi-leg shipper */}
+                                                                                {!itemSnoozed && item.isBulkVendor && (
+                                                                                    <span
+                                                                                        className="text-[9px] font-mono px-1 py-0.5 rounded border border-violet-500/40 bg-violet-500/10 text-violet-300 shrink-0"
+                                                                                        title="Bulk vendor — shipments arrive in multiple legs over time"
+                                                                                    >
+                                                                                        🚛 BULK
+                                                                                    </span>
+                                                                                )}
+
+                                                                                <div className="relative shrink-0 ml-1">
+                                                                                    <button
+                                                                                        onClick={e => {
+                                                                                            e.stopPropagation();
+                                                                                            // Single click unsnoozes — no menu needed when the only action is "bring it back."
+                                                                                            if (itemSnoozed) { doUnsnooze(iKey); return; }
+                                                                                            setSnoozeMenu(snoozeMenu === iKey ? null : iKey);
+                                                                                        }}
+                                                                                        className={`text-[11px] font-mono px-1.5 py-0.5 rounded transition-colors ${itemSnoozed
+                                                                                            ? "text-emerald-400/80 hover:text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/10"
+                                                                                            : "text-zinc-500 hover:text-zinc-300"
+                                                                                            }`}
+                                                                                        title={itemSnoozed ? "Unsnooze this item" : "Snooze this item"}
+                                                                                    >{itemSnoozed ? "↩ unsnooze" : "···"}</button>
+                                                                                    {!itemSnoozed && snoozeMenu === iKey && renderSnoozeMenu(iKey)}
+                                                                                </div>
+                                                                            </div>
+
+                                                                            {/* Row 1.5: Open-PO lifecycle ribbon — one chip per open PO covering this SKU */}
+                                                                            {!itemSnoozed && item.openPOs && item.openPOs.length > 0 && (
+                                                                                <div className="mt-1.5 flex flex-col gap-1">
+                                                                                    {item.openPOs.map((openPo) => {
+                                                                                        const detail = openPosDetail.get(openPo.orderId);
+                                                                                        const stage = detail?.lifecycleStage;
+                                                                                        // Color the chip by stage — green when shipped/delivered, amber when sent but unconfirmed, blue when sent+acked, gray when unknown.
+                                                                                        const chipClass = stage === "delivered" || stage === "moving_with_tracking"
+                                                                                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-200"
+                                                                                            : stage === "vendor_acknowledged" || stage === "tracking_unavailable"
+                                                                                                ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-200"
+                                                                                                : detail?.sentVerification?.verified
+                                                                                                    ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-200"
+                                                                                                    : "bg-zinc-800/60 border-zinc-700/60 text-zinc-300";
+                                                                                        // Build the inline status pieces.
+                                                                                        const pieces: string[] = [];
+                                                                                        if (detail?.sentVerification?.verified) pieces.push(`sent ✓`);
+                                                                                        if (detail?.vendorAcknowledgedAt) pieces.push(`acked ${new Date(detail.vendorAcknowledgedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
+                                                                                        if ((detail?.trackingNumbers?.length ?? 0) > 0) pieces.push(`📦 ${detail!.trackingNumbers![0].slice(-6)}`);
+                                                                                        if (detail?.expectedDate) pieces.push(`ETA ${new Date(detail.expectedDate).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}`);
+                                                                                        // Phase C — find the rec link for THIS sku (the one being recommended).
+                                                                                        const recLink = (detail?.recLinks ?? []).find(r => r.productId === item.productId);
+                                                                                        const recDivergence = recLink && recLink.recommendedQty > 0
+                                                                                            ? Math.round(((recLink.draftedQty - recLink.recommendedQty) / recLink.recommendedQty) * 100)
+                                                                                            : null;
+                                                                                        return (
+                                                                                            <div key={openPo.orderId} className={`flex items-center gap-2 text-[10.5px] font-mono px-2 py-1 rounded border ${chipClass}`}>
+                                                                                                <span className="font-semibold shrink-0">PO {openPo.orderId}</span>
+                                                                                                <span className="text-[10px] opacity-70 shrink-0">qty {openPo.quantity}</span>
+                                                                                                {recLink && (
+                                                                                                    <span
+                                                                                                        className="text-[9.5px] font-mono text-cyan-300/80 border border-cyan-500/30 rounded px-1 shrink-0"
+                                                                                                        title={`Aria recommended ${recLink.recommendedQty} on ${new Date(recLink.recommendedAt).toLocaleDateString()} → drafted ${recLink.draftedQty} on ${new Date(recLink.draftedAt).toLocaleDateString()}`}
+                                                                                                    >
+                                                                                                        rec {recLink.recommendedQty}→{recLink.draftedQty}
+                                                                                                        {recDivergence != null && Math.abs(recDivergence) >= 10 && (
+                                                                                                            <span className="ml-1 text-amber-400">{recDivergence > 0 ? '+' : ''}{recDivergence}%</span>
+                                                                                                        )}
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {pieces.length > 0 && <span className="text-zinc-500 shrink-0">·</span>}
+                                                                                                <span className="truncate">{pieces.join(' · ')}</span>
+                                                                                                {!detail && <span className="text-[9.5px] text-zinc-500 italic shrink-0">no tracking detail</span>}
+                                                                                            </div>
+                                                                                        );
+                                                                                    })}
+                                                                                </div>
+                                                                            )}
+
+                                                                            {/* ── Bulk last-receipt + order-needed row ── */}
+                                                                            {/* DECISION(2026-05-21): Shown for all isBulkVendor items so the
+                                                                                ordering surface always answers: when did we last buy, and when
+                                                                                must we place the next order? Removes need to cross-reference
+                                                                                Active Purchases or Finale for bulk vendors. */}
+                                                                            {!itemSnoozed && item.isBulkVendor && (() => {
+                                                                                const lastDate = item.lastPurchaseDate;
+                                                                                const lastQty  = item.lastPurchaseQty;
+                                                                                // "Order by" = today + (runwayDays - leadTimeDays).
+                                                                                // Positive = days until we MUST place the order.
+                                                                                // Zero/negative = already past the order window.
+                                                                                const orderByDays = Math.round(item.runwayDays - item.leadTimeDays);
+                                                                                const orderByDate = orderByDays > -90
+                                                                                    ? new Date(Date.now() + orderByDays * 86400000)
+                                                                                        .toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+                                                                                    : null;
+                                                                                const hasOpenPO = (item.openPOs?.length ?? 0) > 0;
+                                                                                return (
+                                                                                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] font-mono text-zinc-500 px-0.5">
+                                                                                        {lastDate && lastQty != null ? (
+                                                                                            <span title="Most recent completed PO order date + qty for this SKU">
+                                                                                                Last rcvd:
+                                                                                                <span className="text-zinc-300 ml-1">
+                                                                                                    {lastQty.toLocaleString()} · {new Date(lastDate + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' })}
+                                                                                                </span>
+                                                                                            </span>
+                                                                                        ) : (
+                                                                                            <span className="text-zinc-600 italic">no receipt history</span>
+                                                                                        )}
+                                                                                        <span className="text-zinc-700">·</span>
+                                                                                        {hasOpenPO ? (
+                                                                                            <span className="text-emerald-400/80 font-semibold">
+                                                                                                ✓ PO committed
+                                                                                            </span>
+                                                                                        ) : orderByDate ? (
+                                                                                            <span
+                                                                                                className={`font-semibold ${
+                                                                                                    orderByDays <= 0  ? 'text-red-400' :
+                                                                                                    orderByDays <= 14 ? 'text-amber-400' :
+                                                                                                    'text-zinc-400'
+                                                                                                }`}
+                                                                                                title={`Place order by ${orderByDate} so it arrives before stockout (runway ${Math.round(item.runwayDays)}d − lead ${item.leadTimeDays}d = ${orderByDays}d remaining)`}
+                                                                                            >
+                                                                                                {orderByDays <= 0 ? '⚠ ORDER NOW — window closed' : `order by ${orderByDate}`}
+                                                                                            </span>
+                                                                                        ) : (
+                                                                                            <span className="text-zinc-600">order timing unknown</span>
+                                                                                        )}
+                                                                                    </div>
+                                                                                );
+                                                                            })()}
+
+                                                                            {/* Row 2: Description & Amount */}
+                                                                            {!itemSnoozed && (
+                                                                                <div className="flex items-center gap-2 mt-1">
+                                                                                    <span className="text-[13px] font-mono text-zinc-200 flex-1 truncate">
+                                                                                        {item.productName}
+                                                                                        {(item.itemType === 'bom-component' || item.itemType === 'resale-bom') && (
+                                                                                            <span
+                                                                                                className="text-[8px] font-mono px-1 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 ml-1"
+                                                                                                title={item.itemType === 'resale-bom'
+                                                                                                    ? 'Both sold directly AND used as a BOM component in finished goods'
+                                                                                                    : 'BOM component — consumed by finished goods builds, not sold directly'}
+                                                                                            >
+                                                                                                {item.itemType === 'resale-bom' ? 'BOM+RESALE' : 'BOM'}
                                                                                             </span>
                                                                                         )}
                                                                                     </span>
                                                                                     {item.reorderMethod === "default" && item.dailyRateSource === "demand" && (
-                                                                                        <span className="text-[11px] font-mono text-zinc-300 shrink-0">
+                                                                                        <span className="text-[11px] font-mono text-zinc-300 shrink-0" title="No sales or receipt velocity found — falling back to Finale demand signal">
                                                                                             demand fallback
                                                                                         </span>
                                                                                     )}
@@ -1592,7 +1995,57 @@ export default function PurchasingPanel() {
                                                                                 </div>
                                                                             )}
 
-                                                                            {!itemSnoozed && (item.itemType === 'bom-component' || item.itemType === 'resale-bom') && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0 && (
+                                                                            {/* Row 2.5: Demand context — what is driving this order? */}
+                                                                            {/* DECISION(2026-05-27): Users asked "why is this critical, what triggers it,
+                                                                                how is it consumed?" This row answers all three without requiring a Why drawer:
+                                                                                - Retail demand: sold directly, shows sales velocity + demand rate
+                                                                                - BOM demand: component of finished goods, shows which products consume it
+                                                                                - BOM+retail: both paths, shows combined burn rate */}
+                                                                            {!itemSnoozed && (() => {
+                                                                                const isBom = item.itemType === 'bom-component' || item.itemType === 'resale-bom';
+                                                                                const isResale = item.itemType === 'resale' || item.itemType === 'resale-bom';
+                                                                                const hasFGs = (item.feedsFinishedGoods?.length ?? 0) > 0;
+                                                                                const hasDemandContext = isBom || (item.candidate?.bomDemand ?? 0) > 0 || (item.candidate?.directDemand ?? 0) > 0;
+                                                                                if (!hasDemandContext && !hasFGs) return null;
+                                                                                return (
+                                                                                    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] font-mono text-zinc-500 px-0.5">
+                                                                                        {/* Retail demand signal */}
+                                                                                        {isResale && (item.candidate?.directDemand ?? 0) > 0 && (
+                                                                                            <span title="Direct retail sales velocity feeding this reorder">
+                                                                                                retail: <span className="text-zinc-300">{(item.candidate!.directDemand).toFixed(1)}/day</span>
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {/* BOM demand signal */}
+                                                                                        {isBom && (item.candidate?.bomDemand ?? 0) > 0 && (
+                                                                                            <span title="Demand from BOM builds — how many units of this component are consumed per day across all finished goods">
+                                                                                                bom: <span className="text-purple-300">{(item.candidate!.bomDemand).toFixed(1)}/day</span>
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {/* What finished goods consume this */}
+                                                                                        {hasFGs && (
+                                                                                            <span
+                                                                                                className="text-purple-300/70"
+                                                                                                title={item.feedsFinishedGoods!.map(fg => `${fg.sku} – ${fg.name} (≈${fg.buildsWorth} builds covered)`).join('\n')}
+                                                                                            >
+                                                                                                feeds: {item.feedsFinishedGoods!.slice(0, 2).map(fg => fg.sku).join(', ')}
+                                                                                                {(item.feedsFinishedGoods!.length) > 2 && ` +${item.feedsFinishedGoods!.length - 2}`}
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {/* Trigger reason in plain language */}
+                                                                                        {item.triggerReason === 'build-driven' && (
+                                                                                            <span className="text-cyan-400/80" title={item.triggerDetail ?? 'Triggered by upcoming BOM build demand'}>↑ build demand</span>
+                                                                                        )}
+                                                                                        {item.triggerReason === 'stockout-padded' && (
+                                                                                            <span className="text-rose-400/80" title={item.triggerDetail ?? 'Stockout imminent — ordering with safety padding'}>⚠ stockout risk</span>
+                                                                                        )}
+                                                                                        {item.triggerReason === 'runway-short' && (
+                                                                                            <span className="text-amber-400/80" title={item.triggerDetail ?? 'Runway is below the safety threshold'}>↓ runway short</span>
+                                                                                        )}
+                                                                                    </div>
+                                                                                );
+                                                                            })()}
+
+                                                                            {!itemSnoozed && (item.itemType === 'bom-component' || item.itemType === 'resale-bom') && item.feedsFinishedGoods && item.feedsFinishedGoods.length > 0 && false && (
                                                                                 <div className="text-[9px] text-zinc-500 font-mono mt-0.5 truncate">
                                                                                     feeds: {item.feedsFinishedGoods.slice(0, 2).map(fg =>
                                                                                         `${fg.name} (≈${fg.buildsWorth} builds covered)`
