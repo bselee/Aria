@@ -1,3 +1,4 @@
+import { createClient } from '@/lib/supabase';
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
@@ -8,6 +9,30 @@ import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
 
 export async function GET(req: NextRequest) {
+    // Auto-detect cross-process database PO changes and invalidate SWR cache dynamically
+    try {
+        const supabase = createClient();
+        if (supabase && resaleSlot.at > 0) {
+            const { data } = await supabase
+                .from('purchase_orders')
+                .select('updated_at')
+                .order('updated_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            
+            if (data?.updated_at) {
+                const lastChange = new Date(data.updated_at).getTime();
+                if (lastChange > resaleSlot.at) {
+                    console.log(`[purchasing/route] Database PO change detected (${new Date(lastChange).toISOString()} > cache at ${new Date(resaleSlot.at).toISOString()}). Invalidating SWR cache.`);
+                    invalidatePurchasingCaches();
+                }
+            }
+        }
+    } catch (err: any) {
+        console.warn('[purchasing/route] SWR cross-process invalidation check failed:', err.message);
+    }
+
+
     const bust = req.nextUrl.searchParams.has('bust');
     const urgency = req.nextUrl.searchParams.get('urgency');
     const mode = (req.nextUrl.searchParams.get('mode') || 'all') as 'all' | 'resale' | 'bom';

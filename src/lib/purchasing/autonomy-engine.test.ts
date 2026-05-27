@@ -13,6 +13,7 @@ import * as poSender from './po-sender';
 
 const mockGetRecentPurchaseOrders = vi.fn();
 const mockGetDraftPOForReview = vi.fn();
+const mockCommitDraftPO = vi.fn();
 const mockGmailList = vi.fn();
 
 // Mock dependencies
@@ -36,6 +37,7 @@ vi.mock('../finale/client', () => {
     class MockFinaleClient {
         getRecentPurchaseOrders = mockGetRecentPurchaseOrders;
         getDraftPOForReview = mockGetDraftPOForReview;
+        commitDraftPO = mockCommitDraftPO;
     }
     return {
         FinaleClient: MockFinaleClient,
@@ -159,7 +161,26 @@ describe('autoProcessAutonomyDrafts', () => {
         const result = await autoProcessAutonomyDrafts(mockBot);
 
         expect(result.processed).toBe(2); // Auto-marked both
+        expect(mockCommitDraftPO).toHaveBeenCalledTimes(2); // Both committed in Finale!
         expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // Safe check: didn't send again!
+        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
+            '12345',
+            expect.stringContaining('Already manually sent'),
+            expect.any(Object)
+        );
+    });
+
+    it('should automatically mark PO as sent and commit in Finale even for Level 0 (manual) vendors', async () => {
+        vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(0); // Level 0 Manual
+        
+        // Gmail list mock returns a matching sent message
+        mockGmailList.mockResolvedValue({ data: { messages: [{ id: 'msg-123' }] } });
+
+        const result = await autoProcessAutonomyDrafts(mockBot);
+
+        expect(result.processed).toBe(2); // Auto-marked and status-healed both
+        expect(mockCommitDraftPO).toHaveBeenCalledTimes(2); // Both committed in Finale!
+        expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // No automatic sending triggered
         expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
             '12345',
             expect.stringContaining('Already manually sent'),
