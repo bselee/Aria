@@ -62,6 +62,10 @@ import {
     handleIssueRun,
     handleIssueDetail,
 } from './handlers/task-issue-actions';
+import {
+    handleReceiptConfirm,
+    handleReceiptSkip,
+} from './handlers/receipt-actions';
 
 // ============================================================================
 // HELPERS
@@ -252,6 +256,10 @@ bot.action(/^issue_pause_(.+)$/, (ctx) => handleIssuePause(ctx, ctx.match[1]));
 bot.action(/^issue_resume_(.+)$/, (ctx) => handleIssueResume(ctx, ctx.match[1]));
 bot.action(/^issue_run_(.+)$/, (ctx) => handleIssueRun(ctx, ctx.match[1]));
 bot.action(/^issue_detail_(.+)$/, (ctx) => handleIssueDetail(ctx, ctx.match[1]));
+
+// ── Receipt confirmation actions ─────────────────────────────────────────
+bot.action(/^receipt_confirm_(.+)$/, (ctx) => handleReceiptConfirm(ctx, ctx.match[1]));
+bot.action(/^receipt_skip_(.+)$/, (ctx) => handleReceiptSkip(ctx, ctx.match[1]));
 
 bot.action('approve_uline_friday', (ctx) => {
     const opsManager = (bot.context as any).opsManager;

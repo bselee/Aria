@@ -221,6 +221,23 @@ defineJob({
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
 
+// HERMIA(2026-05-28): Prompt Bill to confirm receipt of delivered POs.
+// Runs 4x/day during business hours. Finds delivered 24-72h ago, not yet
+// received in Finale. Sends Telegram with inline buttons.
+defineJob({
+    name: "delivery-receipt-prompt",
+    schedule: "0 9,12,15,18 * * 1-5",
+    onFail: "log",
+    description: "Prompt Bill to confirm receipt of delivered POs (4x/day weekdays).",
+    handler: async () => {
+        const { promptDeliveredReceipts } = await import("@/lib/tracking/delivery-receipt-prompt");
+        const result = await promptDeliveredReceipts();
+        if (result.prompted > 0) {
+            console.log(`[delivery-receipt-prompt] Prompted ${result.prompted} PO(s), ${result.skippedAlreadyPrompted} skipped`);
+        }
+    },
+});
+
 defineJob({
     name: "purchasing-calendar-sync",
     schedule: "0 */4 * * *",
