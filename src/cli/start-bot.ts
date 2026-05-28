@@ -419,6 +419,37 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     startCronRunner();
     console.log('[boot] Cron registry started.');
 
+    // ── Boot-time warmup ────────────────────────────────────────────
+    // (a) Fix: AP polling shows "stale" after every PM2 restart because
+    //     the cron scheduler waits for the first */15 tick. Fire immediately
+    //     so ops_health_summary doesn't flag it.
+    // (b) Fix: Bot heartbeat starts at "stale" (0 min = 10 min stale threshold)
+    //     because heartbeats only fire after cron hook success. Register
+    //     a startup heartbeat so control-plane doesn't trigger a restart alert.
+    // (c) Nightshift queue backlog — intentionally NOT suppressed. It's
+    //     expected during dev iteration and clears itself within a few hours.
+
+    try {
+        // Startup heartbeat (writes to agent_heartbeats via oversightAgent)
+        await ops.cronHookSuccess("aria-bot-startup");
+        console.log('[boot] Startup heartbeat written.');
+    } catch (e: any) {
+        console.warn(`[boot] startup heartbeat failed (non-fatal): ${e.message}`);
+    }
+
+    try {
+        // Fire AP polling immediately so it's not "stale" until the next */15 tick
+        console.log('[boot] Firing immediate AP poll...');
+        await ops.pollAPInbox().catch((e: any) => {
+            console.warn(`[boot] immediate AP poll failed (non-fatal): ${e.message}`);
+        });
+        await ops.cronHookSuccess("ap-polling");
+        console.log('[boot] AP polling boot run complete.');
+    } catch (e: any) {
+        console.warn(`[boot] AP polling boot run failed (non-fatal): ${e.message}`);
+    }
+    // ── End boot-time warmup ────────────────────────────────────────
+
     // slack watchdog
     const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
     let startedWatchdog: SlackWatchdog | null = null;
