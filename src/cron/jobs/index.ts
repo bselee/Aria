@@ -221,6 +221,22 @@ defineJob({
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
 
+// HERMIA(2026-05-28): L2/L3 vendor escalation. L2=10-14d (firmer draft),
+// L3=15+d (Telegram alert with replace/draft buttons).
+defineJob({
+    name: "vendor-escalation",
+    schedule: "30 10,14 * * 1-5",
+    onFail: "log",
+    description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
+    handler: async () => {
+        const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
+        const result = await runVendorEscalation();
+        if (result.l2Count > 0 || result.l3Count > 0) {
+            console.log();
+        }
+    },
+});
+
 // HERMIA(2026-05-28): Prompt Bill to confirm receipt of delivered POs.
 // Runs 4x/day during business hours. Finds delivered 24-72h ago, not yet
 // received in Finale. Sends Telegram with inline buttons.

@@ -66,6 +66,10 @@ import {
     handleReceiptConfirm,
     handleReceiptSkip,
 } from './handlers/receipt-actions';
+import {
+    handleEscalationReplace,
+    handleEscalationDraft,
+} from './handlers/escalation-actions';
 
 // ============================================================================
 // HELPERS
@@ -260,6 +264,10 @@ bot.action(/^issue_detail_(.+)$/, (ctx) => handleIssueDetail(ctx, ctx.match[1]))
 // ── Receipt confirmation actions ─────────────────────────────────────────
 bot.action(/^receipt_confirm_(.+)$/, (ctx) => handleReceiptConfirm(ctx, ctx.match[1]));
 bot.action(/^receipt_skip_(.+)$/, (ctx) => handleReceiptSkip(ctx, ctx.match[1]));
+
+// ── Vendor escalation actions ──────────────────────────────────────────
+bot.action(/^escalation_replace_(.+)$/, (ctx) => handleEscalationReplace(ctx, ctx.match[1]));
+bot.action(/^escalation_draft_(.+)$/, (ctx) => handleEscalationDraft(ctx, ctx.match[1]));
 
 bot.action('approve_uline_friday', (ctx) => {
     const opsManager = (bot.context as any).opsManager;
