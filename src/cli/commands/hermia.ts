@@ -343,21 +343,6 @@ const apHealthCommand: BotCommand = {
     },
 };
 
-export const hermiaCommands: BotCommand[] = [
-    cognitionCommand,
-    priorityCommand,
-    orderNowCommand,
-    ballCommand,
-    orderGuardCommand,
-    budgetCommand,
-    memoriesCommand,
-    agentsCommand,
-    hermiaCommand,
-    shipCommand,
-    costCommand,
-    apHealthCommand,
-];
-
 /**
  * /ordernow — What needs ordering RIGHT NOW. Manufacturing-first.
  * Cuts through 121 items to show only what will lose money if delayed.
@@ -539,3 +524,21 @@ const hermiaCommand: BotCommand = {
         }
     },
 };
+
+// ── Export: MUST come after all command definitions ─────────────────────────
+// const declarations are not hoisted — referencing them before init crashes.
+
+export const hermiaCommands: BotCommand[] = [
+    cognitionCommand,
+    priorityCommand,
+    orderNowCommand,
+    ballCommand,
+    orderGuardCommand,
+    budgetCommand,
+    memoriesCommand,
+    agentsCommand,
+    hermiaCommand,
+    shipCommand,
+    costCommand,
+    apHealthCommand,
+];
