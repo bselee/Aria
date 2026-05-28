@@ -82,11 +82,14 @@ defineJob({
     handler: async () => { await ops()?.runHousekeeping(); },
 });
 
+// HERMIA(2026-05-28): Hourly → every 6h. pinecone.ts is already a Supabase shim
+// writing to email_context_log — this is an audit log, not a real-time index.
+// Saves ~120 invocations/day.
 defineJob({
     name: "stat-indexing",
-    schedule: "5 * * * *",
+    schedule: "5 */6 * * *",
     onFail: "log",
-    description: "Hourly Pinecone indexing of operational context.",
+    description: "Every 6h: audit-log operational context to email_context_log.",
     handler: async () => { await ops()?.indexOperationsContext(); },
 });
 
@@ -233,35 +236,43 @@ defineJob({
     handler: async () => { await ops()?.checkMissingReconciliationRuns(); },
 });
 
+// HERMIA(2026-05-28): 5m → 15m. Task closure is hygiene, not urgent.
+// Saves ~192 invocations/day.
 defineJob({
     name: "close-finished-tasks",
-    schedule: "*/5 * * * *",
+    schedule: "*/15 * * * *",
     onFail: "log",
-    description: "Hygiene: close completed agent_task rows (every 5m).",
+    description: "Hygiene: close completed agent_task rows (every 15m).",
     handler: async () => { await ops()?.runCloseFinishedTasks(); },
 });
 
+// HERMIA(2026-05-28): 30m → hourly. Migrations don't drift that fast.
+// Saves ~24 invocations/day.
 defineJob({
     name: "migration-tripwire",
-    schedule: "*/30 * * * *",
+    schedule: "0 * * * *",
     onFail: "log",
-    description: "Self-heal Layer A: tripwire checks (every 30m).",
+    description: "Self-heal Layer A: tripwire checks (hourly).",
     handler: async () => { await ops()?.runMigrationTripwire(); },
 });
 
+// HERMIA(2026-05-28): 10m → 30m. Playbook dispatch rarely has queued work.
+// Saves ~96 invocations/day.
 defineJob({
     name: "task-self-healer",
-    schedule: "*/10 * * * *",
+    schedule: "*/30 * * * *",
     onFail: "log",
-    description: "Self-heal Layer C: dispatch queued playbooks (every 10m).",
+    description: "Self-heal Layer C: dispatch queued playbooks (every 30m).",
     handler: async () => { await ops()?.runTaskSelfHealer(); },
 });
 
+// HERMIA(2026-05-28): 5m → 15m. Issue projection rarely finds new work per cycle.
+// Saves ~192 invocations/day.
 defineJob({
     name: "issue-projection",
-    schedule: "*/5 * * * *",
+    schedule: "*/15 * * * *",
     onFail: "log",
-    description: "Phase 1 issue ledger projection (every 5m).",
+    description: "Phase 1 issue ledger projection (every 15m).",
     handler: async () => { await ops()?.runIssueProjection(); },
 });
 
@@ -316,9 +327,11 @@ defineJob({
 });
 
 // Gated cron — preserved env flag from inline registration.
+// HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
+// When enabled, 15m is plenty for orchestrating issue remediation cycles.
 defineJob({
     name: "issue-orchestrator",
-    schedule: "*/5 * * * *",
+    schedule: "*/15 * * * *",
     enabled: (process.env.ISSUE_ORCHESTRATOR_ENABLED ?? "false").toLowerCase() === "true",
     onFail: "log",
     description: "Issue orchestrator (every 5m, gated by ISSUE_ORCHESTRATOR_ENABLED).",

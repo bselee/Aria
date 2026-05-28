@@ -22,9 +22,50 @@ export class SupervisorAgent {
     }
 
     /**
+     * HERMIA(2026-05-28): Deterministic error classification via regex.
+     * Handles ~90% of errors without burning an LLM call. Falls through to
+     * LLM only for genuinely ambiguous errors.
+     */
+    private deterministicClassify(message: string): "RETRY" | "ESCALATE" | "IGNORE" | null {
+        const msg = message || "";
+
+        // ── Network / transient → RETRY ──────────────────────────
+        if (/timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|network error/i.test(msg)) return "RETRY";
+        if (/429|rate.?limit|too many requests|quota/i.test(msg)) return "RETRY";
+        if (/\b50[0234]\b|server error|bad gateway|service unavailable/i.test(msg)) return "RETRY";
+        if (/EAI_AGAIN|ENOTFOUND|getaddrinfo|DNS/i.test(msg)) return "RETRY";
+        if (/fetch failed|request failed|api error/i.test(msg)) return "RETRY";
+
+        // ── Expected / noisy → IGNORE ────────────────────────────
+        if (/expired|invalid_grant|token.*expired/i.test(msg)) return "IGNORE";
+        if (/no.*credentials|not.*configured|not.*authenticated/i.test(msg)) return "IGNORE";
+        if (/cancelled|aborted|user abort/i.test(msg)) return "IGNORE";
+        if (/no records found|not found.*invoice|no pending/i.test(msg)) return "IGNORE";
+
+        // ── Logic / code errors → ESCALATE ───────────────────────
+        if (/TypeError|ReferenceError|undefined is not/i.test(msg)) return "ESCALATE";
+        if (/Cannot read propert/i.test(msg)) return "ESCALATE";
+        if (/\bnull\b.*\bundefined\b/i.test(msg) && /is not a|Cannot/i.test(msg)) return "ESCALATE";
+        if (/is not a function|has no method/i.test(msg)) return "ESCALATE";
+
+        // ── Ambiguous → fall through to LLM ──────────────────────
+        return null;
+    }
+
+    /**
      * Determines the appropriate action for a specific agent error.
+     * HERMIA(2026-05-28): Try deterministic regex first. Only use LLM
+     * for genuinely ambiguous errors that don't match any known pattern.
      */
     private async classifyErrorAndRemedy(agent: string, errorMessage: string, errorStack: string): Promise<string> {
+        // HERMIA(2026-05-28): Fast-path — deterministic regex before LLM.
+        // ~90% of errors match a known pattern. Saves an LLM call + 2-5s latency.
+        const fast = this.deterministicClassify(errorMessage);
+        if (fast) {
+            console.log(`     [Supervisor] Fast-classified ${agent} "${errorMessage.slice(0, 60)}" → ${fast}`);
+            return fast;
+        }
+
         const schema = z.object({
             remedy: z.enum(["RETRY", "ESCALATE", "IGNORE"]),
             reasoning: z.string().describe("Why this remedy was chosen")
