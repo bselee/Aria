@@ -322,6 +322,27 @@ const costCommand: BotCommand = {
     },
 };
 
+/**
+ * /aphealth — AP pipeline health: stuck emails, daily stats, reconciliation.
+ */
+const apHealthCommand: BotCommand = {
+    name: "aphealth",
+    description: "AP pipeline health: stuck emails, daily stats",
+    handler: async (ctx, deps) => {
+        await ctx.sendChatAction("typing");
+
+        try {
+            const { getAPDailyStats, detectStuckEmails, formatAPHealth } = await import("@/lib/intelligence/ap-health");
+            const stats = await getAPDailyStats();
+            const stuck = await detectStuckEmails();
+            const report = formatAPHealth(stats, stuck);
+            await ctx.reply(report, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ Failed: ${err.message}`);
+        }
+    },
+};
+
 export const hermiaCommands: BotCommand[] = [
     cognitionCommand,
     priorityCommand,
@@ -330,4 +351,5 @@ export const hermiaCommands: BotCommand[] = [
     agentsCommand,
     shipCommand,
     costCommand,
+    apHealthCommand,
 ];
