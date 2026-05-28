@@ -23,6 +23,7 @@ import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
 import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
+import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -109,6 +110,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         label: "Recent Runs",
         short: "Recent Runs",
         render: () => <RecentRunsPanel />,
+    },
+    {
+        id: "vendor-scorecard",
+        label: "Vendor Scorecard",
+        short: "Vendor Scores",
+        render: () => <VendorScorecardPanel />,
     },
 ];
 

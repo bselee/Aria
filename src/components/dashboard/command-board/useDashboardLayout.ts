@@ -31,6 +31,7 @@ export const ALL_PANEL_IDS = [
     "purchasing-calendar",
     "oversight",
     "recent-runs",
+    "vendor-scorecard",
 ] as const;
 
 export type PanelId = (typeof ALL_PANEL_IDS)[number];
