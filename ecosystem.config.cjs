@@ -49,14 +49,13 @@ module.exports = {
             },
             watch: false,
             autorestart: true,
-            max_restarts: 10,
+            max_restarts: 20,
             min_uptime: "10s",
             restart_delay: 5000,           // 5s between restart attempts
-            max_memory_restart: "768M",    // Restart if memory exceeds 768MB (raised from 512M after OOM fixes)
-            // DECISION(2026-02-25): exp_backoff_restart_delay prevents rapid-fire
-            // restarts if there's a persistent error (e.g. expired API key).
-            // Delay doubles each restart: 5s → 10s → 20s → 40s → ... up to 5min.
-            exp_backoff_restart_delay: 5000,
+            max_memory_restart: "800M",    // HERMIA: raised from 768M for headroom
+            // HERMIA(2026-05-28): exp_backoff starts at 10s, doubles each restart.
+            // Prevents rapid-fire restart cascades on persistent failures.
+            exp_backoff_restart_delay: 10000,
             log_date_format: "YYYY-MM-DD HH:mm:ss Z",
             error_file: path.join(__dirname, "logs", "aria-bot-error.log"),
             out_file: path.join(__dirname, "logs", "aria-bot-out.log"),
