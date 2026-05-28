@@ -483,6 +483,7 @@ export async function unifiedObjectGeneration<T>(
                 schemaName: options.schemaName,
                 system: options.system,
                 temperature: options.temperature,
+                maxTokens: options.maxTokens,
                 maxRetries: 0, // IMPORTANT: Disable 3x auto-retry per provider
                 providerOptions: {
                     openai: { strictJsonSchema: false },

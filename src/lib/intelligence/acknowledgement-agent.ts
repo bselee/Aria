@@ -195,6 +195,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 schema,
                 schemaName: "EmailAcknowledgementIntent",
                 tier: "free",
+                maxTokens: 150,
             }) as { intent: string; reasoning: string };
 
             console.log(`     [LLM] Intent: ${res.intent} | Reason: ${res.reasoning}`);
