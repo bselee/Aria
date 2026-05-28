@@ -290,7 +290,10 @@ export async function POST(req: NextRequest) {
             recentPOs: mapRecentPOsToVendorCyclePOs(recentPOs),
             requestedLines,
         });
-        if (vendorCycle.decision === 'routine_locked') {
+        // HERMIA(2026-05-28): Honor ignoreCommitGuards for vendor cycle too.
+        // Without this the dashboard can show a "Force Draft" prompt but the
+        // API still rejects the call when vendor is already in a routine PO.
+        if (vendorCycle.decision === 'routine_locked' && !ignoreCommitGuards) {
             return NextResponse.json(
                 {
                     error: vendorCycle.summary,
