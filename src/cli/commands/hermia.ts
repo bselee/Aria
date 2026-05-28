@@ -611,7 +611,34 @@ const followupCommand: BotCommand = {
             },
         };
 
-        // ── Export: MUST come after all command definitions ─────────────────────────
+        
+        /**
+         * /order <po_number> — Fill vendor cart via browser (Uline/Axiom).
+         * Opens headful Chrome, fills items, screenshots cart, sends review buttons.
+         */
+        const orderCommand: BotCommand = {
+            name: "order",
+            description: "Fill vendor cart from PO (Uline/Axiom)",
+            handler: async (ctx) => {
+                await ctx.sendChatAction("typing");
+                const poNumber = (ctx.message && "text" in ctx.message ? ctx.message.text : "").replace(/^/orders*/i, "").trim();
+                if (!poNumber) {
+                    await ctx.reply("Usage: /order PO-12345
+Fills vendor cart via browser for Uline/Axiom orders.");
+                    return;
+                }
+                try {
+                    const { executeBrowserOrder } = await import("@/lib/ordering/browser-order");
+                    const result = await executeBrowserOrder(poNumber);
+                    if (!result) {
+                        await ctx.reply("Order failed — check PM2 logs.");
+                    }
+                } catch (err: any) {
+                    await ctx.reply("Order failed: " + err.message);
+                }
+            },
+        };
+// ── Export: MUST come after all command definitions ─────────────────────────
                 // const declarations are not hoisted — referencing them before init crashes.
 
                 export const hermiaCommands: BotCommand[] = [
@@ -623,6 +650,7 @@ const followupCommand: BotCommand = {
                     followupCommand,
                     emailCommand,
                     emailSearchCommand,
+            orderCommand,
                     apSummaryCommand,
                     budgetCommand,
                     memoriesCommand,
