@@ -735,6 +735,14 @@ export default function PurchasingPanel() {
             if (result) {
                 setCreatedPOs(p => ({ ...p, [pid]: result }));
                 setCreatedPODetails(p => ({ ...p, [pid]: result }));
+                // HERMIA(2026-05-28): Auto-advance to Review & Send modal.
+                // Bill never needs to leave the dashboard or open Finale.
+                // Draft created → review opens immediately → one click to commit.
+                if (result.orderId) {
+                    await load(true);
+                    await handleReviewAndSend(result.orderId);
+                    return;
+                }
             }
             await load(true);
         } catch (e: any) {
