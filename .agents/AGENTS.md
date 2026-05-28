@@ -46,10 +46,10 @@ z-ai/glm-5.1
 Medium
 203K
 Zero-cost agentic coding
-qwen/qwen3.6-plus:free
-78.8 SWE-bench, excellent repo-level & front-end
+moonshotai/kimi-k2.6:free
+Excellent long-context, fast, multimodal & coding capability
 Free
-1M
+262K
 Pure coding / fast edits
 qwen/qwen3-coder:free
 Current strongest free pure coder
@@ -61,14 +61,14 @@ Strong multimodal + document understanding
 Free / Medium
 256K+
 
-Pro strategy:Start every session with Sonnet 4.6 or Qwen3.6-plus:free.
+Pro strategy:Start every session with Sonnet 4.6 or Kimi K2.6 (moonshotai/kimi-k2.6:free).
 Switch to Opus 4.6 or GLM-5.1 only for /plan on big refactors or orchestration changes.
 Use free models (:free) for crons, tests, PDF processing, and routine tasks.
 
 3. Model Switching & DefaultsIn OpenCode TUI → /models → pick any model above.
 To set a permanent default for this project, add to your PowerShell profile:powershell
 
-$env:OPENAI_MODEL = "qwen/qwen3.6-plus:free"   # change as needed
+$env:OPENAI_MODEL = "moonshotai/kimi-k2.6:free"   # change as needed
 
 Never let the default fall back to Google Gemini — always force an OpenRouter model.
 
@@ -162,6 +162,10 @@ finale-ops
 Finale Inventory API
 (external only)
 ap, build-risk, reorder, bot, dashboard, vendor
+hermes-agent
+Master autonomous orchestrator & developer
+(all agents)
+(user-facing CLI entry)
 memory-pinecone
 Pinecone vector memory
 (external only)

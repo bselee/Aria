@@ -13,6 +13,8 @@ import type { CommitVerification } from './po-verification';
 import { renderPurchaseOrderPdf } from './po-email-pdf';
 import { sendGmailPdfEmail } from '../gmail/send-email';
 
+type POEmailVia = 'finale-native' | 'gmail-fallback';
+
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
 // ──────────────────────────────────────────────────
@@ -58,6 +60,31 @@ function serializePendingPOSend(entry: PendingPOSend) {
         created_at: new Date(entry.createdAt).toISOString(),
         expires_at: new Date(entry.expiresAt).toISOString(),
     };
+}
+
+function buildPOSentVerifiedEvidence(input: {
+    emailVia: POEmailVia;
+    sentAt: string;
+    vendorEmail: string;
+    triggeredBy: 'telegram' | 'dashboard';
+    finaleEmailActionUrl?: string;
+    gmailMessageId?: string | null;
+    gmailFromAddress?: string | null;
+}) {
+    const viaLabel = input.emailVia === 'finale-native'
+        ? 'Finale native'
+        : 'Gmail fallback';
+
+    return [{
+        type: 'po_send',
+        at: input.sentAt,
+        detail: `${viaLabel} (${input.emailVia}) sent PO to ${input.vendorEmail}`,
+        source: input.emailVia,
+        by: input.triggeredBy,
+        finaleEmailActionUrl: input.finaleEmailActionUrl ?? null,
+        gmailMessageId: input.gmailMessageId ?? null,
+        gmailFromAddress: input.gmailFromAddress ?? null,
+    }];
 }
 
 function rowToPendingPOSend(row: any): PendingPOSend | undefined {
@@ -431,7 +458,7 @@ export async function commitAndSendPO(
     gmailMessageId: string | null;
     finaleEmailSent: boolean;
     emailSent: boolean;
-    emailVia: 'finale-native' | 'gmail-fallback' | null;
+    emailVia: POEmailVia | null;
     pdfAttached: boolean;
     emailSkipped: boolean;
     emailError?: string;
@@ -508,15 +535,13 @@ export async function commitAndSendPO(
     let sentAt: string | null = null;
     let finaleEmailActionUrl: string | undefined;
     let emailError: string | undefined;
-    let emailVia: 'finale-native' | 'gmail-fallback' | null = null;
+    let emailVia: POEmailVia | null = null;
     let gmailMessageId: string | null = null;
     let gmailFromAddress: string | null = null;
 
-    // DECISION(2026-05-19, Will): outgoing POs must carry the professional
-    // Finale-rendered PDF. If the Finale native email action is unavailable
-    // we do NOT fall back to a self-rendered PDF over Gmail — the PO simply
-    // lands as committed-but-unsent and Will sends it manually from Finale.
-    // Better a clear fail than a vendor receiving a "funky" homemade PO.
+    // Prefer Finale-native email because it carries Finale's PO render. If the
+    // native endpoint is unavailable, Gmail fallback keeps the vendor thread
+    // moving with an attached PO PDF and records the send source explicitly.
     if (!skipEmail && vendorEmail) {
         const { subject, body } = generatePOEmailBody(review);
         try {
@@ -605,6 +630,17 @@ export async function commitAndSendPO(
             : emailError
                 ? `PO #${orderId} committed in Finale — vendor email failed (${emailError}). Send manually from Finale.`
                 : `PO #${orderId} committed in Finale (Email skipped/unavailable)`;
+        const sentVerifiedEvidence = emailSent && vendorEmail && sentAt && emailVia
+            ? buildPOSentVerifiedEvidence({
+                emailVia,
+                sentAt,
+                vendorEmail,
+                triggeredBy,
+                finaleEmailActionUrl,
+                gmailMessageId,
+                gmailFromAddress,
+            })
+            : null;
         const writes: Array<PromiseLike<any>> = [
             db.from('ap_activity_log').insert({
                 email_from: gmailFromAddress ?? 'bill.selee@buildasoil.com',
@@ -643,6 +679,13 @@ export async function commitAndSendPO(
                 finale_url: review.finaleUrl,
                 committed_at: committed ? committedAt : null,
                 po_sent_at: emailSent ? sentAt : null,
+                ...(sentVerifiedEvidence
+                    ? {
+                        po_sent_verified_at: sentAt,
+                        po_sent_verified_source: emailVia,
+                        po_sent_verified_evidence: sentVerifiedEvidence,
+                    }
+                    : {}),
                 po_email_message_id: emailSent
                     ? (gmailMessageId ?? finaleEmailActionUrl ?? null)
                     : null,
@@ -739,7 +782,7 @@ export async function retrySendEmail(
     sentTo: string | null;
     gmailMessageId: string | null;
     emailSent: boolean;
-    emailVia: 'finale-native' | 'gmail-fallback' | null;
+    emailVia: POEmailVia | null;
     pdfAttached: boolean;
     emailError?: string;
     retryable: boolean;
@@ -766,7 +809,7 @@ export async function retrySendEmail(
 
     let emailSent = false;
     let pdfAttached = false;
-    let emailVia: 'finale-native' | 'gmail-fallback' | null = null;
+    let emailVia: POEmailVia | null = null;
     let gmailMessageId: string | null = null;
     let gmailFromAddress: string | null = null;
     let finaleEmailActionUrl: string | undefined;
@@ -805,12 +848,26 @@ export async function retrySendEmail(
     // Best-effort writes: log the retry outcome to ap_activity_log + po_sends.
     const db = createClient();
     if (db && emailSent && sentAt) {
+        const sentVerifiedEvidence = emailVia
+            ? buildPOSentVerifiedEvidence({
+                emailVia,
+                sentAt,
+                vendorEmail,
+                triggeredBy,
+                finaleEmailActionUrl,
+                gmailMessageId,
+                gmailFromAddress,
+            })
+            : null;
+        const retryViaLabel = emailVia === 'gmail-fallback'
+            ? 'Gmail fallback'
+            : 'Finale native';
         const writes: Array<PromiseLike<any>> = [
             db.from('ap_activity_log').insert({
                 email_from: gmailFromAddress ?? 'bill.selee@buildasoil.com',
                 email_subject: subject,
                 intent: emailVia === 'gmail-fallback' ? 'PO_SEND_GMAIL' : 'PO_SEND_FINALE',
-                action_taken: `PO #${orderId} email retry succeeded via Finale native → ${vendorEmail}`,
+                action_taken: `PO #${orderId} email retry succeeded via ${retryViaLabel} -> ${vendorEmail}`,
                 notified_slack: false,
                 metadata: {
                     orderId,
@@ -835,6 +892,13 @@ export async function retrySendEmail(
                 item_count: review.items.length,
                 finale_url: review.finaleUrl,
                 po_sent_at: sentAt,
+                ...(sentVerifiedEvidence
+                    ? {
+                        po_sent_verified_at: sentAt,
+                        po_sent_verified_source: emailVia,
+                        po_sent_verified_evidence: sentVerifiedEvidence,
+                    }
+                    : {}),
                 po_email_message_id: gmailMessageId ?? finaleEmailActionUrl ?? null,
                 lifecycle_stage: 'sent',
                 updated_at: new Date().toISOString(),

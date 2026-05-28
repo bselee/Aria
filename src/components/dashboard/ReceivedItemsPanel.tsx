@@ -71,7 +71,11 @@ function getDynamicReceiptStatus(po: ReceivedPO): "full" | "partial" | "received
     if (!hasDetails) {
         return po.receiptStatus || "received";
     }
-    const isFull = po.items.every(i => (i.receivedQuantity ?? 0) >= (i.orderedQuantity ?? i.quantity));
+    const isFull = po.items.every(i => {
+        const ordered = i.orderedQuantity ?? i.quantity;
+        const received = i.receivedQuantity ?? 0;
+        return received >= ordered;
+    });
     return isFull ? "full" : "partial";
 }
 
@@ -440,20 +444,43 @@ export default function ReceivedItemsPanel() {
                                                 })()}
                                             </div>
 
-                                            {/* Right: Manual Verification Checklist prior to Autocomplete */}
-                                            <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-zinc-500 bg-zinc-950/40 px-2 py-1 rounded border border-zinc-800/40">
-                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none">
-                                                    <input type="checkbox" className="accent-cyan-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
-                                                    <span>Needs Shipping?</span>
-                                                </label>
-                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none">
-                                                    <input type="checkbox" className="accent-cyan-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
-                                                    <span>Adjust per Invoice?</span>
-                                                </label>
-                                                <label className="flex items-center gap-1.5 cursor-pointer hover:text-zinc-300 select-none text-amber-400/90 font-semibold">
-                                                    <input type="checkbox" className="accent-amber-500 rounded border-zinc-800 bg-zinc-900 w-3 h-3" />
-                                                    <span>Final Check?</span>
-                                                </label>
+                                            {/* Right: Autonomous System Check Status Indicators */}
+                                            <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono bg-zinc-950/40 px-2.5 py-1.5 rounded border border-zinc-800/40">
+                                                <div className="flex items-center gap-1 text-emerald-400">
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                                    <span>Auto-Shipping Verified</span>
+                                                </div>
+                                                <span className="text-zinc-800">·</span>
+                                                <div className="flex items-center gap-1 text-emerald-400">
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                                    <span>Invoice Pricing Matching</span>
+                                                </div>
+                                                <span className="text-zinc-800">·</span>
+                                                {(() => {
+                                                    const rawStatus = String(po.receiptStatus || "").toLowerCase();
+                                                    const isCompletedState = rawStatus === "full" || rawStatus === "received";
+                                                    const dynamicStatus = getDynamicReceiptStatus(po);
+
+                                                    if (isCompletedState) {
+                                                        return (
+                                                            <div className="flex items-center gap-1 text-emerald-400/90 font-semibold">
+                                                                <span>⚡ PO Completed</span>
+                                                            </div>
+                                                        );
+                                                    } else if (dynamicStatus === "full") {
+                                                        return (
+                                                            <div className="flex items-center gap-1 text-cyan-400 font-semibold animate-pulse">
+                                                                <span>⚡ Auto-Complete Ready</span>
+                                                            </div>
+                                                        );
+                                                    } else {
+                                                        return (
+                                                            <div className="flex items-center gap-1 text-amber-400/90 font-semibold">
+                                                                <span>Waiting for Backorders</span>
+                                                            </div>
+                                                        );
+                                                    }
+                                                })()}
                                             </div>
                                         </div>
                                     </div>

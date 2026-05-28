@@ -49,9 +49,9 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             const tomorrow = new Date(now);
             tomorrow.setDate(tomorrow.getDate() + 1);
             const tomorrowStr = endDate || tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-            const queryStart = getReceiptQueryStartDate(today);
-            const PAGE_SIZE = 500;
-            const MAX_PAGES = 12;
+            const queryStart = getReceiptQueryStartDate(today, 14);
+            const PAGE_SIZE = 150;
+            const MAX_PAGES = 3;
             const edges: any[] = [];
             let cursor: string | null = null;
 
@@ -115,21 +115,16 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 const po = edge.node;
                 if (!receivedOrderIds.has(po?.orderId)) return;
 
-                const receivedShipmentIds = getShipmentsInReceiptWindow(po, today, tomorrowStr)
+                const allShipmentIds = (po.shipmentList || [])
                     .map((shipment: any) => String(shipment?.shipmentId || ""))
                     .filter(Boolean);
-                const receivedShipmentIdSet = new Set(receivedShipmentIds);
                 const urls: string[] = Array.isArray(po?.shipmentUrlList) && po.shipmentUrlList.length > 0
                     ? po.shipmentUrlList
-                    : receivedShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
+                    : allShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
 
                 const details = await Promise.all(urls.map(async (url) => {
                     try {
-                        const detail = await this.getShipmentDetails(url);
-                        const detailId = String(detail?.shipmentId || "");
-                        return !detailId || receivedShipmentIdSet.size === 0 || receivedShipmentIdSet.has(detailId)
-                            ? detail
-                            : null;
+                        return await this.getShipmentDetails(url);
                     } catch {
                         return null;
                     }

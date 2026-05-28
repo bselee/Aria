@@ -605,7 +605,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
      */
     protected async getProductCatalog(): Promise<string[]> {
         const now = Date.now();
-        if (this.productCatalogCache && (now - this.catalogCacheTime) < FinaleClient.CACHE_TTL_MS) {
+        if (this.productCatalogCache && (now - this.catalogCacheTime) < FinaleProductsClient.CACHE_TTL_MS) {
             return this.productCatalogCache;
         }
 

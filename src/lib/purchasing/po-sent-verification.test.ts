@@ -66,6 +66,25 @@ describe("derivePOSentVerification", () => {
         });
     });
 
+    it("treats stamped send verification columns as PO send evidence", () => {
+        const result = derivePOSentVerification({
+            poNumber: "124790",
+            purchaseOrder: {
+                po_sent_verified_at: "2026-05-02T09:15:00.000Z",
+                po_sent_verified_source: "finale-native",
+            },
+            sendRows: [],
+            hasTracking: false,
+        });
+
+        expect(result).toMatchObject({
+            verified: true,
+            sentAt: "2026-05-02T09:15:00.000Z",
+            source: "po_send",
+        });
+        expect(result.evidence[0]?.detail).toBe("finale-native");
+    });
+
     it("keeps the PO unverified when no evidence exists", () => {
         const result = derivePOSentVerification({
             poNumber: "124790",

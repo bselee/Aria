@@ -34,6 +34,16 @@ export function getLocalDb() {
 
         CREATE INDEX IF NOT EXISTS idx_cal_status ON purchasing_calendar_events(status);
 
+        -- HERMIA(2026-05-28): Cognitive round decision log
+        CREATE TABLE IF NOT EXISTS cognitive_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ran_at TEXT NOT NULL DEFAULT (datetime('now')),
+            state_json TEXT NOT NULL DEFAULT '{}',
+            decisions_json TEXT NOT NULL DEFAULT '[]',
+            duration_ms INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_cog_rounds_at ON cognitive_rounds(ran_at);
+
         CREATE TABLE IF NOT EXISTS shipments_cache (
             tracking_number TEXT PRIMARY KEY,
             po_numbers TEXT, -- JSON array

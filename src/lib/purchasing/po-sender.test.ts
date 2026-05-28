@@ -23,6 +23,8 @@ const {
     upsertFromSourceMock: vi.fn(),
 }));
 
+const dbWrites: Array<{ table: string; op: "insert" | "upsert"; payload: any }> = [];
+
 vi.mock("../finale/client", () => ({
     FinaleClient: vi.fn().mockImplementation(function () {
         return {
@@ -58,11 +60,17 @@ import {
     storePendingPOSend,
 } from "./po-sender";
 
-function makeTableMock() {
+function makeTableMock(table: string) {
     return {
         select: vi.fn().mockReturnThis(),
-        upsert: vi.fn().mockResolvedValue({ error: null }),
-        insert: vi.fn().mockResolvedValue({ error: null }),
+        upsert: vi.fn((payload: any) => {
+            dbWrites.push({ table, op: "upsert", payload });
+            return Promise.resolve({ error: null });
+        }),
+        insert: vi.fn((payload: any) => {
+            dbWrites.push({ table, op: "insert", payload });
+            return Promise.resolve({ error: null });
+        }),
         update: vi.fn().mockReturnThis(),
         eq: vi.fn().mockReturnThis(),
         order: vi.fn().mockReturnThis(),
@@ -89,6 +97,7 @@ function makeReview() {
 describe("commitAndSendPO", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        dbWrites.length = 0;
         clearPendingPOSendCache();
         commitDraftPOMock.mockResolvedValue({ orderId: "124790", committed: true, finalStatus: "ORDER_LOCKED" });
         sendPurchaseOrderEmailMock.mockResolvedValue({
@@ -106,14 +115,10 @@ describe("commitAndSendPO", () => {
         });
         updateBySourceMock.mockResolvedValue(undefined);
         upsertFromSourceMock.mockResolvedValue(null);
-        fromMock.mockImplementation(() => makeTableMock());
+        fromMock.mockImplementation((table: string) => makeTableMock(table));
     });
 
-    // Will's rule (2026-05-19): "no funky format" — if Finale-native fails the
-    // PO stays committed-but-unsent, the session is parked for retry, and Aria
-    // does NOT fall back to a self-rendered PDF over Gmail. Better a clear
-    // surfaced failure than the vendor receiving a worse-quality PO.
-    it("parks the session for retry when Finale-native email fails — never falls back to Gmail with a homemade PDF", async () => {
+    it("falls back to Gmail PDF when Finale-native email fails", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValue(new Error("Finale native PO email action was not available"));
         const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
             channel: "dashboard",
@@ -167,6 +172,37 @@ describe("commitAndSendPO", () => {
             retryable: false,
         });
         expect(result.emailError).toBeUndefined();
+    });
+
+    it("writes verified sent evidence to purchase_orders when email send succeeds", async () => {
+        const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
+            channel: "dashboard",
+        });
+
+        await commitAndSendPO(sendId, "dashboard", false);
+
+        const poUpsert = dbWrites.find((write) =>
+            write.table === "purchase_orders" &&
+            write.op === "upsert" &&
+            write.payload.po_number === "124790" &&
+            write.payload.lifecycle_stage === "sent"
+        );
+
+        expect(poUpsert?.payload).toMatchObject({
+            po_number: "124790",
+            po_sent_at: expect.any(String),
+            po_sent_verified_at: expect.any(String),
+            po_sent_verified_source: "finale-native",
+            lifecycle_stage: "sent",
+        });
+        expect(poUpsert?.payload.po_sent_verified_evidence).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    type: "po_send",
+                    detail: expect.stringContaining("finale-native"),
+                }),
+            ]),
+        );
     });
 
     it("refuses an empty PO outright", async () => {

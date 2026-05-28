@@ -66,8 +66,8 @@ export const POStepper: React.FC<POStepperProps> = ({ po }) => {
     const isCancelled = po.status.toLowerCase() === "cancelled";
 
     // 1. Sent Step
-    const sentDate = po.sentVerification.sentAt || po.orderDate;
-    const isSentCompleted = po.sentVerification.verified || !!po.orderDate;
+    const sentDate = po.sentVerification.sentAt;
+    const isSentCompleted = po.sentVerification.verified;
 
     // 2. Recognized Step
     const ackDate = po.vendorAcknowledgedAt;
@@ -92,7 +92,11 @@ export const POStepper: React.FC<POStepperProps> = ({ po }) => {
     const steps: StepDetail[] = [
         {
             title: "Sent",
-            description: isSentCompleted ? "PO transmitted to vendor" : "Drafting PO",
+            description: isSentCompleted
+                ? "PO transmitted to vendor"
+                : po.orderDate
+                ? "PO committed; send not verified"
+                : "Drafting PO",
             date: sentDate ? new Date(sentDate).toLocaleDateString() : null,
             status: isCancelled ? "pending" : isSentCompleted ? "completed" : "active",
             extra: po.sentVerification.source ? `Source: ${po.sentVerification.source}` : undefined,

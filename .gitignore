@@ -8,6 +8,7 @@ coverage/
 build/
 dist/
 .next/
+.aria-cache/
 tsconfig.tsbuildinfo
 .tsbuildinfo.cli
 
