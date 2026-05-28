@@ -239,7 +239,17 @@ export async function runFollowUpSOP(): Promise<void> {
 
     // Send Telegram nudge
     const formatted = formatFollowUpReport(report);
-    await sendTelegramNotify(formatted);
+
+    // Append AP forwarding failures to the same message
+    const { getStuckForwardingAlerts, formatForwardingAlerts } = await import("@/lib/intelligence/email-forwarding-alert");
+    const forwardAlerts = await getStuckForwardingAlerts();
+    const forwardText = formatForwardingAlerts(forwardAlerts);
+
+    const fullMessage = forwardText
+        ? `${formatted}\n\n${forwardText}`
+        : formatted;
+
+    await sendTelegramNotify(fullMessage);
 
     // Mark Slack requests as nudged to avoid re-nudging
     const nudgeIds = report.staleSlackRequests.map(r => r.id);
