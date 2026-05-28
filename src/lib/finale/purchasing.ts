@@ -3029,6 +3029,40 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         return { orderId, committed: true, finalStatus };
     }
 
+    /**
+     * Cancel a draft PO that hasn't been sent yet.
+     * HERMIA(2026-05-28): Lets Bill undo a draft without opening Finale.
+     * Only ORDER_CREATED drafts can be canceled — committed (ORDER_LOCKED)
+     * or already-sent POs cannot be canceled through this method; those
+     * require opening Finale or issuing a vendor-visible cancellation email.
+     */
+    async cancelDraftPO(orderId: string): Promise<{ orderId: string; canceled: boolean; finalStatus: string }> {
+        const po = await (this as any).getOrderDetails(orderId);
+
+        if (po.statusId !== "ORDER_CREATED") {
+            throw new Error(`PO ${orderId} is in status "${po.statusId}" — can only cancel ORDER_CREATED drafts`);
+        }
+
+        const updated: any = await this.post(
+            `/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`,
+            { ...po, statusId: "ORDER_CANCELED" }
+        );
+
+        const finalStatus = updated?.statusId || "ORDER_CANCELED";
+        console.log(`[finale] cancelDraftPO: PO #${orderId} canceled → ${finalStatus}`);
+
+        // Release reservations so stock is freed for real orders.
+        try {
+            const { releaseReservations: _release } = await import("@/lib/purchasing/calibration");
+            const released = await _release(orderId, "cancelled");
+            if (released > 0) console.log(`[finale] cancelDraftPO: released ${released} reservation(s) for PO #${orderId}`);
+        } catch (err: any) {
+            console.warn(`[finale] reservation release failed for PO #${orderId}: ${err.message}`);
+        }
+
+        return { orderId, canceled: true, finalStatus };
+    }
+
     async sendPurchaseOrderEmail(
         orderId: string,
         input: SendPurchaseOrderEmailInput,
