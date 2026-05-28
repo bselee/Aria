@@ -181,6 +181,30 @@ function getProviderChain(tier: LLMTier = 'paid'): ProviderEntry[] {
 const deadProviders = new Map<string, number>();
 const DEAD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+// HERMIA(2026-05-28): Rate-limit counter — silently counts 429s instead of
+// flooding logs. Logs a summary every 5 minutes max. Prevents 256MB error logs.
+const rateLimitCounts = new Map<string, number>();
+let rateLimitSummaryAt = 0;
+const RATE_LIMIT_SUMMARY_INTERVAL_MS = 5 * 60 * 1000;
+
+function bumpRateLimitCounter(provider: string): void {
+    const count = (rateLimitCounts.get(provider) || 0) + 1;
+    rateLimitCounts.set(provider, count);
+
+    const now = Date.now();
+    if (now >= rateLimitSummaryAt) {
+        const entries = Array.from(rateLimitCounts.entries())
+            .filter(([_, c]) => c > 0)
+            .map(([p, c]) => `${p}: ${c} rate limits`)
+            .join(", ");
+        if (entries) {
+            console.warn(`⏱️ [LLM] Rate limit summary (5min): ${entries}`);
+        }
+        rateLimitCounts.clear();
+        rateLimitSummaryAt = now + RATE_LIMIT_SUMMARY_INTERVAL_MS;
+    }
+}
+
 function isProviderDead(name: string): boolean {
     const deadUntil = deadProviders.get(name);
     if (!deadUntil) return false;
@@ -314,20 +338,29 @@ export async function unifiedTextGeneration(options: LLMOptions): Promise<string
             }
             return result.text;
         } catch (err: any) {
-            lastError = err;
+                    lastError = err;
 
-            // If quota out, mark dead
-            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("429"))) {
-                markProviderDead(provider.name, err.message);
-            }
+                    // HERMIA(2026-05-28): 429/rate limit → silent counter instead of
+                    // per-call log spam. Summary logged every 5 min by bumpRateLimitCounter.
+                    const isRateLimit = err.message && (err.message.includes("429") || err.message.includes("rate limit"));
+                    if (isRateLimit) {
+                        bumpRateLimitCounter(provider.name);
+                        markProviderDead(provider.name, err.message);
+                        continue; // Don't log per-call — summary handles it
+                    }
 
-            const next = providers[i + 1];
-            if (next) {
-                console.warn(`⚠️ ${provider.name} failed: ${err.message}. Falling back to ${next.name}...`);
-            } else {
-                console.error(`❌ All LLM providers failed. Last error (${provider.name}): ${err.message}`);
-            }
-        }
+                    // Quota / billing — mark dead silently
+                    if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("balance"))) {
+                        markProviderDead(provider.name, err.message);
+                    }
+
+                    const next = providers[i + 1];
+                    if (next) {
+                        console.warn(`⚠️ ${provider.name} failed: ${err.message}. Falling back to ${next.name}...`);
+                    } else {
+                        console.error(`❌ All LLM providers failed. Last error (${provider.name}): ${err.message}`);
+                    }
+                }
     }
 
     throw lastError || new Error('All LLM providers failed.');
@@ -385,7 +418,15 @@ export async function unifiedToolTextGeneration(options: LLMToolOptions): Promis
         } catch (err: any) {
             lastError = err;
 
-            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("429"))) {
+            // HERMIA(2026-05-28): Silent rate-limit counter (same as text gen)
+            const isRateLimit = err.message && (err.message.includes("429") || err.message.includes("rate limit"));
+            if (isRateLimit) {
+                bumpRateLimitCounter(provider.name);
+                markProviderDead(provider.name, err.message);
+                continue;
+            }
+
+            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("balance"))) {
                 markProviderDead(provider.name, err.message);
             }
 
@@ -465,8 +506,15 @@ export async function unifiedObjectGeneration<T>(
         } catch (err: any) {
             lastError = err;
 
-            // If quota out, mark dead
-            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("balance") || err.message.includes("429"))) {
+            // HERMIA(2026-05-28): Silent rate-limit counter
+            const isRateLimit = err.message && (err.message.includes("429") || err.message.includes("rate limit"));
+            if (isRateLimit) {
+                bumpRateLimitCounter(provider.name);
+                markProviderDead(provider.name, err.message);
+                continue;
+            }
+
+            if (err.message && (err.message.includes("quota") || err.message.includes("credit") || err.message.includes("balance"))) {
                 markProviderDead(provider.name, err.message);
             }
 

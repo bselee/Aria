@@ -53,14 +53,18 @@ module.exports = {
             min_uptime: "10s",
             restart_delay: 5000,           // 5s between restart attempts
             max_memory_restart: "800M",    // HERMIA: raised from 768M for headroom
-            // HERMIA(2026-05-28): exp_backoff starts at 10s, doubles each restart.
-            // Prevents rapid-fire restart cascades on persistent failures.
-            exp_backoff_restart_delay: 10000,
-            log_date_format: "YYYY-MM-DD HH:mm:ss Z",
-            error_file: path.join(__dirname, "logs", "aria-bot-error.log"),
-            out_file: path.join(__dirname, "logs", "aria-bot-out.log"),
-            merge_logs: true,
-            // Graceful shutdown: give the bot 5s to clean up Telegram polling
+                        // HERMIA(2026-05-28): exp_backoff starts at 10s, doubles each restart.
+                        // Prevents rapid-fire restart cascades on persistent failures.
+                        exp_backoff_restart_delay: 10000,
+                        log_date_format: "YYYY-MM-DD HH:mm:ss Z",
+                        error_file: path.join(__dirname, "logs", "aria-bot-error.log"),
+                        out_file: path.join(__dirname, "logs", "aria-bot-out.log"),
+                        merge_logs: true,
+                        // HERMIA(2026-05-28): Log rotation — cap each log at 10MB, keep 5 rotated copies.
+                        // Prevents the 256MB error log problem from free-tier rate limit spam.
+                        max_size: "10M",
+                        retain: 5,
+                        // Graceful shutdown: give the bot 5s to clean up Telegram polling
             kill_timeout: 5000,
         },
         // ─── Aria Dashboard (Next.js production mode) ───
