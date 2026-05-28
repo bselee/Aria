@@ -18,6 +18,7 @@ import { inventoryCommands } from './inventory';
 import { operationsCommands } from './operations';
 import { memoryCommands } from './memory-cmds';
 import { kaizenCommands } from './kaizen';
+import { hermiaCommands } from './hermia';
 
 /**
  * All bot commands, aggregated from every module.
@@ -29,6 +30,7 @@ export const allCommands: BotCommand[] = [
     ...operationsCommands,
     ...memoryCommands,
     ...kaizenCommands,
+    ...hermiaCommands,
 ];
 
 /**
