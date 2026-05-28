@@ -591,23 +591,44 @@ const followupCommand: BotCommand = {
             },
         };
 
-        // ── Export: MUST come after all command definitions ─────────────────────────
-        // const declarations are not hoisted — referencing them before init crashes.
+        /**
+         * /apsummary — AP autonomous flow summary. Shows auto-approval rate,
+         * top vendors, and what needs review in the last 24h.
+         */
+        const apSummaryCommand: BotCommand = {
+            name: "apsummary",
+            description: "AP flow summary — auto-approvals, reviews, vendor stats",
+            handler: async (ctx) => {
+                await ctx.sendChatAction("typing");
+                try {
+                    const { buildAPSummary, formatAPSummary } = await import("@/lib/intelligence/ap-summary");
+                    const hours = 24;
+                    const report = await buildAPSummary(hours);
+                    await ctx.reply(formatAPSummary(report), { parse_mode: "Markdown" });
+                } catch (err: any) {
+                    await ctx.reply(`❌ ${err.message}`);
+                }
+            },
+        };
 
-        export const hermiaCommands: BotCommand[] = [
-            cognitionCommand,
-            priorityCommand,
-            orderNowCommand,
-            ballCommand,
-            orderGuardCommand,
-            followupCommand,
-            emailCommand,
-            emailSearchCommand,
-            budgetCommand,
-            memoriesCommand,
-            agentsCommand,
-            hermiaCommand,
-            shipCommand,
-            costCommand,
-            apHealthCommand,
-        ];
+        // ── Export: MUST come after all command definitions ─────────────────────────
+                // const declarations are not hoisted — referencing them before init crashes.
+
+                export const hermiaCommands: BotCommand[] = [
+                    cognitionCommand,
+                    priorityCommand,
+                    orderNowCommand,
+                    ballCommand,
+                    orderGuardCommand,
+                    followupCommand,
+                    emailCommand,
+                    emailSearchCommand,
+                    apSummaryCommand,
+                    budgetCommand,
+                    memoriesCommand,
+                    agentsCommand,
+                    hermiaCommand,
+                    shipCommand,
+                    costCommand,
+                    apHealthCommand,
+                ];
