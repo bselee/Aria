@@ -264,6 +264,10 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
 
             console.log(`   Found ${messages.length} email(s) in queue to evaluate.`);
 
+            // Batch collector for REQUIRES_HUMAN notifications
+            // Collect during processing, send ONE digest at the end to avoid spam
+            const requiresHumanBatch: Array<{ from: string; subject: string; snippet: string }> = [];
+
             let processedCount = 0;
 
             for (const m of messages) {
@@ -466,6 +470,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         console.error(`     ❌ Failed to enqueue paid invoice:`, err.message);
                     }
                 } else {
+                    // REQUIRES_HUMAN — Bill needs to respond to this email
                     try {
                         await recordHumanReviewRequired({
                             gmailMessageId,
@@ -477,7 +482,77 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     } catch (humanReviewErr: any) {
                         console.error(`     ❌ Failed to record human review signal:`, humanReviewErr.message);
                     }
+
+                    // Ninja surfacing: collect for batch notification
+                    requiresHumanBatch.push({
+                        from: senderEmail,
+                        subject,
+                        snippet: (snippet || "").slice(0, 120),
+                    });
                     console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
+                }
+            }
+
+            // ── Batch REQUIRES_HUMAN notification ──────────────────────────
+            // Single digest message to Bill rather than spamming per-email.
+            // Only fires during business hours to avoid 3am pings.
+            if (requiresHumanBatch.length > 0) {
+                const hour = new Date().getHours();
+                const isBusinessHours = hour >= 6 && hour <= 22; // 6am - 10pm MT
+
+                try {
+                    const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                    const lines: string[] = [];
+
+                    if (requiresHumanBatch.length === 1) {
+                        const e = requiresHumanBatch[0];
+                        lines.push(`✉️ *Email needs your response*`);
+                        lines.push(`━━━━━━━━━━━━━━━━━━━━`);
+                        lines.push(`📩 *From:* ${e.from}`);
+                        lines.push(`📋 *Re:* ${e.subject}`);
+                        if (e.snippet) lines.push(`   _${e.snippet}_`);
+                    } else {
+                        lines.push(`✉️ *${requiresHumanBatch.length} emails need your response*`);
+                        lines.push(`━━━━━━━━━━━━━━━━━━━━`);
+
+                        for (const e of requiresHumanBatch.slice(0, 5)) {
+                            lines.push(`📩 *${e.from}*`);
+                            lines.push(`   ${e.subject}`);
+                        }
+
+                        if (requiresHumanBatch.length > 5) {
+                            lines.push(`   _...and ${requiresHumanBatch.length - 5} more_`);
+                        }
+                    }
+
+                    if (!isBusinessHours) {
+                        lines.push(`\n🌙 _Off-hours: holding notification for morning digest._`);
+                        // Queue for morning digest instead of sending now
+                        try {
+                            const { createClient } = await import("@/lib/supabase");
+                            const { sendTelegramNotify: sendNow } = await import("@/lib/intelligence/telegram-notify");
+                            const db = createClient();
+                            if (db) {
+                                // Write to agent_task for morning pickup
+                                const { upsertTask } = await import("@/lib/command-board/task-actions");
+                                await upsertTask({
+                                    source: "ack-agent",
+                                    source_id: `requires-human-${Date.now()}`,
+                                    kind: "email_needs_response",
+                                    title: `${requiresHumanBatch.length} email(s) need response`,
+                                    details: requiresHumanBatch.map(e => `${e.from}: ${e.subject}`).join("\n"),
+                                    priority: "medium",
+                                });
+                                console.log(`🌙 [Acknowledgement-Agent] Queued ${requiresHumanBatch.length} REQUIRES_HUMAN emails for morning digest.`);
+                                return; // Skip immediate send
+                            }
+                        } catch { /* fall through to immediate notify */ }
+                    }
+
+                    await sendTelegramNotify(lines.join("\n"));
+                    console.log(`📨 [Acknowledgement-Agent] Notified Bill: ${requiresHumanBatch.length} email(s) need response.`);
+                } catch (notifyErr: any) {
+                    console.warn(`⚠️ [Acknowledgement-Agent] Failed to send REQUIRES_HUMAN batch notification: ${notifyErr.message}`);
                 }
             }
 
