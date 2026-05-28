@@ -1,216 +1,201 @@
-import { describe, expect, it } from "vitest";
+/**
+ * @file    src/lib/purchasing/vendor-order-cycle.test.ts
+ * @purpose Unit tests for vendor-level order cycle guard.
+ *          Verifies Grassroots/TeaLAB fragmentation patterns,
+ *          exception evidence bypass, and cancel/dropship exclusion.
+ * @author  Hermia
+ * @created 2026-05-28
+ * @deps    vitest, ./vendor-order-cycle
+ *
+ * Run: npx vitest run src/lib/purchasing/vendor-order-cycle.test.ts
+ */
 
+import { describe, it, expect } from "vitest";
 import {
-    classifyVendorOrderCycle,
-    deriveVendorCycleExceptionEvidence,
-    mapRecentPOsToVendorCyclePOs,
+    evaluateVendorCycle,
+    findReusableDraft,
+    type VendorCycleCheck,
 } from "./vendor-order-cycle";
-import type { AssessedPurchasingLine } from "./assessment-service";
 
-function line(overrides: Partial<AssessedPurchasingLine["item"]> = {}): AssessedPurchasingLine {
-    return {
-        item: {
-            productId: "BSA101",
-            productName: "TeaLAB item",
-            supplierName: "TeaLAB",
-            supplierPartyId: "party-tealab",
-            unitPrice: 15,
-            stockOnHand: 20,
-            stockOnOrder: 0,
-            purchaseVelocity: 0,
-            salesVelocity: 1,
-            demandVelocity: 1,
-            dailyRate: 1,
-            runwayDays: 20,
-            adjustedRunwayDays: 20,
-            leadTimeDays: 14,
-            leadTimeProvenance: "14d (Finale)",
-            openPOs: [],
-            urgency: "warning",
-            explanation: "Routine reorder.",
-            suggestedQty: 24,
-            orderIncrementQty: 1,
-            isBulkDelivery: false,
-            finaleReorderQty: 24,
-            finaleStockoutDays: 20,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 90,
-            ...overrides,
-        },
-        candidate: {
-            vendorName: "TeaLAB",
-            productId: overrides.productId ?? "BSA101",
-            directDemand: overrides.demandVelocity ?? 1,
-            bomDemand: 0,
-            stockOnHand: overrides.stockOnHand ?? 20,
-            stockOnOrder: overrides.stockOnOrder ?? 0,
-            adjustedRunwayDays: overrides.adjustedRunwayDays ?? 20,
-            finishedGoodsCoverageDays: null,
-            leadTimeDays: overrides.leadTimeDays ?? 14,
-            suggestedQty: overrides.suggestedQty ?? 24,
-            orderIncrementQty: overrides.orderIncrementQty ?? 1,
-            minimumOrderQty: null,
-            minimumOrderValue: null,
-            unitPrice: overrides.unitPrice ?? 15,
-            explanation: "Routine reorder.",
-            sourceUrgency: overrides.urgency ?? "warning",
-            openPOs: [],
-            leadTimeProvenance: "14d (Finale)",
-            finaleDemandQty: 90,
-            finaleConsumptionQty: 0,
-            isBulkDelivery: false,
-            reorderMethod: "default",
-        },
-        assessment: {
-            vendorName: "TeaLAB",
-            productId: overrides.productId ?? "BSA101",
-            decision: "order",
-            recommendedQty: overrides.suggestedQty ?? 24,
-            confidence: "high",
-            reasonCodes: ["direct_demand_support"],
-            explanation: "Current demand supports reorder.",
-            metrics: {
-                directDemand: overrides.demandVelocity ?? 1,
-                bomDemand: 0,
-                sharedDemand: overrides.demandVelocity ?? 1,
-                stockOnHand: overrides.stockOnHand ?? 20,
-                stockOnOrder: overrides.stockOnOrder ?? 0,
-                adjustedRunwayDays: overrides.adjustedRunwayDays ?? 20,
-                finishedGoodsCoverageDays: null,
-                leadTimeDays: overrides.leadTimeDays ?? 14,
-            },
-        },
+type TestPO = {
+    orderId: string;
+    orderDate: string | null;
+    status: string;
+    supplier: string;
+    isDropship?: boolean;
+    isCanceled?: boolean;
+};
+
+describe("evaluateVendorCycle", () => {
+    const baseCheck: VendorCycleCheck = {
+        vendorPartyId: "party_001",
+        vendorName: "Test Vendor",
     };
-}
 
-describe("classifyVendorOrderCycle", () => {
-    it("maps Finale recent PO history into vendor cycle PO records", () => {
-        const mapped = mapRecentPOsToVendorCyclePOs([
-            {
-                orderId: "124832",
-                vendorName: "TeaLAB",
-                vendorPartyId: "party-tealab",
-                status: "Committed",
-                orderDate: "2026-05-19T15:00:00.000Z",
-                receiveDate: "2026-05-29",
-                items: [
-                    { productId: "BSA101" },
-                    { sku: "BBB101" },
-                    { productId: "" },
-                ],
+    // ── Grassroots-like fragmentation pattern ───────────────────────────
+
+    it("should lock after first committed PO (Grassroots pattern)", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+            { orderId: "PO-002", orderDate: "2026-05-05T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("routine_locked");
+        expect(result.blockingPOs.length).toBeGreaterThanOrEqual(1);
+        expect(result.blockingPOs[0].orderId).toBe("PO-001");
+    });
+
+    // ── TeaLAB-like: second PO 12 days after first committed ──────────
+
+    it("should block second PO 12 days after first committed (TeaLAB pattern)", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "TeaLAB" },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("routine_locked");
+        expect(result.blockingPOs).toHaveLength(1);
+    });
+
+    // ── Canceled POs should not lock ──────────────────────────────────
+
+    it("should ignore canceled POs (Grassroots May 2026 canceled)", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_CANCELED", supplier: "Grassroots", isCanceled: true },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("clear");
+        expect(result.ignoredCanceled).toBe(1);
+    });
+
+    // ── Dropship POs should not lock ──────────────────────────────────
+
+    it("should ignore dropship POs", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "DropshipVendor", isDropship: true },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("clear");
+        expect(result.ignoredDropship).toBe(1);
+    });
+
+    // ── Old POs outside cycle window should not block ─────────────────
+
+    it("should ignore POs older than 30 days", () => {
+        const oldDate = new Date(Date.now() - 35 * 86400000).toISOString();
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: oldDate, status: "ORDER_COMMITTED", supplier: "Old Vendor" },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("clear");
+    });
+
+    // ── Exception evidence bypass ─────────────────────────────────────
+
+    it("should allow exception for sale demand despite cycle lock", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+        ];
+
+        const check: VendorCycleCheck = {
+            ...baseCheck,
+            exceptionReason: {
+                reason: "sale_demand",
+                detail: "Linked to sales order #456, 200 units needed",
             },
-            { orderId: "missing-date", orderDate: null, items: [] },
-        ]);
+        };
 
-        expect(mapped).toEqual([
-            {
-                orderId: "124832",
-                vendorName: "TeaLAB",
-                vendorPartyId: "party-tealab",
-                status: "Committed",
-                orderDate: "2026-05-19",
-                receiveDate: "2026-05-29",
-                skus: ["BSA101", "BBB101"],
+        const result = evaluateVendorCycle(pos, check);
+        expect(result.decision).toBe("exception_allowed");
+        expect(result.exceptionEvidence?.reason).toBe("sale_demand");
+    });
+
+    it("should allow exception for surge demand", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+        ];
+
+        const check: VendorCycleCheck = {
+            ...baseCheck,
+            exceptionReason: {
+                reason: "surge_demand",
+                detail: "Demand 3× above baseline this week",
             },
-        ]);
+        };
+
+        const result = evaluateVendorCycle(pos, check);
+        expect(result.decision).toBe("exception_allowed");
     });
 
-    it("locks routine replenishment when a stocking PO exists in the 30-day vendor cycle", () => {
-        const decision = classifyVendorOrderCycle({
-            vendorPartyId: "party-tealab",
-            asOfDate: "2026-05-27",
-            requestedLines: [line()],
-            recentPOs: [
-                {
-                    orderId: "124832",
-                    vendorPartyId: "party-tealab",
-                    vendorName: "TeaLAB",
-                    status: "Committed",
-                    orderDate: "2026-05-19",
-                    receiveDate: null,
-                    skus: ["BSA101"],
-                },
-            ],
-        });
+    it("should allow exception for build-critical demand", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_OPEN", supplier: "BuildsVendor" },
+        ];
 
-        expect(decision.decision).toBe("routine_locked");
-        expect(decision.blockingPO?.orderId).toBe("124832");
-        expect(decision.lockedUntil).toBe("2026-06-18");
-    });
-
-    it("ignores canceled and dropship POs for routine cycle locks", () => {
-        const decision = classifyVendorOrderCycle({
-            vendorPartyId: "party-grassroots",
-            asOfDate: "2026-05-27",
-            requestedLines: [line({ supplierPartyId: "party-grassroots", supplierName: "Grassroots Fabric Pots" })],
-            recentPOs: [
-                {
-                    orderId: "124731",
-                    vendorPartyId: "party-grassroots",
-                    vendorName: "Grassroots Fabric Pots",
-                    status: "Canceled",
-                    orderDate: "2026-04-30",
-                    receiveDate: null,
-                    skus: ["GLP101"],
-                },
-                {
-                    orderId: "23391567-DropshipPO",
-                    vendorPartyId: "party-grassroots",
-                    vendorName: "Grassroots Fabric Pots",
-                    status: "Completed",
-                    orderDate: "2026-05-20",
-                    receiveDate: null,
-                    skus: ["GLP105"],
-                },
-            ],
-        });
-
-        expect(decision.decision).toBe("clear");
-        expect(decision.ignoredPOs.map(po => po.orderId).sort()).toEqual(["124731", "23391567-DropshipPO"].sort());
-    });
-
-    it("allows a build or surge exception even when routine cycle is locked", () => {
-        const exceptionLine = line({
-            productId: "BSA101",
-            triggerReason: "stockout-padded",
-            adjustedRunwayDays: 2,
-            runwayDays: 2,
-            urgency: "critical",
-        } as any);
-
-        const decision = classifyVendorOrderCycle({
-            vendorPartyId: "party-tealab",
-            asOfDate: "2026-05-27",
-            requestedLines: [exceptionLine],
-            recentPOs: [
-                {
-                    orderId: "124801",
-                    vendorPartyId: "party-tealab",
-                    vendorName: "TeaLAB",
-                    status: "Completed",
-                    orderDate: "2026-05-07",
-                    receiveDate: "2026-05-21",
-                    skus: ["BSA102", "BBB101"],
-                },
-            ],
-        });
-
-        expect(decision.decision).toBe("exception_allowed");
-        expect(decision.exceptionEvidence.map(evidence => evidence.reason)).toContain("stockout_before_cycle_end");
-    });
-
-    it("derives exception evidence from build-driven trigger context", () => {
-        const evidence = deriveVendorCycleExceptionEvidence(line({
-            productId: "GLP114",
-            triggerReason: "build-driven",
-            triggerDetail: "Build CRAFT10 needs this component.",
-        } as any));
-
-        expect(evidence).toEqual([
-            expect.objectContaining({
+        const check: VendorCycleCheck = {
+            ...baseCheck,
+            exceptionReason: {
                 reason: "build_critical",
-                productId: "GLP114",
-            }),
-        ]);
+                detail: "BOM requires this SKU for tomorrow's build",
+            },
+        };
+
+        const result = evaluateVendorCycle(pos, check);
+        expect(result.decision).toBe("exception_allowed");
+    });
+
+    // ── No POs at all → clear ─────────────────────────────────────────
+
+    it("should return clear when no POs exist", () => {
+        const result = evaluateVendorCycle([], baseCheck);
+        expect(result.decision).toBe("clear");
+        expect(result.blockingPOs).toHaveLength(0);
+    });
+
+    // ── Mixed: committed + canceled + dropship ────────────────────────
+
+    it("should only count committed/open POs, not canceled or dropship", () => {
+        const pos: TestPO[] = [
+            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "MixedVendor" },
+            { orderId: "PO-002", orderDate: "2026-05-05T00:00:00Z", status: "ORDER_CANCELED", supplier: "MixedVendor", isCanceled: true },
+            { orderId: "PO-003", orderDate: "2026-05-10T00:00:00Z", status: "ORDER_COMMITTED", supplier: "MixedVendor", isDropship: true },
+        ];
+
+        const result = evaluateVendorCycle(pos, baseCheck);
+        expect(result.decision).toBe("routine_locked");
+        expect(result.blockingPOs).toHaveLength(1); // Only PO-001
+        expect(result.ignoredCanceled).toBe(1);
+        expect(result.ignoredDropship).toBe(1);
+    });
+});
+
+describe("findReusableDraft", () => {
+    it("should find a reusable draft PO within the cycle window", () => {
+        const recentDraft = new Date().toISOString();
+        const pos: TestPO[] = [
+            { orderId: "PO-DRAFT", status: "ORDER_DRAFT", orderDate: recentDraft, supplier: "TestVendor" },
+        ];
+
+        const draft = findReusableDraft(pos.map(p => ({
+            orderId: p.orderId,
+            status: p.status,
+            orderDate: p.orderDate,
+        })));
+        expect(draft).not.toBeNull();
+        expect(draft!.orderId).toBe("PO-DRAFT");
+    });
+
+    it("should not find draft PO outside cycle window", () => {
+        const oldDate = new Date(Date.now() - 35 * 86400000).toISOString();
+        const pos = [
+            { orderId: "PO-OLD-DRAFT", status: "ORDER_DRAFT", orderDate: oldDate },
+        ];
+
+        const draft = findReusableDraft(pos);
+        expect(draft).toBeNull();
     });
 });

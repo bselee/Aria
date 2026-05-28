@@ -345,6 +345,23 @@ defineJob({
     },
 });
 
+// HERMIA(2026-05-28): Memory hot/cold tier sync.
+// Pushes local SQLite vectors to Supabase backup every 6h.
+// Protects against aria-local.db loss/corruption.
+defineJob({
+    name: "memory-sync",
+    schedule: "0 */6 * * *",
+    onFail: "log",
+    description: "Sync local memory vectors to Supabase backup (every 6h).",
+    handler: async () => {
+        const { syncMemoryToSupabase } = await import("@/lib/storage/memory-sync");
+        const result = await syncMemoryToSupabase();
+        if (result.synced > 0) {
+            console.log(`[memory-sync] Synced ${result.synced} vectors across ${result.namespaces} namespaces`);
+        }
+    },
+});
+
 // Gated cron — preserved env flag from inline registration.
 // HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
 // When enabled, 15m is plenty for orchestrating issue remediation cycles.
