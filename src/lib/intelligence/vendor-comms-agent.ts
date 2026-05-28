@@ -264,6 +264,16 @@ export class VendorCommsAgent {
             `Hi,\n\nHaven't heard back on PO #${poNumber} from ${sentDateStr}.${detailsBlock}\n\nCan you confirm the status?\n\nThanks!`,
         ];
 
+        // HERMIA(2026-05-28): L3 templates for 15+ day unresponsive vendors.
+        // Firmer tone, mentions reorder risk and alternate sourcing.
+        const L3_TEMPLATES = [
+            `Hi,\n\nThis is our third follow-up on PO #${poNumber} sent ${sentDateStr} — now ${Math.floor((Date.now() - new Date(sentDateStr).getTime()) / 86400000)} days ago.${detailsBlock}\n\nWe have not received tracking or a ship date. This is now impacting our reorder planning.\n\nPlease confirm the order status today. If the order cannot be fulfilled, we will need to source from an alternate vendor.\n\nRegards,\nBuildASoil Purchasing`,
+            `Hi,\n\nWe've followed up twice on PO #${poNumber} from ${sentDateStr} with no response.${detailsBlock}\n\nWithout tracking or a status update, we're unable to plan our receiving schedule and may need to cancel and reorder elsewhere.\n\nCan you please respond with tracking or a ship date today?\n\nRegards,\nBuildASoil Purchasing`,
+        ];
+
+        if (count >= 3) {
+            return L3_TEMPLATES[(count - 3) % L3_TEMPLATES.length];
+        }
         if (count >= 2) {
             return L2_TEMPLATES[(count - 2) % L2_TEMPLATES.length];
         }
