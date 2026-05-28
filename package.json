@@ -32,7 +32,6 @@
     "@mendable/firecrawl-js": "^1.4.0",
     "@octokit/rest": "^21.0.0",
     "@openrouter/ai-sdk-provider": "^2.2.5",
-    "@pinecone-database/pinecone": "^3.0.3",
     "@ricky0123/vad-react": "^0.0.19",
     "@slack/bolt": "^4.6.0",
     "@slack/web-api": "^7.14.1",
