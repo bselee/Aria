@@ -8,12 +8,21 @@
  * `prewarmPurchasingCaches()` is called from `src/instrumentation.ts` at
  * dashboard boot and on a 25-min interval — the user never hits a cold scan.
  */
+import { mkdirSync, readFileSync } from 'fs';
+import { writeFile } from 'fs/promises';
+import { join } from 'path';
+
 import { FinaleClient, type PurchasingGroup } from '@/lib/finale/client';
 
 export type CacheSlot = {
     value: PurchasingGroup[] | null;
     at: number;
     promise: Promise<PurchasingGroup[]> | null;
+};
+export type CacheKey = 'resale' | 'bom';
+type PersistedSnapshot = {
+    at: number;
+    value: PurchasingGroup[];
 };
 
 // Pinned to globalThis because Next.js compiles instrumentation.ts and route.ts
@@ -37,11 +46,55 @@ export const resaleSlot = stash.resale;
 export const bomSlot = stash.bom;
 export const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 
+function cacheDir(): string {
+    return process.env.ARIA_PURCHASING_CACHE_DIR || join(process.cwd(), '.aria-cache', 'purchasing');
+}
+
+function cacheFile(key: CacheKey): string {
+    return join(cacheDir(), `purchasing-${key}.json`);
+}
+
+function inferCacheKey(slot: CacheSlot): CacheKey | null {
+    if (slot === resaleSlot) return 'resale';
+    if (slot === bomSlot) return 'bom';
+    return null;
+}
+
+function readPersistedSnapshot(key: CacheKey): PersistedSnapshot | null {
+    try {
+        const parsed = JSON.parse(readFileSync(cacheFile(key), 'utf8')) as Partial<PersistedSnapshot>;
+        if (!Number.isFinite(parsed.at) || !Array.isArray(parsed.value)) return null;
+        return { at: parsed.at, value: parsed.value as PurchasingGroup[] };
+    } catch {
+        return null;
+    }
+}
+
+function hydrateFromDisk(slot: CacheSlot, key: CacheKey): void {
+    if (slot.value) return;
+    const snapshot = readPersistedSnapshot(key);
+    if (!snapshot) return;
+    slot.value = snapshot.value;
+    slot.at = snapshot.at;
+}
+
+async function persistSnapshot(key: CacheKey, value: PurchasingGroup[], at: number): Promise<void> {
+    try {
+        mkdirSync(cacheDir(), { recursive: true });
+        await writeFile(cacheFile(key), JSON.stringify({ at, value }), 'utf8');
+    } catch (err: any) {
+        console.warn('[purchasing/cache] failed to persist snapshot:', err?.message || err);
+    }
+}
+
 export async function readSWR(
     slot: CacheSlot,
     fetcher: () => Promise<PurchasingGroup[]>,
     force: boolean,
+    cacheKey: CacheKey | null = inferCacheKey(slot),
 ): Promise<{ value: PurchasingGroup[]; refreshing: boolean }> {
+    if (cacheKey) hydrateFromDisk(slot, cacheKey);
+
     const stale = force || !slot.value || Date.now() - slot.at > CACHE_TTL;
 
     if (stale && !slot.promise) {
@@ -50,6 +103,7 @@ export async function readSWR(
                 const v = await fetcher();
                 slot.value = v;
                 slot.at = Date.now();
+                if (cacheKey) void persistSnapshot(cacheKey, v, slot.at);
                 return v;
             } finally {
                 slot.promise = null;

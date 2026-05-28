@@ -8,6 +8,22 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 
 export const dynamic = "force-dynamic";
 
+function headerValue(headers: Array<{ name?: string | null; value?: string | null }> | undefined, name: string): string | undefined {
+    return headers?.find((header) => header.name?.toLowerCase() === name.toLowerCase())?.value ?? undefined;
+}
+
+function canUseStoredMessageIdWithGmailApi(value: string): boolean {
+    return Boolean(value) && !value.startsWith("/") && !value.includes("://");
+}
+
+function replySubject(orderId: string, originalSubject?: string, hasThread = false): string {
+    const normalized = originalSubject?.replace(/^(re:\s*)+/i, "").trim();
+    if (normalized) return `Re: ${normalized}`;
+    return hasThread
+        ? `Re: Purchase Order ${orderId}`
+        : `Purchase Order ${orderId} Follow-up: Tracking Details Required`;
+}
+
 export async function GET(req: Request) {
     try {
         const finale = new FinaleClient();
@@ -192,27 +208,80 @@ export async function POST(req: Request) {
                 .eq("po_number", orderId)
                 .maybeSingle();
 
-            const poMessageId = poDetails?.po_email_message_id;
+            const poMessageId = typeof poDetails?.po_email_message_id === "string"
+                ? poDetails.po_email_message_id.trim()
+                : "";
 
             // Initialize Gmail
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
 
-            // Try to resolve Gmail thread ID
+            // Try to resolve Gmail thread ID. Gmail fallback stores the Gmail API
+            // message id, not the RFC822 Message-ID header, so resolve that first
+            // and only use RFC822 search as a fallback.
             let threadId: string | undefined;
-            if (poMessageId) {
+            let replyReferenceMessageId: string | undefined;
+            let originalSubject: string | undefined;
+            if (poMessageId && canUseStoredMessageIdWithGmailApi(poMessageId)) {
                 try {
-                    const q = `rfc822msgid:${poMessageId}`;
-                    const listRes = await gmail.users.messages.list({ userId: "me", q });
-                    if (listRes.data.messages && listRes.data.messages.length > 0) {
-                        threadId = listRes.data.messages[0].threadId;
+                    const getRes = await gmail.users.messages.get({
+                        userId: "me",
+                        id: poMessageId,
+                        format: "metadata",
+                        metadataHeaders: ["Message-ID", "Subject"],
+                    });
+                    threadId = getRes.data.threadId ?? undefined;
+                    replyReferenceMessageId = headerValue(getRes.data.payload?.headers, "Message-ID");
+                    originalSubject = headerValue(getRes.data.payload?.headers, "Subject");
+                } catch {
+                    try {
+                        const q = `rfc822msgid:${poMessageId}`;
+                        const listRes = await gmail.users.messages.list({ userId: "me", q });
+                        if (listRes.data.messages && listRes.data.messages.length > 0) {
+                            const foundMessage = listRes.data.messages[0];
+                            threadId = foundMessage.threadId;
+                            replyReferenceMessageId = poMessageId;
+                            if (foundMessage.id) {
+                                const getRes = await gmail.users.messages.get({
+                                    userId: "me",
+                                    id: foundMessage.id,
+                                    format: "metadata",
+                                    metadataHeaders: ["Subject"],
+                                });
+                                originalSubject = headerValue(getRes.data.payload?.headers, "Subject");
+                            }
+                        }
+                    } catch (searchErr) {
+                        console.warn("Failed to find Gmail thread for message ID:", poMessageId, searchErr);
                     }
-                } catch (gErr) {
-                    console.warn("Failed to find Gmail thread for message ID:", poMessageId, gErr);
                 }
             }
 
-            const subject = poMessageId ? `Re: Purchase Order ${orderId}` : `Purchase Order ${orderId} Follow-up: Tracking Details Required`;
+            if (!threadId) {
+                try {
+                    const listRes = await gmail.users.messages.list({
+                        userId: "me",
+                        q: `subject:${orderId} newer_than:365d`,
+                        maxResults: 1,
+                    });
+                    const foundMessage = listRes.data.messages?.[0];
+                    if (foundMessage?.id) {
+                        const getRes = await gmail.users.messages.get({
+                            userId: "me",
+                            id: foundMessage.id,
+                            format: "metadata",
+                            metadataHeaders: ["Message-ID", "Subject"],
+                        });
+                        threadId = getRes.data.threadId ?? foundMessage.threadId ?? undefined;
+                        replyReferenceMessageId = headerValue(getRes.data.payload?.headers, "Message-ID");
+                        originalSubject = headerValue(getRes.data.payload?.headers, "Subject");
+                    }
+                } catch (subjectSearchErr) {
+                    console.warn("Failed to find Gmail thread by PO subject:", orderId, subjectSearchErr);
+                }
+            }
+
+            const subject = replySubject(orderId, originalSubject, Boolean(threadId || replyReferenceMessageId));
 
             // Build raw RFC 2822 message
             const lines = [
@@ -222,9 +291,9 @@ export async function POST(req: Request) {
                 `MIME-Version: 1.0`,
                 `Content-Type: text/plain; charset=UTF-8`,
             ];
-            if (poMessageId) {
-                lines.push(`In-Reply-To: ${poMessageId}`);
-                lines.push(`References: ${poMessageId}`);
+            if (replyReferenceMessageId) {
+                lines.push(`In-Reply-To: ${replyReferenceMessageId}`);
+                lines.push(`References: ${replyReferenceMessageId}`);
             }
             lines.push("", emailBody);
             const rawEmail = lines.join("\r\n");

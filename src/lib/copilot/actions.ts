@@ -131,11 +131,11 @@ export async function executePOSendAction(input: ExecutePOSendActionInput): Prom
         if (result.emailError) {
             return makeActionResult(
                 "partial_success",
-                `PO #${result.orderId} committed in Finale — vendor email failed (${result.emailError}). Send the PO manually from Finale; Aria will not auto-retry with an alternate format.`,
+                `PO #${result.orderId} committed in Finale — vendor email failed (${result.emailError}). Retry email from the dashboard or send it manually from Finale.`,
                 {
                     actionRef: input.sendId,
-                    retryAllowed: false,
-                    safeToRetry: false,
+                    retryAllowed: result.retryable,
+                    safeToRetry: result.retryable,
                     details: result,
                 },
             );

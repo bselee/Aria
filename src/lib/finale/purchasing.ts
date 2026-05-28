@@ -21,6 +21,7 @@ import {
     type RecommendationSnapshot,
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
+import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
 import {
     FinaleProductsClient,
     EXCLUDED_VENDOR_PATTERN,
@@ -2362,11 +2363,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
 
         // ── Step 1: Page productViewConnection — presence signal only ──
-        // Two signals qualify a product as "actively moving":
-        //   - reorderQuantityToOrder > 0  : Finale is flagging it for reorder (covers purchased-for-resale)
-        //   - consumptionQuantity > 0     : BOM consumption (covers purchased components)
-        // NOTE: consumptionQuantity alone misses purchased-for-resale items (boxes, packaging, etc.)
-        // which have consumptionQuantity=0 but reorderQuantityToOrder>0 and demandQuantity>0.
+        // Resale ordering should only process products Finale is explicitly
+        // flagging for reorder. Finale's demandQuantity mirrors BOM consumption
+        // for hundreds of component SKUs, and that workload belongs to the
+        // separate getBOMDemand() pipeline.
         const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
 
         if (normalizedVendorFilter) {
@@ -2418,14 +2418,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const stockoutDays = this.parseFinaleNum(p.stockoutDays);
                     const demandQty = this.parseFinaleNum(p.demandQuantity);
                     const demandPerDay = this.parseFinaleNum(p.demandPerDay);
-                    candidates.push({
+                    const candidate = {
                         productId: p.productId,
                         finaleReorderQty: reorderQty,
                         finaleStockoutDays: stockoutDays,
                         finaleConsumptionQty: consumption,
                         finaleDemandQty: demandQty,
                         finaleDemandPerDay: demandPerDay,
-                    });
+                    };
+                    if (shouldIncludePurchasingCandidate(candidate)) {
+                        candidates.push(candidate);
+                    }
                 }
 
                 if (!conn.pageInfo.hasNextPage) break;

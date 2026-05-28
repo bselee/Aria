@@ -29,6 +29,16 @@ function firstTimestamp(...values: Array<string | null | undefined>): string | n
     return values.find((value) => typeof value === "string" && value.length > 0) ?? null;
 }
 
+function sourceFromVerifiedColumn(source: unknown): POSentVerificationSource {
+    if (!source) return "manual";
+    if (source === "manual") return "manual";
+    if (source === "tracking") return "tracking";
+    if (source === "vendor_reply") return "vendor_reply";
+    if (source === "purchase_order") return "purchase_order";
+    if (source === "po_send") return "po_send";
+    return "po_send";
+}
+
 export function derivePOSentVerification(input: DerivePOSentVerificationInput): POSentVerification {
     const evidence: POSentEvidence[] = [];
     const po = input.purchaseOrder ?? {};
@@ -37,7 +47,7 @@ export function derivePOSentVerification(input: DerivePOSentVerificationInput): 
 
     if (manualAt) {
         evidence.push({
-            type: "manual",
+            type: sourceFromVerifiedColumn(po.po_sent_verified_source),
             at: manualAt,
             detail: po.po_sent_verified_source || "Marked verified by user",
         });

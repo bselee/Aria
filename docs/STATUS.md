@@ -37,6 +37,7 @@
 
 | Date | What Changed | Key Files |
 |---|---|---|
+| 2026-05-28 | **Hermia Orchestration Overhaul** — Cron frequency tightening (6 jobs reduced ~504 invocations/day), Supervisor deterministic error classification (regex fast-path before LLM), Pinecone→SQLite memory swap (memory-store.ts + memory.ts + vendor-memory.ts), AP agent module extraction (ap/vendor-router.ts, ap/retry-policy.ts, ap/types.ts), Cognitive Round system (cognitive-round.ts — unified decision engine) | cron/jobs, supervisor-agent, memory-store, memory.ts, vendor-memory.ts, cognitive-round.ts |
 | 2026-05-26 | **Dashboard Schema Fixes** — Corrected statusId GraphQL queries and agent-task unique constraint conflicts | finale/client, intelligence/agent-task |
 | 2026-05-21 | **Tracking Precision Hardening** — Hardened Oak Harbor regex prefix, centralized all tracking extraction to eliminate duplicate regexes, verified all unit + integration tests green | carriers/tracking-service, intelligence/tracking-agent |
 | 2026-05-19 | **PO Send revert** — fail-closed; dropped Gmail fallback + homemade PDF | purchasing/po-send |

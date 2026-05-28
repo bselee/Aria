@@ -326,6 +326,25 @@ defineJob({
     },
 });
 
+// HERMIA(2026-05-28): Cognitive Round — the "soul" of Aria.
+// Surveys all state, makes priority decisions, logs to SQLite.
+// Runs every 15 min, right before ap-polling.
+defineJob({
+    name: "cognitive-round",
+    schedule: "*/15 * * * *",
+    onFail: "log",
+    description: "Cognitive Round: survey state, decide priorities, log decisions (every 15m).",
+    handler: async () => {
+        const { runCognitiveRound } = await import("@/lib/intelligence/cognitive-round");
+        const decision = await runCognitiveRound();
+        // Future: wire decision.suppress/boost into cron runner
+        // so suppressed jobs skip their next tick after this round
+        if (decision.suppress.length > 0 || decision.boost.length > 0) {
+            console.log(`[cognitive-round] suppress: ${decision.suppress.join(", ")} | boost: ${decision.boost.join(", ")}`);
+        }
+    },
+});
+
 // Gated cron — preserved env flag from inline registration.
 // HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
 // When enabled, 15m is plenty for orchestrating issue remediation cycles.

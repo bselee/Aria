@@ -104,6 +104,20 @@ export async function GET(req: NextRequest) {
         groups = groups.filter(g => allowed.includes(g.urgency));
     }
 
+    if (groups.length === 0) {
+        return NextResponse.json(
+            {
+                groups: [],
+                cachedAt: new Date(resaleSlot.at || bomSlot.at || Date.now()).toISOString(),
+                vendorSummaries: { totalSuggestedValue: 0, criticalCount: 0, warningCount: 0, watchCount: 0, okCount: 0 },
+                mode,
+                refreshing,
+                upcomingBuilds: [],
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
     const assessment = assessPurchasingGroups(groups);
 
     // Fetch recent POs from the past 180 days (6 months) to detect duplicate drafts
