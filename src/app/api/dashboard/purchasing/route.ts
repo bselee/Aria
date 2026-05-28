@@ -139,7 +139,6 @@ export async function GET(req: NextRequest) {
             vendorPartyId: group.vendorPartyId,
             vendorName: group.vendorName,
             recentPOs: vendorCyclePOs,
-            requestedLines: group.items,
         });
 
         return {

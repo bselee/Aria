@@ -99,6 +99,12 @@ export function evaluateVendorCycle(
     }>,
     check: VendorCycleCheck,
 ): VendorCycleResult {
+    // Guard: Finale API or upstream transform may produce non-array data
+    // under error conditions, causing "a is not iterable" in for-of below.
+    if (!Array.isArray(pos)) {
+        return { decision: "clear", blockingPOs: [], ignoredCanceled: 0, ignoredDropship: 0 };
+    }
+
     const now = Date.now();
     const cutoff = now - CYCLE_WINDOW_MS;
 
