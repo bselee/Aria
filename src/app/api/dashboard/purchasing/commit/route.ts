@@ -12,10 +12,11 @@ import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 /**
  * POST /api/dashboard/purchasing/commit
  *
- * Two-step:
- *   action=review  → fetch PO details + vendor email, store pending, return review data
- *   action=send    → commit in Finale + send email (requires sendId from review step)
- *   action=cancel  → discard pending, PO stays as draft
+ * Actions:
+ *   action=review       → fetch PO details + vendor email, store pending, return review data
+ *   action=send         → commit in Finale + send email (requires sendId from review step)
+ *   action=cancel       → discard pending send session, PO stays as draft in Finale
+ *   action=cancel-draft → cancel the PO in Finale (ORDER_CREATED → ORDER_CANCELED)
  */
 export async function POST(req: NextRequest) {
     try {
@@ -114,6 +115,27 @@ export async function POST(req: NextRequest) {
             } catch (err: any) {
                 return NextResponse.json({ status: 'failed', error: err.message }, { status: 400 });
             }
+
+        } else if (action === 'cancel-draft') {
+            const { sendId, orderId } = body;
+            if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+
+            // Expire the pending send session if one exists
+            if (sendId) {
+                const { expirePendingPOSend } = await import('@/lib/purchasing/po-sender');
+                await expirePendingPOSend(sendId);
+            }
+
+            // Cancel the PO in Finale
+            const client = new FinaleClient();
+            const result = await client.cancelDraftPO(orderId);
+            invalidatePurchasingCaches();
+
+            return NextResponse.json({
+                cancelled: true,
+                orderId,
+                finalStatus: result.finalStatus,
+            });
 
         } else if (action === 'cancel') {
             const { sendId } = body;

@@ -924,6 +924,42 @@ export default function PurchasingPanel() {
         dismissCommitModal();
     }
 
+    async function handleCancelDraft(orderId: string) {
+        if (!confirm(`Cancel draft PO #${orderId}?\n\nThis will delete it from Finale. Cannot be undone.`)) {
+            return;
+        }
+
+        setCommitLoading(orderId);
+        try {
+            const res = await fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'cancel-draft', orderId, sendId: commitModal?.sendId || null }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.error || 'Failed to cancel draft');
+            }
+            // Remove from local state
+            setCreatedPOs(prev => {
+                const next = { ...prev };
+                for (const [pid, po] of Object.entries(next)) {
+                    if (po.orderId === orderId) delete next[pid];
+                }
+                return next;
+            });
+            // Close the commit modal if it was open for this PO
+            if (commitModal?.review?.orderId === orderId) {
+                dismissCommitModal();
+            }
+            await load();
+        } catch (err: any) {
+            setVendorError(err.message);
+        } finally {
+            setCommitLoading(null);
+        }
+    }
+
     // ── ULINE direct ordering ──────────────────────────────────────────────
     function isUlineVendor(vendorName: string): boolean {
         return vendorName.toLowerCase().includes("uline");
@@ -1289,10 +1325,32 @@ export default function PurchasingPanel() {
                             </div>
                         )}
                         <div className="px-4 py-3 border-t border-zinc-800 flex items-center justify-end gap-2">
-                            <button onClick={handleCancelCommit}
-                                className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
-                                {Object.keys(sendSteps).length > 0 ? 'Close' : 'Cancel'}
-                            </button>
+                            {canRetryEmail ? (
+                                <button onClick={handleCancelCommit}
+                                    className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
+                                    Close
+                                </button>
+                            ) : Object.keys(sendSteps).length > 0 ? (
+                                <button onClick={handleCancelCommit}
+                                    className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
+                                    Close
+                                </button>
+                            ) : (
+                                <>
+                                    <button
+                                        onClick={() => handleCancelDraft(commitModal.review.orderId)}
+                                        disabled={sendingPO}
+                                        className="text-[11px] font-mono px-3 py-1.5 rounded bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border border-rose-700/50 transition-colors disabled:opacity-40 mr-auto"
+                                        title="Cancel this PO in Finale — removes the draft entirely"
+                                    >
+                                        🗑 Cancel Draft
+                                    </button>
+                                    <button onClick={handleCancelCommit}
+                                        className="text-[11px] font-mono px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
+                                        Keep Draft
+                                    </button>
+                                </>
+                            )}
                             {canRetryEmail ? (
                                 <button
                                     onClick={handleRetryEmail}
@@ -1802,14 +1860,24 @@ export default function PurchasingPanel() {
                                                                 {sentPOs.has(po.orderId) ? (
                                                                     <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
                                                                 ) : (
-                                                                    <button
-                                                                        onClick={() => handleReviewAndSend(po.orderId)}
-                                                                        disabled={commitLoading === po.orderId}
-                                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
-                                                                        title="Commit in Finale and email vendor"
-                                                                    >
-                                                                        {commitLoading === po.orderId ? '…' : 'Commit & Send'}
-                                                                    </button>
+                                                                    <>
+                                                                        <button
+                                                                            onClick={() => handleReviewAndSend(po.orderId)}
+                                                                            disabled={commitLoading === po.orderId}
+                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
+                                                                            title="Commit in Finale and email vendor"
+                                                                        >
+                                                                            {commitLoading === po.orderId ? '…' : 'Commit & Send'}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => handleCancelDraft(po.orderId)}
+                                                                            disabled={commitLoading === po.orderId}
+                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border-rose-700/50 transition-colors disabled:opacity-40"
+                                                                            title="Cancel this draft PO in Finale"
+                                                                        >
+                                                                            ✕
+                                                                        </button>
+                                                                    </>
                                                                 )}
                                                             </div>
                                                         ) : (
@@ -1884,13 +1952,23 @@ export default function PurchasingPanel() {
                                                                 {sentPOs.has(po.orderId) ? (
                                                                     <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
                                                                 ) : (
-                                                                    <button
-                                                                        onClick={() => handleReviewAndSend(po.orderId)}
-                                                                        disabled={commitLoading === po.orderId}
-                                                                        className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40"
-                                                                    >
-                                                                        {commitLoading === po.orderId ? 'Loading…' : 'Commit & Send'}
-                                                                    </button>
+                                                                    <>
+                                                                        <button
+                                                                            onClick={() => handleReviewAndSend(po.orderId)}
+                                                                            disabled={commitLoading === po.orderId}
+                                                                            className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600 transition-colors disabled:opacity-40"
+                                                                        >
+                                                                            {commitLoading === po.orderId ? 'Loading…' : 'Commit & Send'}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => handleCancelDraft(po.orderId)}
+                                                                            disabled={commitLoading === po.orderId}
+                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border border-rose-700/50 transition-colors disabled:opacity-40"
+                                                                            title="Cancel this draft PO in Finale"
+                                                                        >
+                                                                            ✕
+                                                                        </button>
+                                                                    </>
                                                                 )}
                                                             </div>
                                                         ) : selectedCount > 0 ? (
@@ -2484,19 +2562,18 @@ export default function PurchasingPanel() {
                                                                                                 Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
                                                                                             </p>
                                                                                             <div className="flex items-center gap-2 pt-1">
-                                                                                                <a 
-                                                                                                    href={item.draftPO.finaleUrl}
-                                                                                                    target="_blank"
-                                                                                                    rel="noopener noreferrer"
-                                                                                                    className="px-2 py-1 rounded border border-amber-500/40 hover:bg-amber-500/20 hover:text-amber-200 transition-all flex items-center gap-1 text-[10px] font-semibold"
-                                                                                                >
-                                                                                                    <span>View Draft ↗</span>
-                                                                                                </a>
                                                                                                 <button
                                                                                                     onClick={(e) => { e.stopPropagation(); handleReviewAndSend(item.draftPO!.orderId); }}
                                                                                                     className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[10px]"
                                                                                                 >
                                                                                                     Commit & Send PO
+                                                                                                </button>
+                                                                                                <button
+                                                                                                    onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
+                                                                                                    className="px-2 py-1 rounded border border-rose-500/40 hover:bg-rose-500/20 hover:text-rose-200 text-rose-300 transition-all font-semibold text-[10px]"
+                                                                                                    title="Cancel this draft PO in Finale"
+                                                                                                >
+                                                                                                    🗑 Cancel Draft
                                                                                                 </button>
                                                                                             </div>
                                                                                         </div>
