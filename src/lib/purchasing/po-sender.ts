@@ -11,7 +11,7 @@ import type { CopilotChannel } from '../copilot/types';
 import * as agentTask from '../intelligence/agent-task';
 import type { CommitVerification } from './po-verification';
 import { renderPurchaseOrderPdf } from './po-email-pdf';
-import { sendGmailPdfEmail } from '../gmail/send-email';
+import { sendGmailPdfEmail, sendTextOnlyGmailEmail } from '../gmail/send-email';
 
 type POEmailVia = 'finale-native' | 'gmail-fallback';
 
@@ -425,6 +425,46 @@ export function generatePOEmailBody(review: DraftPOReview): { subject: string; b
     return { subject, body };
 }
 
+// HERMIA(2026-05-28): Text-only PO email — used when PDF generation fails.
+// Includes all line items inline so the vendor still gets the PO details.
+export function generateTextOnlyPOEmail(review: DraftPOReview): string {
+    const date = new Date(`${review.orderDate.slice(0, 10)}T00:00:00`);
+    const datePart = Number.isNaN(date.getTime())
+        ? review.orderDate
+        : `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
+
+    const fmtMoney = (v: number) => `$${Number.isFinite(v) ? v.toFixed(2) : "0.00"}`;
+
+    const itemLines = (review.items || []).map((item, i) => {
+        const sku = item.productId || '';
+        const desc = item.productName || '';
+        const qty = item.quantity ?? 0;
+        const unit = item.unitPrice ?? 0;
+        const lineTotal = qty * unit;
+        return `  ${i + 1}. ${sku}\n     ${desc}\n     Qty: ${qty}  Unit: ${fmtMoney(unit)}  Line: ${fmtMoney(lineTotal)}`;
+    });
+
+    return [
+        `Hi ${review.vendorName},`,
+        ``,
+        `Please see our purchase order below:`,
+        ``,
+        `PO #: ${review.orderId}`,
+        `Date: ${datePart}`,
+        `Total: ${fmtMoney(review.total || 0)}`,
+        `Finale: ${review.finaleUrl}`,
+        ``,
+        `Line Items:`,
+        ...(itemLines.length > 0 ? itemLines : ['  (no items listed)']),
+        ``,
+        `Please acknowledge receipt and send ETA in this email thread.`,
+        ``,
+        `Thanks,`,
+        ``,
+        `BuildASoil Purchasing`,
+    ].join('\n');
+}
+
 async function findExistingPOSend(orderId: string): Promise<any | null> {
     const db = createClient();
     if (!db) return null;
@@ -577,8 +617,28 @@ export async function commitAndSendPO(
                 emailError = undefined;
                 verificationIssues.push(`Gmail fallback sent PO PDF to ${vendorEmail}`);
             } catch (gmailErr: any) {
-                emailError = `Finale native failed (${finaleNativeError}); Gmail fallback failed (${gmailErr?.message ?? String(gmailErr)})`;
-                verificationIssues.push(`Gmail fallback failed: ${gmailErr?.message ?? String(gmailErr)} — PO is committed in Finale; send manually from there.`);
+                // HERMIA(2026-05-28): If PDF generation fails (font missing, PDFKit bundled
+                // without AFM files, etc), send a text-only email with PO details instead.
+                // Better to send a readable text email than nothing.
+                const textOnlyBody = generateTextOnlyPOEmail(review);
+                try {
+                    const textGmailResult = await sendTextOnlyGmailEmail({
+                        to: vendorEmail,
+                        subject,
+                        body: textOnlyBody,
+                    });
+                    emailSent = true;
+                    pdfAttached = false;
+                    sentAt = new Date().toISOString();
+                    emailVia = 'gmail-fallback';
+                    gmailMessageId = textGmailResult.messageId;
+                    gmailFromAddress = textGmailResult.fromAddress;
+                    emailError = `PDF generation failed (${gmailErr?.message ?? String(gmailErr)}) — sent text-only email.`;
+                    verificationIssues.push(`Text-only Gmail fallback sent to ${vendorEmail}`);
+                } catch (textErr: any) {
+                    emailError = `Finale native failed (${finaleNativeError}); Gmail fallback failed (${gmailErr?.message ?? String(gmailErr)})`;
+                    verificationIssues.push(`Gmail fallback failed: ${gmailErr?.message ?? String(gmailErr)} — PO is committed in Finale; send manually from there.`);
+                }
             }
         }
     }

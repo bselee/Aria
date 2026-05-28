@@ -39,6 +39,13 @@ const nextConfig = {
         '@googleapis/calendar',
         'node-cron',
         'chokidar',
+        // HERMIA(2026-05-28): pdfkit MUST be external — it resolves font AFMs
+        // (Helvetica.afm etc.) via `__dirname + '/data/...'`. When bundled by
+        // Next.js into .next/server/chunks/, __dirname points to the chunk
+        // directory which has no font data → PO PDF generation fails →
+        // Gmail PO-email fallback broken. Keeping it external lets pdfkit
+        // find its shipped fonts at node_modules/pdfkit/js/data/.
+        'pdfkit',
     ],
 };
 
