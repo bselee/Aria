@@ -484,12 +484,12 @@ export async function commitAndSendPO(
     }
 
     // Refuse empty PO renders — review.items.length === 0 would otherwise
-    // commit a $0/0-line PO in Finale and ship the vendor a blank PDF.
-    if (!Array.isArray(review.items) || review.items.length === 0) {
-        throw new Error(`PO #${orderId} has no line items — refusing to commit/send`);
-    }
+        // commit a $0/0-line PO in Finale and ship the vendor a blank PDF.
+        if (!Array.isArray(review.items) || review.items.length === 0) {
+            throw new Error(`PO #${orderId} has no line items — refusing to commit/send`);
+        }
 
-    // 1. Commit in Finale (idempotent: if the PO is already ORDER_LOCKED from
+        // 1. Commit in Finale
     //    a previous attempt that crashed mid-send, skip the commit and proceed
     //    directly to send. This is the retry path that turns a stuck "locked
     //    but unsent" PO back into a recoverable state.)

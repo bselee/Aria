@@ -347,6 +347,8 @@ export const hermiaCommands: BotCommand[] = [
     cognitionCommand,
     priorityCommand,
     orderNowCommand,
+    ballCommand,
+    orderGuardCommand,
     budgetCommand,
     memoriesCommand,
     agentsCommand,
@@ -381,6 +383,118 @@ const orderNowCommand: BotCommand = {
             const report = buildOrderingReport(data.groups);
             const formatted = formatOrderingReport(report);
             await ctx.reply(formatted, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ ${err.message}`);
+        }
+    },
+};
+
+/**
+ * /ball — Crystal Ball projection. What happens if nothing is ordered today?
+ * Shows stockout dates, build impact, and monthly revenue at risk.
+ */
+const ballCommand: BotCommand = {
+    name: "ball",
+    description: "Crystal Ball: what happens if nothing is ordered today",
+    handler: async (ctx, deps) => {
+        await ctx.sendChatAction("typing");
+
+        try {
+            const response = await fetch("http://localhost:3001/api/dashboard/purchasing?bust=1");
+            if (!response.ok) throw new Error(`Purchasing API returned ${response.status}`);
+
+            const data = await response.json();
+            if (!data.groups || data.groups.length === 0) {
+                await ctx.reply("No purchasing data available. The scanner may still be running.");
+                return;
+            }
+
+            const { buildCrystalBallReport, formatCrystalBallReport } = await import("@/lib/intelligence/crystal-ball");
+            const report = buildCrystalBallReport(data.groups);
+            const formatted = formatCrystalBallReport(report);
+            await ctx.reply(formatted, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ ${err.message}`);
+        }
+    },
+};
+
+/**
+ * /orderguard — Check vendor cycle guard for the current purchasing data.
+ * Shows which vendors already have active POs and which would fail the cycle guard.
+ */
+const orderGuardCommand: BotCommand = {
+    name: "orderguard",
+    description: "Vendor cycle guard — find fragmented POs before committing",
+    handler: async (ctx, deps) => {
+        await ctx.sendChatAction("typing");
+
+        try {
+            const response = await fetch("http://localhost:3001/api/dashboard/purchasing?bust=1");
+            if (!response.ok) throw new Error(`Purchasing API returned ${response.status}`);
+
+            const data = await response.json();
+            if (!data.groups || data.groups.length === 0) {
+                await ctx.reply("No purchasing data available. The scanner may still be running.");
+                return;
+            }
+
+            const { evaluateVendorCycle } = await import("@/lib/purchasing/vendor-order-cycle");
+            const lines: string[] = [];
+            lines.push(`🛡️ *Vendor Cycle Guard — Multi-PO Flag Check*`);
+            lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+            // Only show vendors with actionable items
+            const activeGroups = data.groups.filter((g: any) =>
+                g.items?.some((i: any) =>
+                    (i.urgency === "critical" || i.urgency === "warning") && i.suggestedQty > 0
+                )
+            );
+
+            if (activeGroups.length === 0) {
+                await ctx.reply("✅ No vendors with urgent items. Cycle guard clear.");
+                return;
+            }
+
+            let flagCount = 0;
+            for (const group of activeGroups.slice(0, 10)) {
+                const vendorName = group.vendorName;
+
+                // Use vendor party ID to look up recent POs from the dashboard data
+                const recentPOs = group.items
+                    ?.filter((i: any) => i.openPOs?.length > 0)
+                    .flatMap((i: any) => (i.openPOs || []).map((po: any) => ({
+                        orderId: po.orderId || "",
+                        orderDate: po.orderDate || null,
+                        status: po.status || "ORDER_LOCKED",
+                        supplier: vendorName,
+                    }))) || [];
+
+                // Deduplicate by orderId
+                const uniquePOs = [...new Map(recentPOs.map((p: any) => [p.orderId, p])).values()];
+
+                const cycleResult = evaluateVendorCycle(uniquePOs as any, {
+                    vendorName,
+                    vendorPartyId: group.vendorPartyId || "",
+                    exception: undefined,
+                });
+
+                if (cycleResult.decision === "routine_locked") {
+                    flagCount++;
+                    lines.push(`⚠️ *${vendorName}* — ${cycleResult.blockingPOs.length} active PO(s) in cycle`);
+                    lines.push(`   Blocking: ${cycleResult.blockingPOs.map((p: any) => `#${p.orderId} (${p.orderDate?.split("T")[0] || "unknown"})`).join(", ")}`);
+                    lines.push(`   Ignored canceled: ${cycleResult.ignoredCanceled} | Dropship: ${cycleResult.ignoredDropship}`);
+                    lines.push("");
+                }
+            }
+
+            if (flagCount === 0) {
+                lines.push("✅ All vendor cycles clear for current urgent items.");
+            } else {
+                lines.push(`\n${flagCount} vendor(s) flagged. Consider consolidating before committing new POs.`);
+            }
+
+            await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
         } catch (err: any) {
             await ctx.reply(`❌ ${err.message}`);
         }
