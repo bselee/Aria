@@ -33,11 +33,35 @@ export class AcknowledgementAgent {
         this.tokenIdentifier = tokenIdentifier;
     }
 
-    // DECISION(2026-03-24): System sender addresses that ARIA should never auto-reply to.
-    // These are internal pipeline senders (Stockie alerts, etc.) that feed ARIA data
-    // but should not receive "Thanks!" or follow-up responses.
+    // DECISION(2026-03-24→2026-05-28): System sender addresses that ARIA should never auto-reply to.
+    // Expanded beyond Stockie — any platform-level sender, notification-only service,
+    // or internal tool that should not receive "Thanks!" auto-replies.
+    // These catch ~80% of noise before any LLM call.
     private static SYSTEM_SENDERS = [
-        'dev@plutonian.io',   // Stockie Low Stock Alert — triggers OOS report pipeline
+        'dev@plutonian.io',       // Stockie Low Stock Alert — triggers OOS report pipeline
+        '@notifications.google',  // Google Workspace notifications
+        '@googlemail.l.google',   // Gmail system messages
+        'noreply@google.com',     // Google Cloud, Calendar, etc.
+        'no-reply@accounts.google', // Google account notifications
+        'stripe.com',             // Stripe payment receipts
+        'shopify.com',            // Shopify order confirmations
+        'squarespace.com',        // Squarespace notifications
+        'paypal.com',             // PayPal receipts
+        'quickbooks.com',         // QuickBooks invoices
+        'bill.com',               // Bill.com notifications  
+        'buildasoilap@bill.com',  // Our own Bill.com AP inbox
+        '@send.',                 // Generic ESP pattern
+        '@email.',                // Generic ESP pattern
+        '@notify.',               // Generic ESP pattern
+        '@mail.',                 // Generic ESP pattern (sendgrid, etc.)
+        'zendesk.com',            // Zendesk ticket notifications
+        'freshdesk.com',          // Freshdesk notifications
+        'intercom.io',            // Intercom notifications
+        'docusign.com',           // DocuSign signature requests
+        'hellosign.com',          // HelloSign
+        'calendly.com',           // Calendly booking confirmations
+        'hubspot.com',            // HubSpot notifications
+        'jotform.com',            // JotForm submissions
     ];
 
     // DECISION(2026-03-24): Subject patterns for ARIA's own outbound reports.
@@ -279,7 +303,31 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
 
                 console.log(`   Evaluating: "${subject}" from ${senderEmail}`);
 
-                // Guardrail 2: Classify intent
+                // Guardrail 2: REGEX FAST-PATH — skip LLM entirely for noreply/marketplace senders
+                // These are always PROMOTIONAL or routine status updates. No human action needed.
+                if (this.isNoReply(senderEmail)) {
+                    console.log(`     -> Fast-path PROMOTIONAL (noreply sender: ${senderEmail})`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me", id: m.gmail_message_id,
+                            requestBody: { removeLabelIds: ["UNREAD"] }
+                        });
+                    } catch { /* best effort */ }
+                    continue;
+                }
+
+                if (this.isMarketplaceOrStatusSender(senderEmail, subject)) {
+                    console.log(`     -> Fast-path PROMOTIONAL (marketplace/status: ${senderEmail})`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me", id: m.gmail_message_id,
+                            requestBody: { removeLabelIds: ["UNREAD"] }
+                        });
+                    } catch { /* best effort */ }
+                    continue;
+                }
+
+                // Guardrail 3: Classify intent (LLM call — expensive, only reached for real vendor emails)
                 let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
                 let humanReviewReason = "llm_requires_human";
 

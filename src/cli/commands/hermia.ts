@@ -541,26 +541,48 @@ const followupCommand: BotCommand = {
             const formatted = formatFollowUpReport(report);
             await ctx.reply(formatted, { parse_mode: "Markdown" });
         } catch (err: any) {
-            await ctx.reply(`❌ ${err.message}`);
-        }
-    },
-};
+                await ctx.reply(`❌ ${err.message}`);
+            }
+        },
+        };
 
-// ── Export: MUST come after all command definitions ─────────────────────────
-// const declarations are not hoisted — referencing them before init crashes.
+        /**
+        * /email — Email pipeline triage. Shows queue health, stuck items,
+        * slow vendor acks, and draft follow-ups. Ninja-grade visibility.
+        */
+        const emailCommand: BotCommand = {
+        name: "email",
+        description: "Email pipeline triage — queues, stuck items, slow vendors",
+        handler: async (ctx, deps) => {
+            await ctx.sendChatAction("typing");
 
-export const hermiaCommands: BotCommand[] = [
-    cognitionCommand,
-    priorityCommand,
-    orderNowCommand,
-    ballCommand,
-    orderGuardCommand,
-    followupCommand,
-    budgetCommand,
-    memoriesCommand,
-    agentsCommand,
-    hermiaCommand,
-    shipCommand,
-    costCommand,
-    apHealthCommand,
-];
+            try {
+                const { buildEmailTriageReport, formatEmailTriageReport } = await import("@/lib/intelligence/email-triage");
+                const report = await buildEmailTriageReport();
+                const formatted = formatEmailTriageReport(report);
+                await ctx.reply(formatted, { parse_mode: "Markdown" });
+            } catch (err: any) {
+                await ctx.reply(`❌ ${err.message}`);
+            }
+        },
+        };
+
+        // ── Export: MUST come after all command definitions ─────────────────────────
+        // const declarations are not hoisted — referencing them before init crashes.
+
+        export const hermiaCommands: BotCommand[] = [
+        cognitionCommand,
+        priorityCommand,
+        orderNowCommand,
+        ballCommand,
+        orderGuardCommand,
+        followupCommand,
+        emailCommand,
+        budgetCommand,
+        memoriesCommand,
+        agentsCommand,
+        hermiaCommand,
+        shipCommand,
+        costCommand,
+        apHealthCommand,
+        ];
