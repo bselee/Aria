@@ -2859,7 +2859,7 @@ function buildReconciliationSummary(
 
     // Footer â€” net impact and status
     const impactFmt = totalDollarImpact.toFixed(2);
-    const totalFmt = invoice.total.toFixed(2);
+    const totalFmt = (invoice.total ?? 0).toFixed(2);
 
     if (overallVerdict === "auto_approve") {
         if (totalDollarImpact === 0) {
