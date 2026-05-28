@@ -738,6 +738,25 @@ export default function PurchasingPanel() {
             }
             await load(true);
         } catch (e: any) {
+            // HERMIA(2026-05-28): When server-side commit guard blocks the draft,
+            // surface a confirmation dialog to force past the guard instead of
+            // just showing a red error banner. The client-side check (30d simple)
+            // can pass while the server's full check (lead_time + 30d coverage)
+            // still rejects — in that case, user should be able to force-through.
+            const isDraftBlocked = /Draft blocked/i.test(e.message || "");
+            const isRoutineLocked = /routine|active PO/i.test(e.message || "");
+            if ((isDraftBlocked || isRoutineLocked) && !ignoreCommitGuards) {
+                const proceed = window.confirm(
+                    `PO guard for ${group.vendorName}:\n\n${e.message}\n\n` +
+                    `Aria's safety check recommends a larger quantity or more items.\n` +
+                    `Force create a draft PO with your selected quantities?\n\n` +
+                    `(OK = force create · Cancel = abort)`
+                );
+                if (proceed) {
+                    handleCreateOne(group, true);
+                    return;
+                }
+            }
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
             setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
