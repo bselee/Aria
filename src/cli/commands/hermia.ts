@@ -346,6 +346,7 @@ const apHealthCommand: BotCommand = {
 export const hermiaCommands: BotCommand[] = [
     cognitionCommand,
     priorityCommand,
+    orderNowCommand,
     budgetCommand,
     memoriesCommand,
     agentsCommand,
@@ -354,6 +355,37 @@ export const hermiaCommands: BotCommand[] = [
     costCommand,
     apHealthCommand,
 ];
+
+/**
+ * /ordernow — What needs ordering RIGHT NOW. Manufacturing-first.
+ * Cuts through 121 items to show only what will lose money if delayed.
+ */
+const orderNowCommand: BotCommand = {
+    name: "ordernow",
+    description: "What needs ordering RIGHT NOW — manufacturing-first",
+    handler: async (ctx, deps) => {
+        await ctx.sendChatAction("typing");
+
+        try {
+            // Fetch purchasing data from dashboard API
+            const response = await fetch("http://localhost:3001/api/dashboard/purchasing?bust=1");
+            if (!response.ok) throw new Error(`Purchasing API returned ${response.status}`);
+
+            const data = await response.json();
+            if (!data.groups || data.groups.length === 0) {
+                await ctx.reply("No purchasing data available. The scanner may still be running.");
+                return;
+            }
+
+            const { buildOrderingReport, formatOrderingReport } = await import("@/lib/intelligence/ordering-urgency");
+            const report = buildOrderingReport(data.groups);
+            const formatted = formatOrderingReport(report);
+            await ctx.reply(formatted, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ ${err.message}`);
+        }
+    },
+};
 
 /**
  * /hermia — Agent accountability hierarchy. Who owns what, who's failing.
