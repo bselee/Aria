@@ -525,6 +525,27 @@ const hermiaCommand: BotCommand = {
     },
 };
 
+/**
+ * /followup — Follow-up SOP. Checks for unanswered Slack requests (>24h)
+ * and vendor POs without confirmation (>48h).
+ */
+const followupCommand: BotCommand = {
+    name: "followup",
+    description: "Follow-up SOP — unanswered Slack requests + unconfirmed POs",
+    handler: async (ctx, deps) => {
+        await ctx.sendChatAction("typing");
+
+        try {
+            const { buildFollowUpReport, formatFollowUpReport } = await import("@/lib/slack/followup-sop");
+            const report = await buildFollowUpReport();
+            const formatted = formatFollowUpReport(report);
+            await ctx.reply(formatted, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ ${err.message}`);
+        }
+    },
+};
+
 // ── Export: MUST come after all command definitions ─────────────────────────
 // const declarations are not hoisted — referencing them before init crashes.
 
@@ -534,6 +555,7 @@ export const hermiaCommands: BotCommand[] = [
     orderNowCommand,
     ballCommand,
     orderGuardCommand,
+    followupCommand,
     budgetCommand,
     memoriesCommand,
     agentsCommand,
