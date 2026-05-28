@@ -386,3 +386,18 @@ defineJob({
         await autoProcessAutonomyDrafts(o.bot);
     },
 });
+
+// ── CORE-04: Follow-up SOP ───────────────────────────────────────────────
+// Checks for stale Slack requests (>24h unanswered) and vendor POs (>48h
+// without confirmation). Nudges Bill via Telegram. Runs every 2 hours.
+// Slack requests are marked last_nudge_at to avoid re-nudging within 24h.
+defineJob({
+    name: "followup-sop",
+    schedule: "0 */2 * * *", // every 2 hours
+    onFail: "log",
+    description: "Follow-up SOP: nudge Bill for unanswered Slack requests or unconfirmed vendor POs.",
+    handler: async () => {
+        const { runFollowUpSOP } = await import("../../lib/slack/followup-sop");
+        await runFollowUpSOP();
+    },
+});
