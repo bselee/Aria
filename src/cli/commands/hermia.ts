@@ -349,7 +349,47 @@ export const hermiaCommands: BotCommand[] = [
     budgetCommand,
     memoriesCommand,
     agentsCommand,
+    hermiaCommand,
     shipCommand,
     costCommand,
     apHealthCommand,
 ];
+
+/**
+ * /hermia — Agent accountability hierarchy. Who owns what, who's failing.
+ */
+const hermiaCommand: BotCommand = {
+    name: "hermia",
+    description: "Agent hierarchy — who owns what, accountability board",
+    handler: async (ctx, deps) => {
+        try {
+            const { getOrchestrator } = await import("@/lib/intelligence/hermes-orchestrator");
+            const orch = getOrchestrator();
+
+            // Register heartbeats from current state
+            const { createClient } = await import("@/lib/supabase");
+            const supabase = createClient();
+            if (supabase) {
+                const { data: heartbeats } = await supabase
+                    .from("agent_heartbeats")
+                    .select("agent_name, status, heartbeat_at")
+                    .order("heartbeat_at", { ascending: false });
+
+                if (heartbeats) {
+                    for (const hb of heartbeats as any[]) {
+                        const elapsed = Date.now() - new Date(hb.heartbeat_at).getTime();
+                        const status: "healthy" | "degraded" | "stopped" =
+                            elapsed > 900000 ? "stopped" :
+                            elapsed > 450000 ? "degraded" : "healthy";
+                        await orch.registerHeartbeat(hb.agent_name, status);
+                    }
+                }
+            }
+
+            const report = orch.formatAgentHierarchy();
+            await ctx.reply(report, { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ ${err.message}`);
+        }
+    },
+};
