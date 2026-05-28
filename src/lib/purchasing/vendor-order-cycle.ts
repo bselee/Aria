@@ -217,3 +217,44 @@ export function formatCycleResult(result: VendorCycleResult): string {
             return "Unknown cycle state.";
     }
 }
+
+/**
+ * Map raw PO records into the shape expected by evaluateVendorCycle.
+ * Thin adapter used by the purchasing dashboard API route.
+ */
+export function mapRecentPOsToVendorCyclePOs(recentPOs: Array<{
+    orderId: string;
+    orderDate: string | null;
+    status: string;
+    supplier: string;
+    isDropship?: boolean;
+    isCanceled?: boolean;
+}>): Array<{
+    orderId: string;
+    orderDate: string | null;
+    status: string;
+    supplier: string;
+    isDropship?: boolean;
+    isCanceled?: boolean;
+}> {
+    return recentPOs;
+}
+
+/**
+ * Classify a vendor's order cycle status from their recent PO history.
+ * Convenience wrapper around evaluateVendorCycle used by the dashboard.
+ */
+export function classifyVendorOrderCycle(
+    recentPOs: Array<{
+        orderId: string;
+        orderDate: string | null;
+        status: string;
+        supplier: string;
+        isDropship?: boolean;
+        isCanceled?: boolean;
+    }>,
+    vendorPartyId: string,
+    vendorName: string,
+): VendorCycleResult {
+    return evaluateVendorCycle(recentPOs, { vendorPartyId, vendorName });
+}
