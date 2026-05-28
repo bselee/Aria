@@ -237,6 +237,21 @@ defineJob({
     },
 });
 
+// HERMIA(2026-05-28): Delivery exception auto-escalation.
+// Finds shipments with exception status, drafts vendor email, alerts Bill.
+defineJob({
+    name: "delivery-exception-escalator",
+    schedule: "0 */4 * * 1-5",
+    onFail: "log",
+    description: "Auto-escalate delivery exceptions — draft vendor email + Telegram alert (every 4h weekdays).",
+    handler: async () => {
+        const { escalateDeliveryExceptions } = await import("@/lib/tracking/delivery-exception-escalator");
+        const result = await escalateDeliveryExceptions();
+        if (result.escalated.length > 0) {
+            console.log(`[delivery-exception-escalator] Escalated ${result.escalated.length} exception(s)`);
+        }
+    },
+});
 // HERMIA(2026-05-28): Prompt Bill to confirm receipt of delivered POs.
 // Runs 4x/day during business hours. Finds delivered 24-72h ago, not yet
 // received in Finale. Sends Telegram with inline buttons.
