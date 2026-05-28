@@ -1,106 +1,92 @@
 /**
  * @file    embedding.ts
- * @purpose Centralized embedding module — single source of truth for vector generation.
- *          Used by memory.ts and vendor-memory.ts. Includes retry with exponential
- *          backoff for errors and graceful null-return on failure.
- * @author  Will / Antigravity
+ * @purpose Centralized embedding module — generates 1024-dimensional vectors
+ *          for memory search. Uses OpenAI text-embedding-3-small.
+ * @author  Will / Antigravity / Hermia
  * @created 2026-02-24
- * @updated 2026-03-13
- * @deps    @pinecone-database/pinecone
- * @env     PINECONE_API_KEY
+ * @updated 2026-05-28
+ * @deps    openai
+ * @env     OPENAI_API_KEY
  *
- * DECISION(2026-03-06): Extracted from duplicated embed() in memory.ts and vendor-memory.ts.
- * Single place to swap providers (e.g., Gemini text-embedding-004) if needed later.
- * The gravity-memory Pinecone index is 1024d — any replacement model must output 1024d.
+ * HERMIA(2026-05-28): Migrated from Pinecone Inference (llama-text-embed-v2)
+ * to OpenAI text-embedding-3-small. Both output 1024d vectors.
+ * Existing Pinecone vectors are INCOMPATIBLE (different embedding space) —
+ * the import script re-embeds all stored content from metadata.
  *
- * DECISION(2026-03-11): Added circuit breaker to prevent log spam when quota is exhausted.
- * Logs the error once, then silently returns null for 10 minutes before retrying.
+ * Cost: ~$0.02/MTok. At Aria's volume (~1000 embeds/day, avg 500 chars each),
+ * estimated cost is <$0.50/month.
  *
- * DECISION(2026-03-13): Switched from OpenAI text-embedding-3-small to Pinecone Inference
- * llama-text-embed-v2 — eliminates OpenAI quota dependency entirely. Pinecone Inference
- * is included with the Pinecone API key, no separate billing. Model supports 1024d output
- * natively, matching the existing gravity-memory index dimensions.
+ * @original-deps @pinecone-database/pinecone (REMOVED)
  */
 
-import { Pinecone } from '@pinecone-database/pinecone';
+import OpenAI from 'openai';
 
-let pc: Pinecone | null = null;
+let client: OpenAI | null = null;
 
-/** Embedding model config — change here to swap providers project-wide. */
-const EMBEDDING_MODEL = 'llama-text-embed-v2';
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const EMBEDDING_DIMENSIONS = 1024;
 const MAX_INPUT_CHARS = 8000;
 const MAX_RETRIES = 3;
 
 // Circuit breaker: when provider issues occur, skip all calls for DEAD_TIMEOUT_MS
-// to avoid spamming the error log on every embed() call.
 let deadUntil = 0;
 const DEAD_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-/**
- * Lazy-init the Pinecone client singleton.
- * Reused across embed() calls to avoid re-creating connections.
- */
-function getPineconeClient(): Pinecone {
-    if (!pc) {
-        const apiKey = process.env.PINECONE_API_KEY;
-        if (!apiKey) throw new Error('PINECONE_API_KEY not set — required for embeddings');
-        pc = new Pinecone({ apiKey });
+function getOpenAIClient(): OpenAI {
+    if (!client) {
+        const apiKey = process.env.OPENAI_API_KEY;
+        if (!apiKey) throw new Error('OPENAI_API_KEY not set — required for embeddings');
+        client = new OpenAI({ apiKey });
     }
-    return pc;
+    return client;
 }
 
 /**
- * Generate an embedding vector from text using Pinecone Inference (llama-text-embed-v2).
+ * Generate an embedding vector from text using OpenAI text-embedding-3-small.
  *
  * @param   text  - Input text to embed (truncated to 8000 chars internally)
- * @returns Float array, or null if all retries exhausted (error/rate-limit)
+ * @returns Float array (1024d), or null if all retries exhausted
  *
  * Callers MUST handle `null` gracefully:
  *   - remember() → skip the upsert, log warning
  *   - recall()   → return empty results, log warning
  */
 export async function embed(text: string): Promise<number[] | null> {
-    // Circuit breaker — skip immediately if provider was recently dead
-    if (deadUntil && Date.now() < deadUntil) {
-        return null;
-    }
-    // If circuit breaker expired, reset it and try again
+    if (deadUntil && Date.now() < deadUntil) return null;
     if (deadUntil && Date.now() >= deadUntil) {
         deadUntil = 0;
-        console.log('🔄 Embedding circuit breaker reset — retrying Pinecone Inference...');
+        console.log('🔄 Embedding circuit breaker reset — retrying OpenAI...');
     }
 
-    const client = getPineconeClient();
+    const openai = getOpenAIClient();
     const truncatedText = text.slice(0, MAX_INPUT_CHARS);
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-            const result = await client.inference.embed(
-                EMBEDDING_MODEL,
-                [truncatedText],
-                { inputType: 'passage', truncate: 'END', dimension: '1024' }
-            );
+            const result = await openai.embeddings.create({
+                model: EMBEDDING_MODEL,
+                input: truncatedText,
+                dimensions: EMBEDDING_DIMENSIONS,
+            });
 
-            // EmbeddingsList → data[0].values is the vector
-            const embedding = result?.data?.[0]?.values;
+            const embedding = result?.data?.[0]?.embedding;
             if (!embedding || !Array.isArray(embedding)) {
-                console.warn('⚠️ Pinecone Inference returned no embedding data');
+                console.warn('⚠️ OpenAI returned no embedding data');
                 return null;
             }
-            return embedding as number[];
+            return embedding;
         } catch (err: any) {
             const msg = err?.message || '';
             const is429 = err?.status === 429 || msg.includes('429') || msg.includes('rate limit');
-            const isQuotaExceeded = msg.includes('quota') || msg.includes('exceeded') || msg.includes('billing');
+            const isQuotaExceeded = msg.includes('quota') || msg.includes('exceeded') || msg.includes('billing') || msg.includes('insufficient');
 
             if (is429 && !isQuotaExceeded && attempt < MAX_RETRIES - 1) {
-                const backoffMs = Math.pow(2, attempt + 1) * 1000; // 2s, 4s
+                const backoffMs = Math.pow(2, attempt + 1) * 1000;
                 console.warn(`⏳ Embedding rate-limited (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${backoffMs / 1000}s...`);
                 await new Promise(resolve => setTimeout(resolve, backoffMs));
                 continue;
             }
 
-            // Hard error — trip circuit breaker, log once, suppress for 10 min
             if (isQuotaExceeded) {
                 deadUntil = Date.now() + DEAD_TIMEOUT_MS;
                 console.warn('🛑 Embedding provider circuit-broken for 10 min (quota exhausted). Memory calls will be skipped.');
@@ -115,38 +101,14 @@ export async function embed(text: string): Promise<number[] | null> {
 
 /**
  * Generate an embedding optimized for search queries (vs passage storage).
- * Uses inputType: 'query' which produces vectors tuned for retrieval.
+ * OpenAI text-embedding-3-small handles query/passage distinction implicitly
+ * through training — no separate inputType parameter needed.
  *
  * @param   query - Search query text
- * @returns Float array, or null on failure
+ * @returns Float array (1024d), or null on failure
  */
 export async function embedQuery(query: string): Promise<number[] | null> {
-    // Circuit breaker — same as embed()
-    if (deadUntil && Date.now() < deadUntil) {
-        return null;
-    }
-    if (deadUntil && Date.now() >= deadUntil) {
-        deadUntil = 0;
-        console.log('🔄 Embedding circuit breaker reset — retrying Pinecone Inference...');
-    }
-
-    const client = getPineconeClient();
-
-    try {
-        const result = await client.inference.embed(
-            EMBEDDING_MODEL,
-            [query.slice(0, MAX_INPUT_CHARS)],
-            { inputType: 'query', truncate: 'END', dimension: '1024' }
-        );
-
-        const embedding = result?.data?.[0]?.values;
-        if (!embedding || !Array.isArray(embedding)) {
-            console.warn('⚠️ Pinecone Inference returned no embedding data for query');
-            return null;
-        }
-        return embedding as number[];
-    } catch (err: any) {
-        console.error(`❌ embedQuery() failed: ${(err?.message || '').slice(0, 120)}`);
-        return null;
-    }
+    // OpenAI text-embedding-3-small uses the same endpoint for queries and passages.
+    // The model is trained to handle both — no asymmetric embedding needed.
+    return embed(query);
 }

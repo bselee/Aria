@@ -508,70 +508,23 @@ export async function runHousekeeping(): Promise<HousekeepingReport> {
 }
 
 /**
- * Prune stale Pinecone memories that haven't been recalled in 60+ days.
- * Uses the `last_recalled_at` metadata field set by recall().
+ * Prune stale memories that haven't been recalled in 60+ days.
+ * HERMIA(2026-05-28): Migrated from Pinecone to local SQLite.
+ * pruneStaleMemories() from memory.ts handles SQLite cleanup via deleteByFilter().
  *
- * Strategy:
- * 1. List vectors in the aria-memory namespace (batch of 100)
- * 2. Check `last_recalled_at` metadata
- * 3. Delete any vector where last_recalled_at is older than 60 days
- *    OR where last_recalled_at is missing (never recalled, and stored_at > 60 days)
- *
- * Returns count of pruned vectors.
+ * @original-impl Used Pinecone list()+delete() on aria-memory namespace
+ * @new-impl Delegates to memory.ts which uses memory-store.ts deleteByFilter()
  */
 async function pruneStaleMemories(): Promise<number> {
     try {
-        const { Pinecone } = await import("@pinecone-database/pinecone");
-        const apiKey = process.env.PINECONE_API_KEY;
-        if (!apiKey) return 0;
-
-        const pc = new Pinecone({ apiKey });
-        const indexName = process.env.PINECONE_INDEX || "gravity-memory";
-        const indexHost = process.env.PINECONE_MEMORY_HOST;
-        const index = indexHost ? pc.index(indexName, indexHost) : pc.index(indexName);
-
-        const namespace = index.namespace("aria-memory");
-        const staleCutoff = new Date(Date.now() - RETENTION.PINECONE_STALE_DAYS * 86400000).toISOString();
-
-        // List vectors — Pinecone list() returns IDs in pages
-        const listResult = await namespace.listPaginated({ limit: 100 });
-
-        if (!listResult.vectors || listResult.vectors.length === 0) return 0;
-
-        const ids = listResult.vectors.map(v => v.id);
-        const fetchResult = await namespace.fetch(ids);
-
-        const idsToDelete: string[] = [];
-
-        for (const [id, record] of Object.entries(fetchResult.records || {})) {
-            if (!record?.metadata) continue;
-
-            const meta = record.metadata as Record<string, any>;
-            const lastRecalled = meta.last_recalled_at as string | undefined;
-            const storedAt = meta.stored_at as string | undefined;
-
-            // Never recalled — check if it's old enough to prune
-            if (!lastRecalled) {
-                if (storedAt && storedAt < staleCutoff) {
-                    idsToDelete.push(id);
-                }
-                continue;
-            }
-
-            // Recalled, but not recently
-            if (lastRecalled < staleCutoff) {
-                idsToDelete.push(id);
-            }
+        const { pruneStaleMemories: pruneFromStore } = await import("./memory");
+        const count = await pruneFromStore();
+        if (count > 0) {
+            console.log(`🧹 [Housekeeping] Pruned ${count} stale local memories`);
         }
-
-        if (idsToDelete.length > 0) {
-            await namespace.deleteMany(idsToDelete);
-            console.log(`🧹 [Housekeeping] Pruned ${idsToDelete.length} stale Pinecone memories: ${idsToDelete.join(", ")}`);
-        }
-
-        return idsToDelete.length;
+        return count;
     } catch (err: any) {
-        console.error(`❌ [Housekeeping] Pinecone prune error: ${err.message}`);
+        console.error(`❌ [Housekeeping] Local memory prune error: ${err.message}`);
         return 0;
     }
 }

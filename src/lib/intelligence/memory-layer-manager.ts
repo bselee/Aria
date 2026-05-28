@@ -1,10 +1,13 @@
 /**
  * @file memory-layer-manager.ts
  * @purpose L0-L4 memory taxonomy manager.
+ *
+ * HERMIA(2026-05-28): Migrated all Pinecone calls to local SQLite memory-store.ts.
+ * insight-index, aria-memory, and session-archive namespaces now use memory_vectors table.
  */
 
-import { Pinecone } from "@pinecone-database/pinecone";
 import { embed, embedQuery } from "./embedding";
+import { upsertVector, queryVectors } from "@/lib/storage/memory-store";
 import { getLocalDb } from "@/lib/storage/local-db";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
@@ -44,23 +47,7 @@ export interface SessionSummary {
     createdAt: string;
 }
 
-let pc: Pinecone | null = null;
-
-function getPineconeClient(): Pinecone {
-    if (!pc) {
-        const apiKey = process.env.PINECONE_API_KEY;
-        if (!apiKey) throw new Error("PINECONE_API_KEY not set");
-        pc = new Pinecone({ apiKey });
-    }
-    return pc;
-}
-
-function getIndex() {
-    const client = getPineconeClient();
-    const indexName = process.env.PINECONE_INDEX || "gravity-memory";
-    const indexHost = process.env.PINECONE_MEMORY_HOST;
-    return indexHost ? client.index(indexName, indexHost) : client.index(indexName);
-}
+// HERMIA(2026-05-28): Pinecone client removed. All vector ops now use memory-store.ts.
 
 function getSupabase() {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -117,15 +104,11 @@ export class MemoryLayerManager {
             const vector = await embed((metadata.text as string) ?? JSON.stringify(metadata));
             if (!vector) return;
 
-            await getIndex().namespace("insight-index").upsert([{
-                id: `insight-${key}`,
-                values: vector,
-                metadata: {
-                    ...metadata,
-                    key,
-                    indexed_at: new Date().toISOString(),
-                },
-            }]);
+            upsertVector("insight-index", `insight-${key}`, new Float32Array(vector), {
+                ...metadata,
+                key,
+                indexed_at: new Date().toISOString(),
+            });
         } catch (err: any) {
             console.error("L1 index() failed:", err.message);
         }
@@ -136,10 +119,8 @@ export class MemoryLayerManager {
             const vector = await embedQuery(query);
             if (!vector) return [];
 
-            const results = await getIndex().namespace("insight-index").query({
-                vector,
+            const results = queryVectors("insight-index", new Float32Array(vector), {
                 topK: limit,
-                includeMetadata: true,
             });
 
             return (results.matches || []).map((match) => {
@@ -167,16 +148,12 @@ export class MemoryLayerManager {
                 ? new Date(Date.now() + ttlSeconds * 1000).toISOString()
                 : undefined;
 
-            await getIndex().namespace("aria-memory").upsert([{
-                id: key,
-                values: vector,
-                metadata: {
-                    category,
-                    data,
-                    expiresAt: expiresAt ?? "",
-                    stored_at: new Date().toISOString(),
-                },
-            }]);
+            upsertVector("aria-memory", key, new Float32Array(vector), {
+                category,
+                data: typeof data === "string" ? data : JSON.stringify(data),
+                expiresAt: expiresAt ?? "",
+                stored_at: new Date().toISOString(),
+            });
 
             const supabase = getSupabase();
             if (supabase) {
@@ -198,15 +175,13 @@ export class MemoryLayerManager {
             const vector = await embedQuery(query);
             if (!vector) return [];
 
-            const results = await getIndex().namespace("aria-memory").query({
-                vector,
+            const results = queryVectors("aria-memory", new Float32Array(vector), {
                 topK: 10,
-                includeMetadata: true,
-                filter: { category: { $eq: category } },
+                filter: { category: category },
             });
 
             const now = new Date();
-            return (results.matches || [])
+            return results
                 .filter((match) => {
                     const metadata = match.metadata as Record<string, unknown>;
                     const expiresAt = metadata.expiresAt as string | undefined;
@@ -245,20 +220,16 @@ export class MemoryLayerManager {
             const vector = await embed(text);
 
             if (vector) {
-                await getIndex().namespace("session-archive").upsert([{
-                    id: `session-${sessionId}`,
-                    values: vector,
-                    metadata: {
-                        sessionId,
-                        agentName: summary.agentName,
-                        taskType: summary.taskType,
-                        inputSummary: summary.inputSummary,
-                        outputSummary: summary.outputSummary,
-                        status: summary.status,
-                        skillId: summary.skillId ?? "",
-                        created_at: summary.createdAt,
-                    },
-                }]);
+                upsertVector("session-archive", `session-${sessionId}`, new Float32Array(vector), {
+                    sessionId,
+                    agentName: summary.agentName,
+                    taskType: summary.taskType,
+                    inputSummary: summary.inputSummary,
+                    outputSummary: summary.outputSummary,
+                    status: summary.status,
+                    skillId: summary.skillId ?? "",
+                    created_at: summary.createdAt,
+                });
             }
         } catch (err: any) {
             console.error("L4 archiveSession() failed:", err.message);
