@@ -152,6 +152,12 @@ export class OpsManager {
         this.oversightAgent = new OversightAgent();
         this.registerOversightRecoveries();
 
+        // HERMIA(2026-05-28): Detect crash loops on boot — alerts Will via Telegram
+        // if aria-bot restarted 3+ times in 5 minutes.
+        import("@/lib/ops/crash-loop-detector").then(
+            ({ detectAndAlertCrashLoop }) => detectAndAlertCrashLoop(this.bot).catch(() => {}),
+        ).catch(() => {});
+
         // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
         // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
         this.hydrateSeenCompletedBuildIds();
