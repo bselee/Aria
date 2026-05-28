@@ -70,6 +70,10 @@ import {
     handleEscalationReplace,
     handleEscalationDraft,
 } from './handlers/escalation-actions';
+import {
+    handleExceptionReview,
+    handleExceptionDismiss,
+} from './handlers/exception-actions';
 
 // ============================================================================
 // HELPERS
@@ -268,6 +272,10 @@ bot.action(/^receipt_skip_(.+)$/, (ctx) => handleReceiptSkip(ctx, ctx.match[1]))
 // ── Vendor escalation actions ──────────────────────────────────────────
 bot.action(/^escalation_replace_(.+)$/, (ctx) => handleEscalationReplace(ctx, ctx.match[1]));
 bot.action(/^escalation_draft_(.+)$/, (ctx) => handleEscalationDraft(ctx, ctx.match[1]));
+
+// ── Exception escalation actions ─────────────────────────────────────────
+bot.action(/^exception_review_(.+)$/, (ctx) => handleExceptionReview(ctx, ctx.match[1]));
+bot.action(/^exception_dismiss_(.+)$/, (ctx) => handleExceptionDismiss(ctx, ctx.match[1]));
 
 bot.action('approve_uline_friday', (ctx) => {
     const opsManager = (bot.context as any).opsManager;
