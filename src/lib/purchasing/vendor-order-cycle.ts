@@ -244,7 +244,9 @@ export function mapRecentPOsToVendorCyclePOs(recentPOs: Array<{
  * Classify a vendor's order cycle status from their recent PO history.
  * Convenience wrapper around evaluateVendorCycle used by the dashboard.
  */
-export function classifyVendorOrderCycle(
+export function classifyVendorOrderCycle(params: {
+    vendorPartyId: string;
+    vendorName: string;
     recentPOs: Array<{
         orderId: string;
         orderDate: string | null;
@@ -252,9 +254,11 @@ export function classifyVendorOrderCycle(
         supplier: string;
         isDropship?: boolean;
         isCanceled?: boolean;
-    }>,
-    vendorPartyId: string,
-    vendorName: string,
-): VendorCycleResult {
-    return evaluateVendorCycle(recentPOs, { vendorPartyId, vendorName });
+    }>;
+}): VendorCycleResult & { summary: string } {
+    const result = evaluateVendorCycle(params.recentPOs, {
+        vendorPartyId: params.vendorPartyId,
+        vendorName: params.vendorName,
+    });
+    return { ...result, summary: formatCycleResult(result) };
 }
