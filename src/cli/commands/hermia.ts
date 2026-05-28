@@ -567,22 +567,47 @@ const followupCommand: BotCommand = {
         },
         };
 
+        /**
+         * /emailsearch <query> — Search both inboxes for matching emails.
+         * Searches from, subject, body_text, invoice_number, vendor_name.
+         */
+        const emailSearchCommand: BotCommand = {
+            name: "emailsearch",
+            description: "Search email history across both inboxes",
+            handler: async (ctx) => {
+                await ctx.sendChatAction("typing");
+                const query = (ctx.message && "text" in ctx.message ? ctx.message.text : "").replace(/^\/emailsearch\s*/i, "").trim();
+                if (!query) {
+                    await ctx.reply("Usage: /emailsearch <query>\nExample: /emailsearch Grassroots");
+                    return;
+                }
+                try {
+                    const { searchEmails, formatEmailSearchResults } = await import("@/lib/intelligence/email-search");
+                    const report = await searchEmails(query);
+                    await ctx.reply(formatEmailSearchResults(report), { parse_mode: "Markdown" });
+                } catch (err: any) {
+                    await ctx.reply(`❌ Search failed: ${err.message}`);
+                }
+            },
+        };
+
         // ── Export: MUST come after all command definitions ─────────────────────────
         // const declarations are not hoisted — referencing them before init crashes.
 
         export const hermiaCommands: BotCommand[] = [
-        cognitionCommand,
-        priorityCommand,
-        orderNowCommand,
-        ballCommand,
-        orderGuardCommand,
-        followupCommand,
-        emailCommand,
-        budgetCommand,
-        memoriesCommand,
-        agentsCommand,
-        hermiaCommand,
-        shipCommand,
-        costCommand,
-        apHealthCommand,
+            cognitionCommand,
+            priorityCommand,
+            orderNowCommand,
+            ballCommand,
+            orderGuardCommand,
+            followupCommand,
+            emailCommand,
+            emailSearchCommand,
+            budgetCommand,
+            memoriesCommand,
+            agentsCommand,
+            hermiaCommand,
+            shipCommand,
+            costCommand,
+            apHealthCommand,
         ];
