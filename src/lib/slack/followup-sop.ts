@@ -36,6 +36,11 @@ export interface VendorFollowUp {
     last_contact_at: string | null;
     age_hours: number;
     reason: string;  // 'no_confirmation' | 'no_ack_received'
+    // HERMIA(2026-05-28): enriched PO context for /followup surfacing
+    totalAmount: number | null;
+    itemCount: number | null;
+    requiredDate: string | null;
+    lifecycleStage: string | null;
 }
 
 export interface FollowUpReport {

@@ -51,6 +51,13 @@ interface StalePO {
     tracking_numbers: string[] | null;
     tracking_requested_at: string | null;
     vendor_noncomm_at: string | null;
+    // HERMIA(2026-05-28): enriched fields for PO context in follow-up drafts
+    total_amount: number | null;
+    total: number | null;
+    line_items: any[] | null;
+    issue_date: string | null;
+    required_date: string | null;
+    lifecycle_stage: string | null;
 }
 
 function daysSince(iso: string | null | undefined): number | null {
@@ -209,7 +216,8 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
         .from('purchase_orders')
         .select(
             'po_number, vendor_name, vendor_party_id, po_sent_verified_at, ' +
-            'vendor_acknowledged_at, tracking_numbers, tracking_requested_at, vendor_noncomm_at'
+            'vendor_acknowledged_at, tracking_numbers, tracking_requested_at, vendor_noncomm_at, ' +
+            'total_amount, total, line_items, issue_date, required_date, lifecycle_stage'
         )
         .gte('po_sent_verified_at', cutoffMin)
         .lte('po_sent_verified_at', cutoffMax)
@@ -308,6 +316,9 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
             continue;
         }
 
+        // HERMIA(2026-05-28): Enrich context with PO details from purchase_orders
+        // so the draft follow-up email includes total amount, line items, and ETA.
+        const lineItemsArr = Array.isArray(po.line_items) ? po.line_items : [];
         const ctx: VendorCommContext = {
             poNumber: po.po_number,
             vendorEmail,
@@ -319,6 +330,17 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
             hasTracking: false,
             trackingQuality: 'none',
             responseType: 'follow_up_l1',
+            poTotalAmount: po.total_amount ?? po.total ?? undefined,
+            itemCount: lineItemsArr.length > 0 ? lineItemsArr.length : undefined,
+            lineItems: lineItemsArr.map((li: any) => ({
+                sku: li.sku || li.productId || undefined,
+                description: li.description || li.productName || li.name || undefined,
+                quantity: li.quantity || li.qty || undefined,
+                unitPrice: li.unitPrice || li.price || undefined,
+            })),
+            issueDate: po.issue_date ?? undefined,
+            requiredDate: po.required_date ?? undefined,
+            lifecycleStage: po.lifecycle_stage ?? undefined,
         };
 
         try {

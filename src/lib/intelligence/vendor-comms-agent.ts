@@ -21,6 +21,13 @@ export interface VendorCommContext {
     hasTracking: boolean;
     trackingQuality: 'clear' | 'unclear' | 'none';
     responseType: 'thank_you' | 'clarify' | 'follow_up_l1' | 'follow_up_l2' | 'escalate' | 'none';
+    // HERMIA(2026-05-28): PO context for enriched follow-up drafts
+    poTotalAmount?: number;
+    itemCount?: number;
+    lineItems?: Array<{ sku?: string; description?: string; quantity?: number; unitPrice?: number }>;
+    issueDate?: string;
+    requiredDate?: string;
+    lifecycleStage?: string;
 }
 
 export class VendorCommsAgent {
@@ -122,7 +129,7 @@ export class VendorCommsAgent {
             month: 'short', day: 'numeric', year: 'numeric',
             timeZone: 'America/Denver',
         });
-        const body = this.getFollowUpBody(context.poNumber, sentDateStr, followUpCount);
+        const body = this.getFollowUpBody(context, sentDateStr, followUpCount);
         const rawEmail = buildFollowUpEmail({
             to: context.vendorEmail,
             subject: `Re: ${context.subject}`,
@@ -152,7 +159,7 @@ export class VendorCommsAgent {
             timeZone: 'America/Denver',
         });
 
-        const body = this.getFollowUpBody(context.poNumber, sentDateStr, followUpCount);
+        const body = this.getFollowUpBody(context, sentDateStr, followUpCount);
 
         const rawEmail = buildFollowUpEmail({
             to: context.vendorEmail,
@@ -212,20 +219,49 @@ export class VendorCommsAgent {
         console.log(`[vendor-comms] Human reply detected for PO #${context.poNumber} - deescalated`);
     }
 
-    private getFollowUpBody(poNumber: string, sentDateStr: string, count: number): string {
+    /**
+     * Build an enriched follow-up body including PO context when available.
+     * HERMIA(2026-05-28): Previously templates contained only PO # + date.
+     * Now includes total amount, item count, expected date, and line items
+     * so Bill has full context when reviewing the draft before sending.
+     */
+    private getFollowUpBody(context: VendorCommContext, sentDateStr: string, count: number): string {
+        const { poNumber, vendorName, poTotalAmount, itemCount, lineItems, requiredDate } = context;
+
+        // Build PO details block (only if we have meaningful context)
+        const hasContext = poTotalAmount || itemCount || requiredDate || (lineItems && lineItems.length > 0);
+        let detailsBlock = '';
+        if (hasContext) {
+            const lines: string[] = [];
+            if (itemCount) lines.push(`  ${itemCount} item(s)`);
+            if (poTotalAmount) lines.push(`  Total: $${poTotalAmount.toFixed(2)}`);
+            if (requiredDate) {
+                const reqDate = new Date(requiredDate);
+                const daysOverdue = Math.floor((Date.now() - reqDate.getTime()) / 86400000);
+                if (daysOverdue > 0) {
+                    lines.push(`  Expected by: ${reqDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} (${daysOverdue}d overdue)`);
+                } else {
+                    lines.push(`  Expected by: ${reqDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`);
+                }
+            }
+            if (lineItems && lineItems.length > 0) {
+                lines.push(`  ${lineItems.slice(0, 5).map(li =>
+                    `- ${li.description || li.sku || 'item'}${li.quantity ? ` (qty ${li.quantity})` : ''}`
+                ).join('\n  ')}`);
+                if (lineItems.length > 5) lines.push(`  ... and ${lineItems.length - 5} more`);
+            }
+            detailsBlock = '\n\nPO Details:\n' + lines.join('\n');
+        }
+
         const L1_TEMPLATES = [
-            `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Do you have an expected ship date or tracking?\n\nThanks!`,
-            `Hi,\n\nChecking in on PO #${poNumber} — any update on tracking or estimated arrival?\n\nThanks!`,
-            `Hi,\n\nJust wanted to check on PO #${poNumber} sent ${sentDateStr}. Tracking or ETA would be great!\n\nThanks!`,
-            `Hi,\n\nFollowing up on our PO #${poNumber}. Do you have shipping info or an ETA?\n\nThanks!`,
-            `Hi,\n\nPO #${poNumber} from ${sentDateStr} — do you have tracking or ship date?\n\nThanks!`,
+            `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nDo you have an expected ship date or tracking number?\n\nThanks!`,
+            `Hi,\n\nChecking in on PO #${poNumber} from ${sentDateStr}.${detailsBlock}\n\nAny update on tracking or an ETA?\n\nThanks!`,
+            `Hi,\n\nJust following up on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nCould you share tracking or a ship date?\n\nThanks!`,
         ];
 
         const L2_TEMPLATES = [
-            `Hi,\n\nFollowing up again on PO #${poNumber} sent ${sentDateStr}. We really need the tracking or ship date to plan our receiving.\n\nThanks!`,
-            `Hi,\n\nHaven't heard back on PO #${poNumber}. Do you have an ETA or tracking info?\n\nThanks!`,
-            `Hi,\n\nChecking in again on PO #${poNumber}. Any shipping updates or tracking?\n\nThanks!`,
-            `Hi,\n\nStill waiting on tracking for PO #${poNumber} from ${sentDateStr}. Can you help?\n\nThanks!`,
+            `Hi,\n\nFollowing up again on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nWe need tracking or a ship date to plan receiving. Any update?\n\nThanks!`,
+            `Hi,\n\nHaven't heard back on PO #${poNumber} from ${sentDateStr}.${detailsBlock}\n\nCan you confirm the status?\n\nThanks!`,
         ];
 
         if (count >= 2) {
