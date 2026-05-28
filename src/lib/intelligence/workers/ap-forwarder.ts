@@ -185,6 +185,42 @@ export class APForwarderAgent {
 
                     const boundary = "b_aria_fwd_" + Math.random().toString(36).substring(2);
 
+                    // HERMIA(2026-05-28): Enriched forward body — inject extracted vendor/
+                    // invoice/amount context so Bill.com can match bills even if OCR
+                    // struggles with unusual PDF formats. Include only present fields.
+                    const ej = (item.extracted_json || {}) as Record<string, any>;
+                    const bodyLines = ["Forwarded invoice (Aria AP pipeline).", ""];
+                    const fields: Array<[string, string | undefined | null]> = [
+                        ["Vendor", item.vendor_name],
+                        ["Invoice #", item.invoice_number || ej.invoice_number],
+                        ["Amount", item.invoice_total != null ? `$${Number(item.invoice_total).toFixed(2)}` : null],
+                        ["Invoice Date", item.invoice_date || ej.invoice_date],
+                        ["PO #", item.po_number],
+                        ["Sent From", item.email_from],
+                        ["PDF", item.pdf_filename],
+                    ];
+                    const present = fields.filter(([, v]) => v != null && String(v).trim() !== "");
+                    if (present.length > 0) {
+                        bodyLines.push("Extracted metadata:");
+                        for (const [label, value] of present) {
+                            bodyLines.push(`  ${label}: ${value}`);
+                        }
+                    }
+                    // Surface multi-invoice split context when applicable.
+                    const splitInfo: string[] = [];
+                    if (ej.expected_forward_count && ej.expected_forward_count > 1) {
+                        splitInfo.push(`Split ${ej.pdf_attachment_index ?? "?"}/${ej.expected_forward_count} of multi-invoice statement`);
+                    }
+                    if (ej.split_invoice_numbers && Array.isArray(ej.split_invoice_numbers)) {
+                        splitInfo.push(`Invoice #s in packet: ${ej.split_invoice_numbers.join(", ")}`);
+                    }
+                    if (splitInfo.length > 0) {
+                        bodyLines.push("");
+                        bodyLines.push("Packet:");
+                        for (const line of splitInfo) bodyLines.push(`  ${line}`);
+                    }
+                    const forwardBody = bodyLines.join("\r\n");
+
                     const mimeMessage = [
                         `To: buildasoilap@bill.com`,
                         `Subject: Fwd: ${item.email_subject}`,
@@ -194,7 +230,7 @@ export class APForwarderAgent {
                         `--${boundary}`,
                         `Content-Type: text/plain; charset="UTF-8"`,
                         ``,
-                        `Forwarded invoice.`,
+                        forwardBody,
                         ``,
                         `--${boundary}`,
                         `Content-Type: application/pdf; name="${item.pdf_filename}"`,
