@@ -4,7 +4,6 @@ const {
     gmailFactoryMock,
     getAuthenticatedClientMock,
     createClientMock,
-    splitAAACooperStatementAttachmentsMock,
     queueStatementEmailIntakeMock,
     queueStatementMetadataOnlyMock,
     applyMessageLabelPolicyMock,
@@ -18,7 +17,6 @@ const {
     gmailFactoryMock: vi.fn(),
     getAuthenticatedClientMock: vi.fn(),
     createClientMock: vi.fn(),
-    splitAAACooperStatementAttachmentsMock: vi.fn(),
     queueStatementEmailIntakeMock: vi.fn(),
     queueStatementMetadataOnlyMock: vi.fn(),
     applyMessageLabelPolicyMock: vi.fn(),
@@ -95,9 +93,6 @@ vi.mock("@/lib/statements/email-intake", () => ({
     queueStatementMetadataOnly: queueStatementMetadataOnlyMock,
 }));
 
-vi.mock("../aaa-cooper-splitter", () => ({
-    splitAAACooperStatementAttachments: splitAAACooperStatementAttachmentsMock,
-}));
 
 vi.mock("pdf-lib", () => ({
     PDFDocument: {
@@ -112,151 +107,6 @@ vi.mock("../../pdf/extractor", () => ({
 }));
 
 import { APIdentifierAgent } from "./ap-identifier";
-
-describe("APIdentifierAgent AAA Cooper handling", () => {
-    beforeEach(() => {
-        vi.clearAllMocks();
-        getAuthenticatedClientMock.mockResolvedValue({});
-        getPreClassificationMock.mockResolvedValue(null);
-        unifiedObjectGenerationMock.mockResolvedValue({ intent: "HUMAN_INTERACTION" });
-        extractPDFMock.mockResolvedValue({
-            rawText: "AAA COOPER INVOICE",
-            pages: [
-                { pageNumber: 1, text: "AAA COOPER TRANSPORTATION INVOICE PRO 12345", hasTable: false },
-                { pageNumber: 2, text: "BOL paperwork page 2", hasTable: false }
-            ],
-            tables: [],
-            metadata: { pageCount: 2, fileSize: 1000 },
-            hasImages: false,
-            ocrStrategy: "pdf-parse",
-            ocrDurationMs: 1,
-        });
-    });
-
-    it("forces INVOICE classification and isolates page 1 before queueing for Bill.com", async () => {
-        const queueRows = [
-            {
-                id: "row-aaa-1",
-                subject: "AAA Cooper Transportation Invoice",
-                from_email: "billing@aaacooper.com",
-                body_snippet: "Please see attached PDF.",
-                body_text: "Please see attached PDF.",
-                gmail_message_id: "gmail-aaa-1",
-                source_inbox: "ap",
-                pdf_filenames: ["AAA_Cooper_Invoice.pdf"],
-            },
-        ];
-
-        const modifyMock = vi.fn();
-        const attachmentGetMock = vi.fn().mockResolvedValue({
-            data: { data: Buffer.from("aaa-pdf").toString("base64url") },
-        });
-        const gmail = {
-            users: {
-                labels: {
-                    list: vi.fn().mockResolvedValue({ data: { labels: [] } }),
-                    create: vi.fn(),
-                },
-                messages: {
-                    get: vi.fn().mockResolvedValue({
-                        data: {
-                            payload: {
-                                parts: [
-                                    { filename: "AAA_Cooper_Invoice.pdf", body: { attachmentId: "att-aaa-1" } },
-                                ],
-                            },
-                        },
-                    }),
-                    modify: modifyMock,
-                    attachments: {
-                        get: attachmentGetMock,
-                    },
-                },
-            },
-        };
-        gmailFactoryMock.mockReturnValue(gmail);
-
-        const insertMock = vi.fn().mockResolvedValue({ error: null });
-        const maybeSingleMock = vi.fn().mockResolvedValue({ data: null });
-        const updateMock = vi.fn(() => ({
-            eq: vi.fn().mockResolvedValue({}),
-        }));
-        const apQueueSelectChain = {
-            eq: vi.fn(() => apQueueSelectChain),
-            gte: vi.fn(() => apQueueSelectChain),
-            maybeSingle: maybeSingleMock,
-        };
-
-        const copyPagesMock = vi.fn().mockResolvedValue([{}]);
-        const addPageMock = vi.fn();
-        const saveMock = vi.fn().mockResolvedValue(new Uint8Array([9, 9, 9]));
-
-        pdfDocumentLoadMock.mockResolvedValue({
-            getPageCount: vi.fn().mockReturnValue(2),
-        });
-        pdfDocumentCreateMock.mockResolvedValue({
-            copyPages: copyPagesMock,
-            addPage: addPageMock,
-            save: saveMock,
-        });
-
-        const supabase = {
-            from: vi.fn((table: string) => {
-                if (table === "email_inbox_queue") {
-                    return {
-                        select: vi.fn(() => ({
-                            eq: vi.fn(() => ({
-                                limit: vi.fn().mockResolvedValue({
-                                    data: queueRows,
-                                    error: null,
-                                }),
-                            })),
-                        })),
-                        update: updateMock,
-                    };
-                }
-                if (table === "ap_inbox_queue") {
-                    return {
-                        select: vi.fn(() => apQueueSelectChain),
-                        insert: insertMock,
-                    };
-                }
-                return {
-                    insert: vi.fn().mockResolvedValue({}),
-                };
-            }),
-            storage: {
-                from: vi.fn(() => ({
-                    upload: vi.fn().mockResolvedValue({ error: null }),
-                })),
-            },
-        };
-        createClientMock.mockReturnValue(supabase);
-
-        const agent = new APIdentifierAgent();
-        await agent.identifyAndQueue();
-
-        // 1. Classification should be forced without calling LLM mock or pre-classification mock
-        expect(unifiedObjectGenerationMock).not.toHaveBeenCalled();
-
-        // 2. Trimming should be executed on page 1 explicitly
-        expect(pdfDocumentLoadMock).toHaveBeenCalled();
-        expect(copyPagesMock).toHaveBeenCalledWith(expect.anything(), [0]); // 0-indexed page 1
-
-        // 3. Document queued as standard invoice PENDING_FORWARD
-        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({
-            email_from: "billing@aaacooper.com",
-            pdf_filename: "AAA_Cooper_Invoice.pdf",
-            status: "PENDING_FORWARD",
-            extracted_json: expect.objectContaining({
-                source_gmail_message_id: "gmail-aaa-1",
-                selected_invoice_page: 1,
-                invoice_page_selection_reason: "AAA Cooper outbound invoice - forced first page only",
-                forwarded_page_count: 1,
-            }),
-        }));
-    });
-});
 
 describe("APIdentifierAgent single-pipeline invoice handling", () => {
     beforeEach(() => {

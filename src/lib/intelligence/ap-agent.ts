@@ -1101,20 +1101,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
             // 1b. Vendor pattern check — consult stored handling rules before proceeding.
             // Non-blocking: if Pinecone is down, processing continues normally.
-            setImmediate(async () => {
-                try {
-                    const { getVendorPattern } = await import("./vendor-memory");
-                    const pattern = await getVendorPattern(invoiceData.vendorName);
-                    if (pattern?.invoiceBehavior === "multi_page_split") {
-                        // Silenced 2026-05-13: was firing on every multi-page
-                        // vendor invoice. Logged to console only — Will can
-                        // review in the dashboard when needed.
-                        console.warn(`⚠️ [vendor-memory] ${invoiceData.vendorName} requires multi_page_split — forwarded as single file`);
-                    }
-                } catch {
-                    // Non-fatal — vendor memory is advisory only
-                }
-            });
 
             // 1c. Low-confidence guard — garbled PDF, skip reconciliation entirely
             if (invoiceData.confidence === "low" && !hasCoreReconciliationSignals(invoiceData)) {
@@ -1183,13 +1169,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // 2. Find matching PO — Finale direct, no Supabase middle layer
             // If invoice has a PO# printed on it, use it. Otherwise query Finale by
             // vendor name + invoice date to find the most plausible open PO.
-            const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoiceData.vendorName || "") || /aaa\s*cooper/i.test(filename);
             
             let finalePONumber: string | null = null;
             let matchSource = "none";
             let forceApproval = false;
 
-            if (!isAAACooper) {
                 finalePONumber = invoiceData.poNumber || null;
                 matchSource = "PO# on invoice";
 
@@ -1338,10 +1322,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         console.warn(`     ⚠️ Finale fallback lookup failed: ${err.message}`);
                     }
                 }
-            } else {
-                matchSource = "AAA Cooper outbound invoice - PO match bypassed";
-                console.log(`     → AAA Cooper outbound invoice: PO match bypassed silently`);
-            }
 
             const matched = !!finalePONumber;
             outcome.matchedPO = matched;
@@ -1357,7 +1337,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_from: from,
                 email_subject: subject,
                 raw_text: extracted.rawText,
-                action_required: isAAACooper ? false : !matched,
+                action_required: !matched,
                 action_summary: `Invoice from ${from} for $${invoiceData.total}`,
                 gmail_message_id: messageId || null,
             }).select("id").single();
@@ -1377,7 +1357,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
-                status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
+                status: matched ? "matched_review" : "unmatched",
                 document_id: docData?.id || null,
                 raw_data: invoiceData
             }, { onConflict: "invoice_number" });
@@ -1485,12 +1465,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 return outcome;
             }
 
-            if (isAAACooper) {
-                outcome.state = "unmatched";
-                outcome.error = null;
-                outcome.success = true;
-                return outcome;
-            }
 
             outcome.state = "unmatched";
             outcome.error = "No Finale PO match found";
@@ -1579,11 +1553,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         matchSource: string,
         from: string,
     ) {
-        const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoice.vendorName || "");
-        if (isAAACooper) {
-            console.log(`     → Suppressing Telegram notification for AAA Cooper`);
-            return;
-        }
 
         let msg = `🧾 *New Invoice Processed*\n`;
         msg += `From: ${from}\n`;

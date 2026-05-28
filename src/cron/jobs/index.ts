@@ -170,37 +170,40 @@ defineJob({
 // po-sweep removed — KAIZEN #5: folded into ap-polling as a post-pass.
 // runPOSweep() remains on OpsManager and is invoked on every ap-polling tick.
 
-defineJob({
-    name: "reconcile-axiom",
-    schedule: "0 1 * * 1-5",
-    onFail: "log",
-    description: "Axiom Print vendor reconciliation (1:00 AM Mon-Fri).",
-    handler: async () => { await ops()?.runReconcileAxiom(); },
-});
+// HERMIA(2026-05-28): Vendor reconcilers disabled. Bill.com handles invoices
+// natively — vendor-specific scraping/reconciliation is unnecessary complexity.
+// CLI scripts remain available for manual runs if needed.
+// defineJob({
+//     name: "reconcile-axiom",
+//     schedule: "0 1 * * 1-5",
+//     onFail: "log",
+//     description: "Axiom Print vendor reconciliation (1:00 AM Mon-Fri).",
+//     handler: async () => { await ops()?.runReconcileAxiom(); },
+// });
 
-defineJob({
-    name: "reconcile-fedex",
-    schedule: "30 1 * * 1-5",
-    onFail: "log",
-    description: "FedEx vendor reconciliation (1:30 AM Mon-Fri).",
-    handler: async () => { await ops()?.runReconcileFedEx(); },
-});
+// defineJob({
+//     name: "reconcile-fedex",
+//     schedule: "30 1 * * 1-5",
+//     onFail: "log",
+//     description: "FedEx vendor reconciliation (1:30 AM Mon-Fri).",
+//     handler: async () => { await ops()?.runReconcileFedEx(); },
+// });
 
-defineJob({
-    name: "reconcile-teraganix",
-    schedule: "0 2 * * 1-5",
-    onFail: "log",
-    description: "TeraGanix vendor reconciliation (2:00 AM Mon-Fri).",
-    handler: async () => { await ops()?.runReconcileTeraGanix(); },
-});
+// defineJob({
+//     name: "reconcile-teraganix",
+//     schedule: "0 2 * * 1-5",
+//     onFail: "log",
+//     description: "TeraGanix vendor reconciliation (2:00 AM Mon-Fri).",
+//     handler: async () => { await ops()?.runReconcileTeraGanix(); },
+// });
 
-defineJob({
-    name: "reconcile-uline",
-    schedule: "0 3 * * 1-5",
-    onFail: "log",
-    description: "ULINE vendor reconciliation (3:00 AM Mon-Fri).",
-    handler: async () => { await ops()?.runReconcileULINE(); },
-});
+// defineJob({
+//     name: "reconcile-uline",
+//     schedule: "0 3 * * 1-5",
+//     onFail: "log",
+//     description: "ULINE vendor reconciliation (3:00 AM Mon-Fri).",
+//     handler: async () => { await ops()?.runReconcileULINE(); },
+// });
 
 defineJob({
     name: "build-completion-watcher",

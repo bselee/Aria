@@ -21,7 +21,10 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@supabase/supabase-js";
 import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
-import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
+// HERMIA(2026-05-28): Vendor-specific PDF manipulation removed per Will's directive.
+// Bill.com handles PDFs natively — no need for AAA Cooper statement splitting.
+// This CLI script is archived. If you need it, restore aaa-cooper-splitter.ts first.
+// import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
 import { upsertVendorInvoice, lookupVendorInvoices } from "../lib/storage/vendor-invoices";
 import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
 import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
