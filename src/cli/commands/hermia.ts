@@ -621,10 +621,9 @@ const followupCommand: BotCommand = {
             description: "Fill vendor cart from PO (Uline/Axiom)",
             handler: async (ctx) => {
                 await ctx.sendChatAction("typing");
-                const poNumber = (ctx.message && "text" in ctx.message ? ctx.message.text : "").replace(/^/orders*/i, "").trim();
+                const poNumber = (ctx.message && "text" in ctx.message ? ctx.message.text : "").replace(/^\/order\s*/i, "").trim();
                 if (!poNumber) {
-                    await ctx.reply("Usage: /order PO-12345
-Fills vendor cart via browser for Uline/Axiom orders.");
+                    await ctx.reply("Usage: /order PO-12345\nFills vendor cart via browser for Uline/Axiom orders.");
                     return;
                 }
                 try {
