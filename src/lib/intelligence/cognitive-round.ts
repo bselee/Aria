@@ -338,3 +338,37 @@ export function getRecentDecisions(hours = 24): Array<{
         return [];
     }
 }
+
+/**
+ * KAIZEN(2026-05-29): Check if a job should be suppressed based on the latest
+ * cognitive decision. Called by cron runner before executing each tick.
+ *
+ * Returns true if the job is in the suppress list of the most recent decision
+ * (within the last 30 minutes — cognitive rounds run every 15 min, so 30 min
+ * means we skip at most 2 cycles before re-evaluating).
+ *
+ * Best-effort: if the DB query fails, returns false (job runs normally).
+ */
+export function isJobSuppressed(jobName: string): boolean {
+    try {
+        const db = getLocalDb();
+        const row = db.prepare(
+            `SELECT decisions_json, ran_at
+             FROM cognitive_rounds
+             ORDER BY ran_at DESC
+             LIMIT 1`
+        ).get() as { decisions_json: string; ran_at: string } | undefined;
+
+        if (!row) return false;
+
+        // Only respect decisions from the last 30 minutes
+        const decisionAge = Date.now() - new Date(row.ran_at).getTime();
+        if (decisionAge > 30 * 60 * 1000) return false;
+
+        const decision: CognitiveDecision = JSON.parse(row.decisions_json);
+        return decision.suppress.includes(jobName);
+    } catch (err: any) {
+        console.warn(`[CognitiveRound] isJobSuppressed(${jobName}) failed (non-fatal): ${err.message}`);
+        return false;
+    }
+}

@@ -50,6 +50,26 @@ export async function runJobOnce(
         return { status: "skipped", durationMs: 0, failureReason: "disabled" };
     }
 
+    // KAIZEN(2026-05-29): Cognitive suppression check.
+    // The cognitive round (every 15 min) produces a suppress list of jobs
+    // that should be deferred. Manual invocations bypass this check so
+    // /run always works, and cognitive-round itself is never suppressed.
+    if (invokedBy === "cron" && jobName !== "cognitive-round") {
+        try {
+            const { isJobSuppressed } = await import("../lib/intelligence/cognitive-round");
+            if (isJobSuppressed(jobName)) {
+                return {
+                    status: "skipped",
+                    durationMs: 0,
+                    failureReason: "cognitive-suppressed",
+                    failureMessage: `Suppressed by latest cognitive decision`,
+                };
+            }
+        } catch {
+            // Non-fatal — if cognitive round module fails to load, job runs normally
+        }
+    }
+
     // dependsOn check — every named upstream must have its most recent run
     // be a success (modern 'succeeded' or legacy 'success').
     if (job.dependsOn && job.dependsOn.length > 0) {

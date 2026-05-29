@@ -170,40 +170,11 @@ defineJob({
 // po-sweep removed — KAIZEN #5: folded into ap-polling as a post-pass.
 // runPOSweep() remains on OpsManager and is invoked on every ap-polling tick.
 
-// HERMIA(2026-05-28): Vendor reconcilers disabled. Bill.com handles invoices
-// natively — vendor-specific scraping/reconciliation is unnecessary complexity.
-// CLI scripts remain available for manual runs if needed.
-// defineJob({
-//     name: "reconcile-axiom",
-//     schedule: "0 1 * * 1-5",
-//     onFail: "log",
-//     description: "Axiom Print vendor reconciliation (1:00 AM Mon-Fri).",
-//     handler: async () => { await ops()?.runReconcileAxiom(); },
-// });
-
-// defineJob({
-//     name: "reconcile-fedex",
-//     schedule: "30 1 * * 1-5",
-//     onFail: "log",
-//     description: "FedEx vendor reconciliation (1:30 AM Mon-Fri).",
-//     handler: async () => { await ops()?.runReconcileFedEx(); },
-// });
-
-// defineJob({
-//     name: "reconcile-teraganix",
-//     schedule: "0 2 * * 1-5",
-//     onFail: "log",
-//     description: "TeraGanix vendor reconciliation (2:00 AM Mon-Fri).",
-//     handler: async () => { await ops()?.runReconcileTeraGanix(); },
-// });
-
-// defineJob({
-//     name: "reconcile-uline",
-//     schedule: "0 3 * * 1-5",
-//     onFail: "log",
-//     description: "ULINE vendor reconciliation (3:00 AM Mon-Fri).",
-//     handler: async () => { await ops()?.runReconcileULINE(); },
-// });
+// KAIZEN(2026-05-29): Dead reconciler cron entries removed.
+// vendor-axiom, vendor-fedex, vendor-teraganix, vendor-uline reconcilers
+// have been disabled since 2026-05-28. Bill.com now handles invoice reconciliation
+// natively. Manual CLI scripts remain at src/cli/reconcile-{axiom,fedex,teraganix,uline}.ts
+// if needed for ad-hoc verification. No automated cron necessary.
 
 defineJob({
     name: "build-completion-watcher",
@@ -357,12 +328,14 @@ defineJob({
 // Phase 1 backend agentic flow substrate. Drains flow_events, spawns and
 // advances flow_runs. Side-effect imports the flow registry on first tick.
 // Gated by FLOWS_ENABLED so a misbehaving runner can be disabled in one env.
+// KAIZEN(2026-05-29): 1m → 5m. Flow events rarely need sub-minute latency.
+// Saves ~1,152 invocations/day. Gated by FLOWS_ENABLED.
 defineJob({
     name: "flows-tick",
-    schedule: "* * * * *",
+    schedule: "*/5 * * * *",
     enabled: (process.env.FLOWS_ENABLED ?? "true").toLowerCase() !== "false",
     onFail: "log",
-    description: "Flow runner: drain flow_events, spawn/advance flow_runs (every 1m).",
+    description: "Flow runner: drain flow_events, spawn/advance flow_runs (every 5m).",
     handler: async () => {
         const [{ tick }] = await Promise.all([
             import("@/flows/runner"),
@@ -388,8 +361,9 @@ defineJob({
     handler: async () => {
         const { runCognitiveRound } = await import("@/lib/intelligence/cognitive-round");
         const decision = await runCognitiveRound();
-        // Future: wire decision.suppress/boost into cron runner
-        // so suppressed jobs skip their next tick after this round
+        // KAIZEN(2026-05-29): Decisions now wired — cron/runner.ts checks
+        // isJobSuppressed() before each tick. Suppressed jobs return
+        // "cognitive-suppressed" status in run history.
         if (decision.suppress.length > 0 || decision.boost.length > 0) {
             console.log(`[cognitive-round] suppress: ${decision.suppress.join(", ")} | boost: ${decision.boost.join(", ")}`);
         }
