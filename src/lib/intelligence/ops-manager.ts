@@ -235,6 +235,7 @@ export class OpsManager {
     /**
      * Hook called by src/cron/runner on each successful tick. Fires heartbeat
      * to OversightAgent so the dashboard "agent healthy" signal stays fresh.
+     * Also notifies HermesOrchestrator so /hermia stays current in real-time.
      * Best-effort — never throws.
      */
     public async cronHookSuccess(taskName: string): Promise<void> {
@@ -243,6 +244,11 @@ export class OpsManager {
         } catch (e: any) {
             console.warn(`[ops-manager] cronHookSuccess(${taskName}) heartbeat failed: ${e.message}`);
         }
+        // HERMIA(2026-05-29): Bridge cron outcomes to orchestrator agent registry
+        try {
+            const { getOrchestrator } = await import("@/lib/intelligence/hermes-orchestrator");
+            await getOrchestrator().notifyCronOutcome(taskName, true);
+        } catch { /* non-fatal */ }
     }
 
     /**
@@ -255,6 +261,11 @@ export class OpsManager {
         } catch (e: any) {
             console.warn(`[ops-manager] cronHookFailure(${taskName}) heartbeat failed: ${e.message}`);
         }
+        // HERMIA(2026-05-29): Bridge cron failures to orchestrator agent registry
+        try {
+            const { getOrchestrator } = await import("@/lib/intelligence/hermes-orchestrator");
+            await getOrchestrator().notifyCronOutcome(taskName, false, String(error?.message ?? error));
+        } catch { /* non-fatal */ }
         try {
             this.supervisor.reportAgentException(taskName, error);
         } catch (e: any) {
