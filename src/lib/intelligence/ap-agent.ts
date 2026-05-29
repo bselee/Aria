@@ -42,59 +42,13 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  * @purpose Dedicated agent for the ap@buildasoil.com inbox.
  *          Downloads attached PDF invoices, parses data, correlates with POs,
  *          and notifies the team of discrepancies or matching statuses.
- * @author  Antigravity / Aria
- * @updated 2026-05-20
+ * @author  Antigravity / Aria / Hermia
+ * @updated 2026-05-29
+ *
+ * KAIZEN(2026-05-29): Vendor routing rules extracted to ./ap/vendor-router.ts.
+ * This file now imports VendorRoutingRule + matchVendorRouting from there.
  */
-
-// ─── Vendor Routing Rules ────────────────────────────────────────────────────
-// DECISION(2026-03-18): Deterministic routing for known vendor types.
-// Runs BEFORE LLM classification to save API calls and ensure correctness.
-// - 'autopay'       → vendor is on autopay or recurring subscription; mark read, no Bill.com forward
-// - 'dropship'      → forward to Bill.com, mark read, skip PO matching/reconciliation
-// - 'ignore'        → skip entirely (e.g., internal forwarded emails from Will's inbox)
-// - 'amazon_order'  → route to Amazon order parser for tracking + Slack request matching
-interface VendorRoutingRule {
-    /** Match criteria — at least one must be provided */
-    match: {
-        domain?: string;          // e.g., 'wwex.com' — matches sender email domain
-        fromExact?: string;       // e.g., 'bill.selee@buildasoil.com' — exact sender match
-        senderContains?: string;  // e.g., 'logan labs' — case-insensitive substring in From header
-    };
-    action: 'autopay' | 'dropship' | 'ignore' | 'amazon_order';
-    label: string;  // Human-readable label for logging
-}
-
-const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
-    // ── Autopay / recurring (mark read, no Bill.com forward) ─────────────
-    // WWEX / Worldwide Express
-    { match: { domain: 'wwex.com' }, action: 'autopay', label: 'Worldwide Express (Autopay)' },
-    // DECISION(2026-03-19): Recurring utility and software subscriptions.
-    // Not forwarded to Bill.com at this time. Saves LLM classification calls.
-    { match: { senderContains: 'pioneer propane' }, action: 'autopay', label: 'Pioneer Propane' },
-    { match: { domain: 'gorgias.com' }, action: 'autopay', label: 'Gorgias' },
-    { match: { senderContains: 'gorgias' }, action: 'autopay', label: 'Gorgias' },
-    { match: { domain: 'google.com' }, action: 'autopay', label: 'Google' },
-    { match: { senderContains: 'google workspace' }, action: 'autopay', label: 'Google Workspace' },
-    { match: { senderContains: 'google cloud' }, action: 'autopay', label: 'Google Cloud' },
-
-    // ── Amazon (route to order parser for tracking) ──────────────────────
-    // DECISION(2026-03-19): Amazon order/shipping confirmation emails are
-    // parsed for order #, items, tracking, and matched to pending Slack
-    // requests so the requester can be notified when their order ships.
-    { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },
-    { match: { senderContains: 'ship-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Shipping' },
-    { match: { senderContains: 'shipment-tracking@amazon' }, action: 'amazon_order', label: 'Amazon Tracking' },
-    { match: { senderContains: 'order-update@amazon' }, action: 'amazon_order', label: 'Amazon Order Update' },
-
-    // ── Dropship vendors (forward to Bill.com, no PO matching) ──────────
-    { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
-    { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
-    // NOTE: Bill.com has historically had trouble recognizing their PDF invoices.
-    { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
-
-    // ── Internal ignores ────────────────────────────────────────────────
-    { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
-];
+import { type VendorRoutingRule, matchVendorRouting } from "./ap/vendor-router";
 
 function countMeaningfulLineItems(invoice: InvoiceData): number {
     return (invoice.lineItems || []).filter((li) => {
@@ -168,22 +122,9 @@ export class APAgent {
 
     /**
      * Match a sender against the deterministic vendor routing rules.
-     * Returns the first matching rule, or null if no rule matches.
+     * KAIZEN(2026-05-29): Vendor routing delegated to ./ap/vendor-router.ts.
+     * See matchVendorRouting() there for the deterministic rule engine.
      */
-    private matchVendorRouting(fromHeader: string): VendorRoutingRule | null {
-        const fromLower = fromHeader.toLowerCase();
-        // Extract bare email from "Display Name <email@domain.com>" format
-        const emailMatch = fromLower.match(/<([^>]+)>/);
-        const bareEmail = emailMatch ? emailMatch[1] : fromLower.trim();
-        const domain = bareEmail.split('@')[1] || '';
-
-        for (const rule of VENDOR_ROUTING_RULES) {
-            if (rule.match.domain && domain === rule.match.domain) return rule;
-            if (rule.match.fromExact && bareEmail === rule.match.fromExact.toLowerCase()) return rule;
-            if (rule.match.senderContains && fromLower.includes(rule.match.senderContains.toLowerCase())) return rule;
-        }
-        return null;
-    }
 
     private decodeBase64(data: string): string {
         return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
@@ -355,7 +296,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                 // ── Pre-classification: Deterministic vendor routing ──────────────
                 // Known vendors are routed without burning an LLM call.
-                const routingRule = this.matchVendorRouting(from);
+                // KAIZEN(2026-05-29): Parse From header into email + name for the
+                // imported matchVendorRouting() from ap/vendor-router.ts.
+                const fromEmailMatch = from.match(/<([^>]+)>/);
+                const fromEmail = fromEmailMatch ? fromEmailMatch[1] : from.trim();
+                const fromName = from.replace(/<[^>]+>/, '').trim();
+                const routingRule = matchVendorRouting(fromEmail, fromName);
                 if (routingRule) {
                     console.log(`     -> Vendor routing match: ${routingRule.label} (${routingRule.action})`);
 
