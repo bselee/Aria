@@ -1,7 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "../supabase";
-import { getLocalDb } from "../storage/local-db";
+import { getLocalDb, dedupSeen, dedupMark, dedupCount } from "../storage/local-db";
 import { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
 import { WebClient } from "@slack/web-api";
@@ -105,16 +105,10 @@ export class OpsManager {
     private supervisor: SupervisorAgent;
     private oversightAgent: OversightAgent;
     private agentName = "ops-manager";
-    // In-memory dedup for build completion alerts.
-    // Hydrated from Supabase on startup to prevent duplicate alerts after restart.
-    private seenCompletedBuildIds = new Set<string>();
-    // In-memory dedup for PO receiving alerts.
-    // Hydrated from today's received POs on startup to prevent replay after restart.
-    private seenReceivedPOIds = new Set<string>();
-    // In-memory dedup for outside-PO-thread email alerts.
-    // Prevents the same vendor email from triggering a Telegram notification on every sync cycle.
-    // Hydrated from Supabase on startup.
-    private seenOutsideThreadMsgIds = new Set<string>();
+    // KAIZEN(2026-05-29): In-memory dedup Sets replaced with SQLite dedup_cache.
+    // dedupSeen() / dedupMark() from local-db.ts. Survives restarts, no boot
+    // hydration needed. Namespaces: 'build_completions' (90d TTL), 'received_pos' (7d TTL).
+    // Previously these were private Sets hydrated from Supabase on startup.
 
     // Pending ULINE Friday approval — set when cron sends pre-check Telegram message.
     // Cleared when user approves or skips.
@@ -158,29 +152,11 @@ export class OpsManager {
             ({ detectAndAlertCrashLoop }) => detectAndAlertCrashLoop(this.bot).catch(() => {}),
         ).catch(() => {});
 
-        // Hydrate seenCompletedBuildIds from build_completions to prevent duplicate
-        // notifications after a restart.  Uses a fire-and-forget so it doesn't block boot.
-        this.hydrateSeenCompletedBuildIds();
-    }
-
-    private async hydrateSeenCompletedBuildIds() {
-        try {
-            const supabase = createClient();
-            if (!supabase) return;
-            const { data } = await supabase
-                .from('build_completions')
-                .select('build_id')
-                .gte('created_at', new Date(Date.now() - 90 * 86400000).toISOString());
-            if (data) {
-                for (const row of data) {
-                    this.seenCompletedBuildIds.add(row.build_id);
-                }
-                if (this.seenCompletedBuildIds.size > 0) {
-                    console.log(`🔨 Hydrated ${this.seenCompletedBuildIds.size} seen build IDs from build_completions`);
-                }
-            }
-        } catch {
-            // Non-critical — dedup set starts empty on fresh boot
+        // KAIZEN(2026-05-29): Dedup now handled by SQLite dedup_cache.
+        // No boot hydration needed — DB queries check historical entries directly.
+        const buildCount = dedupCount('build_completions');
+        if (buildCount > 0) {
+            console.log(`🔨 Loaded ${buildCount} dedup entries for build_completions from SQLite`);
         }
     }
 
@@ -765,8 +741,8 @@ export class OpsManager {
             let notified = 0;
 
             for (const build of completed) {
-                if (this.seenCompletedBuildIds.has(build.buildId)) continue;
-                this.seenCompletedBuildIds.add(build.buildId);
+                if (dedupSeen('build_completions', build.buildId)) continue;
+                                dedupMark('build_completions', build.buildId, 2160); // 90 days TTL
                 notified++;
 
                 let calendarEventId: string | null = null;
@@ -884,10 +860,10 @@ export class OpsManager {
             }
 
             for (const po of received) {
-                if (this.seenReceivedPOIds.has(po.orderId)) continue;
+                if (dedupSeen('received_pos', po.orderId)) continue;
                 if (alreadyAlertedPoIds.has(po.orderId)) {
                     // Already alerted in a prior tick or before restart — cache locally and skip.
-                    this.seenReceivedPOIds.add(po.orderId);
+                    dedupMark('received_pos', po.orderId, 168); // 7 days TTL
                     continue;
                 }
 
@@ -910,7 +886,7 @@ export class OpsManager {
                     }
                 }
 
-                this.seenReceivedPOIds.add(po.orderId);
+                dedupMark('received_pos', po.orderId, 168); // 7 days TTL
                 // 2026-05-15: Telegram per-receiving alert removed — Activity
                 // feed is the spine, daily summary rolls these up. Will's
                 // ask: "Only need errors and a summary at most." The Activity
