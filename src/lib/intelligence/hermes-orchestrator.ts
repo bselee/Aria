@@ -247,6 +247,107 @@ export class HermesOrchestrator {
     }
 
     /**
+     * HERMIA(2026-05-29): Sync agent status from Supabase agent_heartbeats.
+     * Called at boot and periodically so the in-memory registry reflects
+     * real-world agent health without waiting for a /hermia command.
+     */
+    async syncFromSupabase(): Promise<void> {
+        const supabase = createClient();
+        if (!supabase) return;
+
+        try {
+            const { data } = await supabase
+                .from("agent_heartbeats")
+                .select("agent_name, status, heartbeat_at")
+                .order("heartbeat_at", { ascending: false })
+                .limit(100);
+
+            if (!data) return;
+
+            const now = Date.now();
+            for (const row of data as Array<{ agent_name: string; status: string; heartbeat_at: string }>) {
+                const agent = this.agents.get(row.agent_name);
+                if (!agent) continue;
+
+                const elapsed = now - new Date(row.heartbeat_at).getTime();
+                const computedStatus: AgentStatus =
+                    elapsed > 15 * 60 * 1000 ? "stopped" :
+                    elapsed > 7.5 * 60 * 1000 ? "degraded" : "healthy";
+
+                agent.status = computedStatus;
+                agent.lastHeartbeat = row.heartbeat_at;
+            }
+        } catch {
+            /* non-fatal — Supabase may be temporarily unreachable */
+        }
+    }
+
+    /**
+     * HERMIA(2026-05-29): Map a cron task name to orchestrator agent(s)
+     * and register a heartbeat for each. Called by OpsManager on cron
+     * tick success/failure so the orchestrator stays current in real-time.
+     */
+    async notifyCronOutcome(taskName: string, success: boolean, error?: string): Promise<void> {
+        // Map cron task → orchestrator agent names
+        const CRON_AGENT_MAP: Record<string, string[]> = {
+            "ap-polling": ["ap-ingestor", "ap-classifier", "ap-extractor", "ap-matcher", "ap-forwarder", "ap-master"],
+            "po-sync": ["purchasing-master", "purchasing-scanner"],
+            "build-risk": ["purchasing-scanner"],
+            "cognitive-round": ["cognitive-round", "ops-master"],
+            "close-finished-tasks": ["cron-scheduler", "ops-master"],
+            "issue-projection": ["ops-master"],
+            "issue-orchestrator": ["ops-master"],
+            "task-self-healer": ["supervisor", "ops-master"],
+            "build-completion-watcher": ["tracking-master"],
+            "po-receiving-watcher": ["tracking-master", "carrier-poller"],
+            "flows-tick": ["cron-scheduler"],
+            "purchasing-calendar-sync": ["purchasing-scanner"],
+            "memory-sync": ["ops-master"],
+            "stat-indexing": ["ops-master"],
+            "migration-tripwire": ["ops-master"],
+            "autonomy-scan": ["ops-master"],
+            "followup-sop": ["purchasing-followup", "comms-master"],
+            "po-arrival-risk-check": ["purchasing-scanner", "tracking-master"],
+            "daily-summary": ["ops-master"],
+            "weekly-summary": ["ops-master"],
+            "vendor-escalation": ["purchasing-followup", "comms-master"],
+            "delivery-receipt-prompt": ["tracking-master", "shipment-intel"],
+            "delivery-exception-escalator": ["tracking-master", "shipment-intel"],
+            "missing-reconciliation": ["ap-reconciler"],
+            "nightshift-enqueue": ["ops-master"],
+            "housekeeping": ["ops-master"],
+            "qty-calibration": ["purchasing-scanner"],
+            "aria-bot-startup": ["ops-master", "cron-scheduler"],
+        };
+
+        const agentNames = CRON_AGENT_MAP[taskName];
+        if (!agentNames) return; // unmapped cron — no-op
+
+        const status: AgentStatus = success ? "healthy" : "degraded";
+        for (const name of agentNames) {
+            await this.registerHeartbeat(name, status);
+            if (!success && error) {
+                await this.reportTaskOutcome(name, "failure", error);
+            }
+        }
+    }
+
+    /**
+     * HERMIA(2026-05-29): Mark all "starting" agents as healthy on boot.
+     * Called once during bot startup so /hermia doesn't show every agent
+     * as ⚪ starting.
+     */
+    markAllBooted(): void {
+        const now = new Date().toISOString();
+        for (const agent of this.agents.values()) {
+            if (agent.status === "starting") {
+                agent.status = "healthy";
+                agent.lastHeartbeat = now;
+            }
+        }
+    }
+
+    /**
      * Format a human-readable agent hierarchy for Telegram display.
      */
     formatAgentHierarchy(): string {

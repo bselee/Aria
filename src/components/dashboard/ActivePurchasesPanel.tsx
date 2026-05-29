@@ -688,9 +688,24 @@ export default function ActivePurchasesPanel() {
                                                     ✓ Vendor ack
                                                 </span>
                                             )}
-                                            {daysOut != null && !po.isReceived && !overdue && (
-                                                <span className="text-[10px] font-mono text-zinc-600 shrink-0">{daysOut}d out</span>
-                                            )}
+                                            {daysOut != null && !po.isReceived && !overdue && (() => {
+                                                // PO Aging color-code: green <7d, yellow 7-14d, orange 14-21d, red >21d
+                                                const agingColor = daysOut < 7
+                                                    ? 'text-emerald-400'
+                                                    : daysOut < 14
+                                                    ? 'text-yellow-400'
+                                                    : daysOut < 21
+                                                    ? 'text-orange-400'
+                                                    : 'text-rose-400';
+                                                const noTracking = (!po.trackingNumbers || po.trackingNumbers.length === 0)
+                                                    && confirmedShipments.length === 0
+                                                    && po.lifecycleStage !== 'received';
+                                                return (
+                                                    <span className={`text-[10px] font-mono shrink-0 ${agingColor}`} title={`PO age: ${daysOut} days since sent${noTracking ? ' — no tracking yet' : ''}`}>
+                                                        {daysOut}d out{noTracking && <span className="ml-0.5 opacity-70">⊘</span>}
+                                                    </span>
+                                                );
+                                            })()}
                                             {po.total > 0 && (
                                                 <span className="text-xs font-mono text-zinc-400 shrink-0 ml-auto mr-1">
                                                     ${po.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
