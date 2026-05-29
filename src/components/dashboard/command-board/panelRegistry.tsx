@@ -24,6 +24,7 @@ import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
 import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
+import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -116,6 +117,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         label: "Vendor Scorecard",
         short: "Vendor Scores",
         render: () => <VendorScorecardPanel />,
+    },
+    {
+        id: "daily-ops-summary",
+        label: "Daily Ops",
+        short: "Daily Ops",
+        render: () => <DailyOpsSummaryPanel />,
     },
 ];
 

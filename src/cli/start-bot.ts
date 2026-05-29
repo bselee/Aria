@@ -451,6 +451,23 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     startCronRunner();
     console.log('[boot] Cron registry started.');
 
+    // ── HERMIA(2026-05-29): Orchestrator boot wiring ───────────────────
+    // Initialize the HermesOrchestrator singleton so:
+    //   1) All domain agents transition from "starting" → "healthy"
+    //   2) Supabase agent_heartbeats are synced into memory
+    //   3) Cron hooks (success/failure) bridge to orchestrator agent registry
+    //      (see ops-manager cronHookSuccess/cronHookFailure)
+    try {
+        const { getOrchestrator } = await import('../lib/intelligence/hermes-orchestrator');
+        const orch = getOrchestrator();
+        orch.markAllBooted();
+        await orch.syncFromSupabase();
+        console.log('[boot] HermesOrchestrator: ✅ 24 agents initialized');
+    } catch (err: any) {
+        console.warn(`[boot] Orchestrator init failed (non-fatal): ${err.message}`);
+    }
+    // ── End orchestrator wiring ─────────────────────────────────────────
+
     // ── Boot-time warmup ────────────────────────────────────────────
     // (a) Fix: AP polling shows "stale" after every PM2 restart because
     //     the cron scheduler waits for the first */15 tick. Fire immediately

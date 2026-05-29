@@ -640,6 +640,31 @@ const followupCommand: BotCommand = {
 // ── Export: MUST come after all command definitions ─────────────────────────
                 // const declarations are not hoisted — referencing them before init crashes.
 
+        /**
+         * /task <description> — Create a follow-up task from chat.
+         * Optionally matches existing emails for linking.
+         * Usage: /task Reply to Grassroots about the late shipment
+         */
+        const taskCommand: BotCommand = {
+            name: "task",
+            description: "Create a follow-up task: /task <description>",
+            handler: async (ctx) => {
+                await ctx.sendChatAction("typing");
+                const text = (ctx.message && "text" in ctx.message ? ctx.message.text : "").replace(/^\/task\s*/i, "").trim();
+                if (!text) {
+                    await ctx.reply("Usage: /task <description>\\nExample: /task Reply to Grassroots about late shipment\\n\\nCreates a task visible in the dashboard TasksPanel.");
+                    return;
+                }
+                try {
+                    const { createEmailTask, formatTaskResult } = await import("@/lib/intelligence/email-task-creator");
+                    const result = await createEmailTask({ description: text });
+                    await ctx.reply(formatTaskResult(result), { parse_mode: "Markdown" });
+                } catch (err: any) {
+                    await ctx.reply(`❌ ${err.message}`);
+                }
+            },
+        };
+
                 export const hermiaCommands: BotCommand[] = [
                     cognitionCommand,
                     priorityCommand,
@@ -651,6 +676,7 @@ const followupCommand: BotCommand = {
                     emailSearchCommand,
             orderCommand,
                     apSummaryCommand,
+                    taskCommand,
                     budgetCommand,
                     memoriesCommand,
                     agentsCommand,
