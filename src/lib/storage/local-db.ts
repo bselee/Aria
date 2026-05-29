@@ -67,6 +67,21 @@ export function getLocalDb() {
             last_checked_at DATETIME,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- KAIZEN(2026-05-29): Browserbase session tracking for free tier usage control.
+        -- Free tier = 100 sessions/month. Track usage, warn at 80, block at 95.
+        CREATE TABLE IF NOT EXISTS browserbase_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bb_session_id TEXT,
+            task_type TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
+            reused_count INTEGER DEFAULT 0,
+            closed_at DATETIME,
+            reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_bb_monthly ON browserbase_sessions(created_at);
+        CREATE INDEX IF NOT EXISTS idx_bb_task_reuse ON browserbase_sessions(task_type, expires_at);
     `);
 
     return dbInstance;

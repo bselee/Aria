@@ -104,6 +104,8 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
             headless: false,  // CRITICAL: Bill needs to see this
             cookiesPath,
             useRunningBrowser: true, // Prefer existing Chrome via CDP
+            useBrowserbase: process.env.BROWSERBASE_AUTO === 'true', // KAIZEN: cloud browser if enabled
+            browserbaseTaskType: `cart-filling-${platform}`, // Session reuse within vendor
         });
     } catch (err: any) {
         await sendTelegramNotifyWithButtons(
