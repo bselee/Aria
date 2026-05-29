@@ -23,6 +23,7 @@
  */
 
 import { createClient } from "../supabase";
+import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
 import {
     classifyVendorFreightPattern,
     type PatternEvidence,
@@ -162,6 +163,8 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
     const { finaleClient } = await import("../finale/client");
     const { loadActivePurchases } = await import("./active-purchases");
 
+    const auditCtx: ToolAuditContext = { agent: "po-auto-complete-watcher" };
+
     const stats: AutoCompleteRunStats = {
         scanned: 0,
         eligible: 0,
@@ -201,7 +204,12 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
     for (const po of candidates) {
         try {
             // Pull fresh PO details for adjustments (loadActivePurchases doesn't surface them).
-            const details = await finaleClient.getOrderDetails(po.orderId);
+            const details = await withToolAudit(
+                "finale_get_order_details",
+                auditCtx,
+                { orderId: po.orderId },
+                () => finaleClient.getOrderDetails(po.orderId),
+            );
             const adjustments: any[] = details.orderAdjustmentList ?? [];
             const poFreightAmount = adjustments
                 .filter(adj => {
@@ -272,7 +280,12 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
             }
 
             // Live path: complete the order, then write Activity row.
-            await finaleClient.completeOrder(po.orderId);
+            await withToolAudit(
+                "finale_complete_order",
+                auditCtx,
+                { orderId: po.orderId, vendor: po.vendorName },
+                () => finaleClient.completeOrder(po.orderId),
+            );
             stats.completed++;
 
             try {
