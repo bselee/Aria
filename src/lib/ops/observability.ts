@@ -109,6 +109,8 @@ const MODEL_COSTS: Record<string, { inPerMToken: number; outPerMToken: number }>
     "gemini-2.5-flash": { inPerMToken: 0, outPerMToken: 0 },       // Free via OpenRouter
     "gpt-4o": { inPerMToken: 2.50, outPerMToken: 10.00 },
     "gpt-4o-mini": { inPerMToken: 0.15, outPerMToken: 0.60 },
+    "gpt-4": { inPerMToken: 30.00, outPerMToken: 60.00 },           // Best accuracy + speed (0.62s)
+    "gpt-3.5-turbo": { inPerMToken: 0.50, outPerMToken: 1.50 },     // Best value for high-volume (0.74s)
     "claude-sonnet-4": { inPerMToken: 3.00, outPerMToken: 15.00 },
     "openrouter-free": { inPerMToken: 0, outPerMToken: 0 },
 };

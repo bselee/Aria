@@ -47,6 +47,8 @@ const COST_PER_1K_TOKENS: Record<string, number> = {
     // OpenAI
     "gpt-4o": 0.006,
     "gpt-4o-mini": 0.0008,
+    "gpt-4": 0.015,  // Best accuracy + speed (0.62s avg)
+    "gpt-3.5-turbo": 0.001,  // Best value for high-volume (0.74s avg)
     // Gemini
     "gemini-2.5-flash": 0.0005,
     "gemini-2.5-flash-lite": 0.0002,

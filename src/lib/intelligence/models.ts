@@ -44,6 +44,8 @@ export const OPENROUTER_MODELS = {
     claudeHaiku: 'anthropic/claude-haiku-4-5',
     geminiFlash: 'google/gemini-2.5-flash',  // Uses OpenRouter's quota, not ours
     gpt4oMini: 'openai/gpt-4o-mini',
+    gpt4: 'openai/gpt-4',              // Best accuracy + speed (0.62s avg)
+    gpt35Turbo: 'openai/gpt-3.5-turbo', // Best value for high-volume (0.74s avg)
 } as const;
 
 // ── Fallback Chains ─────────────────────────────────────────────────────────
@@ -55,6 +57,7 @@ export const OPENROUTER_MODELS = {
  * Every model is proven for Zod schema generation and tool calling.
  */
 export const OPENROUTER_STRUCTURED_CHAIN = [
+    { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },        // Best accuracy + speed (0.62s)
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
@@ -65,6 +68,8 @@ export const OPENROUTER_STRUCTURED_CHAIN = [
  * Same models — chat quality is equally important.
  */
 export const OPENROUTER_CHAT_CHAIN = [
+    { name: 'OpenRouter GPT-3.5 Turbo', slug: OPENROUTER_MODELS.gpt35Turbo }, // Fastest chat (0.74s), cheapest
+    { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },               // When accuracy matters
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
@@ -101,6 +106,7 @@ export const OPENROUTER_FREE_CHAIN = [
  */
 export const OPENROUTER_VISION_MODELS_ARRAY = [
     OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first
+    OPENROUTER_MODELS.gpt4,         // ✅ Supports PDF base64, best accuracy (0.62s)
     OPENROUTER_MODELS.claudeHaiku,  // ❌ PDF base64 → 400 error
     OPENROUTER_MODELS.gpt4oMini,    // Unlikely to support PDF base64
 ] as const;
