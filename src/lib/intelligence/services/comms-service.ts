@@ -7,11 +7,11 @@
  */
 
 import { Telegraf } from 'telegraf';
-import { createClient } from '../supabase';
-import { finaleClient } from '../finale/client';
-import { CalendarClient } from '../google/calendar';
-import { loadActivePurchases } from '../purchasing/active-purchases';
-import * as agentTask from './agent-task';
+import { createClient } from '../../supabase';
+import { finaleClient } from '../../finale/client';
+import { CalendarClient } from '../../google/calendar';
+import { loadActivePurchases } from '../../purchasing/active-purchases';
+import * as agentTask from '../agent-task';
 
 export class CommsService {
   constructor(private bot: Telegraf) {}
@@ -181,7 +181,7 @@ export class CommsService {
   async sendWeeklySummary() {
     console.log("📊 Preparing Weekly Summary (Aria vs Finale retro)...");
     try {
-      const { summarizeAriaVsFinale } = await import("../purchasing/calibration-engine");
+      const { summarizeAriaVsFinale } = await import("../../purchasing/calibration-engine");
       const summary = await summarizeAriaVsFinale(7);
       const chatId = process.env.TELEGRAM_CHAT_ID || "";
 
