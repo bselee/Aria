@@ -3,6 +3,7 @@ import { chromium, type Browser, BrowserContext, Page } from 'playwright';
 import fs from 'fs';
 import https from 'https';
 import http from 'http';
+import { BrowserbaseManager } from './browserbase-manager';
 
 export interface BrowserOptions {
   headless?: boolean;
@@ -12,6 +13,14 @@ export interface BrowserOptions {
   useRunningBrowser?: boolean;
   connectToChrome?: boolean;
   debuggingPort?: number;
+  /**
+   * KAIZEN(2026-05-29): Use Browserbase cloud browser instead of local Chrome.
+   * Falls back to local if Browserbase is unavailable or budget exhausted.
+   * Set BROWSERBASE_AUTO=true env var to auto-use for all headful sessions.
+   */
+  useBrowserbase?: boolean;
+  /** Task type for Browserbase session reuse (e.g. 'cart-filling-uline'). */
+  browserbaseTaskType?: string;
 }
 
 const DEFAULT_CDP_PORT = 9222;
@@ -166,6 +175,27 @@ export class BrowserManager {
     }
     this.launching = true;
     try {
+      // ── KAIZEN(2026-05-29): Browserbase cloud browser routing ──────────
+      // useBrowserbase=true OR BROWSERBASE_AUTO=true routes through cloud.
+      // Falls back to local Chrome if budget exhausted or API fails.
+      const wantBrowserbase = options.useBrowserbase ||
+        (process.env.BROWSERBASE_AUTO === 'true' && !options.headless);
+      if (wantBrowserbase) {
+        try {
+          const bbManager = BrowserbaseManager.getInstance();
+          const taskType = options.browserbaseTaskType || 'general-browsing';
+          const stats = bbManager.getUsageStats();
+          console.log(`[BrowserManager] → Browserbase cloud (${stats.used}/${stats.limit} this month)`);
+          const page = await bbManager.getBrowserPage(taskType);
+          this.usingCDP = true; // Browserbase uses CDP under the hood
+          this.headlessMode = false;
+          return page;
+        } catch (bbError: any) {
+          console.warn(`[BrowserManager] Browserbase unavailable (${bbError.message}), falling back to local Chrome`);
+          // Continue to local Chrome fallback below
+        }
+      }
+
       if (options.useRunningBrowser || options.connectToChrome) {
         const port = options.debuggingPort ?? DEFAULT_CDP_PORT;
         if (await this.isCDPAvailable(port)) {
