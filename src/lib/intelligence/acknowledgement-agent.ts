@@ -92,6 +92,61 @@ export class AcknowledgementAgent {
             lowerFrom.includes("@send.");
     }
 
+    /**
+     * Fast-path promotional/newsletter detection by subject line + sender.
+     * Catches ~60% of incoming emails before the LLM call — saves tokens on obvious ads.
+     * Returns true if the email is clearly promotional and can be archived without processing.
+     */
+    private isPromotionalFastPath(from: string, subject: string): boolean {
+        const lowerSubject = subject.toLowerCase();
+        const lowerFrom = from.toLowerCase();
+
+        // Promotional subject patterns — high-confidence marketing signals
+        const PROMO_SUBJECT_PATTERNS: RegExp[] = [
+            /\b(?:sale|clearance|blowout|flash\s*sale|weekend\s*sale|end.of.season)\b/i,
+            /\b(?:\d+%\s*off|save\s+\$?\d+|up\s+to\s+\d+%|take\s+\d+%)\b/i,
+            /\b(?:coupon|promo\s*code|discount\s*code|offer\s*code|voucher)\b/i,
+            /\b(?:limited\s*time|act\s*now|hurry|last\s*chance|don'?t\s*miss|exclusive\s*offer)\b/i,
+            /\b(?:free\s*shipping|free\s*delivery|ships?\s*free|gratis)\b/i,
+            /\b(?:new\s*arrival|just\s*in|now\s*available|pre.?order\s*now)\b/i,
+            /\b(?:unsubscribe|opt.out|manage\s*preferences|email\s*preferences)\b/i,
+            /\b(?:weekly\s*digest|newsletter|this\s*week'?s?\s*(deals|picks|highlights))\b/i,
+            /\b(?:black\s*friday|cyber\s*monday|holiday\s*savings|seasonal\s*deals?)\b/i,
+            /\b(?:buy\s+\d+\s*get|bundle\s*deal|special\s*pricing|member.?only)\b/i,
+            /\b(?:you'?re\s*invited|join\s*us|webinar|event\s*registration)\b/i,
+            /\b(?:refer\s*a\s*friend|earn\s*\$|rewards?\s*points?|loyalty\s*bonus)\b/i,
+        ];
+
+        if (PROMO_SUBJECT_PATTERNS.some(p => p.test(lowerSubject))) {
+            return true;
+        }
+
+        // ESP/newsletter sender domains — almost always promotional
+        const ESP_DOMAIN_PATTERNS: RegExp[] = [
+            /mailchimp/i, /sendgrid/i, /constantcontact/i,
+            /campaign-archive/i, /list-manage/i, /sendinblue/i,
+            /brevo/i, /klaviyo/i, /iterable/i, /customer\.io/i,
+            /em\.spotify/i, /e\.reddit/i, /email\.[a-z]+\.com/i,
+            /news\.[a-z]+\.com/i, /newsletter\.[a-z]+\.com/i,
+        ];
+
+        if (ESP_DOMAIN_PATTERNS.some(p => p.test(lowerFrom))) {
+            return true;
+        }
+
+        // Newsletter sender address patterns
+        if (/^-?(newsletter|marketing|deals|promotions|offers|updates)\@/i.test(lowerFrom)) {
+            return true;
+        }
+
+        // Subject starts with emoji + ALL CAPS (common promo pattern)
+        if (/^[\uD83C-\uDBFF\uDC00-\uDFFF\u2600-\u27BF]\s*[A-Z\s\W]{15,}$/.test(subject)) {
+            return true;
+        }
+
+        return false;
+    }
+
     private isMarketplaceOrStatusSender(from: string, subject: string): boolean {
         const haystack = `${from} ${subject}`.toLowerCase();
         return [
@@ -323,6 +378,19 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
 
                 if (this.isMarketplaceOrStatusSender(senderEmail, subject)) {
                     console.log(`     -> Fast-path PROMOTIONAL (marketplace/status: ${senderEmail})`);
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me", id: m.gmail_message_id,
+                            requestBody: { removeLabelIds: ["UNREAD"] }
+                        });
+                    } catch { /* best effort */ }
+                    continue;
+                }
+
+                // Guardrail 2c: Promotional subject fast-path — catches newsletters, ads, ESP blasts
+                // before the expensive LLM call. ~60% of incoming emails are clearly promotional.
+                if (this.isPromotionalFastPath(senderEmail, subject)) {
+                    console.log(`     -> Fast-path PROMOTIONAL (subject/sender match: ${subject.slice(0, 60)})`);
                     try {
                         await gmail.users.messages.modify({
                             userId: "me", id: m.gmail_message_id,
