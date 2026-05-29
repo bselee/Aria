@@ -44,6 +44,19 @@ export function getLocalDb() {
         );
         CREATE INDEX IF NOT EXISTS idx_cog_rounds_at ON cognitive_rounds(ran_at);
 
+        -- KAIZEN(2026-05-29): Persistent dedup cache replacing in-memory Sets.
+        -- Survives restarts — no boot-hydration needed.
+        -- Namespaces: 'build_completions', 'received_pos', etc.
+        -- expire_at allows auto-cleanup; NULL = never expires.
+        CREATE TABLE IF NOT EXISTS dedup_cache (
+            namespace TEXT NOT NULL,
+            value TEXT NOT NULL,
+            seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expire_at DATETIME,
+            PRIMARY KEY (namespace, value)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dedup_expire ON dedup_cache(expire_at);
+
         CREATE TABLE IF NOT EXISTS shipments_cache (
             tracking_number TEXT PRIMARY KEY,
             po_numbers TEXT, -- JSON array
@@ -57,4 +70,66 @@ export function getLocalDb() {
     `);
 
     return dbInstance;
+}
+
+// ── Dedup cache helpers (replacing in-memory Sets) ──────────────────────────
+
+/**
+ * Check if a value has been seen in a namespace.
+ * Returns false if expired or never seen.
+ */
+export function dedupSeen(namespace: string, value: string): boolean {
+    try {
+        const db = getLocalDb();
+        const row = db.prepare(
+            `SELECT 1 FROM dedup_cache
+             WHERE namespace = ? AND value = ?
+             AND (expire_at IS NULL OR expire_at > datetime('now'))`
+        ).get(namespace, value);
+        return !!row;
+    } catch {
+        return false; // on DB error, assume not seen — safer to re-process than silently skip
+    }
+}
+
+/**
+ * Mark a value as seen in a namespace.
+ * If ttlHours is provided, the entry auto-expires after that duration.
+ * On insert failure, silently no-ops (dedup must never block processing).
+ */
+export function dedupMark(namespace: string, value: string, ttlHours?: number): void {
+    try {
+        const db = getLocalDb();
+        if (ttlHours) {
+            const expireAt = new Date(Date.now() + ttlHours * 3600000).toISOString();
+            db.prepare(
+                `INSERT OR REPLACE INTO dedup_cache (namespace, value, seen_at, expire_at)
+                 VALUES (?, ?, datetime('now'), ?)`
+            ).run(namespace, value, expireAt);
+        } else {
+            db.prepare(
+                `INSERT OR REPLACE INTO dedup_cache (namespace, value, seen_at)
+                 VALUES (?, ?, datetime('now'))`
+            ).run(namespace, value);
+        }
+    } catch {
+        // non-critical — dedup is best-effort
+    }
+}
+
+/**
+ * Count entries in a namespace (for hydration logging after startup).
+ */
+export function dedupCount(namespace: string): number {
+    try {
+        const db = getLocalDb();
+        const row = db.prepare(
+            `SELECT COUNT(*) as cnt FROM dedup_cache
+             WHERE namespace = ?
+             AND (expire_at IS NULL OR expire_at > datetime('now'))`
+        ).get(namespace) as { cnt: number } | undefined;
+        return row?.cnt ?? 0;
+    } catch {
+        return 0;
+    }
 }
