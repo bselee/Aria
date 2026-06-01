@@ -17,6 +17,7 @@ import { inventoryCommands } from './inventory';
 import { operationsCommands } from './operations';
 import { memoryCommands } from './memory-cmds';
 import { kaizenCommands } from './kaizen';
+import { hermiaCommands } from './hermia';
 
 describe('Bot Command Modularization', () => {
     describe('allCommands aggregation', () => {
@@ -26,7 +27,8 @@ describe('Bot Command Modularization', () => {
                 inventoryCommands.length +
                 operationsCommands.length +
                 memoryCommands.length +
-                kaizenCommands.length;
+                kaizenCommands.length +
+                hermiaCommands.length;
 
             expect(allCommands.length).toBe(expected);
             expect(allCommands.length).toBeGreaterThanOrEqual(15);

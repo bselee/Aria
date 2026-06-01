@@ -35,9 +35,10 @@ describe("evaluateVendorCycle", () => {
     // ── Grassroots-like fragmentation pattern ───────────────────────────
 
     it("should lock after first committed PO (Grassroots pattern)", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
-            { orderId: "PO-002", orderDate: "2026-05-05T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "Grassroots" },
+            { orderId: "PO-002", orderDate: new Date(Date.now() - 5 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "Grassroots" },
         ];
 
         const result = evaluateVendorCycle(pos, baseCheck);
@@ -49,8 +50,9 @@ describe("evaluateVendorCycle", () => {
     // ── TeaLAB-like: second PO 12 days after first committed ──────────
 
     it("should block second PO 12 days after first committed (TeaLAB pattern)", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "TeaLAB" },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 12 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "TeaLAB" },
         ];
 
         const result = evaluateVendorCycle(pos, baseCheck);
@@ -61,8 +63,9 @@ describe("evaluateVendorCycle", () => {
     // ── Canceled POs should not lock ──────────────────────────────────
 
     it("should ignore canceled POs (Grassroots May 2026 canceled)", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_CANCELED", supplier: "Grassroots", isCanceled: true },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_CANCELED", supplier: "Grassroots", isCanceled: true },
         ];
 
         const result = evaluateVendorCycle(pos, baseCheck);
@@ -73,8 +76,9 @@ describe("evaluateVendorCycle", () => {
     // ── Dropship POs should not lock ──────────────────────────────────
 
     it("should ignore dropship POs", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "DropshipVendor", isDropship: true },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "DropshipVendor", isDropship: true },
         ];
 
         const result = evaluateVendorCycle(pos, baseCheck);
@@ -97,8 +101,9 @@ describe("evaluateVendorCycle", () => {
     // ── Exception evidence bypass ─────────────────────────────────────
 
     it("should allow exception for sale demand despite cycle lock", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "Grassroots" },
         ];
 
         const check: VendorCycleCheck = {
@@ -115,8 +120,9 @@ describe("evaluateVendorCycle", () => {
     });
 
     it("should allow exception for surge demand", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "Grassroots" },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "Grassroots" },
         ];
 
         const check: VendorCycleCheck = {
@@ -132,8 +138,9 @@ describe("evaluateVendorCycle", () => {
     });
 
     it("should allow exception for build-critical demand", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_OPEN", supplier: "BuildsVendor" },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_OPEN", supplier: "BuildsVendor" },
         ];
 
         const check: VendorCycleCheck = {
@@ -159,10 +166,11 @@ describe("evaluateVendorCycle", () => {
     // ── Mixed: committed + canceled + dropship ────────────────────────
 
     it("should only count committed/open POs, not canceled or dropship", () => {
+        const day = 86400000;
         const pos: TestPO[] = [
-            { orderId: "PO-001", orderDate: "2026-05-01T00:00:00Z", status: "ORDER_COMMITTED", supplier: "MixedVendor" },
-            { orderId: "PO-002", orderDate: "2026-05-05T00:00:00Z", status: "ORDER_CANCELED", supplier: "MixedVendor", isCanceled: true },
-            { orderId: "PO-003", orderDate: "2026-05-10T00:00:00Z", status: "ORDER_COMMITTED", supplier: "MixedVendor", isDropship: true },
+            { orderId: "PO-001", orderDate: new Date(Date.now() - 10 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "MixedVendor" },
+            { orderId: "PO-002", orderDate: new Date(Date.now() - 5 * day).toISOString(), status: "ORDER_CANCELED", supplier: "MixedVendor", isCanceled: true },
+            { orderId: "PO-003", orderDate: new Date(Date.now() - 2 * day).toISOString(), status: "ORDER_COMMITTED", supplier: "MixedVendor", isDropship: true },
         ];
 
         const result = evaluateVendorCycle(pos, baseCheck);

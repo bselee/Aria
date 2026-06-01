@@ -34,6 +34,14 @@ type MatchDetails = {
     isLockedBom: boolean;
 };
 
+type DraftEvent = {
+    vendorName: string;
+    orderId: string;
+    itemCount: number;
+    totalUnits: number;
+    draftedAt: number;
+};
+
 type PurchasingLifecycleContextValue = {
     focus: LifecycleFocus | null;
     lockedFocus: LifecycleFocus | null;
@@ -48,6 +56,10 @@ type PurchasingLifecycleContextValue = {
     // Option C BOM Additions
     registerBOM: (componentSku: string, finishedGoodSkus: string[]) => void;
     checkMatchDetails: (input: LifecycleMatchInput) => MatchDetails;
+
+    // Draft event bridge: Ordering → Purchases → Receiving flow
+    lastDraft: DraftEvent | null;
+    notifyDraft: (event: Omit<DraftEvent, "draftedAt">) => void;
 };
 
 const PurchasingLifecycleContext = createContext<PurchasingLifecycleContextValue>({
@@ -62,6 +74,8 @@ const PurchasingLifecycleContext = createContext<PurchasingLifecycleContextValue
     matchesLockedFocus: () => false,
     registerBOM: () => { },
     checkMatchDetails: () => ({ isDirect: false, isBom: false, isLockedDirect: false, isLockedBom: false }),
+    lastDraft: null,
+    notifyDraft: () => { },
 });
 
 function normalize(value?: string | null): string {
@@ -75,6 +89,7 @@ function normalizeSkuSet(values?: string[]): Set<string> {
 export function PurchasingLifecycleProvider({ children }: { children: React.ReactNode }) {
     const [focus, setFocusState] = useState<LifecycleFocus | null>(null);
     const [lockedFocus, setLockedFocusState] = useState<LifecycleFocus | null>(null);
+    const [lastDraft, setLastDraft] = useState<DraftEvent | null>(null);
 
     // Dynamic, non-rendering BOM relationships registry (Option C)
     const bomRelationsRef = useRef<{
@@ -263,6 +278,11 @@ export function PurchasingLifecycleProvider({ children }: { children: React.Reac
         return details.isLockedDirect || details.isLockedBom;
     }, [checkMatchDetails]);
 
+    // Draft event bridge: called by Ordering pane after successful PO draft
+    const notifyDraft = useCallback((event: Omit<DraftEvent, "draftedAt">) => {
+        setLastDraft({ ...event, draftedAt: Date.now() });
+    }, []);
+
     // DECISION(2026-05-19): Register a global keydown listener for the Escape key 
     // inside the provider to clear locked focus and hover focus instantly.
     React.useEffect(() => {
@@ -288,9 +308,11 @@ export function PurchasingLifecycleProvider({ children }: { children: React.Reac
             matchesFocus: isMatch,
             matchesLockedFocus,
             registerBOM,
-            checkMatchDetails
+            checkMatchDetails,
+            lastDraft,
+            notifyDraft,
         }),
-        [focus, lockedFocus, setFocus, clearFocus, setLockedFocus, clearLockedFocus, isMatch, matchesLockedFocus, registerBOM, checkMatchDetails],
+        [focus, lockedFocus, setFocus, clearFocus, setLockedFocus, clearLockedFocus, isMatch, matchesLockedFocus, registerBOM, checkMatchDetails, lastDraft, notifyDraft],
     );
 
     return (
