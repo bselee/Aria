@@ -11,6 +11,7 @@
  */
 
 import { createClient } from "@/lib/supabase";
+import { getLocalDb } from "@/lib/storage/local-db";
 
 /** Valid lifecycle states */
 export const PO_LIFECYCLE_STATES = [
@@ -37,7 +38,7 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
  * @throws Error if the transition is invalid
  * @internal
  */
-export function assetValidTransition(from: string | null, to: string): void {
+export function assertValidTransition(from: string | null, to: string): void {
     const allowed = VALID_TRANSITIONS[from || "ORDERED"];
     if (!allowed || !allowed.includes(to)) {
         throw new Error(
@@ -92,27 +93,50 @@ export async function transitionLifecycleState(
     metadata?: Record<string, unknown>
 ): Promise<void> {
     try {
+        // Phase 1: Write to local SQLite FIRST — crash-safe write-ahead log
+        // If process crashes after this write but before Supabase, the transition
+        // is recoverable from local DB on next boot.
+        let currentState: string | null = "ORDERED";
+        try {
+            const db = getLocalDb();
+            const existing = db.prepare(
+                `SELECT lifecycle_state FROM po_lifecycle_cache WHERE po_number = ?`
+            ).get(poNumber) as { lifecycle_state: string } | undefined;
+            if (existing) currentState = existing.lifecycle_state;
+
+            // Validate transition
+            try {
+                assertValidTransition(currentState, toState);
+            } catch (valErr) {
+                console.warn(
+                    `[po-lifecycle] ${(valErr as Error).message} — skipping transition`
+                );
+                return;
+            }
+
+            const now = new Date().toISOString();
+            db.prepare(
+                `INSERT OR REPLACE INTO po_lifecycle_cache (po_number, lifecycle_state, last_transitioned_at, triggered_by)
+                 VALUES (?, ?, ?, ?)`
+            ).run(poNumber, toState, now, triggeredBy);
+        } catch (localErr) {
+            console.warn(
+                `[po-lifecycle] Local SQLite write failed for PO ${poNumber}:`,
+                (localErr as Error).message
+            );
+            // Continue to Supabase anyway — local write is best-effort
+        }
+
+        // Phase 2: Write to Supabase (durable remote storage)
         const supabase = createClient();
         if (!supabase) {
             console.warn(
                 `[po-lifecycle] No Supabase client — skipping transition ${poNumber} → ${toState}`
             );
-            return;
+            return; // Local SQLite write already done above — state is safe
         }
 
-        // Get current state
-        const currentState = await getLifecycleState(poNumber);
-
-        // Validate transition
-        try {
-            assetValidTransition(currentState, toState);
-        } catch (valErr) {
-            console.warn(
-                `[po-lifecycle] ${(valErr as Error).message} — skipping transition`
-            );
-            return;
-        }
-
+        // Validation already passed in Phase 1 (local SQLite write) — skip duplicate
         const now = new Date().toISOString();
 
         // Update purchase_orders

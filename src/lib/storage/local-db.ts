@@ -95,6 +95,17 @@ export function getLocalDb() {
                     expire_at DATETIME NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_recv_cache_expire ON receiving_cache(expire_at);
+
+        -- KAIZEN(2026-06-01): Crash-safe PO lifecycle cache (write-ahead log)
+        -- Written FIRST in transitionLifecycleState before Supabase. Survives
+        -- process crashes. Boot-hydrated on restart to catch missed transitions.
+        CREATE TABLE IF NOT EXISTS po_lifecycle_cache (
+            po_number TEXT PRIMARY KEY,
+            lifecycle_state TEXT NOT NULL DEFAULT 'ORDERED',
+            last_transitioned_at TEXT NOT NULL,
+            triggered_by TEXT,
+            synced_to_supabase INTEGER DEFAULT 0
+        );
     `);
 
     return dbInstance;

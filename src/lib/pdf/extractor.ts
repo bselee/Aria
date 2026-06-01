@@ -204,7 +204,7 @@ async function extractScannedPDF(
                 const { data } = await Tesseract.recognize(buffer, "eng", {
                     logger: (m: any) => {
                         if (m.status === "recognizing text") {
-                            console.log(`[extractor] tesseract: ${Math.round(m.progress * 100)}%`);
+                            if (m.progress >= 0.5 && m.progress < 0.55) { console.log(`[extractor] tesseract: ${Math.round(m.progress * 100)}%`) };
                         }
                     },
                 });
