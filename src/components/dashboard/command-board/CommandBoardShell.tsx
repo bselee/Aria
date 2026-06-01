@@ -68,49 +68,28 @@ function PurchasingLifecyclePanel() {
     return (
         <PurchasingLifecycleProvider>
             <div
-                className="grid h-full min-h-0 grid-cols-[minmax(680px,1.7fr)_auto_minmax(280px,0.75fr)_auto_minmax(260px,0.65fr)] gap-0 p-2 overflow-x-auto"
+                className="grid h-full min-h-0 grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
                 data-testid="purchasing-lifecycle-panel"
             >
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
-                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100 flex items-center gap-2">
-                    <span className="flex items-center justify-center w-5 h-5 rounded-full bg-blue-500/20 text-blue-300 text-[10px] font-bold">1</span>
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
                     Ordering
                 </div>
                 <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
                     <PurchasingPanel />
                 </div>
             </section>
-            {/* Flow arrow: Ordering → Purchases */}
-            <div className="flex items-center justify-center px-1 shrink-0">
-                <div className="flex flex-col items-center gap-1">
-                    <svg width="16" height="24" viewBox="0 0 16 24" className="text-zinc-700">
-                        <path d="M2 12h10M10 6l4 6-4 6" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    <span className="text-[8px] font-mono text-zinc-700 uppercase tracking-widest">draft</span>
-                </div>
-            </div>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-purchases">
-                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100 flex items-center gap-2">
-                    <span className="flex items-center justify-center w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold">2</span>
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
                     Purchases
                 </div>
                 <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
                     <ActivePurchasesPanel />
                 </div>
             </section>
-            {/* Flow arrow: Purchases → Receiving */}
-            <div className="flex items-center justify-center px-1 shrink-0">
-                <div className="flex flex-col items-center gap-1">
-                    <svg width="16" height="24" viewBox="0 0 16 24" className="text-zinc-700">
-                        <path d="M2 12h10M10 6l4 6-4 6" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    <span className="text-[8px] font-mono text-zinc-700 uppercase tracking-widest">recv</span>
-                </div>
-            </div>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-rcv">
-                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100 flex items-center gap-2">
-                    <span className="flex items-center justify-center w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">3</span>
-                    Receiving
+                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
+                    RCV
                 </div>
                 <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
                     <ReceivedItemsPanel />
@@ -256,23 +235,18 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         }
         const healthy = heartbeats.filter(h => h.staleness === "fresh").length;
         const stale = heartbeats.filter(h => h.staleness !== "fresh").length;
-        const totalHB = healthy + stale;
         const cronHealthy = crons.filter(c => c.lastStatus === "success").length;
         const cronError = crons.filter(c => c.lastStatus === "error").length;
         const cronNeverRun = crons.filter(c => c.lastStatus == null).length;
         return {
             lanes,
-            agents: { total: totalHB, healthy, stale },
+            agents: { total: agents.length, healthy, stale },
             crons: { total: crons.length, healthy: cronHealthy, error: cronError, neverRun: cronNeverRun, recentSuccess24h: 0, recentError24h: 0 },
         } as CommandBoardSummary;
     }, [summary, tasks, heartbeats, crons, agents.length]);
 
-    const cronHealthy = summaryCounts.crons.healthy;
-    const cronNeverRun = summaryCounts.crons.neverRun ?? 0;
     const cronAccent = summaryCounts.crons.error > 0 ? "bg-rose-500"
-        : cronHealthy > 0 ? "bg-emerald-500"
-        : cronNeverRun > 0 ? "bg-zinc-500"
-        : "bg-zinc-600";
+        : summaryCounts.crons.healthy > 0 ? "bg-emerald-500" : "bg-zinc-600";
 
     const needsWill = summaryCounts.lanes["needs-will"] ?? 0;
 
@@ -296,9 +270,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                     />
                     <HealthChip
                         label="crons"
-                        value={cronNeverRun === summaryCounts.crons.total
-                            ? `${summaryCounts.crons.total} pending`
-                            : `${cronHealthy}/${summaryCounts.crons.total}`}
+                        value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
                         accent={cronAccent}
                     />
                 </div>
