@@ -183,20 +183,44 @@ async function extractScannedPDF(
 
     // Strategy 2: free fallback models on OpenRouter (no PDF base64 support — send as prompt text instead)
     if (!extractedText) {
-        console.log(`[extractor] Trying free fallback...`);
-        const freeModels = [
-            "google/gemini-2.5-flash-preview",  // free tier
-            "qwen/qwen3-8b",                      // free, good at text
-        ];
-        for (const model of freeModels) {
-            if (await callOpenRouter(model)) {
-                console.log(`[extractor] ✅ ${model} — ${extractedText.length} chars`);
-                break;
+            console.log(`[extractor] Trying free fallback...`);
+            const freeModels = [
+                "google/gemini-2.5-flash-preview",  // free tier
+                "qwen/qwen3-8b",                      // free, good at text
+            ];
+            for (const model of freeModels) {
+                if (await callOpenRouter(model)) {
+                    console.log(`[extractor] ✅ ${model} — ${extractedText.length} chars`);
+                    break;
+                }
             }
         }
-    }
 
-    if (!extractedText) {
+        // Strategy 3: Local tesseract.js OCR as last resort before giving up
+        if (!extractedText) {
+            console.log(`[extractor] Trying local tesseract.js OCR...`);
+            try {
+                const Tesseract = await import("tesseract.js");
+                const { data } = await Tesseract.recognize(buffer, "eng", {
+                    logger: (m: any) => {
+                        if (m.status === "recognizing text") {
+                            console.log(`[extractor] tesseract: ${Math.round(m.progress * 100)}%`);
+                        }
+                    },
+                });
+                if (data?.text && data.text.trim().length > 50) {
+                    extractedText = data.text;
+                    successStrategy = "tesseract.js";
+                    console.log(`[extractor] ✅ tesseract.js — ${extractedText.length} chars`);
+                } else {
+                    console.warn(`[extractor] tesseract.js returned insufficient text (${data?.text?.length || 0} chars)`);
+                }
+            } catch (tessErr: any) {
+                console.warn(`[extractor] tesseract.js failed: ${tessErr.message.slice(0, 80)}`);
+            }
+        }
+
+        if (!extractedText) {
         throw new Error(`[extractor] All OpenRouter strategies failed for PDF OCR`);
     }
 

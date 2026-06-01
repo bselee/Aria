@@ -25,6 +25,7 @@ import StatementReconciliationPanel from "@/components/dashboard/StatementReconc
 import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
+import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -119,12 +120,18 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         render: () => <VendorScorecardPanel />,
     },
     {
-        id: "daily-ops-summary",
-        label: "Daily Ops",
-        short: "Daily Ops",
-        render: () => <DailyOpsSummaryPanel />,
-    },
-];
+            id: "daily-ops-summary",
+            label: "Daily Ops",
+            short: "Daily Ops",
+            render: () => <DailyOpsSummaryPanel />,
+        },
+        {
+            id: "po-lifecycle",
+            label: "PO Lifecycle",
+            short: "PO Lifecycle",
+            render: () => <POLifecyclePanel />,
+        },
+    ];
 
 export const PANEL_BY_ID: Record<PanelId, PanelDefinition> =
     PANEL_DEFINITIONS.reduce<Record<string, PanelDefinition>>((acc, def) => {

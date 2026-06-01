@@ -192,6 +192,19 @@ defineJob({
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
 
+// KAIZEN(2026-06-01): Post-reconciliation receiving check. When goods arrive
+// after an invoice was reconciled, re-checks quantities and alerts if short.
+defineJob({
+    name: "po-receipt-recheck",
+    schedule: "*/30 * * * *",
+    onFail: "log",
+    description: "Re-check reconciled invoices against newly received goods (every 30m).",
+    handler: async () => {
+        const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
+        await recheckReconciledInvoices();
+    },
+});
+
 // HERMIA(2026-05-28): L2/L3 vendor escalation. L2=10-14d (firmer draft),
 // L3=15+d (Telegram alert with replace/draft buttons).
 defineJob({

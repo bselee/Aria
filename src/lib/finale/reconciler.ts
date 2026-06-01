@@ -2375,6 +2375,27 @@ export async function applyReconciliation(
         });
     });
 
+    // Lifecycle: transition PO to RECONCILED when reconciliation applies successfully
+    if (result.orderId && errors.length === 0) {
+        setImmediate(() => {
+            // Using direct import to avoid circular dependency risk
+            import("../purchasing/po-lifecycle").then(({ transitionLifecycleState }) => {
+                transitionLifecycleState(
+                    result.orderId,
+                    "RECONCILED",
+                    "reconciler",
+                    {
+                        invoiceNumber: result.invoiceNumber,
+                        vendorName: result.vendorName,
+                        verdict: result.overallVerdict,
+                        appliedCount: applied.length,
+                        skippedCount: skipped.length,
+                    }
+                ).catch(() => {});
+            }).catch(() => {});
+        });
+    }
+
     return { applied, skipped, errors };
 }
 
