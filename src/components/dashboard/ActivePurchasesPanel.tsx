@@ -283,6 +283,17 @@ export default function ActivePurchasesPanel() {
         return () => clearInterval(t);
     }, [fetchPurchases]);
 
+    // Draft notification bridge: flash + auto-refresh when Ordering pane drafts a PO
+    useEffect(() => {
+        const d = lifecycle.lastDraft;
+        if (!d || d.draftedAt === prevDraftRef.current) return;
+        prevDraftRef.current = d.draftedAt;
+        setDraftFlash({ vendor: d.vendorName, orderId: d.orderId, at: d.draftedAt });
+        fetchPurchases(true);
+        const tid = setTimeout(() => setDraftFlash(null), 4000);
+        return () => clearTimeout(tid);
+    }, [lifecycle.lastDraft, fetchPurchases]);
+
     async function markSentVerified(orderId: string) {
         setVerifyingSent((prev) => new Set(prev).add(orderId));
         setError(null);
