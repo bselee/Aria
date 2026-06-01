@@ -284,6 +284,16 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
                     updated_at: new Date().toISOString(),
                 }).eq('po_number', po.po_number);
 
+                // Self-heal: if PO is still in REVIEW (manual send, state never updated),
+                // promote to SENT first, then ACKNOWLEDGED
+                if (po.lifecycle_stage === 'REVIEW' || po.lifecycle_stage === 'ORDERED' || po.lifecycle_stage === null) {
+                    await transitionLifecycleState(po.po_number, 'SENT', 'po-followup-watcher', {
+                        source: 'self_heal_from_review',
+                        vendorName: po.vendor_name ?? undefined,
+                        reason: 'vendor_replied_before_sent_transition',
+                    });
+                }
+
                 // Transition lifecycle: SENT → ACKNOWLEDGED on verified vendor reply
                 await transitionLifecycleState(po.po_number, 'ACKNOWLEDGED', 'po-followup-watcher', {
                     source: match.source,
