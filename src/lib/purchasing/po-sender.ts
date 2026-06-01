@@ -12,6 +12,7 @@ import * as agentTask from '../intelligence/agent-task';
 import type { CommitVerification } from './po-verification';
 import { renderPurchaseOrderPdf } from './po-email-pdf';
 import { sendGmailPdfEmail, sendTextOnlyGmailEmail } from '../gmail/send-email';
+import { transitionLifecycleState } from './po-lifecycle';
 
 type POEmailVia = 'finale-native' | 'gmail-fallback';
 
@@ -783,9 +784,18 @@ export async function commitAndSendPO(
         }
 
         await Promise.allSettled(writes);
-    }
 
-    // Session lifecycle: full success closes the session ('confirmed').
+                // Transition lifecycle state: REVIEW → SENT if email was sent,
+                // otherwise stays in REVIEW (email failed or was skipped)
+                await transitionLifecycleState(orderId, emailSent ? 'SENT' : 'REVIEW', triggeredBy, {
+                    vendorEmail,
+                    emailVia,
+                    emailSent,
+                    gmailMessageId,
+                });
+            }
+
+            // Session lifecycle: full success closes the session ('confirmed').
     // Partial-success (commit landed, email failed both paths) parks the
     // session in 'email_failed' so the dashboard can fire a retry without
     // requiring Will to re-review from scratch. Skipping email entirely is

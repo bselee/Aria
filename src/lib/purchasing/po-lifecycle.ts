@@ -1,9 +1,12 @@
 /**
  * @file    src/lib/purchasing/po-lifecycle.ts
  * @purpose PO lifecycle state machine — tracks every PO through
- *          ORDERED → INVOICED → RECONCILED → RECEIVED → COMPLETED
+ *          REVIEW → SENT → ACKNOWLEDGED → INVOICED → RECONCILED → RECEIVED → COMPLETED
+ *          Plus CANCELLED as a terminal state.
+ *          ORDERED is retained as a legacy alias for data compatibility.
  * @author  Hermia
  * @created 2026-06-01
+ * @updated 2026-06-01 (added REVIEW, SENT, ACKNOWLEDGED, CANCELLED dispatch stages)
  * @deps    @/lib/supabase
  *
  * All functions are best-effort (try/catch, never throw) so they can
@@ -15,23 +18,46 @@ import { getLocalDb } from "@/lib/storage/local-db";
 
 /** Valid lifecycle states */
 export const PO_LIFECYCLE_STATES = [
-    "ORDERED",
-    "INVOICED",
-    "RECONCILED",
-    "RECEIVED",
-    "COMPLETED",
+    "ORDERED",        // legacy — kept for backward-compat with existing data
+    "REVIEW",         // draft created in Finale, awaiting human review
+    "SENT",           // PO dispatched to vendor via email
+    "ACKNOWLEDGED",   // vendor replied confirming receipt
+    "INVOICED",       // invoice received and matched
+    "RECONCILED",     // invoice lines reconciled against PO
+    "RECEIVED",       // goods received (partial or full)
+    "COMPLETED",      // all done
+    "CANCELLED",      // PO cancelled — terminal
 ] as const;
 
 export type POLifecycleState = (typeof PO_LIFECYCLE_STATES)[number];
 
-/** Valid state transitions */
+/** Initial state for new POs (replaces legacy ORDERED) */
+export const INITIAL_LIFECYCLE_STATE = "REVIEW";
+
+/**
+ * Valid state transitions.
+ * Backward compatibility: ORDERED maps to same children as REVIEW
+ * so existing POs with legacy state can still progress.
+ */
 const VALID_TRANSITIONS: Record<string, string[]> = {
-    ORDERED: ["INVOICED", "RECEIVED"],
+    // Legacy backward compat
+    ORDERED: ["INVOICED", "RECEIVED", "CANCELLED"],
+    // Dispatch stages
+    REVIEW: ["SENT", "INVOICED", "RECEIVED", "CANCELLED"],
+    SENT: ["ACKNOWLEDGED", "INVOICED", "RECEIVED"],
+    ACKNOWLEDGED: ["INVOICED", "RECEIVED"],
+    // Invoice / fulfillment pipeline
     INVOICED: ["RECONCILED", "RECEIVED"],
     RECONCILED: ["RECEIVED", "COMPLETED"],
     RECEIVED: ["RECONCILED", "COMPLETED"],
     COMPLETED: [], // terminal state
+    CANCELLED: [], // terminal state
 };
+
+/** Fallback if state is missing or null */
+function resolveState(state: string | null): string {
+    return state || INITIAL_LIFECYCLE_STATE;
+}
 
 /**
  * Assert that a state transition is valid.
@@ -39,18 +65,19 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
  * @internal
  */
 export function assertValidTransition(from: string | null, to: string): void {
-    const allowed = VALID_TRANSITIONS[from || "ORDERED"];
+    const resolved = resolveState(from);
+    const allowed = VALID_TRANSITIONS[resolved];
     if (!allowed || !allowed.includes(to)) {
         throw new Error(
-            `Invalid PO lifecycle transition: ${from || "ORDERED"} → ${to}. ` +
-            `Allowed from ${from || "ORDERED"}: [${(allowed || []).join(", ")}]`
+            `Invalid PO lifecycle transition: ${resolved} → ${to}. ` +
+            `Allowed from ${resolved}: [${(allowed || []).join(", ")}]`
         );
     }
 }
 
 /**
  * Get current lifecycle state for a PO.
- * @returns The current state, or "ORDERED" if no state is recorded
+ * @returns The current state, or REVIEW if no state is recorded
  */
 export async function getLifecycleState(
     poNumber: string
@@ -65,8 +92,8 @@ export async function getLifecycleState(
             .eq("po_number", poNumber)
             .single();
 
-        if (error || !data) return "ORDERED";
-        return (data.lifecycle_state as POLifecycleState) || "ORDERED";
+        if (error || !data) return INITIAL_LIFECYCLE_STATE as POLifecycleState;
+        return (data.lifecycle_state as POLifecycleState) || INITIAL_LIFECYCLE_STATE as POLifecycleState;
     } catch (err) {
         console.warn(
             `[po-lifecycle] Failed to get state for PO ${poNumber}:`,
@@ -96,7 +123,7 @@ export async function transitionLifecycleState(
         // Phase 1: Write to local SQLite FIRST — crash-safe write-ahead log
         // If process crashes after this write but before Supabase, the transition
         // is recoverable from local DB on next boot.
-        let currentState: string | null = "ORDERED";
+        let currentState: string | null = INITIAL_LIFECYCLE_STATE;
         try {
             const db = getLocalDb();
             const existing = db.prepare(
@@ -156,11 +183,12 @@ export async function transitionLifecycleState(
         }
 
         // Insert transition audit log
+        const resolvedFrom = resolveState(currentState);
         const { error: insertErr } = await supabase
             .from("po_lifecycle_transitions")
             .insert({
                 po_number: poNumber,
-                from_state: currentState || "ORDERED",
+                from_state: resolvedFrom,
                 to_state: toState,
                 transitioned_at: now,
                 triggered_by: triggeredBy,
@@ -176,7 +204,7 @@ export async function transitionLifecycleState(
         }
 
         console.log(
-            `[po-lifecycle] ${poNumber}: ${currentState || "ORDERED"} → ${toState} (${triggeredBy})`
+            `[po-lifecycle] ${poNumber}: ${resolvedFrom} → ${toState} (${triggeredBy})`
         );
     } catch (err) {
         console.warn(
@@ -241,7 +269,7 @@ export async function getLifecycleSummary(): Promise<
 
         const counts: Record<string, number> = {};
         for (const row of data) {
-            const state = (row.lifecycle_state as string) || "ORDERED";
+            const state = (row.lifecycle_state as string) || INITIAL_LIFECYCLE_STATE;
             counts[state] = (counts[state] || 0) + 1;
         }
         return counts;

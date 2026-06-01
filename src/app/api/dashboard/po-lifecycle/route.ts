@@ -25,15 +25,18 @@ export async function GET() {
         }
 
         const counts: Record<string, number> = {
-            ORDERED: 0,
+            REVIEW: 0,
+            SENT: 0,
+            ACKNOWLEDGED: 0,
             INVOICED: 0,
             RECONCILED: 0,
             RECEIVED: 0,
             COMPLETED: 0,
+            CANCELLED: 0,
         };
 
         for (const row of data) {
-            const state = (row.lifecycle_state as string) || "ORDERED";
+            const state = (row.lifecycle_state as string) || "REVIEW";
             counts[state] = (counts[state] || 0) + 1;
         }
 

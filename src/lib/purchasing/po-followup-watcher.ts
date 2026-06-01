@@ -22,6 +22,7 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { matchPOAgainstInbox, type POTarget } from "./vendor-reply-detector";
 import { lookupVendorOrderEmail } from "./po-sender";
+import { transitionLifecycleState } from "./po-lifecycle";
 
 const DROPSHIP_PATTERN = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
 
@@ -282,6 +283,13 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
                     vendor_ack_source: match.source,
                     updated_at: new Date().toISOString(),
                 }).eq('po_number', po.po_number);
+
+                // Transition lifecycle: SENT → ACKNOWLEDGED on verified vendor reply
+                await transitionLifecycleState(po.po_number, 'ACKNOWLEDGED', 'po-followup-watcher', {
+                    source: match.source,
+                    vendorName: po.vendor_name ?? undefined,
+                    fromEmail: match.fromEmail,
+                });
             }
             outcomes.push({
                 poNumber: po.po_number,
