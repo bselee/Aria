@@ -21,6 +21,9 @@ export const READ_TOOL_NAMES = [
     "build_risk_analysis",
     "inspect_artifact",
     "scrape_purchasing_dashboard",
+    "web_search",
+    "search_products",
+    "system_health",
 ] as const;
 
 export type ReadToolName = typeof READ_TOOL_NAMES[number];
@@ -212,6 +215,102 @@ export function getSharedReadTools(opts?: { threadId?: string }) {
                 const { runPurchasingIntelligence } = await import('@/lib/intelligence/purchasing-pipeline');
                 const result = await runPurchasingIntelligence({ source: 'manual', triggeredBy: 'bot' });
                 return result.telegramMessage;
+            },
+        }),
+
+        web_search: tool({
+            description: "Search the internet for real-time information using Perplexity AI. Use for general knowledge, current events, pricing, vendor research, or anything not in the Aria database.",
+            inputSchema: z.object({
+                query: z.string().describe("Search query — be specific for best results"),
+            }),
+            execute: async ({ query }) => {
+                const apiKey = process.env.PERPLEXITY_API_KEY;
+                if (!apiKey) return "Web search not configured (PERPLEXITY_API_KEY missing).";
+                try {
+                    const res = await fetch("https://api.perplexity.ai/chat/completions", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${apiKey}`,
+                        },
+                        body: JSON.stringify({
+                            model: "sonar",
+                            messages: [{ role: "user", content: query }],
+                        }),
+                    });
+                    if (!res.ok) {
+                        const body = await res.text();
+                        return `Search API error: ${body.slice(0, 200)}`;
+                    }
+                    const data = await res.json() as any;
+                    const answer = data.choices?.[0]?.message?.content || "";
+                    const citations = data.citations || [];
+                    const citeStr = citations.length > 0
+                        ? "\n\nSources: " + citations.slice(0, 5).join(", ")
+                        : "";
+                    return answer + citeStr;
+                } catch (err: any) {
+                    return `Web search failed: ${err.message}`;
+                }
+            },
+        }),
+
+        search_products: tool({
+            description: "Search Finale Inventory for products by keyword in name, description, or SKU. Use when looking for products by name, ingredient, vendor, or description (e.g. 'kashi', 'kelp', 'castings'). Returns matching SKUs with stock levels.",
+            inputSchema: z.object({
+                keyword: z.string().describe("Search keyword"),
+                limit: z.number().optional().describe("Max results (default 15)"),
+            }),
+            execute: async ({ keyword, limit }) => {
+                try {
+                    const result = await finaleClient.searchProducts(keyword, limit || 15);
+                    return result.telegramMessage;
+                } catch (err: any) {
+                    return `Product search failed: ${err.message}`;
+                }
+            },
+        }),
+
+        system_health: tool({
+            description: "Check Aria system health — bot status, recent cron runs, agent exceptions, and activity counts.",
+            inputSchema: z.object({}),
+            execute: async () => {
+                try {
+                    const { exec } = await import("child_process");
+                    const { promisify } = await import("util");
+                    const execAsync = promisify(exec);
+
+                    // PM2 status
+                    let pm2Status = "unknown";
+                    try {
+                        const { stdout } = await execAsync("npx pm2 jlist 2>/dev/null", { timeout: 10000 });
+                        const procs = JSON.parse(stdout);
+                        pm2Status = procs.map((p: any) =>
+                            `${p.name}: ${p.pm2_env?.status || 'unknown'} (${p.monit?.cpu || 0}% CPU, ${Math.round((p.monit?.memory || 0) / 1024 / 1024)}MB)`
+                        ).join("\n");
+                    } catch {
+                        pm2Status = "pm2 status unavailable";
+                    }
+
+                    // Recent cron runs
+                    let cronInfo = "unavailable";
+                    try {
+                        const { getAllCronRunStatuses } = await import("../scheduler/cron-registry");
+                        const statuses = getAllCronRunStatuses();
+                        const recent = [...statuses.entries()]
+                            .sort((a, b) => (b[1].lastRun?.getTime() || 0) - (a[1].lastRun?.getTime() || 0))
+                            .slice(0, 8);
+                        cronInfo = recent.map(([name, s]) =>
+                            `${name}: ${s.lastStatus || 'never'} (${s.lastDurationMs || 0}ms)`
+                        ).join("\n");
+                    } catch {
+                        cronInfo = "cron registry unavailable";
+                    }
+
+                    return `═══ SYSTEM HEALTH ═══\n\n── PM2 Processes ──\n${pm2Status}\n\n── Recent Cron Runs ──\n${cronInfo}`;
+                } catch (err: any) {
+                    return `Health check failed: ${err.message}`;
+                }
             },
         }),
     };
