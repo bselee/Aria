@@ -2129,8 +2129,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         // Days until earliest build that needs this component
                         const buildMs = forward ? new Date(forward.earliestBuildDate).getTime() - Date.now() : Infinity;
                         const buildDays = buildMs / 86_400_000;
-                        if (buildDays < leadTimeDays) urgency = 'critical';
-                        else if (urgency === 'ok' || urgency === 'watch') urgency = 'warning';
+                        // HERMIA(2026-06-01): Guard forward-demand critical bump.
+                        // Previously any shortfall + build within lead time forced critical,
+                        // even when the item had 1028d or 1920d of runway. A BOM explosion
+                        // for a year of builds shouldn't override "we have 3 years of stock."
+                        // Rule: force critical ONLY if runway is genuinely short (< leadTime × 3),
+                        // so items with plenty of normal-velocity stock stay in planning buckets.
+                        const runwayCap = leadTimeDays * 3;
+                        if (buildDays < leadTimeDays && adjustedRunwayDays < runwayCap) urgency = 'critical';
+                        else if (forwardShortfall > 0 && (urgency === 'ok' || urgency === 'watch')) urgency = 'warning';
                     }
                     const projectedNextOrderDate = projectNextOrderDate({
                         stockOnHand,
@@ -2176,7 +2183,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     );
                     // Floor the suggestion at the forward shortfall — we have to
                     // cover scheduled builds first, then add coverage cushion.
-                    const rawSuggestedQty = Math.max(baseNeed, forwardShortfall);
+                    // HERMIA(2026-06-01): Cap forward shortfall influence at 180d of supply.
+                    // BOM explosions for annual builds produce absurd shortfalls
+                    // (e.g., 2.8M units = 24 years of rice bran). The build schedule
+                    // should drive ordering cadence, not total coverage in one PO.
+                    const MAX_COVERAGE_DAYS = 180;
+                    const cappedShortfall = dailyBurn > 0
+                        ? Math.min(forwardShortfall, dailyBurn * MAX_COVERAGE_DAYS)
+                        : forwardShortfall;
+                    const rawSuggestedQty = Math.max(baseNeed, cappedShortfall);
                     const rounded = applyCommonOrderRounding({
                         rawSuggestedQty,
                         purchaseQtys: compActivity.purchaseQtys,

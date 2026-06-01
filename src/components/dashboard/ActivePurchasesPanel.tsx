@@ -156,17 +156,6 @@ export default function ActivePurchasesPanel() {
     // Draft notification: flash when a PO is drafted/committed in the Ordering pane
     const [draftFlash, setDraftFlash] = useState<{ vendor: string; orderId: string; at: number } | null>(null);
     const prevDraftRef = useRef<number>(0);
-    useEffect(() => {
-        const d = lifecycle.lastDraft;
-        if (!d || d.draftedAt === prevDraftRef.current) return;
-        prevDraftRef.current = d.draftedAt;
-        setDraftFlash({ vendor: d.vendorName, orderId: d.orderId, at: d.draftedAt });
-        // Auto-refresh purchases to pick up the new PO
-        fetchPurchases(true);
-        // Clear flash after 4 seconds
-        const tid = setTimeout(() => setDraftFlash(null), 4000);
-        return () => clearTimeout(tid);
-    }, [lifecycle.lastDraft, fetchPurchases]);
 
     useEffect(() => {
         const stored = localStorage.getItem("aria-dash-purchases-dismissed");
