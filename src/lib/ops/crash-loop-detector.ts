@@ -10,6 +10,7 @@
 
 import { createClient } from "@/lib/supabase";
 import type { Telegraf } from "telegraf";
+import { criticalAlert } from "@/lib/intelligence/alert-gate";
 
 const CRASH_LOOP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const CRASH_LOOP_THRESHOLD = 3; // 3+ restarts in window = crash loop
@@ -60,7 +61,7 @@ export async function detectAndAlertCrashLoop(bot: Telegraf): Promise<void> {
             ].join("\n");
 
             try {
-                await bot.telegram.sendMessage(chatId, alert, { parse_mode: "HTML" });
+                await criticalAlert(bot, chatId, alert, { parse_mode: "HTML" });
                 console.log(`[CrashLoop] 🚨 Alerted Will: ${restartCount} restarts in 5m`);
             } catch (err: any) {
                 console.warn(`[CrashLoop] Failed to send Telegram alert: ${err.message}`);

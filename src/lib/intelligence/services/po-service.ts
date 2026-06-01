@@ -36,6 +36,7 @@ import { runPOSweep as runPOSweepModule } from "../../matching/po-sweep";
 import { leadTimeService } from "../../builds/lead-time-service";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { businessHoursAlert } from "../alert-gate";
 
 const execAsync = promisify(exec);
 const RECONCILE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -269,7 +270,7 @@ export class POService {
                 .limit(1);
 
             if (!data || data.length === 0) {
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID || "",
                     `No successful ${vendor} reconciliation run in the last 24h. ` +
                     `Last run may have failed or not run. Check reconciliation_runs table.`,
@@ -450,7 +451,7 @@ export class POService {
         } catch (err: any) {
             console.error("PO Receiving error:", err.message);
             try {
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID || "",
                     `pollPOReceivings error: ${err.message}`,
                 );
@@ -840,7 +841,7 @@ export class POService {
                 );
                 const msg = `Tracking Updates (${trackingUpdatesBatch.length})\n\n${lines.join("\n")}`;
                 try {
-                    await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
+                    await businessHoursAlert(this.bot, process.env.TELEGRAM_CHAT_ID || "", msg, { parse_mode: "Markdown" });
                 } catch (e: any) {
                     console.warn("[po-sync] tracking batch send failed:", e.message);
                 }

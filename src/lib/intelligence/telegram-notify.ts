@@ -5,13 +5,23 @@
  *          that don't have access to the Telegraf bot instance.
  * @author  Hermia
  * @created 2026-05-28
+ * @updated 2026-05-30 — Added business hours gate (Mon-Fri 7AM-5PM Denver)
  */
+
+import { isBusinessHours } from './alert-gate';
 
 /**
  * Send a Markdown message to Bill's Telegram chat.
+ * Gated by business hours — drops silently outside Mon-Fri 7AM-5PM.
  * Falls back to plain text if Markdown parsing fails.
  */
 export async function sendTelegramNotify(text: string): Promise<void> {
+    // Gate: only send during business hours
+    if (!isBusinessHours()) {
+        const preview = text.slice(0, 60).replace(/\n/g, ' ');
+        console.log(`[telegram-notify] Gated (outside business hours): "${preview}..."`);
+        return;
+    }
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!token || !chatId) {
@@ -69,6 +79,12 @@ export async function sendTelegramNotifyWithButtons(
     text: string,
     buttons: TelegramInlineButton[][],
 ): Promise<void> {
+    // Gate: only send during business hours
+    if (!isBusinessHours()) {
+        const preview = text.slice(0, 60).replace(/\n/g, ' ');
+        console.log(`[telegram-notify] Gated buttons (outside business hours): "${preview}..."`);
+        return;
+    }
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!token || !chatId) {

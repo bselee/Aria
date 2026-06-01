@@ -19,6 +19,7 @@ import type { Telegraf } from 'telegraf';
 import { APAgent } from './ap-agent';
 import { unifiedTextGeneration } from './llm';
 import { createClient } from '../supabase';
+import { businessHoursAlert } from "./alert-gate";
 
 // ── Directory layout ──────────────────────────────────────────────────────────
 
@@ -75,7 +76,7 @@ async function notifyTelegram(bot: Telegraf, message: string) {
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!chatId || !bot) return;
     try {
-        await bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
+        await businessHoursAlert(bot, chatId, message, { parse_mode: "HTML" });
     } catch (err: any) {
         console.warn(`[sandbox] Telegram notify failed: ${err.message}`);
     }

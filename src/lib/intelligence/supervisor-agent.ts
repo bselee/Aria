@@ -13,6 +13,7 @@ import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 import { remember, recall, Memory } from "./memory";
 import { recordFeedback } from "./feedback-loop";
+import { criticalAlert } from "./alert-gate";
 
 export class SupervisorAgent {
     private bot: Telegraf;
@@ -268,7 +269,8 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
         const stackSnippet = errorStack.split('\n').slice(0, 3).join('\n');
 
         try {
-            await this.bot.telegram.sendMessage(
+            await criticalAlert(
+                this.bot,
                 chatId,
                 `🚨 <b>Agent Crash Escalation</b> 🚨\n\n<b>Agent:</b> ${agentName}\n<b>Supervisor Assessment:</b> Fix required.\n<b>Error:</b> ${errorMessage}\n<pre>${stackSnippet}</pre>`,
                 { parse_mode: 'HTML' }

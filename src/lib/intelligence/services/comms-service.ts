@@ -12,6 +12,7 @@ import { finaleClient } from '../../finale/client';
 import { CalendarClient } from '../../google/calendar';
 import { loadActivePurchases } from '../../purchasing/active-purchases';
 import * as agentTask from '../agent-task';
+import { businessHoursAlert } from '../alert-gate';
 
 export class CommsService {
   constructor(private bot: Telegraf) {}
@@ -162,11 +163,11 @@ export class CommsService {
     }
     if (chatId && body.length > 0) {
       try {
-        await this.bot.telegram.sendMessage(chatId, body, { parse_mode: "Markdown" });
+        await businessHoursAlert(this.bot, chatId, body, { parse_mode: "Markdown" });
       } catch (err: any) {
         console.warn("[CommsService] daily summary send failed, retrying without markdown:", err.message);
         try {
-          await this.bot.telegram.sendMessage(chatId, body);
+          await businessHoursAlert(this.bot, chatId, body);
         } catch (err2: any) {
           console.error("[CommsService] daily summary send failed completely:", err2.message);
         }
@@ -187,7 +188,7 @@ export class CommsService {
 
       if (summary.totalSamples === 0) {
         if (chatId) {
-          await this.bot.telegram.sendMessage(chatId,
+          await businessHoursAlert(this.bot, chatId,
             "📊 *Weekly Reorder Retro*\n\nNo calibrated recommendations in the last 7 days yet — calibration loop needs received POs to score against. Check back next week.",
             { parse_mode: "Markdown" }
           );
@@ -220,7 +221,7 @@ export class CommsService {
       }
 
       if (chatId) {
-        await this.bot.telegram.sendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" });
+        await businessHoursAlert(this.bot, chatId, lines.join("\n"), { parse_mode: "Markdown" });
       }
     } catch (err: any) {
       console.error("[CommsService] weekly summary failed:", err.message);
