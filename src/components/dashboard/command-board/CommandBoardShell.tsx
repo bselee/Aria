@@ -267,8 +267,12 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         } as CommandBoardSummary;
     }, [summary, tasks, heartbeats, crons, agents.length]);
 
+    const cronHealthy = summaryCounts.crons.healthy;
+    const cronNeverRun = summaryCounts.crons.neverRun ?? 0;
     const cronAccent = summaryCounts.crons.error > 0 ? "bg-rose-500"
-        : summaryCounts.crons.healthy > 0 ? "bg-emerald-500" : "bg-zinc-600";
+        : cronHealthy > 0 ? "bg-emerald-500"
+        : cronNeverRun > 0 ? "bg-zinc-500"
+        : "bg-zinc-600";
 
     const needsWill = summaryCounts.lanes["needs-will"] ?? 0;
 
@@ -292,7 +296,9 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                     />
                     <HealthChip
                         label="crons"
-                        value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
+                        value={cronNeverRun === summaryCounts.crons.total
+                            ? `${summaryCounts.crons.total} pending`
+                            : `${cronHealthy}/${summaryCounts.crons.total}`}
                         accent={cronAccent}
                     />
                 </div>
