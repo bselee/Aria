@@ -28,6 +28,9 @@ vi.mock('../supabase', () => ({
                 })),
             })),
             insert: vi.fn().mockResolvedValue({ data: {} }),
+            update: vi.fn(() => ({
+                eq: vi.fn().mockResolvedValue({ data: {} }),
+            })),
             upsert: vi.fn().mockResolvedValue({ data: {} }),
         })),
     })),
@@ -121,14 +124,14 @@ describe('autoProcessAutonomyDrafts', () => {
         );
     });
 
-    it('should autonomously commit and email POs via fallback for Level 2 vendors', async () => {
-        vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(2); // Auto-Commit & Send
+    it('should set Level 2 vendors to REVIEW state without auto-sending', async () => {
+        vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(2); // Auto-Review (no auto-send)
         vi.mocked(poSender.lookupVendorOrderEmail).mockResolvedValue({ email: 'orders@sustainable.com', source: 'vendor_profiles' });
 
         const result = await autoProcessAutonomyDrafts(mockBot);
 
         expect(result.processed).toBe(2);
-        expect(poSender.commitAndSendPO).toHaveBeenCalled();
+        expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // No auto-send
         expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
             '12345',
             expect.stringContaining('Level 2'),

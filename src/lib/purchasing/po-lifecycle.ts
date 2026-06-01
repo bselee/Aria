@@ -131,6 +131,9 @@ export async function transitionLifecycleState(
             ).get(poNumber) as { lifecycle_state: string } | undefined;
             if (existing) currentState = existing.lifecycle_state;
 
+            // Silent skip: already in the target state
+            if (currentState === toState) return;
+
             // Validate transition
             try {
                 assertValidTransition(currentState, toState);
