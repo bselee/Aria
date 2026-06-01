@@ -665,23 +665,108 @@ const followupCommand: BotCommand = {
             },
         };
 
-                export const hermiaCommands: BotCommand[] = [
-                    cognitionCommand,
-                    priorityCommand,
-                    orderNowCommand,
-                    ballCommand,
-                    orderGuardCommand,
-                    followupCommand,
-                    emailCommand,
-                    emailSearchCommand,
-            orderCommand,
-                    apSummaryCommand,
-                    taskCommand,
-                    budgetCommand,
-                    memoriesCommand,
-                    agentsCommand,
-                    hermiaCommand,
-                    shipCommand,
-                    costCommand,
-                    apHealthCommand,
-                ];
+        /**
+         * /reclassify — Reclassify an invoice between dropship flow-through and real invoice.
+         * Usage: /reclassify <gmail_message_id> <dropship|real>
+         *   OR try: /reclassify <vendor_name> <dropship|real>
+         *
+         * Flipping creates a new ap_activity_log entry recording the reclassification so
+         * the dashboard and pipeline both see the updated intent on next poll.
+         */
+        const reclassifyCommand: BotCommand = {
+            name: "reclassify",
+            description: "Reclassify an invoice: /reclassify <msg_id|vendor> <dropship|real>",
+            handler: async (ctx, deps) => {
+                const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+                const parts = text.split(/\s+/).slice(1); // remove /reclassify
+
+                if (parts.length < 2) {
+                    await ctx.reply(
+                        `📋 *Invoice Reclassification*\n\n` +
+                        `Usage:\n` +
+                        `/reclassify <gmail_message_id|vendor_name> <dropship|real>\n\n` +
+                        `Examples:\n` +
+                        `/reclassify 190a5f7bb2f3afc4 dropship — mark message as flow-through\n` +
+                        `/reclassify "Logan Labs" real — mark vendor as needs analysis\n\n` +
+                        `This flips how the system treats that invoice going forward.`,
+                        { parse_mode: 'Markdown' }
+                    );
+                    return;
+                }
+
+                const identifier = parts[0];
+                const targetClass = parts[1].toLowerCase();
+
+                if (targetClass !== 'dropship' && targetClass !== 'real') {
+                    await ctx.reply('❌ Target must be either `dropship` or `real`.', { parse_mode: 'Markdown' });
+                    return;
+                }
+
+                const classification = targetClass === 'dropship' ? 'dropship_flow_through' : 'real_invoice';
+
+                try {
+                    const { createClient } = await import('@/lib/supabase');
+                    const supabase = createClient();
+                    if (!supabase) {
+                        await ctx.reply('❌ Supabase not available.');
+                        return;
+                    }
+
+                    // Write reclassification decision to activity log
+                    const { error } = await supabase.from('ap_activity_log').insert({
+                        email_from: `reclassify-command`,
+                        email_subject: `Reclassification: ${identifier} → ${classification}`,
+                        intent: 'RECLASSIFICATION',
+                        action_taken: `Reclassified ${identifier} to ${classification}`,
+                        metadata: {
+                            classification,
+                            original_identifier: identifier,
+                            reclassified_by: 'telegram_command',
+                            reclassified_at: new Date().toISOString(),
+                            previous_classification: null, // optimistic — we don't read the current one here
+                        },
+                    });
+
+                    if (error) {
+                        await ctx.reply(`❌ Failed to record reclassification: ${error.message}`);
+                        return;
+                    }
+
+                    await ctx.reply(
+                        `✅ *Reclassification recorded*\n\n` +
+                        `Invoice: \`${identifier}\`\n` +
+                        `New classification: \`${classification}\`\n\n` +
+                        `The dashboard and pipeline will pick this up on next poll (` +
+                        (classification === 'dropship_flow_through'
+                            ? 'invoice will be treated as flow-through, no PO matching'
+                            : 'invoice will go through full reconciliation pipeline'
+                        ) + `).`,
+                        { parse_mode: 'Markdown' }
+                    );
+                } catch (err: any) {
+                    await ctx.reply(`❌ Reclassification failed: ${err.message}`);
+                }
+            },
+        };
+
+        export const hermiaCommands: BotCommand[] = [
+                            cognitionCommand,
+                            priorityCommand,
+                            orderNowCommand,
+                            ballCommand,
+                            orderGuardCommand,
+                            followupCommand,
+                            emailCommand,
+                            emailSearchCommand,
+                    orderCommand,
+                            apSummaryCommand,
+                            taskCommand,
+                            budgetCommand,
+                            memoriesCommand,
+                            agentsCommand,
+                            hermiaCommand,
+                            shipCommand,
+                            costCommand,
+                            apHealthCommand,
+                    reclassifyCommand,
+                        ];

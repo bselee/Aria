@@ -50,6 +50,7 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  */
 import { type VendorRoutingRule, matchVendorRouting } from "./ap/vendor-router";
 import { businessHoursAlert } from "./alert-gate";
+import { classifyInvoice, type ClassificationResult } from "@/config/invoice-classification";
 
 function countMeaningfulLineItems(invoice: InvoiceData): number {
     return (invoice.lineItems || []).filter((li) => {
@@ -302,7 +303,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 const fromEmailMatch = from.match(/<([^>]+)>/);
                 const fromEmail = fromEmailMatch ? fromEmailMatch[1] : from.trim();
                 const fromName = from.replace(/<[^>]+>/, '').trim();
-                const routingRule = matchVendorRouting(fromEmail, fromName);
+                const routingRule = matchVendorRouting(fromEmail, fromName, subject);
                 if (routingRule) {
                     console.log(`     -> Vendor routing match: ${routingRule.label} (${routingRule.action})`);
 
@@ -447,7 +448,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             });
                             await this.logActivity(supabase, from, subject, "DROPSHIP",
                                 `${routingRule.label} — forwarded to Bill.com (${pdfNames}), no PO matching`,
-                                { attachments: pdfNames, dropship: true, vendor: routingRule.label });
+                                {
+                                    attachments: pdfNames,
+                                    dropship: true,
+                                    vendor: routingRule.label,
+                                    classification: 'dropship_flow_through',
+                                    classification_reason: `Vendor routing rule: ${routingRule.action} (${routingRule.label})`,
+                                });
                             console.log(`     ✅ Dropship complete: forwarded, marked read, no PO matching`);
                             // Phase 1 flow canary: emit the trigger that spawns
                             // the dropship_forward flow run. Best-effort — a
@@ -761,6 +768,19 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 }
                             }
 
+                            // ── BOL/shipping document detection ───────────────────────────
+                            // Skip forwarding + reconciliation for shipping documents that look
+                            // like invoices but are actually Bills of Lading, waybills, or PRO
+                            // forms. These have a dollar amount but no PO to match against.
+                            const isShippingDoc = /\b(bol|bill\s*of\s*lading|waybill|pro\s*#|pro\s*number)\b/i.test(part.filename!);
+                            if (isShippingDoc) {
+                                console.log(`     ⏭️ Skipping shipping document (not an invoice): ${part.filename}`);
+                                await this.logActivity(supabase, from, subject, "SHIPPING_DOC",
+                                    `Skipped non-invoice shipping document: ${part.filename}`,
+                                    { filename: part.filename, reason: 'bol_or_shipping_doc' });
+                                continue;
+                            }
+
                             // 2. Forward strictly to buildasoilap@bill.com IMMEDIATELY
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
                             const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, buffer);
@@ -814,7 +834,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         }
                     });
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, { attachments: pdfNames });
+                    await this.logActivity(supabase, from, subject, "INVOICE", `Forwarded to Bill.com (${pdfNames})`, {
+                        attachments: pdfNames,
+                        classification: 'real_invoice',
+                        classification_reason: 'LLM classified as INVOICE — full reconciliation pipeline',
+                    });
                 } else {
                     console.log(`     ⚠️ No PDF found on INVOICE. Checking for inline links...`);
                     const emailText = this.extractEmailText(payload, snippet);
@@ -1121,6 +1145,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             let finalePONumber: string | null = null;
             let matchSource = "none";
             let forceApproval = false;
+            // Track whether the vendor has any PO history in Finale at all.
+            // When true, unmatched invoices are actionable alerts. When false,
+            // the vendor doesn't work via BAS POs (dropship, local, one-off) —
+            // suppress the "No PO found" notification.
+            let vendorHasPOs = false;
 
             if (!isAAACooper) {
                 finalePONumber = invoiceData.poNumber || null;
@@ -1246,6 +1275,12 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             invoiceData.invoiceDate,
                             30 // ±30-day window
                         );
+                        // Track whether this vendor has any PO history in Finale at all.
+                        // When candidates.length > 0, this vendor regularly uses POs — an
+                        // unmatched invoice IS a signal worth flagging. When candidates is
+                        // empty, the vendor doesn't operate via BAS POs (dropship, local
+                        // purchase, one-off), and unmatched is expected — suppress the alert.
+                        vendorHasPOs = candidates.length > 0;
                         // Filter to open/committed/draft POs within 10% of invoice total.
                         // DECISION(2026-05-20): Keeping this cap tight — all standard vendors
                         // (Farm Fuel, Grassroots, Marion Ag, etc.) must have the Finale PO#
@@ -1280,6 +1315,25 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             outcome.matchedPO = matched;
             outcome.poNumber = finalePONumber || null;
             console.log(`     → PO match: ${matched ? finalePONumber + " (" + matchSource + ")" : "none"}`);
+            
+            // Lifecycle: transition PO to INVOICED when successfully matched
+            if (matched && finalePONumber) {
+                setImmediate(() => {
+                    import("../purchasing/po-lifecycle").then(({ transitionLifecycleState }) => {
+                        transitionLifecycleState(
+                            finalePONumber!,
+                            "INVOICED",
+                            "ap-agent",
+                            {
+                                invoiceNumber: invoiceData.invoiceNumber || null,
+                                vendorName: invoiceData.vendorName || null,
+                                matchSource,
+                                filename,
+                            }
+                        ).catch(() => {});
+                    }).catch(() => {});
+                });
+            }
 
             // 3. Save to DB — audit trail and daily recap source
             const { data: docData } = await supabase.from("documents").insert({
@@ -1400,8 +1454,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }
             });
 
-            // 4. Notify Will — unmatched gets info message
-            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, from);
+            // 4. Notify Will — unmatched gets info message (suppressed for non-PO vendors)
+            await this.sendNotification(invoiceData, matched, finalePONumber, matchSource, from, vendorHasPOs);
 
             // 5. Reconcile against Finale
             // Reconciler fetches the live PO, runs all guardrails, and either
@@ -1443,6 +1497,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 },
                 resolvedAt: new Date(),
             }).catch(() => { /* never throws — swallow silently */ });
+
+            // Vendor pattern learning: record match failure for improved future OCR
+            setImmediate(() => {
+                import("./vendor-po-patterns").then(({ recordMatchFailure }) => {
+                    recordMatchFailure(
+                        invoiceData.vendorName || "",
+                        retryReasons?.join(",") || "po_missing"
+                    ).catch(() => {});
+                }).catch(() => {});
+            });
             return outcome;
 
         } catch (err: any) {
@@ -1512,10 +1576,19 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         poNumber: string | null,
         matchSource: string,
         from: string,
+        vendorHasPOs: boolean = false,
     ) {
+        // Suppress "No PO found" alerts for vendors that don't operate via BAS POs.
+        // AAA Cooper is freight-only — always suppress.
         const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoice.vendorName || "");
         if (isAAACooper) {
             console.log(`     → Suppressing Telegram notification for AAA Cooper`);
+            return;
+        }
+        // When the vendor has zero PO history in Finale (dropship, local purchase,
+        // one-off vendor), an unmatched invoice is expected — not worth alerting.
+        if (!matched && !vendorHasPOs) {
+            console.log(`     → Suppressing unmatched alert for "${invoice.vendorName}" — no Finale PO history`);
             return;
         }
 

@@ -9,6 +9,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase';
 import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
+import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -29,6 +30,8 @@ export type InvoiceQueueItem = {
     dollarImpact: number | null;
     balanceWarning: string | null;
     metadata: Record<string, unknown> | null;
+    classification: InvoiceClassification;
+    classificationReason: string | null;
 };
 
 export type InvoiceQueueStats = {
@@ -201,10 +204,19 @@ export async function GET(req: NextRequest) {
         let totalDollarImpact = 0;
 
         const invoices: InvoiceQueueItem[] = rows.flatMap(row => {
-            // Filter dropship vendors — they get forwarded to Bill.com directly,
-            // never need AP review and should never appear in the queue.
-            const vendorLower = (row.vendor_name ?? '').toLowerCase();
-            if (KNOWN_DROPSHIP_KEYWORDS.some(kw => vendorLower.includes(kw.toLowerCase()))) {
+            const vendorName = row.vendor_name ?? 'Unknown';
+            const fromEmail = row.email_from ?? '';
+            const subject = row.email_subject ?? '';
+
+            // Use the unified classification module — single source of truth
+            const classResult = classifyInvoice({
+                vendorName,
+                fromEmail,
+                subject,
+            });
+
+            // Dropship flow-through invoices never appear in the queue
+            if (classResult.classification === 'dropship_flow_through') {
                 return [];
             }
             const invNum: string = row.invoice_number ?? '';
@@ -238,23 +250,25 @@ export async function GET(req: NextRequest) {
             if (dollarImpact !== null) totalDollarImpact += dollarImpact;
 
             return [{
-                id: String(row.id),
-                activityLogId: hasActivityLog ? String(matchedLog.id) : null,
-                invoiceNumber: invNum,
-                vendorName: row.vendor_name ?? 'Unknown',
-                total: Number(row.total ?? 0),
-                subtotal: Number(row.subtotal ?? 0),
-                freight: row.freight !== null ? Number(row.freight) : null,
-                tax: row.tax !== null ? Number(row.tax) : null,
-                tariff: row.tariff !== null ? Number(row.tariff) : null,
-                labor: row.labor !== null ? Number(row.labor) : null,
-                status: resolvedStatus,
-                poNumber: row.po_number ?? null,
-                processedAt,
-                dollarImpact,
-                balanceWarning,
-                metadata: hasActivityLog ? (matchedLog?.metadata ?? null) : null,
-            }];
+                            id: String(row.id),
+                            activityLogId: hasActivityLog ? String(matchedLog.id) : null,
+                            invoiceNumber: invNum,
+                            vendorName,
+                            total: Number(row.total ?? 0),
+                            subtotal: Number(row.subtotal ?? 0),
+                            freight: row.freight !== null ? Number(row.freight) : null,
+                            tax: row.tax !== null ? Number(row.tax) : null,
+                            tariff: row.tariff !== null ? Number(row.tariff) : null,
+                            labor: row.labor !== null ? Number(row.labor) : null,
+                            status: resolvedStatus,
+                            poNumber: row.po_number ?? null,
+                            processedAt,
+                            dollarImpact,
+                            balanceWarning,
+                            metadata: hasActivityLog ? (matchedLog?.metadata ?? null) : null,
+                            classification: classResult.classification,
+                            classificationReason: classResult.reason,
+                        }];
         });
 
         const needsEyes = {
