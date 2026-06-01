@@ -81,7 +81,20 @@ export function getLocalDb() {
             reason TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_bb_monthly ON browserbase_sessions(created_at);
-        CREATE INDEX IF NOT EXISTS idx_bb_task_reuse ON browserbase_sessions(task_type, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_bb_task_reuse ON browserbase_sessions(task_type, expires_at);
+
+                -- KAIZEN(2026-06-01): Receiving data cache — caches Finale PO shipment
+                -- receiving data with TTL to avoid repeated API calls during reconciliation.
+                CREATE TABLE IF NOT EXISTS receiving_cache (
+                    po_number TEXT PRIMARY KEY,
+                    received_qty_total REAL DEFAULT 0,
+                    line_items_json TEXT NOT NULL DEFAULT '[]',
+                    fully_received INTEGER DEFAULT 0,
+                    last_receipt_date TEXT,
+                    fetched_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    expire_at DATETIME NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_recv_cache_expire ON receiving_cache(expire_at);
     `);
 
     return dbInstance;
