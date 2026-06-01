@@ -1,7 +1,22 @@
-// DECISION(2026-02-27): These vendors always ship directly to customers —
-// there is NEVER a matching Finale PO for them. Skip LLM classification and
-// auto-route as DROPSHIP_INVOICE (forward to bill.com, no reconciliation).
-// Add vendor name or email fragments (case-insensitive) as needed.
+/**
+ * @file    src/config/dropship-vendors.ts
+ * @purpose Backward-compatible re-export of the dropship vendor list.
+ *          SOURCE OF TRUTH has moved to src/config/invoice-classification.ts.
+ *
+ *          The KNOWN_DROPSHIP_KEYWORDS constant is preserved here for backward
+ *          compatibility, but NEW code should import `classifyInvoice` or
+ *          `isDropshipFlowThrough` directly from `@/config/invoice-classification`.
+ *
+ * @deprecated Import from @/config/invoice-classification instead.
+ * @author  Aria
+ * @created 2026-02-27
+ * @updated 2026-06-01 — Now delegates to the unified invoice-classification module.
+ */
+
+/**
+ * Legacy keyword list — kept for backward compat.
+ * New code: use classifyInvoice() from @/config/invoice-classification.
+ */
 export const KNOWN_DROPSHIP_KEYWORDS = [
     "autopot",
     "logan labs",
@@ -10,5 +25,4 @@ export const KNOWN_DROPSHIP_KEYWORDS = [
     "evergreengrow",
     "abel",
     "abelsace",
-    // add more: "vendor name fragment" or "emaildomain.com"
 ];

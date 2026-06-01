@@ -21,6 +21,7 @@ import {
     ReconciliationResult,
     TrackingUpdate,
 } from "../lib/finale/reconciler";
+import { classifyInvoice } from "../config/invoice-classification";
 
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
@@ -212,6 +213,18 @@ async function main() {
         console.log(`      Amount Due:   $${invoiceData.amountDue}`);
         console.log(`      Tracking:     ${invoiceData.trackingNumbers?.join(", ") || "none"}`);
         console.log(`      Confidence:   ${invoiceData.confidence}`);
+
+        // Classify invoice as dropship flow-through vs real invoice
+        const classResult = classifyInvoice({
+            vendorName: invoiceData.vendorName,
+            fromEmail: from,
+            subject,
+        });
+        const classIcon = classResult.classification === 'dropship_flow_through' ? '⟳' : '🔍';
+        console.log(`      Classification: ${classIcon} ${classResult.classification} — ${classResult.reason}`);
+        if (classResult.matchedRule) {
+            console.log(`      Matched rule: ${classResult.matchedRule}`);
+        }
 
         for (const item of invoiceData.lineItems || []) {
             console.log(`        - [${item.sku || "—"}] ${item.description}: qty=${item.qty} × $${item.unitPrice} = $${item.total}`);

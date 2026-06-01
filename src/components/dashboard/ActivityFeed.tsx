@@ -784,7 +784,18 @@ export default function ActivityFeed() {
                                     <div className="flex items-center gap-2">
                                         <Icon className={`w-4 h-4 ${isError ? "text-rose-400" : isPaused ? "text-amber-300" : needsReview ? "text-amber-400" : isSuccess ? "text-emerald-400" : isJunk ? "text-zinc-500" : "text-neon-blue"}`} />
                                         <span className="text-xs font-mono font-medium tracking-wider text-zinc-400 uppercase">{log.intent}</span>
-                                        {/* Review status badges */}
+                                                                                {/* Classification badge: dropship flow-through vs real invoice */}
+                                                                                {log.metadata?.classification === 'dropship_flow_through' && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-sky-500/10 text-sky-400 border border-sky-500/20">
+                                                                                        ⟳ FLOW-THROUGH
+                                                                                    </span>
+                                                                                )}
+                                                                                {log.metadata?.classification === 'real_invoice' && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                                                                                        🔍 NEEDS ANALYSIS
+                                                                                    </span>
+                                                                                )}
+                                                                                {/* Review status badges */}
                                         {isReviewed && !isDismissed && (
                                             <span className="text-[10px] font-mono px-1 py-px rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                                                 ✓ {log.reviewed_action}
