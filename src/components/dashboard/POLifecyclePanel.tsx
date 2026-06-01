@@ -1,7 +1,8 @@
 /**
  * @file    POLifecyclePanel.tsx
  * @purpose Dashboard panel showing PO lifecycle states as a visual flow.
- *          Displays a summary per state: ORDERED → INVOICED → RECONCILED → RECEIVED → COMPLETED
+ *          DISPLAYS error/loading/no-data/empty states cleanly.
+ *          State flow: ORDERED → INVOICED → RECONCILED → RECEIVED → COMPLETED
  * @author  Hermia
  * @created 2026-06-01
  * @deps    react
@@ -47,7 +48,6 @@ export default function POLifecyclePanel() {
             setError(null);
         } catch (e: any) {
             setError(e.message);
-            // Fallback: show empty counts
             setCounts({});
         } finally {
             setLoading(false);
@@ -56,7 +56,7 @@ export default function POLifecyclePanel() {
 
     useEffect(() => {
         fetchData();
-        const interval = setInterval(fetchData, 60000); // refresh every 60s
+        const interval = setInterval(fetchData, 60000);
         return () => clearInterval(interval);
     }, []);
 
@@ -88,7 +88,9 @@ export default function POLifecyclePanel() {
                 </div>
             </div>
 
-            {/* Error state */}
+            {/* Content area */}
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                {/* Error state */}
                 {error && (
                     <div className="text-xs text-red-600 bg-red-50 border border-red-200 p-2 rounded flex items-center gap-1">
                         <span>⚠️</span>
@@ -96,106 +98,105 @@ export default function POLifecyclePanel() {
                     </div>
                 )}
 
-                {!error && !counts && !loading && (
-                    <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 p-2 rounded flex items-center gap-1">
-                        <span>⏳</span>
-                        <span>No data yet — waiting for first sync</span>
+                {/* No data yet (initial load completed, nothing from API) */}
+                {!error && !loading && counts && total === 0 && (
+                    <div className="text-xs text-gray-500 bg-gray-50 border border-gray-200 p-2 rounded flex items-center gap-1">
+                        <span>📭</span>
+                        <span>No POs in lifecycle tracking yet</span>
                     </div>
                 )}
 
+                {/* Waiting for first sync (initial loading, no data returned yet) */}
                 {!error && loading && !counts && (
                     <div className="flex items-center justify-center py-6 text-gray-400 text-xs">
                         <span className="animate-pulse">Loading...</span>
                     </div>
                 )}
 
-                {/* Flow arrows */}
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                {error && (
-                    <div className="text-xs text-red-500 bg-red-50 p-2 rounded">
-                        {error}
-                    </div>
-                )}
-
-                {/* Flow arrows */}
-                <div className="flex items-center justify-between px-1 py-2">
-                    {STATE_ORDER.map((state, idx) => (
-                        <React.Fragment key={state}>
-                            <div
-                                className={`flex flex-col items-center justify-center w-14 h-14 rounded-full border-2 ${
-                                    STATE_COLORS[state] || "bg-gray-100"
-                                }`}
-                            >
-                                <span className="text-sm">{STATE_ICONS[state]}</span>
-                                <span className="text-[10px] font-bold leading-tight mt-0.5">
-                                    {counts?.[state] ?? 0}
-                                </span>
-                            </div>
-                            {idx < STATE_ORDER.length - 1 && (
-                                <div className="flex-1 flex items-center justify-center px-1">
-                                    <svg className="w-full h-4" viewBox="0 0 40 16">
-                                        <line
-                                            x1="0" y1="8" x2="35" y2="8"
-                                            stroke="#d1d5db" strokeWidth="2"
-                                        />
-                                        <polygon
-                                            points="35,8 30,4 30,12"
-                                            fill="#d1d5db"
-                                        />
-                                    </svg>
-                                </div>
-                            )}
-                        </React.Fragment>
-                    ))}
-                </div>
-
-                {/* State labels */}
-                <div className="flex justify-between px-1">
-                    {STATE_ORDER.map(state => (
-                        <span key={state} className="text-[10px] text-gray-500 text-center w-14">
-                            {state}
-                        </span>
-                    ))}
-                </div>
-
-                {/* Detail breakdown */}
-                <div className="mt-3 border-t border-gray-100 pt-2 space-y-1">
-                    {STATE_ORDER.map(state => {
-                        const count = counts?.[state] ?? 0;
-                        const pct = total > 0 ? Math.round((count / total) * 100) : 0;
-                        return (
-                            <div key={state} className="flex items-center gap-2 text-xs">
-                                <span className="w-20 text-gray-600 truncate">
-                                    {STATE_ICONS[state]} {state}
-                                </span>
-                                <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden">
+                {/* Flow content — only when we have data to show */}
+                {counts && total > 0 && (
+                    <>
+                        {/* Flow arrows */}
+                        <div className="flex items-center justify-between px-1 py-2">
+                            {STATE_ORDER.map((state, idx) => (
+                                <React.Fragment key={state}>
                                     <div
-                                        className={`h-full rounded-full transition-all duration-500 ${
-                                            state === "COMPLETED"
-                                                ? "bg-gray-400"
-                                                : state === "RECEIVED"
-                                                ? "bg-teal-400"
-                                                : state === "RECONCILED"
-                                                ? "bg-green-400"
-                                                : state === "INVOICED"
-                                                ? "bg-amber-400"
-                                                : "bg-blue-400"
+                                        className={`flex flex-col items-center justify-center w-14 h-14 rounded-full border-2 ${
+                                            STATE_COLORS[state] || "bg-gray-100"
                                         }`}
-                                        style={{ width: `${pct}%` }}
-                                    />
-                                </div>
-                                <span className="w-16 text-right text-gray-500 tabular-nums">
-                                    {count} ({pct}%)
-                                </span>
-                            </div>
-                        );
-                    })}
-                </div>
+                                    >
+                                        <span className="text-sm">{STATE_ICONS[state]}</span>
+                                        <span className="text-[10px] font-bold leading-tight mt-0.5">
+                                            {counts?.[state] ?? 0}
+                                        </span>
+                                    </div>
+                                    {idx < STATE_ORDER.length - 1 && (
+                                        <div className="flex-1 flex items-center justify-center px-1">
+                                            <svg className="w-full h-4" viewBox="0 0 40 16">
+                                                <line
+                                                    x1="0" y1="8" x2="35" y2="8"
+                                                    stroke="#d1d5db" strokeWidth="2"
+                                                />
+                                                <polygon
+                                                    points="35,8 30,4 30,12"
+                                                    fill="#d1d5db"
+                                                />
+                                            </svg>
+                                        </div>
+                                    )}
+                                </React.Fragment>
+                            ))}
+                        </div>
 
-                {/* Legend */}
-                <div className="mt-2 text-[10px] text-gray-400 text-center">
-                    {lastRefresh ? `Updated ${lastRefresh}` : ""}
-                </div>
+                        {/* State labels */}
+                        <div className="flex justify-between px-1">
+                            {STATE_ORDER.map(state => (
+                                <span key={state} className="text-[10px] text-gray-500 text-center w-14">
+                                    {state}
+                                </span>
+                            ))}
+                        </div>
+
+                        {/* Detail breakdown */}
+                        <div className="mt-3 border-t border-gray-100 pt-2 space-y-1">
+                            {STATE_ORDER.map(state => {
+                                const count = counts?.[state] ?? 0;
+                                const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+                                return (
+                                    <div key={state} className="flex items-center gap-2 text-xs">
+                                        <span className="w-20 text-gray-600 truncate">
+                                            {STATE_ICONS[state]} {state}
+                                        </span>
+                                        <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden">
+                                            <div
+                                                className={`h-full rounded-full transition-all duration-500 ${
+                                                    state === "COMPLETED"
+                                                        ? "bg-gray-400"
+                                                        : state === "RECEIVED"
+                                                        ? "bg-teal-400"
+                                                        : state === "RECONCILED"
+                                                        ? "bg-green-400"
+                                                        : state === "INVOICED"
+                                                        ? "bg-amber-400"
+                                                        : "bg-blue-400"
+                                                }`}
+                                                style={{ width: `${pct}%` }}
+                                            />
+                                        </div>
+                                        <span className="w-16 text-right text-gray-500 tabular-nums">
+                                            {count} ({pct}%)
+                                        </span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {/* Legend */}
+                        <div className="mt-2 text-[10px] text-gray-400 text-center">
+                            {lastRefresh ? `Updated ${lastRefresh}` : ""}
+                        </div>
+                    </>
+                )}
             </div>
         </div>
     );

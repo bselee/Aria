@@ -189,7 +189,7 @@ export async function transitionLifecycleState(
 /**
  * Get the last N transition events for a PO.
  */
-export async function getP̣OLifecycleHistory(
+export async function getPOLifecycleHistory(
     poNumber: string,
     limit: number = 10
 ): Promise<Array<Record<string, unknown>> | null> {
