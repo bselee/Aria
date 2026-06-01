@@ -33,6 +33,7 @@ import { FinaleClient } from "../../finale/client";
 import { resolveFinalePo, correlatePo, type CorrelationStrategy } from "../../finale/po-resolver";
 import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
+import { isBusinessHours } from "../alert-gate";
 import { createClient } from "../../supabase";
 import { findRelevantPatterns, storeVendorPattern } from "../vendor-memory";
 import { getAuthenticatedClient } from "../../gmail/auth";
@@ -70,6 +71,7 @@ export interface DefaultInboxInvoiceResult {
 // ── Telegram alert (fetch-based, no Telegraf dependency) ──────────────────────
 
 async function sendTelegramAlert(html: string): Promise<void> {
+    if (!isBusinessHours()) { console.log(`[default-inbox-invoice] Gated (outside business hours)`); return; }
     const token  = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!token || !chatId) return;

@@ -10,6 +10,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createClient } from '../supabase';
+import { businessHoursAlert } from "./alert-gate";
 
 const execAsync = promisify(exec);
 
@@ -232,7 +233,7 @@ export async function runPurchasingIntelligence(options: {
     if (botToken && chatId && (newHighNeedSkus.length > 0 || newPendingRequests.length > 0)) {
       const { Telegraf } = await import('telegraf');
       const bot = new Telegraf(botToken);
-      await bot.telegram.sendMessage(chatId, telegramMessage, { parse_mode: 'HTML' });
+      await businessHoursAlert(bot, chatId, telegramMessage, { parse_mode: "HTML" });
     }
 
     return {
@@ -253,7 +254,7 @@ export async function runPurchasingIntelligence(options: {
       try {
         const { Telegraf } = await import('telegraf');
         const bot = new Telegraf(botToken);
-        await bot.telegram.sendMessage(
+        await businessHoursAlert(bot, 
           chatId,
           `❌ <b>Purchasing Intelligence Failed</b>\n\n<pre>${err.message}</pre>`,
           { parse_mode: 'HTML' }

@@ -49,6 +49,7 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  * This file now imports VendorRoutingRule + matchVendorRouting from there.
  */
 import { type VendorRoutingRule, matchVendorRouting } from "./ap/vendor-router";
+import { businessHoursAlert } from "./alert-gate";
 
 function countMeaningfulLineItems(invoice: InvoiceData): number {
     return (invoice.lineItems || []).filter((li) => {
@@ -275,7 +276,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     if (isQuota) {
                         console.warn("   ⚠️ Gmail API rate limit hit — stopping batch early.");
                         try {
-                            await this.bot.telegram.sendMessage(
+                            await businessHoursAlert(this.bot, 
                                 process.env.TELEGRAM_CHAT_ID || "",
                                 `⚠️ Gmail API rate limit hit — AP inbox poll interrupted.Some emails may not have been processed.Will retry on next cycle.`
                             );
@@ -675,7 +676,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                     const warnMsg = `🚨 *Prepayment Required*\n*From:* ${from}\n*Subject:* _${subject}_\n\nThis vendor requires prepayment before shipping. Please review this email, click any payment links, or pay via credit card.${urlSnippets}`;
                     try {
-                        await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" });
+                        await businessHoursAlert(this.bot, process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" });
                     } catch { /* swallow */ }
                     
                     // Archive and mark read, team was alerted via Telegram
@@ -766,7 +767,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             if (!forwarded) {
                                 // Critical: Bill.com never received the invoice — alert Will immediately
                                 try {
-                                    await this.bot.telegram.sendMessage(
+                                    await businessHoursAlert(this.bot, 
                                         process.env.TELEGRAM_CHAT_ID || "",
                                         `🚨 * BILL\\.COM FORWARD FAILED *\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\\.com\\. Please forward manually\\.`,
                                         { parse_mode: "MarkdownV2" }
@@ -781,7 +782,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             this.processInvoiceBuffer(buffer, capturedFilename, subject, from, supabase, false, capturedMessageId, pdfStoragePath).catch(async (err) => {
                                 console.error(`     ❌ Background processing failed for ${capturedFilename}:`, err);
                                 try {
-                                    await this.bot.telegram.sendMessage(
+                                    await businessHoursAlert(this.bot, 
                                         process.env.TELEGRAM_CHAT_ID || "",
                                         `⚠️ *Invoice processing failed — manual review needed*\nFile: \`${capturedFilename}\`\nFrom: ${from}\nSubject: _${subject.substring(0, 80)}_\n\nError: ${err.message}\n\nForwarded to Bill\.com ${forwarded ? "✓" : "✗"} \| Finale reconciliation ✗`,
                                         { parse_mode: "MarkdownV2" }
@@ -1102,7 +1103,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     });
                 } catch { /* best-effort */ }
                 const warnMsg = `⚠️ *Invoice parsed with 0 line items — possible OCR failure*\nVendor: ${invoiceData.vendorName}\nInvoice: #${invoiceData.invoiceNumber}\nFile: \`${filename}\`\nForwarded to Bill.com. Finale reconciliation skipped — please review manually.`;
-                try { await this.bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch { }
+                try { await businessHoursAlert(this.bot, process.env.TELEGRAM_CHAT_ID || "", warnMsg, { parse_mode: "Markdown" }); } catch { }
                 await this.logActivity(supabase, from, subject, "PROCESSING_ERROR",
                     `Invoice parsed with 0 line items — possible OCR failure (${filename})`,
                     { invoiceNumber: invoiceData.invoiceNumber, vendorName: invoiceData.vendorName, filename }
@@ -1115,11 +1116,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // 2. Find matching PO — Finale direct, no Supabase middle layer
             // If invoice has a PO# printed on it, use it. Otherwise query Finale by
             // vendor name + invoice date to find the most plausible open PO.
+            const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoiceData.vendorName || "") || /aaa\s*cooper/i.test(filename);
             
             let finalePONumber: string | null = null;
             let matchSource = "none";
             let forceApproval = false;
 
+            if (!isAAACooper) {
                 finalePONumber = invoiceData.poNumber || null;
                 matchSource = "PO# on invoice";
 
@@ -1268,6 +1271,10 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         console.warn(`     ⚠️ Finale fallback lookup failed: ${err.message}`);
                     }
                 }
+            } else {
+                matchSource = "AAA Cooper outbound invoice - PO match bypassed";
+                console.log(`     → AAA Cooper outbound invoice: PO match bypassed silently`);
+            }
 
             const matched = !!finalePONumber;
             outcome.matchedPO = matched;
@@ -1283,7 +1290,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_from: from,
                 email_subject: subject,
                 raw_text: extracted.rawText,
-                action_required: !matched,
+                action_required: isAAACooper ? false : !matched,
                 action_summary: `Invoice from ${from} for $${invoiceData.total}`,
                 gmail_message_id: messageId || null,
             }).select("id").single();
@@ -1303,7 +1310,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
                 amount_due: invoiceData.amountDue,
-                status: matched ? "matched_review" : "unmatched",
+                status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
                 document_id: docData?.id || null,
                 raw_data: invoiceData
             }, { onConflict: "invoice_number" });
@@ -1412,6 +1419,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             }
 
 
+            if (isAAACooper) {
+                outcome.state = "unmatched";
+                outcome.error = null;
+                outcome.success = true;
+                return outcome;
+            }
+
             outcome.state = "unmatched";
             outcome.error = "No Finale PO match found";
             outcome.success = true;
@@ -1437,7 +1451,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // Alert Will — something in the pipeline failed after bill.com forward
             const chatId = process.env.TELEGRAM_CHAT_ID || "";
             try {
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     chatId,
                     `⚠️ *Invoice processing error — manual review needed*\nFile: \`${filename}\`\nFrom: ${from}\n\nError: ${err.message}\n\nBill\.com forward already sent\. Finale reconciliation did NOT run\.`,
                     { parse_mode: "MarkdownV2" }
@@ -1499,6 +1513,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         matchSource: string,
         from: string,
     ) {
+        const isAAACooper = /aaa\s*cooper/i.test(from) || /aaa\s*cooper/i.test(invoice.vendorName || "");
+        if (isAAACooper) {
+            console.log(`     → Suppressing Telegram notification for AAA Cooper`);
+            return;
+        }
 
         let msg = `🧾 *New Invoice Processed*\n`;
         msg += `From: ${from}\n`;
@@ -1518,7 +1537,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
         const chatId = process.env.TELEGRAM_CHAT_ID || "";
         if (!matched) {
-            this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+            businessHoursAlert(this.bot, chatId, msg, { parse_mode: "Markdown" });
         }
 
     }
@@ -1847,7 +1866,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     })
                     .join("\n");
 
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID!,
                     `⚠️ *Short Shipment Detected — Held for Review*\n\n` +
                     `PO: \`${result.orderId}\`\n` +
@@ -1895,7 +1914,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 const balanceCheck = validateInvoiceBalance(invoice);
                 const dashboardReviewActivityLogId = await enqueueForDashboardReview(result, balanceCheck);
                 writeReconciliationMemory("dashboard_review");
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID!,
                     `🔍 Invoice #${result.invoiceNumber} (${result.vendorName}) changes outside guardrails — enqueued for dashboard review\n\n${result.summary}\n\nCheck the AP / Invoices panel to approve or dismiss.`
                 );
@@ -1990,7 +2009,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             console.error(`   ❌ Reconciliation failed for PO ${orderId}:`, err.message);
             // Alert Will — Finale API failure means PO was not updated. Human must check manually.
             try {
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID || "",
                     `🚨 *Reconciliation failed — manual action needed*\nPO: \`${orderId}\`\nVendor: ${invoice.vendorName}\nInvoice: ${invoice.invoiceNumber}\n\nError: ${err.message}\n\nBill\.com forward ✓ \| Finale PO update ✗\nPlease review PO ${orderId} manually\.`,
                     { parse_mode: "MarkdownV2" }
@@ -2153,7 +2172,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         try {
             if (logId) {
                 // Send with Noted / Flag inline buttons
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     chatId,
                     msg,
                     {
@@ -2166,7 +2185,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 );
             } else {
                 // No logId available (rejected path etc.) — send without buttons
-                await this.bot.telegram.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+                await businessHoursAlert(this.bot, chatId, msg, { parse_mode: "Markdown" });
             }
         } catch (err: any) {
             console.error("Telegram reconciliation notification failed:", err.message);
@@ -2188,7 +2207,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         const msg = result.summary + "\n\n☝️ *Tap to approve or reject these changes:*";
 
         try {
-            const sentMsg = await this.bot.telegram.sendMessage(
+            const sentMsg = await businessHoursAlert(this.bot, 
                 process.env.TELEGRAM_CHAT_ID || "",
                 msg,
                 {
@@ -2207,7 +2226,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             console.error("Telegram approval request failed:", err.message);
             // Fallback: send without buttons
             try {
-                await this.bot.telegram.sendMessage(
+                await businessHoursAlert(this.bot, 
                     process.env.TELEGRAM_CHAT_ID || "",
                     msg + "\n\n(Buttons failed — reply /approve or /reject to this PO)",
                     { parse_mode: "Markdown" }
@@ -2329,7 +2348,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
         // Send to Telegram
         try {
-            await this.bot.telegram.sendMessage(
+            await businessHoursAlert(this.bot, 
                 process.env.TELEGRAM_CHAT_ID || "",
                 msg,
                 { parse_mode: "Markdown" }

@@ -14,6 +14,7 @@ import { createClient } from '../../supabase';
 import { unifiedObjectGeneration } from '../llm';
 import { z } from 'zod';
 import axios from 'axios';
+import { isBusinessHours } from "../alert-gate";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -318,6 +319,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         const token = process.env.TELEGRAM_BOT_TOKEN;
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
+        if (!isBusinessHours()) { console.log("[amazon-order-parser] Gated (outside business hours)"); return; }
 
         const itemList = order.items
             .map(i => `  ${i.quantity}x ${i.name}${i.price ? ` ($${i.price.toFixed(2)})` : ''}`)
@@ -361,6 +363,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         const token = process.env.TELEGRAM_BOT_TOKEN;
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
+        if (!isBusinessHours()) { console.log("[amazon-order-parser] Gated (outside business hours)"); return; }
 
         let message = `Amazon Order Shipped\n\n`;
         message += `Order: ${order.orderId}\n`;

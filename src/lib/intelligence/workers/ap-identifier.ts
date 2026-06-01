@@ -40,6 +40,8 @@ import {
     queueStatementEmailIntake,
     queueStatementMetadataOnly,
 } from "@/lib/statements/email-intake";
+import { pickPrimaryInvoicePage } from "./invoice-page-selector";
+import { businessHoursAlert } from "../alert-gate";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -253,6 +255,49 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         const sortedExpected = [...expected].sort();
         const sortedActual = [...actual].sort();
         return sortedExpected.every((value, index) => value === sortedActual[index]);
+    }
+
+    private isFedExInvoiceEmail(
+        from: string,
+        subject: string,
+        snippet: string,
+        pdfFilenames: string[],
+    ): boolean {
+        if (!/fedex/i.test(from)) return false;
+
+        return (
+            /\binvoice\b/i.test(subject)
+            || /\binvoice\b/i.test(snippet)
+            || pdfFilenames.some((filename) => /\b(invoice|bill)\b/i.test(filename))
+        );
+    }
+
+    private async selectPrimaryInvoicePageNumber(
+        buffer: Buffer,
+        extractedPages: Array<{ pageNumber: number; text: string; hasTable: boolean }> | undefined,
+        pageCount: number | undefined,
+    ): Promise<{ pageNumber: number | null; confidence: "none" | "weak" | "strong"; reason: string }> {
+        const initialSelection = pickPrimaryInvoicePage(extractedPages || []);
+        if (initialSelection.pageNumber || (pageCount ?? 1) <= 1) {
+            return initialSelection;
+        }
+
+        try {
+            const { extractPerPage } = await import("../../pdf/extractor");
+            const physicalPages = await extractPerPage(buffer);
+            return pickPrimaryInvoicePage(physicalPages);
+        } catch {
+            return initialSelection;
+        }
+    }
+
+    private async extractSinglePagePdf(buffer: Buffer, pageNumber: number): Promise<Buffer> {
+        const { PDFDocument } = await import("pdf-lib");
+        const pdfDoc = await PDFDocument.load(buffer);
+        const singlePageDoc = await PDFDocument.create();
+        const [copiedPage] = await singlePageDoc.copyPages(pdfDoc, [pageNumber - 1]);
+        singlePageDoc.addPage(copiedPage);
+        return Buffer.from(await singlePageDoc.save());
     }
 
     private async queueStatementCandidates(
@@ -526,12 +571,17 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 // Subject signals for non-invoice PO emails
                 const isReadyNotification = /\*\*READY\*\*/i.test(subject);
                 const isOrderAck = /acknowledgement|order\s*confirm/i.test(subject);
+                const isFedExInvoice = this.isFedExInvoiceEmail(from, subject, snippet, pdfFilenames);
+                const isAAACooper = /aaa\s*cooper/i.test(from);
 
                 let intent: string;
                 if (hasInvoicePdf && !isNonInvoicePdf) {
                     // Override: PDF filename clearly indicates an invoice document
                     intent = "INVOICE";
                     console.log(`     -> Forced INVOICE (PDF filename match: ${pdfFilenames.join(', ')})`);
+                } else if (isFedExInvoice && hasPdfAttachment && !isNonInvoicePdf) {
+                    intent = "INVOICE";
+                    console.log(`     -> Forced INVOICE (FedEx invoice pattern)`);
                 } else if (isReadyNotification || isOrderAck) {
                     // DECISION(2026-03-19): "PO READY" notifications and order acks
                     // are vendor confirmations, not invoices. Skip without LLM call.
@@ -801,12 +851,79 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 }
                             }
 
-                            // HERMIA(2026-05-28): Forward the ENTIRE PDF to Bill.com.
-                            // No page trimming, splitting, or vendor-specific manipulation.
-                            // Bill.com handles multi-page PDFs natively — manual forwarding
-                            // confirms this works reliably.
-                            const queueBuffer = buffer;
+                            let queueBuffer = buffer;
                             const queueMetadata: Record<string, unknown> = {};
+                            if (extractedPdf) {
+                                let pageSelection;
+                                if (isAAACooper) {
+                                    pageSelection = {
+                                        pageNumber: 1,
+                                        confidence: "strong" as const,
+                                        reason: "AAA Cooper outbound invoice - forced first page only",
+                                    };
+                                } else {
+                                    pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                        buffer,
+                                        extractedPdf.pages,
+                                        extractedPdf.metadata?.pageCount,
+                                    );
+                                }
+
+                                const multiPagePacket = (extractedPdf.metadata?.pageCount ?? 1) > 1;
+                                const needsFedExOcrRetry = isFedExInvoice
+                                    && multiPagePacket
+                                    && extractedPdf.ocrStrategy === "pdf-parse"
+                                    && pageSelection.confidence !== "strong";
+
+                                if (needsFedExOcrRetry) {
+                                    try {
+                                        const { extractPDFWithLLM } = await import("../../pdf/extractor");
+                                        const retriedExtraction = await extractPDFWithLLM(buffer);
+                                        const retriedSelection = await this.selectPrimaryInvoicePageNumber(
+                                            buffer,
+                                            retriedExtraction.pages,
+                                            retriedExtraction.metadata?.pageCount,
+                                        );
+                                        queueMetadata.invoice_page_ocr_retry_used = true;
+                                        queueMetadata.invoice_page_ocr_retry_strategy = retriedExtraction.ocrStrategy ?? "unknown";
+                                        extractedPdf = retriedExtraction;
+                                        pageSelection = retriedSelection;
+                                    } catch (retryErr: any) {
+                                        queueMetadata.invoice_page_ocr_retry_used = true;
+                                        queueMetadata.invoice_page_ocr_retry_error = retryErr.message;
+                                    }
+                                }
+
+                                if (isFedExInvoice && multiPagePacket && pageSelection.confidence !== "strong") {
+                                    manualReviewReason = `Ambiguous FedEx invoice packet (${capturedFilename}) - unable to isolate a single invoice page`;
+                                    console.log(`     ⚠️ ${manualReviewReason}`);
+                                    await this.logActivity(supabase, from, subject, "AMBIGUOUS_INVOICE_PACKET", manualReviewReason, {
+                                        reasonCode: "ambiguous_invoice_packet",
+                                        sourceInbox,
+                                        gmailMessageId: m.gmail_message_id,
+                                        pdfFilename: capturedFilename,
+                                        invoicePageSelectionConfidence: pageSelection.confidence,
+                                        invoicePageSelectionReason: pageSelection.reason,
+                                        ocrRetryUsed: Boolean(queueMetadata.invoice_page_ocr_retry_used),
+                                        ocrRetryStrategy: queueMetadata.invoice_page_ocr_retry_strategy ?? null,
+                                    });
+                                    attachmentIndex++;
+                                    continue;
+                                }
+
+                                if (pageSelection.pageNumber) {
+                                    try {
+                                        queueBuffer = await this.extractSinglePagePdf(buffer, pageSelection.pageNumber);
+                                        queueMetadata.selected_invoice_page = pageSelection.pageNumber;
+                                        queueMetadata.invoice_page_selection_confidence = pageSelection.confidence;
+                                        queueMetadata.invoice_page_selection_reason = pageSelection.reason;
+                                        queueMetadata.forwarded_page_count = 1;
+                                        console.log(`     ✂️ Trimmed ${capturedFilename} to invoice page ${pageSelection.pageNumber}`);
+                                    } catch (pageErr: any) {
+                                        console.warn(`     ⚠️ Failed to trim ${capturedFilename} to invoice page: ${pageErr.message}`);
+                                    }
+                                }
+                            }
 
                             // Upload to Supabase Storage
                             const storagePath = `${m.gmail_message_id}/${Date.now()}_${capturedFilename}`;
@@ -1154,7 +1271,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             }
 
             try {
-                await this.bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
+                await businessHoursAlert(this.bot, chatId, message, { parse_mode: "HTML" });
             } catch (tgErr: any) {
                 console.warn(`     ⚠️ Telegram alert failed:`, tgErr.message);
             }

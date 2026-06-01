@@ -40,6 +40,7 @@ import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
 import { writeReconciliationOutcome } from "../runtime/observability/reconciliation-outcomes";
+import { businessHoursAlert } from "../intelligence/alert-gate";
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // PENDING APPROVAL STORE
@@ -475,7 +476,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
         try {
             const { Telegraf } = await import("telegraf");
             const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
-            await alertBot.telegram.sendMessage(
+            await businessHoursAlert(alertBot, 
                 process.env.TELEGRAM_CHAT_ID!,
                 `ðŸš¨ AUDIT LOG FAILURE â€” approval for PO \`${entry.result.orderId}\` was applied to Finale but NOT logged to Supabase.\nâš ï¸ Risk of double-reconciliation on next invoice poll.\nManually verify PO in Finale and mark invoice as processed.`
             );
@@ -643,7 +644,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
         try {
             const { Telegraf } = await import("telegraf");
             const alertBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
-            await alertBot.telegram.sendMessage(
+            await businessHoursAlert(alertBot, 
                 process.env.TELEGRAM_CHAT_ID!,
                 `ðŸš¨ AUDIT LOG FAILURE â€” rejection for PO \`${entry.result.orderId}\` was actioned but NOT logged to Supabase.\nâš ï¸ Risk of duplicate reconciliation attempt on next invoice poll.\nNo Finale changes were made, but manually verify the invoice is not re-processed.`
             );
