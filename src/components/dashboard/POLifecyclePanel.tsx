@@ -2,7 +2,8 @@
  * @file    POLifecyclePanel.tsx
  * @purpose Dashboard panel showing PO lifecycle states as a visual flow.
  *          DISPLAYS error/loading/no-data/empty states cleanly.
- *          State flow: ORDERED → INVOICED → RECONCILED → RECEIVED → COMPLETED
+ *          State flow: REVIEW → SENT → ACKNOWLEDGED → INVOICED → RECONCILED → RECEIVED → COMPLETED
+ *          COMPACT mode renders just the flow bar (no detail breakdown) for embedding in CommandBoard.
  * @author  Hermia
  * @created 2026-06-01
  * @deps    react
@@ -26,6 +27,17 @@ const STATE_COLORS: Record<string, string> = {
     CANCELLED: "bg-red-100 text-red-800 border-red-300",
 };
 
+const STATE_COLORS_DARK: Record<string, string> = {
+    REVIEW: "bg-purple-900/40 text-purple-200 border-purple-600/50",
+    SENT: "bg-blue-900/40 text-blue-200 border-blue-600/50",
+    ACKNOWLEDGED: "bg-indigo-900/40 text-indigo-200 border-indigo-600/50",
+    INVOICED: "bg-amber-900/40 text-amber-200 border-amber-600/50",
+    RECONCILED: "bg-green-900/40 text-green-200 border-green-600/50",
+    RECEIVED: "bg-teal-900/40 text-teal-200 border-teal-600/50",
+    COMPLETED: "bg-gray-700/40 text-gray-300 border-gray-600/50",
+    CANCELLED: "bg-red-900/40 text-red-200 border-red-600/50",
+};
+
 const STATE_ICONS: Record<string, string> = {
     REVIEW: "🔍",
     SENT: "📨",
@@ -37,7 +49,12 @@ const STATE_ICONS: Record<string, string> = {
     CANCELLED: "🗑️",
 };
 
-export default function POLifecyclePanel() {
+interface POLifecyclePanelProps {
+    /** Compact mode: just the flow bar, no detail breakdown, dark-theme friendly. */
+    compact?: boolean;
+}
+
+export default function POLifecyclePanel({ compact = false }: POLifecyclePanelProps) {
     const [counts, setCounts] = useState<LifecycleCounts | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -70,7 +87,73 @@ export default function POLifecyclePanel() {
         ? Object.values(counts).reduce((sum, c) => sum + c, 0)
         : 0;
 
-    return (
+    return compact ? (
+        // ── Compact mode: dark theme, no detail breakdown ──────────────
+        <div className="flex flex-col bg-zinc-900/40 border border-zinc-800/60 rounded overflow-hidden" data-testid="po-lifecycle-compact">
+            {/* Header */}
+            <div className="flex items-center justify-between px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                    <span className="text-sm leading-none">🔄</span>
+                    <span className="font-semibold text-[11px] text-zinc-100 uppercase tracking-wider">
+                        PO Pipeline
+                    </span>
+                </div>
+                <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-zinc-500 font-mono">
+                        {loading ? "—" : `${total} POs`}
+                    </span>
+                    <button
+                        onClick={fetchData}
+                        disabled={loading}
+                        className="text-[10px] text-zinc-500 hover:text-zinc-300 disabled:opacity-40"
+                    >
+                        {loading ? "..." : "↻"}
+                    </button>
+                </div>
+            </div>
+
+            {/* Flow bar */}
+            <div className="flex-1 flex items-center overflow-x-auto px-3 py-2 gap-0 scrollbar-thin">
+                {error && (
+                    <span className="text-[10px] text-red-400 font-mono">⚠ {error}</span>
+                )}
+                {!error && loading && !counts && (
+                    <span className="text-[10px] text-zinc-500 font-mono animate-pulse">loading...</span>
+                )}
+                {!error && !loading && counts && total === 0 && (
+                    <span className="text-[10px] text-zinc-500 font-mono">📭 No POs tracked</span>
+                )}
+                {counts && total > 0 && (
+                    <div className="flex items-center gap-0">
+                        {STATE_ORDER.map((state, idx) => (
+                            <React.Fragment key={state}>
+                                <div
+                                    className={`flex flex-col items-center justify-center w-12 h-12 rounded-full border shrink-0 ${
+                                        STATE_COLORS_DARK[state] || "bg-zinc-800/60 text-zinc-400 border-zinc-700/50"
+                                    }`}
+                                    title={`${state}: ${counts?.[state] ?? 0} POs`}
+                                >
+                                    <span className="text-xs leading-none">{STATE_ICONS[state]}</span>
+                                    <span className="text-[9px] font-bold leading-tight mt-0.5 tabular-nums">
+                                        {counts?.[state] ?? 0}
+                                    </span>
+                                </div>
+                                {idx < STATE_ORDER.length - 1 && (
+                                    <div className="flex items-center justify-center px-0.5 shrink-0">
+                                        <svg className="w-5 h-3" viewBox="0 0 20 12">
+                                            <line x1="0" y1="6" x2="17" y2="6" stroke="#3f3f46" strokeWidth="1.5" />
+                                            <polygon points="17,6 14,3 14,9" fill="#3f3f46" />
+                                        </svg>
+                                    </div>
+                                )}
+                            </React.Fragment>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    ) : (
+        // ── Full mode: light card, detail breakdown ────────────────────
         <div className="flex flex-col h-full bg-white rounded-lg border border-gray-200 overflow-hidden">
             {/* Header */}
             <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 bg-gray-50">
