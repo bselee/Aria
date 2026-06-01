@@ -19,6 +19,7 @@ import { Activity, Bell, RefreshCw } from "lucide-react";
 import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
+import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
 import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
 import AxiomSkuMappingPanel from "./AxiomSkuMappingPanel";
 import { PANEL_BY_ID } from "./panelRegistry";
@@ -67,10 +68,16 @@ const TAB_STORAGE_KEY = "aria-dash-active-tab";
 function PurchasingLifecyclePanel() {
     return (
         <PurchasingLifecycleProvider>
-            <div
-                className="grid h-full min-h-0 grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
-                data-testid="purchasing-lifecycle-panel"
-            >
+            <div className="flex flex-col h-full min-h-0 overflow-hidden">
+                {/* Pipeline summary bar — compact lifecycle overview */}
+                <div className="shrink-0">
+                    <POLifecyclePanel compact />
+                </div>
+                {/* Three-column grid: Ordering | Purchases | RCV */}
+                <div
+                    className="flex-1 min-h-0 grid grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
+                    data-testid="purchasing-lifecycle-panel"
+                >
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
                 <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
                     Ordering
@@ -95,7 +102,8 @@ function PurchasingLifecyclePanel() {
                     <ReceivedItemsPanel />
                 </div>
             </section>
-            </div>
+            </div> {/* end grid */}
+            </div> {/* end flex wrapper */}
         </PurchasingLifecycleProvider>
     );
 }
