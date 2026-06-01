@@ -463,7 +463,11 @@ export async function getCommandBoardCrons(): Promise<CommandBoardCron[]> {
     return CRON_JOBS.map((job) => {
         const last = latestByName.get(job.name);
         const lastStatus =
-            last?.status === "success" ? "success" : last?.status === "error" ? "error" : null;
+            last?.status === "success" || last?.status === "succeeded"
+                ? "success"
+                : last?.status === "error" || last?.status === "failed"
+                ? "error"
+                : null;
         return {
             name: job.name,
             description: job.description,
