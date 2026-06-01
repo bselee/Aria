@@ -518,6 +518,28 @@ describe("PurchasingPanel - draft PO state", () => {
         const empty = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
         vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
+            if (url.includes("/api/dashboard/purchasing/commit")) {
+                return Promise.resolve({
+                    ok: true,
+                    json: () => Promise.resolve({
+                        sendId: "send-123",
+                        review: {
+                            orderId: "124790",
+                            vendorName: "Colorful Packaging Ltd",
+                            vendorPartyId: "10918",
+                            total: 2800,
+                            orderDate: "2026-05-05",
+                            items: [
+                                { productId: "CP-LABEL-1", productName: "Colorful printed label", quantity: 200, unitPrice: 14, lineTotal: 2800 }
+                            ],
+                            finaleUrl: "https://finale.example/po/124790"
+                        },
+                        email: "vendor@colorful.com",
+                        emailSource: "vendor policy override",
+                        warning: ""
+                    }),
+                });
+            }
             if (url.includes("/api/dashboard/purchasing") && init?.method === "POST") {
                 return Promise.resolve({
                     ok: true,
@@ -541,6 +563,7 @@ describe("PurchasingPanel - draft PO state", () => {
         fireEvent.click(screen.getByText(/Draft PO \(1\)/i));
 
         await waitFor(() => expect(screen.getAllByText(/PO #124790/i).length).toBeGreaterThan(0));
+        fireEvent.click(screen.getByText(/Keep Draft/i));
         expect(screen.queryByText(/Colorful printed label/i)).toBeNull();
     });
 });

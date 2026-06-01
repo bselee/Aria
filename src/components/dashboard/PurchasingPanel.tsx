@@ -453,6 +453,19 @@ export default function PurchasingPanel() {
         return "Selected items need PO handling";
     }
     function itemMatchesFocus(item: PurchasingItem): boolean {
+        if (focusFilter === "order_now") {
+            if (itemMatchesOrderingFocus(item, "order_now")) {
+                return true;
+            }
+            if (itemMatchesOrderingFocus(item, "30")) {
+                const group = data?.groups.find(g => g.vendorPartyId === item.supplierPartyId);
+                const hasOrderNow = group?.items.some(i => itemMatchesOrderingFocus(i, "order_now"));
+                if (hasOrderNow) {
+                    return true;
+                }
+            }
+            return false;
+        }
         return itemMatchesOrderingFocus(item, focusFilter);
     }
     function itemMatchesMode(item: PurchasingItem): boolean {
@@ -735,6 +748,15 @@ export default function PurchasingPanel() {
             if (result) {
                 setCreatedPOs(p => ({ ...p, [pid]: result }));
                 setCreatedPODetails(p => ({ ...p, [pid]: result }));
+                // Bridge: notify Purchases pane that a new draft PO was created
+                const selItems = group.items.filter(i => checked[pid]?.[i.productId]);
+                const totalUnits = selItems.reduce((s, i) => s + (qtys[pid]?.[i.productId] ?? i.assessment?.recommendedQty ?? i.suggestedQty), 0);
+                lifecycle.notifyDraft({
+                    vendorName: group.vendorName,
+                    orderId: result.orderId || "pending",
+                    itemCount: selItems.length || group.items.length,
+                    totalUnits,
+                });
                 // HERMIA(2026-05-28): Auto-advance to Review & Send modal.
                 // Bill never needs to leave the dashboard or open Finale.
                 // Draft created → review opens immediately → one click to commit.
@@ -836,6 +858,13 @@ export default function PurchasingPanel() {
             const details = json.details ?? {};
             if (details.finaleEmailSent || emailSent) {
                 setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+                // Bridge: re-notify Purchases pane that PO is now committed (not just drafted)
+                lifecycle.notifyDraft({
+                    vendorName: commitModal.review.vendorName,
+                    orderId: commitModal.review.orderId,
+                    itemCount: commitModal.review.items.length,
+                    totalUnits: commitModal.review.items.reduce((s, i) => s + i.quantity, 0),
+                });
             }
             setCreatedPOs(prev => {
                 const next = { ...prev };

@@ -179,7 +179,13 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(gmailModifyMock).toHaveBeenCalledWith({
+            userId: "me",
+            id: "gmail-11",
+            requestBody: {
+                removeLabelIds: ["UNREAD"],
+            },
+        });
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });

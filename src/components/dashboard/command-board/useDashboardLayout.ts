@@ -61,7 +61,7 @@ export const DEFAULT_LAYOUT: DashboardLayout = {
         "tracking-board",
     ],
     midRight: ["purchasing", "purchasing-calendar"],
-    right: ["activity", "build-schedule", "oversight", "recent-runs", "daily-ops-summary"],
+    right: ["activity", "build-schedule", "oversight", "recent-runs", "vendor-scorecard", "daily-ops-summary"],
 };
 
 export const LAYOUT_STORAGE_KEY = "aria-dash-layout";

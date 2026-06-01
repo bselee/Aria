@@ -153,6 +153,21 @@ export default function ActivePurchasesPanel() {
     // Dismissal state
     const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
+    // Draft notification: flash when a PO is drafted/committed in the Ordering pane
+    const [draftFlash, setDraftFlash] = useState<{ vendor: string; orderId: string; at: number } | null>(null);
+    const prevDraftRef = useRef<number>(0);
+    useEffect(() => {
+        const d = lifecycle.lastDraft;
+        if (!d || d.draftedAt === prevDraftRef.current) return;
+        prevDraftRef.current = d.draftedAt;
+        setDraftFlash({ vendor: d.vendorName, orderId: d.orderId, at: d.draftedAt });
+        // Auto-refresh purchases to pick up the new PO
+        fetchPurchases(true);
+        // Clear flash after 4 seconds
+        const tid = setTimeout(() => setDraftFlash(null), 4000);
+        return () => clearTimeout(tid);
+    }, [lifecycle.lastDraft, fetchPurchases]);
+
     useEffect(() => {
         const stored = localStorage.getItem("aria-dash-purchases-dismissed");
         if (stored) {
@@ -521,6 +536,21 @@ export default function ActivePurchasesPanel() {
 
             {!isCollapsed && (
                 <>
+                    {/* Draft notification: visual bridge from Ordering → Purchases */}
+                    {draftFlash && (
+                        <div className="px-4 py-1.5 bg-blue-500/10 border-b border-blue-500/30 flex items-center gap-2 animate-pulse">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                            <span className="text-[11px] font-mono text-blue-300">
+                                PO #{draftFlash.orderId} drafted for <b>{draftFlash.vendor}</b> — auto-refreshing…
+                            </span>
+                            <button
+                                onClick={() => setDraftFlash(null)}
+                                className="ml-auto text-blue-400/60 hover:text-blue-200 text-[10px] font-mono"
+                            >
+                                dismiss
+                            </button>
+                        </div>
+                    )}
                     {loading ? (
                         <div className="px-4 py-2 space-y-2.5">
                             {[1, 2, 3].map(i => (
