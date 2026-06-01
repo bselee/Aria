@@ -447,6 +447,18 @@ export class POService {
                 }
 
                 dedupMark("received_pos", po.orderId, 168); // 7 days TTL
+
+                // KAIZEN(2026-06-01): Lifecycle RECEIVED transition
+                setImmediate(() => {
+                    import("../../purchasing/po-lifecycle").then(({ transitionLifecycleState }) => {
+                        transitionLifecycleState(
+                            String(po.orderId),
+                            "RECEIVED",
+                            "po-receiving-watcher",
+                            { supplier: po.supplier, total: po.total }
+                        ).catch(() => {});
+                    }).catch(() => {});
+                });
             }
         } catch (err: any) {
             console.error("PO Receiving error:", err.message);

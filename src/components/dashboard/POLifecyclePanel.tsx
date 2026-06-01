@@ -88,7 +88,28 @@ export default function POLifecyclePanel() {
                 </div>
             </div>
 
-            {/* Flow visualization */}
+            {/* Error state */}
+                {error && (
+                    <div className="text-xs text-red-600 bg-red-50 border border-red-200 p-2 rounded flex items-center gap-1">
+                        <span>⚠️</span>
+                        <span>Offline — {error}</span>
+                    </div>
+                )}
+
+                {!error && !counts && !loading && (
+                    <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 p-2 rounded flex items-center gap-1">
+                        <span>⏳</span>
+                        <span>No data yet — waiting for first sync</span>
+                    </div>
+                )}
+
+                {!error && loading && !counts && (
+                    <div className="flex items-center justify-center py-6 text-gray-400 text-xs">
+                        <span className="animate-pulse">Loading...</span>
+                    </div>
+                )}
+
+                {/* Flow arrows */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
                 {error && (
                     <div className="text-xs text-red-500 bg-red-50 p-2 rounded">
