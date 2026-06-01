@@ -13,22 +13,28 @@ import React, { useEffect, useState } from "react";
 
 type LifecycleCounts = Record<string, number>;
 
-const STATE_ORDER = ["ORDERED", "INVOICED", "RECONCILED", "RECEIVED", "COMPLETED"];
+const STATE_ORDER = ["REVIEW", "SENT", "ACKNOWLEDGED", "INVOICED", "RECONCILED", "RECEIVED", "COMPLETED"];
 
 const STATE_COLORS: Record<string, string> = {
-    ORDERED: "bg-blue-100 text-blue-800 border-blue-300",
+    REVIEW: "bg-purple-100 text-purple-800 border-purple-300",
+    SENT: "bg-blue-100 text-blue-800 border-blue-300",
+    ACKNOWLEDGED: "bg-indigo-100 text-indigo-800 border-indigo-300",
     INVOICED: "bg-amber-100 text-amber-800 border-amber-300",
     RECONCILED: "bg-green-100 text-green-800 border-green-300",
     RECEIVED: "bg-teal-100 text-teal-800 border-teal-300",
     COMPLETED: "bg-gray-100 text-gray-800 border-gray-300",
+    CANCELLED: "bg-red-100 text-red-800 border-red-300",
 };
 
 const STATE_ICONS: Record<string, string> = {
-    ORDERED: "📋",
+    REVIEW: "🔍",
+    SENT: "📨",
+    ACKNOWLEDGED: "👋",
     INVOICED: "🧾",
     RECONCILED: "✅",
     RECEIVED: "📦",
     COMPLETED: "🏁",
+    CANCELLED: "🗑️",
 };
 
 export default function POLifecyclePanel() {
@@ -178,7 +184,13 @@ export default function POLifecyclePanel() {
                                                         ? "bg-green-400"
                                                         : state === "INVOICED"
                                                         ? "bg-amber-400"
-                                                        : "bg-blue-400"
+                                                        : state === "CANCELLED"
+                                                        ? "bg-red-400"
+                                                        : state === "ACKNOWLEDGED"
+                                                        ? "bg-indigo-400"
+                                                        : state === "SENT"
+                                                        ? "bg-blue-400"
+                                                        : "bg-purple-400"
                                                 }`}
                                                 style={{ width: `${pct}%` }}
                                             />

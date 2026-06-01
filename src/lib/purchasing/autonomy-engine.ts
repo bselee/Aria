@@ -15,6 +15,7 @@ import {
     getVendorAutonomyLevel,
     lookupVendorOrderEmail
 } from './po-sender';
+import { transitionLifecycleState } from './po-lifecycle';
 import type { Telegraf } from 'telegraf';
 
 /**
@@ -76,6 +77,12 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                 console.log(`[autonomy] PO #${draft.orderId} has already been emailed. Auto-marking as sent.`);
                 
                 try {
+                    // Transition lifecycle to SENT since it was already dispatched
+                    await transitionLifecycleState(draft.orderId, 'SENT', 'autonomy-engine', {
+                        source: 'gmail_search_proof',
+                        vendorName: draft.vendorName,
+                    });
+
                     // Commit in Finale so that its status changes to ORDER_LOCKED/ORDER_COMMITTED and stock is officially marked on order
                     await finale.commitDraftPO(draft.orderId);
                     console.log(`[autonomy] PO #${draft.orderId} committed successfully in Finale`);
@@ -151,6 +158,12 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                 // 4. Act according to autonomy levels
                 if (autonomyLevel === 1) {
                     // Level 1: Auto-Draft Review Prompter
+                    // Set lifecycle to REVIEW so dashboard shows it awaiting review
+                    await transitionLifecycleState(draft.orderId, 'REVIEW', 'autonomy-engine', {
+                        vendorName: review.vendorName,
+                        autonomyLevel: 1,
+                    });
+
                     const sendId = await storePendingPOSend(draft.orderId, review, email, source, {
                         channel: 'telegram',
                         telegramChatId: chatId,
@@ -175,28 +188,34 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     console.log(`[autonomy] Level 1 enqueued and Telegram review sent for PO #${draft.orderId}`);
 
                 } else if (autonomyLevel === 2) {
-                    // Level 2: Auto-Commit & Send
+                    // Level 2: Auto-Review (trust building — no auto-send until trust is earned)
+                    // Set lifecycle to REVIEW so dashboard shows it awaiting review
+                    await transitionLifecycleState(draft.orderId, 'REVIEW', 'autonomy-engine', {
+                        vendorName: review.vendorName,
+                        autonomyLevel: 2,
+                    });
+
                     const sendId = await storePendingPOSend(draft.orderId, review, email, source, {
                         channel: 'telegram',
                         telegramChatId: chatId,
                     });
 
-                    // Execute autonomous commit + email send via fallback
-                    const outcome = await commitAndSendPO(sendId, 'telegram');
-
+                    // Level 2 POs get the same review prompt as Level 1
+                    // Auto-send disabled intentionally — trust building phase
                     const link = `https://app.finaleinventory.com/buildasoilorganics/purchaseOrder?orderId=${draft.orderId}`;
                     await bot.telegram.sendMessage(
                         chatId,
-                        `✅ *PO #${draft.orderId} Auto-Sent (Level 2)*\n` +
+                        `✅ *PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
                         `*Vendor*: ${review.vendorName}\n` +
                         `*Total*: $${review.total.toFixed(2)}\n` +
-                        `*Sent To*: ${email} (via active Gmail fallback)\n` +
-                        `🔗 [View in Finale](${link})`,
-                        { parse_mode: 'Markdown', disable_web_page_preview: true }
+                        `*Sent To*: ${email}\n` +
+                        `🔗 [View in Finale](${link})\n\n` +
+                        `_Auto-send disabled during trust building. Review and approve via dashboard or /sendpo ${draft.orderId}_`,
+                        { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
                     );
 
                     processed++;
-                    console.log(`[autonomy] Level 2 completed and sent PO #${draft.orderId}`);
+                    console.log(`[autonomy] Level 2 reviewed (not auto-sent) PO #${draft.orderId}`);
                 }
 
             } catch (innerErr: any) {
