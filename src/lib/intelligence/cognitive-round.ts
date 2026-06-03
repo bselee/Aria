@@ -27,6 +27,7 @@ export interface CognitiveState {
     agentHeartbeats: Array<{ agent: string; status: string; lastBeat: string }>;
     poPipeline: Array<{ stage: string; count: number }>;
     timeContext: { hour: number; dayOfWeek: number; isBusinessHours: boolean; isWeekend: boolean };
+    gmailAuthFailing: boolean;
 }
 
 // ── Decision ────────────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ async function gatherState(): Promise<CognitiveState> {
         agentHeartbeats: [],
         poPipeline: [],
         timeContext,
+        gmailAuthFailing: false,
     };
 
     // Supabase queries (best-effort — failures degrade gracefully to empty state)
@@ -85,11 +87,12 @@ async function gatherState(): Promise<CognitiveState> {
             const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
             const { data: failures } = await supabase
                 .from("cron_runs")
-                .select("job_name, status, started_at")
+                .select("job_name, status, started_at, error_message")
                 .eq("status", "failed")
                 .gte("started_at", oneHourAgo);
             if (failures && failures.length > 0) {
                 const byJob = new Map<string, { count: number; lastFailed: string }>();
+                let hasGmailAuthFailure = false;
                 for (const f of failures as any[]) {
                     const existing = byJob.get(f.job_name);
                     if (existing) {
@@ -98,12 +101,18 @@ async function gatherState(): Promise<CognitiveState> {
                     } else {
                         byJob.set(f.job_name, { count: 1, lastFailed: f.started_at });
                     }
+                    // Detect Gmail auth failures specifically
+                    const errMsg = (f.error_message || '').toLowerCase();
+                    if (errMsg.includes('login required') || errMsg.includes('no gmail token')) {
+                        hasGmailAuthFailure = true;
+                    }
                 }
                 state.cronFailures = Array.from(byJob.entries()).map(([job, v]) => ({
                     job,
                     count: v.count,
                     lastFailed: v.lastFailed,
                 }));
+                state.gmailAuthFailing = hasGmailAuthFailure;
             }
 
             // Pending approvals
@@ -146,6 +155,17 @@ function evaluateState(state: CognitiveState): CognitiveDecision[] {
             suppress: ["stat-indexing", "housekeeping"],
             boost: ["ap-polling"],
             summary: `${state.inboxDepth.ap} unprocessed AP emails`,
+        });
+    }
+
+    // Rule 1b: Gmail auth failure — escalate immediately
+    if (state.gmailAuthFailing) {
+        decisions.push({
+            priority: "critical",
+            action: "Gmail authentication failure detected — OAuth token expired. Run npx tsx src/cli/gmail-auth.ts to re-auth affected account(s). Email pipeline is dead until resolved.",
+            suppress: ["ap-polling", "daily-summary", "po-sync", "nightshift-enqueue", "acknowledgement-agent"],
+            boost: [],
+            summary: `Gmail auth failing — Login Required / No token in last hour`,
         });
     }
 

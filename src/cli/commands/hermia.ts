@@ -525,26 +525,6 @@ const hermiaCommand: BotCommand = {
     },
 };
 
-/**
- * /followup — Follow-up SOP. Checks for unanswered Slack requests (>24h)
- * and vendor POs without confirmation (>48h).
- */
-const followupCommand: BotCommand = {
-    name: "followup",
-    description: "Follow-up SOP — unanswered Slack requests + unconfirmed POs",
-    handler: async (ctx, deps) => {
-        await ctx.sendChatAction("typing");
-
-        try {
-            const { buildFollowUpReport, formatFollowUpReport } = await import("@/lib/slack/followup-sop");
-            const report = await buildFollowUpReport();
-            const formatted = formatFollowUpReport(report);
-            await ctx.reply(formatted, { parse_mode: "Markdown" });
-        } catch (err: any) {
-                await ctx.reply(`❌ ${err.message}`);
-            }
-        },
-        };
 
         /**
         * /email — Email pipeline triage. Shows queue health, stuck items,
@@ -755,7 +735,6 @@ const followupCommand: BotCommand = {
                             orderNowCommand,
                             ballCommand,
                             orderGuardCommand,
-                            followupCommand,
                             emailCommand,
                             emailSearchCommand,
                     orderCommand,

@@ -23,6 +23,47 @@ export class SupervisorAgent {
     }
 
     /**
+     * HERMIA(2026-06-03): Wire the missing entry point that ops-manager has
+     * been calling as a no-op since the refactor. The pre-refactor code
+     * inserted a row here; the refactor moved the polling logic to
+     * supervise() but never reconnected the producer side. This inserts a
+     * row into the same `ops_agent_exceptions` table that supervise() polls
+     * at line 127, completing the cycle.
+     *
+     * Fire-and-forget contract — ops-manager calls without await and catches
+     * any throw. The function returns void (the existing call sites discard
+     * the return value).
+     */
+    async reportAgentException(taskName: string, error: any): Promise<void> {
+        const supabase = createClient();
+        if (!supabase) {
+            console.warn(`[Supervisor-Agent] reportAgentException(${taskName}): supabase unavailable — exception dropped.`);
+            return;
+        }
+        try {
+            const errorMessage = String(error?.message ?? error ?? "(no message)");
+            const errorStack = String(error?.stack ?? "");
+            const { error: insertError } = await supabase
+                .from("ops_agent_exceptions")
+                .insert({
+                    agent_name: taskName,
+                    error_message: errorMessage.slice(0, 2000),
+                    error_stack: errorStack.slice(0, 8000),
+                    status: "pending",
+                    context_data: { source: "supervisor.reportAgentException" },
+                });
+            if (insertError) {
+                console.warn(`[Supervisor-Agent] reportAgentException(${taskName}) insert failed: ${insertError.message}`);
+            }
+        } catch (e: any) {
+            // Non-fatal — the original error has already been logged by the
+            // caller (ops-manager.cronHookFailure / safeRun). Swallow to
+            // preserve the fire-and-forget contract.
+            console.warn(`[Supervisor-Agent] reportAgentException(${taskName}) threw: ${e.message}`);
+        }
+    }
+
+    /**
      * HERMIA(2026-05-28): Deterministic error classification via regex.
      * Handles ~90% of errors without burning an LLM call. Falls through to
      * LLM only for genuinely ambiguous errors.

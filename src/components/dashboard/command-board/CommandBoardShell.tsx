@@ -21,6 +21,7 @@ import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
 import AxiomSkuMappingPanel from "./AxiomSkuMappingPanel";
+import KanbanBoard from "@/components/dashboard/KanbanBoard";
 import { PANEL_BY_ID } from "./panelRegistry";
 import type { PanelId } from "./useDashboardLayout";
 import type {
@@ -58,6 +59,7 @@ type TabId =
     | "lifecycle"
     | "builds"
     | "axiom-skus"
+    | "kanban"
     | "activity";
 
 type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
@@ -218,6 +220,7 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                 ),
             },
             { id: "axiom-skus", label: "Axiom SKUs", render: () => <AxiomSkuMappingPanel /> },
+            { id: "kanban", label: "Kanban", render: () => <KanbanBoard /> },
             { id: "activity", label: "Activity", render: () => panelById("activity") },
         ],
         [panelById],

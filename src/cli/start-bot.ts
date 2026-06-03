@@ -21,9 +21,7 @@ import '../cron/jobs'; // side-effect: registers every cron job
 import { startCronRunner } from '../cron/runner';
 import { registerAllCommands } from './commands';
 import { FinaleClient } from '../lib/finale/client';
-import { SlackWatchdog } from '../lib/slack/watchdog';
 import { APAgent } from '../lib/intelligence/ap-agent';
-import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import { initSandboxWatcher } from '../lib/intelligence/sandbox-watcher';
 import { startBotControlPlane } from '../lib/ops/bot-control-plane';
 import {
@@ -31,7 +29,7 @@ import {
     type ReconciliationResult,
 } from '../lib/finale/reconciler';
 import { handleTelegramText } from '../lib/copilot/channels/telegram';
-import { getStartupHealth } from '../lib/copilot/smoke';
+// Slack removed — getStartupHealth deleted
 
 // ── Import modular handlers ──────────────────────────
 import { handlePhotoUpload, handleDocumentUpload } from './handlers/media-handler';
@@ -149,7 +147,7 @@ console.log(`🔭 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configur
 console.log(`🎙️ ElevenLabs: ${elevenLabsKey ? '✅ Loaded' : '❌ Not Configured'}`);
 console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not Configured'}`);
 
-let globalWatchdog: SlackWatchdog | null = null;
+// Slack removed — globalWatchdog deleted
 
 // ============================================================================
 // Telegram Event Listeners & Router Delegations
@@ -498,34 +496,10 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn(`[boot] AP polling boot run failed (non-fatal): ${e.message}`);
     }
     // ── End boot-time warmup ────────────────────────────────────────
-
-    // slack watchdog
-    const pollInterval = parseInt(process.env.SLACK_POLL_INTERVAL || '60', 10);
-    let startedWatchdog: SlackWatchdog | null = null;
-    const startupHealth = await getStartupHealth({
-        hasSlackToken: Boolean(process.env.SLACK_ACCESS_TOKEN),
-        startSlackWatchdog: async () => {
-            const watchdog = new SlackWatchdog(pollInterval);
-            await watchdog.start();
-            startedWatchdog = watchdog;
-        },
-    });
-    globalWatchdog = startedWatchdog;
-
-    console.log(`[boot] Startup health: bot=${startupHealth.bot}, dashboard=${startupHealth.dashboard}, slack=${startupHealth.slack}`);
-    if (startupHealth.slack === 'running') {
-        console.log('Slack Watchdog: running in-process');
-    } else if (process.env.SLACK_ACCESS_TOKEN) {
-        startupHealth.notes.forEach((note) => console.warn(`[boot] ${note}`));
-    } else {
-        console.log('Slack Watchdog: disabled by config');
-    }
-
     const botDeps = {
         bot,
         finale,
         opsManager: ops,
-        watchdog: globalWatchdog,
         chatHistory,
         chatLastActive,
         perplexityKey: perplexityKey || null,

@@ -28,9 +28,10 @@ export async function pollActiveShipments(): Promise<CarrierPollOutcome[]> {
     const supabase = createClient();
     if (!supabase) return [];
 
-    // Active shipments that aren't already delivered. Skip shipments checked
-    // within the last 12 hours — pacing.
-    const cutoff = new Date(Date.now() - 12 * 3600_000).toISOString();
+    // Re-poll shipments every 2 hours. Most parcel carriers (UPS, FedEx, USPS)
+    // update tracking 4–6×/day during transit. 12h cooldown was missing same-day
+    // delivery confirmations entirely.
+    const cutoff = new Date(Date.now() - 2 * 3600_000).toISOString();
     const { data: ships, error } = await supabase
         .from('shipments')
         .select('id, tracking_number, status_category, status_display, last_checked_at, delivered_at, po_numbers, vendor_names')
