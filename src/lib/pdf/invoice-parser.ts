@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { unifiedObjectGeneration } from "../intelligence/llm";
+import { extractTrackingNumbers } from "../carriers/tracking-service";
 
 export const LineItemSchema = z.object({
     lineNumber: z.coerce.number().nullable().optional(),
@@ -80,8 +81,9 @@ Extract ALL fields from the invoice with exact values — do not round or interp
 ## Other fields
 
 - Payment terms: exact text as written (Net 30, 2/10 Net 30, Due on Receipt, etc.)
-- PO numbers, order numbers, BOL numbers, PRO numbers, tracking numbers
-- Ship-to vs bill-to addresses if different
+- **PO numbers**: Look in ALL of these locations — dedicated "PO Number" field, "Customer Reference", "Reference", "Your Ref", "Memo", "Notes", "Order #", and header text. Many vendors put the PO in a memo/reference field, not a labeled PO box. If multiple candidate numbers exist, prefer the one that looks like a Finale PO (4+ digits, numeric).
+- **Tracking numbers**: Scan the ENTIRE invoice text for tracking numbers — they often appear unlabeled in shipping sections, at the bottom of the page, or in small-print reference lines. Common formats: UPS `1Z...` (starts with "1Z"), FedEx (12 or 15 digits, often `96...`), USPS (20-22 digits starting with 94/91/82), DHL (10 digits), and freight PRO numbers. Extract ALL found tracking numbers — the system deduplicates. Also check for a "Ship Date" anywhere in the document.
+- BOL numbers, PRO numbers
 - Due date: calculate from invoice date + terms if not explicitly stated
 
 ## Validation
@@ -269,6 +271,9 @@ const PO_LABEL_PATTERNS: RegExp[] = [
     /Ref(?:erence)?\s*#?\s*[:.]?\s*(\d{5,})/i,
     // "Order No 124547" / "Order Number: 124547"
     /Order\s+(?:Number|No\.?|#)\s*[:.]?\s*(\d{4,})/i,
+    // "Memo: 124547" / "Notes: 124547" / "Customer Reference 124547"
+    // Many vendors (Uline, Bunzl, WCP) put PO# in memo/reference fields
+    /(?:Memo|Notes?|Customer\s+Ref(?:erence)?)\s*[:.]?\s*(\d{4,})/i,
 ];
 
 /**
@@ -473,6 +478,40 @@ export async function parseInvoice(rawText: string, tables?: string[][]): Promis
         // than a separate freight charge. The reconciler needs this in invoice.freight
         // to map it to the Finale FREIGHT fee type on the PO.
         extractShippingToFreight(invoice);
+
+        // ——— Tracking number regex fallback —————————————————————————————
+        // LLM extraction of tracking numbers from PDFs is unreliable — the
+        // LLM often misses tracking numbers in table cells, columnar layouts,
+        // or unlabeled positions. Run the deterministic regex extractor from
+        // tracking-service.ts on the FULL raw text to catch any the LLM missed.
+        // Deduplication against what the LLM already found is handled downstream
+        // in reconcileTracking.
+        if (!invoice.trackingNumbers?.length) {
+            const regexTracks = extractTrackingNumbers(rawText);
+            if (regexTracks.length > 0) {
+                const deduped = [...new Set(regexTracks.map(t => t.trackingNumber))];
+                invoice.trackingNumbers = deduped;
+                if (!invoice.carrierName) {
+                    invoice.carrierName = regexTracks[0].carrier;
+                }
+                console.log(`[invoice-parser] Regex tracking fallback: extracted ${deduped.length} tracking numbers (LLM found 0)`);
+            }
+        } else {
+            // LLM found tracking numbers — supplement with any regex finds it missed
+            const regexTracks = extractTrackingNumbers(rawText);
+            const existing = new Set(invoice.trackingNumbers);
+            let added = 0;
+            for (const { trackingNumber, carrier } of regexTracks) {
+                if (!existing.has(trackingNumber)) {
+                    invoice.trackingNumbers.push(trackingNumber);
+                    existing.add(trackingNumber);
+                    added++;
+                }
+            }
+            if (added > 0) {
+                console.log(`[invoice-parser] Regex tracking supplement: +${added} tracking numbers (LLM had ${invoice.trackingNumbers.length - added})`);
+            }
+        }
 
         return invoice;
     } catch (err: any) {

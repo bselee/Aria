@@ -13,7 +13,6 @@ import type { Context, Telegraf } from 'telegraf';
 import type { Update } from 'telegraf/types';
 import type { FinaleClient } from '../../lib/finale/client';
 import type { OpsManager } from '../../lib/intelligence/ops-manager';
-import type { SlackWatchdog } from '../../lib/slack/watchdog';
 
 /**
  * A single bot command definition. Commands are registered by
@@ -40,7 +39,6 @@ export interface BotDeps {
     bot: Telegraf;
     finale: FinaleClient;
     opsManager: OpsManager;
-    watchdog: SlackWatchdog | null;
     chatHistory: Record<number, any[]>;
     chatLastActive: Record<number, number>;
     perplexityKey: string | null;

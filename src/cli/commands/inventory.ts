@@ -52,7 +52,7 @@ const productCommand: BotCommand = {
 };
 
 /**
- * /receivings — Post today's received POs to Telegram + Slack #purchasing.
+ * /receivings — Post today's received POs to Telegram.
  */
 const receivingsCommand: BotCommand = {
     name: 'receivings',
@@ -76,23 +76,7 @@ const receivingsCommand: BotCommand = {
                 disable_web_page_preview: true,
             });
 
-            // Post to Slack #purchasing if token available
-            if (process.env.SLACK_BOT_TOKEN) {
-                try {
-                    const { WebClient } = await import('@slack/web-api');
-                    const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
-                    await slack.chat.postMessage({
-                        channel: '#purchasing',
-                        text: digest,
-                        mrkdwn: true,
-                    });
-                    await ctx.reply('✅ _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
-                } catch (slackErr: any) {
-                    console.error('Slack post error:', slackErr.message);
-                    await ctx.reply('⚠️ _Telegram only — Slack post failed_', { parse_mode: 'Markdown' });
-                }
-            }
-        } catch (err: any) {
+            } catch (err: any) {
             console.error('Receivings error:', err.message);
             ctx.reply(`❌ Error fetching receivings: ${err.message}`);
         }

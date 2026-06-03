@@ -251,7 +251,14 @@ export class OpsManager {
             await getOrchestrator().notifyCronOutcome(taskName, false, String(error?.message ?? error));
         } catch { /* non-fatal */ }
         try {
-            this.supervisor.reportAgentException(taskName, error);
+            // HERMIA(2026-06-03): await — supervisor.reportAgentException is now
+            // async (writes to ops_agent_exceptions table). Fire-and-forget was
+            // the pre-refactor contract when it was a no-op; now it can throw
+            // async (e.g. supabase insert error), and the surrounding try/catch
+            // only catches sync throws. Awaiting here surfaces any error to the
+            // existing warn-log. The function itself swallows + logs its own
+            // errors, so this catch is purely defensive.
+            await this.supervisor.reportAgentException(taskName, error);
         } catch (e: any) {
             console.warn(`[ops-manager] cronHookFailure(${taskName}) supervisor escalate failed: ${e.message}`);
         }
@@ -351,8 +358,12 @@ export class OpsManager {
             }
 
             console.error(`\u274c Cron Task Failed: ${taskName}`, error.message);
-            // Escalate to Supervisor
-            this.supervisor.reportAgentException(taskName, error);
+            // Escalate to Supervisor (fire-and-forget; reportAgentException
+            // swallows its own errors so this cannot reject — but we add
+            // .catch defensively to silence any future contract change)
+            this.supervisor.reportAgentException(taskName, error).catch((e: any) => {
+                console.warn(`[ops-manager] safeRun(${taskName}) supervisor escalate failed: ${e.message}`);
+            });
             // Register heartbeat on error
             await this.oversightAgent?.registerHeartbeat(this.agentName, taskName, { lastError: String(error) });
             await memoryLayerManager.archiveSession(`cron:${taskName}:${startedAtIso}`, {

@@ -368,19 +368,31 @@ defineJob({
 // Runs every 15 min, right before ap-polling.
 defineJob({
     name: "cognitive-round",
-    schedule: "*/15 * * * *",
-    onFail: "log",
-    description: "Cognitive Round: survey state, decide priorities, log decisions (every 15m).",
-    handler: async () => {
-        const { runCognitiveRound } = await import("@/lib/intelligence/cognitive-round");
-        const decision = await runCognitiveRound();
-        // KAIZEN(2026-05-29): Decisions now wired — cron/runner.ts checks
-        // isJobSuppressed() before each tick. Suppressed jobs return
-        // "cognitive-suppressed" status in run history.
-        if (decision.suppress.length > 0 || decision.boost.length > 0) {
-            console.log(`[cognitive-round] suppress: ${decision.suppress.join(", ")} | boost: ${decision.boost.join(", ")}`);
-        }
-    },
+        schedule: "*/15 * * * *",
+        onFail: "log",
+        description: "Cognitive Round: survey state, decide priorities, log decisions (every 15m).",
+        handler: async () => {
+            const { runCognitiveRound } = await import("@/lib/intelligence/cognitive-round");
+            const decision = await runCognitiveRound();
+            // KAIZEN(2026-05-29): Decisions now wired — cron/runner.ts checks
+            // isJobSuppressed() before each tick. Suppressed jobs return
+            // "cognitive-suppressed" status in run history.
+            if (decision.suppress.length > 0 || decision.boost.length > 0) {
+                console.log(`[cognitive-round] suppress: ${decision.suppress.join(", ")} | boost: ${decision.boost.join(", ")}`);
+            }
+            // KAIZEN(2026-06-02): Surface critical decisions via Telegram.
+            if (decision.priority === "critical") {
+                try {
+                    const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                    await sendTelegramNotify(
+                        `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
+                    );
+                    console.log(`[cognitive-round] Telegram alert sent for critical decision`);
+                } catch (err: any) {
+                    console.warn(`[cognitive-round] Telegram alert failed (non-fatal): ${err.message}`);
+                }
+            }
+        },
 });
 
 // HERMIA(2026-05-28): Memory hot/cold tier sync.
@@ -426,16 +438,30 @@ defineJob({
 });
 
 // ── CORE-04: Follow-up SOP ───────────────────────────────────────────────
-// Checks for stale Slack requests (>24h unanswered) and vendor POs (>48h
-// without confirmation). Nudges Bill via Telegram. Runs every 2 hours.
-// Slack requests are marked last_nudge_at to avoid re-nudging within 24h.
+// HERMIA(2026-06-03): The legacy followup-sop logic (lib/slack/followup-sop.ts)
+// was deleted in the 2026-05 refactor. Its responsibilities — nudging for
+// stale Slack requests (>24h unanswered) and unconfirmed vendor POs (>48h) —
+// are now distributed across three dedicated crons that were added as part
+// of the same kaizen:
+//
+//   • po-followup-watcher      — PO acknowledgements + reorder nudges
+//   • vendor-escalation        — vendor POs >48h without confirmation
+//   • delivery-exception-escalator — delivery exceptions + receipt prompts
+//
+// The autonomy engine (purchasing-followup worker + comms-master master)
+// tracks heartbeat status for this cron via notifyCronOutcome (wired in
+// ops-manager.safeRun). This handler is now a heartbeat tick — its sole job
+// is to keep the cron registry happy and the orchestrator registry current.
 defineJob({
     name: "followup-sop",
     schedule: "0 */2 * * *", // every 2 hours
     onFail: "log",
-    description: "Follow-up SOP: nudge Bill for unanswered Slack requests or unconfirmed vendor POs.",
+    description: "Follow-up SOP heartbeat — logic now distributed across po-followup-watcher + vendor-escalation + delivery-exception-escalator. Orchestrator tracks via notifyCronOutcome.",
     handler: async () => {
-        const { runFollowUpSOP } = await import("../../lib/slack/followup-sop");
-        await runFollowUpSOP();
+        // Intentionally minimal. The work lives in the three crons above.
+        // Logging once per tick confirms the cron is healthy; the orchestrator
+        // heartbeat (via ops-manager.safeRun → notifyCronOutcome) handles
+        // failure signalling.
+        console.log("💓 [followup-sop] heartbeat tick — work distributed to po-followup-watcher / vendor-escalation / delivery-exception-escalator");
     },
 });

@@ -1,13 +1,12 @@
 /**
  * @file    operations.ts
  * @purpose Telegram commands for operational intelligence: build risk analysis,
- *          PO correlation, proactive alerts, Slack request tracking, and
- *          Amazon order notification approval.
+ *          PO correlation, and proactive alerts.
  *          Extracted from start-bot.ts lines ~457-587, ~653-705, ~912-1012.
  * @author  Will / Antigravity
  * @created 2026-03-20
- * @updated 2026-03-20
- * @deps    build-risk, reorder-engine, po-correlator, supabase, @slack/web-api
+ * @updated 2026-06-03
+ * @deps    build-risk, reorder-engine, po-correlator, supabase
  */
 
 import type { BotCommand, BotDeps } from './types';
@@ -90,21 +89,6 @@ const buildriskCommand: BotCommand = {
                 await ctx.reply(askMsg, { parse_mode: 'Markdown' });
             }
 
-            // Also post to Slack if configured
-            if (process.env.SLACK_BOT_TOKEN) {
-                try {
-                    const { WebClient } = await import('@slack/web-api');
-                    const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
-                    await slack.chat.postMessage({
-                        channel: '#purchasing',
-                        text: report.slackMessage,
-                        mrkdwn: true,
-                    });
-                    await ctx.reply('📤 _Also posted to Slack #purchasing_', { parse_mode: 'Markdown' });
-                } catch (slackErr: any) {
-                    console.error('Slack post error:', slackErr.message);
-                }
-            }
         } catch (err: any) {
             console.error('Build risk error:', err.message);
             await ctx.reply(`❌ Build risk analysis failed: ${err.message}`, { parse_mode: 'Markdown' });
@@ -112,53 +96,6 @@ const buildriskCommand: BotCommand = {
     },
 };
 
-/**
- * /requests — Show recent Slack product requests detected by the watchdog.
- */
-const requestsCommand: BotCommand = {
-    name: 'requests',
-    description: 'Show Slack product requests',
-    handler: async (ctx, deps) => {
-        ctx.sendChatAction('typing');
-
-        try {
-            const pending = deps.watchdog?.getRecentRequests() || [];
-
-            if (pending.length === 0) {
-                await ctx.reply(
-                    `🦊 *Slack Request Tracker*\n\n` +
-                    `✅ No pending product requests right now.\n\n` +
-                    `Monitoring: *#purchasing*, *#purchase-orders*, DMs\n` +
-                    `Thread replies: ✅ Included\n` +
-                    `_New requests appear as 🦊 Aria Slack Digest messages._`,
-                    { parse_mode: 'Markdown' }
-                );
-                return;
-            }
-
-            let reply = `🦊 *Slack Request Tracker* — ${pending.length} pending\n\n`;
-            for (const req of pending) {
-                const urgencyEmoji = req.analysis.urgency === 'high' ? '🔴' :
-                    req.analysis.urgency === 'medium' ? '🟡' : '🟢';
-                reply += `${urgencyEmoji} *${req.userName}* in #${req.channel}\n`;
-                reply += `  📦 ${req.analysis.itemDescription}`;
-                if (req.analysis.quantity) reply += ` (×${req.analysis.quantity})`;
-                reply += `\n`;
-                if (req.matchedProduct) {
-                    reply += `  ✅ SKU: \`${req.matchedProduct.sku}\`\n`;
-                }
-                if (req.activePO) {
-                    reply += `  📋 PO: #${req.activePO} — ${req.eta}\n`;
-                }
-                reply += `\n`;
-            }
-            reply += `_Channels: #purchasing, #purchase-orders, DMs + thread replies_`;
-            await ctx.reply(reply, { parse_mode: 'Markdown' });
-        } catch (err: any) {
-            await ctx.reply(`❌ Error: ${err.message}`);
-        }
-    },
-};
 
 /**
  * /alerts — Show recent smart reorder/build prescriptions from the last 24 hours.
@@ -227,113 +164,6 @@ const correlateCommand: BotCommand = {
     },
 };
 
-/**
- * /notify <request_id> — Approve sending an Amazon order update to the Slack requester.
- *
- * DECISION(2026-03-19): Manual review gate before any Slack notification.
- * Will reviews the Amazon order match on Telegram and approves with /notify.
- */
-const notifyCommand: BotCommand = {
-    name: 'notify',
-    description: 'Send Amazon order update to Slack requester',
-    handler: async (ctx, _deps) => {
-        ctx.sendChatAction('typing');
-
-        const requestId = getCmdText(ctx).split(' ').slice(1).join(' ').trim();
-        if (!requestId) {
-            await ctx.reply('Usage: /notify <request_id>\n\nCopy the ID from an Amazon order notification.');
-            return;
-        }
-
-        try {
-            const { createClient } = await import('../../lib/supabase');
-            const supabase = createClient();
-            if (!supabase) {
-                await ctx.reply('Database unavailable.');
-                return;
-            }
-
-            const { data: req, error } = await supabase
-                .from('slack_requests')
-                .select('*')
-                .eq('id', requestId)
-                .single();
-
-            if (error || !req) {
-                await ctx.reply(`Request not found: ${requestId}`);
-                return;
-            }
-
-            if (req.notified_at) {
-                await ctx.reply(`Already notified on ${new Date(req.notified_at).toLocaleString('en-US', { timeZone: 'America/Denver' })}`);
-                return;
-            }
-
-            if (req.channel_id === 'unmatched') {
-                await ctx.reply('This order has no matched Slack request. Nothing to notify.');
-                return;
-            }
-
-            // Build the Slack message — factual, no emojis, precise
-            const items = (req.amazon_items || [])
-                .map((i: any) => `  ${i.quantity}x ${i.name}${i.price ? ` ($${i.price.toFixed(2)})` : ''}`)
-                .join('\n');
-
-            let slackMessage = '';
-            if (req.status === 'shipped' && req.tracking_number) {
-                slackMessage = `Your order has shipped.\n\n`;
-                slackMessage += `Order: ${req.amazon_order_id}\n`;
-                if (req.carrier) slackMessage += `Carrier: ${req.carrier}\n`;
-                slackMessage += `Tracking: ${req.tracking_number}\n`;
-                if (req.estimated_delivery) {
-                    const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
-                        weekday: 'long', month: 'long', day: 'numeric',
-                        timeZone: 'America/Denver',
-                    });
-                    slackMessage += `Expected delivery: ${eta}\n`;
-                }
-                if (items) slackMessage += `\nItems:\n${items}\n`;
-            } else {
-                slackMessage = `Your order has been placed.\n\n`;
-                slackMessage += `Order: ${req.amazon_order_id}\n`;
-                if (req.estimated_delivery) {
-                    const eta = new Date(req.estimated_delivery).toLocaleDateString('en-US', {
-                        weekday: 'long', month: 'long', day: 'numeric',
-                        timeZone: 'America/Denver',
-                    });
-                    slackMessage += `Expected delivery: ${eta}\n`;
-                }
-                if (items) slackMessage += `\nItems:\n${items}\n`;
-            }
-
-            // Send to Slack in the original thread
-            const slackToken = process.env.SLACK_BOT_TOKEN;
-            if (!slackToken) {
-                await ctx.reply('SLACK_BOT_TOKEN not configured.');
-                return;
-            }
-
-            const { WebClient } = await import('@slack/web-api');
-            const slack = new WebClient(slackToken);
-
-            await slack.chat.postMessage({
-                channel: req.channel_id,
-                text: slackMessage,
-                thread_ts: req.thread_ts || req.message_ts,
-            });
-
-            // Mark as notified
-            await supabase
-                .from('slack_requests')
-.update({ notified_at: new Date().toISOString() })
-                .eq('id', requestId);
-
-            await ctx.reply(`Sent to ${req.requester_name} in Slack.`);
-         } catch (err: any) {
-             await ctx.reply(`Failed: ${err.message}`);
-         }
-     },
- };
 
  /**
   * /purchases — Run purchasing intelligence pipeline on-demand.
@@ -776,10 +606,8 @@ const notifyCommand: BotCommand = {
 
  export const operationsCommands: BotCommand[] = [
      buildriskCommand,
-     requestsCommand,
      alertsCommand,
      correlateCommand,
-     notifyCommand,
      purchasesCommand,
      vendorCommand,
      ulineCommand,
