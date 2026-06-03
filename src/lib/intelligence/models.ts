@@ -41,7 +41,10 @@ export const DIRECT_MODELS = {
 
 /** OpenRouter model slugs (org/model format) */
 export const OPENROUTER_MODELS = {
-    claudeHaiku: 'anthropic/claude-haiku-4-5',
+    // HERMIA(2026-06-03): fixed slug — was 'claude-haiku-4-5' (hyphen) but
+    // OpenRouter's actual id is 'claude-haiku-4.5' (dot). Every call to
+    // the wrong slug 404'd and the chain fell through to Gemini unnecessarily.
+    claudeHaiku: 'anthropic/claude-haiku-4.5',
     geminiFlash: 'google/gemini-2.5-flash',  // Uses OpenRouter's quota, not ours
     gpt4oMini: 'openai/gpt-4o-mini',
     gpt4: 'openai/gpt-4',              // Best accuracy + speed (0.62s avg)

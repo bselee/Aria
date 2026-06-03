@@ -105,7 +105,10 @@ export function getAgentStats(agentName: string, hours = 24): Array<{
 
 /** Cost per million tokens (USD) */
 const MODEL_COSTS: Record<string, { inPerMToken: number; outPerMToken: number }> = {
-    "claude-haiku-4-5": { inPerMToken: 0.80, outPerMToken: 4.00 },
+    // HERMIA(2026-06-03): key corrected to dot-form to match OpenRouter's
+    // returned model id (was "claude-haiku-4-5" with hyphen — never matched
+    // any real call, so cost tracking silently fell through to "unknown").
+    "claude-haiku-4.5": { inPerMToken: 0.80, outPerMToken: 4.00 },
     "gemini-2.5-flash": { inPerMToken: 0, outPerMToken: 0 },       // Free via OpenRouter
     "gpt-4o": { inPerMToken: 2.50, outPerMToken: 10.00 },
     "gpt-4o-mini": { inPerMToken: 0.15, outPerMToken: 0.60 },
