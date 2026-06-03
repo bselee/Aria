@@ -23,6 +23,7 @@ import { registerAllCommands } from './commands';
 import { FinaleClient } from '../lib/finale/client';
 import { APAgent } from '../lib/intelligence/ap-agent';
 import { initSandboxWatcher } from '../lib/intelligence/sandbox-watcher';
+import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import { startBotControlPlane } from '../lib/ops/bot-control-plane';
 import {
     loadPendingApprovalsFromSupabase,
