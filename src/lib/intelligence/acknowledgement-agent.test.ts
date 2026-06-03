@@ -266,6 +266,62 @@ describe("AcknowledgementAgent", () => {
         });
     });
 
+    it("does NOT escalate active conversation threads where BuildASoil has already replied", async () => {
+        // Regression test for Invico PO 124392 ping-pong: each new vendor "Re:"
+        // got a fresh gmail_message_id, dedup missed it, and the conversation-thread
+        // upgrade re-escalated every 15 min. The fix: if BuildASoil has already
+        // replied in the thread, keep it as ROUTINE_INFO and silently archive.
+        queueState.messages = [
+            {
+                id: 22,
+                gmail_message_id: "gmail-22",
+                thread_id: "thread-22",
+                rfc_message_id: "<msg-22>",
+                from_email: "jade@invicoworldwide.com",
+                subject: "Re: Invico Worldwide Order Confirmation (Ref IUSA26942 | PO 124392)",
+                body_snippet: "Per our last call, confirming updated ship date.",
+                body_text: "Per our last call, confirming updated ship date.\n\nOn Mon, Bill wrote:\nThanks for the update!",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+        // Thread history: BuildASoil replied AFTER the vendor, so the conversation
+        // is already active. The new vendor reply should NOT trigger human review.
+        gmailThreadsGetMock.mockResolvedValue({
+            data: {
+                messages: [
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Bill Selee <bill.selee@buildasoil.com>" }],
+                        },
+                    },
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Jade <jade@invicoworldwide.com>" }],
+                        },
+                    },
+                    {
+                        payload: {
+                            headers: [{ name: "From", value: "Bill Selee <bill.selee@buildasoil.com>" }],
+                        },
+                    },
+                ],
+            },
+        });
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        // Must NOT escalate to human.
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
+        // Must NOT send a duplicate "Thanks!" on top of our own existing reply.
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        // The message stays in the inbox (left visible for review) — the
+        // dedup-on-processed_by_ack in the queue table prevents ping-pong.
+        expect(gmailModifyMock).not.toHaveBeenCalled();
+    });
+
     it("queues inline invoices without archiving them out of view", async () => {
         queueState.messages = [
             {
