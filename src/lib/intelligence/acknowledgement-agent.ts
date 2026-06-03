@@ -6,7 +6,7 @@ import { z } from "zod";
 import { recall } from "./memory";
 import { applyMessageLabelPolicy } from "./gmail-policy";
 import { recordHumanReviewRequired, recordSimpleAutoReply } from "./email-feedback";
-import { summarizeThreadCommunication } from "./po-correlator";
+import { summarizeThreadCommunication, ThreadCommunicationSummary } from "./po-correlator";
 
 /**
  * @file acknowledgement-agent.ts
@@ -403,11 +403,30 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 // Guardrail 3: Classify intent (LLM call — expensive, only reached for real vendor emails)
                 let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
                 let humanReviewReason = "llm_requires_human";
+                let activeThreadSummary: ThreadCommunicationSummary | null = null;
 
                 if (intent === "ROUTINE_INFO" && this.looksLikeConversationThread(subject, bodyText)) {
-                    console.log(`     -> Upgrading ROUTINE_INFO → REQUIRES_HUMAN (conversation thread detected)`);
-                    intent = "REQUIRES_HUMAN";
-                    humanReviewReason = "conversation_thread";
+                    // DECISION(2026-06-03): Ping-pong fix for active vendor confirmation threads.
+                    // Symptom: Bill received repeated "1 email needs response" pings about the
+                    // same vendor thread (e.g. "Re: Invico Worldwide PO 124392" from jade@invicoworldwide.com)
+                    // every 15 min. Root cause: Gmail hands out a fresh `gmail_message_id` for
+                    // every vendor reply, so the dedup-on-message_id never matches. Each new
+                    // vendor "Re:" was re-escalated from ROUTINE_INFO → REQUIRES_HUMAN here.
+                    //
+                    // Fix: peek at the thread. If BuildASoil has already replied at least once
+                    // in this thread, the conversation is active and Bill is aware — keep it
+                    // as ROUTINE_INFO so the auto-reply branch archives it normally (and the
+                    // extended `suppressAutoReply` below prevents sending a duplicate "Thanks!"
+                    // on top of our own existing reply).
+                    activeThreadSummary = await this.getThreadCommunicationSummary(gmail, threadId);
+                    if (activeThreadSummary?.buildasoilRepliedAfterVendor) {
+                        console.log(`     -> Suppressing REQUIRES_HUMAN upgrade (active thread — ${activeThreadSummary.buildasoilReplyCount} BuildASoil reply, last actor: ${activeThreadSummary.lastActor})`);
+                        // Keep intent as ROUTINE_INFO. Auto-reply will be suppressed below.
+                    } else {
+                        console.log(`     -> Upgrading ROUTINE_INFO → REQUIRES_HUMAN (conversation thread detected)`);
+                        intent = "REQUIRES_HUMAN";
+                        humanReviewReason = "conversation_thread";
+                    }
                 }
 
                 // DECISION(2026-03-13): Post-classification cost-data guard.
@@ -452,13 +471,21 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                     const isNoRep = this.isNoReply(senderEmail);
                     const isMarketplaceStatus = this.isMarketplaceOrStatusSender(senderEmail, subject);
                     const isPurchaseThread = this.looksLikePurchaseThread(subject, bodyText);
-                    const threadSummary = isPurchaseThread
-                        ? await this.getThreadCommunicationSummary(gmail, threadId)
-                        : null;
+                    // Reuse the thread summary we already fetched in the conversation-thread
+                    // upgrade above (when applicable) so we don't make a second Gmail API call.
+                    const threadSummary = activeThreadSummary
+                        ?? (isPurchaseThread
+                            ? await this.getThreadCommunicationSummary(gmail, threadId)
+                            : null);
                     let replied = false;
+                    const isActiveConversationThread = activeThreadSummary?.buildasoilRepliedAfterVendor === true;
                     const suppressAutoReply = isMarketplaceStatus
                         || (isPurchaseThread && (threadSummary?.vendorReplyCount || 0) > 0)
-                        || (isPurchaseThread && !!threadSummary?.buildasoilRepliedAfterVendor);
+                        || (isPurchaseThread && !!threadSummary?.buildasoilRepliedAfterVendor)
+                        // DECISION(2026-06-03): Don't send a "Thanks!" on top of our own
+                        // existing reply in an active vendor thread — we already replied,
+                        // the vendor is in conversation with us, no need to chime in again.
+                        || isActiveConversationThread;
 
                     if (!suppressAutoReply && !isNoRep && rfcMessageId && myEmail) {
                         try {
