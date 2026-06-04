@@ -57,9 +57,10 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // ── Internal ignores ────────────────────────────────────────────────
     { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
 
-    // ── Expected non-PO vendors (no PO will ever exist — suppress noise) ──
-    { match: { senderContains: 'culligan' }, action: 'ignore', label: 'Culligan Water (No PO — Recurring Service)' },
-    { match: { senderContains: 'aaa cooper' }, action: 'ignore', label: 'AAA Cooper Transportation (Freight — No PO)' },
+    // ── Autopay / paid elsewhere (mark read, log for audit, NO Bill.com forward) ──
+    // Culligan Water: bottled-water service, paid on autopay. Logged for visibility
+    // but never forwarded to Bill.com and never PO-matched.
+    { match: { senderContains: 'culligan' }, action: 'autopay', label: 'Culligan Water (Autopay — Paid, No Forward)' },
 ];
 
 /**

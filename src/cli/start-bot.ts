@@ -27,6 +27,7 @@ import { initAriaReviewWatcher } from '../lib/intelligence/aria-review-watcher';
 import { startBotControlPlane } from '../lib/ops/bot-control-plane';
 import {
     loadPendingApprovalsFromSupabase,
+    expireStaleApprovals,
     type ReconciliationResult,
 } from '../lib/finale/reconciler';
 import { handleTelegramText } from '../lib/copilot/channels/telegram';
@@ -402,6 +403,12 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
     // restore approvals
     try {
+        // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
+        // linger as status='pending' in Supabase (a 2026-03 Uline approval sat
+        // 'pending' for 2+ months because the boot loader only skipped them
+        // in-memory and never wrote the expiry back).
+        await expireStaleApprovals();
+
         const pending = await loadPendingApprovalsFromSupabase();
 
         if (pending.length > 0) {

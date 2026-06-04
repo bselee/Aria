@@ -412,6 +412,25 @@ defineJob({
     },
 });
 
+// HERMIA(2026-06-04): Expire stale AP pending approvals.
+// Marks any ap_pending_approvals row still status='pending' past its 24h
+// expires_at as 'expired'. Without this the boot loader only skips them
+// in-memory — the DB row lingers forever (a 2026-03 Uline approval sat
+// 'pending' 2+ months). Daily is plenty; expiry is non-urgent housekeeping.
+defineJob({
+    name: "expire-stale-approvals",
+    schedule: "0 6 * * *",
+    onFail: "log",
+    description: "Expire AP pending approvals past their 24h window (daily 6 AM).",
+    handler: async () => {
+        const { expireStaleApprovals } = await import("@/lib/finale/reconciler");
+        const expired = await expireStaleApprovals();
+        if (expired > 0) {
+            console.log(`[expire-stale-approvals] Expired ${expired} stale approval(s)`);
+        }
+    },
+});
+
 // Gated cron — preserved env flag from inline registration.
 // HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
 // When enabled, 15m is plenty for orchestrating issue remediation cycles.

@@ -280,6 +280,44 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
 }
 
 /**
+ * Sweep stale pending approvals: mark any row still status='pending' whose
+ * expires_at is in the past as status='expired'. Without this, expired rows
+ * linger in 'pending' forever (the boot loader only SKIPS them in-memory; it
+ * never persists the state change). A 2026-03 Uline approval sat 'pending' for
+ * 2+ months before this sweep was added.
+ *
+ * KAIZEN(2026-06-04): Wired into boot + a dedicated cron so the DB self-heals.
+ * Best-effort — never throws. Returns the count of rows expired.
+ */
+export async function expireStaleApprovals(): Promise<number> {
+    try {
+        const supabase = createClient();
+        if (!supabase) return 0;
+
+        const { data, error } = await supabase
+            .from("ap_pending_approvals")
+            .update({ status: "expired" })
+            .eq("status", "pending")
+            .lt("expires_at", new Date().toISOString())
+            .select("id");
+
+        if (error) {
+            console.warn("[reconciler] expireStaleApprovals query error:", error.message);
+            return 0;
+        }
+
+        const count = data?.length ?? 0;
+        if (count > 0) {
+            console.log(`[reconciler] Expired ${count} stale pending approval(s) past their 24h window`);
+        }
+        return count;
+    } catch (err: any) {
+        console.warn("[reconciler] expireStaleApprovals failed:", err.message);
+        return 0;
+    }
+}
+
+/**
  * Retrieve a pending approval by ID.
  * C3 FIX: Now async â€” reads from Supabase first, falls back to in-memory cache.
  * On restart, in-memory cache is empty but Supabase has the row.
