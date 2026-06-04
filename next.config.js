@@ -18,6 +18,15 @@
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+    async redirects() {
+        return [
+            {
+                source: "/",
+                destination: "/dashboard",
+                permanent: false,
+            },
+        ];
+    },
     typescript: {
         // DECISION(2026-03-09): Skip type-checking during `next build`.
         // Type-check separately: `npm run typecheck` (tsconfig.json — app code only).
