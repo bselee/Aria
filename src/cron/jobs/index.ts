@@ -438,30 +438,35 @@ defineJob({
 });
 
 // ── CORE-04: Follow-up SOP ───────────────────────────────────────────────
-// HERMIA(2026-06-03): The legacy followup-sop logic (lib/slack/followup-sop.ts)
-// was deleted in the 2026-05 refactor. Its responsibilities — nudging for
-// stale Slack requests (>24h unanswered) and unconfirmed vendor POs (>48h) —
-// are now distributed across three dedicated crons that were added as part
-// of the same kaizen:
+// HERMIA(2026-06-04): The legacy followup-sop logic (lib/slack/followup-sop.ts)
+// was deleted in the 2026-05 refactor. Its five responsibilities split:
 //
-//   • po-followup-watcher      — PO acknowledgements + reorder nudges
-//   • vendor-escalation        — vendor POs >48h without confirmation
-//   • delivery-exception-escalator — delivery exceptions + receipt prompts
+//   • PO acknowledgements + reorder nudges  → po-followup-watcher cron
+//   • L2/L3 vendor escalation                → vendor-escalation cron
+//   • Delivery exception escalation          → delivery-exception-escalator cron
+//   • Stale Slack requests >24h unanswered   → stale-request-watcher (this handler)
+//   • AP invoices stuck in ERROR_FORWARDING  → email-forwarding-alert (this handler)
+//
+// The three PO-side crons run on weekday business hours. The two alerts that
+// need 24/7 coverage (Slack requests + AP forwarding) run on this cron's
+// 2-hour schedule via this handler. Both modules early-return + log when
+// there's nothing to surface, so a quiet hour is silent.
 //
 // The autonomy engine (purchasing-followup worker + comms-master master)
 // tracks heartbeat status for this cron via notifyCronOutcome (wired in
-// ops-manager.safeRun). This handler is now a heartbeat tick — its sole job
-// is to keep the cron registry happy and the orchestrator registry current.
+// ops-manager.safeRun).
 defineJob({
     name: "followup-sop",
-    schedule: "0 */2 * * *", // every 2 hours
+    schedule: "0 */2 * * *", // every 2 hours, 24/7
     onFail: "log",
-    description: "Follow-up SOP heartbeat — logic now distributed across po-followup-watcher + vendor-escalation + delivery-exception-escalator. Orchestrator tracks via notifyCronOutcome.",
+    description: "Follow-up SOP fan-out: stale Slack requests (stale-request-watcher) + AP forwarding alerts (email-forwarding-alert). PO-side work lives in three dedicated crons.",
     handler: async () => {
-        // Intentionally minimal. The work lives in the three crons above.
-        // Logging once per tick confirms the cron is healthy; the orchestrator
-        // heartbeat (via ops-manager.safeRun → notifyCronOutcome) handles
-        // failure signalling.
-        console.log("💓 [followup-sop] heartbeat tick — work distributed to po-followup-watcher / vendor-escalation / delivery-exception-escalator");
+        // HERMIA(2026-06-04): fan out to the two missing modules. Both
+        // early-return + log when there's nothing to report.
+        const [{ runStaleRequestWatcher }, { runForwardingEscalation }] = await Promise.all([
+            import("@/lib/slack/stale-request-watcher"),
+            import("@/lib/intelligence/email-forwarding-alert"),
+        ]);
+        await Promise.all([runStaleRequestWatcher(), runForwardingEscalation()]);
     },
 });
