@@ -81,7 +81,10 @@ const DROPSHIP_RULES: DropshipRule[] = [
     // Format: { senderKeyword: 'domain.com', label: 'Vendor Name (Dropship)' }
     //   OR    { vendorKeyword: 'vendor name', label: 'Vendor Name (Dropship)' }
     { vendorKeyword: 'ferticell', label: 'Ferticell (Dropship)' },
-    { vendorKeyword: 'fert', label: 'Ferticell (Dropship)' },
+    // KAIZEN(2026-06-04): 'fert' alone removed — too short, latent false-positive
+    // risk with "Fertilizer Co" or "Fertility Plus" vendors. The QuickBooks rule
+    // with subjectRequired:'fert' remains — it's guarded by sender:quickbooks.
+    // Vendor keyword 'ferticell' catches all Ferticell OCR name variants.
 ];
 
 // ─── Real Invoice Overrides ───────────────────────────────────────────────────
