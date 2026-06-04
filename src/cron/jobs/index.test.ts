@@ -26,6 +26,7 @@ const EXPECTED_JOBS = [
     "task-self-healer",
     "issue-projection",
     "issue-orchestrator",
+    "expire-stale-approvals",
 ];
 
 beforeAll(async () => {
