@@ -181,12 +181,13 @@ async function extractScannedPDF(
         console.log(`[extractor] ✅ google/gemini-2.5-flash — ${extractedText.length} chars`);
     }
 
-    // Strategy 2: free fallback models on OpenRouter (no PDF base64 support — send as prompt text instead)
+    // Strategy 2: cheap fallback models on OpenRouter when Gemini fails
     if (!extractedText) {
-            console.log(`[extractor] Trying free fallback...`);
+            console.log(`[extractor] Trying cheap fallback models...`);
             const freeModels = [
-                "google/gemini-2.5-flash-preview",  // free tier
-                "qwen/qwen3-8b",                      // free, good at text
+                "google/gemini-2.5-flash-preview",  // free tier — try first
+                "deepseek/deepseek-v4-flash",        // KAIZEN(2026-06-04): reliable, $0.14/M
+                "qwen/qwen3-8b",                     // free, good at text
             ];
             for (const model of freeModels) {
                 if (await callOpenRouter(model)) {

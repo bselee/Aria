@@ -49,6 +49,12 @@ export const OPENROUTER_MODELS = {
     gpt4oMini: 'openai/gpt-4o-mini',
     gpt4: 'openai/gpt-4',              // Best accuracy + speed (0.62s avg)
     gpt35Turbo: 'openai/gpt-3.5-turbo', // Best value for high-volume (0.74s avg)
+    // HERMIA(2026-06-04): DeepSeek V4 Flash — current default model for Aria.
+    // Extremely cheap ($0.14/M input), fast, and proven reliable for structured
+    // JSON and classification. Added to every chain as the cost-optimised first try.
+    deepseekV4: 'deepseek/deepseek-v4-flash',
+    // Cheap alternatives for free-tier fallback when openrouter/free router is down
+    mistralNemo: 'mistralai/mistral-nemo-jb:free',
 } as const;
 
 // ── Fallback Chains ─────────────────────────────────────────────────────────
@@ -60,6 +66,7 @@ export const OPENROUTER_MODELS = {
  * Every model is proven for Zod schema generation and tool calling.
  */
 export const OPENROUTER_STRUCTURED_CHAIN = [
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.14/M — cheapest proven, try first
     { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },        // Best accuracy + speed (0.62s)
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
@@ -71,6 +78,7 @@ export const OPENROUTER_STRUCTURED_CHAIN = [
  * Same models — chat quality is equally important.
  */
 export const OPENROUTER_CHAT_CHAIN = [
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.14/M — cheapest, fast, try first
     { name: 'OpenRouter GPT-3.5 Turbo', slug: OPENROUTER_MODELS.gpt35Turbo }, // Fastest chat (0.74s), cheapest
     { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },               // When accuracy matters
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
@@ -93,14 +101,17 @@ export const OPENROUTER_CHAT_CHAIN = [
 export const OPENROUTER_FREE_CHAIN = [
     // DECISION(2026-04-28): `openrouter/free` is OpenRouter's "Free Models
     // Router" that auto-picks an available free model per call. Resilient to
-    // upstream rotations (no slug rot to chase). Hand-curated specifics
-    // remain as fallback in case the router itself has an outage.
+    // upstream rotations (no slug rot to chase).
     { name: 'OpenRouter Free Router', slug: 'openrouter/free' },
-    { name: 'OpenRouter Nemotron 3 Super 120B (free)', slug: 'nvidia/nemotron-3-super-120b-a12b:free' },
-    { name: 'OpenRouter Qwen3 80B (free)', slug: 'qwen/qwen3-next-80b-a3b-instruct:free' },
-    { name: 'OpenRouter MiniMax M2.5 (free)', slug: 'minimax/minimax-m2.5:free' },
-    { name: 'OpenRouter Gemma 4 31B (free)', slug: 'google/gemma-4-31b-it:free' },
-    { name: 'OpenRouter Llama 3.3 70B (free)', slug: 'meta-llama/llama-3.3-70b-instruct:free' },
+    // KAIZEN(2026-06-04): Previous Qwen3 80B, MiniMax M2.5, Gemma 4 31B,
+    // and Llama 3.3 70B all consistently returned "Provider returned error".
+    // Replaced with Mistral Nemo (free-tier active) and DeepSeek V4 ($0.14/M
+    // fallback — not free but cheap enough to not worry about). The 5+ failed
+    // attempts per request were burning ~10s each on dead endpoints.
+    { name: 'OpenRouter Mistral Nemo (free)', slug: OPENROUTER_MODELS.mistralNemo },
+    // Paid fallback: DeepSeek V4 Flash at $0.14/M is still negligible cost
+    // for low-stakes classification. Better than burning 5x failed calls.
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },
 ] as const;
 
 /**
@@ -109,6 +120,7 @@ export const OPENROUTER_FREE_CHAIN = [
  */
 export const OPENROUTER_VISION_MODELS_ARRAY = [
     OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first
+    OPENROUTER_MODELS.deepseekV4,   // ✅ Supports PDF base64 — cheap $0.14/M
     OPENROUTER_MODELS.gpt4,         // ✅ Supports PDF base64, best accuracy (0.62s)
     OPENROUTER_MODELS.claudeHaiku,  // ❌ PDF base64 → 400 error
     OPENROUTER_MODELS.gpt4oMini,    // Unlikely to support PDF base64
