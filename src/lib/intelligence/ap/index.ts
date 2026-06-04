@@ -34,3 +34,9 @@ export {
     type ReconciliationIdentity,
     type OCRRetryDecision,
 } from './types';
+
+// ── Autopay Detection (heuristic fallback, no LLM) ──────────────────────────
+export {
+    detectAutopay,
+    type AutopayDetectionResult,
+} from './autopay-detector';

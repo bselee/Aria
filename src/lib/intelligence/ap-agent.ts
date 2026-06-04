@@ -49,6 +49,7 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  * This file now imports VendorRoutingRule + matchVendorRouting from there.
  */
 import { type VendorRoutingRule, matchVendorRouting } from "./ap/vendor-router";
+import { detectAutopay } from "./ap/autopay-detector";
 import { businessHoursAlert } from "./alert-gate";
 import { classifyInvoice, type ClassificationResult } from "@/config/invoice-classification";
 
@@ -535,6 +536,27 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         }
                         continue;
                     }
+                }
+
+                // ── Autopay detection fallback (heuristic, no LLM) ───────────---
+                // If no deterministic vendor routing rule matched, check email-level
+                // signals for autopay/recurring service indicators. This catches
+                // vendors like Culligan, Terminix, and other services that send
+                // monthly autopay invoices with no PO — without burning an LLM call.
+                const autopayResult = detectAutopay(fromEmail, fromName, subject);
+                if (autopayResult.isAutopay && autopayResult.confidence !== 'low') {
+                    console.log(`     -> Autopay detector (${autopayResult.confidence}): ${autopayResult.reason}`);
+                    await gmail.users.messages.modify({
+                        userId: "me",
+                        id: m.id!,
+                        requestBody: {
+                            removeLabelIds: ["INBOX", "UNREAD"]
+                        }
+                    });
+                    await this.logActivity(supabase, from, subject, "AUTOPAY",
+                        `Auto-detected: ${autopayResult.reason} — marked read, no Bill.com forward`);
+                    console.log(`     ✅ Autopay (auto-detected): ${autopayResult.reason} — marked read, no forward`);
+                    continue;
                 }
 
                 // ── Standard LLM classification (no vendor routing match) ─────────
