@@ -543,19 +543,30 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // signals for autopay/recurring service indicators. This catches
                 // vendors like Culligan, Terminix, and other services that send
                 // monthly autopay invoices with no PO — without burning an LLM call.
-                const autopayResult = detectAutopay(fromEmail, fromName, subject);
-                if (autopayResult.isAutopay && autopayResult.confidence !== 'low') {
-                    console.log(`     -> Autopay detector (${autopayResult.confidence}): ${autopayResult.reason}`);
-                    await gmail.users.messages.modify({
-                        userId: "me",
-                        id: m.id!,
-                        requestBody: {
-                            removeLabelIds: ["INBOX", "UNREAD"]
-                        }
-                    });
-                    await this.logActivity(supabase, from, subject, "AUTOPAY",
-                        `Auto-detected: ${autopayResult.reason} — marked read, no Bill.com forward`);
-                    console.log(`     ✅ Autopay (auto-detected): ${autopayResult.reason} — marked read, no forward`);
+                //
+                // CRITICAL RULE: Only archive if we can verify the invoice was PAID.
+                // If there's ANY doubt, log the detection but leave the email UNREAD
+                // in the inbox for human escalation.
+                const autopayResult = detectAutopay(fromEmail, fromName, subject, snippet);
+                if (autopayResult.isAutopay) {
+                    if (autopayResult.verifiedPaid) {
+                        // Payment confirmed — safe to archive
+                        console.log(`     ✅ Autopay (verified paid): ${autopayResult.reason}`);
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: {
+                                removeLabelIds: ["INBOX", "UNREAD"]
+                            }
+                        });
+                        await this.logActivity(supabase, from, subject, "AUTOPAY",
+                            `Auto-detected (paid): ${autopayResult.reason} — marked read, no Bill.com forward`);
+                    } else {
+                        // No payment verification — leave UNREAD in inbox for escalation
+                        console.log(`     ⚠️ Autopay (no payment verification): ${autopayResult.reason} — leaving UNREAD`);
+                        await this.logActivity(supabase, from, subject, "AUTOPAY_SUSPECTED",
+                            `Auto-detected (unverified): ${autopayResult.reason} — left UNREAD for human review`);
+                    }
                     continue;
                 }
 

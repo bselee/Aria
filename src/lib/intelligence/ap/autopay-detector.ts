@@ -1,22 +1,24 @@
 /**
  * @file    src/lib/intelligence/ap/autopay-detector.ts
- * @purpose Auto-detect autopay vendors from email-level signals (sender, subject)
- *          BEFORE LLM classification or OCR — saves API calls and ensures
- *          consistent handling for recurring service providers.
+ * @purpose Auto-detect autopay vendors from email-level signals (sender, subject,
+ *          snippet) BEFORE LLM classification or OCR.
  *
- *          This runs as a fallback AFTER deterministic vendor-router.ts rules
- *          fail to match. It catches vendors like Culligan, Terminix, local
- *          utilities, and other recurring-service senders that:
- *            - Never have a PO number
- *            - Are paid on autopay (no Bill.com forward needed)
- *            - Send monthly invoices for small recurring amounts ($10-200)
+ *          CRITICAL RULE: Must verify the invoice has ACTUALLY BEEN PAID before
+ *          allowing the caller to archive it. If there's any doubt, the caller
+ *          must leave the email UNREAD in the inbox for human escalation.
+ *
+ *          Two-stage detection:
+ *            Stage 1: Is this from an autopay vendor? (domain, sender, subject)
+ *            Stage 2: Has this invoice been PAID? (snippet, subject signals)
+ *
+ *          verifiedPaid=true  → caller MAY archive (mark read, remove from inbox)
+ *          verifiedPaid=false → caller MUST leave UNREAD (log but don't touch inbox)
  *
  * PATTERNS IDENTIFIED (kaizen 2026-06-04):
- *   - Subject keywords: "autopay", "auto pay", "monthly service", "recurring"
- *   - Sender domain: known utility/service providers
- *   - Sender name: contains words like "water", "gas", "electric", "waste",
- *     "pest", "propane", "internet", "phone", "security", "alarm"
- *   - Recurring: same vendor appears monthly with no PO history
+ *   - Domain match: known autopay providers (culligan.com, terminix.com)
+ *   - Subject keywords: "autopay", "monthly service", "recurring"
+ *   - Payment keywords: "paid", "payment received", "receipt", "confirmation"
+ *   - Snippet: "balance $0.00", "paid in full", "payment successful"
  *
  * @author  Hermia
  * @created 2026-06-04
@@ -24,9 +26,37 @@
  * @env     none
  */
 
+// ─── Payment Verification Signals ──────────────────────────────────────────
+// These indicate the invoice has actually been PAID, not just sent.
+// Subject-based (available before OCR/download).
+
+const PAID_SUBJECT_PATTERNS: RegExp[] = [
+    /payment\s+(received|confirmed|successful|complete|processed)/i,
+    /autopay\s+(receipt|confirmation|notice)/i,
+    /receipt/i,                                     // "Receipt for your payment"
+    /paid\s+invoice/i,
+    /invoice\s+paid/i,
+    /payment\s+receipt/i,
+    /confirmation\s+#?\d/i,                         // "Payment confirmation #12345"
+    /thank\s+you\s+for\s+your\s+(payment|order)/i,
+    /auto\s*pay.*confirm/i,
+];
+
+const PAID_SNIPPET_PATTERNS: RegExp[] = [
+    /balance\s*:?\s*\$?\s*0\.00/i,
+    /paid\s+in\s+full/i,
+    /payment\s+received/i,
+    /transaction\s+(complete|successful|approved)/i,
+    /amount\s+paid/i,
+    /total\s+paid/i,
+    /autopay\s+processed/i,
+    /this\s+(payment|transaction).*(complete|processed)/i,
+    /your\s+payment\s+of\s+\$[\d,]+\.\d{2}/i,
+];
+
 // ─── Autopay Signal Patterns ────────────────────────────────────────────────
-// These patterns indicate an email is about an autopay/recurring service
-// that should NOT be forwarded to Bill.com.
+// These indicate the email is FROM an autopay/recurring vendor (not necessarily
+// confirming payment — just identifying the sender type).
 
 const SUBJECT_AUTOPAY_PATTERNS: RegExp[] = [
     /auto[- ]?pay/i,
@@ -116,9 +146,15 @@ const STRONG_AUTOPAY_DOMAINS: Array<{ domain: string; label: string }> = [
 // ─── Result Type ────────────────────────────────────────────────────────────
 
 export interface AutopayDetectionResult {
-    /** Whether the email is confidently an autopay/recurring service */
+    /** Whether the email appears to be from an autopay/recurring vendor */
     isAutopay: boolean;
-    /** Confidence level */
+    /**
+     * Whether we can verify the invoice has actually been PAID.
+     * If false, the caller MUST leave the email UNREAD in the inbox
+     * for human escalation — do NOT archive.
+     */
+    verifiedPaid: boolean;
+    /** Confidence level of the autopay vendor detection */
     confidence: 'high' | 'medium' | 'low';
     /** Human-readable reason for the decision */
     reason: string;
@@ -127,83 +163,116 @@ export interface AutopayDetectionResult {
 // ─── Detector ───────────────────────────────────────────────────────────────
 
 /**
- * Detect whether an email represents an autopay/recurring vendor invoice
- * that should be marked read and NOT forwarded to Bill.com.
+ * Detect whether an email represents a PAID autopay/recurring vendor invoice.
  *
- * This runs as a heuristic fallback AFTER deterministic vendor-router.ts
- * rules fail to match, and BEFORE the expensive LLM classification call.
+ * Two-stage detection:
+ *   1. Is this from an autopay vendor? (domain, sender, subject)
+ *   2. Has this invoice been PAID? (subject, snippet signals)
  *
- * Three signal tiers (checked in order):
- *   1. Strong domain match — sender domain is a known autopay provider
- *   2. Subject signals — subject contains autopay/recurring keywords
- *   3. Sender name signals — sender display name contains service keywords
+ * **Caller contract:**
+ *   - verifiedPaid=true  → MAY archive (mark read, remove from inbox)
+ *   - verifiedPaid=false → MUST leave UNREAD in inbox for escalation
+ *   - isAutopay=false    → proceed with normal LLM classification
  *
  * @param fromEmail  - The sender's email address (e.g., "billing@culligan.com")
  * @param fromName   - The sender's display name (e.g., "Culligan Water Service")
  * @param subject    - The email subject line
- * @returns AutopayDetectionResult with isAutopay flag and confidence
+ * @param snippet    - (Optional) Gmail snippet/preview text for payment signals
+ * @returns AutopayDetectionResult with isAutopay, verifiedPaid, and confidence
  *
  * @example
- *   const result = detectAutopay('billing@culligan.com', 'Culligan Water', 'Your Invoice from Culligan');
- *   // => { isAutopay: true, confidence: 'high', reason: 'Strong domain match: culligan.com' }
+ *   // Strong domain match, no payment verification → log, don't archive
+ *   detectAutopay('billing@culligan.com', 'Culligan Water', 'Your Invoice');
+ *   // => { isAutopay: true, verifiedPaid: false, confidence: 'high', ... }
+ *
+ *   // Subject confirms payment → safe to archive
+ *   detectAutopay('billing@culligan.com', 'Culligan Water', 'Payment Receipt - Culligan');
+ *   // => { isAutopay: true, verifiedPaid: true, confidence: 'high', ... }
  */
 export function detectAutopay(
     fromEmail: string,
     fromName: string,
     subject: string,
+    snippet?: string,
 ): AutopayDetectionResult {
     const email = (fromEmail || '').toLowerCase();
     const name = (fromName || '').toLowerCase();
     const subjectLower = (subject || '').toLowerCase();
+    const snippetLower = (snippet || '').toLowerCase();
+    const combinedText = `${subjectLower} ${snippetLower}`;
 
-    // ── Tier 1: Strong domain match (high confidence) ────────────────────
+    // ── Stage 1: Is this from an autopay vendor? ──────────────────────────
+
+    let isAutopay = false;
+    let confidence: 'high' | 'medium' | 'low' = 'low';
+    let reasonParts: string[] = [];
+
+    // Tier 1: Strong domain match
     if (email.includes('@')) {
         const domain = email.split('@')[1];
         for (const entry of STRONG_AUTOPAY_DOMAINS) {
             if (domain === entry.domain || domain.endsWith('.' + entry.domain)) {
-                return {
-                    isAutopay: true,
-                    confidence: 'high',
-                    reason: `Strong domain match: ${entry.domain} → ${entry.label}`,
-                };
+                isAutopay = true;
+                confidence = 'high';
+                reasonParts.push(`Domain: ${entry.domain} → ${entry.label}`);
+                break;
             }
         }
     }
 
-    // ── Tier 2: Subject keyword match (high/medium confidence) ────────────
-    for (const pattern of SUBJECT_AUTOPAY_PATTERNS) {
-        if (pattern.test(subjectLower)) {
-            return {
-                isAutopay: true,
-                confidence: 'high',
-                reason: `Subject matches autopay pattern: ${pattern.source}`,
-            };
+    // Tier 2: Subject keyword match
+    if (!isAutopay) {
+        for (const pattern of SUBJECT_AUTOPAY_PATTERNS) {
+            if (pattern.test(subjectLower)) {
+                isAutopay = true;
+                confidence = 'high';
+                reasonParts.push(`Subject: ${pattern.source}`);
+                break;
+            }
         }
     }
 
-    // ── Tier 3: Sender name contains service keyword (medium confidence) ──
-    // Only fire when BOTH subject and sender name look like a service bill.
-    // This prevents false positives from vendors whose names coincidentally
-    // contain generic words like "electric" or "waste".
-    const matchedSender = SERVICE_SENDER_KEYWORDS.find(
-        entry => name.includes(entry.keyword) || email.includes(entry.keyword),
-    );
+    // Tier 3: Sender name contains service keyword
+    if (!isAutopay) {
+        const matchedSender = SERVICE_SENDER_KEYWORDS.find(
+            entry => name.includes(entry.keyword) || email.includes(entry.keyword),
+        );
+        if (matchedSender) {
+            const hasInvoiceSignal = /invoice|bill|statement|receipt|payment|charge|due/i.test(subjectLower);
+            isAutopay = true;
+            confidence = hasInvoiceSignal ? 'high' : 'medium';
+            reasonParts.push(`Sender: "${matchedSender.keyword}" → ${matchedSender.label}`);
+        }
+    }
 
-    if (matchedSender) {
-        // Boost confidence if subject also looks invoice-like
-        const hasInvoiceSignal = /invoice|bill|statement|receipt|payment|charge|due/i.test(subjectLower);
-        const confidence: 'medium' | 'high' = hasInvoiceSignal ? 'high' : 'medium';
-
+    if (!isAutopay) {
         return {
-            isAutopay: true,
-            confidence,
-            reason: `Sender contains "${matchedSender.keyword}" → ${matchedSender.label}${hasInvoiceSignal ? ' + invoice subject signal' : ''}`,
+            isAutopay: false,
+            verifiedPaid: false,
+            confidence: 'low',
+            reason: 'No autopay signals detected',
         };
     }
 
+    // ── Stage 2: Has this invoice been PAID? ──────────────────────────────
+    // Check subject + snippet for payment confirmation signals.
+    // Without payment verification, we log but leave the email UNREAD.
+
+    const subjectHasPaidSignal = PAID_SUBJECT_PATTERNS.some(p => p.test(subjectLower));
+    const snippetHasPaidSignal = PAID_SNIPPET_PATTERNS.some(p => p.test(snippetLower));
+    const verifiedPaid = subjectHasPaidSignal || snippetHasPaidSignal;
+
+    if (verifiedPaid) {
+        if (subjectHasPaidSignal) reasonParts.push('Subject confirms payment');
+        if (snippetHasPaidSignal) reasonParts.push('Snippet confirms payment');
+    } else {
+        reasonParts.push('No payment verification (leave UNREAD)');
+    }
+
     return {
-        isAutopay: false,
-        confidence: 'low',
-        reason: 'No autopay signals detected',
+        isAutopay: true,
+        verifiedPaid,
+        confidence,
+        reason: reasonParts.join('; '),
     };
 }
