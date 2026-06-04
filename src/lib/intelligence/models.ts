@@ -53,9 +53,7 @@ export const OPENROUTER_MODELS = {
     // Extremely cheap ($0.14/M input), fast, and proven reliable for structured
     // JSON and classification. Added to every chain as the cost-optimised first try.
     deepseekV4: 'deepseek/deepseek-v4-flash',
-    // Cheap alternatives for free-tier fallback when openrouter/free router is down
-        phi4: 'microsoft/phi-4:free',               // Small, fast, well-maintained on OpenRouter free tier
-    } as const;
+} as const;
 
 // ── Fallback Chains ─────────────────────────────────────────────────────────
 // Each chain is ordered by: cost (cheapest first) → reliability for the task.
@@ -101,16 +99,14 @@ export const OPENROUTER_CHAT_CHAIN = [
 export const OPENROUTER_FREE_CHAIN = [
     // DECISION(2026-04-28): `openrouter/free` is OpenRouter's "Free Models
     // Router" that auto-picks an available free model per call. Resilient to
-    // upstream rotations (no slug rot to chase).
+    // upstream rotations (no slug rot to chase). Often rate-limited but
+    // succeeds ~30-50% of the time — worth trying before paying.
     { name: 'OpenRouter Free Router', slug: 'openrouter/free' },
-    // KAIZEN(2026-06-04): Previous Qwen3 80B, MiniMax M2.5, Gemma 4 31B,
-    // and Llama 3.3 70B all consistently returned "Provider returned error".
-    // Replaced with Phi-4 (free-tier active, microsoft/phi-4) and DeepSeek
-    // V4 ($0.14/M fallback — not free but cheap enough to not worry about).
-    // The 5+ failed attempts per request were burning ~10s each on dead endpoints.
-    { name: 'OpenRouter Phi-4 (free)', slug: OPENROUTER_MODELS.phi4 },
-    // Paid fallback: DeepSeek V4 Flash at $0.14/M is still negligible cost
-    // for low-stakes classification. Better than burning 5x failed calls.
+    // KAIZEN(2026-06-04): Removed 5 dead free models (Qwen3 80B, MiniMax M2.5,
+    // Gemma 4 31B, Llama 3.3 70B, Nemotron — all "Provider returned error")
+    // and a failed Phi-4 free slug ("No endpoints found"). Free-tier models
+    // are too volatile to pin. Jump directly to DeepSeek V4 Flash ($0.14/M)
+    // when the meta-router fails — cheaper than 2+ failed attempts.
     { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },
 ] as const;
 
