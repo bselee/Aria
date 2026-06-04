@@ -80,6 +80,8 @@ const DROPSHIP_RULES: DropshipRule[] = [
     // ── Add new dropship vendors here ──────────────────────────────────────
     // Format: { senderKeyword: 'domain.com', label: 'Vendor Name (Dropship)' }
     //   OR    { vendorKeyword: 'vendor name', label: 'Vendor Name (Dropship)' }
+    { vendorKeyword: 'ferticell', label: 'Ferticell (Dropship)' },
+    { vendorKeyword: 'fert', label: 'Ferticell (Dropship)' },
 ];
 
 // ─── Real Invoice Overrides ───────────────────────────────────────────────────

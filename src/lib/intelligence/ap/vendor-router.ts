@@ -47,6 +47,7 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
     { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
+    { match: { senderContains: 'ferticell' }, action: 'dropship', label: 'Ferticell (Dropship)' },
 
     // ── QuickBooks dropship vendors (subject-based — vendor name only in subject line) ──
     { match: { senderContains: 'quickbooks', subjectContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship via QuickBooks)' },
@@ -55,6 +56,10 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
 
     // ── Internal ignores ────────────────────────────────────────────────
     { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
+
+    // ── Expected non-PO vendors (no PO will ever exist — suppress noise) ──
+    { match: { senderContains: 'culligan' }, action: 'ignore', label: 'Culligan Water (No PO — Recurring Service)' },
+    { match: { senderContains: 'aaa cooper' }, action: 'ignore', label: 'AAA Cooper Transportation (Freight — No PO)' },
 ];
 
 /**

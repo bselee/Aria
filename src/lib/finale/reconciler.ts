@@ -1899,11 +1899,14 @@ function evaluatePriceChange(
         }
     }
 
-    // Layer 1b: Zero to non-zero (PO had $0, invoice has a real price)
-    if (poPrice === 0 && invoicePrice > 0) {
+    // Layer 1b: Zero to non-zero (or vice versa) — suspicious but not a decimal error
+    // A $0 → $48 shift could be a placeholder PO; $48 → $0 could be an OCR failure.
+    // Route both to human review instead of rejecting or silently accepting.
+    if ((poPrice === 0 && invoicePrice > 0) || (invoicePrice === 0 && poPrice > 0)) {
+        const direction = poPrice === 0 ? 'new' : 'zeroed';
         return {
-            verdict: "needs_approval",
-            reason: `PO had $0.00 price, invoice shows $${invoicePrice.toFixed(2)}. May be a placeholder PO line.`,
+            verdict: 'needs_approval',
+            reason: `Price changed from $${poPrice.toFixed(2)} → $${invoicePrice.toFixed(2)} (${direction} price). This may be a new item or a UOM/OCR issue. Needs manual review.`,
         };
     }
 
