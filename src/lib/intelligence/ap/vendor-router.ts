@@ -61,6 +61,7 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // Culligan Water: bottled-water service, paid on autopay. Logged for visibility
     // but never forwarded to Bill.com and never PO-matched.
     { match: { senderContains: 'culligan' }, action: 'autopay', label: 'Culligan Water (Autopay — Paid, No Forward)' },
+    { match: { senderContains: 'terminix' }, action: 'autopay', label: 'Terminix (Autopay)' },
 ];
 
 /**

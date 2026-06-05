@@ -42,6 +42,7 @@ import {
 } from "@/lib/statements/email-intake";
 import { pickPrimaryInvoicePage } from "./invoice-page-selector";
 import { businessHoursAlert } from "../alert-gate";
+import { matchVendorRouting } from "../ap/vendor-router";
 
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
@@ -496,6 +497,83 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
                         `Blocked: ${blockedSender.label} — archived without forwarding`);
                     continue;
+                }
+
+                // ── VENDOR ROUTING (deterministic pre-LLM) ──────────────────
+                // DECISION(2026-06-05): Match known vendor senders for autopay,
+                // dropship, ignore, and amazon_order — runs BEFORE LLM call to
+                // save API costs and ensure correctness for deterministic rules.
+                const fromEmailMatch = from.match(/<([^>]+)>/);
+                const fromEmail = fromEmailMatch ? fromEmailMatch[1] : from.trim();
+                const fromName = from.replace(/<[^>]+>/, '').trim();
+                const routingRule = matchVendorRouting(fromEmail, fromName, subject);
+                if (routingRule) {
+                    console.log(`     -> Vendor routing match: ${routingRule.label} (${routingRule.action})`);
+
+                    if (routingRule.action === 'ignore') {
+                        // Skip entirely — archive and mark read
+                        try {
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.gmail_message_id,
+                                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                            });
+                        } catch (e) { /* ignore */ }
+                        await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                            `Ignored: ${routingRule.label} — archived without forwarding`);
+                        console.log(`     ⏭️ Ignored (${routingRule.label})`);
+                        continue;
+                    }
+
+                    if (routingRule.action === 'autopay') {
+                        // Autopay / recurring — mark as read, do NOT forward to Bill.com
+                        try {
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.gmail_message_id,
+                                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                            });
+                        } catch (e) { /* ignore */ }
+                        await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                            `${routingRule.label} — marked read, no Bill.com forward`);
+                        console.log(`     ✅ Autopay: ${routingRule.label} — marked read, no forward`);
+                        continue;
+                    }
+
+                    if (routingRule.action === 'dropship') {
+                        // Dropship vendor — queue to ap_inbox_queue with dropship metadata,
+                        // skip LLM classification. The AP Forwarder will handle Bill.com.
+                        try {
+                            await supabase.from("ap_inbox_queue").insert({
+                                message_id: m.gmail_message_id,
+                                email_from: from,
+                                email_subject: subject,
+                                intent: "INVOICE",
+                                status: "PENDING_FORWARD",
+                                source_inbox: sourceInbox,
+                                extracted_json: {
+                                    vendor_routing_action: "dropship",
+                                    vendor_name: routingRule.label,
+                                    source_gmail_message_id: m.gmail_message_id,
+                                },
+                            });
+                            console.log(`     🚚 Dropship: ${routingRule.label} — queued for forward`);
+                            await this.logActivity(supabase, from, subject, "DROPSHIP",
+                                `${routingRule.label} — queued for Bill.com forward (dropship, no PO matching)`, {
+                                    vendor_routing_action: "dropship",
+                                    vendor_name: routingRule.label,
+                                });
+                        } catch (e: any) {
+                            console.error(`     ❌ Dropship queue failed: ${e.message}`);
+                        }
+                        continue;
+                    }
+
+                    if (routingRule.action === 'amazon_order') {
+                        // Amazon orders — skip for now, let normal processing handle
+                        console.log(`     📦 Amazon order: ${routingRule.label} — continuing normal flow`);
+                        // Fall through to normal processing
+                    }
                 }
 
                 // ── TAX DOCUMENT GUARD ─────────────────────────────────────
