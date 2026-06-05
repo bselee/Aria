@@ -401,6 +401,23 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
     }
 
+    // ── Slack Request Detector ────────────────────────────────────────────
+    // Polls #purchase-orders / #purchasing for SKU requests, looks up Finale
+    // for open POs, posts threaded reply with PO + ETA if on order.
+    try {
+        const mod = await import('../lib/slack/request-detector');
+        const startSlackRequestDetector = mod.startSlackRequestDetector ?? (mod.default as any)?.startSlackRequestDetector;
+        if (typeof startSlackRequestDetector === 'function') {
+            await startSlackRequestDetector();
+            console.log('[boot] Slack Request Detector: ✅ Started');
+        } else {
+            console.warn('[boot] Slack Request Detector: Could not resolve start function');
+        }
+    } catch (err: any) {
+        console.warn('[boot] Slack Request Detector failed (non-fatal):', err.message);
+    }
+    // ── End Slack Request Detector ────────────────────────────────────────
+
     // restore approvals
     try {
         // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
@@ -431,20 +448,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
                 const summaryText = buildRestoredApprovalMessage(result, approvalId, minutesLeft);
 
-                try {
-                    await bot.telegram.sendMessage(chatId, summaryText, {
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                            inline_keyboard: [[
-                                { text: '✅ Approve & Apply', callback_data: `approve_${approvalId}` },
-                                { text: '❌ Reject', callback_data: `reject_${approvalId}` },
-                            ]],
-                        },
-                    });
-                    console.log(`[boot] Restored approval prompt for ${approvalId} (${minutesLeft}m remaining)`);
-                } catch (sendErr: any) {
-                    console.warn(`[boot] Could not send restored approval for ${approvalId}: ${sendErr.message}`);
-                }
+                console.log(`[boot] Pending approval ${approvalId} available on Dashboard (${minutesLeft}m remaining)`);
             }
         }
     } catch (err: any) {
