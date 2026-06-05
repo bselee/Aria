@@ -56,11 +56,11 @@ defineJob({
     onFail: "telegram-will",
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
-        const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
-        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-        const report = await generateAPHealthReport();
-        await sendTelegramNotify(report);
-        console.log("[ap-health-report] Morning report sent.");
+            const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
+            const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            const report = await generateAPHealthReport();
+            await sendCriticalTelegramNotify(report);
+            console.log("[ap-health-report] Morning report sent via sendCriticalTelegramNotify.");
     },
 });
 
@@ -397,10 +397,9 @@ defineJob({
             // KAIZEN(2026-06-02): Surface critical decisions via Telegram.
             if (decision.priority === "critical") {
                 try {
-                    const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-                    await sendTelegramNotify(
-                        `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
-                    );
+                    console.log(
+                                            `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
+                                        );
                     console.log(`[cognitive-round] Telegram alert sent for critical decision`);
                 } catch (err: any) {
                     console.warn(`[cognitive-round] Telegram alert failed (non-fatal): ${err.message}`);
