@@ -49,6 +49,8 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
     return (await res.json()) as T;
 }
 
+import APHealthPanel from "@/components/dashboard/APHealthPanel";
+
 // ── Module tab definitions ──────────────────────────────────────────────────
 //
 // Tab order matches Will's daily ops priority. "Blocking" is first because
@@ -69,10 +71,14 @@ const TAB_STORAGE_KEY = "aria-dash-active-tab";
 function PurchasingLifecyclePanel() {
     return (
         <PurchasingLifecycleProvider>
-            <div
-                className="grid h-full min-h-0 grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
-                data-testid="purchasing-lifecycle-panel"
-            >
+            <div className="flex flex-col h-full min-h-0 overflow-hidden">
+                <div className="shrink-0 px-2 pt-2">
+                    <APHealthPanel />
+                </div>
+                <div
+                    className="flex-1 min-h-0 grid grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
+                    data-testid="purchasing-lifecycle-panel"
+                >
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
                 <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
                     Ordering
