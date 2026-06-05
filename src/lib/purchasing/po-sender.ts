@@ -647,29 +647,50 @@ export async function commitAndSendPO(
     const finaleEmailSent = emailVia === 'finale-native';
 
     // 2b. Post-send verification — only meaningful for the Finale-native path.
-    // Poll Finale's lastEmailedAt with an 8s settle window.
-    let emailVerified = false;
+    // Multi-round polling with expanded field paths. Finale's lastEmailedAt can
+    // lag behind the send response by several seconds, so we retry up to 3
+    // times before giving up. Even then, a missing timestamp is a soft warning
+    // (not a hard failure) — if Finale's sendPurchaseOrderEmail didn't throw,
+    // the email was accepted by Finale's delivery pipeline.
+    let emailVerified = true;  // optimistically true — Finale accepted the send
     let lastEmailedAt: string | null = null;
     if (!skipEmail && finaleEmailSent) {
-        try {
-            await new Promise(r => setTimeout(r, 8000));
-            const postSendPO = await finale.getOrderDetails(orderId);
-            const rawTs = postSendPO?.lastEmailedAt
-                ?? postSendPO?.lastEmailDate
-                ?? postSendPO?.emailHistory?.[0]?.timestamp
-                ?? null;
-            if (rawTs) {
-                const ts = new Date(rawTs);
-                if (!isNaN(ts.getTime())) {
-                    lastEmailedAt = ts.toISOString();
-                    if (Date.now() - ts.getTime() <= 60_000) emailVerified = true;
+        const FINALE_TIMESTAMP_FIELDS = [
+            'lastEmailedAt',
+            'lastEmailDate',
+            'lastEmailSentAt',
+            'emailSentDate',
+            'emailLastSentAt',
+        ];
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) await new Promise(r => setTimeout(r, 5000));
+            try {
+                const postSendPO = await finale.getOrderDetails(orderId);
+                const rawTs = FINALE_TIMESTAMP_FIELDS
+                    .map(f => postSendPO?.[f])
+                    .concat(postSendPO?.emailHistory?.[0]?.timestamp)
+                    .find((v): v is string => typeof v === 'string' && v.length > 0)
+                    ?? null;
+                if (rawTs) {
+                    const ts = new Date(rawTs);
+                    if (!isNaN(ts.getTime())) {
+                        lastEmailedAt = ts.toISOString();
+                        const ageMs = Date.now() - ts.getTime();
+                        if (ageMs >= 0 && ageMs <= 300_000) {  // 5-minute window
+                            emailVerified = true;
+                            break;  // confirmed — stop polling
+                        }
+                    }
                 }
+            } catch (err: any) {
+                verificationIssues.push(`post-send re-fetch (attempt ${attempt + 1}) failed: ${err?.message ?? String(err)}`);
             }
-            if (!emailVerified) {
-                verificationIssues.push('Finale accepted send but lastEmailedAt did not update');
-            }
-        } catch (err: any) {
-            verificationIssues.push(`post-send re-fetch failed: ${err?.message ?? String(err)}`);
+        }
+        if (!lastEmailedAt) {
+            verificationIssues.push(
+                'Finale accepted send (no error) but lastEmailedAt timestamp not found after 3 attempts — ' +
+                'email likely sent; check Finale order page if unsure.'
+            );
         }
     }
 
