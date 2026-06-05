@@ -834,7 +834,7 @@ export default function PurchasingPanel() {
             // Read verification block to drive step indicators.
             const v: CommitVerification | undefined = json.verification ?? json.details?.verification;
             const committed = v?.committed ?? (json.status !== 'failed');
-            const emailSent = v?.emailSent ?? json.details?.finaleEmailSent ?? false;
+            const emailSent = v?.emailSent ?? json.details?.emailSent ?? json.details?.finaleEmailSent ?? false;
             const emailVerified = v?.emailVerified ?? emailSent;
             setSendSteps({
                 commit: committed ? 'ok' : 'fail',
