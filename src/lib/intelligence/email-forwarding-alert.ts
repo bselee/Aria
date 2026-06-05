@@ -30,7 +30,7 @@
  */
 
 import { createClient } from "../supabase";
-import { sendTelegramNotify } from "./telegram-notify";
+import { sendCriticalTelegramNotify } from "./telegram-notify";
 
 export interface StuckForwardAlert {
     messageId: string;
@@ -60,7 +60,16 @@ export async function getStuckForwardingAlerts(): Promise<StuckForwardAlert[]> {
 
     if (error || !data) return [];
 
-    return (data as any[]).map(row => {
+    // Filter out zombie records — old pipeline debris with empty extracted_json
+    // that has no from/vendor_name/subject. These are months-old ERROR_PROCESSING
+    // records that should not be reported as "stuck".
+    const meaningful = (data as any[]).filter(row => {
+        const ej = row.extracted_json;
+        if (!ej || typeof ej !== 'object') return false;
+        return ej.from || ej.vendor_name || ej.subject;
+    });
+
+    return meaningful.map(row => {
         const ej = row.extracted_json || {};
         return {
             messageId: row.message_id || "unknown",
@@ -115,6 +124,6 @@ export async function runForwardingEscalation(): Promise<void> {
     }
 
     const formatted = formatForwardingAlerts(alerts);
-    await sendTelegramNotify(formatted);
+    await sendCriticalTelegramNotify(formatted);
     console.log(`[forwarding-alert] Alerted Bill: ${alerts.length} AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.`);
 }
