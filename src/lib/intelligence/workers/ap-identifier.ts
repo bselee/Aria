@@ -419,13 +419,26 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     const msgIds = retryMessages.map((r: any) => r.gmail_message_id);
                     const { data: errorItems } = await supabase
                         .from('ap_inbox_queue')
-                        .select('message_id, extracted_json')
+                        .select('message_id, extracted_json, updated_at')
                         .in('message_id', msgIds)
                         .eq('status', 'ERROR_PROCESSING');
 
                     if (errorItems && errorItems.length > 0) {
+                        const maxRetryAge = 3 * 3600000; // 3 hours — don't retry invoices stuck longer
+                        const now = Date.now();
                         const retryIds = retryMessages
-                            .filter((r: any) => errorItems.some((e: any) => e.message_id === r.gmail_message_id))
+                            .filter((r: any) => {
+                                const errorItem = errorItems.find((e: any) => e.message_id === r.gmail_message_id);
+                                if (!errorItem) return false;
+                                // Compute age of the ERROR_PROCESSING entry
+                                const updatedAt = new Date(errorItem.updated_at).getTime();
+                                const age = now - updatedAt;
+                                if (age > maxRetryAge) {
+                                    console.log(`   ⏭️ Not retrying ${r.gmail_message_id} — ERROR_PROCESSING for ${Math.round(age / 3600000)}h (max ${maxRetryAge / 3600000}h)`);
+                                    return false; // too old, leave as permanent error
+                                }
+                                return true;
+                            })
                             .map((r: any) => r.id);
 
                         if (retryIds.length > 0) {

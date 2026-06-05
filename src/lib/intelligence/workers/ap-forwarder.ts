@@ -252,6 +252,32 @@ export class APForwarderAgent {
                     await this.verifySentMessage(gmail, sentMessageId);
                     billComSendVerified = true;
 
+                    // KAIZEN(2026-06-05): Dropship invoices skip PO matching/reconciliation.
+                    // The vendor routing in APIdentifier already classified this as dropship;
+                    // we just need to forward the PDF to Bill.com — no OCR, no PO matching.
+                    if ((item.extracted_json as any)?.vendor_routing_action === "dropship") {
+                        console.log(`     🚚 Dropship (skip PO match): ${item.email_subject?.slice(0, 60)}`);
+                        await supabase
+                            .from('ap_inbox_queue')
+                            .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
+                            .eq('id', item.id);
+                        await this.logActivity(supabase, item.email_from, item.email_subject, 'DROPSHIP',
+                            `Dropship: forwarded to Bill.com (${item.pdf_filename}), no PO matching`, {
+                                vendor_routing_action: "dropship",
+                                billcom_sent_message_id: sentMessageId,
+                            });
+                        await supabase
+                            .from('email_inbox_queue')
+                            .update({ processed_by_ap: true })
+                            .eq('gmail_message_id', sourceMessageId);
+                        await this.finalizeSourceEmailIfReady(supabase, gmail, {
+                            gmailMessageId: sourceMessageId,
+                            addLabels: ["Invoice Forward"],
+                            expectedForwardCount: ej.expected_forward_count,
+                        });
+                        continue;
+                    }
+
                     const sendExtractedJson = {
                         ...(item.extracted_json || {}),
                         billcom_sent_message_id: sentMessageId,

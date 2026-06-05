@@ -62,6 +62,11 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // but never forwarded to Bill.com and never PO-matched.
     { match: { senderContains: 'culligan' }, action: 'autopay', label: 'Culligan Water (Autopay — Paid, No Forward)' },
     { match: { senderContains: 'terminix' }, action: 'autopay', label: 'Terminix (Autopay)' },
+
+    // ── Internal documents / statements (archive, no forward) ────────────
+    // BuildASoil's own statements and internal documents should never reach Bill.com
+    { match: { subjectContains: 'build a soil statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
+    { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
 ];
 
 /**
