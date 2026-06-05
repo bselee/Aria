@@ -114,6 +114,8 @@ export function formatForwardingAlerts(alerts: StuckForwardAlert[]): string {
 
 /**
  * Run the forwarding escalation check. Called by followup-sop cron.
+ * Dedup: only alerts once per 24h per message_id — checks ap_activity_log
+ * for recent FORWARDING_ESCALATED entries before sending.
  * Only sends when there are actual stuck items.
  */
 export async function runForwardingEscalation(): Promise<void> {
@@ -123,7 +125,61 @@ export async function runForwardingEscalation(): Promise<void> {
         return;
     }
 
+    // ── Dedup: Check if we already alerted for these message_ids in the last 24h ──
+    const db = createClient();
+    if (db) {
+        const msgIds = alerts.map(a => a.messageId);
+        const yesterday = new Date(Date.now() - 24 * 3600000).toISOString();
+        const { data: recentEscalations } = await db
+            .from("ap_activity_log")
+            .select("email_subject")
+            .gte("created_at", yesterday)
+            .eq("intent", "FORWARDING_ESCALATED")
+            .in("email_subject", msgIds);
+
+        if (recentEscalations && recentEscalations.length > 0) {
+            const alreadyAlerted = new Set(recentEscalations.map((r: any) => r.email_subject));
+            const newAlerts = alerts.filter(a => !alreadyAlerted.has(a.messageId));
+            if (newAlerts.length === 0) {
+                console.log(`[forwarding-alert] All ${alerts.length} stuck invoice(s) already alerted in last 24h — skipping.`);
+                return;
+            }
+            if (newAlerts.length < alerts.length) {
+                console.log(`[forwarding-alert] ${newAlerts.length} new stuck invoice(s), ${alerts.length - newAlerts.length} already alerted — sending for new only.`);
+                // Send only for the new ones
+                const formatted = formatForwardingAlerts(newAlerts);
+                await sendCriticalTelegramNotify(formatted);
+                // Log each new alert for future dedup
+                for (const a of newAlerts) {
+                    await db.from("ap_activity_log").insert({
+                        email_from: a.from,
+                        email_subject: a.messageId,
+                        intent: "FORWARDING_ESCALATED",
+                        action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
+                        metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
+                    }).catch(() => {});
+                }
+                console.log(`[forwarding-alert] Alerted Bill: ${newAlerts.length} AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.`);
+                return;
+            }
+        }
+    }
+
     const formatted = formatForwardingAlerts(alerts);
     await sendCriticalTelegramNotify(formatted);
+
+    // Log each alert for future dedup
+    if (db) {
+        for (const a of alerts) {
+            await db.from("ap_activity_log").insert({
+                email_from: a.from,
+                email_subject: a.messageId,
+                intent: "FORWARDING_ESCALATED",
+                action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
+                metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
+            }).catch(() => {});
+        }
+    }
+
     console.log(`[forwarding-alert] Alerted Bill: ${alerts.length} AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.`);
 }
