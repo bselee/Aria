@@ -729,6 +729,171 @@ const hermiaCommand: BotCommand = {
             },
         };
 
+/**
+ * /apretry — Re-queue stuck AP invoices from ERROR back to PENDING_FORWARD.
+ * Usage: /apretry — list stuck items
+ *        /apretry <message_id> — retry a specific item by message_id
+ *        /apretry <vendor> — retry items matching vendor name
+ */
+const apRetryCommand: BotCommand = {
+    name: "apretry",
+    description: "Re-queue stuck AP invoices: /apretry [message_id|vendor]",
+    handler: async (ctx) => {
+        await ctx.sendChatAction("typing");
+
+        const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
+        const args = text.replace(/^\/apretry\s*/i, "").trim();
+
+        try {
+            const { createClient } = await import("@/lib/supabase");
+            const supabase = createClient();
+            if (!supabase) {
+                await ctx.reply("❌ Supabase not available.");
+                return;
+            }
+
+            // Query error-state records
+            const { data: stuckItems, error: queryError } = await supabase
+                .from("ap_inbox_queue")
+                .select("*")
+                .in("status", ["ERROR_FORWARDING", "ERROR_PROCESSING"])
+                .order("created_at", { ascending: false });
+
+            if (queryError) {
+                await ctx.reply(`❌ Query failed: ${queryError.message}`);
+                return;
+            }
+
+            if (!stuckItems || stuckItems.length === 0) {
+                await ctx.reply("✅ No stuck AP invoices in ERROR status. Pipeline is clear.");
+                return;
+            }
+
+            // No args — list the stuck items
+            if (!args) {
+                const lines: string[] = [
+                    "⚠️ *Stuck AP Invoices*",
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+                    `Found ${stuckItems.length} item(s) in ERROR status.`,
+                    "",
+                    "Use `/apretry <message_id>` to retry a specific item.",
+                    "Use `/apretry <vendor>` to retry all items for a vendor.",
+                    "",
+                ];
+
+                for (const item of stuckItems.slice(0, 15)) {
+                    const vendor = item.vendor_name || item.extracted_json?.vendor_name || "unknown";
+                    const subject = item.subject || "no subject";
+                    const errorDetail = item.error_message || item.extracted_json?.error || "unknown error";
+                    const line = `\`${item.message_id}\`\n` +
+                        `   Vendor: ${vendor}\n` +
+                        `   Subject: ${subject.slice(0, 60)}\n` +
+                        `   Status: ${item.status}\n` +
+                        `   Error: ${errorDetail.slice(0, 80)}`;
+                    lines.push(line);
+                    lines.push("");
+                }
+
+                if (stuckItems.length > 15) {
+                    lines.push(`_…and ${stuckItems.length - 15} more items._`);
+                }
+
+                await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+                return;
+            }
+
+            // Args provided — try to match by message_id first, then vendor name
+            let matchedItems = stuckItems.filter((item: any) => item.message_id === args);
+
+            // If no direct message_id match, try vendor name (case-insensitive partial match)
+            if (matchedItems.length === 0) {
+                const vendorArg = args.toLowerCase();
+                matchedItems = stuckItems.filter((item: any) => {
+                    const vendorName = (item.vendor_name || item.extracted_json?.vendor_name || "").toLowerCase();
+                    return vendorName.includes(vendorArg);
+                });
+            }
+
+            if (matchedItems.length === 0) {
+                await ctx.reply(
+                    `❌ No stuck items found matching \`${args}\`.\n\n` +
+                    `Use /apretry without arguments to see the full list of stuck items.`,
+                    { parse_mode: "Markdown" }
+                );
+                return;
+            }
+
+            // Reset each matched item to PENDING_FORWARD
+            let successCount = 0;
+            const errors: string[] = [];
+
+            for (const item of matchedItems) {
+                // Update the record
+                const { error: updateError } = await supabase
+                    .from("ap_inbox_queue")
+                    .update({
+                        status: "PENDING_FORWARD",
+                        error_message: null,
+                        extracted_json: {
+                            ...(item.extracted_json || {}),
+                            error: null,
+                            error_retried_at: new Date().toISOString(),
+                        },
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq("id", item.id);
+
+                if (updateError) {
+                    errors.push(`${item.message_id}: ${updateError.message}`);
+                    continue;
+                }
+
+                // Log the retry to activity log
+                const { error: logError } = await supabase.from("ap_activity_log").insert({
+                    email_from: `apretry-command`,
+                    email_subject: `Retry: ${item.subject || item.message_id}`,
+                    intent: "PROCESSING_ERROR",
+                    action_taken: `Re-queued ${item.message_id} from ${item.status} to PENDING_FORWARD`,
+                    metadata: {
+                        message_id: item.message_id,
+                        original_status: item.status,
+                        new_status: "PENDING_FORWARD",
+                        retried_by: "telegram_command",
+                        retried_at: new Date().toISOString(),
+                        matched_by: args === item.message_id ? "message_id" : "vendor_name",
+                    },
+                });
+
+                if (logError) {
+                    errors.push(`${item.message_id}: logged retry but failed to record activity — ${logError.message}`);
+                }
+
+                successCount++;
+            }
+
+            // Build response
+            const responseLines: string[] = [
+                `✅ *AP Retry Complete*`,
+                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+                `Re-queued: ${successCount} item(s)`,
+                `Status: ERROR → PENDING_FORWARD`,
+            ];
+
+            if (errors.length > 0) {
+                responseLines.push(`Errors: ${errors.length}`);
+                responseLines.push("");
+                for (const err of errors.slice(0, 5)) {
+                    responseLines.push(`⚠️ ${err}`);
+                }
+            }
+
+            await ctx.reply(responseLines.join("\n"), { parse_mode: "Markdown" });
+        } catch (err: any) {
+            await ctx.reply(`❌ AP retry failed: ${err.message}`);
+        }
+    },
+};
+
         export const hermiaCommands: BotCommand[] = [
                             cognitionCommand,
                             priorityCommand,
@@ -748,4 +913,5 @@ const hermiaCommand: BotCommand = {
                             costCommand,
                             apHealthCommand,
                     reclassifyCommand,
+                    apRetryCommand,
                         ];
