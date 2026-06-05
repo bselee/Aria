@@ -22,6 +22,27 @@ export async function sendTelegramNotify(text: string): Promise<void> {
         console.log(`[telegram-notify] Gated (outside business hours): "${preview}..."`);
         return;
     }
+    await sendTelegramMessage(text);
+}
+
+/**
+ * Send a critical Markdown message to Bill's Telegram chat.
+ * Bypasses business hours gate — always sends, even at night/weekends.
+ * Falls back to plain text if Markdown parsing fails.
+ *
+ * Use for: stuck invoices, system failures, payment deadlines — anything
+ * where silence during off-hours is worse than noise.
+ */
+export async function sendCriticalTelegramNotify(text: string): Promise<void> {
+    console.log('[telegram-notify] Critical alert — bypassing business hours gate.');
+    await sendTelegramMessage(text);
+}
+
+/**
+ * Core send implementation. Not exported — use sendTelegramNotify or
+ * sendCriticalTelegramNotify instead.
+ */
+async function sendTelegramMessage(text: string): Promise<void> {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!token || !chatId) {

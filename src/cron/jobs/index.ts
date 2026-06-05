@@ -51,6 +51,20 @@ defineJob({
 });
 
 defineJob({
+    name: "ap-health-report",
+    schedule: "30 8 * * 1-5",
+    onFail: "telegram-will",
+    description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
+    handler: async () => {
+        const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
+        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+        const report = await generateAPHealthReport();
+        await sendTelegramNotify(report);
+        console.log("[ap-health-report] Morning report sent.");
+    },
+});
+
+defineJob({
     name: "daily-summary",
     schedule: "0 8 * * 1-5",
     onFail: "telegram-will",
