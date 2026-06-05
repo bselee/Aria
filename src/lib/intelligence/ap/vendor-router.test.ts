@@ -68,6 +68,29 @@ describe("vendor-router senderContains match", () => {
     });
 });
 
+describe("vendor-router internal statement match", () => {
+    it("subject 'build a soil statement' alone → autopay (no forward)", () => {
+        const r = matchVendorRouting("some@internal.com", "Internal", "BUILD A SOIL STATEMENT AS OF JUNE 4 2026");
+        expect(r?.action).toBe("autopay");
+        expect(r?.label).toContain("BuildASoil Statement");
+    });
+
+    it("buildasoil.com sender + 'statement' in subject → autopay", () => {
+        const r = matchVendorRouting("noreply@buildasoil.com", "BuildASoil", "Monthly Statement - June");
+        expect(r?.action).toBe("autopay");
+    });
+
+    it("buildasoil.com sender without 'statement' in subject → no match", () => {
+        const r = matchVendorRouting("billing@buildasoil.com", "BuildASoil", "Invoice #123");
+        expect(r).toBeNull();
+    });
+
+    it("'statement' subject without buildasoil.com sender → no match via that rule", () => {
+        const r = matchVendorRouting("vendor@other.com", "Vendor", "Monthly Statement");
+        expect(r).toBeNull(); // subjectContains alone doesn't match this rule (needs buildasoil.com)
+    });
+});
+
 describe("vendor-router dropship match", () => {
     it("matches logan labs via email → dropship", () => {
         const r = matchVendorRouting("loganlabs@ship.com", "Logan Labs LLC", "Invoice 133821");
