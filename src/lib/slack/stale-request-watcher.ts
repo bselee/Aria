@@ -15,6 +15,7 @@
 
 import { createClient } from "../supabase";
 import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { isBusinessHours } from "../intelligence/alert-gate";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -126,6 +127,12 @@ export function formatStaleRequests(report: StaleRequestReport): string {
  * if any are over SLA. Called from the followup-sop cron.
  */
 export async function runStaleRequestWatcher(): Promise<void> {
+    // Only check during business hours — stale Slack requests can wait until Monday
+    if (!isBusinessHours()) {
+        console.log("[stale-request-watcher] Outside business hours — skipping stale request check.");
+        return;
+    }
+
     const stale = await getStaleSlackRequests();
     if (stale.length === 0) {
         console.log("[stale-request-watcher] No pending Slack requests over SLA.");

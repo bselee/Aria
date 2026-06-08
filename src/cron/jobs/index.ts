@@ -51,6 +51,112 @@ defineJob({
 });
 
 defineJob({
+    name: "jit-forward-projection",
+    schedule: "0 8 * * 1-5",
+    onFail: "log",
+    description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
+    handler: async () => {
+        const { createClient } = await import("@/lib/supabase");
+        const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+
+        // Bill's rule: don't ping daily. Only alert when an orderTriggerDate is
+        // imminent (≤7 days away). If every component is far in the future,
+        // stay silent — "no news is good news".
+        const ALERT_BUFFER_DAYS = 7;
+
+        const db = createClient();
+        if (!db) {
+            console.log("[jit-forward-projection] Supabase unavailable — skipping.");
+            return;
+        }
+
+        // Latest snapshot that has components JSON with orderTriggerDate fields
+        // (written by the build-risk job that already fired at 7:30).
+        const { data, error } = await db
+            .from("build_risk_snapshots")
+            .select("generated_at,components")
+            .order("generated_at", { ascending: false })
+            .limit(1);
+
+        if (error || !data || !data[0]) {
+            console.log("[jit-forward-projection] No snapshot available. Will surface at 7:30 run.");
+            return;
+        }
+        const snap = data[0] as any;
+        const comps = (snap.components ?? {}) as Record<string, any>;
+        const snapshotDate = new Date(snap.generated_at);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const todayISO = today.toISOString().slice(0, 10);
+        const bufferEnd = new Date(today.getTime() + ALERT_BUFFER_DAYS * 86_400_000);
+        const bufferISO = bufferEnd.toISOString().slice(0, 10);
+
+        // Collect components whose orderTriggerDate is in [today, today+7]
+        const triggers: Array<{
+            sku: string;
+            riskLevel: string;
+            triggerDate: string;
+            coverageDays?: number | null;
+            vendorName?: string | null;
+            stockoutDays?: number | null;
+            onHand?: number | null;
+            usedIn: string[];
+        }> = [];
+
+        for (const [sku, c] of Object.entries(comps)) {
+            if (!c || !c.orderTriggerDate) continue;
+            const d = c.orderTriggerDate;
+            if (d < todayISO) continue;          // already past — no alert
+            if (d > bufferISO) continue;         // not within the window yet
+            triggers.push({
+                sku,
+                riskLevel: c.riskLevel,
+                triggerDate: d,
+                coverageDays: c.coverageDays,
+                vendorName: c.vendorName,
+                stockoutDays: c.stockoutDays,
+                onHand: c.onHand,
+                usedIn: Array.isArray(c.usedIn) ? c.usedIn : Object.keys(c.usedIn ?? {}),
+            });
+        }
+
+        if (triggers.length === 0) {
+            console.log("[jit-forward-projection] No JIT triggers in the next 7d — silent.");
+            return;
+        }
+
+        // Build Telegram message. Sorted so CRITICAL (today/tomorrow) is at top.
+        triggers.sort((a, b) => a.triggerDate.localeCompare(b.triggerDate));
+        const lines: string[] = [
+            `📅 *JIT Forward Projection — Order Triggers (≤${ALERT_BUFFER_DAYS}d)*`,
+            `_snapshot: ${snapshotDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Denver' })}_`,
+            `${triggers.length} component(s) need attention:\n`,
+        ];
+
+        for (const t of triggers) {
+            const isUrgent = t.triggerDate === todayISO;
+            const urgency = isUrgent ? "🔴 TODAY" : "🟡 by " + t.triggerDate;
+            const label = t.riskLevel === 'CRITICAL' ? " 🔴" : t.riskLevel === 'WARNING' ? " " : " ⚠️";
+            lines.push(`• ${urgency} ${label} \`${t.sku}\`${t.riskLevel ? `  [${t.riskLevel}]` : ''}`);
+            lines.push(`     Vendor: ${t.vendorName ?? '?'}  |  On hand: ${t.onHand !== null ? Math.round(t.onHand) : '—'}`);
+            const fg = Array.isArray(t.usedIn) ? t.usedIn.join(', ') : '';
+            if (fg) lines.push(`     Feeds FGs: ${fg}`);
+            if (t.coverageDays !== null && t.coverageDays !== undefined) {
+                lines.push(`     FG shelf: ~${Math.round(t.coverageDays)}d until runout`);
+            }
+            lines.push('');
+        }
+
+        lines.push(`> Order by the dates above. POs placed outside the trigger window are premature; placing too late = build-block.`);
+
+        await sendCriticalTelegramNotify(lines.join("\n"));
+        console.log(`[jit-forward-projection] Fired alert for ${triggers.length} components.`);
+    },
+    // Budget: reads Supabase once, sends one Telegram — generous default is fine.
+    budget: { durationMs: 60_000 },
+});
+
+defineJob({
     name: "ap-health-report",
     schedule: "30 8 * * 1-5",
     onFail: "telegram-will",
@@ -397,9 +503,10 @@ defineJob({
             // KAIZEN(2026-06-02): Surface critical decisions via Telegram.
             if (decision.priority === "critical") {
                 try {
-                    console.log(
-                                            `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
-                                        );
+                    const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                    await sendCriticalTelegramNotify(
+                        `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
+                    );
                     console.log(`[cognitive-round] Telegram alert sent for critical decision`);
                 } catch (err: any) {
                     console.warn(`[cognitive-round] Telegram alert failed (non-fatal): ${err.message}`);

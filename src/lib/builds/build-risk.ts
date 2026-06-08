@@ -42,6 +42,10 @@ export interface ComponentDemand {
     hasFinaleData: boolean;
     vendorName: string | null;       // Primary supplier name (resolved from partygroup)
     vendorPartyId: string | null;     // Primary supplier partyId (for PO routing)
+    /** ISO date (YYYY-MM-DD) by which PO should be placed. */
+    orderTriggerDate?: string | null;
+    /** Days of FG shelf coverage, used to compute orderTriggerDate. */
+    coverageDays?: number | null;
 }
 
 export interface UnrecognizedSku {
@@ -428,6 +432,81 @@ export async function runBuildRiskAnalysis(
     const withData = Array.from(fgVelocity.values()).filter(v => v.dailyRate > 0).length;
     log(`   Sales velocity for ${withData}/${fgVelocity.size} SKUs.`);
 
+    // ── Step 6: JIT order-trigger date ← 2026-06-08 Bill request ──────
+    // For each component that's not OK, compute the ISO date by which a PO
+    // must be placed. This is the "crystal-ball" signal: not binary order/
+    // don't-order, but _when_ we must act.
+    //
+    // Formula: orderTriggerDate = today + max(0, coverageDays - bufferDays - leadTime)
+    //   coverageDays     = earliest FG shelf coverage for any of demand.usedIn
+    //   bufferDays       = 14-day safety margin above lead time (MFG scheduling
+    //                      variability; we don't control builds, so we need a
+    //                      buffer in case they start earlier than expected)
+    //   leadTime         = vendor lead time in days (defaults to 14)
+    //
+    // Priority: Finale's native stockoutDays is always preferred when available
+    // (it already encodes BOM, consumption, and FG projection). Path 2 is the
+    // FG-traceback fallback when stockoutDays is null.
+    //
+    // Coverage info is also stored on the component (coverageDays) so the
+    // Telegram/Slack reports and the cron handler can display human-readable
+    // context without redoing the math.
+    const JIT_BUFFER_DAYS = 14;
+    let jitTriggers = 0;
+    for (const d of demandEntries) {
+        if (d.riskLevel === 'OK') {
+            d.orderTriggerDate = null;
+            continue;
+        }
+
+        // Earliest runout across all FGs consumed by this component
+        let earliestFGRunout: number | null = null;
+        let earliestFGSku = '';
+        for (const fgSku of d.usedIn) {
+            const vel = fgVelocity.get(fgSku);
+            if (!vel || vel.dailyRate === 0 || vel.stockOnHand === null || vel.stockOnHand === 0) continue;
+            const days = vel.stockOnHand / vel.dailyRate;
+            if (earliestFGRunout === null || days < earliestFGRunout) {
+                earliestFGRunout = days;
+                earliestFGSku = fgSku;
+            }
+        }
+
+        d.coverageDays = earliestFGRunout !== null ? Math.round(earliestFGRunout) : d.stockoutDays;
+
+        // Path A: Finale's native stockoutDays wins (already includes BOM math)
+        if (d.stockoutDays !== null && d.stockoutDays > 0) {
+            const runout = new Date(Date.now() + Math.round(d.stockoutDays) * 86_400_000);
+            d.orderTriggerDate = runout.toISOString().slice(0, 10);
+            jitTriggers++;
+            continue;
+        }
+
+        // Path B: FG-traceback derived trigger
+        if (earliestFGRunout !== null) {
+            const lt = d.leadTimeDays ?? 14;
+            const daysUntilOrder = Math.max(0, earliestFGRunout - JIT_BUFFER_DAYS - lt);
+            const trigger = new Date(Date.now() + daysUntilOrder * 86_400_000);
+            d.orderTriggerDate = trigger.toISOString().slice(0, 10);
+            jitTriggers++;
+        } else {
+            // No FG velocity and no stockoutDays — fallback to earliestBuildDate
+            if (d.earliestBuildDate && d.earliestBuildDate.length === 10) {
+                const lt = d.leadTimeDays ?? 14;
+                const build = new Date(d.earliestBuildDate);
+                const advance = new Date(build.getTime() - (lt + JIT_BUFFER_DAYS) * 86_400_000);
+                d.orderTriggerDate = advance.toISOString().slice(0, 10);
+            } else {
+                d.orderTriggerDate = null;
+            }
+            jitTriggers++;
+        }
+
+        // Annotation for audit
+        (d as any)._earliestFGTrigger = earliestFGSku || null;
+    }
+    log(`🔔 JIT order-trigger dates computed: ${jitTriggers}/${demandEntries.length} components.`);
+
     const slackMessage = formatSlackReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
     const telegramMessage = formatTelegramReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
 
@@ -607,6 +686,11 @@ function formatTelegramReport(
             const desig = Array.from(c.designations).join('/');
             msg += `• [${desig}] \`${c.componentSku}\` — Stockout in ${c.stockoutDays ?? '?'}d, no POs\n`;
             msg += `  ↳ Used in: ${Array.from(c.usedIn).slice(0, 3).join(', ')}\n`;
+            if (c.orderTriggerDate) {
+                msg += `  ↳ 🎯 Order by: ${c.orderTriggerDate}`;
+                const coverage = c.coverageDays !== null ? ` (FG coverage ~${c.coverageDays}d)` : '';
+                msg += `${coverage}\n`;
+            }
         }
         if (criticals.length > 15) msg += `_...and ${criticals.length - 15} more_\n`;
         msg += `\n`;
@@ -618,6 +702,11 @@ function formatTelegramReport(
             const desig = Array.from(c.designations).join('/');
             const poNote = c.incomingPOs.length > 0 ? ` (${c.incomingPOs.length} PO)` : '';
             msg += `• [${desig}] \`${c.componentSku}\` — ${c.stockoutDays ?? '?'}d${poNote}\n`;
+            if (c.orderTriggerDate) {
+                msg += `  ↳ 🎯 Order by: ${c.orderTriggerDate}`;
+                const coverage = c.coverageDays !== null ? ` (${c.coverageDays}d FG shelf)` : '';
+                msg += `${coverage}\n`;
+            }
         }
         if (warnings.length > 10) msg += `_...and ${warnings.length - 10} more_\n`;
         msg += `\n`;
