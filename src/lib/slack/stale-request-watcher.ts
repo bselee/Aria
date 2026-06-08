@@ -139,8 +139,13 @@ export async function runStaleRequestWatcher(): Promise<void> {
     };
 
     const formatted = formatStaleRequests(report);
-    await sendTelegramNotify(formatted);
+    console.log(formatted);
     await markRequestNudged(stale.map((r) => r.id));
+
+    // Actually notify Bill — not just log to console
+    if (formatted) {
+        await sendTelegramNotify(formatted).catch(() => {});
+    }
 
     console.log(`[stale-request-watcher] Nudged Bill about ${stale.length} stale Slack request(s).`);
 }

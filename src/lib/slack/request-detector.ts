@@ -20,6 +20,7 @@ import { WebClient } from "@slack/web-api";
 import { FinaleClient } from "../finale/client";
 import { createClient } from "../supabase";
 import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { resolveSkuAlias, expandSkuToken } from "../sku-aliases";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -49,20 +50,35 @@ function buildFinalePOUrl(orderId: string): string {
 
 /**
  * Extract potential SKU codes from text.
- * Heuristic: uppercase alphanumeric tokens, 3-15 chars, at least one letter + one digit.
+ * Heuristic: tokens with letter+digit mix (3-15 chars) PLUS digit-first
+ * patterns like "0811 BAGS" / "0711 BAGS" where digits are followed by
+ * a letter-word. Filters out pure-letter common words.
  */
 function extractSKUs(text: string): string[] {
     const upper = text.toUpperCase();
-    const matches = upper.match(/\b[A-Z][A-Z0-9]{2,14}\b/g);
-    if (!matches) return [];
+
+    // Pattern 1: Classic mixed SKUs — starts with letter, has digit
+    // e.g. CRAFT4L, HAL100, BAV5LBBAG, GBB06, ACTV101, FM104
+    const mixedMatches = upper.match(/\b[A-Z][A-Z0-9]{2,14}\b/g) || [];
+
+    // Pattern 2: Digit-first SKU labels — digits followed by a letter-word
+    // e.g. "0811 BAGS" → 0811BAGS, "0711 BAGS" → 0711BAGS
+    const digitFirst = upper.match(/\b\d{3,6}\s[A-Z]{2,8}\b/g) || [];
 
     const unique = new Set<string>();
-    for (const token of matches) {
-        // Must have at least one digit AND one letter (not purely one or the other)
+
+    for (const token of mixedMatches) {
+        // Must have at least one digit AND one letter
         if (/[A-Z]/.test(token) && /\d/.test(token)) {
             unique.add(token);
         }
     }
+
+    for (const token of digitFirst) {
+        // Strip whitespace → "0811BAGS", "0711BAGS"
+        unique.add(token.replace(/\s+/g, ""));
+    }
+
     return Array.from(unique);
 }
 
@@ -276,19 +292,32 @@ export class SlackRequestDetector {
         if (userId && this.ownerUserId && userId === this.ownerUserId) return;
 
         // Extract SKUs
-        const skus = extractSKUs(text);
-        if (skus.length === 0) return;
+        const rawTokens = extractSKUs(text);
+        if (rawTokens.length === 0) return;
+
+        // Resolve aliases — "0811 BAGS" → SBD21410811, "BAV5LBBAG" → same, etc.
+        // Falls back to the raw token when no alias match (Finale will attempt lookup).
+        const resolvedSkus: Array<{ displayToken: string; finaleSku: string }> = [];
+        for (const token of rawTokens) {
+            const expanded = expandSkuToken(token);
+            for (const e of expanded) {
+                resolvedSkus.push({
+                    displayToken: e.aliasName,
+                    finaleSku: e.finaleSku ?? token, // use alias Finale SKU, or fall back to raw
+                });
+            }
+        }
 
         console.log(
-            `[slack-detector] #${channelName}: SKUs detected: ${skus.join(", ")}`,
+            `[slack-detector] #${channelName}: SKUs detected: ${resolvedSkus.map(s => `${s.displayToken}${s.finaleSku !== s.displayToken ? '→' + s.finaleSku : ''}`).join(", ")}`,
         );
 
         // Check each SKU in Finale FIRST — only respond publicly if we know something
         let hasPO = false;
         let foundInFinale = false;
-        for (const sku of skus) {
+        for (const { displayToken, finaleSku } of resolvedSkus) {
             try {
-                const product = await this.finale.lookupProduct(sku);
+                const product = await this.finale.lookupProduct(finaleSku);
                 foundInFinale = true;
                 const onOrderPOs = (product?.openPOs || []).filter(
                     (po) =>
@@ -305,7 +334,7 @@ export class SlackRequestDetector {
                     await this.postOrderInfo(
                         channelId,
                         ts,
-                        sku,
+                        displayToken,
                         onOrderPOs,
                         product?.name,
                     );
@@ -325,19 +354,35 @@ export class SlackRequestDetector {
             ts,
             userId,
             text,
-            skus,
+            resolvedSkus.map(s => s.finaleSku),
         ).catch(() => {});
 
-        // No open PO found — notify Bill via Telegram, but nothing public
+        // No open PO found — notify Bill via Telegram so he can act on the request
         if (!hasPO && foundInFinale) {
             const slackLink = `https://slack.com/archives/${channelId}/${ts.replace(".", "")}`;
-            const skuLine = skus.join(", ");
-            const msg = [
-                `📥 ${skuLine} in #${channelName}`,
-                `Not on order. ${slackLink}`,
+            const skuLine = resolvedSkus.map(s => s.displayToken).join(", ");
+
+            // Resolve requester name (best-effort)
+            let requesterName = "someone";
+            if (msg.user) {
+                try {
+                    const ui = await this.writer.users.info({ user: msg.user });
+                    requesterName = ui.user?.real_name || ui.user?.name || "someone";
+                } catch { /* fallback */ }
+            }
+
+            const tgMsg = [
+                `📥 Slack purchase request from *${requesterName}* in #${channelName}`,
+                ``,
+                `*SKUs:* ${skuLine}`,
+                ``,
+                `"${(msg.text || "").slice(0, 120)}${(msg.text || "").length > 120 ? "…" : ""}"`,
+                ``,
+                `Not on order. [Slack →](${slackLink})`,
             ].join("\n");
 
-            await sendTelegramNotify(msg).catch(() => {});
+            await sendTelegramNotify(tgMsg).catch(() => {});
+            console.log('[request-detector] Telegram alert sent for Slack purchase request');
         }
         // If !foundInFinale: complete silence, no trace in Slack
     }
