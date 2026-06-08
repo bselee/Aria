@@ -111,26 +111,60 @@ async function runWithConcurrency<T>(
 // RISK CLASSIFICATION
 // ──────────────────────────────────────────────────
 
+/**
+ * Classify component risk level.
+ *
+ * DECISION(2026-03-04): CRAFT builds pull from many vendors and have deep BOMs.
+ * Give CRAFT components an extra 7-day buffer on all thresholds so they trigger
+ * earlier and get more ordering lead time.
+ *
+ * 2026-06-08: Added build-demand fallback. Finale returns null for stockoutDays
+ * on raw material / BOM components (no direct sales history). Without this, every
+ * component with null stockoutDays silently fell through to OK — even when
+ * onHand < build demand. Now derives runway from onHand / (totalRequiredQty/30)
+ * when Finale's native stockoutDays is unavailable.
+ */
 function classifyRisk(demand: ComponentDemand, isCraftComponent: boolean = false): ComponentDemand['riskLevel'] {
-    const days = demand.stockoutDays;
     const hasPOs = demand.incomingPOs.length > 0;
+    const onHand = demand.onHand ?? 0;
+    const needed = demand.totalRequiredQty || 0;
+    const leadTime = demand.leadTimeDays ?? 14; // default 14d when unknown
 
     // DECISION(2026-03-04): CRAFT builds pull from many vendors and have deep BOMs.
     // Give CRAFT components an extra 7-day buffer on all thresholds so they trigger
     // earlier and get more ordering lead time.
     const buffer = isCraftComponent ? 7 : 0;
 
-    // Stockout ≤14d (21d for CRAFT) with no POs → CRITICAL
-    if (days !== null && days <= 14 + buffer && !hasPOs) return 'CRITICAL';
+    // ── Path 1: Finale provides stockoutDays ──
+    if (demand.stockoutDays !== null && demand.stockoutDays > 0) {
+        const days = demand.stockoutDays;
+        if (days <= 14 + buffer && !hasPOs) return 'CRITICAL';
+        if (days <= 14 + buffer && hasPOs) return 'WARNING';
+        if (days <= 30 + buffer) return 'WARNING';
+        if (days <= 60 + buffer) return 'WATCH';
+        return 'OK';
+    }
 
-    // Stockout ≤14d (21d for CRAFT) with POs (PO might save us) → WARNING
-    if (days !== null && days <= 14 + buffer && hasPOs) return 'WARNING';
+    // ── Path 2: Finale returns null stockoutDays — derive runway from build demand ──
+    // dailyRate = totalRequiredQty (30d build need) / 30 → units consumed per day
+    // derivedRunway = onHand / dailyRate → days of stock remaining
+    const dailyRate = needed > 0 ? needed / 30 : 0;
+    const derivedRunway = dailyRate > 0 ? onHand / dailyRate : (onHand > 0 ? 999 : 0);
 
-    // Stockout ≤30d (37d for CRAFT) → WARNING
-    if (days !== null && days <= 30 + buffer) return 'WARNING';
+    // Immediate deficit: onHand < 30d build need with no incoming POs
+    const deficit = onHand < needed;
+    const totalSupply = onHand + demand.incomingPOs.reduce((s, po) => s + (po.quantity || 0), 0);
+    const supplyCovers = totalSupply >= needed;
 
-    // Stockout ≤60d (67d for CRAFT) → WATCH
-    if (days !== null && days <= 60 + buffer) return 'WATCH';
+    // CRITICAL: will run out before lead-time window closes, or current stock can't cover builds
+    if ((derivedRunway < leadTime || (derivedRunway <= 14 + buffer)) && !hasPOs) return 'CRITICAL';
+    if (derivedRunway <= 7 && deficit && !hasPOs) return 'CRITICAL';
+
+    // WARNING: runway shorter than lead time + buffer, or deficit exists even with POs
+    if (derivedRunway < leadTime + buffer || (deficit && !supplyCovers)) return 'WARNING';
+
+    // Watch: deficit but POs cover it, or runway < 30d
+    if (derivedRunway < 45 + buffer || (deficit && supplyCovers)) return 'WATCH';
 
     return 'OK';
 }
@@ -200,7 +234,68 @@ export async function runBuildRiskAnalysis(
         }
     }
 
+    // Step 2.5 (FG-traceback filter, 2026-06-08):
+    // Fetch FG shelf coverage for every target finished-good, then drop the
+    // ones where rebuild would create pure overstock. Without this filter the
+    // Oracle sums every calendar build into totalRequiredQty — driving
+    // component orders for products we already have 300+ days of FG inventory
+    // on the shelf. Bill: "we don't control when MFG builds, but we control
+    // what we buy." So we only buy components whose FG actually needs
+    // rebuilding soon.
+    //
+    // Rule: an FG build is "optional" if onHand / dailySalesRate > leadTime
+    //       + 28d safety buffer. Keep it otherwise (no data / zero sales /
+    //       stockout-level shelf = we trust the calendar build).
+    //
+    // Thresholds:
+    //   FG_COVERAGE_BUFFER_DAYS  = 28  (4-week safety above leadTime)
+    //   LEADTIME_DEFAULT         = 14  (used when component LT unknown)
+    //
+    const FG_COVERAGE_BUFFER_DAYS = 28;
+    const LEADTIME_DEFAULT = 14;
+    const FG_VELOCITY_WINDOW = 90;
+    log(`🔍 Fetching FG velocity for coverage filter (${aggregatedBuilds.size} FGs)...`);
+    let fgVelocityPreFilter: Map<string, FGVelocity> = new Map();
+    try {
+        fgVelocityPreFilter = await finale.getFinishedGoodVelocity(
+            Array.from(aggregatedBuilds.keys()),
+            FG_VELOCITY_WINDOW,
+        );
+        const withData = Array.from(fgVelocityPreFilter.values()).filter(v => v.dailyRate > 0).length;
+        log(`   Sales velocity for ${withData}/${aggregatedBuilds.size} FGs`);
+    } catch (err: any) {
+        log(`   ⚠️ FG velocity fetch failed for filter (continuing with calendar sum): ${err.message}`);
+    }
+
+    let droppedFGs = 0;
+    const droppedFGLog: string[] = [];
+    for (const [fgSku, meta] of Array.from(aggregatedBuilds.entries())) {
+        const vel = fgVelocityPreFilter.get(fgSku);
+        // Keep the build if: no FG velocity, 0 sales, null stock, or low shelf
+        if (!vel) continue;
+        if (!vel.dailyRate || vel.dailyRate === 0) continue;
+        if (vel.stockOnHand === null || vel.stockOnHand === 0) continue;
+        const coverageDays = vel.stockOnHand / vel.dailyRate;
+        const threshold = LEADTIME_DEFAULT + FG_COVERAGE_BUFFER_DAYS;
+        if (coverageDays > threshold) {
+            aggregatedBuilds.delete(fgSku);
+            droppedFGs++;
+            droppedFGLog.push(
+                `${fgSku}: ${Math.round(coverageDays)}d shelf (×${vel.dailyRate.toFixed(2)}/d) > ${threshold}d threshold`
+            );
+        }
+    }
+    if (droppedFGs > 0) {
+        log(`   ✸ Dropped ${droppedFGs} optional FG build(s) — excessive FG shelf:`);
+        for (const entry of droppedFGLog.slice(0, 10)) log(`      ${entry}`);
+        if (droppedFGLog.length > 10) log(`      +${droppedFGLog.length - 10} more`);
+        log(`   → ${aggregatedBuilds.size} FG builds remain after filter.`);
+    } else {
+        log(`   ✅ All ${aggregatedBuilds.size} FGs need rebuilding (none above coverage threshold).`);
+    }
+
     // Step 3: Explode BOMs + track unrecognized SKUs
+    // NOTE: This now only iterates over filtered FG builds (post FG-traceback).
     log(`💥 Exploding ${aggregatedBuilds.size} finished goods into raw components...`);
     const componentDemandTracker = new Map<string, ComponentDemand>();
     const unrecognizedSkus: UnrecognizedSku[] = [];
@@ -325,18 +420,13 @@ export async function runBuildRiskAnalysis(
     const okCount = demandEntries.length - criticalCount - warningCount - watchCount;
     log(`✅ 🔴 ${criticalCount} critical · 🟡 ${warningCount} warning · 👀 ${watchCount} watch · ✅ ${okCount} OK`);
 
-    // Step 5: Sales velocity for finished goods — how fast are we selling each SKU?
-    // Enriches the report with dailyRate + finished stock runway, no impact on component risk.
-    log(`📈 Fetching sales velocity for ${aggregatedBuilds.size} finished goods...`);
-    const fgSkus = Array.from(aggregatedBuilds.keys());
-    let fgVelocity: Map<string, FGVelocity> = new Map();
-    try {
-        fgVelocity = await finale.getFinishedGoodVelocity(fgSkus, 90);
-        const withData = Array.from(fgVelocity.values()).filter(v => v.dailyRate > 0).length;
-        log(`✅ Sales velocity fetched for ${withData}/${fgSkus.length} SKUs.`);
-    } catch (err: any) {
-        log(`⚠️ Sales velocity fetch failed (non-fatal): ${err.message}`);
-    }
+    // Step 5: FG velocity — reuse the snapshot taken at Step 2.5 (FG trace-back).
+    // No second Finale call needed; same 90-day window, same FGs (plus dropped
+    // over-stock FGs that the formatter can still surface for audit trail).
+    log(`📈 FG velocity carried from Step 2.5 (${fgVelocityPreFilter.size} FGs).`);
+    const fgVelocity: Map<string, FGVelocity> = fgVelocityPreFilter;
+    const withData = Array.from(fgVelocity.values()).filter(v => v.dailyRate > 0).length;
+    log(`   Sales velocity for ${withData}/${fgVelocity.size} SKUs.`);
 
     const slackMessage = formatSlackReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
     const telegramMessage = formatTelegramReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
