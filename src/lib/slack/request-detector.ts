@@ -53,30 +53,45 @@ function buildFinalePOUrl(orderId: string): string {
  * Heuristic: tokens with letter+digit mix (3-15 chars) PLUS digit-first
  * patterns like "0811 BAGS" / "0711 BAGS" where digits are followed by
  * a letter-word. Filters out pure-letter common words.
+ *
+ * 2026-06-08 update: The earlier "letter AND digit" filter dropped all-letter
+ * product codes like `RAWMILLEDGNARBAR` (Parker McMahon's 6/8 message
+ * lost 1 of 12 SKUs). Now: pass when (letter AND digit) OR (all-letter
+ * AND length >= 12). 12 chars is the floor — common English words
+ * (PURCHASING=10, THRESHOLD=9, CALENDAR=8, COMPONENT=9) all get filtered.
+ * Real all-letter product codes are usually 12+ chars (RAWMILLEDGNARBAR=16,
+ * BAV5LBBAG=10 still needs alias table — see `sku-aliases.ts`).
+ * Final 404s on lookups (e.g. `BILL`, `ORDER`) are swallowed silently
+ * elsewhere in the pipeline.
  */
 function extractSKUs(text: string): string[] {
     const upper = text.toUpperCase();
 
-    // Pattern 1: Classic mixed SKUs — starts with letter, has digit
-    // e.g. CRAFT4L, HAL100, BAV5LBBAG, GBB06, ACTV101, FM104
+    // Pattern 1: Classic mixed SKUs — starts with letter, 3-15 chars total
+    // e.g. CRAFT4L, HAL100, BAV5LBBAG (via alias table), GBB06, ACTV101, FM104
     const mixedMatches = upper.match(/\b[A-Z][A-Z0-9]{2,14}\b/g) || [];
 
     // Pattern 2: Digit-first SKU labels — digits followed by a letter-word
     // e.g. "0811 BAGS" → 0811BAGS, "0711 BAGS" → 0711BAGS
     const digitFirst = upper.match(/\b\d{3,6}\s[A-Z]{2,8}\b/g) || [];
 
+    // Pattern 3 (NEW): All-letter product codes >= 12 chars
+    // e.g. RAWMILLEDGNARBAR. The 12-char floor filters common English words.
+    const longAllLetter = upper.match(/\b[A-Z]{12,}\b/g) || [];
+
     const unique = new Set<string>();
 
     for (const token of mixedMatches) {
-        // Must have at least one digit AND one letter
+        // Letter+digits: any length >=3 is product-like (e.g. GBB06, FM104)
         if (/[A-Z]/.test(token) && /\d/.test(token)) {
             unique.add(token);
         }
     }
-
     for (const token of digitFirst) {
-        // Strip whitespace → "0811BAGS", "0711BAGS"
         unique.add(token.replace(/\s+/g, ""));
+    }
+    for (const token of longAllLetter) {
+        unique.add(token);
     }
 
     return Array.from(unique);
@@ -437,7 +452,7 @@ export class SlackRequestDetector {
                     need30 = Math.round(c.totalRequiredQty ?? 0);
                     vendor = c.vendorName ?? "Unknown vendor";
                     leadTime = c.leadTimeDays ?? 14;
-                    productName = c.productName;
+                    productName = c.productName ?? null;
                 } else {
                     // Fallback: product-level data already in hand from
                     // the hasPO loop above (we called lookupProduct).
