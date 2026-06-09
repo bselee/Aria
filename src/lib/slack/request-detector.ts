@@ -37,8 +37,42 @@ const MIN_AGE_MS = 15_000;
 const LOOKBACK_MS = 120_000;
 
 /**
- * Build a Finale PO URL for Slack link unfurling.
+ * Heuristic: does Bill's message look like a data request (not just chatter)?
+ * 2026-06-09 — used to decide whether to process his Slack messages in
+ * #purchasing / #purchase-orders. Default is "skip his messages" so the
+ * bot isn't a chat companion; only process if it looks like an actionable
+ * data request.
+ *
+ * Trigger signals (any one is enough):
+ *   - Contains "?" anywhere
+ *   - Starts with imperative verb: show, list, what, how, check, status,
+ *     give, find, count, get, where, when, why, who, can, do, is
+ *   - Contains bot mention: @purchase, @aria, @aria-bot
+ *   - Starts with "/" (slash command like /buildrisk)
+ *   - Contains a SKU-shaped token (handled by extractSKUs; not checked here)
  */
+function looksLikeDataRequest(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+
+    // Slash command
+    if (t.startsWith("/")) return true;
+
+    // Any question
+    if (t.includes("?")) return true;
+
+    // Bot mention
+    if (/@(purchase|aria|aria-bot|bot)\b/i.test(t)) return true;
+
+    // Imperative verb at start
+    const lower = t.toLowerCase();
+    const imperative = /^(show|list|what|how|check|status|give|find|count|get|where|when|why|who|can|do|is|are)\b/;
+    if (imperative.test(lower)) return true;
+
+    return false;
+}
+
+
 function buildFinalePOUrl(orderId: string): string {
     const base = process.env.FINALE_BASE_URL || "https://app.finaleinventory.com";
     const accountPath = process.env.FINALE_ACCOUNT_PATH || "";
@@ -46,6 +80,33 @@ function buildFinalePOUrl(orderId: string): string {
         `/${accountPath}/api/order/purchase/${orderId}`,
     ).toString("base64");
     return `${base}/${accountPath}/sc2/?order/purchase/order/${encoded}`;
+}
+
+/**
+ * Format a PO status into the Slack thread label suffix.
+ * 2026-06-09 — Bill wants DRAFT and COMMITTED to surface explicitly so
+ * he can tell at a glance which POs are still being assembled vs already
+ * sent. SENT / OPEN / PARTIAL are normal terminal states and get no
+ * label. Unknown statuses get the bare status name in parens for safety.
+ *
+ * Examples:
+ *   "DRAFT"     → " (DRAFT)"
+ *   "COMMITTED" → " (COMMITTED)"
+ *   "SENT"      → ""
+ *   "OPEN"      → ""
+ *   "PARTIAL"   → ""
+ *   "PENDING"   → " (PENDING)"
+ */
+function formatPOStateLabel(status: string | undefined | null): string {
+    if (!status) return "";
+    const upper = status.toUpperCase().trim();
+    if (upper === "DRAFT") return " (DRAFT)";
+    if (upper === "COMMITTED") return " (COMMITTED)";
+    // Normal terminal states — no label
+    if (upper === "SENT" || upper === "OPEN" || upper === "PARTIAL" ||
+        upper === "RECEIVED" || upper === "CLOSED") return "";
+    // Unknown — surface for safety
+    return ` (${upper})`;
 }
 
 /**
@@ -63,6 +124,12 @@ function buildFinalePOUrl(orderId: string): string {
  * BAV5LBBAG=10 still needs alias table — see `sku-aliases.ts`).
  * Final 404s on lookups (e.g. `BILL`, `ORDER`) are swallowed silently
  * elsewhere in the pipeline.
+ *
+ * 2026-06-09 update: Added Pattern 4 (correlation pass). Catches space-split
+ * product codes by concatenating adjacent words. E.g. "RAWMILLED GNARBAR"
+ * → "RAWMILLEDGNARBAR" (16 chars, all-letter, passes 12-char floor),
+ * "KMS 101" → "KMS101" (6 chars, mixed, passes letter+digits filter).
+ * Downstream alias resolver / Finale lookup filters false positives.
  */
 function extractSKUs(text: string): string[] {
     const upper = text.toUpperCase();
@@ -79,6 +146,34 @@ function extractSKUs(text: string): string[] {
     // e.g. RAWMILLEDGNARBAR. The 12-char floor filters common English words.
     const longAllLetter = upper.match(/\b[A-Z]{12,}\b/g) || [];
 
+    // Pattern 4 (NEW 2026-06-09): Correlation pass — concatenate adjacent
+    // words and apply the same pass-criteria as Patterns 1+3. Catches
+    // space-split product codes like "RAWMILLED GNARBAR" (people type
+    // with spaces), "KMS 101" (mixed letter+digits with separator),
+    // "BAV 5LB BAG" (multi-word product code).
+    //
+    // Restrict to:
+    //   - adjacent words (max 3 words concatenated) so we don't glue
+    //     "PURCHASING DEPARTMENT" together
+    //   - both/all parts ≥ 4 chars (filters out short connectors like
+    //     "ON", "TO", "OF", "AND")
+    //   - apply the same pass-criteria as the standalone patterns:
+    //     (letter AND digit) OR (all-letter AND >= 12 chars)
+    //
+    // The downstream alias resolver / Finale lookup swallows false
+    // positives (e.g. "PURCHASINGDEPARTMENT" gets 404'd quietly).
+    const wordSequence = upper.split(/\s+/).filter(w => /^[A-Z0-9]+$/.test(w));
+    const correlationCandidates: string[] = [];
+    for (let i = 0; i < wordSequence.length - 1; i++) {
+        for (let j = i + 1; j <= Math.min(i + 3, wordSequence.length); j++) {
+            const parts = wordSequence.slice(i, j);
+            // All parts must be ≥ 4 chars to filter short connectors
+            if (parts.some(p => p.length < 4)) continue;
+            const candidate = parts.join("");
+            correlationCandidates.push(candidate);
+        }
+    }
+
     const unique = new Set<string>();
 
     for (const token of mixedMatches) {
@@ -92,6 +187,14 @@ function extractSKUs(text: string): string[] {
     }
     for (const token of longAllLetter) {
         unique.add(token);
+    }
+    for (const token of correlationCandidates) {
+        // Same pass-criteria as Patterns 1+3:
+        if (/[A-Z]/.test(token) && /\d/.test(token)) {
+            unique.add(token);
+        } else if (/^[A-Z]+$/.test(token) && token.length >= 12) {
+            unique.add(token);
+        }
     }
 
     return Array.from(unique);
@@ -302,9 +405,28 @@ export class SlackRequestDetector {
         const text = (msg.text || "") as string;
         if (!text.trim()) return;
 
-        // Skip messages from Bill
+        // Bill's messages: skip by default. Process only if he's asking a
+        // question or requesting data. The detector is a SKU listener, not
+        // a chat companion — Bill usually posts in #purchasing to ask for
+        // POs or request status checks. Anything else is noise.
+        //
+        // 2026-06-09: Heuristic for "looks like a data request":
+        //   - Contains "?" (any question)
+        //   - Starts with imperative verbs: show, list, what, how, check,
+        //     status, give, find, count, get, where, when, why, who
+        //   - Contains a bot mention: @purchase, @aria
+        //   - Contains a SKU token (extractSKUs picks it up)
+        //   - Starts with "/" (slash command, e.g. /buildrisk)
+        //
+        // If the message has a SKU token in it, the SKU branch handles
+        // it — we don't need a separate check. The first three are
+        // for the data-request case where Bill doesn't include a SKU
+        // but wants to know something.
         const userId = msg.user as string | undefined;
-        if (userId && this.ownerUserId && userId === this.ownerUserId) return;
+        if (userId && this.ownerUserId && userId === this.ownerUserId) {
+            if (!looksLikeDataRequest(text)) return;
+            console.log(`[slack-detector] Processing Bill's message (data request): "${text.slice(0, 80)}"`);
+        }
 
         // Extract SKUs
         const rawTokens = extractSKUs(text);
@@ -604,6 +726,11 @@ export class SlackRequestDetector {
         // Cap at 3 POs to keep the thread tight; if more, the first 3 are
         // enough to confirm "we have orders" — a separate escalation can
         // handle the rare multi-PO SKU.
+        //
+        // 2026-06-09 (cont.): state labels — DRAFT and COMMITTED get
+        // explicit `(STATE)` markers so Bill can tell at a glance which
+        // POs are still being assembled vs already sent. SENT / OPEN /
+        // PARTIAL are normal states and get no label.
         const maxPOs = Math.min(pos.length, 3);
         const lines: string[] = [];
 
@@ -617,7 +744,9 @@ export class SlackRequestDetector {
                   })
                 : "TBD";
             const url = buildFinalePOUrl(po.orderId);
-            lines.push(`*${sku} - <${url}|${po.orderId}> - ETA (${eta})*`);
+            const stateLabel = formatPOStateLabel(po.status);
+            const line = `*${sku} - <${url}|${po.orderId}> - ETA (${eta})${stateLabel}*`;
+            lines.push(line);
         }
 
         const text = lines.join("\n");

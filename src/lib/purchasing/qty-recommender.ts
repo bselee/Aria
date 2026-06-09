@@ -95,6 +95,26 @@ export interface RecommenderInput {
      * historical learning.
      */
     favoriteBatches?: number[] | null;
+    /**
+     * v2.5 (2026-06-09) — Bill McMahon's KMS101 fix: when a component is
+     * BOM-only (BOW&SALE flag absent, or has zero direct sales), the
+     * smoothed `dailyRate × coverDays` formula under-shoots the actual
+     * 30d BOM-driven need. Callers should pass `bomDrivenNeed` =
+     * totalRequiredQty from the FG-traceback snapshot for BOM-only SKUs.
+     * The recommender uses this as the PRIMARY `rawNeededEaches` signal,
+     * overriding the dailyRate formula. BOW&SALE components (mixed
+     * retail + BOM) leave this null and keep the smoothed formula.
+     */
+    bomDrivenNeed?: number | null;
+    /**
+     * v2.5 (2026-06-09) — Bill: "look at past orders and gain amounts
+     * from last 3-4 orders". Soft cap on `suggestedQty` based on
+     * historical PO batch sizes. Prevents runaway recommendations for
+     * low-volume SKUs where 1× coverDays gives a wildly larger qty than
+     * we've ever actually ordered. Default cap: 2× the median of
+     * `historicalLineQtys`. Set to null to disable the cap.
+     */
+    historicalCapMultiple?: number | null;
 }
 
 export interface ProvenanceStep {
@@ -150,6 +170,20 @@ function fallbackIncrementForVendor(vendorName?: string): number | null {
     if (!vendorName) return null;
     if (/miles\s+filippelli/i.test(vendorName)) return 10;
     return null;
+}
+
+/**
+ * Median of an array of numbers. Returns 0 for empty input.
+ * Used by the historical cap (v2.5) to derive a soft ceiling from past
+ * PO batch sizes.
+ */
+function median(values: number[]): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+        ? (sorted[mid - 1] + sorted[mid]) / 2
+        : sorted[mid];
 }
 
 function effectiveOrderIncrement(input: RecommenderInput): { increment: number | null; source: "finale" | "vendor_fallback" | "none" } {
@@ -300,17 +334,41 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     }
 
     // ── Step 6: needed eaches (subtract supply NET of reservations) ──────
+    // v2.5 (2026-06-09): BOM-driven signal takes precedence when set.
+    // Bill's KMS101 case: smoothed `dailyRate × coverDays` under-shoots
+    // the actual 30d BOM-driven need for components that are consumed
+    // by FG rebuilds (not sold retail). When `bomDrivenNeed` is set,
+    // we use the FG-traceback total as the primary signal. The dailyRate
+    // path is preserved for BOW&SALE / direct-sale components.
     const targetUnits = dailyRate * coverDays;
     const supplyForOrder = effectiveStock + stockOnOrder - reservedQty;
-    const rawNeededEaches = Math.max(0, targetUnits - supplyForOrder);
-    trace.push({
-        step: "raw_qty",
-        detail: `${dailyRate.toFixed(2)}/d × ${coverDays}d = ${Math.round(targetUnits)} target ` +
-            `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
-            (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
-            ` = ${Math.round(rawNeededEaches)} needed`,
-        value: Math.round(rawNeededEaches),
-    });
+    const bomNeed = input.bomDrivenNeed != null && input.bomDrivenNeed > 0
+        ? input.bomDrivenNeed
+        : null;
+    const baseNeed = bomNeed != null
+        ? Math.max(bomNeed, targetUnits)  // BOM-driven OR the smoothed need, whichever is higher
+        : targetUnits;
+    const rawNeededEaches = Math.max(0, baseNeed - supplyForOrder);
+    if (bomNeed != null) {
+        trace.push({
+            step: "raw_qty",
+            detail: `BOM-driven need: ${Math.round(bomNeed)} (30d FG-traceback) ` +
+                `vs smoothed ${Math.round(targetUnits)} (${dailyRate.toFixed(2)}/d × ${coverDays}d) — using max of both, ` +
+                `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
+                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
+                ` = ${Math.round(rawNeededEaches)} needed`,
+            value: Math.round(rawNeededEaches),
+        });
+    } else {
+        trace.push({
+            step: "raw_qty",
+            detail: `${dailyRate.toFixed(2)}/d × ${coverDays}d = ${Math.round(targetUnits)} target ` +
+                `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
+                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
+                ` = ${Math.round(rawNeededEaches)} needed`,
+            value: Math.round(rawNeededEaches),
+        });
+    }
 
     // ── Step 7: pack rounding & 30-day supply minimum floor ───────────────
     const { increment: orderIncrementQty, source: orderIncrementSource } = effectiveOrderIncrement(input);
@@ -375,6 +433,32 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         }
         roundingMethod = round.method === "noop" ? null : round.method;
         roundingAlternatives = round.alternatives;
+    }
+
+    // ── Step 7.6 (v2.5, 2026-06-09): historical cap ─────────────────────
+    // Bill: "look at past orders and gain amounts from last 3-4 orders".
+    // Soft cap on `suggestedQty` based on historical PO batch sizes — the
+    // median of `historicalLineQtys × capMultiple` (default 2×). Prevents
+    // runaway recommendations for low-volume SKUs where 1× coverDays gives
+    // a wildly larger qty than we've ever actually ordered. The cap only
+    // applies when we have ≥3 historical line qtys (sparse history is
+    // unreliable; trust the formula). Pass `historicalCapMultiple: null`
+    // to disable.
+    if (
+        suggestedQty > 0 &&
+        input.historicalCapMultiple !== null &&
+        (input.historicalLineQtys ?? []).length >= 3
+    ) {
+        const cap = (input.historicalCapMultiple ?? 2) *
+            median(input.historicalLineQtys!);
+        if (suggestedQty > cap) {
+            trace.push({
+                step: "historical_cap",
+                detail: `Capped at ${input.historicalCapMultiple ?? 2}× median of last ${input.historicalLineQtys!.length} PO qtys (median ${Math.round(median(input.historicalLineQtys!))}) → ${Math.round(cap)}`,
+                value: Math.round(cap),
+            });
+            suggestedQty = Math.round(cap);
+        }
     }
 
     // ── Step 8: vendor MOQ — tri-state mode ───────────────────────────────
