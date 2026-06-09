@@ -257,17 +257,34 @@ def main():
     n_draft_po = sum(len(v) for v in by_vendor.values())
     n_covered = sum(1 for d in step4_data if d['in_snapshot'] and max(0, d['need30'] - d['on_hand'] - d['incoming']) == 0)
     n_silent = len(not_in_finale)
-    
+
     print(f'  Total SKUs requested:         {n_total}')
     print(f'  Slack thread reply (PO):     {n_with_po}  ({", ".join(has_po_skus) or "—"})')
     print(f'  TG DM (no PO, draft generated): {n_total - n_with_po - n_silent}')
     print(f'  Draft PO lines (consolidated): {n_draft_po} across {len(by_vendor)} vendors')
     print(f'  Items already covered:       {n_covered}  (no order needed)')
-    print(f'  Items not in Finale:          {n_silent}  (silent)')
+    print(f'  Items not in Finale/snapshot: {n_silent}  (silent)')
     print()
-    print(f'  Public Slack messages: 0  (silent per convention)')
+    print(f'  Public Slack messages:   0  (silent per convention)')
     print(f'  Telegram DMs to Bill:    1  (per-vendor draft POs)')
-    print(f'  Slack thread reactions:  1  (👀 on RAWMILLEDGNARBAR)')
+    print(f'  Slack 👀 reactions:       {n_with_po}  (one per PO found)')
+
+    # Per-SKU outcome table
+    print('\n  Per-SKU outcome:')
+    print(f'  {"SKU":<20} {"Vendor":<22} {"InSnap?":<8} {"OnHand":<7} {"Inc":<5} {"30d":<5} Branch')
+    print(f'  {"─"*20} {"─"*22} {"─"*8} {"─"*7} {"─"*5} {"─"*5} {"─" * 32}')
+    for d in step4_data:
+        in_snap = '✓' if d['in_snapshot'] else '·'
+        gap = max(0, d['need30'] - d['on_hand'] - d['incoming'])
+        if d['has_open_po']:
+            branch = '👀 Slack thread'
+        elif not d['in_snapshot']:
+            branch = 'silent (FG-trace-back dropped)'
+        elif gap == 0:
+            branch = '✅ already covered'
+        else:
+            branch = f'→ order {gap} units'
+        print(f'  {d["sku"]:<20} {d["vendor"][:22]:<22} {in_snap:<8} {str(d["on_hand"]):<7} {str(d["incoming"]):<5} {str(d["need30"]):<5} {branch}')
 
 
 if __name__ == '__main__':
