@@ -1473,7 +1473,7 @@ export default function PurchasingPanel() {
 
                 {/* v2 ordering filter — Order Now / 30 / 60 / 90 / All. Cumulative. Item-counted. */}
                 {([
-                    { k: "order_now" as const, label: "ORDER NOW", count: orderNowCount, active: "bg-red-500/20 text-red-300 border-red-500/40", title: "Items short within lead time (or already short with no PO coverage)" },
+                    { k: "order_now" as const, label: "TODAY", count: orderNowCount, active: "bg-red-500/20 text-red-300 border-red-500/40", title: "Items short within lead time (or already short with no PO coverage)" },
                     { k: "30" as const, label: "30", count: thirtyCount, active: "bg-amber-500/20 text-amber-300 border-amber-500/40", title: "Show items projected short within 30 days" },
                     { k: "60" as const, label: "60", count: sixtyCount, active: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40", title: "Show items projected short within 60 days" },
                     { k: "90" as const, label: "90", count: ninetyCount, active: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40", title: "Show items projected short within 90 days" },
@@ -2326,7 +2326,7 @@ export default function PurchasingPanel() {
                                                                                                 }`}
                                                                                                 title={`Place order by ${orderByDate} so it arrives before stockout (runway ${Math.round(item.runwayDays)}d − lead ${item.leadTimeDays}d = ${orderByDays}d remaining)`}
                                                                                             >
-                                                                                                {orderByDays <= 0 ? '⚠ ORDER NOW — window closed' : `order by ${orderByDate}`}
+                                                                                                {orderByDays <= 0 ? '⚠ TODAY — window closed' : `order by ${orderByDate}`}
                                                                                             </span>
                                                                                         ) : (
                                                                                             <span className="text-zinc-600">order timing unknown</span>

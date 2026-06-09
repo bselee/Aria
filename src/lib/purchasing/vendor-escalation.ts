@@ -8,9 +8,9 @@
  * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
  *
  * DESIGN:
- *   L1 (5-9 days): gentle Gmail draft — handled by po-followup-watcher.ts
- *   L2 (10-14 days): firmer Gmail draft mentioning reorder risk
- *   L3 (15+ days): Telegram alert to Bill with "consider alternate vendor"
+ *   L1 (2 days): polite Gmail draft — handled by po-followup-watcher.ts
+ *   L2 (5 days): firmer Gmail draft mentioning reorder risk
+ *   L3 (7+ days): Telegram alert to Bill with "consider alternate vendor"
  *
  *   Escalation tracking:
  *   - `followup_level` text column: 'l1' | 'l2' | 'l3' | null
@@ -35,9 +35,10 @@ import { createClient } from "@/lib/supabase";
 import { sendTelegramNotify, sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 
 /** Escalation windows (days since PO sent) */
-const L2_MIN_DAYS = 10;
-const L2_MAX_DAYS = 14;
-const L3_MIN_DAYS = 15;
+// L1 (2d) → L2 (5d) → L3 (7d) — tightens vendor response cycle
+const L2_MIN_DAYS = 5;
+const L2_MAX_DAYS = 6; // Narrow window so L2 fires once, then L3 takes over
+const L3_MIN_DAYS = 7;
 const L3_MAX_DAYS = 45; // Age out at 45 days — beyond that it's a manual decision
 
 /** Max escalations per run to avoid spam */
