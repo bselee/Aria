@@ -11,6 +11,11 @@ type ComponentRisk = {
   usedIn: string[];
   designations: string[];
   riskLevel: "CRITICAL" | "WARNING" | "WATCH" | "OK";
+  productName?: string | null;
+  /** Projected date by which a PO must be placed. ISO format YYYY-MM-DD. */
+  orderTriggerDate?: string | null;
+  /** Earliest FG shelf coverage days (from JIT projection). */
+  coverageDays?: number | null;
 };
 
 type Snapshot = {
@@ -99,14 +104,27 @@ export default function BuildRiskPanel() {
     return () => { supabase.removeChannel(sub); };
   }, []);
 
-  // Sort: most-needed first. Risk tier wins, then stockout days asc within tier
-  // (smaller = worse). null stockout days sink to bottom of their tier.
+  // Sort: most-needed first. Risk tier wins. Within a tier:
+  //   1. Components with imminent orderTriggerDate (today < past-due < future)
+  //   2. Stockout days (smaller = worse, null = infinity)
+  const todayISO = new Date().toISOString().slice(0, 10);
   const atRisk = snapshot
     ? Object.values(snapshot.components)
       .filter(c => c.riskLevel !== "OK")
       .sort((a, b) => {
         const tier = RISK[a.riskLevel].order - RISK[b.riskLevel].order;
         if (tier !== 0) return tier;
+        // JIT tiebreaker: earlier trigger date → higher priority.
+        // Past-due sorts before today. Missing trigger dates sink.
+        const aTrig = a.orderTriggerDate ?? null;
+        const bTrig = b.orderTriggerDate ?? null;
+        if (aTrig && bTrig) {
+          const ac = aTrig < todayISO ? -1 : aTrig === todayISO ? 0 : 1;
+          const bc = bTrig < todayISO ? -1 : bTrig === todayISO ? 0 : 1;
+          if (ac !== bc) return ac - bc;
+          if (aTrig !== bTrig) return aTrig.localeCompare(bTrig);
+        } else if (aTrig && !bTrig) return -1;
+        else if (!aTrig && bTrig) return 1;
         const aOut = a.stockoutDays ?? Number.POSITIVE_INFINITY;
         const bOut = b.stockoutDays ?? Number.POSITIVE_INFINITY;
         return aOut - bOut;
@@ -180,7 +198,11 @@ export default function BuildRiskPanel() {
                         {comp.riskLevel}
                       </span>
                       <span className="text-xs text-[var(--dash-l2)]">
-                        {comp.stockoutDays !== null ? `${comp.stockoutDays}d` : "no data"}
+                        {comp.coverageDays !== null && comp.coverageDays !== undefined
+                          ? `FG ${Math.round(comp.coverageDays)}d`
+                          : comp.stockoutDays !== null
+                            ? `${comp.stockoutDays}d`
+                            : "no data"}
                       </span>
                       {comp.incomingPOs.length > 0 && (
                         <span className="text-xs text-zinc-600">
@@ -193,6 +215,38 @@ export default function BuildRiskPanel() {
                       <div className="mt-0.5 text-xs text-[var(--dash-l3)]">
                         {comp.usedIn.slice(0, 4).join("  ·  ")}
                         {comp.usedIn.length > 4 && <span> +{comp.usedIn.length - 4}</span>}
+                      </div>
+                    )}
+                    {/* Line 3: JIT order trigger — crystal ball signal */}
+                    {comp.orderTriggerDate && (
+                      <div className="mt-0.5 flex items-center gap-1.5">
+                        <span className="text-[10px] text-[var(--dash-l3)]">Order by</span>
+                        {(() => {
+                          const trig = comp.orderTriggerDate!;
+                          if (trig < todayISO) {
+                            return (
+                              <span className="text-[11px] font-mono font-bold text-rose-400">
+                                {trig} 🔴 past due
+                              </span>
+                            );
+                          }
+                          if (trig === todayISO) {
+                            return (
+                              <span className="text-[11px] font-mono font-bold text-amber-400">
+                                {trig} TODAY
+                              </span>
+                            );
+                          }
+                          // Within 7 days → amber-yellow; otherwise neutral
+                          const triggerMs = new Date(trig + "T12:00:00-06:00").getTime();
+                          const daysAway = Math.round((triggerMs - Date.now()) / 86_400_000);
+                          const urgentStyle = daysAway <= 7 ? "text-amber-400 font-semibold" : "text-emerald-400";
+                          return (
+                            <span className={`text-[11px] font-mono ${urgentStyle}`}>
+                              {trig} <span className="text-[10px] text-[var(--dash-l3)]">({daysAway}d)</span>
+                            </span>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>
