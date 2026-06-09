@@ -28,7 +28,14 @@ import { resolveSkuAlias, expandSkuToken } from "../sku-aliases";
 const POLL_INTERVAL_MS = 60_000;
 
 /** Channel names to watch for purchasing requests (without # prefix). */
-const WATCH_CHANNEL_NAMES = ["purchase-orders", "purchasing"];
+/**
+ * Channels the bot watches for SKU requests.
+ * 2026-06-09: Bill confirmed — only #purchase-orders. #purchasing is the
+ * internal team channel ("nobody but us will post in #purchasing"), so
+ * the bot doesn't need to monitor it. External requests (Parker, MFG,
+ * etc.) go to #purchase-orders.
+ */
+const WATCH_CHANNEL_NAMES = ["purchase-orders"];
 
 /** Minimum message age to avoid reacting to messages still being typed. */
 const MIN_AGE_MS = 15_000;
