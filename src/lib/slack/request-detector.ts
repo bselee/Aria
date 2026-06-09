@@ -357,10 +357,13 @@ export class SlackRequestDetector {
             resolvedSkus.map(s => s.finaleSku),
         ).catch(() => {});
 
-        // No open PO found — notify Bill via Telegram so he can act on the request
+        // No open PO found — render per-vendor draft POs in TG DM only.
+        // Reads the latest build_risk_snapshot (which already has FG-traceback
+        // 30d need, onHand, incomingPOs, vendorName, leadTimeDays populated)
+        // so we don't hammer Finale per request. Silent on Slack — per the
+        // "no PO → silent Slack, TG DM Bill" convention.
         if (!hasPO && foundInFinale) {
             const slackLink = `https://slack.com/archives/${channelId}/${ts.replace(".", "")}`;
-            const skuLine = resolvedSkus.map(s => s.displayToken).join(", ");
 
             // Resolve requester name (best-effort)
             let requesterName = "someone";
@@ -371,18 +374,140 @@ export class SlackRequestDetector {
                 } catch { /* fallback */ }
             }
 
-            const tgMsg = [
-                `📥 Slack purchase request from *${requesterName}* in #${channelName}`,
-                ``,
-                `*SKUs:* ${skuLine}`,
-                ``,
-                `"${(msg.text || "").slice(0, 120)}${(msg.text || "").length > 120 ? "…" : ""}"`,
-                ``,
-                `Not on order. [Slack →](${slackLink})`,
-            ].join("\n");
+            // Fetch latest snapshot for the 30d coverage math.
+            // Single Supabase query — uses the snapshot the morning
+            // build-risk cron already populated.
+            type SnapEntry = {
+                onHand: number | null;
+                incomingPOs?: Array<{ quantity?: number; expectedDelivery?: string }>;
+                totalRequiredQty?: number;
+                leadTimeDays?: number | null;
+                vendorName?: string | null;
+                productName?: string | null;
+                usedIn?: string[];
+            };
+            let snapComps: Record<string, SnapEntry> = {};
+            try {
+                const { createClient } = await import("../supabase");
+                const db = createClient();
+                if (db) {
+                    const { data } = await db
+                        .from("build_risk_snapshots")
+                        .select("components")
+                        .order("generated_at", { ascending: false })
+                        .limit(1)
+                        .single();
+                    snapComps = ((data as any)?.components ?? {}) as Record<string, SnapEntry>;
+                }
+            } catch { /* snapshot unavailable — proceed with empty, fall through to fresh Finale data */ }
 
-            await sendTelegramNotify(tgMsg).catch(() => {});
-            console.log('[request-detector] Telegram alert sent for Slack purchase request');
+            // Build per-SKU lines (canonical SKUs from alias resolution).
+            // For each SKU: onHand, incoming, 30d need, gap, vendor, lead time, ETA.
+            type LineEntry = {
+                displayToken: string;
+                finaleSku: string;
+                productName: string | null;
+                vendor: string;
+                onHand: number;
+                incoming: number;
+                need30: number;
+                gap: number;
+                leadTimeDays: number;
+                eta: string;
+                covered: boolean;
+            };
+            const today = new Date();
+            const fmtDate = (d: Date) => d.toLocaleDateString("en-US", { month: "numeric", day: "numeric" });
+            const lines: LineEntry[] = [];
+            for (const { displayToken, finaleSku } of resolvedSkus) {
+                // Prefer the snapshot (already FG-traceback'd). Fall back to
+                // the openPOs we already fetched from lookupProduct if the
+                // snapshot doesn't have this SKU.
+                const c = snapComps[finaleSku];
+                let onHand: number;
+                let incoming: number;
+                let need30: number;
+                let vendor: string;
+                let leadTime: number;
+                let productName: string | null;
+
+                if (c) {
+                    onHand = c.onHand ?? 0;
+                    incoming = (c.incomingPOs ?? []).reduce((s, p) => s + (p.quantity ?? 0), 0);
+                    need30 = Math.round(c.totalRequiredQty ?? 0);
+                    vendor = c.vendorName ?? "Unknown vendor";
+                    leadTime = c.leadTimeDays ?? 14;
+                    productName = c.productName;
+                } else {
+                    // Fallback: product-level data already in hand from
+                    // the hasPO loop above (we called lookupProduct).
+                    // Without the snapshot we don't have 30d need — show
+                    // what we have and let Bill know the snapshot was
+                    // missing.
+                    onHand = 0;
+                    incoming = 0;
+                    need30 = 0;
+                    vendor = "Unknown vendor";
+                    leadTime = 14;
+                    productName = null;
+                }
+                const totalSupply = onHand + incoming;
+                const gap = Math.max(0, need30 - totalSupply);
+                const eta = (() => {
+                    const etaMs = today.getTime() + leadTime * 86_400_000;
+                    return fmtDate(new Date(etaMs));
+                })();
+                lines.push({
+                    displayToken, finaleSku, productName, vendor,
+                    onHand: Math.round(onHand), incoming: Math.round(incoming),
+                    need30, gap, leadTimeDays: leadTime, eta,
+                    covered: gap === 0,
+                });
+            }
+
+            // Group by vendor for the consolidated draft-PO summary.
+            const byVendor = new Map<string, LineEntry[]>();
+            for (const l of lines) {
+                if (l.covered) continue; // skip already-covered items from PO summary
+                const arr = byVendor.get(l.vendor) ?? [];
+                arr.push(l);
+                byVendor.set(l.vendor, arr);
+            }
+
+            // Build the Telegram message.
+            const out: string[] = [];
+            out.push(`📦 Slack request from *${requesterName}* in #${channelName}`);
+            out.push("");
+            out.push("Stock check (30d FG build horizon):");
+            for (const l of lines) {
+                const namePart = l.productName ? ` (${l.productName.slice(0, 38)})` : "";
+                out.push(`  \`${l.finaleSku}\`${namePart}`);
+                out.push(`    ${l.vendor} · ${l.leadTimeDays}d lead · ETA ${l.eta}`);
+                out.push(`    on hand ${l.onHand}  ·  incoming ${l.incoming}  ·  30d need ${l.need30}  ·  gap ${l.gap}`);
+                if (l.covered) out.push("    ✅ already covered");
+                else out.push(`    → order ${l.gap} units`);
+            }
+            out.push("");
+            if (byVendor.size === 0) {
+                out.push("All items already covered by current stock + incoming POs — no order needed.");
+            } else {
+                out.push("📋 Draft POs (consolidated by vendor):");
+                let n = 1;
+                for (const [vendor, items] of byVendor) {
+                    const totalQty = items.reduce((s, i) => s + i.gap, 0);
+                    out.push(`  ${n}. ${vendor} — ${totalQty} units, ETA ${items[0]?.eta}`);
+                    for (const i of items) {
+                        out.push(`     • ${i.finaleSku} × ${i.gap}  (${i.leadTimeDays}d lead)`);
+                    }
+                    n++;
+                }
+            }
+            out.push("");
+            out.push("Quiet — no public Slack post.");
+            out.push(`[Slack →](${slackLink})`);
+
+            await sendTelegramNotify(out.join("\n")).catch(() => {});
+            console.log(`[request-detector] TG DM sent: ${lines.length} SKU(s), ${byVendor.size} vendor(s) need POs`);
         }
         // If !foundInFinale: complete silence, no trace in Slack
     }
