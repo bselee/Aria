@@ -598,8 +598,14 @@ export class SlackRequestDetector {
         pos: any[],
         productName?: string,
     ): Promise<void> {
-        const pieces: string[] = [];
+        // 2026-06-09: Reformatted per Bill's spec — "sounds like purchase
+        // sensei bill, not Ai generated". One line per PO. BOLD via Slack
+        // mrkdwn (`*text*`). Format: `*SKU - <url|PO#XXXXXX> - ETA (date)*`.
+        // Cap at 3 POs to keep the thread tight; if more, the first 3 are
+        // enough to confirm "we have orders" — a separate escalation can
+        // handle the rare multi-PO SKU.
         const maxPOs = Math.min(pos.length, 3);
+        const lines: string[] = [];
 
         for (let i = 0; i < maxPOs; i++) {
             const po = pos[i];
@@ -611,11 +617,10 @@ export class SlackRequestDetector {
                   })
                 : "TBD";
             const url = buildFinalePOUrl(po.orderId);
-            const qty = po.quantityOnOrder ?? "?";
-            pieces.push(`<${url}|${po.orderId}> (ETA ${eta}, ${qty} units)`);
+            lines.push(`*${sku} - <${url}|${po.orderId}> - ETA (${eta})*`);
         }
 
-        const text = `${sku} → ${pieces.join(" + ")}`;
+        const text = lines.join("\n");
 
         try {
             await this.reader.chat.postMessage({
