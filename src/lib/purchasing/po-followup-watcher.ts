@@ -26,9 +26,12 @@ import { transitionLifecycleState } from "./po-lifecycle";
 
 const DROPSHIP_PATTERN = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i;
 
-// Forward-looking window: only pokes POs sent 5–9 days ago. Anything older
-// stays untouched — review manually.
-const WINDOW_MIN_DAYS = 5;
+// Forward-looking window: only pokes POs sent 2–9 days ago. Anything older
+// stays untouched — L2/L3 escalation picks those up.
+// L1: 2 days — polite acknowledgment request
+// L2: 5 days — firmer, mentioning reorder risk
+// L3: 7+ days — escalate, consider alternate vendor
+const WINDOW_MIN_DAYS = 2;
 const WINDOW_MAX_DAYS = 9;
 
 export interface FollowupOutcome {

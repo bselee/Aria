@@ -232,7 +232,7 @@ defineJob({
 });
 
 // Politely follow up with vendors who haven't acknowledged a sent PO.
-// L1 at sent+5d → L2 at L1+7d → mark NONCOMM at L2+7d. Dropships excluded.
+// L1 at sent+2d → L2 at sent+5d → L3 at sent+7d. Dropships excluded.
 defineJob({
     name: "po-followup-watcher",
     schedule: "45 7 * * 1-5",
@@ -271,9 +271,9 @@ defineJob({
 // Refresh carrier status for every active shipment.
 defineJob({
     name: "carrier-poll",
-    schedule: "0 6 * * *",
+    schedule: "0 6,14 * * *", // 6am + 2pm daily — catches afternoon deliveries
     onFail: "log",
-    description: "6 AM daily: refresh live carrier status for active shipments.",
+    description: "Refresh live carrier status for active shipments (2x/day).",
     handler: async () => {
         const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
         const outcomes = await pollActiveShipments();
@@ -298,17 +298,17 @@ defineJob({
 
 defineJob({
     name: "build-completion-watcher",
-    schedule: "*/30 * * * *",
+    schedule: "*/30 7-18 * * 1-5", // every 30m, 7am–6pm weekdays — build team hours only
     onFail: "log",
-    description: "Poll Finale for completed production builds (every 30m).",
+    description: "Poll Finale for completed production builds (every 30m during business hours).",
     handler: async () => { await ops()?.pollBuildCompletions(); },
 });
 
 defineJob({
     name: "po-receiving-watcher",
-    schedule: "*/30 * * * *",
+    schedule: "*/30 7-18 * * 1-5", // every 30m, 7am–6pm weekdays — warehouse hours only
     onFail: "log",
-    description: "Poll Finale for received POs (every 30m).",
+    description: "Poll Finale for received POs (every 30m during business hours).",
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
 
@@ -563,11 +563,48 @@ defineJob({
     handler: async () => { await ops()?.runIssueOrchestrator(); },
 });
 
+// ── DRAFTER AGENT: Autonomous PO draft creation ──────────────────────
+// HERMIA(2026-06-09): Creates draft POs in Finale for vetted vendors whose
+// shortages align with lead times and all commit guards pass. Runs BEFORE
+// the autonomy-scan (which picks up the created drafts and sends Telegram
+// review notifications). Conservative trust gates: vendor must be on the
+// TRUSTED_VENDOR_ALIASES whitelist AND have autonomy_level >= 1 in
+// vendor_profiles (human-vetted). Drafts only — never auto-sends.
+defineJob({
+    name: "drafter-scan",
+    schedule: "0 7 * * 1-5", // 7 AM weekdays — morning batch before arrival
+    onFail: "log",
+    description: "Morning PO draft creation for vetted vendors. Runs once daily before arrival to present actionable drafts for review.",
+    handler: async () => {
+        const { runDrafterAgent, formatDrafterTelegramSummary } = await import("../../lib/purchasing/drafter-agent");
+        const result = await runDrafterAgent();
+
+        // Notify on Telegram if any drafts were created (or errors occurred)
+        if (result.created > 0 || result.errors > 0) {
+            const o = ops();
+            if (o?.bot) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                if (chatId) {
+                    try {
+                        await o.bot.telegram.sendMessage(
+                            chatId,
+                            formatDrafterTelegramSummary(result),
+                        );
+                    } catch (err: any) {
+                        console.warn(`[drafter-scan] Telegram notification failed: ${err.message}`);
+                    }
+                }
+            }
+        }
+    },
+    budget: { durationMs: 120_000 }, // 2min — Finale intelligence fetch is slow
+});
+
 defineJob({
     name: "autonomy-scan",
-    schedule: "*/10 * * * *", // every 10 minutes
+    schedule: "30 7,13 * * 1-5", // 7:30am + 1:30pm weekdays — right after drafter + afternoon manual drafts
     onFail: "log",
-    description: "Scan for draft POs and process Level 1 & Level 2 vendor autonomy actions.",
+    description: "Process draft POs for Level 1 & 2 autonomy (2x/day weekdays).",
     handler: async () => {
         const o = ops();
         if (!o || !o.bot) return;
