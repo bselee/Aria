@@ -304,6 +304,15 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
             const profile = await gmail.users.getProfile({ userId: "me" });
             const myEmail = profile.data.emailAddress;
 
+            // DECISION(2026-06-10): Per-batch thread dedup guard.
+            // When a vendor sends two emails in the same thread close together,
+            // both land in the queue. After replying to the first, the Gmail API
+            // hasn't indexed our sent message yet, so getThreadCommunicationSummary()
+            // still shows buildasoilRepliedAfterVendor=false for the second row.
+            // Fix: track threadIds we've already auto-replied to in THIS batch and
+            // suppress any further replies for the same thread.
+            const repliedThreadIds = new Set<string>();
+
             // Fetch unprocessed rows
             const { data: messages, error } = await supabase
                 .from('email_inbox_queue')
@@ -479,7 +488,12 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                             : null);
                     let replied = false;
                     const isActiveConversationThread = activeThreadSummary?.buildasoilRepliedAfterVendor === true;
+                    // DECISION(2026-06-10): Check if we already auto-replied to this thread
+                    // in the current batch. Closes the race where Gmail API hasn't indexed
+                    // our just-sent reply yet, preventing double "Thanks!" pings.
+                    const alreadyRepliedThisBatch = repliedThreadIds.has(threadId);
                     const suppressAutoReply = isMarketplaceStatus
+                        || alreadyRepliedThisBatch
                         || (isPurchaseThread && (threadSummary?.vendorReplyCount || 0) > 0)
                         || (isPurchaseThread && !!threadSummary?.buildasoilRepliedAfterVendor)
                         // DECISION(2026-06-03): Don't send a "Thanks!" on top of our own
@@ -502,6 +516,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                             });
                             console.log(`     ✅ Sent reply: "${replyBody}"`);
                             replied = true;
+                            repliedThreadIds.add(threadId);
                             await recordSimpleAutoReply({
                                 gmailMessageId,
                                 threadId,
@@ -512,6 +527,8 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         } catch (replyErr: any) {
                             console.error(`     ❌ Failed to send reply:`, replyErr.message);
                         }
+                    } else if (alreadyRepliedThisBatch) {
+                        console.log(`     -> Suppressing auto-reply (already replied to thread ${threadId} this batch).`);
                     } else if (suppressAutoReply) {
                         console.log(`     -> Suppressing auto-reply for marketplace/purchase thread.`);
                     } else if (isNoRep) {
