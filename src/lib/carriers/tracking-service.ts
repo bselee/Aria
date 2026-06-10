@@ -90,7 +90,7 @@ const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
     [/\boak\s+harbor\s+freight\s+lines\b/i, "Oak Harbor Freight Lines"],
     [/\boak\s+harbor\b/i, "Oak Harbor Freight Lines"],
     [/\baaa\s+cooper\s+transport\b/i, "AAA Cooper"],
-    [/\baaa\s+cooper\b/i, "AAA Cooper"],
+    [/\baaa\s+co(p|o)per\b/i, "AAA Cooper"],  // tolerates typo "Copper" → "Cooper"
 ];
 
 /**
@@ -126,6 +126,11 @@ const LTL_DIRECT_LINKS: Record<string, string> = {
     "ArcBest": "https://arcb.com/tools/tracking.html?pro={PRO}",
     "Oak Harbor Freight Lines": "https://www.oakh.com/tracking?pro={PRO}",
     "AAA Cooper": "https://www.aaacooper.com/pwb/Transit/ProTrackResults.aspx?ProNum={PRO}&AllAccounts=true",
+    // Parcel carriers — same map, used when carrier name is passed via "Carrier:::Number" encoding
+    "UPS": "https://www.ups.com/track?tracknum={PRO}",
+    "FedEx": "https://www.fedex.com/fedextrack/?tracknumbers={PRO}",
+    "USPS": "https://tools.usps.com/go/TrackConfirmAction?tLabels={PRO}",
+    "DHL": "https://www.dhl.com/us-en/home/tracking.html?tracking-id={PRO}",
 };
 
 // ──────────────────────────────────────────────────

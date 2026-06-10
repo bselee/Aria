@@ -10,6 +10,7 @@ import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import {
     loadActiveReservations,
+    loadAllVendorReorderPolicies,
     loadCalibrationStats,
     loadVendorMOQs,
     loadVendorReorderPolicies,
@@ -2001,6 +2002,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // fine; the next scan picks up the calendar lift.
         const forwardDemand = readForwardDemand(30);
 
+        // Pre-load vendor reorder policies once (small table, <50 rows) so the
+        // per-component loop can read in O(1). Fixes the bug where BOM components
+        // from long-lead-time vendors (e.g., Colorful Packaging — 60d lead, 180d
+        // cover target) were being suggested with hardcoded 60d cover regardless
+        // of the vendor_reorder_policies configuration.
+        const bomVendorPolicies = await loadAllVendorReorderPolicies();
+
         // ── Step 5: Resolve each component (stock, vendor, lead time, urgency) ──
         const { leadTimeService } = await import('@/lib/builds/lead-time-service');
         const items: PurchasingItem[] = [];
@@ -2059,6 +2067,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     if (EXCLUDED_VENDOR_PATTERN.test(groupName)) continue;
 
+                    // ── VENDOR POLICY LOOKUP (BOM pipeline) ───────────────────
+                    // Pre-loaded once before the loop; zero-cost per component.
+                    // Drives lead-time override (e.g., Colorful Packaging 60d) and
+                    // cover target (e.g., Colorful 4-6 month supply = 180d).
+                    const bomPolicy = bomVendorPolicies.get(partyId) ?? null;
+
                     const stockOnHand = compActivity.stockOnHand ?? 0;
                     const rawStockOnOrder = compActivity.openPOs.reduce(
                         (sum, po) => sum + (po.quantity || 0),
@@ -2078,9 +2092,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const priorStockouts = stockoutCounts.get(compSku)?.eventCount ?? 0;
                     const stockoutMultiplier = leadTimeMultiplierFromStockouts(priorStockouts);
                     const leadTimeDays = Math.ceil(baseLeadTimeDays * stockoutMultiplier);
-                    const leadTimeProvenance = priorStockouts > 0
-                        ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
-                        : lt.label;
+                    // Policy override: take explicit Will-set lead time over Finale's
+                    // lead-time service. Stockout multiplier NOT applied to overrides —
+                    // the override is the ground-truth build/ship time Bill knows.
+                    const effectiveLeadTimeDays = bomPolicy?.leadTimeOverrideDays ?? leadTimeDays;
+                    const leadTimeProvenance = bomPolicy?.leadTimeOverrideDays
+                        ? `${effectiveLeadTimeDays}d vendor policy override (was ${leadTimeDays}d ${lt.label})`
+                        : priorStockouts > 0
+                            ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
+                            : lt.label;
 
                     // DECISION(2026-05-12): Receipt velocity is the primary signal.
                     // Captures seasonality, builds, contracts, wholesale, growth —
@@ -2122,7 +2142,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     let urgency = classifyBomUrgency({
                         adjustedRunwayDays,
-                        leadTimeDays,
+                        leadTimeDays: effectiveLeadTimeDays,
                         medianPOGapDays,
                     });
                     if (forwardShortfall > 0) {
@@ -2135,21 +2155,21 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         // for a year of builds shouldn't override "we have 3 years of stock."
                         // Rule: force critical ONLY if runway is genuinely short (< leadTime × 3),
                         // so items with plenty of normal-velocity stock stay in planning buckets.
-                        const runwayCap = leadTimeDays * 3;
-                        if (buildDays < leadTimeDays && adjustedRunwayDays < runwayCap) urgency = 'critical';
+                        const runwayCap = effectiveLeadTimeDays * 3;
+                        if (buildDays < effectiveLeadTimeDays && adjustedRunwayDays < runwayCap) urgency = 'critical';
                         else if (forwardShortfall > 0 && (urgency === 'ok' || urgency === 'watch')) urgency = 'warning';
                     }
                     const projectedNextOrderDate = projectNextOrderDate({
                         stockOnHand,
                         stockOnOrder,
                         dailyBurn,
-                        leadTimeDays,
+                        leadTimeDays: effectiveLeadTimeDays,
                     });
 
                     // Record stockout event if adjusted runway dropped below lead time
                     // (this is the "we're already late ordering" condition). Idempotent
                     // per SKU per day. Fire-and-forget — don't block the scan.
-                    if (adjustedRunwayDays < leadTimeDays && dailyBurn > 0) {
+                    if (adjustedRunwayDays < effectiveLeadTimeDays && dailyBurn > 0) {
                         void recordStockoutEvent({
                             productId: compSku,
                             vendorPartyId: partyId || null,
@@ -2157,7 +2177,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             stockOnOrder,
                             dailyBurn,
                             runwayDays: adjustedRunwayDays,
-                            leadTimeDays,
+                            leadTimeDays: effectiveLeadTimeDays,
                         });
                     }
 
@@ -2176,7 +2196,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         };
                     });
 
-                    const coverDays = 60;
+                    // ── COVER DAYS: vendor policy override or default 60 ────────
+                    // Default 60d covers most domestic vendors (lead + 30-45d safety).
+                    // Long-lead-time overseas vendors (Colorful Packaging — 60d build/ship,
+                    // target 4-6 month supply) override via vendor_reorder_policies.target_cover_days.
+                    const coverDays = bomPolicy?.targetCoverDays ?? 60;
                     const baseNeed = Math.max(
                         0,
                         Math.ceil(dailyBurn * coverDays - stockOnHand)
@@ -2240,7 +2264,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         dailyRateSource: chosen.source === 'none' ? undefined : chosen.source,
                         runwayDays: Math.round(runwayDays * 10) / 10,
                         adjustedRunwayDays: Math.round(adjustedRunwayDays * 10) / 10,
-                        leadTimeDays,
+                        leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance,
                         openPOs: compActivity.openPOs,
                         urgency,
