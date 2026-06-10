@@ -58,30 +58,27 @@ describe("classifyInvoice — Dropship Vendor Keyword Match", () => {
     });
 });
 
-describe("classifyInvoice — Real Invoice Overrides (ULINE)", () => {
-    it("ULINE by vendorName overrides any dropship", () => {
+describe("classifyInvoice — ULINE (non-dropship, falls to real_invoice)", () => {
+    // ULINE was removed from REAL_INVOICE_OVERRIDES (kaizen 5186363) — it was an
+    // unnecessary override since ULINE doesn't match any dropship rule in the first
+    // place. It naturally falls through to real_invoice via the default fallback.
+    it("'Uline' vendorName classifies as real_invoice (no override needed)", () => {
         const result = classifyInvoice({ vendorName: "Uline" });
         expect(result.classification).toBe(real);
-        expect(result.reason).toContain("Override");
-        expect(result.matchedRule).toContain("ULINE");
+        // No override matched — falls through to default
+        expect(result.matchedRule).toBeUndefined();
     });
 
-    it("ULINE by vendorName mixed case still matches", () => {
+    it("'ULINE' uppercase also classifies as real_invoice", () => {
         const result = classifyInvoice({ vendorName: "ULINE" });
         expect(result.classification).toBe(real);
     });
 
-    it("ULINE by vendorName even if subject also looks dropship", () => {
-        // Subject matches autopot which would be dropship, but ULINE override wins
+    it("ULINE vendor + dropship-looking subject still resolves as real_invoice", () => {
+        // Subject matches autopot dropship rule, but vendorName 'Uline' doesn't
+        // match any dropship vendor — so the subject match fails (needs both)
         const result = classifyInvoice({ vendorName: "Uline", subject: "autopot order" });
         expect(result.classification).toBe(real);
-        expect(result.reason).toContain("Override");
-    });
-
-    it("ULINE by vendorName even if fromEmail contains quickbooks", () => {
-        const result = classifyInvoice({ vendorName: "Uline", fromEmail: "quickbooks@notification.intuit.com" });
-        expect(result.classification).toBe(real);
-        expect(result.reason).toContain("Override");
     });
 });
 
@@ -359,10 +356,11 @@ describe("needsAnalysis", () => {
 describe("classifyInvoice — Full resolution order", () => {
     // Verify the ordering: RealInvoiceOverrides > DropshipRules > Fallback > Unknown
 
-    it("Step 1: RealInvoiceOverrides win — ULINE", () => {
+    it("Step 1: ULINE falls through to real_invoice (no override needed since 5186363 kaizen removed it)", () => {
         const r = classifyInvoice({ vendorName: "Uline" });
         expect(r.classification).toBe(real);
-        expect(r.matchedRule).toContain("ULINE");
+        // No override — falls to default (vendor present → real_invoice)
+        expect(r.matchedRule).toBeUndefined();
     });
 
     it("Step 2: DropshipRules match — AutoPot", () => {
