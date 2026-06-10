@@ -269,8 +269,8 @@ export default function APHealthPanel() {
     // ── Status config ──────────────────────────────────────────────────────────
     const statusCfg: Record<string, { icon: any; color: string; bg: string; label: string }> = {
         healthy: { icon: CheckCircle, color: "text-emerald-400", bg: "bg-emerald-500/10 border-emerald-500/20", label: "Healthy" },
-        degraded: { icon: AlertTriangle, color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20", label: "Degraded" },
-        critical: { icon: XCircle, color: "text-rose-400", bg: "bg-rose-500/10 border-rose-500/20", label: "Critical" },
+        degraded: { icon: AlertTriangle, color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20", label: "Heads Up" },
+        critical: { icon: XCircle, color: "text-rose-400", bg: "bg-rose-500/10 border-rose-500/20", label: "Needs Fix" },
     };
     const sc = data ? statusCfg[data.status] : statusCfg.healthy;
     const StatusIcon = sc.icon;
@@ -475,7 +475,7 @@ export default function APHealthPanel() {
                             {data.stuck > 0 && data.recentStuck && data.recentStuck.length > 0 && (
                                 <div className="space-y-1.5">
                                     <div className="flex items-center justify-between">
-                                        <div className="text-xs font-semibold text-rose-400">🚨 Stuck Invoices</div>
+                                        <div className="text-xs font-semibold text-amber-400">Stuck Invoices</div>
                                         <div className="flex gap-2">
                                             <ActionButton
                                                 label="Clean Zombies"

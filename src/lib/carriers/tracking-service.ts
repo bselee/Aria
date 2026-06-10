@@ -54,6 +54,12 @@ export const TRACKING_PATTERNS = {
     // DECISION(2026-05-21): Refined oakharbor regex prefix to be strictly mandatory, preventing
     // raw 8-12 digit numbers from matching as Oak Harbor tracking numbers. Added support for OAKH abbreviation.
     oakharbor: /\b(?:Oak\s+Harbor(?:\s+Freight(?:\s+Lines)?)?|OAKH)(?:[\s\-\#\:]*(?:PRO|BOL)?[\s\-\#\:]*)+(\d{8,12})\b/i,
+    // LTL PRO with account suffix: "71473626-1" (PRO digits-digits)
+    // DECISION(2026-06-09): Catches vendor emails like "AAA Cooper-71473626-1"
+    // where the tracking number is digits-digits format (PRO + account/shipto code).
+    // Requires the number to be preceded by a carrier name, "tracking", "PRO", or "pallet"
+    // context to avoid false positives on random hyphenated numbers.
+    ltlPro: /(?<=\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*[-–:]\s*|tracking\s*[#:]?\s*|PRO\s*[#\-]?\s*|pallet\w*\s+|shipped?\s+(?:via|by)\s+))(\d{6,15}-\d{1,3})\b/i,
 };
 
 // ──────────────────────────────────────────────────
@@ -83,6 +89,8 @@ const LTL_CARRIER_KEYWORDS: [RegExp, string][] = [
     [/\bsaia\b/i, "Saia"],
     [/\boak\s+harbor\s+freight\s+lines\b/i, "Oak Harbor Freight Lines"],
     [/\boak\s+harbor\b/i, "Oak Harbor Freight Lines"],
+    [/\baaa\s+cooper\s+transport\b/i, "AAA Cooper"],
+    [/\baaa\s+cooper\b/i, "AAA Cooper"],
 ];
 
 /**
@@ -117,6 +125,7 @@ const LTL_DIRECT_LINKS: Record<string, string> = {
     "ABF Freight": "https://arcb.com/tools/tracking.html?pro={PRO}",
     "ArcBest": "https://arcb.com/tools/tracking.html?pro={PRO}",
     "Oak Harbor Freight Lines": "https://www.oakh.com/tracking?pro={PRO}",
+    "AAA Cooper": "https://www.aaacooper.com/pwb/Transit/ProTrackResults.aspx?ProNum={PRO}&AllAccounts=true",
 };
 
 // ──────────────────────────────────────────────────

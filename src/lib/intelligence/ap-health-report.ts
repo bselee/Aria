@@ -306,10 +306,10 @@ export async function generateAPHealthReport(): Promise<string> {
         lines.push(`📊 Rate: **${pct}%**`);
 
         if (pct < 50 && matchStats.total >= 3) {
-            lines.push(`🚨 Low match rate — investigate!`);
+            lines.push(`⚠️ Low match rate — worth a look.`);
             actionRequired = true;
         } else if (pct < 75 && matchStats.total >= 3) {
-            lines.push(`⚠️ Below target (>75% expected).`);
+            lines.push(`📋 Below target (>75% expected).`);
             needsAttention = true;
         }
     } else if (matchStats && matchStats.total === 0) {
@@ -322,7 +322,7 @@ export async function generateAPHealthReport(): Promise<string> {
     if (stuck.length === 0) {
         lines.push("✅ No invoices stuck in ERROR_FORWARDING or ERROR_PROCESSING.");
     } else {
-        lines.push(`🚨 **${stuck.length}** invoice(s) stuck >24h:`);
+        lines.push(`⚠️ **${stuck.length}** invoice(s) stuck >24h:`);
         for (const s of stuck.slice(0, 5)) {
             const emoji = s.status === "ERROR_FORWARDING" ? "🚫" : "⚠️";
             lines.push(`${emoji} ${s.subject.slice(0, 50)} — ${s.status} (${s.ageHours}h)`);
@@ -368,11 +368,11 @@ export async function generateAPHealthReport(): Promise<string> {
     // ── 6. Overall Status ───────────────────────────────────────────────
     lines.push("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     if (actionRequired) {
-        lines.push("🚨 *Action Required* — Check the items above.");
+        lines.push("⚠️ *Needs Attention* — check the items above.");
     } else if (needsAttention) {
-        lines.push("⚠️ *Needs Attention* — Monitor flagged areas.");
+        lines.push("📋 *Heads Up* — minor items flagged.");
     } else {
-        lines.push("✅ *All Clear* — AP pipeline is healthy.");
+        lines.push("✅ *All Clear* — pipeline is healthy.");
     }
 
     return lines.join("\n");
