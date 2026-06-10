@@ -163,10 +163,86 @@ defineJob({
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
             const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
-            const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
             const report = await generateAPHealthReport();
-            await sendCriticalTelegramNotify(report);
-            console.log("[ap-health-report] Morning report sent via sendCriticalTelegramNotify.");
+            await sendTelegramNotify(report);
+            console.log("[ap-health-report] Morning report sent.");
+    },
+});
+
+// HERMIA(2026-06-10): Post-run follow-up — quick pipeline check at noon and 4 PM.
+// Only sends if there's actual activity or unresolved issues. Keeps Bill in the
+// loop without burning tokens on empty reports.
+defineJob({
+    name: "ap-follow-up",
+    schedule: "0 12,16 * * 1-5",
+    onFail: "log",
+    description: "Midday/afternoon AP pipeline follow-up (Mon-Fri 12 PM & 4 PM).",
+    handler: async () => {
+        const { createClient } = await import("@/lib/supabase");
+        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+
+        const db = createClient();
+        if (!db) return;
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const todayIso = today.toISOString();
+
+        // Count today's activity
+        const { data: rows } = await db
+            .from("ap_activity_log")
+            .select("intent, metadata")
+            .gte("created_at", todayIso);
+
+        if (!rows || rows.length === 0) {
+            console.log("[ap-follow-up] No AP activity today — skipping.");
+            return;
+        }
+
+        let matched = 0;
+        let total = 0;
+        const counts: Record<string, number> = {};
+        for (const r of rows as any[]) {
+            const intent = r.intent || "UNKNOWN";
+            counts[intent] = (counts[intent] || 0) + 1;
+            if (intent === "BILL_FORWARD" || intent === "INVOICE") {
+                total++;
+                if (r.metadata?.matched === true || r.metadata?.matched === "true") matched++;
+            }
+        }
+
+        // Check stuck count
+        const twoHoursAgo = new Date(Date.now() - 2 * 3600000).toISOString();
+        const { data: stuckRows } = await db
+            .from("ap_inbox_queue")
+            .select("message_id, extracted_json")
+            .in("status", ["ERROR_FORWARDING", "ERROR_PROCESSING"])
+            .lt("updated_at", twoHoursAgo)
+            .limit(20);
+
+        let stuck = 0;
+        for (const r of (stuckRows || []) as any[]) {
+            const ej = r.extracted_json;
+            if (ej && typeof ej === "object" && (ej.from || ej.subject || ej.vendor_name)) stuck++;
+        }
+
+        const pct = total > 0 ? Math.round((matched / total) * 100) : 100;
+        const status = stuck === 0 ? "✅" : stuck < 5 ? "⚠️" : "🔴";
+
+        const lines: string[] = [];
+        lines.push(`${status} *AP Check-in*`);
+        lines.push(`${total} invoices processed, ${matched} matched (${pct}%)`);
+        if (stuck > 0) lines.push(`${stuck} stuck >2h`);
+
+        // Show top intents
+        const topIntents = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+        if (topIntents.length > 0) {
+            lines.push(topIntents.map(([k, v]) => `${k}: ${v}`).join(" · "));
+        }
+
+        await sendTelegramNotify(lines.join("\n"));
+        console.log(`[ap-follow-up] Sent: ${total} processed, ${stuck} stuck.`);
     },
 });
 
@@ -257,13 +333,43 @@ defineJob({
     name: "po-stuck-detector",
     schedule: "50 7 * * 1-5",
     onFail: "log",
-    description: "7:50 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc).",
+    description: "7:50 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc). Also drafts vendor follow-up emails for overdue POs (po-overdue-followup).",
     handler: async () => {
         const { detectStuckPOs, summariseStuck } = await import("@/lib/purchasing/po-stuck-detector");
         const rows = await detectStuckPOs();
         const summary = summariseStuck(rows);
         if (summary.total > 0) {
             console.log(`[po-stuck-detector] ${summary.total} stuck:`, summary.byStage);
+        }
+
+        // HERMIA(2026-06-09): After detection, run the proactive vendor follow-up.
+        // Finds POs past expected receive date with 0 items received, searches
+        // Gmail for vendor replies, and drafts polite "where's my stuff?" emails.
+        // Telegram summary sent to Bill with status per PO.
+        const { runOverdueFollowup } = await import("@/lib/purchasing/po-overdue-followup");
+        try {
+            await runOverdueFollowup();
+        } catch (err: any) {
+            console.warn(`[po-stuck-detector] overdue follow-up failed: ${err.message}`);
+        }
+    },
+});
+
+// Scan Gmail for vendor shipping confirmations — extract tracking + POs → shipments table.
+// HERMIA(2026-06-09): Closes the "manual tracking insert" gap. Vendor emails a tracking
+// number, system auto-detects carrier (including LTL like AAA Cooper), builds tracking URL,
+// and writes to shipments table so carrier-poll picks it up for status refresh.
+defineJob({
+    name: "email-tracking-ingest",
+    schedule: "15 */2 * * *", // every 2 hours, offset by 15 min from ap-polling
+    onFail: "log",
+    description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments.",
+    handler: async () => {
+        const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
+        try {
+            await runEmailTrackingIngest();
+        } catch (err: any) {
+            console.warn(`[email-tracking-ingest] failed: ${err.message}`);
         }
     },
 });

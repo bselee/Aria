@@ -207,6 +207,29 @@ function extractSKUs(text: string): string[] {
     return Array.from(unique);
 }
 
+/**
+ * Extract PO number references from text.
+ * Matches "PO 124833", "PO-124833", "order 124833", etc.
+ * Returns cleaned numeric order IDs.
+ *
+ * 2026-06-09: Added so staff can ask about a PO by number (not SKU) and
+ * get a threaded reply with status. Branson asking "when do we get PO 124833"
+ * used to go unanswered by the detector (only handles SKU tokens).
+ */
+function extractPONumbers(text: string): string[] {
+    const cleaned = text
+        .replace(/\bPO[-\s]*/gi, "PO ")
+        .replace(/\border[-\s]*/gi, "order ");
+    const matches = cleaned.match(/(?:PO|order)\s*\D*(\d{5,7})\b/gi);
+    if (!matches) return [];
+    const seen = new Set<string>();
+    for (const m of matches) {
+        const num = m.replace(/\D/g, "");
+        if (num.length >= 5) seen.add(num);
+    }
+    return Array.from(seen);
+}
+
 // ── Detector ──────────────────────────────────────────────────────────────
 
 export class SlackRequestDetector {
@@ -433,9 +456,35 @@ export class SlackRequestDetector {
         if (userId && this.ownerUserId && userId === this.ownerUserId) {
             if (!looksLikeDataRequest(text)) return;
             console.log(`[slack-detector] Processing Bill's message (data request): "${text.slice(0, 80)}"`);
-        }
+            }
 
-        // Extract SKUs
+            // ── PO number reference branch (BEFORE SKU extraction) ────────────
+            // When someone asks about a specific PO number, look it up directly.
+            // HERMIA(2026-06-09): Branson asked "when do we expect PO 124833?"
+            // and the detector silently discarded it (no SKU tokens). Now:
+            // extract PO numbers → getOrderDetails → thread reply.
+            const poNumbers = extractPONumbers(text);
+            if (poNumbers.length > 0) {
+                console.log(`[slack-detector] #${channelName}: PO number(s) detected: ${poNumbers.join(", ")}`);
+                for (const orderId of poNumbers) {
+                    try {
+                        const po = await (this.finale as any).getOrderDetails?.(orderId);
+                        if (po && po.orderId) {
+                            await this.addEyesReaction(channelId, ts).catch(() => {});
+                            await this.postSinglePOInfo(channelId, ts, po);
+                            await this.replaceWithAck(channelId, ts).catch(() => {});
+                        }
+                    } catch {
+                        // PO not found or getOrderDetails unavailable — silent
+                    }
+                }
+                await this.recordRequest(
+                    channelName, channelId, ts, userId, text, [],
+                ).catch(() => {});
+                return; // PO branch handled, don't fall through to SKU branch
+            }
+
+            // Extract SKUs
         const rawTokens = extractSKUs(text);
         if (rawTokens.length === 0) return;
 
@@ -774,9 +823,87 @@ export class SlackRequestDetector {
         } catch (err: any) {
             console.warn(
                 `[slack-detector] Thread reply failed: ${err.message}`,
-            );
-        }
-    }
+                );
+                }
+                }
+
+                /**
+                * Post a threaded reply when a PO NUMBER (not SKU) is referenced.
+                * Invoice-aware: checks if an invoice exists (vendor invoiced = goods shipped).
+                * If shipped: "PO 124833 shipped today — Grassroots Fabric Pots, 4 items"
+                * If not: "PO 124833 — expected 5/29, 0/4 received, 4 items: GLP114, …"
+                *
+                * HERMIA(2026-06-09): Branson asked about PO 124833 which had already
+                * been invoiced (ship date today) — the original code said "expected 5/29,
+                * 0 received" which is wrong. Invoice ship date = truth.
+                */
+                private async postSinglePOInfo(
+                channelId: string,
+                threadTs: string,
+                po: any,
+                ): Promise<void> {
+                const items = po.orderItemList || [];
+                const itemNames = items.map((l: any) => l.productId || "?").join(", ");
+                const url = buildFinalePOUrl(po.orderId);
+
+                // Check invoices table — if an invoice exists with a ship date,
+                // the vendor has shipped regardless of what Finale PO status says.
+                let shippedLine: string | null = null;
+                try {
+                const db = createClient();
+                if (db) {
+                    const { data } = await db
+                        .from("invoices")
+                        .select("invoice_date, vendor_name, freight, tracking_notes")
+                        .eq("po_number", po.orderId)
+                        .limit(1);
+                    if (data && data.length > 0) {
+                        const inv = data[0];
+                        const shipDate = inv.invoice_date;
+                        const vendor = inv.vendor_name || po.vendor || "";
+                        const ms = shipDate ? new Date(shipDate).getTime() : 0;
+                        const daysSince = ms ? Math.floor((Date.now() - ms) / 86_400_000) : -1;
+                        const shipLabel = daysSince === 0 ? "today" :
+                                          daysSince === 1 ? "yesterday" :
+                                          daysSince > 1 ? `${daysSince}d ago (${new Date(ms).toLocaleDateString("en-US", { month: "numeric", day: "numeric" })})` :
+                                          "";
+                        const track = inv.tracking_notes || "";
+                        shippedLine = `*${po.orderId} shipped ${shipLabel}: ${vendor} — ${items.length} items: ${itemNames}*` +
+                            (track ? `\nTracking: ${track}` : `\nNo tracking yet`);
+                    }
+                }
+                } catch { /* silent — fall through to expected-date reply */ }
+
+                const text = shippedLine || (() => {
+                const totalOrdered = items.reduce((s: number, l: any) => s + (l.quantityOrdered || 0), 0);
+                const totalReceived = items.reduce((s: number, l: any) => s + (l.quantityReceived || 0), 0);
+                const expected = po.receiveDate
+                    ? new Date(po.receiveDate).toLocaleDateString("en-US", {
+                          month: "numeric", day: "numeric", timeZone: "UTC",
+                      })
+                    : "TBD";
+                const stateLabel = formatPOStateLabel(po.statusId);
+                return `*${po.orderId}${stateLabel} — expected ${expected}, ${totalReceived}/${totalOrdered} received (${items.length} items: ${itemNames})*\n<${url}|Finale>`;
+                })();
+
+                try {
+                await this.reader.chat.postMessage({
+                    channel: channelId,
+                    thread_ts: threadTs,
+                    text,
+                    mrkdwn: true,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+                console.log(
+                    `[slack-detector] Thread reply PO# ${po.orderId}: ${shippedLine ? "shipped" : po.statusId}`,
+                );
+                } catch (err: any) {
+                console.warn(
+                    `[slack-detector] PO thread reply failed: ${err.message}`,
+                );
+                }
+                }
 
     // ── Persistence ──────────────────────────────────────────────────────
 

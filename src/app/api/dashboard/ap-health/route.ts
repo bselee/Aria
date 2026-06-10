@@ -126,10 +126,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         const totalMatched = matched;
         const matchRate = totalInvoiceRelated > 0 ? Math.round((totalMatched / totalInvoiceRelated) * 100) : 100;
 
-        // 5. Overall status
+        // 5. Overall status — tuned thresholds so a single stuck invoice
+        //    doesn't flip the panel to red. (HERMIA 2026-06-10)
         let status: ApHealthResponse['status'] = 'healthy';
-        if (stuck > 0 || ocrIssues > 2) status = 'critical';
-        else if (matchRate < 50 || ocrIssues > 0) status = 'degraded';
+        if (stuck >= 10 || ocrIssues > 15) status = 'critical';
+        else if (stuck > 0 || ocrIssues > 0 || matchRate < 50) status = 'degraded';
 
         const response: ApHealthResponse = {
             todayCounts,

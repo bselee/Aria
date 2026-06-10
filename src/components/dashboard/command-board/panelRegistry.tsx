@@ -26,6 +26,7 @@ import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
 import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
+import BasautoPanel from "@/components/dashboard/BasautoPanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -130,6 +131,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
             label: "PO Lifecycle",
             short: "PO Lifecycle",
             render: () => <POLifecyclePanel />,
+        },
+        {
+            id: "basauto-requests",
+            label: "BASAUTO Requests",
+            short: "BASAUTO",
+            render: () => <BasautoPanel />,
         },
     ];
 
