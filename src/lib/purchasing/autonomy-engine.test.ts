@@ -15,6 +15,7 @@ const mockGetRecentPurchaseOrders = vi.fn();
 const mockGetDraftPOForReview = vi.fn();
 const mockCommitDraftPO = vi.fn();
 const mockGmailList = vi.fn();
+const mockGmailGet = vi.fn();
 
 // Mock dependencies
 vi.mock('../supabase', () => ({
@@ -52,6 +53,7 @@ vi.mock('@googleapis/gmail', () => ({
         users: {
             messages: {
                 list: mockGmailList,
+                get: mockGmailGet,
             },
         },
     })),
@@ -95,6 +97,17 @@ describe('autoProcessAutonomyDrafts', () => {
 
         // Default: no matching emails found in Gmail search
         mockGmailList.mockResolvedValue({ data: { messages: [] } });
+        // Default mock for gmail get (won't be called when list returns empty)
+        mockGmailGet.mockResolvedValue({
+            data: {
+                payload: {
+                    headers: [
+                        { name: 'To', value: 'vendor@example.com' },
+                        { name: 'From', value: 'me@gmail.com' },
+                    ],
+                },
+            },
+        });
     });
 
     it('should ignore vendors at autonomy level 0', async () => {
@@ -160,6 +173,17 @@ describe('autoProcessAutonomyDrafts', () => {
         
         // Gmail list mock returns a matching sent message
         mockGmailList.mockResolvedValue({ data: { messages: [{ id: 'msg-123' }] } });
+        // Gmail get returns headers with external recipient (different domain from sender)
+        mockGmailGet.mockResolvedValue({
+            data: {
+                payload: {
+                    headers: [
+                        { name: 'To', value: 'sales@rootwise.com' },
+                        { name: 'From', value: 'me@gmail.com' },
+                    ],
+                },
+            },
+        });
 
         const result = await autoProcessAutonomyDrafts(mockBot);
 
@@ -178,6 +202,17 @@ describe('autoProcessAutonomyDrafts', () => {
         
         // Gmail list mock returns a matching sent message
         mockGmailList.mockResolvedValue({ data: { messages: [{ id: 'msg-123' }] } });
+        // Gmail get returns headers with external recipient (different domain from sender)
+        mockGmailGet.mockResolvedValue({
+            data: {
+                payload: {
+                    headers: [
+                        { name: 'To', value: 'orders@sustainable.com' },
+                        { name: 'From', value: 'me@gmail.com' },
+                    ],
+                },
+            },
+        });
 
         const result = await autoProcessAutonomyDrafts(mockBot);
 

@@ -618,9 +618,15 @@ export async function commitAndSendPO(
                 emailError = undefined;
                 verificationIssues.push(`Gmail fallback sent PO PDF to ${vendorEmail}`);
             } catch (gmailErr: any) {
-                // HERMIA(2026-05-28): If PDF generation fails (font missing, PDFKit bundled
-                // without AFM files, etc), send a text-only email with PO details instead.
-                // Better to send a readable text email than nothing.
+                // HERMIA(2026-06-10): Text-only fallback kept as safety net. PDFKit is
+                // now stable, but if generation fails we still send a readable text email
+                // rather than nothing. The error is surfaced prominently so the operator
+                // knows PDF sending degraded.
+                // ╔══════════════════════════════════════════════════════╗
+                // ║ WARNING: PDF generation failed — falling back to    ║
+                // ║ text-only email. Check renderPurchaseOrderPdf().    ║
+                // ╚══════════════════════════════════════════════════════╝
+                console.warn('[PO-SENDER] PDF generation failed, sending text-only email:', gmailErr?.message ?? String(gmailErr));
                 const textOnlyBody = generateTextOnlyPOEmail(review);
                 try {
                     const textGmailResult = await sendTextOnlyGmailEmail({
@@ -647,11 +653,13 @@ export async function commitAndSendPO(
     const finaleEmailSent = emailVia === 'finale-native';
 
     // 2b. Post-send verification — only meaningful for the Finale-native path.
-    // Multi-round polling with expanded field paths. Finale's lastEmailedAt can
-    // lag behind the send response by several seconds, so we retry up to 3
-    // times before giving up. Even then, a missing timestamp is a soft warning
-    // (not a hard failure) — if Finale's sendPurchaseOrderEmail didn't throw,
-    // the email was accepted by Finale's delivery pipeline.
+    //
+    // FIXED(2026-06-10): Previously this polled Finale 3 × 5s = up to 15s,
+    // blocking the dashboard response. Now we trust the send response: if
+    // sendPurchaseOrderEmail returned {sent:true}, the email was accepted by
+    // Finale's delivery pipeline. We do one quick re-fetch for the timestamp
+    // (for logging), but don't block on it. A missing timestamp is a soft
+    // warning, not a hard failure.
     let emailVerified = true;  // optimistically true — Finale accepted the send
     let lastEmailedAt: string | null = null;
     if (!skipEmail && finaleEmailSent) {
@@ -662,33 +670,29 @@ export async function commitAndSendPO(
             'emailSentDate',
             'emailLastSentAt',
         ];
-        for (let attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0) await new Promise(r => setTimeout(r, 5000));
-            try {
-                const postSendPO = await finale.getOrderDetails(orderId);
-                const rawTs = FINALE_TIMESTAMP_FIELDS
-                    .map(f => postSendPO?.[f])
-                    .concat(postSendPO?.emailHistory?.[0]?.timestamp)
-                    .find((v): v is string => typeof v === 'string' && v.length > 0)
-                    ?? null;
-                if (rawTs) {
-                    const ts = new Date(rawTs);
-                    if (!isNaN(ts.getTime())) {
-                        lastEmailedAt = ts.toISOString();
-                        const ageMs = Date.now() - ts.getTime();
-                        if (ageMs >= 0 && ageMs <= 300_000) {  // 5-minute window
-                            emailVerified = true;
-                            break;  // confirmed — stop polling
-                        }
+        try {
+            const postSendPO = await finale.getOrderDetails(orderId);
+            const rawTs = FINALE_TIMESTAMP_FIELDS
+                .map(f => postSendPO?.[f])
+                .concat(postSendPO?.emailHistory?.[0]?.timestamp)
+                .find((v): v is string => typeof v === 'string' && v.length > 0)
+                ?? null;
+            if (rawTs) {
+                const ts = new Date(rawTs);
+                if (!isNaN(ts.getTime())) {
+                    lastEmailedAt = ts.toISOString();
+                    const ageMs = Date.now() - ts.getTime();
+                    if (ageMs >= 0 && ageMs <= 300_000) {  // 5-minute window
+                        emailVerified = true;
                     }
                 }
-            } catch (err: any) {
-                verificationIssues.push(`post-send re-fetch (attempt ${attempt + 1}) failed: ${err?.message ?? String(err)}`);
             }
+        } catch (err: any) {
+            verificationIssues.push(`post-send re-fetch failed: ${err?.message ?? String(err)}`);
         }
         if (!lastEmailedAt) {
             verificationIssues.push(
-                'Finale accepted send (no error) but lastEmailedAt timestamp not found after 3 attempts — ' +
+                'Finale accepted send (no error) but lastEmailedAt timestamp not found on first check — ' +
                 'email likely sent; check Finale order page if unsure.'
             );
         }

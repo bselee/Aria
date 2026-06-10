@@ -154,9 +154,9 @@ export async function renderPurchaseOrderPdf(review: DraftPOReview): Promise<Buf
             const rowH = Math.max(18, doc.heightOfString(item.productName, { width: COL_WIDTH.DESCR }) + 6);
 
             doc.text(item.productId, COL.PRODUCT_ID, y, { width: COL_WIDTH.PRODUCT_ID });
-            // Supplier's ID not available from DraftPOReview — leave blank
+            doc.text(item.supplierSku ?? "", COL.SUPPLIER_ID, y, { width: COL_WIDTH.SUPPLIER_ID });
             doc.text(item.productName, COL.DESCR, y, { width: COL_WIDTH.DESCR });
-            // Packing not available from DraftPOReview — leave blank
+            doc.text(item.packing ?? "", COL.PACKING, y, { width: COL_WIDTH.PACKING, align: "right" });
             doc.text(fmtQty(item.quantity), COL.QTY, y, { width: COL_WIDTH.QTY, align: "right" });
             doc.text(money(item.unitPrice), COL.UNIT, y, { width: COL_WIDTH.UNIT, align: "right" });
             doc.text(money(item.lineTotal), COL.SUBTOTAL, y, { width: COL_WIDTH.SUBTOTAL, align: "right" });

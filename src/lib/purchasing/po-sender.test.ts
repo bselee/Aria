@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// commitAndSendPO contains a real 8s setTimeout for post-send Finale verification.
-vi.setConfig({ testTimeout: 15000 });
+// commitAndSendPO verification is now 1 quick round-trip (was 3 × 5s polling).
+vi.setConfig({ testTimeout: 10000 });
 
 const {
     commitDraftPOMock,

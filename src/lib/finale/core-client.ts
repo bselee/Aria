@@ -219,7 +219,7 @@ export interface DraftPOReview {
     vendorPartyId: string;
     orderDate: string;
     total: number;
-    items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number }>;
+    items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number; supplierSku?: string; packing?: string }>;
     finaleUrl: string;
     canCommit: boolean;   // true only if statusId === 'ORDER_CREATED'
 }

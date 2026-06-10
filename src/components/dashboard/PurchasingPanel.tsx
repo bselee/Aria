@@ -147,7 +147,7 @@ type CommitReview = {
     emailSource: string;
     warning?: string;
 };
-type SendStepStatus = 'pending' | 'ok' | 'fail' | 'skip';
+type SendStepStatus = 'pending' | 'verifying' | 'ok' | 'fail' | 'skip';
 type SendSteps = { commit?: SendStepStatus; email?: SendStepStatus; verify?: SendStepStatus };
 type SnoozeEntry = { until: number | "forever" };
 type SnoozeMap = Record<string, SnoozeEntry>;
@@ -1418,12 +1418,13 @@ export default function PurchasingPanel() {
                                 {([
                                     { k: 'commit' as const, label: '1. Commit in Finale' },
                                     { k: 'email' as const,  label: '2. Email vendor' },
-                                    { k: 'verify' as const, label: '3. Verify Finale state' },
+                                    { k: 'verify' as const, label: sendSteps.verify === 'verifying' ? '3. ✓ Email sent — verifying delivery…' : '3. Verify Finale state' },
                                 ]).map(s => {
                                     const v = sendSteps[s.k];
                                     const icon = v === 'ok' ? <span className="text-emerald-400">✓</span>
                                         : v === 'fail' ? <span className="text-rose-400">✗</span>
                                         : v === 'skip' ? <span className="text-zinc-600">—</span>
+                                        : v === 'verifying' ? <span className="text-cyan-400 animate-pulse">⟳</span>
                                         : v === 'pending' ? <span className="text-amber-300 animate-pulse">⏳</span>
                                         : <span className="text-zinc-700">·</span>;
                                     return (
