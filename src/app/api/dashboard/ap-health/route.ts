@@ -20,7 +20,7 @@ export interface ApHealthResponse {
     matchRate: number;
     stuck: number;
     ocrIssues: number;
-    recentStuck: Array<{ subject: string; from: string; status: string; ageHours: number }>;
+    recentStuck: Array<{ subject: string; from: string; status: string; ageHours: number; message_id?: string | null }>;
     status: 'healthy' | 'degraded' | 'critical';
 }
 
@@ -77,7 +77,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         const twoHoursAgo = new Date(Date.now() - 2 * 3600000).toISOString();
         const { data: stuckRows } = await db
             .from('ap_inbox_queue')
-            .select('email_subject, email_from, status, created_at, extracted_json')
+            .select('message_id, email_subject, email_from, status, created_at, extracted_json')
             .in('status', ['ERROR_FORWARDING', 'ERROR_PROCESSING'])
             .lt('updated_at', twoHoursAgo)
             .limit(10);
@@ -85,6 +85,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         let stuck = 0;
         const recentStuck: ApHealthResponse['recentStuck'] = [];
         for (const row of (stuckRows || []) as Array<{
+            message_id: string | null;
             email_subject: string | null;
             email_from: string | null;
             status: string;
@@ -99,6 +100,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
             stuck++;
             if (recentStuck.length < 5) {
                 recentStuck.push({
+                    message_id: row.message_id,
                     subject: row.email_subject || (ej.subject as string) || '(no subject)',
                     from: row.email_from || (ej.from as string) || (ej.vendor_name as string) || 'unknown',
                     status: row.status,

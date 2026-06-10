@@ -53,12 +53,12 @@ describe('Bot Command Modularization', () => {
             expect(names).toContain('build');
             expect(names).toContain('builds');
 
-            // Operations commands
+            // Operations commands (updated 2026-06-10: requests/alerts/notify commands removed)
             expect(names).toContain('buildrisk');
-            expect(names).toContain('requests');
             expect(names).toContain('alerts');
             expect(names).toContain('correlate');
-            expect(names).toContain('notify');
+            expect(names).toContain('purchases');
+            expect(names).toContain('vendor');
 
             // Memory commands
             expect(names).toContain('remember');
@@ -149,8 +149,8 @@ describe('Bot Command Modularization', () => {
             expect(inventoryCommands.length).toBe(5);
         });
 
-        it('operations module should export exactly 12 commands', () => {
-            expect(operationsCommands.length).toBe(12);
+        it('operations module should export exactly 10 commands', () => {
+            expect(operationsCommands.length).toBe(10);
         });
 
         it('memory module should export exactly 4 commands', () => {
