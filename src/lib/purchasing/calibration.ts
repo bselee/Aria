@@ -352,27 +352,58 @@ export async function loadVendorReorderPolicies(
             .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days")
             .in("vendor_party_id", vendorPartyIds);
         for (const row of data ?? []) {
-            map.set(row.vendor_party_id, {
-                vendorPartyId: row.vendor_party_id,
-                vendorName: row.vendor_name ?? null,
-                leadTimeOverrideDays: row.lead_time_override_days,
-                targetCoverDays: row.target_cover_days,
-                moqMode: (row.moq_mode ?? "enforce") as VendorMoqMode,
-                overbuyReviewPct: Number(row.overbuy_review_pct ?? 50),
-                overbuyReviewDollars: Number(row.overbuy_review_dollars ?? 1000),
-                notes: row.notes ?? null,
-                favoriteBatches: Array.isArray(row.favorite_batches) && row.favorite_batches.length > 0
-                    ? row.favorite_batches.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n) && n > 0)
-                    : null,
-                isBulkVendor: Boolean(row.is_bulk_vendor),
-                typicalLegCount: row.typical_leg_count ?? null,
-                typicalLegIntervalDays: row.typical_leg_interval_days ?? null,
-            });
+            map.set(row.vendor_party_id, parseVendorPolicyRow(row));
         }
     } catch (err: any) {
         console.warn(`[calibration] loadVendorReorderPolicies failed: ${err.message}`);
     }
     return map;
+}
+
+/**
+ * Load ALL vendor reorder policies (no party-id filter). The table is small
+ * (<50 rows) so a full scan is fine. Used by the BOM pipeline which resolves
+ * vendor partyIds lazily inside a parallel loop — pre-loading all policies
+ * avoids per-component round trips.
+ *
+ * Returns a Map keyed by vendor_party_id (same shape as loadVendorReorderPolicies).
+ * Callers can also iterate the values to do name-based lookups.
+ */
+export async function loadAllVendorReorderPolicies(): Promise<Map<string, VendorReorderPolicy>> {
+    const map = new Map<string, VendorReorderPolicy>();
+    const db = createClient();
+    if (!db) return map;
+    try {
+        const { data } = await db
+            .from("vendor_reorder_policies")
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days");
+        for (const row of data ?? []) {
+            map.set(row.vendor_party_id, parseVendorPolicyRow(row));
+        }
+    } catch (err: any) {
+        console.warn(`[calibration] loadAllVendorReorderPolicies failed: ${err.message}`);
+    }
+    return map;
+}
+
+/** Shared parser for a vendor_reorder_policies row → VendorReorderPolicy. */
+function parseVendorPolicyRow(row: any): VendorReorderPolicy {
+    return {
+        vendorPartyId: row.vendor_party_id,
+        vendorName: row.vendor_name ?? null,
+        leadTimeOverrideDays: row.lead_time_override_days,
+        targetCoverDays: row.target_cover_days,
+        moqMode: (row.moq_mode ?? "enforce") as VendorMoqMode,
+        overbuyReviewPct: Number(row.overbuy_review_pct ?? 50),
+        overbuyReviewDollars: Number(row.overbuy_review_dollars ?? 1000),
+        notes: row.notes ?? null,
+        favoriteBatches: Array.isArray(row.favorite_batches) && row.favorite_batches.length > 0
+            ? row.favorite_batches.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n) && n > 0)
+            : null,
+        isBulkVendor: Boolean(row.is_bulk_vendor),
+        typicalLegCount: row.typical_leg_count ?? null,
+        typicalLegIntervalDays: row.typical_leg_interval_days ?? null,
+    };
 }
 
 // ──────────────────────────────────────────────────

@@ -49,8 +49,6 @@ async function fetchJson<T>(fx: typeof fetch, url: string): Promise<T> {
     return (await res.json()) as T;
 }
 
-import APHealthPanel from "@/components/dashboard/APHealthPanel";
-
 // ── Module tab definitions ──────────────────────────────────────────────────
 //
 // Tab order matches Will's daily ops priority. "Blocking" is first because
@@ -72,9 +70,6 @@ function PurchasingLifecyclePanel() {
     return (
         <PurchasingLifecycleProvider>
             <div className="flex flex-col h-full min-h-0 overflow-hidden">
-                <div className="shrink-0 px-2 pt-2">
-                    <APHealthPanel />
-                </div>
                 <div
                     className="flex-1 min-h-0 grid grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
                     data-testid="purchasing-lifecycle-panel"

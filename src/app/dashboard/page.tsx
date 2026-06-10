@@ -32,7 +32,6 @@ import {
 } from "@dnd-kit/sortable";
 import { useDroppable } from "@dnd-kit/core";
 
-import APHealthPanel from "@/components/dashboard/APHealthPanel";
 import ActivityFeed from "@/components/dashboard/ActivityFeed";
 import BuildRiskPanel from "@/components/dashboard/BuildRiskPanel";
 import BuildSchedulePanel from "@/components/dashboard/BuildSchedulePanel";
@@ -87,7 +86,6 @@ const PANEL_MAP: Record<string, React.ReactNode> = {
         </div>
     ),
     "invoice-queue": <InvoiceQueuePanel />,
-        "ap-health": <APHealthPanel />,
         "statement-reconciliation": <StatementReconciliationPanel />,
     "purchasing": <PurchasingPanel />,
     "build-schedule": <BuildSchedulePanel />,

@@ -44,6 +44,20 @@ const SHIPPING_SEARCH_QUERY = [
     " OR \"ship date\" OR \"ship today\")"
 ].join(" ");
 
+/**
+ * Sender domains that send emails with shipping/tracking keywords but are
+ * NOT actual shipping notifications. We skip these to avoid false positives.
+ * - plutonian.io: Stockie inventory OOS alerts
+ * - info.printful.com: Printful store digest
+ * - dlwholesale.com: marketing newsletters
+ * - notification.intuit.com: QuickBooks invoices (carrier detection handled separately)
+ */
+const SKIP_SENDER_DOMAINS: Set<string> = new Set([
+    "plutonian.io",
+    "info.printful.com",
+    "dlwholesale.com",
+]);
+
 /** Max emails to process per account per run. */
 const MAX_EMAILS_PER_ACCOUNT = 25;
 
