@@ -383,10 +383,10 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         expect(findFilterButton("within 90 days")).not.toBeNull();
         expect(findFilterButton("Every actionable item")).not.toBeNull();
 
-        // Old TODAY/WEEK button text is gone (TODAY tooltip would have read differently).
-        // Use case-sensitive query to avoid matching the new "ORDER NOW" header.
+        // v2 (2026-05-06): the 'today' / 'week' focus KEYS are gone, but the
+        // button labels can still use human-friendly text like "TODAY" for the
+        // order_now filter. Assert that the legacy 'WEEK' label is removed.
         const allBtns = Array.from(document.querySelectorAll("button"));
-        expect(allBtns.some(b => b.textContent?.includes("TODAY"))).toBe(false);
         expect(allBtns.some(b => b.textContent?.includes("WEEK"))).toBe(false);
     });
 

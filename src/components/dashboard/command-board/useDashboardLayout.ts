@@ -34,6 +34,7 @@ export const ALL_PANEL_IDS = [
     "vendor-scorecard",
         "daily-ops-summary",
         "po-lifecycle",
+        "basauto-requests",
     ] as const;
 
 export type PanelId = (typeof ALL_PANEL_IDS)[number];
@@ -54,7 +55,7 @@ export const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "right"];
 
 // ── Default layout — keep in sync with `src/app/dashboard/page.tsx` ─────────
 export const DEFAULT_LAYOUT: DashboardLayout = {
-    left: ["build-risk", "receivings"],
+    left: ["build-risk", "receivings", "basauto-requests"],
     midLeft: [
         "invoice-queue",
         "statement-reconciliation",
