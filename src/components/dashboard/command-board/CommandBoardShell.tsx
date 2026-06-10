@@ -103,6 +103,7 @@ function PurchasingLifecyclePanel() {
                     <ReceivedItemsPanel />
                 </div>
             </section>
+                </div>
             </div>
         </PurchasingLifecycleProvider>
     );

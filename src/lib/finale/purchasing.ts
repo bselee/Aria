@@ -2988,6 +2988,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 quantity: item.quantity || 0,
                 unitPrice: item.unitPrice || 0,
                 lineTotal: (item.quantity || 0) * (item.unitPrice || 0),
+                supplierSku: item.supplierProductId || undefined,
+                packing: item.quantityUomId || undefined,
             }));
 
         const rawOrderUrl = po.orderUrl || `/${this.accountPath}/api/order/${orderId}`;

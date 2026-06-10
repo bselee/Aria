@@ -240,8 +240,9 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 }
 
 /**
- * Searches the Gmail inbox/outbox for any sent messages containing the PO number in the subject or body.
- * Returns true if a sent email is found, indicating it has already been manually sent.
+ * Searches Gmail for any OUTBOUND (sent) messages containing the PO number in the subject or body.
+ * Only matches email that was actually sent externally (not internal notes, Finale confirmations, or forwards).
+ * Returns true if a matching sent email is found, indicating the PO has already been manually sent.
  */
 export async function isPOAlreadyEmailed(poNumber: string): Promise<boolean> {
     try {
@@ -251,15 +252,54 @@ export async function isPOAlreadyEmailed(poNumber: string): Promise<boolean> {
         const auth = await getAuthenticatedClient('default');
         const gmail = GmailApi({ version: 'v1', auth });
 
-        // Search query: find any message with the PO number in the text, subject, or threads.
-        const q = `"${poNumber}" OR "PO ${poNumber}" OR "PO #${poNumber}"`;
+        // Search query: scope to SENT emails only to avoid matching internal notes, Finale confirmations, etc.
+        // Scoped to subject for the bare PO number, and body for the "#PO" variant.
+        const q = `in:sent subject:"${poNumber}" OR in:sent "PO #${poNumber}"`;
         const { data: search } = await gmail.users.messages.list({
             userId: 'me',
             q,
             maxResults: 5,
         });
 
-        return !!(search.messages && search.messages.length > 0);
+        if (!search.messages || search.messages.length === 0) {
+            return false;
+        }
+
+        // Verify the message was actually sent to an external party (not just forwarded internally)
+        // by fetching message headers and checking the To field.
+        for (const msg of search.messages) {
+            try {
+                const { data: msgData } = await gmail.users.messages.get({
+                    userId: 'me',
+                    id: msg.id!,
+                    format: 'metadata',
+                    metadataHeaders: ['To', 'From'],
+                });
+
+                const headers = msgData.payload?.headers || [];
+                const toHeader = headers.find(h => h.name === 'To')?.value || '';
+                const fromHeader = headers.find(h => h.name === 'From')?.value || '';
+
+                // Extract sender domain to detect internal forwarding
+                const senderDomain = fromHeader.match(/@([^>\s]+)/)?.[1] || '';
+                const toAddresses = toHeader.split(',').map(a => a.trim());
+
+                // Check if any To recipient is external (different domain from sender)
+                const hasExternalRecipient = toAddresses.some(addr => {
+                    const domain = addr.match(/@([^>\s]+)/)?.[1] || '';
+                    return domain && domain !== senderDomain && domain !== 'me';
+                });
+
+                if (hasExternalRecipient) {
+                    return true;
+                }
+            } catch {
+                // If we can't fetch metadata for a particular message, skip it
+                continue;
+            }
+        }
+
+        return false;
     } catch (err: any) {
         console.warn(`[autonomy] Gmail search for PO #${poNumber} failed:`, err.message);
         return false;
