@@ -127,15 +127,24 @@ export class APForwarderAgent {
                 return;
             }
 
-            const { data: queueItems, error } = await supabase
+            // HERMIA(2026-06-10): Also retry ERROR_FORWARDING items
+            const { data: pendingItems, error: pendingError } = await supabase
                 .from('ap_inbox_queue')
                 .select('*')
                 .eq('status', 'PENDING_FORWARD')
                 .limit(10);
 
-            if (error) throw error;
+            const { data: retryItems, error: retryError } = await supabase
+                .from('ap_inbox_queue')
+                .select('*')
+                .eq('status', 'ERROR_FORWARDING')
+                .limit(5);
 
-            if (!queueItems || queueItems.length === 0) {
+            if (pendingError) throw pendingError;
+            if (retryError) throw retryError;
+
+            const queueItems = [...(pendingItems || []), ...(retryItems || [])];
+            if (queueItems.length === 0) {
                 return;
             }
 
@@ -156,14 +165,35 @@ export class APForwarderAgent {
                 const sourceMessageId = this.getSourceMessageId(item) || item.message_id;
                 try {
                     // Try to lock the row by updating status to PROCESSING_FORWARD
-                    const { error: lockError } = await supabase
+                    // HERMIA(2026-06-10): Accept both PENDING_FORWARD and ERROR_FORWARDING
+                    const { error: lockError, count: lockCount } = await supabase
                         .from('ap_inbox_queue')
                         .update({ status: 'PROCESSING_FORWARD' })
                         .eq('id', item.id)
-                        .eq('status', 'PENDING_FORWARD');
+                        .in('status', ['PENDING_FORWARD', 'ERROR_FORWARDING']);
 
                     if (lockError) {
                         console.error(`   ❌ Failed to lock item ${item.id}:`, lockError.message);
+                        continue;
+                    }
+
+                    // HERMIA(2026-06-10): Guard against null pdf_filename/pdf_path
+                    // These records were likely created by vendor routing without full PDF
+                    // metadata. Can't forward without a file — mark as error and skip.
+                    if (!item.pdf_filename || !item.pdf_path) {
+                        console.warn(`   ⚠️ Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
+                        await supabase
+                            .from('ap_inbox_queue')
+                            .update({
+                                status: 'ERROR_FORWARDING',
+                                updated_at: new Date().toISOString(),
+                            })
+                            .eq('id', item.id);
+                        // Release the lock back — don't keep retrying forever
+                        await supabase
+                            .from('ap_inbox_queue')
+                            .update({ status: item.status })
+                            .eq('id', item.id);
                         continue;
                     }
 
@@ -303,18 +333,19 @@ export class APForwarderAgent {
                         matched_po_number: processingResult.poNumber || null,
                         processed_invoice_number: processingResult.invoiceNumber || null,
                     };
-                    const finalStatus = processingResult.success ? "FORWARDED" : "ERROR_PROCESSING";
+                    // HERMIA(2026-06-10): If Bill.com received the invoice, mark FORWARDED.
+                    // Post-processing failures (OCR, PO match) are logged but don't block
+                    // the primary pipeline — the invoice is already at Bill.com.
+                    const finalStatus = billComSendVerified ? "FORWARDED" : "ERROR_PROCESSING";
                     await supabase
                         .from('ap_inbox_queue')
                         .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
 
-                    if (!processingResult.success) {
-                        await supabase
-                            .from('email_inbox_queue')
-                            .update({ processed_by_ap: false })
-                            .eq('gmail_message_id', sourceMessageId);
-                    } else {
+                    // HERMIA(2026-06-10): If Bill.com send verified, always mark the
+                    // email as processed — the invoice made it through the critical path.
+                    // Post-processing failures are secondary (logged in extracted_json).
+                    if (billComSendVerified) {
                         await supabase
                             .from('email_inbox_queue')
                             .update({ processed_by_ap: true })
@@ -327,6 +358,14 @@ export class APForwarderAgent {
                                 extracted_json: extractedJson,
                             },
                         );
+                        if (!processingResult.success) {
+                            console.warn(`   ⚠️ Forwarded OK but post-processing failed: ${processingResult.error} — check /aphealth`);
+                        }
+                    } else {
+                        await supabase
+                            .from('email_inbox_queue')
+                            .update({ processed_by_ap: false })
+                            .eq('gmail_message_id', sourceMessageId);
                     }
 
                     await this.logActivity(

@@ -37,6 +37,9 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'google workspace' }, action: 'autopay', label: 'Google Workspace' },
     { match: { senderContains: 'google cloud' }, action: 'autopay', label: 'Google Cloud' },
 
+    // HERMIA(2026-06-10): FedEx is credit-card autopay — never forward to Bill.com
+    { match: { domain: 'fedex.com' }, action: 'autopay', label: 'FedEx (Credit Card Autopay)' },
+
     // ── Amazon (route to order parser for tracking) ──────────────────────
     { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },
     { match: { senderContains: 'ship-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Shipping' },
@@ -47,6 +50,8 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
     { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
+    // HERMIA(2026-06-10): Domain-based match (no space issue with domain evergreengrowers.com)
+    { match: { domain: 'evergreengrowers.com' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
     { match: { senderContains: 'ferticell' }, action: 'dropship', label: 'Ferticell (Dropship)' },
 
     // ── QuickBooks dropship vendors (subject-based — vendor name only in subject line) ──
@@ -67,6 +72,9 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // BuildASoil's own statements and internal documents should never reach Bill.com
     { match: { subjectContains: 'build a soil statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
     { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
+
+    // HERMIA(2026-06-10): Bill.com self-notifications — never re-forward back to Bill.com
+    { match: { domain: 'inform.bill.com' }, action: 'ignore', label: 'Bill.com Self-Notification (Ignore)' },
 ];
 
 /**

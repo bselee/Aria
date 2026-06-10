@@ -269,6 +269,21 @@ async function processMessage(
     const from =
         headers.find((h: any) => h.name?.toLowerCase() === "from")?.value || "";
 
+    // Skip known non-shipping senders (OOS reports, newsletters, marketing)
+    const fromEmail = (from.match(/<([^>]+)>/) || [])[1] || from;
+    const fromDomain = fromEmail.split("@")[1]?.toLowerCase() || "";
+    if (SKIP_SENDER_DOMAINS.has(fromDomain)) {
+        return {
+            messageId, subject, from,
+            poNumbers: [],
+            trackingNumbers: [],
+            detectedCarrier: null,
+            finalCarrier: null,
+            trackingUrl: null,
+            action: "skipped_no_tracking",
+        };
+    }
+
     // Extract plain text body
     const body = extractPlainText(msg.data.payload);
 

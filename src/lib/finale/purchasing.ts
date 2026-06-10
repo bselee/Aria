@@ -58,6 +58,14 @@ let _vendorOnTimeRateCache: Map<string, number> = new Map();
 let _vendorOnTimeRateCacheAt = 0;
 const MAX_VENDOR_LEAD_TIME_DAYS = 90;
 
+/**
+ * Parallel vendor party-ID cache. Populated by getVendorLeadTimeHistory() from
+ * the same GraphQL query — zero extra API calls. Key = lowercased vendor name,
+ * value = party ID string. Used by lead-time-tracker to key vendor_lead_time_stats
+ * by party ID (the canonical identifier) rather than vendor name (which can drift).
+ */
+let _vendorPartyIdCache: Map<string, string> = new Map();
+
 export class FinalePurchasingClient extends FinaleProductsClient {
     constructor() {
         super();
@@ -1079,6 +1087,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
     }
 
     /**
+     * Expose the full on-time rate cache. Used by lead-time-tracker to persist
+     * per-vendor on-time rates to vendor_lead_time_stats.
+     */
+    getVendorOnTimeRates(): Map<string, number> {
+        if (_vendorOnTimeRateCacheAt > 0 && Date.now() - _vendorOnTimeRateCacheAt > VENDOR_LEAD_TIME_RAW_TTL) {
+            return new Map();
+        }
+        return _vendorOnTimeRateCache;
+    }
+
+    /**
      * Ensures the vendor lead-time history cache (and the derived on-time rate
      * cache) is warm. No-op when the cache is fresh (< 4h old). Call this before
      * any code path that reads getVendorOnTimeRate() or getVendorLeadTimeDistribution()
@@ -1118,6 +1137,25 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         return out;
     }
 
+    /**
+     * Expose the party-ID cache populated by getVendorLeadTimeHistory().
+     * Used by lead-time-tracker to key stats by canonical party ID.
+     */
+    getVendorPartyIdMap(): Map<string, string> {
+        return _vendorPartyIdCache;
+    }
+
+    /**
+     * Raw lead-time arrays from the last getVendorLeadTimeHistory() call.
+     * Used by lead-time-tracker to compute spread_days (first→last PO span).
+     * Empty map when cache is cold or stale (>4h).
+     */
+    getRawLeadTimeArrays(): Map<string, number[]> {
+        if (!_vendorLeadTimeRawCache) return new Map();
+        if (Date.now() - _vendorLeadTimeRawCacheAt > VENDOR_LEAD_TIME_RAW_TTL) return new Map();
+        return _vendorLeadTimeRawCache;
+    }
+
     async getVendorLeadTimeHistory(daysBack: number = 365): Promise<Map<string, number>> {
         try {
             const now = new Date();
@@ -1144,7 +1182,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                                     status
                                     orderDate
                                     receiveDate
-                                    supplier { name }
+                                    supplier { name partyUrl }
                                 }
                             }
                         }
@@ -1168,12 +1206,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             const edges = data?.orderViewConnection?.edges || [];
             // Group lead times by vendor
             const byVendor = new Map<string, number[]>();
+            const partyIds = new Map<string, string>(); // vendor name → party ID (from same query, zero extra calls)
             for (const edge of edges) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
                 if (!po.orderDate || !po.receiveDate) continue;
                 const vendor = po.supplier?.name;
                 if (!vendor) continue;
+                // Capture party ID from same query — used by lead-time-tracker to key stats by party ID.
+                const partyUrl: string | undefined = po.supplier?.partyUrl;
+                if (partyUrl && !partyIds.has(vendor)) {
+                    const pid = partyUrl.split('/').pop();
+                    if (pid) partyIds.set(vendor, pid);
+                }
                 // Use po_sent_verified_at when available — more accurate than Finale's
                 // orderDate (which is draft-creation time, not the email-sent time).
                 const anchorDate = resolveLeadTimeAnchor(po.orderDate, po.orderId, sentAtMap);
@@ -1211,6 +1256,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             _vendorLeadTimeRawCacheAt = Date.now();
             _vendorOnTimeRateCache = onTimeMap;
             _vendorOnTimeRateCacheAt = Date.now();
+            _vendorPartyIdCache = partyIds;
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
@@ -2329,7 +2375,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                                 {
                                     step: 'Lead time',
                                     detail: leadTimeProvenance,
-                                    value: leadTimeDays,
+                                    value: effectiveLeadTimeDays,
                                 },
                                 ...(forward ? [{
                                     step: 'Calendar build',

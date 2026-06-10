@@ -78,6 +78,9 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     { match: "colorado worm",  pattern: "no_freight",     note: "Will-confirmed: never has freight" },
     { match: "rootwise",       pattern: "bas_freight",    note: "Will-confirmed: we schedule FedEx; vendor invoice has no freight" },
     { match: "uline",          pattern: "bas_freight",    note: "Will-confirmed: we schedule FedEx; vendor invoice has no freight" },
+    // Colorful Packaging (China) — DDP shipping included on their invoice as a separate line.
+    // Freight value extracted by inline-invoice-handler and reconciled to a FREIGHT adjustment on the PO.
+    { match: "colorful",       pattern: "vendor_freight", note: "Will-confirmed: overseas DDP, vendor includes freight on their CC invoice" },
 ];
 
 function findOverride(vendorName: string): typeof VENDOR_PATTERN_OVERRIDES[number] | null {
