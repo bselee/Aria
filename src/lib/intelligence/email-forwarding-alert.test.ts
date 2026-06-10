@@ -14,24 +14,27 @@ const { createClientMock, dbState, sendCriticalTelegramNotifyMock } = vi.hoisted
         const createClientMock = vi.fn(() => {
             if (dbState.returnNull) return null;
 
+            // Real Supabase chains are thenables — any method can be awaited and
+            // resolves to { data, error }. Add .then() so `await chain.in(...)` works.
+            const chainBase: any = {
+                gte: vi.fn(() => chainBase),
+                eq: vi.fn(() => chainBase),
+                lt: vi.fn(() => chainBase),
+                in: vi.fn(() => chainBase),
+                order: vi.fn(() => chainBase),
+                limit: vi.fn(() => chainBase),
+                select: vi.fn(() => chainBase),
+                insert: vi.fn(() =>
+                    Promise.resolve({ data: null, error: null }) as any,
+                ),
+                // Make the chain awaitable (Supabase thenable contract)
+                then: vi.fn(
+                    (resolve: any) =>
+                        resolve({ data: dbState.data, error: dbState.error }),
+                ),
+            };
             return {
-                from: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                        in: vi.fn(() => ({
-                            lt: vi.fn(() => ({
-                                order: vi.fn(() => ({
-                                    limit: vi.fn(
-                                        () =>
-                                            Promise.resolve({
-                                                data: dbState.data,
-                                                error: dbState.error,
-                                            }) as any,
-                                    ),
-                                })),
-                            })),
-                        })),
-                    })),
-                })),
+                from: vi.fn(() => chainBase),
             };
         });
 
