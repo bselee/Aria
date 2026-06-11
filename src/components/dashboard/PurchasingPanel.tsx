@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Eye, ShoppingCart, Loader2 } from "lucide-react";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Eye, ShoppingCart, Loader2, Search } from "lucide-react";
 import {
     canIncludeInDraftPO,
     canUseDirectOrdering,
@@ -253,6 +253,11 @@ export default function PurchasingPanel() {
     const [error, setError] = useState<string | null>(null);
 
     const [vendorTab, setVendorTab] = useState<string>("all");
+    // Vendor dropdown combobox state (replaces horizontal tab strip)
+    const [vendorDropdownOpen, setVendorDropdownOpen] = useState(false);
+    const [vendorSearchQuery, setVendorSearchQuery] = useState("");
+    const vendorDropdownRef = useRef<HTMLDivElement>(null);
+    const vendorSearchRef = useRef<HTMLInputElement>(null);
     const [expanded, setExpanded] = useState<Set<string>>(new Set());
     const [whyOpen, setWhyOpen] = useState<Set<string>>(new Set());
     const toggleWhy = useCallback((id: string) => {
@@ -335,7 +340,27 @@ export default function PurchasingPanel() {
     }, []);
     useEffect(() => { localStorage.setItem(LIFECYCLE_FILTER_LS, lifecycleFilter); }, [lifecycleFilter]);
 
-    // Fetch open-PO detail (ETA, tracking, lifecycle) once per panel load. Best-effort —
+    // Close vendor dropdown on outside click
+    useEffect(() => {
+        if (!vendorDropdownOpen) return;
+        const handler = (e: MouseEvent) => {
+            if (vendorDropdownRef.current && !vendorDropdownRef.current.contains(e.target as Node)) {
+                setVendorDropdownOpen(false);
+                setVendorSearchQuery("");
+            }
+        };
+        document.addEventListener("mousedown", handler);
+        return () => document.removeEventListener("mousedown", handler);
+    }, [vendorDropdownOpen]);
+
+    // Auto-focus the vendor search input when dropdown opens
+    useEffect(() => {
+        if (vendorDropdownOpen && vendorSearchRef.current) {
+            vendorSearchRef.current.focus();
+        }
+    }, [vendorDropdownOpen]);
+
+    // Fetch open-PO detail
     // missing detail just means the lifecycle ribbon falls back to PO# + qty + orderDate.
     useEffect(() => {
         let cancelled = false;
@@ -1110,6 +1135,20 @@ export default function PurchasingPanel() {
             lifecycleCounts[lifecycleBucket(item)]++;
         }
     }
+    // Vendor dropdown: filtered list of groups based on search query
+    const vendorDropdownItems = (() => {
+        const q = vendorSearchQuery.trim().toLowerCase();
+        if (!q) return focusGroups;
+        return focusGroups.filter(g => {
+            if (g.vendorName.toLowerCase().includes(q)) return true;
+            if (g.vendorPartyId.toLowerCase().includes(q)) return true;
+            // Also match against product IDs in the group
+            return g.items.some(i =>
+                i.productId.toLowerCase().includes(q) ||
+                i.productName.toLowerCase().includes(q)
+            );
+        });
+    })();
     const visibleGroups = vendorTab === "all" ? focusGroups : focusGroups.filter(g => g.vendorPartyId === vendorTab);
 
     // Total hidden items across all snoozed vendors + individually snoozed items
@@ -1582,54 +1621,237 @@ export default function PurchasingPanel() {
                         </button>
                     </div>
 
-                    {/* ── Vendor tabs ── active vendors + snoozed (greyed) when showSnoozed */}
+                    {/* ── Vendor dropdown combobox ── replaces horizontal tab strip */}
                     {focusGroups.length > 0 && (
-                        <div className="flex items-center border-b border-zinc-800/60 bg-zinc-950/30 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                            <button
-                                onClick={() => setVendorTab("all")}
-                                className={`px-3 py-1.5 text-xs font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 ${vendorTab === "all"
-                                    ? "border-zinc-300 text-zinc-100 bg-zinc-800/30"
-                                    : "border-transparent text-zinc-400 hover:text-zinc-200"
+                        <div className="relative border-b border-zinc-800/60 bg-zinc-950/30 px-3 py-1.5" ref={vendorDropdownRef}>
+                            <div className="flex items-center gap-2">
+                                {/* Dropdown trigger button */}
+                                <button
+                                    onClick={() => setVendorDropdownOpen(!vendorDropdownOpen)}
+                                    className={`flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded border transition-colors ${
+                                        vendorTab === "all"
+                                            ? "border-zinc-600 text-zinc-200 bg-zinc-800/40 hover:bg-zinc-800/60"
+                                            : "border-zinc-500 text-zinc-100 bg-zinc-700/40 hover:bg-zinc-700/60"
                                     }`}
-                            >
-                                {({
-                                    order_now: "Order Now",
-                                    "30": "Next 30 Days",
-                                    "60": "Next 60 Days",
-                                    "90": "Next 90 Days",
-                                    all: "All",
-                                } as Record<FocusFilter, string>)[focusFilter]} <span className="opacity-60">{focusGroups.length}</span>
-                            </button>
+                                >
+                                    {vendorTab === "all" ? (
+                                        <>
+                                            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 shrink-0" />
+                                            <span>
+                                                {({
+                                                    order_now: "Order Now",
+                                                    "30": "Next 30d",
+                                                    "60": "Next 60d",
+                                                    "90": "Next 90d",
+                                                    all: "All Vendors",
+                                                } as Record<FocusFilter, string>)[focusFilter]}
+                                            </span>
+                                            <span className="text-zinc-500">{focusGroups.length}</span>
+                                        </>
+                                    ) : (
+                                        (() => {
+                                            const g = focusGroups.find(v => v.vendorPartyId === vendorTab);
+                                            const cfg = g ? URGENCY[g.urgency] : URGENCY.ok;
+                                            const hasPO = g ? !!createdPOs[g.vendorPartyId] : false;
+                                            return (
+                                                <>
+                                                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
+                                                    <span>{g ? g.vendorName : "…"}</span>
+                                                    {hasPO && <span className="text-emerald-500">✓</span>}
+                                                </>
+                                            );
+                                        })()
+                                    )}
+                                    <ChevronDown className={`w-3 h-3 text-zinc-500 transition-transform ${vendorDropdownOpen ? "rotate-180" : ""}`} />
+                                </button>
 
-                            {focusGroups.map(g => {
-                                const cfg = URGENCY[g.urgency];
-                                const isActive = vendorTab === g.vendorPartyId;
-                                const hasPO = !!createdPOs[g.vendorPartyId];
-                                const vSnoozed = !hasPO && vendorSnoozed(g);
-                                const checkedCount = g.items.filter(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId]).length;
-                                return (
-                                    <button key={g.vendorPartyId}
-                                        onClick={() => setVendorTab(g.vendorPartyId)}
-                                        className={`px-3 py-1.5 text-xs font-mono whitespace-nowrap border-b-2 transition-colors shrink-0 flex items-center gap-1 ${vSnoozed
-                                            ? "border-transparent text-zinc-700 hover:text-zinc-500"
-                                            : isActive
-                                                ? `${cfg.tab} bg-zinc-800/30`
-                                                : "border-transparent text-zinc-400 hover:text-zinc-200"
-                                            }`}
+                                {/* Quick summary when a specific vendor is selected */}
+                                {vendorTab !== "all" && (() => {
+                                    const g = focusGroups.find(v => v.vendorPartyId === vendorTab);
+                                    if (!g || g.items.length === 0) return null;
+                                    const earliestRunway = Math.min(...g.items.map(getEffectiveShortageDays));
+                                    const totalNeed = g.items.reduce((s, i) => s + (i.suggestedQty || 0) * (i.unitPrice || 0), 0);
+                                    const leadTime = g.items[0]?.leadTimeDays ?? 0;
+                                    const selectedCount = g.items.filter(i => checked[g.vendorPartyId]?.[i.productId]).length;
+                                    return (
+                                        <div className="flex items-center gap-3 text-[10px] font-mono text-zinc-500">
+                                            <span>{g.items.length} SKUs</span>
+                                            <span className={earliestRunway < 14 ? "text-red-400" : earliestRunway < 45 ? "text-yellow-400" : ""}>
+                                                {Number.isFinite(earliestRunway) ? `${Math.round(earliestRunway)}d runway` : "—"}
+                                            </span>
+                                            <span>lead {leadTime}d</span>
+                                            <span className="text-zinc-300">${totalNeed.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                                            {selectedCount > 0 && <span className="text-emerald-400">{selectedCount} selected</span>}
+                                        </div>
+                                    );
+                                })()}
+
+                                {/* "Show all" quick-action when filtered to a vendor */}
+                                {vendorTab !== "all" && (
+                                    <button
+                                        onClick={() => { setVendorTab("all"); setExpanded(new Set()); }}
+                                        className="text-[10px] font-mono text-zinc-600 hover:text-zinc-300 transition-colors ml-auto"
                                     >
-                                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
-                                        <span className={vSnoozed ? "line-through" : ""}>
-                                            {g.vendorName.length > 14 ? g.vendorName.slice(0, 12) + "…" : g.vendorName}
-                                        </span>
-                                        {!vSnoozed && (hasPO
-                                            ? <span className="text-emerald-500 ml-0.5">✓</span>
-                                            : checkedCount > 0
-                                                ? <span className="text-zinc-500 ml-0.5">{checkedCount}</span>
-                                                : null
-                                        )}
+                                        ← All vendors
                                     </button>
-                                );
-                            })}
+                                )}
+                            </div>
+
+                            {/* Dropdown panel */}
+                            {vendorDropdownOpen && (
+                                <div className="absolute left-0 right-0 z-50 mt-1 mx-2 border border-zinc-700/60 bg-zinc-950 rounded-lg shadow-2xl shadow-black/60 max-h-[420px] flex flex-col overflow-hidden">
+                                    {/* Search header */}
+                                    <div className="px-3 py-2 border-b border-zinc-800/80 flex items-center gap-2 bg-zinc-900/50 shrink-0">
+                                        <Search className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
+                                        <input
+                                            ref={vendorSearchRef}
+                                            type="text"
+                                            value={vendorSearchQuery}
+                                            onChange={e => setVendorSearchQuery(e.target.value)}
+                                            placeholder="Search vendors…"
+                                            className="flex-1 bg-transparent border-none text-xs font-mono text-zinc-100 placeholder-zinc-600 focus:outline-none"
+                                            onKeyDown={e => {
+                                                if (e.key === "Escape") {
+                                                    setVendorDropdownOpen(false);
+                                                    setVendorSearchQuery("");
+                                                }
+                                                if (e.key === "Enter") {
+                                                    const filtered = vendorDropdownItems;
+                                                    if (filtered.length === 1) {
+                                                        setVendorTab(filtered[0].vendorPartyId);
+                                                        setExpanded(prev => { const n = new Set(prev); n.add(filtered[0].vendorPartyId); return n; });
+                                                        setVendorDropdownOpen(false);
+                                                        setVendorSearchQuery("");
+                                                    }
+                                                }
+                                            }}
+                                        />
+                                        <span className="text-[9px] text-zinc-600 shrink-0">
+                                            {vendorSearchQuery ? `${vendorDropdownItems.length} match` : `${focusGroups.length} vendors`}
+                                        </span>
+                                    </div>
+
+                                    {/* Scrollable vendor list */}
+                                    <div className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-zinc-800 [&::-webkit-scrollbar-thumb]:rounded-full">
+                                        {/* "All Vendors" option */}
+                                        <button
+                                            onClick={() => {
+                                                setVendorTab("all");
+                                                setExpanded(new Set());
+                                                setVendorDropdownOpen(false);
+                                                setVendorSearchQuery("");
+                                            }}
+                                            className={`w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-zinc-800/40 transition-colors border-b border-zinc-900/60 ${
+                                                vendorTab === "all" ? "bg-zinc-800/30 text-zinc-100" : "text-zinc-400"
+                                            }`}
+                                        >
+                                            <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 shrink-0" />
+                                            <span className="text-xs font-mono font-semibold flex-1">All Vendors</span>
+                                            <span className="text-[10px] font-mono text-zinc-600">{focusGroups.length}</span>
+                                        </button>
+
+                                        {/* Vendor rows */}
+                                        {vendorDropdownItems.map(g => {
+                                            const cfg = URGENCY[g.urgency];
+                                            const isActive = vendorTab === g.vendorPartyId;
+                                            const hasPO = !!createdPOs[g.vendorPartyId];
+                                            const vSnoozed = !hasPO && vendorSnoozed(g);
+                                            const checkedCount = g.items.filter(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId]).length;
+                                            const earliestRunway = g.items.length > 0
+                                                ? Math.min(...g.items.map(getEffectiveShortageDays))
+                                                : null;
+                                            const leadTime = g.items.length > 0 ? (g.items[0].leadTimeDays ?? 0) : 0;
+                                            const totalNeed = g.items.reduce((s, i) => s + (i.suggestedQty || 0) * (i.unitPrice || 0), 0);
+                                            const totalOnHand = g.items.reduce((s, i) => s + (i.stockOnHand || 0), 0);
+                                            const totalOnOrder = g.items.reduce((s, i) => s + (i.stockOnOrder || 0), 0);
+                                            const topSkus = g.items.slice(0, 3).map(i => i.productId);
+                                            const criticalItems = g.items.filter(i => i.urgency === "critical").length;
+
+                                            return (
+                                                <button
+                                                    key={g.vendorPartyId}
+                                                    onClick={() => {
+                                                        setVendorTab(g.vendorPartyId);
+                                                        setExpanded(prev => { const n = new Set(prev); n.add(g.vendorPartyId); return n; });
+                                                        setVendorDropdownOpen(false);
+                                                        setVendorSearchQuery("");
+                                                    }}
+                                                    className={`w-full text-left px-3 py-2 flex flex-col gap-1 hover:bg-zinc-800/40 transition-colors border-b border-zinc-900/40 ${
+                                                        vSnoozed ? "opacity-30" : ""
+                                                    } ${isActive ? "bg-zinc-800/30" : ""}`}
+                                                >
+                                                    {/* Row 1: vendor name + urgency + SKU count */}
+                                                    <div className="flex items-center gap-2">
+                                                        <span className={`w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
+                                                        <span className={`text-xs font-mono font-semibold flex-1 truncate ${vSnoozed ? "line-through text-zinc-700" : isActive ? "text-zinc-100" : "text-zinc-300"}`}>
+                                                            {g.vendorName}
+                                                        </span>
+                                                        {hasPO && <span className="text-[10px] text-emerald-500 font-mono">✓ PO sent</span>}
+                                                        {checkedCount > 0 && !hasPO && (
+                                                            <span className="text-[10px] font-mono bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded-full border border-zinc-700">
+                                                                {checkedCount} sel
+                                                            </span>
+                                                        )}
+                                                        {criticalItems > 0 && !hasPO && (
+                                                            <span className="text-[9px] font-mono text-red-400 bg-red-500/10 px-1 py-0.5 rounded border border-red-500/20">
+                                                                {criticalItems} CRIT
+                                                            </span>
+                                                        )}
+                                                    </div>
+
+                                                    {/* Row 2: data metrics */}
+                                                    <div className="flex items-center gap-3 text-[9px] font-mono pl-4">
+                                                        <span className="text-zinc-500">{g.items.length} SKUs</span>
+                                                        {Number.isFinite(earliestRunway ?? NaN) && (
+                                                            <span className={
+                                                                (earliestRunway ?? 999) < leadTime
+                                                                    ? "text-red-400 font-semibold"
+                                                                    : (earliestRunway ?? 999) < 30
+                                                                    ? "text-amber-400"
+                                                                    : "text-zinc-500"
+                                                            }>
+                                                                {Math.round(earliestRunway ?? 0)}d runway
+                                                            </span>
+                                                        )}
+                                                        <span className="text-zinc-600">lead {leadTime}d</span>
+                                                        <span className="text-zinc-500">
+                                                            on-hand {totalOnHand.toLocaleString()}
+                                                        </span>
+                                                        {totalOnOrder > 0 && (
+                                                            <span className="text-emerald-600">+{totalOnOrder.toLocaleString()} on order</span>
+                                                        )}
+                                                        <span className="text-zinc-400 font-semibold ml-auto">
+                                                            ${totalNeed.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                                        </span>
+                                                    </div>
+
+                                                    {/* Row 3: affected SKUs */}
+                                                    {topSkus.length > 0 && (
+                                                        <div className="flex items-center gap-1 pl-4">
+                                                            <span className="text-[8px] font-mono text-zinc-700">affects</span>
+                                                            {topSkus.map(sku => (
+                                                                <span key={sku} className="text-[8px] font-mono text-zinc-600 bg-zinc-900 px-1 py-0.5 rounded border border-zinc-800 truncate max-w-[80px]">
+                                                                    {sku}
+                                                                </span>
+                                                            ))}
+                                                            {g.items.length > 3 && (
+                                                                <span className="text-[8px] text-zinc-700">+{g.items.length - 3} more</span>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </button>
+                                            );
+                                        })}
+
+                                        {/* Empty state */}
+                                        {vendorDropdownItems.length === 0 && vendorSearchQuery && (
+                                            <div className="px-4 py-6 text-center text-[10px] font-mono text-zinc-600">
+                                                No vendors matching "{vendorSearchQuery}"
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
 

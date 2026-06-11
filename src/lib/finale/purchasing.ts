@@ -2504,6 +2504,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // hasDeliverablePO) prune noise. Catches SKUs like RMC103 that
         // Finale's native engine silently drops on low-volume items.
         const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
+        const failedProductIds: string[] = [];
 
         if (normalizedVendorFilter) {
             const externalGroups = await this.getExternalReorderItems();
@@ -2564,13 +2565,26 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     };
                     if (shouldIncludePurchasingCandidate(candidate)) {
                         candidates.push(candidate);
+                    } else {
+                        // Track failures for second-pass ariaPOHistory check
+                        failedProductIds.push(p.productId);
                     }
                 }
 
                 if (!conn.pageInfo.hasNextPage) break;
                 cursor = conn.pageInfo.endCursor;
+                }
+
+                // ── Second pass STUB ──────────────────────────────────────────
+                // TODO(aria-2026-06-11): revive products that Finale drops silently
+                // but have strong PO history in our purchase_orders table.
+                // Requires batchLoadAriaPurchaseHistory() — not yet implemented.
+                // Keeping failedProductIds collected for when the function lands.
+                if (failedProductIds.length > 0) {
+                    console.log(`[finale] getPurchasingIntelligence: ${failedProductIds.length} products failed Finale gate (second-pass revival not wired yet)`);
+                }
+                // ── End second pass stub ──────────────────────────────────────
             }
-        }
 
         console.log(`[finale] getPurchasingIntelligence: ${candidates.length} candidates found`);
         if (candidates.length === 0) return [];

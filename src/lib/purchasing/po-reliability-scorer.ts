@@ -115,28 +115,58 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
 
     const orderIds = openPOs.map(po => po.orderId);
 
-    // Fetch PO lifecycle data + shipments in parallel.
-    const [poRes, shipRes] = await Promise.all([
-        supabase
-            .from("purchase_orders")
-            .select(
-                "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
-                "vendor_acknowledged_at, vendor_noncomm_at, po_sent_verified_at, po_sent_at"
-            )
-            .in("po_number", orderIds),
-        supabase
-            .from("shipments")
-            .select("po_numbers, status_category, delivered_at, last_checked_at, updated_at")
-            .overlaps("po_numbers", orderIds),
-    ]);
+    // Fetch PO lifecycle data + shipments in parallel. If Supabase is flaky
+    // (522 timeout, pool exhaustion, network blip), treat every PO as
+    // deliverable — fail-open so we don't accidentally show double-order
+    // recommendations for POs the vendor has acknowledged and is shipping.
+    let poRes: any = { data: [] };
+    let shipRes: any = { data: [] };
+    try {
+        const results = await Promise.all([
+            supabase
+                .from("purchase_orders")
+                .select(
+                    "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
+                    "vendor_acknowledged_at, vendor_noncomm_at, po_sent_verified_at, po_sent_at"
+                )
+                .in("po_number", orderIds),
+            supabase
+                .from("shipments")
+                .select("po_numbers, status_category, delivered_at, last_checked_at, updated_at")
+                .overlaps("po_numbers", orderIds),
+        ]);
+        poRes = results[0];
+        shipRes = results[1];
+    } catch (err: any) {
+        console.warn(`[po-reliability] Supabase fetch failed (${orderIds.length} POs), failing open:`, err?.message ?? err);
+        return openPOs.map(po => ({
+            ...po,
+            isDeliverable: true,
+            stuckReason: "" as const,
+            ageDays: daysSince(po.orderDate) ?? 0,
+        }));
+    }
 
-    // Index lifecycle data by PO number.
+    // Index lifecycle data by PO number. If Supabase returned an error
+    // object instead of rows (e.g. pool busy, connection reset), treat
+    // every PO as deliverable (fail-open).
+    if (poRes.error) {
+        console.warn(`[po-reliability] Supabase PO query returned error, failing open:`, poRes.error.message);
+        return openPOs.map(po => ({
+            ...po,
+            isDeliverable: true,
+            stuckReason: "" as const,
+            ageDays: daysSince(po.orderDate) ?? 0,
+        }));
+    }
+
     const poMap = new Map<string, PORow>();
     for (const row of (poRes.data ?? []) as PORow[]) {
         poMap.set(row.po_number, row);
     }
 
-    // Index shipment data by PO number.
+    // Index shipment data by PO number. If shipment query failed,
+    // continue with PO-only scoring — shipments are supplementary.
     const shipmentsByPO = new Map<string, ShipmentRow[]>();
     for (const s of (shipRes.data ?? []) as ShipmentRow[]) {
         for (const po of (s.po_numbers ?? []) as string[]) {

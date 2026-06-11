@@ -2,71 +2,101 @@ import { describe, expect, it } from "vitest";
 
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
 
-describe("shouldIncludePurchasingCandidate", () => {
-    it("admits products with a Finale reorder recommendation (original gate)", () => {
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 12,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 0,
-            finaleDemandPerDay: 0,
-        })).toBe(true);
+describe("shouldIncludePurchasingCandidate (v2.8 multi-signal OR gate)", () => {
+    describe("Finale signals", () => {
+        it("admits products with a Finale reorder recommendation (Path 1)", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 12,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+            })).toBe(true);
+        });
+
+        it("admits products with measurable Finale demand (Path 2)", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 18,
+                finaleDemandPerDay: 0,
+                finaleStockoutDays: 30,
+            })).toBe(true);
+
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0.67,
+            })).toBe(true);
+        });
+
+        it("rejects products when all Finale signals are zero", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 3,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+            })).toBe(false);
+
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+            })).toBe(false);
+        });
     });
 
-    it("admits products with measurable demand even when Finale skips reorder (v2.7)", () => {
-        // RMC103 case: Finale's demand velocity calculation stutters on
-        // low-volume items, reorderQuantityToOrder comes back null/0,
-        // but demandQuantity is positive — Aria should evaluate it.
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 0,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 18,
-            finaleDemandPerDay: 0,
-            finaleStockoutDays: 30,
-        })).toBe(true);
+    describe("Aria PO history (Path 3)", () => {
+        it("admits when our PO history shows orders", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ariaPOHistory: {
+                    hasHistory: true,
+                    totalQty: 2253,
+                    orderCount: 90,
+                    firstOrderDate: "2017-02-16",
+                    lastOrderDate: "2026-06-10",
+                    avgDailyRate: 0.53,
+                },
+            })).toBe(true);
+        });
 
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 0,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 18,
-            finaleDemandPerDay: 0,
-            finaleStockoutDays: null,
-        })).toBe(true);
+        it("rejects when no Finale signals AND no our PO history", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ariaPOHistory: {
+                    hasHistory: false,
+                    totalQty: 0,
+                    orderCount: 0,
+                    firstOrderDate: null,
+                    lastOrderDate: null,
+                    avgDailyRate: null,
+                },
+            })).toBe(false);
+        });
 
-        // demandPerDay positive — Finale tracking velocity
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 0,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 0,
-            finaleDemandPerDay: 0.67,
-        })).toBe(true);
-    });
-
-    it("rejects products with zero signals across the board", () => {
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 0,
-            finaleConsumptionQty: 0,
-            finaleDemandQty: 0,
-            finaleDemandPerDay: 0,
-        })).toBe(false);
-    });
-
-    it("rejects consumption-only with no demand signal (pure BOM, no retail)", () => {
-        // BOM components with consumption but no demand should NOT admit
-        // through the retail pipeline — the BOM pipeline handles them.
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 0,
-            finaleConsumptionQty: 3,
-            finaleDemandQty: 0,
-            finaleDemandPerDay: 0,
-        })).toBe(false);
-    });
-
-    it("admits when both reorder and demand are positive", () => {
-        expect(shouldIncludePurchasingCandidate({
-            finaleReorderQty: 60,
-            finaleConsumptionQty: 10,
-            finaleDemandQty: 50,
-            finaleDemandPerDay: 1.7,
-        })).toBe(true);
+        it("admits when all signals zero but PO history has data", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ariaPOHistory: {
+                    hasHistory: true,
+                    totalQty: 100,
+                    orderCount: 5,
+                    firstOrderDate: "2025-01-01",
+                    lastOrderDate: "2025-06-01",
+                    avgDailyRate: 0.3,
+                },
+            })).toBe(true);
+        });
     });
 });

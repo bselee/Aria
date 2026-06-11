@@ -471,7 +471,7 @@ export class SlackRequestDetector {
                         const po = await (this.finale as any).getOrderDetails?.(orderId);
                         if (po && po.orderId) {
                             await this.addEyesReaction(channelId, ts).catch(() => {});
-                            await this.postSinglePOInfo(channelId, ts, po);
+                            await this.postSinglePOInfo(channelId, channelName, ts, po);
                             await this.replaceWithAck(channelId, ts).catch(() => {});
                         }
                     } catch {
@@ -526,6 +526,7 @@ export class SlackRequestDetector {
                     // Post threaded reply with PO info
                     await this.postOrderInfo(
                         channelId,
+                        channelName,
                         ts,
                         displayToken,
                         onOrderPOs,
@@ -771,6 +772,7 @@ export class SlackRequestDetector {
      */
     private async postOrderInfo(
         channelId: string,
+        channelName: string,
         threadTs: string,
         sku: string,
         pos: any[],
@@ -807,25 +809,23 @@ export class SlackRequestDetector {
 
         const text = lines.join("\n");
 
-        try {
-            await this.reader.chat.postMessage({
-                channel: channelId,
-                thread_ts: threadTs,
-                text,
-                mrkdwn: true,
-                unfurl_links: false,
-                unfurl_media: false,
-            });
+        // HERMIA(2026-06-11): DISABLED auto-post as Bill. Now sends draft
+        // to Bill via TG for review/approval before posting. Bot still reacts
+        // with 👀 (via addEyesReaction) so the requester knows we saw it.
+        // Bill reviews the draft and tells Hermia to post, or posts himself.
+        const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
+        await sendTelegramNotify(
+            `[Slack Draft]\n` +
+            `#${channelName} — reply to ${sku} request\n` +
+            `Draft:\n${text}\n` +
+            `→ ${slackLink}\n` +
+            `Say "post it" to approve or edit first.`
+        ).catch(() => {});
 
-            console.log(
-                `[slack-detector] Thread reply: ${sku} → ${pos.length} PO(s)`,
-            );
-        } catch (err: any) {
-            console.warn(
-                `[slack-detector] Thread reply failed: ${err.message}`,
-                );
-                }
-                }
+        console.log(
+            `[slack-detector] Draft sent to TG: ${sku} → ${pos.length} PO(s) (NOT auto-posted)`,
+        );
+    }
 
                 /**
                 * Post a threaded reply when a PO NUMBER (not SKU) is referenced.
@@ -839,6 +839,7 @@ export class SlackRequestDetector {
                 */
                 private async postSinglePOInfo(
                 channelId: string,
+                channelName: string,
                 threadTs: string,
                 po: any,
                 ): Promise<void> {
@@ -886,23 +887,19 @@ export class SlackRequestDetector {
                 return `*${po.orderId}${stateLabel} — expected ${expected}, ${totalReceived}/${totalOrdered} received (${items.length} items: ${itemNames})*\n<${url}|Finale>`;
                 })();
 
-                try {
-                await this.reader.chat.postMessage({
-                    channel: channelId,
-                    thread_ts: threadTs,
-                    text,
-                    mrkdwn: true,
-                    unfurl_links: false,
-                    unfurl_media: false,
-                });
+                // HERMIA(2026-06-11): DISABLED auto-post as Bill. Send draft to TG for approval.
+                const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
+                await sendTelegramNotify(
+                    `[Slack Draft]\n` +
+                    `#${channelName} — PO# ${po.orderId} lookup reply\n` +
+                    `Draft:\n${text}\n` +
+                    `→ ${slackLink}\n` +
+                    `Say "post it" to approve or edit first.`
+                ).catch(() => {});
+
                 console.log(
-                    `[slack-detector] Thread reply PO# ${po.orderId}: ${shippedLine ? "shipped" : po.statusId}`,
+                    `[slack-detector] Draft sent to TG: PO# ${po.orderId} (NOT auto-posted)`,
                 );
-                } catch (err: any) {
-                console.warn(
-                    `[slack-detector] PO thread reply failed: ${err.message}`,
-                );
-                }
                 }
 
     // ── Persistence ──────────────────────────────────────────────────────
