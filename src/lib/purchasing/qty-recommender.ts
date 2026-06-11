@@ -25,7 +25,7 @@ import { roundToCleanQty } from "./cognitive-round";
 //     (lead time override, target cover, MOQ tri-state, overbuy review flags)
 //   v2.2-cognitive-round-2026-05-06 — cognitive/historical PO qty rounding
 //   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
-export const QTY_FORMULA_VERSION = "v2.6-historical-floor-2026-06-11";
+export const QTY_FORMULA_VERSION = "v2.7-capped-30d-floor-2026-06-11";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -394,17 +394,27 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     const { increment: orderIncrementQty, source: orderIncrementSource } = effectiveOrderIncrement(input);
     let suggestedQty = 0;
     const min30DaySupply = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
+    // v2.7 — cap the 30-day supply floor at 2× raw need to prevent massive
+    // overbuys on slow-moving SKUs where you already have plenty of runway.
+    // RMC102 case: raw need 18, 30d floor 59 (3.3× overbuy, $1,609 excess).
+    // With cap: floor becomes min(59, 18*2)=36, cognitive-snaps to 40.
+    const cappedMin30 = rawNeededEaches > 0
+        ? Math.min(min30DaySupply, Math.ceil(rawNeededEaches * 2))
+        : min30DaySupply;
     if (rawNeededEaches > 0) {
         let snapped = snapToIncrement(rawNeededEaches, orderIncrementQty);
         let snappedQty = Math.ceil(snapped);
         const fallbackVendor = input.vendorName ?? "vendor";
 
-        if (snappedQty < min30DaySupply) {
-            snapped = snapToIncrement(min30DaySupply, orderIncrementQty);
+        if (snappedQty < cappedMin30) {
+            snapped = snapToIncrement(cappedMin30, orderIncrementQty);
             snappedQty = Math.ceil(snapped);
+            const wasUncapped = min30DaySupply !== cappedMin30;
             trace.push({
                 step: "pack_round",
-                detail: `Bumped to meet 30-day supply minimum of ${min30DaySupply} and rounded to nearest ${orderIncrementQty || 1}-pack → ${snappedQty}`,
+                detail: wasUncapped
+                    ? `Bumped to 2×-capped supply floor of ${cappedMin30} (raw 30d supply was ${min30DaySupply}, capped to avoid overbuy) and rounded to nearest ${orderIncrementQty || 1}-pack → ${snappedQty}`
+                    : `Bumped to meet 30-day supply minimum of ${min30DaySupply} and rounded to nearest ${orderIncrementQty || 1}-pack → ${snappedQty}`,
                 value: snappedQty,
             });
         } else {

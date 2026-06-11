@@ -2497,10 +2497,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
 
         // ── Step 1: Page productViewConnection — presence signal only ──
-        // Resale ordering should only process products Finale is explicitly
-        // flagging for reorder. Finale's demandQuantity mirrors BOM consumption
-        // for hundreds of component SKUs, and that workload belongs to the
-        // separate getBOMDemand() pipeline.
+        // v2.7 (2026-06-11): Broadened candidate admission. Previously only
+        // Finale-flagged reorder qty admitted a SKU. Now also admits any
+        // product with measurable demand — Aria's engine evaluates it and
+        // downstream filters (party resolution, DNR, dailyRate===0,
+        // hasDeliverablePO) prune noise. Catches SKUs like RMC103 that
+        // Finale's native engine silently drops on low-volume items.
         const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
 
         if (normalizedVendorFilter) {

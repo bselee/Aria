@@ -470,7 +470,7 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the current recommender version", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.6-historical-floor-2026-06-11");
+        expect(QTY_FORMULA_VERSION).toBe("v2.7-capped-30d-floor-2026-06-11");
     });
 });
 
@@ -525,7 +525,7 @@ describe("recommendQty — cognitive rounding integration", () => {
     });
 
     it("formula version is bumped to current", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.6-historical-floor-2026-06-11");
+        expect(QTY_FORMULA_VERSION).toBe("v2.7-capped-30d-floor-2026-06-11");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
@@ -539,22 +539,22 @@ describe("recommendQty — cognitive rounding integration", () => {
 });
 
 describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation checks", () => {
-    it("enforces at least a 30-day supply floor", () => {
-        // Daily rate = 5. CoverDays would normal suggest small but we want a 30d supply (150 units).
+    it("enforces a 2×-capped 30-day supply floor (v2.7 — prevents overbuys)", () => {
+        // Daily rate = 5. CoverDays would normally suggest 150 target, rawNeed = 10.
+        // The uncapped 30d floor was 150 (15× overbuy). v2.7 caps it at 2× raw need = 20.
         const result = recommendQty(baseInput({
             dailyRate: 5,
             stockOnHand: 140, // very close to lead time + cover target
             leadTimeDays: 14,
             coverBufferDays: 16, // total target = 5 * 30 = 150 target eaches. rawNeed = 10 eaches.
         }));
-        // 30d supply floor: 5 * 30 = 150.
-        // raw needed is 10, but floor bumps it to 150!
-        expect(result.suggestedQty).toBe(150);
+        // v2.7 capped floor: min(150, 10*2) = 20. 10 < 20, so bumped to 20.
+        expect(result.suggestedQty).toBe(20);
         const packStep = result.provenance.find(p => p.step === "pack_round");
-        expect(packStep?.detail).toContain("30-day supply minimum");
+        expect(packStep?.detail).toContain("2×-capped supply floor");
     });
 
-    it("snaps 30-day supply floor UP to nearest pack multiple", () => {
+    it("pack snap satisfies the capped floor without extra bump", () => {
         const result = recommendQty(baseInput({
             dailyRate: 5,
             stockOnHand: 140,
@@ -562,8 +562,9 @@ describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation c
             coverBufferDays: 16,
             orderIncrementQty: 24, // Case pack = 24
         }));
-        // 30d floor = 150. Snap to nearest 24-pack >= 150 is 168.
-        expect(result.suggestedQty).toBe(168);
+        // rawNeed = 10, cappedMin30 = 20, snapToIncrement(10, 24) = 24.
+        // 24 >= 20 → pack snap already satisfies floor.
+        expect(result.suggestedQty).toBe(24);
     });
 
     it("adds a review flag when suggested quantity deviates by more than 50% from last order", () => {
