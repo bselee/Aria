@@ -25,7 +25,7 @@ import { roundToCleanQty } from "./cognitive-round";
 //     (lead time override, target cover, MOQ tri-state, overbuy review flags)
 //   v2.2-cognitive-round-2026-05-06 — cognitive/historical PO qty rounding
 //   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
-export const QTY_FORMULA_VERSION = "v2.3-vendor-fallback-increments-2026-05-07";
+export const QTY_FORMULA_VERSION = "v2.6-historical-floor-2026-06-11";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -115,6 +115,24 @@ export interface RecommenderInput {
      * `historicalLineQtys`. Set to null to disable the cap.
      */
     historicalCapMultiple?: number | null;
+
+    /**
+     * v2.6 (2026-06-11) — Bill: "look at past orders — if we always order
+     * 20 from Faust, the system should know that." Full per-SKU purchase
+     * history (most-recent first). When 3+ entries are consistent (same
+     * value or within 20%), the mode becomes a HARD ordering floor so a
+     * PO for 5 units never goes to a vendor that always ships 20.
+     * Distinct from `historicalLineQtys` (vendor-wide, for cognitive rounding).
+     */
+    skuPurchaseHistory?: number[];
+
+    /**
+     * v2.6 — explicit per-vendor standard order quantity from
+     * `vendor_reorder_policies.standard_order_qty`. "For Faust, always
+     * order 20." Manual override that takes priority over the historical
+     * auto-detect. Null = use historical signal.
+     */
+    standardOrderQty?: number | null;
 }
 
 export interface ProvenanceStep {
@@ -150,6 +168,8 @@ export interface RecommenderResult {
     roundingMethod?: "cognitive" | "historical" | "vendor_explicit" | null;
     /** v2.2 — two alternative snap targets for the UI override dropdown. */
     roundingAlternatives?: number[];
+    /** v2.6 — true when historical pattern or standard_order_qty forced a qty bump. */
+    historicalFloorApplied: boolean;
 }
 
 function urgencyFor(adjustedRunwayDays: number, leadTimeDays: number): Urgency {
@@ -549,7 +569,74 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             });
         }
     }
-    // ── Step 8.7: historical purchase deviation check ──────────────────────
+    // ── Step 8.7: historical purchase floor (v2.6) ─────────────────────────
+    // Bill: "look at past orders — if we always order 20 from Faust,
+    // the system should know that." Previously this was advisory-only
+    // (set reviewRequired flag). Now: when a vendor has a consistent
+    // order pattern (3+ POs, same qty or within 20%), use the mode as
+    // a HARD ordering floor. A PO for 5 units never goes to a vendor
+    // that always ships 20.
+    let historicalFloorApplied = false;
+
+    // v2.6a: explicit standard_order_qty override (takes priority)
+    const standardOrderQty = input.standardOrderQty ?? null;
+    if (standardOrderQty && standardOrderQty > 0 && suggestedQty > 0 && suggestedQty < standardOrderQty) {
+        const beforeQty = suggestedQty;
+        suggestedQty = standardOrderQty;
+        historicalFloorApplied = true;
+        trace.push({
+            step: "standard_order_floor",
+            detail: `Bumped from ${beforeQty} to ${standardOrderQty} — vendor standard order qty (explicit policy)`,
+            value: standardOrderQty,
+        });
+    }
+
+    // v2.6b: auto-detect consistent SKU purchase pattern
+    if (!historicalFloorApplied && suggestedQty > 0) {
+        const history = (input.skuPurchaseHistory ?? []).filter(q => q > 0);
+        if (history.length >= 3) {
+            // Find mode — most common qty in recent purchases
+            const freq = new Map<number, number>();
+            for (const q of history) freq.set(q, (freq.get(q) || 0) + 1);
+            const sorted = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]);
+            const [modeQty, modeCount] = sorted[0];
+            // Consistent = mode appears in 60%+ of purchases
+            const consistencyPct = (modeCount / history.length) * 100;
+            if (consistencyPct >= 60 && suggestedQty < modeQty) {
+                const beforeQty = suggestedQty;
+                suggestedQty = modeQty;
+                historicalFloorApplied = true;
+                trace.push({
+                    step: "historical_floor",
+                    detail: `Bumped from ${beforeQty} to ${modeQty} — vendor consistently orders ${modeQty} (${consistencyPct.toFixed(0)}% of ${history.length} past POs)`,
+                    value: modeQty,
+                });
+            }
+        }
+    }
+
+    // v2.6c: lastPurchaseQty single-point floor (fallback when no multi-PO history)
+    if (!historicalFloorApplied && suggestedQty > 0) {
+        const lastQty = input.lastPurchaseQty ?? null;
+        const history = input.skuPurchaseHistory ?? [];
+        if (lastQty && lastQty > 0 && suggestedQty < lastQty && history.length === 0) {
+            // Only apply single-point floor if we don't have multi-point history
+            // (avoids double-enforcing when both lastPurchaseQty and history exist)
+            const deviationPct = Math.round(((lastQty - suggestedQty) / lastQty) * 100);
+            if (deviationPct >= 50) {
+                const beforeQty = suggestedQty;
+                suggestedQty = lastQty;
+                historicalFloorApplied = true;
+                trace.push({
+                    step: "last_purchase_floor",
+                    detail: `Bumped from ${beforeQty} to ${lastQty} — last order was ${lastQty} units (${deviationPct}% below)`,
+                    value: lastQty,
+                });
+            }
+        }
+    }
+
+    // Still log the deviation as a dashboard review reason
     const lastPurchaseQty = input.lastPurchaseQty ?? null;
     if (suggestedQty > 0 && lastPurchaseQty !== null && lastPurchaseQty > 0) {
         const deviationPct = Math.round(((suggestedQty - lastPurchaseQty) / lastPurchaseQty) * 100);
@@ -611,5 +698,6 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         reviewReasons,
         roundingMethod,
         roundingAlternatives,
+        historicalFloorApplied,
     };
 }

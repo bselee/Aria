@@ -469,8 +469,8 @@ describe("recommendQty — vendor reorder policy", () => {
         expect(result.reviewReasons).toEqual([]);
     });
 
-    it("formula version reflects the v2.3 vendor fallback increment bump", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.3-vendor-fallback-increments-2026-05-07");
+    it("formula version reflects the current recommender version", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.6-historical-floor-2026-06-11");
     });
 });
 
@@ -524,8 +524,8 @@ describe("recommendQty — cognitive rounding integration", () => {
         expect(result.moqApplied).toBe(true);
     });
 
-    it("formula version is bumped to v2.3", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.3-vendor-fallback-increments-2026-05-07");
+    it("formula version is bumped to current", () => {
+        expect(QTY_FORMULA_VERSION).toBe("v2.6-historical-floor-2026-06-11");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
@@ -576,6 +576,70 @@ describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation c
         }));
         expect(result.reviewRequired).toBe(true);
         expect(result.reviewReasons.join(" ")).toContain("deviates significantly from last order");
+    });
+});
+
+describe("recommendQty — v2.6 historical order floor", () => {
+    // Helper: inputs that produce a small positive recommendation
+    // so the historical floor actually fires (need > 0, need < 20).
+    const lowNeedInput = {
+        dailyRate: 0.3,
+        stockOnHand: 5,
+        stockOnOrder: 0,
+        leadTimeDays: 14,
+        coverBufferDays: 20,
+    };
+
+    it("bumps qty to standard_order_qty when below explicit policy floor", () => {
+        const result = recommendQty(baseInput({
+            ...lowNeedInput,
+            standardOrderQty: 20,
+        }));
+        expect(result.historicalFloorApplied).toBe(true);
+        expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
+        expect(result.provenance.some(s => s.step === "standard_order_floor")).toBe(true);
+    });
+
+    it("auto-detects consistent SKU pattern and bumps to mode", () => {
+        const result = recommendQty(baseInput({
+            ...lowNeedInput,
+            skuPurchaseHistory: [20, 20, 20, 15, 20], // mode = 20 (80% consistency)
+        }));
+        expect(result.historicalFloorApplied).toBe(true);
+        expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
+        expect(result.provenance.some(s => s.step === "historical_floor")).toBe(true);
+    });
+
+    it("does NOT bump when history is inconsistent (no clear pattern)", () => {
+        const result = recommendQty(baseInput({
+            ...lowNeedInput,
+            skuPurchaseHistory: [5, 10, 20, 15, 8], // no mode ≥ 60%
+        }));
+        expect(result.historicalFloorApplied).toBe(false);
+    });
+
+    it("does NOT bump when suggested qty is already above the historical floor", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 2,
+            stockOnHand: 0,
+            stockOnOrder: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 60,
+            standardOrderQty: 20,
+        }));
+        expect(result.suggestedQty).toBeGreaterThan(20);
+        expect(result.historicalFloorApplied).toBe(false);
+    });
+
+    it("uses lastPurchaseQty as fallback floor when no multi-PO history exists", () => {
+        const result = recommendQty(baseInput({
+            ...lowNeedInput,
+            lastPurchaseQty: 20,
+            skuPurchaseHistory: [],
+        }));
+        expect(result.historicalFloorApplied).toBe(true);
+        expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
+        expect(result.provenance.some(s => s.step === "last_purchase_floor")).toBe(true);
     });
 });
 

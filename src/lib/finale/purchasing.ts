@@ -24,6 +24,12 @@ import {
 import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
 import {
+    enrichOpenPOs,
+    hasDeliverablePO,
+    deliverableStockOnOrder,
+    type OpenPOReliable,
+} from "../purchasing/po-reliability-scorer";
+import {
     FinaleProductsClient,
     EXCLUDED_VENDOR_PATTERN,
     _partyCacheShared,
@@ -65,6 +71,21 @@ const MAX_VENDOR_LEAD_TIME_DAYS = 90;
  * by party ID (the canonical identifier) rather than vendor name (which can drift).
  */
 let _vendorPartyIdCache: Map<string, string> = new Map();
+
+/**
+ * Per-PO date cache for lead-time temporal analysis. Key = vendor name,
+ * value = array of { receiveDate, days } for each completed PO in the lookback
+ * window. Populated alongside _vendorLeadTimeRawCache in getVendorLeadTimeHistory()
+ * — same GraphQL call, zero extra API overhead.
+ *
+ * Used by lead-time-tracker to compute:
+ *   - spread_days: calendar days between earliest and latest receiveDate (true PO cadence signal)
+ *   - first_po_date / last_po_date: actual temporal boundaries
+ *   - avg_days_recent_30: trend signal (is the vendor getting faster or slower?)
+ */
+interface LeadTimePOEntry { receiveDate: string; days: number; }
+let _vendorLeadTimeDateCache: Map<string, LeadTimePOEntry[]> = new Map();
+let _vendorLeadTimeDateCacheAt = 0;
 
 export class FinalePurchasingClient extends FinaleProductsClient {
     constructor() {
@@ -1156,6 +1177,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         return _vendorLeadTimeRawCache;
     }
 
+    /**
+     * Per-PO dated entries from the last getVendorLeadTimeHistory() call.
+     * Used by lead-time-tracker to compute true temporal spread (calendar days
+     * between first and last receiveDate) and recent-30d trend signal.
+     * Empty map when cache is cold or stale (>4h).
+     */
+    getLeadTimeDateEntries(): Map<string, Array<{ receiveDate: string; days: number }>> {
+        if (Date.now() - _vendorLeadTimeDateCacheAt > VENDOR_LEAD_TIME_RAW_TTL) return new Map();
+        return _vendorLeadTimeDateCache;
+    }
+
     async getVendorLeadTimeHistory(daysBack: number = 365): Promise<Map<string, number>> {
         try {
             const now = new Date();
@@ -1207,6 +1239,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             // Group lead times by vendor
             const byVendor = new Map<string, number[]>();
             const partyIds = new Map<string, string>(); // vendor name → party ID (from same query, zero extra calls)
+            const dateEntries = new Map<string, LeadTimePOEntry[]>(); // vendor name → dated PO entries (temporal analysis)
             for (const edge of edges) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
@@ -1229,6 +1262,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 if (days < 0 || days > 365) continue; // sanity check
                 if (!byVendor.has(vendor)) byVendor.set(vendor, []);
                 byVendor.get(vendor)!.push(days);
+                // Capture dated entry for temporal analysis (spread_days, dates, recent-30d trend)
+                if (!dateEntries.has(vendor)) dateEntries.set(vendor, []);
+                dateEntries.get(vendor)!.push({ receiveDate: po.receiveDate, days });
             }
 
             // Compute median for vendors with ≥ 2 data points (was 3; monthly-cadence
@@ -1257,6 +1293,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             _vendorOnTimeRateCache = onTimeMap;
             _vendorOnTimeRateCacheAt = Date.now();
             _vendorPartyIdCache = partyIds;
+            _vendorLeadTimeDateCache = dateEntries;
+            _vendorLeadTimeDateCacheAt = Date.now();
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
@@ -1781,7 +1819,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
     async getProductActivity(sku: string, daysBack: number): Promise<{
         purchasedQty: number;
         soldQty: number;
-        openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
+        openPOs: Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }>;
         stockOnHand: number | null;
         stockAvailable: number | null;
         lastPurchaseDate: string | null;
@@ -1838,7 +1876,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     sort: [{ field: "orderDate", mode: "desc" }]
                 ) {
                     edges { node {
-                        orderId status orderDate
+                        orderId status orderDate dueDate
                         itemList(first: 20) {
                             edges { node { product { productId } quantity } }
                         }
@@ -1894,16 +1932,24 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 }
             }
 
-            const openPOs: Array<{ orderId: string; quantity: number; orderDate: string }> = [];
+            const openPOs: Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }> = [];
             for (const edge of data?.committedPOs?.edges || []) {
                 const po = edge.node;
                 if (po.status !== 'Committed' && po.status !== 'Locked') continue;
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
+                        const toIsoDate = (d: unknown): string | null => {
+                            if (!d || typeof d !== 'string') return null;
+                            const parsed = new Date(d);
+                            // Finale returns "M/D/YYYY" or ISO — normalize to YYYY-MM-DD
+                            return isNaN(parsed.getTime()) ? null
+                                : parsed.toISOString().split('T')[0];
+                        };
                         openPOs.push({
                             orderId: po.orderId,
                             quantity: parseFinaleNumber(ie.node.quantity),
                             orderDate: po.orderDate || '',
+                            dueDate: toIsoDate(po.dueDate),
                         });
                         break;
                     }
@@ -1927,7 +1973,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             };
         } catch (err: any) {
             console.error(`[finale] getProductActivity error for ${sku}:`, err.message);
-            return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: null, stockAvailable: null, lastPurchaseDate: null, firstPurchaseDate: null, purchaseCount: 0, purchaseDates: [], purchaseQtys: [] };
+            return { purchasedQty: 0, soldQty: 0, openPOs: [] as Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }>, stockOnHand: null, stockAvailable: null, lastPurchaseDate: null, firstPurchaseDate: null, purchaseCount: 0, purchaseDates: [], purchaseQtys: [] };
         }
     }
 
@@ -2120,13 +2166,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const bomPolicy = bomVendorPolicies.get(partyId) ?? null;
 
                     const stockOnHand = compActivity.stockOnHand ?? 0;
-                    const rawStockOnOrder = compActivity.openPOs.reduce(
-                        (sum, po) => sum + (po.quantity || 0),
-                        0,
-                    );
-                    // Discount stockOnOrder by the vendor's historical on-time rate.
+
+                    // HERMIA(2026-06-10): Enrich open POs with delivery reliability data.
+                    // Stuck/unacknowledged/overdue POs don't count toward on-order coverage.
+                    const bomEnrichedPOs: OpenPOReliable[] = compActivity.openPOs.length > 0
+                        ? await enrichOpenPOs(compActivity.openPOs)
+                        : [];
+                    const rawStockOnOrder = deliverableStockOnOrder(bomEnrichedPOs);
+                    // Discount deliverable stockOnOrder by the vendor's historical on-time rate.
                     // 100% on-time → no discount. 60% on-time → trust only 60% of
-                    // open POs as supply we'll have when we need it.
+                    // DELIVERABLE open POs as supply we'll have when we need it.
                     const onTimeRate = this.getVendorOnTimeRate(groupName);
                     const stockOnOrder = rawStockOnOrder * onTimeRate;
 
@@ -2637,17 +2686,29 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
                     const stockOnHand = activity.stockOnHand ?? restStock;
 
-                    // Open PO supply — raw sum used as a preliminary value.
-                    // For bulk vendors the effective value is computed below after policy lookup.
-                    const rawStockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantity, 0);
+                    // HERMIA(2026-06-10): Enrich open POs with Supabase lifecycle data so
+                    // we can distinguish "in transit" POs from stuck/unacknowledged ones.
+                    // Only DELIVERABLE POs should remove a SKU from Ordering.
+                    const enrichedOpenPOs: OpenPOReliable[] = activity.openPOs.length > 0
+                        ? await enrichOpenPOs(activity.openPOs)
+                        : [];
+                    const stuckPOs = enrichedOpenPOs.filter(po => !po.isDeliverable);
+                    if (stuckPOs.length > 0) {
+                        const stuckSummary = stuckPOs.map(po =>
+                            `${po.orderId}(${po.stuckReason}/${po.ageDays}d)`,
+                        ).join(", ");
+                        console.log(`[purchasing] ${sku}: ${stuckPOs.length} stuck PO(s) — ${stuckSummary} — SKU remains orderable`);
+                    }
 
-                    // DECISION(2026-05-19, Will): once a PO is committed for this SKU it
-                    // moves to "Purchasing Watch" and exits the Ordering surface. Even if
-                    // velocity/runway math still says we'd want more, we surface that as
-                    // an arrival-risk in Active Purchases / build-risk — not as a fresh
-                    // reorder. The Ordering panel is "what do I need to buy" — if a PO
-                    // is already out the door, the answer is "nothing right now."
-                    if (activity.openPOs.length > 0) continue;
+                    // Open PO supply — ONLY count deliverable POs toward coverage.
+                    // Bulk vendor effective value is recomputed below after policy lookup.
+                    const rawStockOnOrder = deliverableStockOnOrder(enrichedOpenPOs);
+
+                    // DECISION(2026-06-10, Will + Hermia): a PO only exits this SKU from
+                    // Ordering when it's genuinely deliverable — sent, with ack/tracking
+                    // or movement evidence. Stuck/unacknowledged/overdue POs do NOT count;
+                    // the SKU stays in the Ordering panel so Will can reorder if needed.
+                    if (hasDeliverablePO(enrichedOpenPOs)) continue;
 
                     // Step 4: velocity + runway
                     const purchaseVelocity = activity.purchasedQty / daysBack;
@@ -2801,6 +2862,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         favoriteBatches: reorderPolicy?.favoriteBatches ?? null,
                         // v2.4 — actual quantity ordered last time for exact SKU deviation check
                         lastPurchaseQty: activity.purchaseQtys[0] ?? null,
+                        // v2.6 — full SKU purchase history for consistent-pattern floor detection
+                        skuPurchaseHistory: activity.purchaseQtys.length > 1 ? activity.purchaseQtys : undefined,
+                        // v2.6 — explicit vendor standard order qty override
+                        standardOrderQty: reorderPolicy?.standardOrderQty ?? null,
                     } as const;
                     const rec = recommendQty(recInputs);
 

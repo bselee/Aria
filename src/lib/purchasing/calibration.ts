@@ -328,6 +328,12 @@ export interface VendorReorderPolicy {
     typicalLegCount: number | null;
     /** Typical days between consecutive legs (pre-fills /legs suggested dates). */
     typicalLegIntervalDays: number | null;
+    /**
+     * v2.6 — per-vendor standard order quantity. When set, the
+     * recommender enforces this as a HARD floor on suggestedQty.
+     * "Faust always gets 20." NULL = use historical auto-detect.
+     */
+    standardOrderQty: number | null;
 }
 
 /**
@@ -349,7 +355,7 @@ export async function loadVendorReorderPolicies(
     try {
         const { data } = await db
             .from("vendor_reorder_policies")
-            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days")
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days, standard_order_qty")
             .in("vendor_party_id", vendorPartyIds);
         for (const row of data ?? []) {
             map.set(row.vendor_party_id, parseVendorPolicyRow(row));
@@ -376,7 +382,7 @@ export async function loadAllVendorReorderPolicies(): Promise<Map<string, Vendor
     try {
         const { data } = await db
             .from("vendor_reorder_policies")
-            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days");
+            .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days, standard_order_qty");
         for (const row of data ?? []) {
             map.set(row.vendor_party_id, parseVendorPolicyRow(row));
         }
@@ -403,6 +409,7 @@ function parseVendorPolicyRow(row: any): VendorReorderPolicy {
         isBulkVendor: Boolean(row.is_bulk_vendor),
         typicalLegCount: row.typical_leg_count ?? null,
         typicalLegIntervalDays: row.typical_leg_interval_days ?? null,
+        standardOrderQty: row.standard_order_qty ?? null,
     };
 }
 
