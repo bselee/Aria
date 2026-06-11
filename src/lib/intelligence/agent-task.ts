@@ -29,7 +29,8 @@ export type AgentTaskType =
     | "code_change"
     | "stuck_source"
     | "ci_failure"
-    | "tripwire_violation";
+    | "tripwire_violation"
+    | "jit_order_trigger";
 
 export type AgentTaskStatus =
     | "PENDING"

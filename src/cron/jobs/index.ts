@@ -151,8 +151,23 @@ defineJob({
 
         lines.push(`> Order by the dates above. POs placed outside the trigger window are premature; placing too late = build-block.`);
 
+        // Task-first: every trigger becomes a durable, owned, deduped task in the
+        // control plane BEFORE we notify. The hub is now the system of record;
+        // Telegram is a view annotated with tracking state. Best-effort — a hub
+        // failure never suppresses the alert.
+        const { routeJitTriggersToHub } = await import("@/lib/intelligence/jit-tasks");
+        const routed = await routeJitTriggersToHub(triggers, todayISO);
+        const trackingNote =
+            routed.failed > 0
+                ? `\n_Tracked in /tasks: ${routed.created} new, ${routed.deduped} recurring, ${routed.failed} not recorded (hub unavailable)._`
+                : `\n_Tracked in /tasks: ${routed.created} new, ${routed.deduped} recurring. Open until you order or 14d lapse._`;
+        lines.push(trackingNote);
+
         await sendCriticalTelegramNotify(lines.join("\n"));
-        console.log(`[jit-forward-projection] Fired alert for ${triggers.length} components.`);
+        console.log(
+            `[jit-forward-projection] ${triggers.length} components → hub(` +
+            `new=${routed.created} recurring=${routed.deduped} failed=${routed.failed}); alert sent.`,
+        );
     },
     // Budget: reads Supabase once, sends one Telegram — generous default is fine.
     budget: { durationMs: 60_000 },

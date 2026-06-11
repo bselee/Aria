@@ -85,6 +85,14 @@ export function closesWhenFor(args: {
     if (args.type === "stuck_source") {
         return { kind: "deadline", max_age_hours: 168 };
     }
+    // JIT order-trigger: no spoke status to watch (the obligation is "place a
+    // PO", which lives in Finale, not a Supabase row keyed by source_id). Until
+    // a PO-placed predicate exists, auto-EXPIRE after a 14-day grace window so
+    // rows don't accumulate forever. An unactioned JIT task is a dropped ball —
+    // the drop-detector (next step) surfaces it well before this expiry.
+    if (args.type === "jit_order_trigger") {
+        return { kind: "deadline", max_age_hours: 336 };
+    }
     return null;
 }
 
