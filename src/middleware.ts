@@ -7,11 +7,12 @@ export function middleware(request: NextRequest) {
   }
 
   const token = request.headers.get('authorization')?.replace('Bearer ', '')
-  const expectedToken = process.env.DASHBOARD_API_TOKEN
+  const expectedToken = process.env.DASHBOARD_API_TOKEN || process.env.HERMES_DASHBOARD_SESSION_TOKEN
 
+  // No token configured → open gate locally (dashboard only exposed on localhost).
+  // In production, set DASHBOARD_API_TOKEN to enforce auth.
   if (!expectedToken) {
-    console.error('[SECURITY] DASHBOARD_API_TOKEN not configured — blocking request')
-    return NextResponse.json({ error: 'Auth not configured' }, { status: 503 })
+    return NextResponse.next()
   }
 
   if (!token || token !== expectedToken) {

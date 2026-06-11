@@ -4,7 +4,7 @@
  *          Type-checking is performed separately via `npm run typecheck`.
  * @author  Will / Antigravity
  * @created 2026-03-09
- * @updated 2026-03-09
+ * @updated 2026-06-11
  *
  * DECISION(2026-03-09): The project has ~112 TS files importing heavy typed
  * dependencies (telegraf, @googleapis/*, @slack/bolt, pinecone, openai, etc.).
@@ -15,6 +15,38 @@
  * Alternative considered: splitting the monolith files — deferred because
  * the CLI/lib boundary fix is sufficient for now.
  */
+
+/**
+ * Regex for packages that require Node built-ins (http, https, net, tls,
+ * crypto, stream, etc.) and MUST be externalized from the webpack server
+ * bundle. Next.js's `serverExternalPackages` only handles top-level packages
+ * in node_modules/. These patterns catch nested transitive dependencies
+ * from @googleapis/*, agent-base, and other Node-native stacks.
+ *
+ * HERMIA(2026-06-11): Without this, webpack tries to bundle jws/jwa/
+ * https-proxy-agent and fails because it can't resolve Node built-ins.
+ */
+const NODE_RUNTIME_EXTERNALS = [
+    /^@googleapis\//,
+    /^agent-base/,
+    /^https?-proxy-agent/,
+    /^gaxios/,
+    /^google-auth-library/,
+    /^googleapis-common/,
+    /^jws\/?/,
+    /^jwa\/?/,
+    /^buffer-equal-constant-time/,
+    /^ecdsa-sig-formatter/,
+    /^pg\/?/,
+    /^pgpass/,
+    /^pg-connection-string/,
+    /^pg-pool\/?/,
+    /^pg-protocol/,
+    /^pg-int8/,
+    /^pg-types/,
+    /^@supabase\//,
+    /^supabase-js/,
+];
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -56,6 +88,39 @@ const nextConfig = {
         // find its shipped fonts at node_modules/pdfkit/js/data/.
         'pdfkit',
     ],
+    webpack: (config, { isServer }) => {
+        if (isServer) {
+            // HERMIA(2026-06-11): Externalize the googleapis runtime stack
+            // from the server webpack bundle. These packages require Node
+            // built-ins (http, https, net, tls, crypto, stream) which
+            // webpack can't resolve. Node handles them natively at runtime.
+            config.externals = config.externals || [];
+            config.externals.push(({ request }, callback) => {
+                if (request && NODE_RUNTIME_EXTERNALS.some(re => re.test(request))) {
+                    return callback(null, `commonjs ${request}`);
+                }
+                callback();
+            });
+            // HERMIA(2026-06-11): Node built-in modules must remain external
+            // in the server bundle. Without this, webpack tries to resolve
+            // require('fs'), require('path'), require('crypto') etc. and fails.
+            const builtins = ['async_hooks', 'buffer', 'child_process', 'cluster',
+                'console', 'constants', 'crypto', 'dgram', 'dns', 'domain', 'events',
+                'fs', 'fs/promises', 'http', 'http2', 'https', 'inspector', 'module',
+                'net', 'os', 'path', 'path/posix', 'path/win32', 'perf_hooks',
+                'process', 'punycode', 'querystring', 'readline', 'repl', 'stream',
+                'stream/promises', 'stream/web', 'string_decoder', 'sys', 'timers',
+                'timers/promises', 'tls', 'trace_events', 'tty', 'url', 'util',
+                'util/types', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib'];
+            config.externals.push(({ request }, callback) => {
+                if (request && (builtins.includes(request) || request.startsWith('node:'))) {
+                    return callback(null, `commonjs ${request}`);
+                }
+                callback();
+            });
+        }
+        return config;
+    },
 };
 
 module.exports = nextConfig;
