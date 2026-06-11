@@ -11,6 +11,7 @@
 
 import type { BotCommand, BotDeps } from './types';
 import { getCmdText } from './types';
+import { sanitizeCliArg } from '../../lib/security/access';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -193,18 +194,24 @@ const correlateCommand: BotCommand = {
      name: 'vendor',
      description: 'Reconcile vendor order confirmations against Finale POs',
      handler: async (ctx, _deps) => {
-         const { exec: _exec } = await import('child_process');
+         const { execFile: _execFile } = await import('child_process');
          const { promisify: _promisify } = await import('util');
-         const execAsync = _promisify(_exec);
+         // execFile (not exec) — args are passed as an array directly to the
+         // process, never through a shell, so user-supplied flag values cannot
+         // inject shell metacharacters. Belt-and-suspenders: every interpolated
+         // value is also validated with sanitizeCliArg below.
+         const execFileAsync = _promisify(_execFile);
+         const runScript = (script: string, scriptFlags: string[], opts: { timeout: number; maxBuffer: number }) =>
+             execFileAsync('node', ['--import', 'tsx', script, ...scriptFlags], opts);
 
          const args = getCmdText(ctx).split(' ').slice(1);
          const [vendor, ...flags] = args;
          const dryRun = flags.includes('--dry-run');
          const scrapeOnly = flags.includes('--scrape-only');
          const updateOnly = flags.includes('--update-only');
-         const poFlag = flags.includes('--po') ? flags[flags.indexOf('--po') + 1] : null;
-         const csvFlag = flags.includes('--csv') ? flags[flags.indexOf('--csv') + 1] : null;
-         const limitFlag = flags.includes('--limit') ? flags[flags.indexOf('--limit') + 1] : null;
+         const poFlag = flags.includes('--po') ? sanitizeCliArg(flags[flags.indexOf('--po') + 1]) : null;
+         const csvFlag = flags.includes('--csv') ? sanitizeCliArg(flags[flags.indexOf('--csv') + 1]) : null;
+         const limitFlag = flags.includes('--limit') ? sanitizeCliArg(flags[flags.indexOf('--limit') + 1]) : null;
 
          const VENDORS: Record<string, { script: string; label: string; needsChrome?: boolean; needsCsv?: boolean }> = {
              uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
@@ -251,11 +258,9 @@ const correlateCommand: BotCommand = {
              if (dryRun) extraFlags.push('--dry-run');
              if (scrapeOnly) extraFlags.push('--scrape-only');
              if (limitFlag) extraFlags.push('--limit', limitFlag);
-             const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
-             const cmd = `node --import tsx src/cli/reconcile-aaa.ts${flagStr}`;
              await ctx.reply('🔄 Running <b>AAA Cooper</b> invoice extraction…\n<i>Scans ap@buildasoil.com, splits statement PDFs, forwards invoices to Bill.com.</i>', { parse_mode: 'HTML' });
              try {
-                 const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+                 const { stdout, stderr } = await runScript('src/cli/reconcile-aaa.ts', extraFlags, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
                  const out = (stdout || '').slice(-2000);
                  const errOut = (stderr || '').slice(-500);
                  const summary = out || errOut || 'No output';
@@ -276,16 +281,13 @@ const correlateCommand: BotCommand = {
          if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
          if (csvFlag && key === 'fedex') extraFlags.push('--csv', csvFlag);
 
-         const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
-         const cmd = `node --import tsx ${entry.script}${flagStr}`;
-
          const chromeNote = entry.needsChrome ? '\n⚠️ <i>Close Chrome before running (Playwright).</i>' : '';
          const csvNote = entry.needsCsv ? '\n📎 <i>Auto-finds latest CSV in Sandbox if --csv omitted.</i>' : '';
 
          await ctx.reply(`🔄 Running <b>${entry.label}</b>…${chromeNote}${csvNote}`, { parse_mode: 'HTML' });
 
          try {
-             const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+             const { stdout, stderr } = await runScript(entry.script, extraFlags, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
              const out = (stdout || '').slice(-2000);
              const errOut = (stderr || '').slice(-500);
              const summary = out || errOut || 'No output';
@@ -480,18 +482,22 @@ const correlateCommand: BotCommand = {
          const args = getCmdText(ctx).split(' ').slice(1);
          const dryRun = args.includes('--dry-run');
          const daysArg = args.find((a: string) => a.startsWith('--days='));
-         const days = daysArg ? daysArg.split('=')[1] : '60';
-         const flagStr = dryRun ? ' --dry-run' : '';
+         // Coerce to a bounded integer — never interpolate the raw flag value
+         // into a command. Falls back to 60 on anything non-numeric.
+         const daysNum = daysArg ? parseInt(daysArg.split('=')[1], 10) : 60;
+         const days = String(Number.isFinite(daysNum) ? Math.min(Math.max(daysNum, 1), 365) : 60);
 
          await ctx.reply(`🔄 Running PO sweep (last ${days} days)…`);
 
-         const { exec: _exec } = await import('child_process');
+         const { execFile: _execFile } = await import('child_process');
          const { promisify: _promisify } = await import('util');
-         const execAsync = _promisify(_exec);
+         const execFileAsync = _promisify(_execFile);
 
          try {
-             const { stdout, stderr } = await execAsync(
-                 `node --import tsx src/cli/reconcile-received-pos.ts --days=${days}${flagStr}`,
+             const scriptArgs = ['--import', 'tsx', 'src/cli/reconcile-received-pos.ts', `--days=${days}`];
+             if (dryRun) scriptArgs.push('--dry-run');
+             const { stdout, stderr } = await execFileAsync(
+                 'node', scriptArgs,
                  { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 }
              );
              const out = (stdout || '').slice(-2000);

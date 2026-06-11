@@ -25,7 +25,9 @@ const ops = () => OpsManager.singleton;
 defineJob({
     name: "ap-polling",
     schedule: "*/15 * * * *",
-    onFail: "log",
+    // Revenue-critical: a silent failure here means invoices stop being
+    // forwarded to Bill.com and reconciled. Surface it to Will, don't bury it.
+    onFail: "telegram-will",
     description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
     handler: async () => {
         const o = ops();
@@ -294,7 +296,10 @@ defineJob({
 defineJob({
     name: "po-sync",
     schedule: "0 */4 * * *",
-    onFail: "log",
+    // Escalate to the supervisor (creates an agent_task row that surfaces on the
+    // dashboard) rather than only logging — a stalled PO sync silently degrades
+    // reconciliation matching, but it's not urgent enough to ping Telegram.
+    onFail: "escalate-to-supervisor",
     description: "Sync PO conversations with Gmail threads (every 4h).",
     handler: async () => { await ops()?.syncPOConversations(); },
 });

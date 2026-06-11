@@ -31,6 +31,7 @@ import {
     type ReconciliationResult,
 } from '../lib/finale/reconciler';
 import { handleTelegramText } from '../lib/copilot/channels/telegram';
+import { isTelegramSenderAllowed } from '../lib/security/access';
 // Slack removed — getStartupHealth deleted
 
 // ── Import modular handlers ──────────────────────────
@@ -137,6 +138,28 @@ if (!token) {
 }
 
 const bot = new Telegraf(token);
+
+// ── Access control: only the configured owner(s) may control the bot ────────
+// Fail-closed. Without TELEGRAM_CHAT_ID set, no one is admitted. This is the
+// first middleware so it gates commands, text, photo, and document handlers
+// alike — anyone else who finds the bot username gets a terse refusal and
+// their update is dropped before any handler (or scraper) runs.
+bot.use(async (ctx, next) => {
+    const senderId = ctx.from?.id;
+    const chatId = ctx.chat?.id;
+    if (isTelegramSenderAllowed(senderId, chatId)) {
+        return next();
+    }
+    console.warn(
+        `[security] Rejected Telegram update from sender=${senderId ?? "?"} chat=${chatId ?? "?"}`,
+    );
+    try {
+        await ctx.reply("⛔ Not authorized.");
+    } catch {
+        /* sender may not allow replies — drop silently */
+    }
+    // Do not call next(): the update stops here.
+});
 
 // Finale Inventory client
 const finale = new FinaleClient();
