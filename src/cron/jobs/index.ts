@@ -25,7 +25,7 @@ const ops = () => OpsManager.singleton;
 defineJob({
     name: "ap-polling",
     schedule: "*/15 * * * *",
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
     handler: async () => {
         const o = ops();
