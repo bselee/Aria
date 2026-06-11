@@ -52,8 +52,8 @@ defineJob({
 
 defineJob({
     name: "jit-forward-projection",
-    schedule: "0 8 * * 1-5",
-    onFail: "log",
+        schedule: "0 8 * * 1-5",
+        onFail: "telegram-will",
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
@@ -313,8 +313,8 @@ defineJob({
 // L1 at sent+2d → L2 at sent+5d → L3 at sent+7d. Dropships excluded.
 defineJob({
     name: "po-followup-watcher",
-    schedule: "45 7 * * 1-5",
-    onFail: "log",
+        schedule: "10 8 * * 1-5",
+        onFail: "telegram-will",
     description: "7:45 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
     handler: async () => {
         const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
@@ -333,8 +333,8 @@ defineJob({
 // Surfaces via /api/dashboard/po-stuck + Telegram digest on cron run.
 defineJob({
     name: "po-stuck-detector",
-    schedule: "50 7 * * 1-5",
-    onFail: "log",
+        schedule: "50 7 * * 1-5",
+        onFail: "telegram-will",
     description: "7:50 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc). Also drafts vendor follow-up emails for overdue POs (po-overdue-followup).",
     handler: async () => {
         const { detectStuckPOs, summariseStuck } = await import("@/lib/purchasing/po-stuck-detector");
@@ -363,8 +363,8 @@ defineJob({
 // and writes to shipments table so carrier-poll picks it up for status refresh.
 defineJob({
     name: "email-tracking-ingest",
-    schedule: "15 */2 * * *", // every 2 hours, offset by 15 min from ap-polling
-    onFail: "log",
+        schedule: "15 */2 * * *",
+        onFail: "telegram-will",
     description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments.",
     handler: async () => {
         const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
@@ -380,7 +380,7 @@ defineJob({
 defineJob({
     name: "carrier-poll",
     schedule: "0 6,14 * * *", // 6am + 2pm daily — catches afternoon deliveries
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Refresh live carrier status for active shipments (2x/day).",
     handler: async () => {
         const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
@@ -415,7 +415,7 @@ defineJob({
 defineJob({
     name: "po-receiving-watcher",
     schedule: "*/30 7-18 * * 1-5", // every 30m, 7am–6pm weekdays — warehouse hours only
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Poll Finale for received POs (every 30m during business hours).",
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
@@ -425,7 +425,7 @@ defineJob({
 defineJob({
     name: "po-receipt-recheck",
     schedule: "*/30 * * * *",
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Re-check reconciled invoices against newly received goods (every 30m).",
     handler: async () => {
         const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
@@ -437,8 +437,8 @@ defineJob({
 // L3=15+d (Telegram alert with replace/draft buttons).
 defineJob({
     name: "vendor-escalation",
-    schedule: "30 10,14 * * 1-5",
-    onFail: "log",
+        schedule: "40 8 * * 1-5",
+        onFail: "telegram-will",
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -454,7 +454,7 @@ defineJob({
 defineJob({
     name: "delivery-exception-escalator",
     schedule: "0 */4 * * 1-5",
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Auto-escalate delivery exceptions — draft vendor email + Telegram alert (every 4h weekdays).",
     handler: async () => {
         const { escalateDeliveryExceptions } = await import("@/lib/tracking/delivery-exception-escalator");
@@ -546,7 +546,7 @@ defineJob({
 defineJob({
     name: "po-auto-complete-watcher",
     schedule: "0 */4 * * *",
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
     handler: async () => { await ops()?.runPOAutoCompleteWatcher(); },
     budget: { durationMs: 300_000 }, // 5min — fetches getOrderDetails per candidate
@@ -560,7 +560,7 @@ defineJob({
 defineJob({
     name: "po-arrival-risk-check",
     schedule: "0 */2 * * *",
-    onFail: "log",
+    onFail: "telegram-will",
     description: "Detect PO arrivals that will land after stockout (every 2h).",
     handler: async () => { await ops()?.runPOArrivalRiskCheck(); },
     budget: { durationMs: 180_000 },
@@ -797,4 +797,23 @@ defineJob({
         }
     },
     budget: { durationMs: 120_000 },
+});
+
+// HERMIA(2026-06-11): Daily proactive morning brief — synthesized action list
+// from across all Aria subsystems (JIT triggers, overdue POs, pending approvals,
+// vendor escalations, consumption spikes). If nothing actionable, stays silent.
+defineJob({
+    name: "proactive-brief",
+    schedule: "0 7 * * 1-5",  // 7 AM Mon-Fri
+    onFail: "telegram-will",
+    description: "7 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
+    handler: async () => {
+        const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
+        try {
+            await generateProactiveBrief();
+        } catch (err: any) {
+            console.warn(`[proactive-brief] failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 90_000 },
 });
