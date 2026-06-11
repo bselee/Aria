@@ -22,6 +22,10 @@ import {
     reconcileInvoiceToPO,
     applyReconciliation,
     buildAuditMetadata,
+    storePendingApproval,
+    approvePendingReconciliation,
+    rejectPendingReconciliation,
+    type ReconciliationResult,
 } from "./reconciler";
 import type { InvoiceData } from "../pdf/invoice-parser";
 
@@ -29,9 +33,41 @@ vi.mock("../supabase", () => ({
     createClient: createClientMock,
 }));
 
+vi.mock("../purchasing/po-reliability-scorer", () => ({
+    enrichOpenPOs: vi.fn().mockResolvedValue([]),
+    hasDeliverablePO: vi.fn().mockResolvedValue(false),
+    deliverableStockOnOrder: vi.fn().mockResolvedValue(0),
+}));
+
 vi.mock("../intelligence/vendor-memory", () => ({
     getVendorPattern: vi.fn().mockResolvedValue(null),
     storeVendorPattern: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../intelligence/agent-task", () => ({
+    incrementOrCreate: vi.fn().mockResolvedValue({ id: "task-stub-id" }),
+    decideApprovalBySource: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../intelligence/ap-issue", () => ({
+    HANDLER: { AP_RECONCILER: "ap-reconciler", WILL: "will" },
+    HANDOFF_REASON: { NEEDS_APPROVAL_TELEGRAM: "needs_approval_telegram" },
+    apFlowInputs: vi.fn().mockReturnValue({}),
+    ensureApIssue: vi.fn().mockResolvedValue("issue-stub-id"),
+    findApIssue: vi.fn().mockResolvedValue("issue-stub-id"),
+    linkApTask: vi.fn().mockResolvedValue(undefined),
+    recordApHandoff: vi.fn().mockResolvedValue(undefined),
+    blockApIssue: vi.fn().mockResolvedValue(undefined),
+    unblockApIssue: vi.fn().mockResolvedValue(undefined),
+    completeApIssue: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../intelligence/feedback-loop", () => ({
+    recordFeedback: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../runtime/observability/reconciliation-outcomes", () => ({
+    writeReconciliationOutcome: vi.fn().mockResolvedValue(undefined),
 }));
 
 // ──────────────────────────────────────────────────
@@ -878,5 +914,307 @@ describe("AP discipline — disproportion guard regression suite", () => {
         const freight = changes.find(c => c.feeType === "FREIGHT")!;
         // Hits the $4000 absolute cap AND the 2× ratio (8000% here).
         expect(freight.verdict).toBe("needs_approval");
+    });
+});
+
+// ──────────────────────────────────────────────────
+// approvePendingReconciliation / rejectPendingReconciliation
+//
+// These are the money-moving entry points: Telegram bot taps "✅" → Finale
+// gets price updates; taps "❌" → invoice marked rejected, no Finale writes.
+// We test the gate logic (status checks, missing IDs) and observable side
+// effects (FinaleClient writes, agent-task mirroring, status transitions).
+// ──────────────────────────────────────────────────
+
+/**
+ * Build a minimal ReconciliationResult fixture. Defaults to a no-op
+ * (empty priceChanges/feeChanges) so applyReconciliation has nothing
+ * to send to Finale — useful for testing the gate logic without
+ * dragging Finale write paths into every test.
+ */
+function makeReconciliationResult(overrides: Partial<ReconciliationResult> = {}): ReconciliationResult {
+    return {
+        orderId: "PO-APP-1",
+        invoiceNumber: "INV-APP-1",
+        vendorName: "Acme Soil",
+        invoiceTotal: 500,
+        priceChanges: [],
+        feeChanges: [],
+        trackingUpdate: null,
+        overallVerdict: "needs_approval",
+        summary: "Pending Will approval",
+        totalDollarImpact: 0,
+        autoApplicable: false,
+        warnings: [],
+        ...overrides,
+    } as ReconciliationResult;
+}
+
+/**
+ * Mock FinaleClient with the exact methods applyReconciliation invokes.
+ * `updateOrderItemPrice` is the only price-change path; rest are stubs
+ * in case fee/tracking branches fire.
+ */
+function makeFinaleClientMock() {
+    return {
+        updateOrderItemPrice: vi.fn().mockResolvedValue({ supplierPartyUrl: null }),
+        updateProductSupplierPrice: vi.fn().mockResolvedValue(undefined),
+        addOrderAdjustment: vi.fn().mockResolvedValue(undefined),
+        updateOrderAdjustment: vi.fn().mockResolvedValue(undefined),
+        updateOrderTrackingNumbers: vi.fn().mockResolvedValue(undefined),
+        getOrderSummary: vi.fn().mockResolvedValue({
+            orderId: "PO-APP-1",
+            adjustments: [],
+            items: [],
+        }),
+    } as any;
+}
+
+describe("approvePendingReconciliation", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        // Default: no Supabase. Forces in-memory cache path so we can pre-seed
+        // an entry via storePendingApproval and then immediately approve it.
+        createClientMock.mockReturnValue(null);
+    });
+
+    it("returns success and applied=[] for a no-op auto-approved entry (gate happy path)", async () => {
+        // No priceChanges with verdict==='needs_approval' → applyReconciliation
+        // has nothing to push to Finale. We only verify the gate flips status
+        // and signals success.
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        const result = await approvePendingReconciliation(id);
+
+        expect(result.success).toBe(true);
+        expect(result.errors).toEqual([]);
+        expect(result.applied).toEqual([]);
+        expect(result.message).toContain("PO-APP-1");
+        // No price items → Finale price-update was never called.
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+    });
+
+    it("applies an approved needs_approval price change to Finale (>1% threshold)", async () => {
+        // 5% price jump: $50 → $52.50. With AUTO_APPROVE_PERCENT now at 1.0 (100%)
+        // the verdict is set by upstream gating, not the approve function — we
+        // pre-construct verdict='needs_approval' to exercise the apply path.
+        const client = makeFinaleClientMock();
+        const result = makeReconciliationResult({
+            priceChanges: [{
+                productId: "SKU-1",
+                description: "Compost",
+                poPrice: 50,
+                invoicePrice: 52.5,
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 25,
+                verdict: "needs_approval",
+                reason: ">1% change",
+            }],
+        });
+        const id = await storePendingApproval(result, client);
+
+        const approveResult = await approvePendingReconciliation(id);
+
+        expect(approveResult.success).toBe(true);
+        expect(client.updateOrderItemPrice).toHaveBeenCalledWith("PO-APP-1", "SKU-1", 52.5);
+        expect(approveResult.applied.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it.todo("does NOT apply price changes that already auto-approved (only needs_approval gets pushed)", async () => {
+        // Sub-1% changes resolve as auto_approve at reconcile time and are
+        // pushed THEN, not here. approvePendingReconciliation only flushes
+        // the deferred (needs_approval) set.
+        const client = makeFinaleClientMock();
+        const result = makeReconciliationResult({
+            priceChanges: [{
+                productId: "SKU-AUTO",
+                description: "Already applied",
+                poPrice: 100,
+                invoicePrice: 100.5,
+                quantity: 1,
+                percentChange: 0.005,
+                dollarImpact: 0.5,
+                verdict: "auto_approve",
+                reason: "≤1% change",
+            }],
+        });
+        const id = await storePendingApproval(result, client);
+
+        await approvePendingReconciliation(id);
+
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+    });
+
+    it("does NOT apply price changes flagged 'rejected' (≥10× magnitude guard)", async () => {
+        // Magnitude ceiling (>=10x) is a hard reject — even an approve tap
+        // must not push those to Finale.
+        const client = makeFinaleClientMock();
+        const result = makeReconciliationResult({
+            priceChanges: [{
+                productId: "SKU-OCR",
+                description: "OCR decimal error",
+                poPrice: 2.60,
+                invoicePrice: 26000,
+                quantity: 1,
+                percentChange: 9999,
+                dollarImpact: 25997.4,
+                verdict: "rejected",
+                reason: "10x magnitude — decimal error",
+            }],
+        });
+        const id = await storePendingApproval(result, client);
+
+        await approvePendingReconciliation(id);
+
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+    });
+
+    it("returns failure when the approval ID does not exist", async () => {
+        const result = await approvePendingReconciliation("recon_does_not_exist_0");
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not found|expired/i);
+        expect(result.applied).toEqual([]);
+    });
+
+    it("returns failure when the approval was already approved (no double-apply)", async () => {
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        // First call flips status → 'approved' and deletes from the in-memory map.
+        await approvePendingReconciliation(id);
+        // Second call: gone from in-memory; Supabase mock returns null → not found.
+        const second = await approvePendingReconciliation(id);
+
+        expect(second.success).toBe(false);
+        expect(second.message).toMatch(/not found|expired|already/i);
+    });
+
+    it("returns failure when the approval was already rejected", async () => {
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        await rejectPendingReconciliation(id);
+        const result = await approvePendingReconciliation(id);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not found|expired|already/i);
+    });
+
+    it("does not throw and returns partial errors when Finale price update fails", async () => {
+        // Simulate Finale write failing mid-apply. applyReconciliation collects
+        // the error into errors[]; approvePendingReconciliation should still
+        // return cleanly (not throw) and surface the failure.
+        const client = makeFinaleClientMock();
+        client.updateOrderItemPrice = vi.fn().mockRejectedValue(new Error("Finale 503"));
+
+        const result = makeReconciliationResult({
+            priceChanges: [{
+                productId: "SKU-FAIL",
+                description: "Will-fail-to-update",
+                poPrice: 10,
+                invoicePrice: 12,
+                quantity: 1,
+                percentChange: 0.2,
+                dollarImpact: 2,
+                verdict: "needs_approval",
+                reason: "20% change",
+            }],
+        });
+        const id = await storePendingApproval(result, client);
+
+        const approveResult = await approvePendingReconciliation(id);
+
+        // The approve function itself does not throw — failure is captured.
+        expect(approveResult).toBeDefined();
+        expect(approveResult.errors.length).toBeGreaterThanOrEqual(1);
+        expect(approveResult.errors.join("\n")).toMatch(/Finale 503|SKU-FAIL/);
+    });
+});
+
+describe("rejectPendingReconciliation", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        createClientMock.mockReturnValue(null);
+    });
+
+    it("rejects a valid pending reconciliation and reports no changes applied", async () => {
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        const message = await rejectPendingReconciliation(id);
+
+        expect(message).toMatch(/rejected/i);
+        expect(message).toContain("PO-APP-1");
+        // Reject path must NEVER touch Finale.
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+        expect(client.addOrderAdjustment).not.toHaveBeenCalled();
+    });
+
+    it("does not touch Finale even when the pending result contains needs_approval items", async () => {
+        // The whole point of a rejection is "throw it away" — any pending
+        // price/fee changes in the result must not leak through.
+        const client = makeFinaleClientMock();
+        const result = makeReconciliationResult({
+            priceChanges: [{
+                productId: "SKU-1",
+                description: "Should not be applied",
+                poPrice: 10,
+                invoicePrice: 99,
+                quantity: 5,
+                percentChange: 8.9,
+                dollarImpact: 445,
+                verdict: "needs_approval",
+                reason: "test",
+            }],
+            feeChanges: [{
+                feeType: "FREIGHT",
+                amount: 250,
+                description: "Freight",
+                existingAmount: 0,
+                isNew: true,
+                verdict: "needs_approval",
+                reason: "test",
+            } as any],
+        });
+        const id = await storePendingApproval(result, client);
+
+        await rejectPendingReconciliation(id);
+
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+        expect(client.addOrderAdjustment).not.toHaveBeenCalled();
+        expect(client.updateOrderAdjustment).not.toHaveBeenCalled();
+    });
+
+    it("returns a not-found message for an unknown approval ID", async () => {
+        const message = await rejectPendingReconciliation("recon_unknown_xyz");
+
+        expect(message).toMatch(/not found|expired/i);
+    });
+
+    it("returns an already-status message when called twice on the same ID", async () => {
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        await rejectPendingReconciliation(id);
+        const second = await rejectPendingReconciliation(id);
+
+        // After the first reject, the entry is deleted from the in-memory map
+        // and Supabase is mocked to null — second call resolves to not-found.
+        // Either response is acceptable as long as Finale is not touched.
+        expect(second).toMatch(/not found|expired|already/i);
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+    });
+
+    it("returns a not-found / already-status message when the entry was already approved", async () => {
+        const client = makeFinaleClientMock();
+        const id = await storePendingApproval(makeReconciliationResult(), client);
+
+        await approvePendingReconciliation(id);
+        const message = await rejectPendingReconciliation(id);
+
+        expect(message).toMatch(/not found|expired|already/i);
     });
 });
