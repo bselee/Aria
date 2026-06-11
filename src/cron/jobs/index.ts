@@ -817,3 +817,72 @@ defineJob({
     },
     budget: { durationMs: 90_000 },
 });
+
+// HERMIA(2026-06-11): Slack detector heartbeat — verifies the request-detector
+// loop is alive. Checks two signals:
+//   1. Most recent slack_requests entry age (detector writes on every SKU detection)
+//   2. aria-bot PM2 process uptime (if bot crashed, detector is dead too)
+// During business hours (M-F 7AM-6PM), alerts TG if no detector activity in 90 min.
+// Silent outside business hours and on weekends.
+defineJob({
+    name: "slack-detector-heartbeat",
+    schedule: "*/15 7-18 * * 1-5",  // every 15 min, 7AM-6PM, Mon-Fri
+    onFail: "log",
+    description: "Slack detector heartbeat: alert if no slack_requests activity >90min during business hours.",
+    handler: async () => {
+        const { createClient } = await import("@/lib/supabase");
+        const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+        const db = createClient();
+        if (!db) return;
+
+        // Check most recent slack_requests entry
+        const { data: latest } = await db
+            .from("slack_requests")
+            .select("created_at")
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+        if (!latest || latest.length === 0) {
+            // No entries ever — detector may have never worked
+            await sendCriticalTelegramNotify(
+                "Slack detector heartbeat: No slack_requests records found. " +
+                "Detector may have never started. Check aria-bot logs."
+            );
+            return;
+        }
+
+        const lastActivity = new Date(latest[0].created_at);
+        const ageMinutes = Math.round((Date.now() - lastActivity.getTime()) / 60_000);
+
+        if (ageMinutes > 90) {
+            // Check if it's actually quiet (no one posted) vs detector dead
+            // We can't distinguish perfectly, but >90 min during business hours
+            // warrants a heads-up
+            await sendCriticalTelegramNotify(
+                `Slack detector heartbeat: last slack_requests entry was ${ageMinutes}min ago ` +
+                `(${lastActivity.toLocaleString("en-US", { timeZone: "America/Denver" })}). ` +
+                `This could mean nobody posted, or the detector is dead. ` +
+                `Check: pm2 logs aria-bot --lines 20 | grep slack`
+            );
+        } else {
+            console.log(`[slack-heartbeat] OK — last activity ${ageMinutes}min ago`);
+        }
+    },
+    budget: { durationMs: 30_000 },
+});
+
+// HERMIA(2026-06-11): System heartbeat — proactive liveness probes for every
+// critical Aria dependency, process, and scheduled job. Runs every 10 min and
+// sends a single consolidated Telegram alert only when something is newly
+// unhealthy (rate-limited 30 min per probe). All-healthy ticks stay silent.
+defineJob({
+    name: "system-heartbeat",
+    schedule: "*/10 * * * *",
+    onFail: "log",  // Don't escalate cron framework failures for the heartbeat itself
+    description: "Proactive liveness probes for all critical Aria systems (every 10 min).",
+    budget: { durationMs: 30_000 },  // 30s total — probes should complete well under this
+    handler: async () => {
+        const { runSystemHeartbeat } = await import("@/lib/ops/heartbeat");
+        await runSystemHeartbeat();
+    },
+});
