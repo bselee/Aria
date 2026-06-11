@@ -57,7 +57,6 @@ defineJob({
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
-        const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
 
         // Bill's rule: don't ping daily. Only alert when an orderTriggerDate is
         // imminent (≤7 days away). If every component is far in the future,
@@ -125,32 +124,21 @@ defineJob({
             return;
         }
 
-        // Build Telegram message. Sorted so CRITICAL (today/tomorrow) is at top.
+        // Task-first: one agent_task per trigger, then a single summary view.
         triggers.sort((a, b) => a.triggerDate.localeCompare(b.triggerDate));
-        const lines: string[] = [
-            `📅 *JIT Forward Projection — Order Triggers (≤${ALERT_BUFFER_DAYS}d)*`,
-            `_snapshot: ${snapshotDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Denver' })}_`,
-            `${triggers.length} component(s) need attention:\n`,
-        ];
-
+        const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
         for (const t of triggers) {
-            const isUrgent = t.triggerDate === todayISO;
-            const urgency = isUrgent ? "🔴 TODAY" : "🟡 by " + t.triggerDate;
-            const label = t.riskLevel === 'CRITICAL' ? " 🔴" : t.riskLevel === 'WARNING' ? " " : " ⚠️";
-            lines.push(`• ${urgency} ${label} \`${t.sku}\`${t.riskLevel ? `  [${t.riskLevel}]` : ''}`);
-            lines.push(`     Vendor: ${t.vendorName ?? '?'}  |  On hand: ${t.onHand !== null ? Math.round(t.onHand) : '—'}`);
-            const fg = Array.isArray(t.usedIn) ? t.usedIn.join(', ') : '';
-            if (fg) lines.push(`     Feeds FGs: ${fg}`);
-            if (t.coverageDays !== null && t.coverageDays !== undefined) {
-                lines.push(`     FG shelf: ~${Math.round(t.coverageDays)}d until runout`);
-            }
-            lines.push('');
+            await notifyViaTask({
+                sourceId: `jit:${t.sku}:${t.triggerDate}`,
+                type: "jit_order_trigger",
+                goal: `Order ${t.sku} by ${t.triggerDate} — ${t.riskLevel}`,
+                inputs: { sku: t.sku, triggerDate: t.triggerDate, vendor: t.vendorName, onHand: t.onHand, usedIn: t.usedIn },
+                priority: t.riskLevel === "CRITICAL" ? 0 : 2,
+                critical: true,
+                summaryLabel: "JIT Forward Projection",
+            });
         }
-
-        lines.push(`> Order by the dates above. POs placed outside the trigger window are premature; placing too late = build-block.`);
-
-        await sendCriticalTelegramNotify(lines.join("\n"));
-        console.log(`[jit-forward-projection] Fired alert for ${triggers.length} components.`);
+        console.log(`[jit-forward-projection] Routed ${triggers.length} triggers through agent_task hub.`);
     },
     // Budget: reads Supabase once, sends one Telegram — generous default is fine.
     budget: { durationMs: 60_000 },
@@ -163,10 +151,17 @@ defineJob({
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
             const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
-            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
             const report = await generateAPHealthReport();
-            await sendTelegramNotify(report);
-            console.log("[ap-health-report] Morning report sent.");
+            const day = new Date().toISOString().slice(0, 10);
+            await notifyViaTask({
+                sourceId: `ap-health:${day}`,
+                type: "cron_summary",
+                goal: report,
+                inputs: { report, day },
+                summaryLabel: "AP Health Report",
+            });
+            console.log("[ap-health-report] Routed morning report through agent_task hub.");
     },
 });
 
@@ -180,7 +175,6 @@ defineJob({
     description: "Midday/afternoon AP pipeline follow-up (Mon-Fri 12 PM & 4 PM).",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
-        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
 
         const db = createClient();
         if (!db) return;
@@ -241,8 +235,16 @@ defineJob({
             lines.push(topIntents.map(([k, v]) => `${k}: ${v}`).join(" · "));
         }
 
-        await sendTelegramNotify(lines.join("\n"));
-        console.log(`[ap-follow-up] Sent: ${total} processed, ${stuck} stuck.`);
+        const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
+        const slot = new Date().getHours() < 14 ? "noon" : "afternoon";
+        await notifyViaTask({
+            sourceId: `ap-follow-up:${todayIso.slice(0, 10)}:${slot}`,
+            type: "cron_summary",
+            goal: lines.join("\n"),
+            inputs: { total, matched, stuck, pct, counts, slot },
+            summaryLabel: "AP Check-in",
+        });
+        console.log(`[ap-follow-up] Routed through agent_task hub: ${total} processed, ${stuck} stuck.`);
     },
 });
 
@@ -609,13 +611,19 @@ defineJob({
             // KAIZEN(2026-06-02): Surface critical decisions via Telegram.
             if (decision.priority === "critical") {
                 try {
-                    const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-                    await sendCriticalTelegramNotify(
-                        `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`
-                    );
-                    console.log(`[cognitive-round] Telegram alert sent for critical decision`);
+                    const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
+                    await notifyViaTask({
+                        sourceId: `cognitive:${decision.action}`,
+                        type: "cognitive_critical",
+                        goal: `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`,
+                        inputs: { action: decision.action, summary: decision.summary },
+                        priority: 0,
+                        critical: true,
+                        summaryLabel: "Cognitive Round CRITICAL",
+                    });
+                    console.log(`[cognitive-round] Routed critical decision through agent_task hub`);
                 } catch (err: any) {
-                    console.warn(`[cognitive-round] Telegram alert failed (non-fatal): ${err.message}`);
+                    console.warn(`[cognitive-round] Hub notify failed (non-fatal): ${err.message}`);
                 }
             }
         },

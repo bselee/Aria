@@ -85,6 +85,12 @@ export function closesWhenFor(args: {
     if (args.type === "stuck_source") {
         return { kind: "deadline", max_age_hours: 168 };
     }
+    if (args.type === "jit_order_trigger") {
+        return { kind: "deadline", max_age_hours: 72 };
+    }
+    if (args.type === "cron_summary") {
+        return { kind: "deadline", max_age_hours: 24 };
+    }
     return null;
 }
 
