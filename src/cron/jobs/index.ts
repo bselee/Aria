@@ -760,3 +760,41 @@ defineJob({
         await Promise.all([runStaleRequestWatcher(), runForwardingEscalation()]);
     },
 });
+
+// HERMIA(2026-06-11): Drop-detector — weekly "what got flagged but nothing happened".
+// Finds open tasks >24h with no recent activity. Surfaces a single summary report
+// via notifyViaTask (drop_detect_report type). One row per week, dedup by date.
+defineJob({
+    name: "drop-detector",
+    schedule: "0 9 * * 5",  // Friday 9 AM — end-of-week surfacing
+    onFail: "log",
+    description: "Friday 9 AM: surface open tasks flagged >24h with no action (weekly ball-dropped report).",
+    handler: async () => {
+        const { surfaceDropReport } = await import("@/lib/intelligence/drop-detector");
+        try {
+            await surfaceDropReport();
+        } catch (err: any) {
+            console.warn(`[drop-detector] failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 60_000 },
+});
+
+// HERMIA(2026-06-11): Pattern miner — weekly closed-loop metrics.
+// Aggregates SUCCEEDED/EXPIRED/FAILED tasks from past 7 days, computes
+// per-type drop-rate and median time-to-close. Surfaces via notifyViaTask.
+defineJob({
+    name: "pattern-miner",
+    schedule: "0 8 * * 1",  // Monday 8 AM — start-of-week retrospective
+    onFail: "log",
+    description: "Monday 8 AM: weekly closed-loop task metrics (drop-rate + median time-to-close per type).",
+    handler: async () => {
+        const { surfacePatternInsight } = await import("@/lib/intelligence/pattern-miner");
+        try {
+            await surfacePatternInsight();
+        } catch (err: any) {
+            console.warn(`[pattern-miner] failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 120_000 },
+});

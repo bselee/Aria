@@ -32,7 +32,9 @@ export type AgentTaskType =
     | "tripwire_violation"
     | "jit_order_trigger"
     | "cron_summary"
-    | "cognitive_critical";
+    | "cognitive_critical"
+    | "drop_detect_report"
+    | "pattern_miner_insight";
 
 export type AgentTaskStatus =
     | "PENDING"
