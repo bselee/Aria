@@ -138,6 +138,31 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
+// SECURITY: owner-only gate. TELEGRAM_CHAT_ID is Will's user/chat id; any update
+// whose `from.id` does not match is dropped silently to avoid leaking the bot's
+// existence. Must run before all other middleware/handlers.
+const OWNER_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
+if (!OWNER_CHAT_ID) {
+    console.error('❌ TELEGRAM_CHAT_ID is not set — refusing to start unauthenticated bot.');
+    process.exit(1);
+}
+bot.use((ctx, next) => {
+    const fromId = ctx.from?.id?.toString();
+    if (fromId !== OWNER_CHAT_ID) {
+        console.log(
+            '[SECURITY] Blocked Telegram update from non-owner',
+            JSON.stringify({
+                from_id: fromId ?? null,
+                username: ctx.from?.username ?? null,
+                chat_id: ctx.chat?.id ?? null,
+                update_type: ctx.updateType,
+            }),
+        );
+        return;
+    }
+    return next();
+});
+
 // Finale Inventory client
 const finale = new FinaleClient();
 

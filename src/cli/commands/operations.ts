@@ -13,6 +13,59 @@ import type { BotCommand, BotDeps } from './types';
 import { getCmdText } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawn } from 'child_process';
+
+// SECURITY: every Telegram-supplied flag value flowing into a child process must
+// match this allowlist. Anything else is rejected outright, not sanitized.
+// Allowed: word chars, dot, slash (paths), backslash (Windows paths), dash, colon.
+const SAFE_ARG_PATTERN = /^[\w.\/\\\-:]+$/;
+function assertSafeArg(name: string, value: string | null | undefined): void {
+    if (value == null) return;
+    if (!SAFE_ARG_PATTERN.test(value)) {
+        throw new Error(`Invalid ${name} value: contains forbidden characters`);
+    }
+}
+
+interface RunResult { stdout: string; stderr: string; code: number | null; timedOut: boolean }
+
+// SECURITY: replaces the prior `execAsync(<interpolated string>)` pattern.
+// Uses spawn with an argv array and NO shell, so flag values cannot break out
+// into additional commands regardless of their contents.
+function runScript(scriptPath: string, scriptArgs: string[], opts: { timeoutMs?: number; maxBuffer?: number } = {}): Promise<RunResult> {
+    const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
+    const maxBuffer = opts.maxBuffer ?? 20 * 1024 * 1024;
+    return new Promise((resolve, reject) => {
+        const child = spawn(
+            process.execPath,
+            ['--import', 'tsx', scriptPath, ...scriptArgs],
+            { stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true },
+        );
+        let stdout = '';
+        let stderr = '';
+        let timedOut = false;
+        const cap = (buf: string, chunk: Buffer | string): string => {
+            const next = buf + chunk.toString();
+            return next.length > maxBuffer ? next.slice(next.length - maxBuffer) : next;
+        };
+        child.stdout?.on('data', (c) => { stdout = cap(stdout, c); });
+        child.stderr?.on('data', (c) => { stderr = cap(stderr, c); });
+        const timer = setTimeout(() => {
+            timedOut = true;
+            try { child.kill('SIGKILL'); } catch { /* noop */ }
+        }, timeoutMs);
+        child.on('error', (err) => { clearTimeout(timer); reject(err); });
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            if (code === 0 && !timedOut) {
+                resolve({ stdout, stderr, code, timedOut });
+            } else {
+                const err: any = new Error(timedOut ? `Process timed out after ${timeoutMs}ms` : `Process exited with code ${code}`);
+                err.stdout = stdout; err.stderr = stderr; err.code = code; err.timedOut = timedOut;
+                reject(err);
+            }
+        });
+    });
+}
 
 /**
  * /buildrisk — 30-day build risk analysis (Calendar → BOM → Stock + POs).
@@ -174,11 +227,8 @@ const correlateCommand: BotCommand = {
      description: 'Run purchasing intelligence pipeline on-demand',
      handler: async (ctx, _deps) => {
          await ctx.reply('🔍 Starting purchase assessment pipeline... This may take a few minutes.');
-         const { exec } = await import('child_process');
-         const { promisify } = await import('util');
-         const execAsync = promisify(exec);
          try {
-             await execAsync('node --import tsx src/cli/run-purchase-assessment.ts', { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+             await runScript('src/cli/run-purchase-assessment.ts', []);
              await ctx.reply('✅ Pipeline triggered. You will receive a Telegram digest when complete.');
          } catch (err: any) {
              await ctx.reply(`❌ Failed to start pipeline: ${err.message}`);
@@ -193,10 +243,6 @@ const correlateCommand: BotCommand = {
      name: 'vendor',
      description: 'Reconcile vendor order confirmations against Finale POs',
      handler: async (ctx, _deps) => {
-         const { exec: _exec } = await import('child_process');
-         const { promisify: _promisify } = await import('util');
-         const execAsync = _promisify(_exec);
-
          const args = getCmdText(ctx).split(' ').slice(1);
          const [vendor, ...flags] = args;
          const dryRun = flags.includes('--dry-run');
@@ -205,6 +251,17 @@ const correlateCommand: BotCommand = {
          const poFlag = flags.includes('--po') ? flags[flags.indexOf('--po') + 1] : null;
          const csvFlag = flags.includes('--csv') ? flags[flags.indexOf('--csv') + 1] : null;
          const limitFlag = flags.includes('--limit') ? flags[flags.indexOf('--limit') + 1] : null;
+
+         // SECURITY: validate every user-supplied flag value against the allowlist
+         // before it touches a child process. Reject — do not sanitize.
+         try {
+             assertSafeArg('--po', poFlag);
+             assertSafeArg('--csv', csvFlag);
+             assertSafeArg('--limit', limitFlag);
+         } catch (err: any) {
+             await ctx.reply(`❌ ${err.message}`);
+             return;
+         }
 
          const VENDORS: Record<string, { script: string; label: string; needsChrome?: boolean; needsCsv?: boolean }> = {
              uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
@@ -247,15 +304,13 @@ const correlateCommand: BotCommand = {
 
          // AAA Cooper — extract invoices from ap@ Gmail, forward each to Bill.com
          if (key === 'aaa') {
-             const extraFlags: string[] = [];
-             if (dryRun) extraFlags.push('--dry-run');
-             if (scrapeOnly) extraFlags.push('--scrape-only');
-             if (limitFlag) extraFlags.push('--limit', limitFlag);
-             const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
-             const cmd = `node --import tsx src/cli/reconcile-aaa.ts${flagStr}`;
+             const aaaArgs: string[] = [];
+             if (dryRun) aaaArgs.push('--dry-run');
+             if (scrapeOnly) aaaArgs.push('--scrape-only');
+             if (limitFlag) aaaArgs.push('--limit', limitFlag);
              await ctx.reply('🔄 Running <b>AAA Cooper</b> invoice extraction…\n<i>Scans ap@buildasoil.com, splits statement PDFs, forwards invoices to Bill.com.</i>', { parse_mode: 'HTML' });
              try {
-                 const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+                 const { stdout, stderr } = await runScript('src/cli/reconcile-aaa.ts', aaaArgs);
                  const out = (stdout || '').slice(-2000);
                  const errOut = (stderr || '').slice(-500);
                  const summary = out || errOut || 'No output';
@@ -276,16 +331,13 @@ const correlateCommand: BotCommand = {
          if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
          if (csvFlag && key === 'fedex') extraFlags.push('--csv', csvFlag);
 
-         const flagStr = extraFlags.length > 0 ? ' ' + extraFlags.join(' ') : '';
-         const cmd = `node --import tsx ${entry.script}${flagStr}`;
-
          const chromeNote = entry.needsChrome ? '\n⚠️ <i>Close Chrome before running (Playwright).</i>' : '';
          const csvNote = entry.needsCsv ? '\n📎 <i>Auto-finds latest CSV in Sandbox if --csv omitted.</i>' : '';
 
          await ctx.reply(`🔄 Running <b>${entry.label}</b>…${chromeNote}${csvNote}`, { parse_mode: 'HTML' });
 
          try {
-             const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
+             const { stdout, stderr } = await runScript(entry.script, extraFlags);
              const out = (stdout || '').slice(-2000);
              const errOut = (stderr || '').slice(-500);
              const summary = out || errOut || 'No output';
@@ -481,18 +533,23 @@ const correlateCommand: BotCommand = {
          const dryRun = args.includes('--dry-run');
          const daysArg = args.find((a: string) => a.startsWith('--days='));
          const days = daysArg ? daysArg.split('=')[1] : '60';
-         const flagStr = dryRun ? ' --dry-run' : '';
+
+         // SECURITY: --days must be a positive integer. Anything else is an
+         // injection attempt or a typo — reject either way.
+         if (!/^\d{1,4}$/.test(days)) {
+             await ctx.reply('❌ Invalid --days value: must be a positive integer (max 4 digits).');
+             return;
+         }
 
          await ctx.reply(`🔄 Running PO sweep (last ${days} days)…`);
 
-         const { exec: _exec } = await import('child_process');
-         const { promisify: _promisify } = await import('util');
-         const execAsync = _promisify(_exec);
+         const sweepArgs = [`--days=${days}`];
+         if (dryRun) sweepArgs.push('--dry-run');
 
          try {
-             const { stdout, stderr } = await execAsync(
-                 `node --import tsx src/cli/reconcile-received-pos.ts --days=${days}${flagStr}`,
-                 { timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 }
+             const { stdout, stderr } = await runScript(
+                 'src/cli/reconcile-received-pos.ts',
+                 sweepArgs,
              );
              const out = (stdout || '').slice(-2000);
              const errOut = (stderr || '').slice(-500);
