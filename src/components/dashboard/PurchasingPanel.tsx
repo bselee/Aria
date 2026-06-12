@@ -1494,10 +1494,8 @@ export default function PurchasingPanel() {
                 <div className="fixed inset-0 z-40" onClick={() => setQtyDropdownOpen(null)} />
             )}
 
-            {/* ── Header ── */}
+            {/* ── Header ── (search + time filters; section label owned by OpsTriPanel) */}
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
-                <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
                 {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
@@ -1630,8 +1628,8 @@ export default function PurchasingPanel() {
                                     onClick={() => setVendorDropdownOpen(!vendorDropdownOpen)}
                                     className={`flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded border transition-colors ${
                                         vendorTab === "all"
-                                            ? "border-zinc-600 text-zinc-200 bg-zinc-800/40 hover:bg-zinc-800/60"
-                                            : "border-zinc-500 text-zinc-100 bg-zinc-700/40 hover:bg-zinc-700/60"
+                                            ? "border-zinc-300/60 text-zinc-100 bg-zinc-900/50 hover:bg-zinc-800/60 hover:border-zinc-200"
+                                            : "border-zinc-300/80 text-zinc-50 bg-zinc-800/50 hover:bg-zinc-700/60 hover:border-zinc-100"
                                     }`}
                                 >
                                     {vendorTab === "all" ? (

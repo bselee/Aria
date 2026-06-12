@@ -149,7 +149,7 @@ export function CrystalBallSearch({ onSelect, onVendorSelect }: CrystalBallSearc
                     onChange={handleInputChange}
                     onFocus={() => setOpen(true)}
                     placeholder="Search SKU or Supplier..."
-                    className="w-full pl-8 pr-8 py-1 bg-zinc-950/80 border border-zinc-800 focus:border-zinc-500 rounded text-xs font-mono text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-zinc-700/50 shadow-inner transition-all"
+                    className="w-full pl-8 pr-8 py-1 bg-zinc-950/80 border border-zinc-500/60 focus:border-zinc-200 rounded text-xs font-mono text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-400/40 shadow-inner transition-all"
                 />
                 <Search className="w-3.5 h-3.5 text-zinc-600 absolute left-2.5 top-1/2 -translate-y-1/2" />
                 
