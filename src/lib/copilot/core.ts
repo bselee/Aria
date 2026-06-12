@@ -1,6 +1,8 @@
 /**
  * @file    src/lib/copilot/core.ts
  * @purpose Shared copilot core for Telegram and dashboard normal Q&A.
+ *          Now supports both read tools and write/action tools so the
+ *          Telegram agent can solve problems when alerts arrive.
  */
 
 import { SYSTEM_PROMPT } from "../../config/persona";
@@ -8,6 +10,7 @@ import { unifiedToolTextGeneration } from "../intelligence/llm";
 import { validateWriteIntent } from "./actions";
 import { buildCopilotContext } from "./context";
 import { getSharedReadTools } from "./tools";
+import { getCopilotActionTools } from "./action-tools";
 import type { CopilotChannel, ArtifactRef } from "./types";
 
 const RUNTIME_RULES = `
@@ -16,16 +19,16 @@ const RUNTIME_RULES = `
 Memory context is background only. For prices, costs, stock, PO status, invoices, or consumption, call the appropriate read tool. Never answer numeric, status, or date data from memory alone.
 
 ## BIAS TO ACTION
-Never ask a clarifying question when a read tool can attempt the lookup.
+Never ask a clarifying question when a read tool can attempt the lookup. When the user wants something done (draft, approve, send, escalate), use the action tools.
 
 ## NO HOLLOW FILLER
 No "What's next?", "Let me know if you need anything else", or similar filler.
 
-## READ TOOL HONESTY
-This shared core currently has read tools only. Never claim a PO was created, sent, approved, or updated unless an explicit action service confirms it.
-
 ## WRITE GATING
-If the user is asking for a write action and the target is missing or ambiguous, explain exactly what is missing.
+If the user is asking for a write action and the target is missing or ambiguous, explain exactly what is missing and ask for the specific PO / task / item.
+
+## ACTION CAPABILITY
+You have both read tools and write/action tools. Use commit_and_send_po and future action tools to solve problems when the user explicitly requests action. Always confirm destructive actions with the user before executing.
 `;
 
 export interface CopilotTurnInput {
@@ -129,11 +132,17 @@ export async function runCopilotTurn(input: CopilotTurnInput): Promise<CopilotTu
         };
     }
 
+    // Merge read tools + action tools so the Telegram agent can solve problems
+    const allTools = {
+        ...getSharedReadTools({ threadId }),
+        ...getCopilotActionTools({ threadId }),
+    };
+
     const generation = await unifiedToolTextGeneration({
         system: SYSTEM_PROMPT + RUNTIME_RULES,
         prompt,
         maxTokens: 1500,
-        tools: getSharedReadTools({ threadId }),
+        tools: allTools,
     });
 
     return {

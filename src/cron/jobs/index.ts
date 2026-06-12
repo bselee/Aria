@@ -15,6 +15,9 @@
  *   #4: po-sync 30m -> 4h (vendor PO emails rarely change <6h).
  *   #6: missing-reconciliation-watchdog Mon-Fri only (was firing
  *       false alarms on weekends when no reconciliations are scheduled).
+ *   #7 (2026-06-12): Business hours enforcement — all Telegram-sending
+ *       crons shifted into 8 AM–5 PM window. Early-morning jobs moved
+ *       to 8:00+ and critical: true flags removed from non-emergency paths.
  */
 
 import { defineJob } from "../registry";
@@ -44,9 +47,9 @@ defineJob({
 
 defineJob({
     name: "build-risk",
-    schedule: "30 7 * * 1-5",
+    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7:30 → 8:00 (business hours start)
     onFail: "telegram-will",
-    description: "Daily build risk analysis (Mon-Fri 7:30 AM).",
+    description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.runDailyBuildRisk(); },
 });
 
@@ -70,7 +73,7 @@ defineJob({
         }
 
         // Latest snapshot that has components JSON with orderTriggerDate fields
-        // (written by the build-risk job that already fired at 7:30).
+        // (written by the build-risk job that already fired at 8:00).
         const { data, error } = await db
             .from("build_risk_snapshots")
             .select("generated_at,components")
@@ -78,7 +81,7 @@ defineJob({
             .limit(1);
 
         if (error || !data || !data[0]) {
-            console.log("[jit-forward-projection] No snapshot available. Will surface at 7:30 run.");
+            console.log("[jit-forward-projection] No snapshot available. Will surface at 8:00 run.");
             return;
         }
         const snap = data[0] as any;
@@ -134,7 +137,7 @@ defineJob({
                 goal: `Order ${t.sku} by ${t.triggerDate} — ${t.riskLevel}`,
                 inputs: { sku: t.sku, triggerDate: t.triggerDate, vendor: t.vendorName, onHand: t.onHand, usedIn: t.usedIn },
                 priority: t.riskLevel === "CRITICAL" ? 0 : 2,
-                critical: true,
+                // KAIZEN #7: removed critical: true — JIT triggers wait for business hours
                 summaryLabel: "JIT Forward Projection",
             });
         }
@@ -313,9 +316,9 @@ defineJob({
 // L1 at sent+2d → L2 at sent+5d → L3 at sent+7d. Dropships excluded.
 defineJob({
     name: "po-followup-watcher",
-        schedule: "10 8 * * 1-5",
+        schedule: "15 8 * * 1-5",  // KAIZEN #7: 7:45 → 8:15 (after business hours start)
         onFail: "telegram-will",
-    description: "7:45 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
+    description: "8:15 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
     handler: async () => {
         const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
         const outcomes = await runPOFollowupWatcher();
@@ -333,9 +336,9 @@ defineJob({
 // Surfaces via /api/dashboard/po-stuck + Telegram digest on cron run.
 defineJob({
     name: "po-stuck-detector",
-        schedule: "50 7 * * 1-5",
+        schedule: "20 8 * * 1-5",  // KAIZEN #7: 7:50 → 8:20 (after business hours start)
         onFail: "telegram-will",
-    description: "7:50 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc). Also drafts vendor follow-up emails for overdue POs (po-overdue-followup).",
+    description: "8:20 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc). Also drafts vendor follow-up emails for overdue POs (po-overdue-followup).",
     handler: async () => {
         const { detectStuckPOs, summariseStuck } = await import("@/lib/purchasing/po-stuck-detector");
         const rows = await detectStuckPOs();
@@ -406,7 +409,7 @@ defineJob({
 
 defineJob({
     name: "build-completion-watcher",
-    schedule: "*/30 7-18 * * 1-5", // every 30m, 7am–6pm weekdays — build team hours only
+    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — build team hours only
     onFail: "log",
     description: "Poll Finale for completed production builds (every 30m during business hours).",
     handler: async () => { await ops()?.pollBuildCompletions(); },
@@ -414,7 +417,7 @@ defineJob({
 
 defineJob({
     name: "po-receiving-watcher",
-    schedule: "*/30 7-18 * * 1-5", // every 30m, 7am–6pm weekdays — warehouse hours only
+    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — warehouse hours only
     onFail: "telegram-will",
     description: "Poll Finale for received POs (every 30m during business hours).",
     handler: async () => { await ops()?.pollPOReceivings(); },
@@ -469,7 +472,7 @@ defineJob({
 // received in Finale. Sends Telegram with inline buttons.
 defineJob({
     name: "delivery-receipt-prompt",
-    schedule: "0 9,12,15,18 * * 1-5",
+    schedule: "0 9,12,15,17 * * 1-5",  // KAIZEN #7: 18 → 17 (no 6 PM messages)
     onFail: "log",
     description: "Prompt Bill to confirm receipt of delivered POs (4x/day weekdays).",
     handler: async () => {
@@ -609,6 +612,8 @@ defineJob({
                 console.log(`[cognitive-round] suppress: ${decision.suppress.join(", ")} | boost: ${decision.boost.join(", ")}`);
             }
             // KAIZEN(2026-06-02): Surface critical decisions via Telegram.
+            // KAIZEN #7 (2026-06-12): Downgraded from critical: true to gated.
+            // Cognitive decisions are important but not crash-loop emergencies.
             if (decision.priority === "critical") {
                 try {
                     const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
@@ -618,7 +623,7 @@ defineJob({
                         goal: `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`,
                         inputs: { action: decision.action, summary: decision.summary },
                         priority: 0,
-                        critical: true,
+                        // critical: true removed — waits for business hours
                         summaryLabel: "Cognitive Round CRITICAL",
                     });
                     console.log(`[cognitive-round] Routed critical decision through agent_task hub`);
@@ -686,7 +691,7 @@ defineJob({
 // vendor_profiles (human-vetted). Drafts only — never auto-sends.
 defineJob({
     name: "drafter-scan",
-    schedule: "0 7 * * 1-5", // 7 AM weekdays — morning batch before arrival
+    schedule: "0 8 * * 1-5", // KAIZEN #7: 7 AM → 8 AM (business hours start)
     onFail: "log",
     description: "Morning PO draft creation for vetted vendors. Runs once daily before arrival to present actionable drafts for review.",
     handler: async () => {
@@ -700,6 +705,7 @@ defineJob({
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId) {
                     try {
+                        // The handler inside drafter-agent already gates the send
                         await o.bot.telegram.sendMessage(
                             chatId,
                             formatDrafterTelegramSummary(result),
@@ -716,7 +722,7 @@ defineJob({
 
 defineJob({
     name: "autonomy-scan",
-    schedule: "30 7,13 * * 1-5", // 7:30am + 1:30pm weekdays — right after drafter + afternoon manual drafts
+    schedule: "30 8,13 * * 1-5", // KAIZEN #7: 7:30am → 8:30am + 1:30pm weekdays
     onFail: "log",
     description: "Process draft POs for Level 1 & 2 autonomy (2x/day weekdays).",
     handler: async () => {
@@ -804,9 +810,9 @@ defineJob({
 // vendor escalations, consumption spikes). If nothing actionable, stays silent.
 defineJob({
     name: "proactive-brief",
-    schedule: "0 7 * * 1-5",  // 7 AM Mon-Fri
+    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
     onFail: "telegram-will",
-    description: "7 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
+    description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
     handler: async () => {
         const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
         try {
@@ -822,7 +828,7 @@ defineJob({
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
     name: "stockout-driver",
-    schedule: "0 7,11,15 * * 1-5",  // 7am, 11am, 3pm weekdays
+    schedule: "0 8,11,15 * * 1-5",  // KAIZEN #7: 7am → 8am, 11am, 3pm weekdays
     onFail: "telegram-will",
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
@@ -843,16 +849,16 @@ defineJob({
 // loop is alive. Checks two signals:
 //   1. Most recent slack_requests entry age (detector writes on every SKU detection)
 //   2. aria-bot PM2 process uptime (if bot crashed, detector is dead too)
-// During business hours (M-F 7AM-6PM), alerts TG if no detector activity in 90 min.
+// During business hours (M-F 8AM-5PM), alerts TG if no detector activity in 90 min.
 // Silent outside business hours and on weekends.
 defineJob({
     name: "slack-detector-heartbeat",
-    schedule: "*/15 7-18 * * 1-5",  // every 15 min, 7AM-6PM, Mon-Fri
+    schedule: "*/15 8-17 * * 1-5",  // KAIZEN #7: 7-18 → 8-17, Mon-Fri
     onFail: "log",
     description: "Slack detector heartbeat: alert if no slack_requests activity >90min during business hours.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
-        const { sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");  // KAIZEN #7: downgraded from sendCritical
         const db = createClient();
         if (!db) return;
 
@@ -865,7 +871,7 @@ defineJob({
 
         if (!latest || latest.length === 0) {
             // No entries ever — detector may have never worked
-            await sendCriticalTelegramNotify(
+            await sendTelegramNotify(
                 "Slack detector heartbeat: No slack_requests records found. " +
                 "Detector may have never started. Check aria-bot logs."
             );
@@ -879,7 +885,7 @@ defineJob({
             // Check if it's actually quiet (no one posted) vs detector dead
             // We can't distinguish perfectly, but >90 min during business hours
             // warrants a heads-up
-            await sendCriticalTelegramNotify(
+            await sendTelegramNotify(
                 `Slack detector heartbeat: last slack_requests entry was ${ageMinutes}min ago ` +
                 `(${lastActivity.toLocaleString("en-US", { timeZone: "America/Denver" })}). ` +
                 `This could mean nobody posted, or the detector is dead. ` +

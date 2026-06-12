@@ -5,7 +5,7 @@
  *          Vercel AI SDK tool calling.
  * @author  Will / Antigravity
  * @created 2026-02-20
- * @updated 2026-05-26
+ * @updated 2026-06-12 — Business hours gate on runtime watchdogs
  *
  * DECISION(2026-03-18): Chat now uses a provider chain with tool support.
  * Refactored on 2026-05-26 to delegate heavy lifters to modular handlers under ./handlers/.
@@ -78,10 +78,11 @@ import {
     handleOrderApprove,
     handleOrderAbandon,
 } from './handlers/order-actions';
+import { isBusinessHours } from '../lib/intelligence/alert-gate';
 
-// ============================================================================
+// ===========================================================================
 // HELPERS
-// ============================================================================
+// ===========================================================================
 
 /**
  * Build the Telegram message text for a restored (post-restart) approval prompt.
@@ -123,9 +124,9 @@ function buildRestoredApprovalMessage(result: ReconciliationResult, approvalId: 
     );
 }
 
-// ============================================================================
+// ===========================================================================
 // CLIENT INITIALIZATION
-// ============================================================================
+// ===========================================================================
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
@@ -176,9 +177,9 @@ console.log(`📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ 
 
 // Slack removed — globalWatchdog deleted
 
-// ============================================================================
+// ===========================================================================
 // Telegram Event Listeners & Router Delegations
-// ============================================================================
+// ===========================================================================
 
 bot.start((ctx) => {
     const username = ctx.from?.first_name || 'Will';
@@ -320,7 +321,7 @@ bot.action('skip_uline_friday', (ctx) => {
 });
 
 // Text Fallbacks for approvals
-bot.hears(/^\/approve_(.+)$/, async (ctx) => {
+bot.hears(/^\\/approve_(.+)$/, async (ctx) => {
     const approvalId = ctx.match[1];
     console.log(`🔑 Approval text command: ${approvalId}`);
     try {
@@ -335,7 +336,7 @@ bot.hears(/^\/approve_(.+)$/, async (ctx) => {
     }
 });
 
-bot.hears(/^\/reject_(.+)$/, async (ctx) => {
+bot.hears(/^\\/reject_(.+)$/, async (ctx) => {
     const approvalId = ctx.match[1];
     console.log(`➡️ Rejection text command: ${approvalId}`);
     try {
@@ -369,9 +370,9 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     await ctx.editMessageText(original + '\n\n🔘 Skipped — invoice left unmatched.');
 });
 
-// ============================================================================
+// ===========================================================================
 // BOOT ORCHESTRATION
-// ============================================================================
+// ===========================================================================
 
 (async () => {
     try {
@@ -455,7 +456,6 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
         if (pending.length > 0) {
             console.log(`[boot] Restoring ${pending.length} pending approval(s) from Supabase...`);
-
             for (const entry of pending) {
                 const { approvalId, result, telegramChatId, expiresAt } = entry;
                 const minutesLeft = Math.round((expiresAt.getTime() - Date.now()) / 60000);
@@ -547,10 +547,10 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     startBotControlPlane(ops);
 
     console.log('📅 Cron schedules registered:');
-    console.log('   🐨 Build Risk Report:  7:30 AM MT (Weekdays)');
+    console.log('   🐨 Build Risk Report:  8:00 AM MT (Weekdays)');
     console.log('   📊 Daily PO Summary:  8:00 AM MT (Weekdays)');
     console.log('   🗓️   Weekly Review:     8:01 AM MT (Fridays)');
-    console.log('   📦 PO Sync:           Every 30 min');
+    console.log('   📦 PO Sync:           Every 4h');
     console.log('   🧹 Ad Cleanup:        Every hour');
 
     const hcUrl = process.env.HEALTHCHECK_PING_URL;
@@ -569,6 +569,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         if (hcUrl) fetch(hcUrl).catch(() => {});
     }, 15 * 60 * 1000);
 
+    // ── GATED: Memory alert only during business hours ──
     let lastMemAlertSent = 0;
     setInterval(async () => {
         const heapUsed = process.memoryUsage().heapUsed;
@@ -577,7 +578,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         if (heapUsed > HEAP_THRESHOLD && Date.now() - lastMemAlertSent > COOLDOWN) {
             const mb = Math.round(heapUsed / 1024 / 1024);
             const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId) {
+            if (chatId && isBusinessHours()) {
                 await bot.telegram.sendMessage(
                     chatId,
                     `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
@@ -587,7 +588,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         }
     }, 30 * 60 * 1000);
 
-    // cron health watchdog
+    // ── GATED: Cron health watchdog only during business hours ──
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000;
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
         { name: 'ap-polling', maxStaleMin: 25 },
@@ -626,7 +627,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
             if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId) {
+                if (chatId && isBusinessHours()) {
                     const names = stale.map(s => `${s.name} (>${s.maxStaleMin}m)`).join(', ');
                     await bot.telegram.sendMessage(
                         chatId,

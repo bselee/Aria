@@ -2008,51 +2008,73 @@ export default function PurchasingPanel() {
                                             onMouseLeave={lifecycle.clearFocus}
                                             className={`border-b border-zinc-800/60 cursor-pointer ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupBg}`}
                                         >
-                                            {/* ── Vendor header ── */}
-                                            <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-zinc-800/30 transition-colors">
-                                                <span className={`w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
-                                                <button
-                                                    onClick={() => !vSnoozed && toggleExpand(pid)}
-                                                    className="flex-1 text-left flex items-center gap-2 min-w-0"
-                                                >
-                                                    <span className={`text-base font-mono font-semibold whitespace-normal break-words leading-tight ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
-                                                        {group.vendorName}
-                                                    </span>
-                                                    <span className="text-xs font-mono text-zinc-200 shrink-0">
-                                                        {vSnoozed
-                                                            ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
-                                                            : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
-                                                    </span>
-                                                    {!vSnoozed && earliestRunway != null && Number.isFinite(earliestRunway) && (() => {
-                                                        // Show the lead time of the most-urgent item so the shortage number is
-                                                        // self-explanatory: "shortage 21d · lead 25d" = we're already late.
-                                                        const critItem = activeItems.find(i => i.urgency === 'critical');
-                                                        const shortageLeadTime = critItem?.leadTimeDays ?? null;
+                                            {/* ── Vendor header (2-row for breathing room) ──
+                                                Row 1: identity — dot + vendor name + SKU count + shortage + selected stats
+                                                Row 2: context strip — cycle badge, qty diff, affects, CRIT, Draft PO, snooze, Dossier, chevron */}
+                                            <div className="flex flex-col gap-1.5 px-4 py-3 hover:bg-zinc-800/30 transition-colors">
+                                                {/* ── Row 1: Vendor identity ── */}
+                                                <div className="flex items-start gap-2">
+                                                    <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
+                                                    <button
+                                                        onClick={() => !vSnoozed && toggleExpand(pid)}
+                                                        className="flex-1 text-left flex items-baseline gap-x-3 gap-y-1 flex-wrap min-w-0"
+                                                    >
+                                                        <span className={`text-base font-mono font-semibold whitespace-normal break-words leading-tight ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
+                                                            {group.vendorName}
+                                                        </span>
+                                                        <span className="text-xs font-mono text-zinc-200 shrink-0">
+                                                            {vSnoozed
+                                                                ? (isSnoozed(vSnoozeKey) ? snoozeLabel(vSnoozeKey) : "all skipped")
+                                                                : `${activeItems.length} SKU${activeItems.length !== 1 ? "s" : ""}`}
+                                                        </span>
+                                                        {!vSnoozed && earliestRunway != null && Number.isFinite(earliestRunway) && (() => {
+                                                            const critItem = activeItems.find(i => i.urgency === 'critical');
+                                                            const shortageLeadTime = critItem?.leadTimeDays ?? null;
+                                                            return (
+                                                                <span
+                                                                    className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}
+                                                                    title={shortageLeadTime != null
+                                                                        ? `Runway ${Math.round(earliestRunway)}d < lead time ${shortageLeadTime}d → order window already closed. Stock will hit zero before the next delivery arrives.`
+                                                                        : "Earliest effective shortage among actionable items"}
+                                                                >
+                                                                    shortage {Math.round(earliestRunway)}d
+                                                                    {shortageLeadTime != null && (
+                                                                        <span className="text-zinc-500 font-normal"> · lead {shortageLeadTime}d</span>
+                                                                    )}
+                                                                </span>
+                                                            );
+                                                        })()}
+                                                        {!vSnoozed && selectedCount > 0 && (
+                                                            <span className="text-xs font-mono text-emerald-300 shrink-0">
+                                                                selected {selectedCount} / {selectedUnits} units
+                                                                {selectedValue > 0 ? ` / $${selectedValue.toFixed(0)}` : ""}
+                                                            </span>
+                                                        )}
+                                                    </button>
+                                                    {/* Row 1 right-side: CRIT / urgency badge (always visible) */}
+                                                    {!vSnoozed && cfg.label && (() => {
+                                                        const critItems = group.urgency === 'critical'
+                                                            ? activeItems.filter(i => i.urgency === 'critical')
+                                                            : [];
+                                                        const critTooltip = critItems.length > 0
+                                                            ? `CRITICAL: stock runway (${Math.round(Math.min(...critItems.map(i => i.adjustedRunwayDays)))}d) is less than vendor lead time (${Math.round(Math.min(...critItems.map(i => i.leadTimeDays)))}d). The order window has closed — you will stock out before the next delivery arrives. Order immediately.`
+                                                            : cfg.label;
                                                         return (
                                                             <span
-                                                                className={`text-xs font-mono shrink-0 ${runwayColor(earliestRunway)}`}
-                                                                title={shortageLeadTime != null
-                                                                    ? `Runway ${Math.round(earliestRunway)}d < lead time ${shortageLeadTime}d → order window already closed. Stock will hit zero before the next delivery arrives.`
-                                                                    : "Earliest effective shortage among actionable items"}
+                                                                className={`text-[10px] font-mono shrink-0 ${group.urgency === "critical"
+                                                                    ? (po ? `px-1 py-0.5 rounded border ${cfg.badgeOutline}` : `px-1 py-0.5 rounded border ${cfg.badge}`)
+                                                                    : cfg.badge
+                                                                }`}
+                                                                title={critTooltip}
                                                             >
-                                                                shortage {Math.round(earliestRunway)}d
-                                                                {shortageLeadTime != null && (
-                                                                    <span className="text-zinc-500 font-normal"> · lead {shortageLeadTime}d</span>
-                                                                )}
+                                                                {cfg.label}
                                                             </span>
                                                         );
                                                     })()}
-                                                    {!vSnoozed && selectedCount > 0 && (
-                                                        <span className="text-xs font-mono text-emerald-300 shrink-0">
-                                                            selected {selectedCount} / {selectedUnits} units
-                                                            {selectedValue > 0 ? ` / $${selectedValue.toFixed(0)}` : ""}
-                                                        </span>
-                                                    )}
-                                                    {!vSnoozed && diffCount > 0 && (
-                                                        <span className="text-[11px] font-mono text-amber-300 border border-amber-500/30 rounded px-1 shrink-0">
-                                                            {diffCount} qty diff
-                                                        </span>
-                                                    )}
+                                                </div>
+
+                                                {/* ── Row 2: Context + actions (indented to align with name) ── */}
+                                                <div className="flex items-center gap-2 pl-4 flex-wrap">
                                                     {!vSnoozed && vendorCycleBadge && (
                                                         <span
                                                             className={`text-[10px] font-mono border rounded px-1 py-0.5 shrink-0 ${vendorCycleBadge.className}`}
@@ -2061,7 +2083,12 @@ export default function PurchasingPanel() {
                                                             {vendorCycleBadge.text}
                                                         </span>
                                                     )}
-                                                    {/* Affected FGs across this vendor's BOM items (collapsed view) */}
+                                                    {!vSnoozed && diffCount > 0 && (
+                                                        <span className="text-[11px] font-mono text-amber-300 border border-amber-500/30 rounded px-1 shrink-0">
+                                                            {diffCount} qty diff
+                                                        </span>
+                                                    )}
+                                                    {/* Affected FGs across this vendor's BOM items */}
                                                     {!vSnoozed && (() => {
                                                         const fgs = new Map<string, string>();
                                                         for (const it of activeItems) {
@@ -2070,167 +2097,145 @@ export default function PurchasingPanel() {
                                                             }
                                                         }
                                                         if (fgs.size === 0) return null;
-                                                        const list = Array.from(fgs.entries());
-                                                        const shown = list.slice(0, 3);
+                                                        const list = Array.from(fgs.entries()).slice(0, 4);
                                                         return (
                                                             <span
-                                                                className="text-[10px] font-mono text-purple-300/80 truncate max-w-[420px] shrink"
+                                                                className="text-[10px] font-mono text-purple-300/80 shrink-0"
                                                                 title={list.map(([sku, name]) => `${sku} · ${name}`).join('\n')}
                                                             >
-                                                                affects {shown.map(([sku]) => sku).join(', ')}
-                                                                {list.length > shown.length && ` · +${list.length - shown.length}`}
+                                                                affects {list.map(([sku]) => sku).join(', ')}
                                                             </span>
                                                         );
                                                     })()}
-                                                </button>
 
-                                                {!vSnoozed && cfg.label && (() => {
-                                                    // DECISION(2026-05-27): CRIT badge gets an explanatory tooltip so humans
-                                                    // understand why CRIT ≠ just "it's bad" — it means the order window is closed.
-                                                    // The tooltip exposes the runway < lead time math that defines critical.
-                                                    const critItems = group.urgency === 'critical'
-                                                        ? activeItems.filter(i => i.urgency === 'critical')
-                                                        : [];
-                                                    const critTooltip = critItems.length > 0
-                                                        ? `CRITICAL: stock runway (${Math.round(Math.min(...critItems.map(i => i.adjustedRunwayDays)))}d) is less than vendor lead time (${Math.round(Math.min(...critItems.map(i => i.leadTimeDays)))}d). The order window has closed — you will stock out before the next delivery arrives. Order immediately.`
-                                                        : cfg.label;
-                                                    return (
-                                                        <span
-                                                            className={`text-[10px] font-mono shrink-0 ${group.urgency === "critical"
-                                                                ? (po ? `px-1 py-0.5 rounded border ${cfg.badgeOutline}` : `px-1 py-0.5 rounded border ${cfg.badge}`)
-                                                                : cfg.badge
-                                                            }`}
-                                                            title={critTooltip}
+                                                    {/* Flex spacer pushes primary actions to the right edge */}
+                                                    <div className="flex-1" />
+
+                                                    {vSnoozed ? (
+                                                        <button
+                                                            onClick={() => {
+                                                                const updated = { ...snooze };
+                                                                delete updated[vSnoozeKey];
+                                                                group.items.forEach(i => delete updated[i.productId]);
+                                                                setSnooze(updated);
+                                                                localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
+                                                            }}
+                                                            className="text-[10px] font-mono text-zinc-600 hover:text-emerald-400 shrink-0 transition-colors"
                                                         >
-                                                            {cfg.label}
-                                                        </span>
-                                                    );
-                                                })()}
-                                                {vSnoozed ? (
-                                                    /* Restore entire snoozed vendor */
-                                                    <button
-                                                        onClick={() => {
-                                                            const updated = { ...snooze };
-                                                            delete updated[vSnoozeKey];
-                                                            group.items.forEach(i => delete updated[i.productId]);
-                                                            setSnooze(updated);
-                                                            localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
-                                                        }}
-                                                        className="text-[10px] font-mono text-zinc-600 hover:text-emerald-400 shrink-0 transition-colors"
-                                                    >
-                                                        ↩ restore
-                                                    </button>
-                                                ) : (
-                                                    <>
-                                                        {po ? (
-                                                            <div className="flex items-center gap-1 shrink-0">
-                                                                <a href={po.finaleUrl} target="_blank" rel="noreferrer"
-                                                                    className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300">
-                                                                    PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
-                                                                </a>
-                                                                {(() => {
-                                                                    const det = createdPODetails[pid];
-                                                                    if (!det?.verification) return null;
-                                                                    if (det.verification.verified) {
+                                                            ↩ restore
+                                                        </button>
+                                                    ) : (
+                                                        <>
+                                                            {po ? (
+                                                                <div className="flex items-center gap-1 shrink-0">
+                                                                    <a href={po.finaleUrl} target="_blank" rel="noreferrer"
+                                                                        className="flex items-center gap-1 text-[10px] font-mono text-emerald-400 hover:text-emerald-300">
+                                                                        PO #{po.orderId} <ExternalLink className="w-2.5 h-2.5" />
+                                                                    </a>
+                                                                    {(() => {
+                                                                        const det = createdPODetails[pid];
+                                                                        if (!det?.verification) return null;
+                                                                        if (det.verification.verified) {
+                                                                            return (
+                                                                                <span
+                                                                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-300 border-emerald-500/40 shrink-0"
+                                                                                    title={det.expectedDelivery?.label ?? 'verified'}
+                                                                                >
+                                                                                    ✓ Verified{det.expectedDelivery?.date ? ` · ETA ${det.expectedDelivery.date.slice(5)}` : ''}
+                                                                                </span>
+                                                                            );
+                                                                        }
                                                                         return (
                                                                             <span
-                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-300 border-emerald-500/40 shrink-0"
-                                                                                title={det.expectedDelivery?.label ?? 'verified'}
+                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0"
+                                                                                title={det.verification.mismatches.join('; ')}
                                                                             >
-                                                                                ✓ Verified{det.expectedDelivery?.date ? ` · ETA ${det.expectedDelivery.date.slice(5)}` : ''}
+                                                                                ⚠ Verify failed
                                                                             </span>
                                                                         );
-                                                                    }
-                                                                    return (
-                                                                        <span
-                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0"
-                                                                            title={det.verification.mismatches.join('; ')}
-                                                                        >
-                                                                            ⚠ Verify failed
-                                                                        </span>
-                                                                    );
-                                                                })()}
-                                                                {sentPOs.has(po.orderId) ? (
-                                                                    <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
-                                                                ) : (
-                                                                    <>
-                                                                        <button
-                                                                            onClick={() => handleReviewAndSend(po.orderId)}
-                                                                            disabled={commitLoading === po.orderId}
-                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
-                                                                            title="Commit in Finale and email vendor"
-                                                                        >
-                                                                            {commitLoading === po.orderId ? '…' : 'Commit & Send'}
-                                                                        </button>
-                                                                        <button
-                                                                            onClick={() => handleCancelDraft(po.orderId)}
-                                                                            disabled={commitLoading === po.orderId}
-                                                                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border-rose-700/50 transition-colors disabled:opacity-40"
-                                                                            title="Cancel this draft PO in Finale"
-                                                                        >
-                                                                            ✕
-                                                                        </button>
-                                                                    </>
-                                                                )}
-                                                            </div>
-                                                        ) : (
-                                                            <>
-                                                                <button
-                                                                    onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
-                                                                    disabled={anyCreating}
-                                                                    className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
-                                                                        ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
-                                                                        : "bg-transparent text-zinc-600 border-zinc-800"
-                                                                        }`}
-                                                                >
-                                                                    {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
-                                                                    {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
-                                                                </button>
-                                                                {/* ULINE: Order Now button — fires items directly to ULINE cart */}
-                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && !directOrderBlocked && (
+                                                                    })()}
+                                                                    {sentPOs.has(po.orderId) ? (
+                                                                        <span className="text-[10px] font-mono text-emerald-500">✓ sent</span>
+                                                                    ) : (
+                                                                        <>
+                                                                            <button
+                                                                                onClick={() => handleReviewAndSend(po.orderId)}
+                                                                                disabled={commitLoading === po.orderId}
+                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-600 transition-colors disabled:opacity-40"
+                                                                                title="Commit in Finale and email vendor"
+                                                                            >
+                                                                                {commitLoading === po.orderId ? '…' : 'Commit & Send'}
+                                                                            </button>
+                                                                            <button
+                                                                                onClick={() => handleCancelDraft(po.orderId)}
+                                                                                disabled={commitLoading === po.orderId}
+                                                                                className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border-rose-700/50 transition-colors disabled:opacity-40"
+                                                                                title="Cancel this draft PO in Finale"
+                                                                            >
+                                                                                ✕
+                                                                            </button>
+                                                                        </>
+                                                                    )}
+                                                                </div>
+                                                            ) : (
+                                                                <>
                                                                     <button
-                                                                        onClick={() => handleOrderOnUline(group)}
-                                                                        disabled={ulineOrdering}
-                                                                        className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-700/80 hover:bg-amber-600 text-amber-100 border-amber-600 transition-colors disabled:opacity-40 shrink-0"
-                                                                        title="Add selected items to ULINE cart via Quick Order"
+                                                                        onClick={() => selectedCount > 0 ? handleCreateOne(group) : toggleExpand(pid)}
+                                                                        disabled={anyCreating}
+                                                                        className={`flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded border transition-colors disabled:opacity-40 shrink-0 ${selectedCount > 0
+                                                                            ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-zinc-100 border-zinc-700"
+                                                                            : "bg-transparent text-zinc-600 border-zinc-800"
+                                                                            }`}
                                                                     >
-                                                                        {ulineOrdering
-                                                                            ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
-                                                                            : <ShoppingCart className="w-2.5 h-2.5" />}
-                                                                        {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                        {isCreatingThis && <div className="w-2 h-2 border border-zinc-600 border-t-transparent rounded-full animate-spin" />}
+                                                                        {selectedCount > 0 ? `Draft PO (${selectedCount})` : "Draft PO"}
                                                                     </button>
-                                                                )}
-                                                                {isUlineVendor(group.vendorName) && selectedCount > 0 && directOrderBlocked && (
-                                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/20 text-amber-300/80 shrink-0">
-                                                                        {directOrderBlockReason(selectedItems)}
-                                                                    </span>
-                                                                )}
-                                                            </>
-                                                        )}
-                                                        {/* Vendor-level snooze menu */}
-                                                        <div className="relative shrink-0">
+                                                                    {/* ULINE: Order Now button — fires items directly to ULINE cart */}
+                                                                    {isUlineVendor(group.vendorName) && selectedCount > 0 && !directOrderBlocked && (
+                                                                        <button
+                                                                            onClick={() => handleOrderOnUline(group)}
+                                                                            disabled={ulineOrdering}
+                                                                            className="flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded border bg-amber-700/80 hover:bg-amber-600 text-amber-100 border-amber-600 transition-colors disabled:opacity-40 shrink-0"
+                                                                            title="Add selected items to ULINE cart via Quick Order"
+                                                                        >
+                                                                            {ulineOrdering
+                                                                                ? <div className="w-2 h-2 border border-amber-300 border-t-transparent rounded-full animate-spin" />
+                                                                                : <ShoppingCart className="w-2.5 h-2.5" />}
+                                                                            {ulineOrdering ? 'Ordering…' : 'Order on ULINE'}
+                                                                        </button>
+                                                                    )}
+                                                                    {isUlineVendor(group.vendorName) && selectedCount > 0 && directOrderBlocked && (
+                                                                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/20 text-amber-300/80 shrink-0">
+                                                                            {directOrderBlockReason(selectedItems)}
+                                                                        </span>
+                                                                    )}
+                                                                </>
+                                                            )}
+                                                            {/* Vendor-level snooze menu */}
+                                                            <div className="relative shrink-0">
+                                                                <button
+                                                                    onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === vSnoozeKey ? null : vSnoozeKey); }}
+                                                                    className="px-1 py-0.5 text-[11px] font-mono text-zinc-700 hover:text-zinc-400 transition-colors"
+                                                                    title="Snooze this vendor"
+                                                                >···</button>
+                                                                {snoozeMenu === vSnoozeKey && renderSnoozeMenu(vSnoozeKey)}
+                                                            </div>
+                                                            {/* Phase 2: Decision Dossier trigger */}
                                                             <button
-                                                                onClick={e => { e.stopPropagation(); setSnoozeMenu(snoozeMenu === vSnoozeKey ? null : vSnoozeKey); }}
-                                                                className="px-1 py-0.5 text-[11px] font-mono text-zinc-700 hover:text-zinc-400 transition-colors"
-                                                                title="Snooze this vendor"
-                                                            >···</button>
-                                                            {snoozeMenu === vSnoozeKey && renderSnoozeMenu(vSnoozeKey)}
-                                                        </div>
-                                                        {/* Phase 2: Decision Dossier trigger — opens agentic audit flyout */}
-                                                        <button
-                                                            onClick={e => { e.stopPropagation(); setFlyoutPid(pid); }}
-                                                            className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border border-cyan-800/50 text-cyan-400 hover:border-cyan-500 hover:text-cyan-300 hover:bg-cyan-950/30 transition-colors shrink-0"
-                                                            title="Open Decision Dossier — view the agent's reasoning + cross-column PO lineage"
-                                                        >
-                                                            <ArrowRight className="w-2.5 h-2.5" />
-                                                            Dossier
-                                                        </button>
-                                                        <ChevronDown
-                                                            onClick={() => toggleExpand(pid)}
-                                                            className={`w-3.5 h-3.5 text-zinc-700 transition-transform shrink-0 cursor-pointer ${isExpanded ? "" : "-rotate-90"}`}
-                                                        />
-                                                    </>
-                                                )}
+                                                                onClick={e => { e.stopPropagation(); setFlyoutPid(pid); }}
+                                                                className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-1 rounded border border-cyan-800/50 text-cyan-400 hover:border-cyan-500 hover:text-cyan-300 hover:bg-cyan-950/30 transition-colors shrink-0"
+                                                                title="Open Decision Dossier — view the agent's reasoning + cross-column PO lineage"
+                                                            >
+                                                                <ArrowRight className="w-2.5 h-2.5" />
+                                                                Dossier
+                                                            </button>
+                                                            <ChevronDown
+                                                                onClick={() => toggleExpand(pid)}
+                                                                className={`w-4 h-4 text-zinc-700 transition-transform shrink-0 cursor-pointer ${isExpanded ? "" : "-rotate-90"}`}
+                                                            />
+                                                        </>
+                                                    )}
+                                                </div>
                                             </div>
 
                                             {/* ── Item rows ── */}

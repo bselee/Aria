@@ -1,33 +1,72 @@
 import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
-import { FinaleClient } from '../lib/finale/client';
 
-async function listAllUlineBoxPOs() {
-    const client: any = new FinaleClient();
-    try {
-        const pos = await client.getRecentPurchaseOrders(365, 1000);
-        const ulinePOs = pos.filter((po: any) => 
-            po.vendorName.toUpperCase().includes('ULINE') && 
-            po.status === 'Completed'
-        );
+const accountPath = process.env.FINALE_ACCOUNT_PATH!;
+const apiBase = process.env.FINALE_BASE_URL || 'https://app.finaleinventory.com';
+const authHeader = `Basic ${Buffer.from(`${process.env.FINALE_API_KEY || ''}:${process.env.FINALE_API_SECRET || ''}`).toString('base64')}`;
 
-        console.log(`Found ${ulinePOs.length} completed ULINE POs.`);
+async function main() {
+    const days = parseInt(process.argv[2], 10) || 90;
+    const end = new Date();
+    const begin = new Date();
+    begin.setDate(begin.getDate() - days);
+    const beginStr = begin.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+    const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 
-        const allItems = new Set();
-        for (const po of ulinePOs) {
-            for (const item of po.items) {
-                allItems.add(`${item.productId} (${item.quantity})`);
-            }
-        }
+    const PAGE_SIZE = 50;
+    let cursor: string | null = null;
+    const allEdges: any[] = [];
 
-        console.log("All items in ULINE POs:");
-        console.log(Array.from(allItems).join('\n'));
+    for (let page = 0; page < 10; page++) {
+        const after = cursor ? `, after: "${cursor}"` : '';
+        const query = {
+            query: `{
+                orderViewConnection(
+                    first: ${PAGE_SIZE}
+                    type: ["PURCHASE_ORDER"]
+                    orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                    sort: [{ field: "orderDate", mode: "desc" }]${after}
+                ) {
+                    pageInfo { hasNextPage endCursor }
+                    edges { node {
+                        orderId orderDate status
+                        supplier { name }
+                    }}
+                }
+            }`
+        };
 
-        process.exit(0);
-    } catch (err) {
-        console.error(err);
-        process.exit(1);
+        const res = await fetch(`${apiBase}/${accountPath}/api/graphql`, {
+            method: 'POST',
+            headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+            body: JSON.stringify(query),
+        });
+        const json = await res.json();
+        if (json.errors) { console.error(json.errors); break; }
+        const conn = json.data?.orderViewConnection;
+        if (!conn) break;
+        allEdges.push(...(conn.edges || []));
+        if (!conn.pageInfo?.hasNextPage) break;
+        cursor = conn.pageInfo.endCursor;
+        if (!cursor) break;
+    }
+
+    console.log(`All POs last ${days}d: ${allEdges.length}`);
+
+    const ulineEdges = allEdges.filter(e => /uline/i.test(e?.node?.supplier?.name || ''));
+    console.log(`\nULINE POs: ${ulineEdges.length}\n`);
+
+    for (const e of ulineEdges) {
+        const po = e.node;
+        console.log(`PO:${po.orderId} status:${po.status} date:${po.orderDate}`);
+    }
+
+    // Print full details for Created/ORDER_CREATED
+    const drafts = ulineEdges.filter(e => /created|draft/i.test(e.node.status));
+    console.log(`\nDraft/created ULINE POs: ${drafts.length}`);
+    for (const e of drafts) {
+        console.log(JSON.stringify(e.node, null, 2));
     }
 }
 
-listAllUlineBoxPOs();
+main().catch(e => { console.error(e.message); process.exit(1); });

@@ -16,6 +16,7 @@ import {
     lookupVendorOrderEmail
 } from './po-sender';
 import { transitionLifecycleState } from './po-lifecycle';
+import { isBusinessHours } from '../intelligence/alert-gate';
 import type { Telegraf } from 'telegraf';
 
 /**
@@ -113,13 +114,18 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                         expires_at: new Date().toISOString(),
                     });
 
-                    await bot.telegram.sendMessage(
-                        chatId,
-                        `ℹ️ *Draft PO #${draft.orderId} Detected!*\n` +
-                        `*Vendor*: ${draft.vendorName}\n` +
-                        `*Status*: Already manually sent (proven via Gmail search). Auto-committed in Finale and marked sent in database.`,
-                        { parse_mode: 'Markdown' }
-                    );
+                    // ── Gated: only notify during business hours ──
+                    if (!isBusinessHours()) {
+                        console.log('[autonomy] Draft PO detected but outside business hours — skipping Telegram.');
+                    } else {
+                        await bot.telegram.sendMessage(
+                            chatId,
+                            `ℹ️ *Draft PO #${draft.orderId} Detected!*\n` +
+                            `*Vendor*: ${draft.vendorName}\n` +
+                            `*Status*: Already manually sent (proven via Gmail search). Auto-committed in Finale and marked sent in database.`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    }
                     processed++;
                 } catch (dbErr: any) {
                     console.warn(`[autonomy] Failed to write manual sent state for PO #${draft.orderId}:`, dbErr.message);
@@ -144,13 +150,15 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 
                 if (!email) {
                     console.warn(`[autonomy] Missing email for vendor ${review.vendorName} on PO #${draft.orderId}`);
-                    await bot.telegram.sendMessage(
-                        chatId,
-                        `⚠️ *Autonomy Blocked on PO #${draft.orderId}*\n` +
-                        `*Vendor*: ${review.vendorName}\n` +
-                        `*Reason*: No order contact email on file. Update vendor\\_profiles or vendors table.`,
-                        { parse_mode: 'Markdown' }
-                    );
+                    if (isBusinessHours()) {
+                        await bot.telegram.sendMessage(
+                            chatId,
+                            `⚠️ *Autonomy Blocked on PO #${draft.orderId}*\n` +
+                            `*Vendor*: ${review.vendorName}\n` +
+                            `*Reason*: No order contact email on file. Update vendor\\_profiles or vendors table.`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    }
                     errors++;
                     continue;
                 }
@@ -174,15 +182,19 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                                 `*Total*: $${review.total.toFixed(2)}\n\n` +
                                 `☝️ _Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
 
-                    await bot.telegram.sendMessage(chatId, msg, {
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                            inline_keyboard: [[
-                                { text: '🔍 Review & Send', callback_data: `po_review_${draft.orderId}` },
-                                { text: '⏭️ Skip', callback_data: `po_skip_${draft.orderId}` }
-                            ]]
-                        }
-                    });
+                    if (isBusinessHours()) {
+                        await bot.telegram.sendMessage(chatId, msg, {
+                            parse_mode: 'Markdown',
+                            reply_markup: {
+                                inline_keyboard: [[
+                                    { text: '🔍 Review & Send', callback_data: `po_review_${draft.orderId}` },
+                                    { text: '⏭️ Skip', callback_data: `po_skip_${draft.orderId}` }
+                                ]]
+                            }
+                        });
+                    } else {
+                        console.log(`[autonomy] Draft PO #${draft.orderId} ready, outside hours — skipping Telegram prompt.`);
+                    }
 
                     processed++;
                     console.log(`[autonomy] Level 1 enqueued and Telegram review sent for PO #${draft.orderId}`);
@@ -203,16 +215,20 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     // Level 2 POs get the same review prompt as Level 1
                     // Auto-send disabled intentionally — trust building phase
                     const link = `https://app.finaleinventory.com/buildasoilorganics/purchaseOrder?orderId=${draft.orderId}`;
-                    await bot.telegram.sendMessage(
-                        chatId,
-                        `✅ *PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
-                        `*Vendor*: ${review.vendorName}\n` +
-                        `*Total*: $${review.total.toFixed(2)}\n` +
-                        `*Sent To*: ${email}\n` +
-                        `🔗 [View in Finale](${link})\n\n` +
-                        `_Auto-send disabled during trust building. Review and approve via dashboard or /sendpo ${draft.orderId}_`,
-                        { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
-                    );
+                    if (isBusinessHours()) {
+                        await bot.telegram.sendMessage(
+                            chatId,
+                            `✅ *PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
+                            `*Vendor*: ${review.vendorName}\n` +
+                            `*Total*: $${review.total.toFixed(2)}\n` +
+                            `*Sent To*: ${email}\n` +
+                            `🔗 [View in Finale](${link})\n\n` +
+                            `_Auto-send disabled during trust building. Review and approve via dashboard or /sendpo ${draft.orderId}_`,
+                            { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+                        );
+                    } else {
+                        console.log(`[autonomy] Level 2 PO #${draft.orderId} reviewed, outside hours — skipping Telegram.`);
+                    }
 
                     processed++;
                     console.log(`[autonomy] Level 2 reviewed (not auto-sent) PO #${draft.orderId}`);
@@ -220,13 +236,15 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 
             } catch (innerErr: any) {
                 console.error(`[autonomy] Error processing PO #${draft.orderId}:`, innerErr);
-                await bot.telegram.sendMessage(
-                    chatId,
-                    `🚨 *Autonomous PO #${draft.orderId} Failed*\n` +
-                    `*Vendor*: ${draft.vendorName}\n` +
-                    `*Error*: ${innerErr.message || innerErr}`,
-                    { parse_mode: 'Markdown' }
-                );
+                if (isBusinessHours()) {
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `🚨 *Autonomous PO #${draft.orderId} Failed*\n` +
+                        `*Vendor*: ${draft.vendorName}\n` +
+                        `*Error*: ${innerErr.message || innerErr}`,
+                        { parse_mode: 'Markdown' }
+                    );
+                }
                 errors++;
             }
         }
