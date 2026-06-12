@@ -60,6 +60,10 @@ export interface FGVelocity {
     stockOnHand: number | null;      // Current finished-good stock on shelf
     daysOfFinishedStock: number | null;  // stockOnHand / dailyRate
     openDemandQty: number;           // Committed sales orders not yet shipped
+    // HERMIA(2026-06-12): Added stockAvailable so FG coverageDays uses the lower
+    // of stockOnHand and stockAvailable — prevents ordering components for FG that
+    // has physical stock but no allocatable inventory.
+    stockAvailable: number | null;
 }
 
 export interface BuildRiskReport {
@@ -272,23 +276,30 @@ export async function runBuildRiskAnalysis(
     }
 
     let droppedFGs = 0;
-    const droppedFGLog: string[] = [];
-    for (const [fgSku, meta] of Array.from(aggregatedBuilds.entries())) {
-        const vel = fgVelocityPreFilter.get(fgSku);
-        // Keep the build if: no FG velocity, 0 sales, null stock, or low shelf
-        if (!vel) continue;
-        if (!vel.dailyRate || vel.dailyRate === 0) continue;
-        if (vel.stockOnHand === null || vel.stockOnHand === 0) continue;
-        const coverageDays = vel.stockOnHand / vel.dailyRate;
-        const threshold = LEADTIME_DEFAULT + FG_COVERAGE_BUFFER_DAYS;
-        if (coverageDays > threshold) {
-            aggregatedBuilds.delete(fgSku);
-            droppedFGs++;
-            droppedFGLog.push(
-                `${fgSku}: ${Math.round(coverageDays)}d shelf (×${vel.dailyRate.toFixed(2)}/d) > ${threshold}d threshold`
-            );
+        const droppedFGLog: string[] = [];
+        for (const [fgSku, meta] of Array.from(aggregatedBuilds.entries())) {
+            const vel = fgVelocityPreFilter.get(fgSku);
+            // Keep the build if: no FG velocity, 0 sales, null stock, or low shelf
+            if (!vel) continue;
+            if (!vel.dailyRate || vel.dailyRate === 0) continue;
+            if (vel.stockOnHand === null || vel.stockOnHand === 0) continue;
+            // HERMIA(2026-06-12): Use min(stockOnHand, stockAvailable) for FG coverage
+            // so we don't drop builds for FG that has physical stock on the shelf but
+            // zero (or very low) allocatable inventory. Falls back to stockOnHand when
+            // stockAvailable is null (e.g. non-inventory SKUs).
+            const effectiveStock = vel.stockAvailable !== null && vel.stockAvailable !== undefined
+                ? Math.min(vel.stockOnHand, vel.stockAvailable)
+                : vel.stockOnHand;
+            const coverageDays = effectiveStock / vel.dailyRate;
+            const threshold = LEADTIME_DEFAULT + FG_COVERAGE_BUFFER_DAYS;
+            if (coverageDays > threshold) {
+                aggregatedBuilds.delete(fgSku);
+                droppedFGs++;
+                droppedFGLog.push(
+                    `${fgSku}: ${Math.round(coverageDays)}d shelf (×${vel.dailyRate.toFixed(2)}/d) > ${threshold}d threshold`
+                );
+            }
         }
-    }
     if (droppedFGs > 0) {
         log(`   ✸ Dropped ${droppedFGs} optional FG build(s) — excessive FG shelf:`);
         for (const entry of droppedFGLog.slice(0, 10)) log(`      ${entry}`);

@@ -264,8 +264,17 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
     const onTimeRate: number = typeof item.vendorOnTimeRate === 'number' ? Math.min(1, Math.max(0, item.vendorOnTimeRate)) : 1;
     const stockOnOrder = Math.round(rawStockOnOrder * onTimeRate);
     
+    // HERMIA(2026-06-12): Use stockAvailable as a ceiling for projection starting stock.
+    // When Finale reports stockAvailable (allocatable inventory), use min(stockOnHand, stockAvailable)
+    // so 7/14/30/60/90d projections don't overstate supply from inventory that's already
+    // committed or reserved for other purposes. Falls back to raw stockOnHand when stockAvailable
+    // is not reported (e.g. non-inventory SKUs or legacy products).
+    const startingStock = item.stockAvailable !== undefined
+        ? Math.min(stockOnHand, item.stockAvailable)
+        : stockOnHand;
+    
     const projections = computeProjections({
-        stockOnHand,
+        stockOnHand: startingStock,
         stockOnOrder,
         dailyRate,
         leadTimeDays,

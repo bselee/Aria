@@ -119,8 +119,8 @@ export interface PurchasingItem {
     demandVelocity: number;        // units/day from Finale 90-day demand (sales + BOM consumption)
     dailyRate: number;             // best signal: demandVelocity → salesVelocity → purchaseVelocity
     dailyRateSource?: "demand" | "sales" | "receipts";
-    runwayDays: number;            // stockOnHand / dailyRate
-    adjustedRunwayDays: number;    // (stockOnHand + stockOnOrder) / dailyRate
+    runwayDays: number;            // effectiveStock / dailyRate (effectiveStock = min(stockOnHand, stockAvailable) via recommender)
+    adjustedRunwayDays: number;    // (effectiveStock + stockOnOrder - reservedQty) / dailyRate
     leadTimeDays: number;
     leadTimeProvenance: string;    // e.g. "14d (Finale)" | "14d default"
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;

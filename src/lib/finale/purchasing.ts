@@ -100,6 +100,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         totalSoldQty: number;
         stockOnHand: number | null;
         openDemandQty: number;
+        stockAvailable: number | null;
     }> {
         try {
             const activity = await this.getProductActivity(sku, daysBack);
@@ -107,6 +108,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 totalSoldQty: activity.soldQty,
                 stockOnHand: activity.stockOnHand,
                 openDemandQty: 0,
+                stockAvailable: activity.stockAvailable,
             };
         } catch (err) {
             console.error(`[finale] getSalesQty error for ${sku}:`, err);
@@ -114,6 +116,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 totalSoldQty: 0,
                 stockOnHand: null,
                 openDemandQty: 0,
+                stockAvailable: null,
             };
         }
     }
@@ -1036,12 +1039,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         stockOnHand: number | null;
         daysOfFinishedStock: number | null;
         openDemandQty: number;
+        stockAvailable: number | null;
     }>> {
         const result = new Map<string, {
             dailyRate: number;
             stockOnHand: number | null;
             daysOfFinishedStock: number | null;
             openDemandQty: number;
+            stockAvailable: number | null;
         }>();
 
         if (skus.length === 0) return result;
@@ -1055,15 +1060,23 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 try {
                     const data = await this.getSalesQty(sku, daysBack);
                     const dailyRate = daysBack > 0 ? data.totalSoldQty / daysBack : 0;
+                    // HERMIA(2026-06-12): Use min(stockOnHand, stockAvailable) for
+                    // daysOfFinishedStock so FG shelf coverage reflects committed stock.
+                    const stockForShelf = data.stockAvailable != null && data.stockOnHand != null && data.stockAvailable < data.stockOnHand
+                        ? data.stockAvailable
+                        : (data.stockOnHand ?? null);
                     const daysOfFinishedStock =
-                        data.stockOnHand !== null && dailyRate > 0
-                            ? Math.round(data.stockOnHand / dailyRate)
+                        stockForShelf !== null && dailyRate > 0
+                            ? Math.round(stockForShelf / dailyRate)
                             : null;
                     result.set(sku, {
                         dailyRate,
                         stockOnHand: data.stockOnHand,
                         daysOfFinishedStock,
                         openDemandQty: data.openDemandQty,
+                        // HERMIA(2026-06-12): Carry stockAvailable through so FG coverage
+                        // filter can use the lower of stockOnHand and stockAvailable.
+                        stockAvailable: data.stockAvailable,
                     });
                 } catch {
                     // Non-fatal: skip this SKU
@@ -2165,7 +2178,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // cover target (e.g., Colorful 4-6 month supply = 180d).
                     const bomPolicy = bomVendorPolicies.get(partyId) ?? null;
 
-                    const stockOnHand = compActivity.stockOnHand ?? 0;
+                    const rawStockOnHand = compActivity.stockOnHand ?? 0;
+                    const finaleAvailable = compActivity.stockAvailable;
+                    const committedQty = (finaleAvailable != null && rawStockOnHand > finaleAvailable)
+                        ? rawStockOnHand - finaleAvailable
+                        : 0;
+                    const effectiveStock = finaleAvailable != null && finaleAvailable < rawStockOnHand
+                        ? finaleAvailable
+                        : rawStockOnHand;
+                    if (committedQty > 0) {
+                        console.log(`[purchasing] BOM ${compSku}: stockAvailable=${finaleAvailable} < stockOnHand=${rawStockOnHand} — committed=${committedQty.toFixed(2)} — using effectiveStock=${effectiveStock.toFixed(2)}`);
+                    }
+                    // Keep raw value for display purposes downstream
+                    const stockOnHand = rawStockOnHand;
 
                     // HERMIA(2026-06-10): Enrich open POs with delivery reliability data.
                     // Stuck/unacknowledged/overdue POs don't count toward on-order coverage.
@@ -2221,18 +2246,18 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const dailyBurn = chosen.value;
                     if (dailyBurn <= 0) continue; // nothing to order — no receipts AND no FG demand
 
-                    const runwayDays = dailyBurn > 0 ? stockOnHand / dailyBurn : 9999;
+                    const runwayDays = dailyBurn > 0 ? effectiveStock / dailyBurn : 9999;
                     const adjustedRunwayDays = dailyBurn > 0
-                        ? (stockOnHand + stockOnOrder) / dailyBurn
+                        ? (effectiveStock + stockOnOrder) / dailyBurn
                         : 9999;
                     const medianPOGapDays = computeMedianPOGap(compActivity.purchaseDates);
 
                     // Forward-demand bump: if upcoming calendar builds will consume
-                    // more than (stockOnHand + stockOnOrder), that's a hard shortfall
+                    // more than (effectiveStock + stockOnOrder), that's a hard shortfall
                     // — bump urgency regardless of historical-velocity math.
                     const forward = forwardDemand.get(compSku);
                     const forwardShortfall = forward
-                        ? Math.max(0, forward.requiredQty - (stockOnHand + stockOnOrder))
+                        ? Math.max(0, forward.requiredQty - (effectiveStock + stockOnOrder))
                         : 0;
 
                     let urgency = classifyBomUrgency({
@@ -2255,7 +2280,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         else if (forwardShortfall > 0 && (urgency === 'ok' || urgency === 'watch')) urgency = 'warning';
                     }
                     const projectedNextOrderDate = projectNextOrderDate({
-                        stockOnHand,
+                        stockOnHand: effectiveStock,
                         stockOnOrder,
                         dailyBurn,
                         leadTimeDays: effectiveLeadTimeDays,
@@ -2268,7 +2293,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         void recordStockoutEvent({
                             productId: compSku,
                             vendorPartyId: partyId || null,
-                            stockOnHand,
+                            stockOnHand: effectiveStock,
                             stockOnOrder,
                             dailyBurn,
                             runwayDays: adjustedRunwayDays,
@@ -2281,7 +2306,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const feedsFinishedGoods = demand.feedsFinishedGoods.map(fg => {
                         const batchSize = fg.dailySalesRate * 30;
                         const buildsWorth = batchSize > 0 && fg.qtyPerUnit > 0
-                            ? stockOnHand / (fg.qtyPerUnit * batchSize)
+                            ? effectiveStock / (fg.qtyPerUnit * batchSize)
                             : 0;
                         return {
                             sku: fg.sku,
@@ -2298,7 +2323,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const coverDays = bomPolicy?.targetCoverDays ?? 60;
                     const baseNeed = Math.max(
                         0,
-                        Math.ceil(dailyBurn * coverDays - stockOnHand)
+                        Math.ceil(dailyBurn * coverDays - effectiveStock)
                     );
                     // Floor the suggestion at the forward shortfall — we have to
                     // cover scheduled builds first, then add coverage cushion.

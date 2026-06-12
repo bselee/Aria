@@ -103,6 +103,7 @@ async function getSkuActivity(
     soldQty: number;
     openPOs: Array<{ orderId: string; quantityOnOrder: number; orderDate: string }>;
     stockOnHand: number;
+    stockAvailable: number | null;
 }> {
     const end = new Date();
     const begin = new Date();
@@ -180,9 +181,9 @@ async function getSkuActivity(
         });
     }
 
-    if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: 0 };
+    if (!res.ok) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: 0, stockAvailable: null };
     const result = await res.json();
-    if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: 0 };
+    if (result.errors) return { purchasedQty: 0, soldQty: 0, openPOs: [], stockOnHand: 0, stockAvailable: null };
 
     let purchasedQty = 0;
     for (const edge of result.data?.purchasedIn?.edges || []) {
@@ -224,8 +225,9 @@ async function getSkuActivity(
 
     const stockNode = result.data?.stockInfo?.edges?.[0]?.node;
     const stockOnHand = parseNum(stockNode?.stockOnHand ?? stockNode?.unitsInStock ?? 0);
+    const stockAvailable = stockNode?.stockAvailable != null ? parseNum(stockNode.stockAvailable) : null;
 
-    return { purchasedQty, soldQty, openPOs, stockOnHand };
+    return { purchasedQty, soldQty, openPOs, stockOnHand, stockAvailable };
 }
 
 function parseNum(val: any): number {
@@ -378,15 +380,22 @@ export async function assessSku(
     const stockOnHand = finaleFound
         ? (activity.stockOnHand || parseNum(prodData?.quantityOnHand ?? 0))
         : 0;
+    // Effective stock: use Finale's stockAvailable if it's lower than stockOnHand,
+    // accounting for committed-but-not-deducted quantities (sales orders, reservations)
+    const rawStockOnHand = stockOnHand;
+    const finaleAvailable = activity.stockAvailable;
+    const effectiveStock = finaleAvailable != null && finaleAvailable < rawStockOnHand
+        ? finaleAvailable
+        : rawStockOnHand;
     const stockOnOrder = activity.openPOs.reduce((sum, po) => sum + po.quantityOnOrder, 0);
     const purchaseVelocity = activity.purchasedQty / DAYS_BACK;
     const salesVelocity = activity.soldQty / DAYS_BACK;
     const dailyRate = Math.max(purchaseVelocity, salesVelocity);
-    const runwayDays = dailyRate > 0 ? stockOnHand / dailyRate : Infinity;
-    const adjustedRunwayDays = dailyRate > 0 ? (stockOnHand + stockOnOrder) / dailyRate : Infinity;
+    const runwayDays = dailyRate > 0 ? effectiveStock / dailyRate : Infinity;
+    const adjustedRunwayDays = dailyRate > 0 ? (effectiveStock + stockOnOrder) / dailyRate : Infinity;
 
     const { necessity, explanation } = computeNecessity(
-        stockOnHand, stockOnOrder, dailyRate, leadTimeDays, finaleFound, doNotReorder,
+        effectiveStock, stockOnOrder, dailyRate, leadTimeDays, finaleFound, doNotReorder,
     );
 
     const openPOs = activity.openPOs.map(po => ({
