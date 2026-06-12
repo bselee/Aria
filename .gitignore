@@ -133,3 +133,4 @@ tools/excel-mcp-server/
 
 # Stray screenshots at repo root (smoke-test artifacts)
 /*.png
+tmp-*.ts
