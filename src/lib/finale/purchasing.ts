@@ -2760,7 +2760,24 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             ? `${daysBack}d sales`
                             : `${daysBack}d receipts`;
 
-                    const effectiveStock = stockOnHand ?? 0;
+                    // HERMIA(2026-06-12): Use Finale's stockAvailable (stockOnHand minus
+                    // committed) when it's meaningfully lower than raw stockOnHand. This
+                    // kills the phantom-runway bug on slow-velocity items: PPD201 had
+                    // 4.18 on-hand but 4.55 committed to builds → effective remaining =
+                    // -0.37, yet the recommender saw 83 days of runway. stockAvailable
+                    // reflects quantity already allocated to open work orders / sales
+                    // orders — units that aren't actually available to fulfill new demand.
+                    const rawStockOnHand = stockOnHand ?? 0;
+                    const finaleAvailable = activity.stockAvailable;
+                    const committedQty = (finaleAvailable != null && rawStockOnHand > finaleAvailable)
+                        ? rawStockOnHand - finaleAvailable
+                        : 0;
+                    const effectiveStock = finaleAvailable != null && finaleAvailable < rawStockOnHand
+                        ? finaleAvailable
+                        : rawStockOnHand;
+                    if (committedQty > 0) {
+                        console.log(`[purchasing] ${sku}: stockAvailable=${finaleAvailable} < stockOnHand=${rawStockOnHand} — committed=${committedQty.toFixed(2)} — using effectiveStock=${effectiveStock.toFixed(2)}`);
+                    }
                     if (effectiveStock === 0 && stockOnHand === null) {
                         console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku}, skipping`);
                         continue;
@@ -2900,7 +2917,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     const runwayDays = rec.runwayDays;
                     const adjustedRunwayDays = rec.adjustedRunwayDays;
-                    const urgency = rec.urgency;
+                    let urgency = rec.urgency;
                     const explanation = rec.explanation;
                     const suggestedQty = rec.suggestedQty;
 
@@ -2917,6 +2934,28 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             runwayDays: adjustedRunwayDays,
                             leadTimeDays: effectiveLeadTimeDays,
                         });
+                    }
+
+                    // HERMIA(2026-06-12): Forward-demand shortfall urgency bump for resale
+                    // items. If upcoming calendar builds will consume more than
+                    // (effectiveStock + stockOnOrder), that's a hard shortfall — force
+                    // critical urgency. Same pattern as BOM path at line ~2243. Catches
+                    // projected-but-yet-uncommitted demand that Finale's stockAvailable
+                    // may not include yet. Guarded: only bumps when runway is genuinely
+                    // short (< 3× lead time) so items with plenty of stock stay green.
+                    if (forward) {
+                        const forwardShortfall = Math.max(0, forward.requiredQty - (effectiveStock + stockOnOrder));
+                        if (forwardShortfall > 0) {
+                            const buildMs = new Date(forward.earliestBuildDate).getTime() - Date.now();
+                            const buildDays = buildMs / 86_400_000;
+                            const runwayCap = effectiveLeadTimeDays * 3;
+                            if (buildDays < effectiveLeadTimeDays && adjustedRunwayDays < runwayCap) {
+                                urgency = 'critical';
+                                console.log(`[purchasing] ${sku}: forward-demand shortfall=${forwardShortfall.toFixed(1)} (needs ${forward.requiredQty}, has ${effectiveStock + stockOnOrder}) — build in ${buildDays.toFixed(0)}d — forcing critical`);
+                            } else if (urgency === 'ok' || urgency === 'watch') {
+                                urgency = 'warning';
+                            }
+                        }
                     }
 
                     // Qty divergence: compare our velocity-based suggestion vs Finale's reorderQuantityToOrder

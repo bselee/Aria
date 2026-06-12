@@ -25,6 +25,8 @@ type RowDef = {
     label: string;
     sub: string;
     render: () => React.ReactNode;
+    /** When true, row is always expanded and shows no collapse header (panel owns its own label). */
+    alwaysOpen?: boolean;
 };
 
 const ROWS: RowDef[] = [
@@ -33,6 +35,9 @@ const ROWS: RowDef[] = [
         label: "Ordering",
         sub: "what to buy next — purchasing intelligence by vendor",
         render: () => <PurchasingPanel />,
+        // PurchasingPanel renders its own cube icon + ORDERING label inside,
+        // so the OpsTri wrapper header would duplicate it. Keep always-open.
+        alwaysOpen: true,
     },
     {
         id: "purchases",
@@ -86,7 +91,7 @@ export default function OpsTriPanel() {
         });
     };
 
-    const expandedCount = ROWS.length - collapsed.size;
+    const expandedCount = ROWS.filter(r => r.alwaysOpen || !collapsed.has(r.id)).length;
 
     return (
         <div
@@ -94,7 +99,9 @@ export default function OpsTriPanel() {
             data-testid="ops-tri-panel"
         >
             {ROWS.map(row => {
-                const isCollapsed = hydrated && collapsed.has(row.id);
+                // alwaysOpen rows (e.g. Ordering, which owns its own header)
+                // are never collapsible — no chevron, no collapse header.
+                const isCollapsed = row.alwaysOpen ? false : hydrated && collapsed.has(row.id);
                 // When N rows are expanded, each gets ~ (100/N)% of available height,
                 // with a 280px floor so a single panel never crushes its content.
                 const flexBasis = isCollapsed
@@ -111,23 +118,25 @@ export default function OpsTriPanel() {
                             minHeight: isCollapsed ? undefined : 280,
                         }}
                     >
-                        <button
-                            type="button"
-                            onClick={() => toggle(row.id)}
-                            aria-expanded={!isCollapsed}
-                            aria-controls={`ops-row-body-${row.id}`}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900/70 hover:bg-zinc-900 border-b border-zinc-800/80 text-left"
-                        >
-                            {isCollapsed
-                                ? <ChevronRight className="w-3.5 h-3.5 text-zinc-500" />
-                                : <ChevronDown className="w-3.5 h-3.5 text-zinc-400" />}
-                            <span className="text-xs font-mono font-semibold uppercase tracking-widest text-zinc-200">
-                                {row.label}
-                            </span>
-                            <span className="text-[10px] font-mono text-zinc-500 truncate">
-                                {row.sub}
-                            </span>
-                        </button>
+                        {!row.alwaysOpen && (
+                            <button
+                                type="button"
+                                onClick={() => toggle(row.id)}
+                                aria-expanded={!isCollapsed}
+                                aria-controls={`ops-row-body-${row.id}`}
+                                className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900/70 hover:bg-zinc-900 border-b border-zinc-800/80 text-left"
+                            >
+                                {isCollapsed
+                                    ? <ChevronRight className="w-3.5 h-3.5 text-zinc-500" />
+                                    : <ChevronDown className="w-3.5 h-3.5 text-zinc-400" />}
+                                <span className="text-xs font-mono font-semibold uppercase tracking-widest text-zinc-200">
+                                    {row.label}
+                                </span>
+                                <span className="text-[10px] font-mono text-zinc-500 truncate">
+                                    {row.sub}
+                                </span>
+                            </button>
+                        )}
                         {!isCollapsed && (
                             <div
                                 id={`ops-row-body-${row.id}`}
