@@ -1,5 +1,5 @@
 /**
- * @file    src/lib/intelligence/email-forwarding-alert.ts
+ * @file    email-forwarding-alert.ts
  * @purpose Escalates AP invoices stuck in ERROR_FORWARDING or ERROR_PROCESSING
  *          so Bill isn't blind to a bill that never made it to Bill.com.
  *
@@ -30,7 +30,7 @@
  */
 
 import { createClient } from "../supabase";
-import { sendCriticalTelegramNotify } from "./telegram-notify";
+import { sendTelegramNotify } from "./telegram-notify";
 
 export interface StuckForwardAlert {
     messageId: string;
@@ -117,6 +117,9 @@ export function formatForwardingAlerts(alerts: StuckForwardAlert[]): string {
  * Dedup: only alerts once per 24h per message_id — checks ap_activity_log
  * for recent FORWARDING_ESCALATED entries before sending.
  * Only sends when there are actual stuck items.
+ *
+ * Uses sendTelegramNotify (gated by business hours) — NOT critical.
+ * Stuck invoices are not a crash-loops emergency; they wait for business hours.
  */
 export async function runForwardingEscalation(): Promise<void> {
     const alerts = await getStuckForwardingAlerts();
@@ -148,7 +151,7 @@ export async function runForwardingEscalation(): Promise<void> {
                 console.log(`[forwarding-alert] ${newAlerts.length} new stuck invoice(s), ${alerts.length - newAlerts.length} already alerted — sending for new only.`);
                 // Send only for the new ones
                 const formatted = formatForwardingAlerts(newAlerts);
-                await sendCriticalTelegramNotify(formatted);
+                await sendTelegramNotify(formatted);
                 // Log each new alert for future dedup
                 for (const a of newAlerts) {
                     await db.from("ap_activity_log").insert({
@@ -166,7 +169,7 @@ export async function runForwardingEscalation(): Promise<void> {
     }
 
     const formatted = formatForwardingAlerts(alerts);
-    await sendCriticalTelegramNotify(formatted);
+    await sendTelegramNotify(formatted);
 
     // Log each alert for future dedup
     if (db) {

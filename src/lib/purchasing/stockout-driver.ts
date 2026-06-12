@@ -204,7 +204,6 @@ export async function runStockoutDriver(): Promise<{
             })).filter(x => x.count > 0),
         },
         priority: 0,
-        critical: true,
         summaryLabel: "Stockout Driver",
     });
 

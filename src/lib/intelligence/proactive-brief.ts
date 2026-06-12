@@ -239,7 +239,6 @@ export async function generateProactiveBrief(): Promise<void> {
             sections: sections.map(s => ({ label: s.label, lineCount: s.lines.length })),
         },
         priority: 1,
-        critical: true,
         summaryLabel: "Morning Brief",
     });
 

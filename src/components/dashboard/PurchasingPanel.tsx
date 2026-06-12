@@ -1,7 +1,11 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Package, RefreshCw, ChevronDown, ExternalLink, Eye, ShoppingCart, Loader2, Search } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { Package, RefreshCw, ChevronDown, ExternalLink, Eye, ShoppingCart, Loader2, Search, ArrowRight } from "lucide-react";
+
+// Lazy-load flyout to avoid SSG bundling-order issues with the agentic audit panel.
+const VendorDecisionFlyout = dynamic(() => import("./VendorDecisionFlyout"), { ssr: false });
 import {
     canIncludeInDraftPO,
     canUseDirectOrdering,
@@ -307,6 +311,9 @@ export default function PurchasingPanel() {
     const [ulineOrdering, setUlineOrdering] = useState(false);
     const [ulineResult, setUlineResult] = useState<UlineOrderResult | null>(null);
     const [selectedItem, setSelectedItem] = useState<CrystalBallItem | null>(null);
+
+    // ── Phase 2: Decision Dossier flyout — glass cockpit on the autonomous ordering agent
+    const [flyoutPid, setFlyoutPid] = useState<string | null>(null);
 
     // collapse + resize
     const [isCollapsed, setIsCollapsed] = useState(false);
@@ -1113,6 +1120,40 @@ export default function PurchasingPanel() {
     });
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g));
     const displayGroups = showSnoozed ? sortedGroups : activeGroups;
+
+    // Phase 2: Decision Dossier flyout payload — snapshot group + derived props
+    // (placed after displayGroups so useMemo factory sees initialized const)
+    const flyoutPayload = React.useMemo(() => {
+        if (!flyoutPid) return null;
+        const group = displayGroups.find(g => g.vendorPartyId === flyoutPid);
+        if (!group) return null;
+        const pid = group.vendorPartyId;
+        const activeItems = group.items.filter(i => !isSnoozed(i.productId));
+        const selectedItems = activeItems.filter(i => checked[pid]?.[i.productId]);
+        const groupQtys = qtys[pid] ?? {};
+        return {
+            group,
+            selectedCount: selectedItems.length,
+            selectedUnits: selectedItems.reduce((s, i) => s + (groupQtys[i.productId] ?? i.suggestedQty), 0),
+            selectedValue: selectedItems.reduce((s, i) => s + (groupQtys[i.productId] ?? i.suggestedQty) * Math.max(0, i.unitPrice), 0),
+            hasDraftPO: !!createdPOs[pid],
+            vendorCycleBadge: group.vendorCycle && group.vendorCycle.decision !== "clear"
+                ? {
+                    text: group.vendorCycle.decision === "routine_locked"
+                        ? `cycle locked${group.vendorCycle.blockingPO?.orderId ? ` - PO ${group.vendorCycle.blockingPO.orderId}` : ""}`
+                        : group.vendorCycle.decision === "exception_allowed"
+                        ? `exception allowed${group.vendorCycle.exceptionEvidence?.[0]?.reason ? ` - ${group.vendorCycle.exceptionEvidence[0].reason.replace(/_/g, " ")}` : ""}`
+                        : `reuse draft${group.vendorCycle.blockingPO?.orderId ? ` - PO ${group.vendorCycle.blockingPO.orderId}` : ""}`,
+                    className: group.vendorCycle.decision === "routine_locked"
+                        ? "text-amber-200 border-amber-500/40 bg-amber-500/10"
+                        : group.vendorCycle.decision === "exception_allowed"
+                        ? "text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
+                        : "text-emerald-200 border-emerald-500/40 bg-emerald-500/10",
+                }
+                : null,
+        };
+    }, [flyoutPid, displayGroups, checked, qtys, createdPOs, isSnoozed]);
+
     const focusGroups = displayGroups
         .map(group => {
             const hasDraftPO = !!createdPOs[group.vendorPartyId];
@@ -2175,6 +2216,15 @@ export default function PurchasingPanel() {
                                                             >···</button>
                                                             {snoozeMenu === vSnoozeKey && renderSnoozeMenu(vSnoozeKey)}
                                                         </div>
+                                                        {/* Phase 2: Decision Dossier trigger — opens agentic audit flyout */}
+                                                        <button
+                                                            onClick={e => { e.stopPropagation(); setFlyoutPid(pid); }}
+                                                            className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border border-cyan-800/50 text-cyan-400 hover:border-cyan-500 hover:text-cyan-300 hover:bg-cyan-950/30 transition-colors shrink-0"
+                                                            title="Open Decision Dossier — view the agent's reasoning + cross-column PO lineage"
+                                                        >
+                                                            <ArrowRight className="w-2.5 h-2.5" />
+                                                            Dossier
+                                                        </button>
                                                         <ChevronDown
                                                             onClick={() => toggleExpand(pid)}
                                                             className={`w-3.5 h-3.5 text-zinc-700 transition-transform shrink-0 cursor-pointer ${isExpanded ? "" : "-rotate-90"}`}
@@ -2885,6 +2935,20 @@ export default function PurchasingPanel() {
                         </div>
                     )}
                 </>
+            )}
+
+            {/* ── Phase 2: Decision Dossier flyout ── agentic audit surface over Ordering column */}
+            {flyoutPayload && (
+                <VendorDecisionFlyout
+                    open={flyoutPid !== null}
+                    onClose={() => setFlyoutPid(null)}
+                    group={flyoutPayload.group}
+                    selectedCount={flyoutPayload.selectedCount}
+                    selectedUnits={flyoutPayload.selectedUnits}
+                    selectedValue={flyoutPayload.selectedValue}
+                    hasDraftPO={flyoutPayload.hasDraftPO}
+                    vendorCycleBadge={flyoutPayload.vendorCycleBadge}
+                />
             )}
         </div>
     );
