@@ -71,7 +71,7 @@ function PurchasingLifecyclePanel() {
         <PurchasingLifecycleProvider>
             <div className="flex flex-col h-full min-h-0 overflow-hidden">
                 <div
-                    className="flex-1 min-h-0 grid grid-cols-[minmax(680px,1.7fr)_minmax(280px,0.75fr)_minmax(260px,0.65fr)] gap-2 p-2 overflow-x-auto"
+                    className="flex-1 min-h-0 grid grid-cols-[minmax(560px,1.4fr)_minmax(480px,1fr)_minmax(400px,0.9fr)] gap-2 p-2 overflow-x-auto"
                     data-testid="purchasing-lifecycle-panel"
                 >
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">

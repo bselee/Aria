@@ -1974,7 +1974,7 @@ export default function PurchasingPanel() {
                                                     onClick={() => !vSnoozed && toggleExpand(pid)}
                                                     className="flex-1 text-left flex items-center gap-2 min-w-0"
                                                 >
-                                                    <span className={`text-base font-mono font-semibold truncate ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
+                                                    <span className={`text-base font-mono font-semibold whitespace-normal break-words leading-tight ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-50"}`}>
                                                         {group.vendorName}
                                                     </span>
                                                     <span className="text-xs font-mono text-zinc-200 shrink-0">
