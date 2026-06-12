@@ -9,15 +9,12 @@
  *
  * Design:
  *   This is the "order, don't tell" principle. The cron:
- *   1. Computes margin = adjustedRunwayDays - effectiveLeadTimeDays per SKU
+ *   1. Computes margin = adjustedRunwayDays - leadTimeDays per SKU
  *   2. Buckets into countdown tiers: stockout in ≤14d, ≤7d, ≤3d, TODAY, PAST DUE
- *   3. For each tier, verifies a draft PO exists for the vendor; creates one if not
+ *   3. For each tier, verifies a draft PO exists for the supplier; creates one if not
  *   4. Sends ONE Telegram with the countdown + inline "Send" buttons per draft
- *   5. The button handler calls po-sender.commitPO() — zero friction, one tap
  *
  * @created 2026-06-11
- * @deps    finale/client, purchasing/drafter-agent, purchasing/po-sender,
- *          intelligence/agent-task, intelligence/telegram-notify
  */
 
 import { createClient } from "@/lib/supabase";
@@ -26,108 +23,96 @@ import { notifyViaTask } from "@/lib/intelligence/notify-via-task";
 import { runDrafterAgent, type DrafterAgentResult } from "@/lib/purchasing/drafter-agent";
 
 // ── Countdown thresholds (margin days) ──────────────────────────────────
-// margin = adjustedRunwayDays - effectiveLeadTimeDays
+// margin = adjustedRunwayDays - leadTimeDays
 // Negative margin = already past the "should have ordered" window.
 const TIERS: Array<{ label: string; emoji: string; maxMargin: number; priority: number }> = [
-    { label: "OVERDUE",    emoji: "🚨", maxMargin: -1, priority: 0 },   // margin < 0 (past due)
-    { label: "TODAY",      emoji: "🔴", maxMargin: 0,  priority: 0 },   // margin = 0 (order NOW)
+    { label: "OVERDUE",    emoji: "🚨", maxMargin: -1, priority: 0 },
+    { label: "TODAY",      emoji: "🔴", maxMargin: 0,  priority: 0 },
     { label: "3 DAYS",     emoji: "🟠", maxMargin: 3,  priority: 1 },
     { label: "7 DAYS",     emoji: "🟡", maxMargin: 7,  priority: 2 },
     { label: "14 DAYS",    emoji: "⚪", maxMargin: 14, priority: 3 },
 ];
 
 interface StockoutCandidate {
-    sku: string;
-    description: string;
-    dailyBurn: number;
+    productId: string;
+    productName: string;
+    dailyRate: number;
     stockOnHand: number;
     runwayDays: number;
     adjustedRunwayDays: number;
-    effectiveLeadTimeDays: number;
-    margin: number;                   // runway - leadTime (negative = overdue)
+    leadTimeDays: number;
+    margin: number;
     tier: typeof TIERS[number];
-    vendorPartyId: string;
-    vendorName: string | null;
+    supplierPartyId: string;
+    supplierName: string | null;
 }
 
-/**
- * Compute stockout candidates from the purchasing intelligence output.
- * Only returns SKUs with margin <= 14 (in the countdown window).
- */
 async function computeStockoutCandidates(finale: FinaleClient): Promise<StockoutCandidate[]> {
-    const intell = finale.getPurchasingIntelligence();
+    const intell = await finale.getPurchasingIntelligence();
     const candidates: StockoutCandidate[] = [];
 
     for (const item of intell) {
-        const dailyBurn = item.dailyBurn ?? 0;
-        if (dailyBurn <= 0) continue;
+        const dailyRate = item.dailyRate ?? 0;
+        if (dailyRate <= 0) continue;
 
-        const runwayDays = item.runwayDays ?? (item.stockOnHand / dailyBurn);
+        const runwayDays = item.runwayDays ?? (item.stockOnHand > 0 ? item.stockOnHand / dailyRate : 0);
         const adjustedRunway = item.adjustedRunwayDays ?? runwayDays;
-        const leadTime = item.effectiveLeadTimeDays ?? 14;
+        const leadTime = item.leadTimeDays ?? 14;
         const margin = adjustedRunway - leadTime;
 
-        if (margin > 14) continue; // not in countdown window
+        if (margin > 14) continue;
 
         const tier = TIERS.find(t => margin <= t.maxMargin);
         if (!tier) continue;
 
         candidates.push({
-            sku: item.sku ?? item.finaleId,
-            description: item.description ?? item.sku ?? "?",
-            dailyBurn,
+            productId: item.productId ?? "",
+            productName: item.productName ?? item.productId ?? "?",
+            dailyRate,
             stockOnHand: item.stockOnHand ?? 0,
             runwayDays,
             adjustedRunwayDays: adjustedRunway,
-            effectiveLeadTimeDays: leadTime ?? 14,
+            leadTimeDays: leadTime,
             margin: Math.round(margin * 10) / 10,
             tier,
-            vendorPartyId: item.vendorPartyId ?? "",
-            vendorName: item.vendorName ?? null,
+            supplierPartyId: item.supplierPartyId ?? "",
+            supplierName: item.supplierName ?? null,
         });
     }
 
     return candidates;
 }
 
-/**
- * Group candidates by vendor and check for existing active draft POs.
- * Returns which vendors need a new draft and which already have one.
- */
-interface VendorDraftStatus {
-    vendorPartyId: string;
-    vendorName: string | null;
+interface SupplierDraftStatus {
+    supplierPartyId: string;
+    supplierName: string | null;
     candidates: StockoutCandidate[];
     hasExistingDraft: boolean;
     draftOrderId: string | null;
 }
 
-async function checkVendorDrafts(
+async function checkSupplierDrafts(
     candidates: StockoutCandidate[],
-    finale: FinaleClient,
-): Promise<VendorDraftStatus[]> {
-    // Group by vendor
-    const byVendor = new Map<string, StockoutCandidate[]>();
+): Promise<SupplierDraftStatus[]> {
+    const bySupplier = new Map<string, StockoutCandidate[]>();
     for (const c of candidates) {
-        const key = c.vendorPartyId || "unknown";
-        const list = byVendor.get(key) ?? [];
+        const key = c.supplierPartyId || "unknown";
+        const list = bySupplier.get(key) ?? [];
         list.push(c);
-        byVendor.set(key, list);
+        bySupplier.set(key, list);
     }
 
-    // Check existing drafts per vendor
     const sb = createClient();
-    const statuses: VendorDraftStatus[] = [];
+    const statuses: SupplierDraftStatus[] = [];
 
-    for (const [vendorPartyId, vendorCandidates] of byVendor) {
-        // Query existing draft POs for this vendor
+    for (const [supplierPartyId, supplierCandidates] of bySupplier) {
         let hasDraft = false;
         let draftId: string | null = null;
         if (sb) {
             const { data } = await sb
                 .from("draft_pos")
                 .select("draft_po_id")
-                .eq("supplier_party_id", vendorPartyId)
+                .eq("supplier_party_id", supplierPartyId)
                 .eq("status", "draft")
                 .limit(1);
             hasDraft = !!(data && data.length > 0);
@@ -135,9 +120,9 @@ async function checkVendorDrafts(
         }
 
         statuses.push({
-            vendorPartyId,
-            vendorName: vendorCandidates[0]?.vendorName ?? null,
-            candidates: vendorCandidates.sort((a, b) => a.margin - b.margin),
+            supplierPartyId,
+            supplierName: supplierCandidates[0]?.supplierName ?? null,
+            candidates: supplierCandidates.sort((a, b) => a.margin - b.margin),
             hasExistingDraft: hasDraft,
             draftOrderId: draftId,
         });
@@ -146,11 +131,6 @@ async function checkVendorDrafts(
     return statuses;
 }
 
-/**
- * Main entrypoint: computes countdown, ensures drafts exist via drafter-agent,
- * and routes a one-tap-send Telegram via the task hub.
- * Called from cron every 2h during business hours.
- */
 export async function runStockoutDriver(): Promise<{
     candidates: number;
     draftsCreated: number;
@@ -161,59 +141,53 @@ export async function runStockoutDriver(): Promise<{
     const candidates = await computeStockoutCandidates(finale);
 
     if (candidates.length === 0) {
-        console.log("[stockout-driver] All SKUs have >14d margin — nothing to drive.");
+        console.log("[stockout-driver] All items have >14d margin — nothing to drive.");
         return { candidates: 0, draftsCreated: 0, draftsExisting: 0, telegramSent: false };
     }
 
-    const vendorStatuses = await checkVendorDrafts(candidates, finale);
+    const supplierStatuses = await checkSupplierDrafts(candidates);
 
-    // Trigger drafter-agent for vendors without drafts.
-    // The drafter creates drafts with full commit-guard enforcement.
     let draftsCreated = 0;
-    const needsDraft = vendorStatuses.filter(v => !v.hasExistingDraft);
+    const needsDraft = supplierStatuses.filter(v => !v.hasExistingDraft);
     if (needsDraft.length > 0) {
-        console.log(`[stockout-driver] ${needsDraft.length} vendor(s) need drafts — running drafter-agent.`);
+        console.log(`[stockout-driver] ${needsDraft.length} supplier(s) need drafts — running drafter-agent.`);
         const result: DrafterAgentResult = await runDrafterAgent();
         draftsCreated = result.created;
         console.log(`[stockout-driver] Drafter created ${draftsCreated} draft(s).`);
 
-        // Re-check statuses after drafter run
-        const updated = await checkVendorDrafts(candidates, finale);
-        vendorStatuses.length = 0;
-        vendorStatuses.push(...updated);
+        const updated = await checkSupplierDrafts(candidates);
+        supplierStatuses.length = 0;
+        supplierStatuses.push(...updated);
     }
 
-    const draftsExisting = vendorStatuses.filter(v => v.hasExistingDraft).length;
+    const draftsExisting = supplierStatuses.filter(v => v.hasExistingDraft).length;
 
-    // Build Telegram countdown message grouped by tier.
-    // Sorted: OVERDUE first, then TODAY, then 3d, 7d, 14d.
-    const byVendorFlat = vendorStatuses.flatMap(v =>
+    const flat = supplierStatuses.flatMap(v =>
         v.candidates.map(c => ({ ...c, hasDraft: v.hasExistingDraft, draftId: v.draftOrderId }))
     ).sort((a, b) => a.tier.priority - b.tier.priority);
 
     const lines: string[] = [];
     let currentTier: string | null = null;
 
-    for (const c of byVendorFlat) {
+    for (const c of flat) {
         if (c.tier.label !== currentTier) {
             currentTier = c.tier.label;
             lines.push(`\n${c.tier.emoji} *${c.tier.label}:*`);
         }
-        const vendorTag = c.vendorName ? ` · ${c.vendorName}` : "";
-        const qty = Math.max(1, Math.ceil(c.dailyBurn * (c.effectiveLeadTimeDays + 30))) ?? "?";
+        const supplierTag = c.supplierName ? ` · ${c.supplierName}` : "";
         lines.push(
-            `• \`${c.sku}\` — ${Math.round(c.stockOnHand)} on hand, ` +
-            `~${c.runwayDays.toFixed(0)}d runway${vendorTag}\n` +
-            `  ${c.hasDraft ? `📋 PO ready (${c.draftId ?? "draft"})` : "⏳ No draft yet"}`
+            `• \`${c.productId}\` — ${Math.round(c.stockOnHand)} on hand, ` +
+            `~${c.runwayDays.toFixed(0)}d runway${supplierTag}\n` +
+            `  margin: ${c.margin}d ${c.hasDraft ? `| 📋 PO ready (${c.draftId ?? "draft"})` : "| ⏳ no draft"}`
         );
     }
 
     const goal = [
-        `🎯 *Stockout Driver* — ${candidates.length} SKU(s) in countdown window`,
-        `${vendorStatuses.filter(v => v.hasExistingDraft).length} vendor draft(s) ready to send`,
+        `🎯 *Stockout Driver* — ${candidates.length} item(s) in countdown window`,
+        `${supplierStatuses.filter(v => v.hasExistingDraft).length} supplier draft(s) ready`,
         draftsCreated > 0 ? `✅ ${draftsCreated} draft(s) just created by drafter` : "",
         lines.join("\n"),
-        "\n_Send these POs now. Every hour of delay = closer to stockout._",
+        "\n_Send these drafts now. Every hour = closer to stockout._",
     ].filter(Boolean).join("\n");
 
     await notifyViaTask({
@@ -226,7 +200,7 @@ export async function runStockoutDriver(): Promise<{
             draftsExisting,
             byTier: TIERS.map(t => ({
                 tier: t.label,
-                count: byVendorFlat.filter(c => c.tier.label === t.label).length,
+                count: flat.filter(c => c.tier.label === t.label).length,
             })).filter(x => x.count > 0),
         },
         priority: 0,

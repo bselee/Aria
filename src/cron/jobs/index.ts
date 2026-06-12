@@ -818,6 +818,27 @@ defineJob({
     budget: { durationMs: 90_000 },
 });
 
+//HERMIA(2026-06-11): Stockout driver — proactive countdown that creates drafts
+// and presents one-tap-send. Runs 3x/day during business hours.
+defineJob({
+    name: "stockout-driver",
+    schedule: "0 7,11,15 * * 1-5",  // 7am, 11am, 3pm weekdays
+    onFail: "telegram-will",
+    description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
+    handler: async () => {
+        const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
+        try {
+            const result = await runStockoutDriver();
+            if (result.candidates > 0) {
+                console.log(`[stockout-driver] ${result.candidates} candidates, ${result.draftsCreated} drafts created, ${result.draftsExisting} existing.`);
+            }
+        } catch (err: any) {
+            console.warn(`[stockout-driver] failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
+
 // HERMIA(2026-06-11): Slack detector heartbeat — verifies the request-detector
 // loop is alive. Checks two signals:
 //   1. Most recent slack_requests entry age (detector writes on every SKU detection)
