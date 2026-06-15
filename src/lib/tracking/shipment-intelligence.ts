@@ -931,7 +931,8 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
         throw new Error(`Shipment load failed: ${error.message}`);
     }
 
-    return refreshDueShipments((data || []) as ShipmentRecord[]);
+    // Return raw data — no carrier refresh during reads (cron handles it).
+    return (data || []) as ShipmentRecord[];
 }
 
 async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
@@ -961,16 +962,31 @@ async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
     return received;
 }
 
+/**
+ * @file shipment-intelligence.ts
+ * @purpose Raw shipment query — limited to current ISO week to keep dashboard fast.
+ * @modified 2026-06-15 — added thisWeekStart filter per Bill's request
+ */
 async function listActiveShipmentsRaw(): Promise<ShipmentRecord[]> {
     const supabase = createClient();
     if (!supabase) return [];
+
+    // Limit to current week (Monday 00:00 UTC) to keep dashboard fast
+    const now = new Date();
+    const dayOfWeek = now.getUTCDay(); // 0=Sunday
+    const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const monday = new Date(now);
+    monday.setUTCDate(now.getUTCDate() - daysSinceMonday);
+    monday.setUTCHours(0, 0, 0, 0);
+    const thisWeekStart = monday.toISOString();
 
     const { data, error } = await supabase
         .from("shipments")
         .select("*")
         .eq("active", true)
+        .gte("updated_at", thisWeekStart)
         .order("updated_at", { ascending: false })
-        .limit(300);
+        .limit(200);
 
     if (error) {
         if (isMissingShipmentsTableError(error.message)) {
@@ -1014,8 +1030,11 @@ async function refreshDueShipments(shipments: ShipmentRecord[]): Promise<Shipmen
 }
 
 async function listActiveShipmentsForRead(): Promise<ShipmentRecord[]> {
+    // Dashboard reads should NOT trigger live carrier HTTP refreshes.
+    // Carrier polling is handled by the Tracking Validation Autopilot cron (every 30min).
+    // This keeps dashboard load sub-second instead of timing out on carrier API round-trips.
     const shipments = await listActiveShipmentsRaw();
-    return refreshDueShipments(shipments);
+    return shipments;
 }
 
 export async function getDashboardTrackingBoard(): Promise<DashboardTrackingBoardResult> {

@@ -1904,7 +1904,7 @@ export default function PurchasingPanel() {
                                     <Package className="w-4 h-4 text-emerald-300 absolute inset-0 m-auto" />
                                 </div>
                                 <div className="text-sm font-mono font-semibold text-emerald-200 tracking-wide">
-                                    {scanning ? "Refreshing…" : "Refreshing…"}
+                                    {scanning ? "Re-scanning Finale…" : "Loading purchasing data…"}
                                 </div>
                                 <div className="text-[11px] font-mono text-zinc-400 text-center min-h-[14px]">
                                     {loadingTiers.size > 0
