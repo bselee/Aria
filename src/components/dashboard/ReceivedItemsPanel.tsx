@@ -287,11 +287,14 @@ export default function ReceivedItemsPanel() {
                                         {todaySummary.headline}
                                     </div>
                                     <div className="mt-2 space-y-1">
-                                        {todaySummary.lines.map((line) => (
-                                            <div key={line} className="text-[11px] font-mono text-cyan-200/85">
-                                                {line}
-                                            </div>
-                                        ))}
+                                        {todaySummary.lines.map((line) => {
+                                            const isValidated = line.includes('✓ validated');
+                                            return (
+                                                <div key={line} className={`text-[11px] font-mono ${isValidated ? 'text-emerald-300' : 'text-cyan-200/85'}`}>
+                                                    {line}
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 </div>
                             )}

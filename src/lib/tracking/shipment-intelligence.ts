@@ -80,6 +80,7 @@ export interface ShipmentRollup {
     publicTrackingUrl: string | null;
     freshnessMinutes: number | null;
     lastCheckedAt: string | null;
+    evidenceLevel: ShipmentEvidenceLevel;
 }
 
 export interface ShipmentBoardBuckets {
@@ -304,14 +305,20 @@ export function classifyShipmentEvidence(record: ShipmentRecord): ShipmentEviden
         ["ap_invoice", "invoice_reconciliation", "bol_pdf", "carrier_api", "po_thread_sync"].includes(ref.source),
     );
 
-    if (hasStrongSource || hasMultipleSources || hasExplicitDocumentSource) {
+    const hasCarrierOrDocumentSource = sourceRefs.some((ref) =>
+        ["carrier_poll", "carrier_api", "ap_invoice", "invoice_reconciliation", "bol_pdf", "po_thread_sync"].includes(ref.source),
+    );
+
+    if ((hasStrongSource || hasMultipleSources) && hasCarrierOrDocumentSource || hasExplicitDocumentSource) {
         return {
             level: "confirmed",
-            reason: hasStrongSource
+            reason: hasExplicitDocumentSource
+                ? "document evidence"
+                : hasCarrierOrDocumentSource
+                ? "carrier or document source"
+                : hasStrongSource
                 ? "strong source correlation"
-                : hasMultipleSources
-                ? "multiple sources agree"
-                : "document evidence",
+                : "multiple sources agree",
         };
     }
 
@@ -326,6 +333,7 @@ function rollupShipment(record: ShipmentRecord, nowIso: string): ShipmentRollup 
         ? Math.max(0, Math.round((new Date(nowIso).getTime() - new Date(record.last_checked_at).getTime()) / 60000))
         : null;
 
+    const evidence = classifyShipmentEvidence(record);
     return {
         id: record.id,
         poNumbers: record.po_numbers || [],
@@ -341,6 +349,7 @@ function rollupShipment(record: ShipmentRecord, nowIso: string): ShipmentRollup 
         publicTrackingUrl: record.public_tracking_url,
         freshnessMinutes,
         lastCheckedAt: record.last_checked_at,
+        evidenceLevel: evidence.level,
     };
 }
 
@@ -362,6 +371,7 @@ export function getShipmentBoardBuckets(
 
     const rollups = shipments
         .filter((shipment) => shipment.active !== false)
+        .filter((shipment) => classifyShipmentEvidence(shipment).level === "confirmed")
         .map((shipment) => rollupShipment(shipment, nowIso));
 
     return {
@@ -478,7 +488,8 @@ export function buildTodayShipmentSummary(board: ShipmentBoardBuckets): TodayShi
                 : shipment.estimatedDeliveryAt
                     ? `ETA ${formatSummaryEta(shipment.estimatedDeliveryAt)}`
                     : shipment.statusDisplay;
-            return `${poLabel} - ${vendorLabel} - ${suffix}`;
+            const valBadge = shipment.evidenceLevel === "confirmed" ? " ✓ validated" : " (candidate)";
+            return `${poLabel} - ${vendorLabel} - ${suffix}${valBadge}`;
         });
 
     return {
