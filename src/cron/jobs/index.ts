@@ -41,6 +41,7 @@ defineJob({
         // is fine — po-sweep is mostly a no-op when there's nothing to match.
         try { await o.runPOSweep(); } catch (err: any) {
             console.warn(`[ap-polling] post-pass po-sweep failed: ${err?.message ?? err}`);
+            throw err;
         }
     },
     budget: { durationMs: 180_000 },  // bumped from default to cover the post-pass
@@ -357,6 +358,7 @@ defineJob({
             await runOverdueFollowup();
         } catch (err: any) {
             console.warn(`[po-stuck-detector] overdue follow-up failed: ${err.message}`);
+            throw err;
         }
     },
 });
@@ -372,11 +374,7 @@ defineJob({
     description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments.",
     handler: async () => {
         const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
-        try {
-            await runEmailTrackingIngest();
-        } catch (err: any) {
-            console.warn(`[email-tracking-ingest] failed: ${err.message}`);
-        }
+        await runEmailTrackingIngest();
     },
 });
 
@@ -778,11 +776,7 @@ defineJob({
     description: "Friday 9 AM: surface open tasks flagged >24h with no action (weekly ball-dropped report).",
     handler: async () => {
         const { surfaceDropReport } = await import("@/lib/intelligence/drop-detector");
-        try {
-            await surfaceDropReport();
-        } catch (err: any) {
-            console.warn(`[drop-detector] failed: ${err?.message ?? err}`);
-        }
+        await surfaceDropReport();
     },
     budget: { durationMs: 60_000 },
 });
@@ -797,11 +791,7 @@ defineJob({
     description: "Monday 8 AM: weekly closed-loop task metrics (drop-rate + median time-to-close per type).",
     handler: async () => {
         const { surfacePatternInsight } = await import("@/lib/intelligence/pattern-miner");
-        try {
-            await surfacePatternInsight();
-        } catch (err: any) {
-            console.warn(`[pattern-miner] failed: ${err?.message ?? err}`);
-        }
+        await surfacePatternInsight();
     },
     budget: { durationMs: 120_000 },
 });
@@ -816,11 +806,7 @@ defineJob({
     description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
     handler: async () => {
         const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
-        try {
-            await generateProactiveBrief();
-        } catch (err: any) {
-            console.warn(`[proactive-brief] failed: ${err?.message ?? err}`);
-        }
+        await generateProactiveBrief();
     },
     budget: { durationMs: 90_000 },
 });
@@ -839,19 +825,13 @@ defineJob({
         const { sendTelegramNotify } = await import(
             "@/lib/intelligence/telegram-notify"
         );
-        try {
-            const report = await getAddressedRequests(24);
-            const msg = formatAddressedReview(report);
-            if (msg) {
-                await sendTelegramNotify(msg);
-            } else {
-                console.log(
-                    "[daily-slack-review] No addressed messages in last 24h — silent.",
-                );
-            }
-        } catch (err: any) {
-            console.warn(
-                `[daily-slack-review] failed: ${err?.message ?? err}`,
+        const report = await getAddressedRequests(24);
+        const msg = formatAddressedReview(report);
+        if (msg) {
+            await sendTelegramNotify(msg);
+        } else {
+            console.log(
+                "[daily-slack-review] No addressed messages in last 24h — silent.",
             );
         }
     },
@@ -867,13 +847,9 @@ defineJob({
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
-        try {
-            const result = await runStockoutDriver();
-            if (result.candidates > 0) {
-                console.log(`[stockout-driver] ${result.candidates} candidates, ${result.draftsCreated} drafts created, ${result.draftsExisting} existing.`);
-            }
-        } catch (err: any) {
-            console.warn(`[stockout-driver] failed: ${err?.message ?? err}`);
+        const result = await runStockoutDriver();
+        if (result.candidates > 0) {
+            console.log(`[stockout-driver] ${result.candidates} candidates, ${result.draftsCreated} drafts created, ${result.draftsExisting} existing.`);
         }
     },
     budget: { durationMs: 120_000 },

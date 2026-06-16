@@ -12,6 +12,7 @@
 
 import { FinaleClient, type FullPO, type POInfo } from '../finale/client';
 import { createClient } from '../supabase';
+import { withToolAudit } from '../agents/tool-registry';
 import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 import ExcelJS from 'exceljs';
@@ -190,10 +191,20 @@ export async function enrichOOSItems(
     const supabase = createClient();
 
     // Pre-fetch vendor lead time history for ETA estimation
-    const vendorLeadTimes = await finaleClient.getVendorLeadTimeHistory(180);
+    const vendorLeadTimes = await withToolAudit(
+        "getVendorLeadTimeHistory",
+        { agent: "oos-report" },
+        { daysBack: 180 },
+        () => finaleClient.getVendorLeadTimeHistory(180),
+    );
 
     // Pre-fetch recent POs (last 120 days) for cross-referencing
-    const recentPOs = await finaleClient.getRecentPurchaseOrders(120);
+    const recentPOs = await withToolAudit(
+        "getRecentPurchaseOrders",
+        { agent: "oos-report" },
+        { daysBack: 120 },
+        () => finaleClient.getRecentPurchaseOrders(120),
+    );
     const oosSkuSet = new Set(items.map(i => i.sku.toLowerCase()));
 
     // Find all POs that contain OOS SKUs
@@ -444,7 +455,12 @@ export async function enrichOOSItems(
         let enrichedItem: EnrichedOOSItem;
 
         try {
-            const report = await finaleClient.productReport(item.sku);
+            const report = await withToolAudit(
+                "productReport",
+                { agent: "oos-report" },
+                { sku: item.sku },
+                () => finaleClient.productReport(item.sku),
+            );
 
             if (report.found && report.product) {
                 const p = report.product;

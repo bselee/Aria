@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase";
 import { InvoiceData } from "@/lib/pdf/invoice-parser";
 import { POData } from "@/lib/pdf/po-parser";
 import { FinaleClient } from "@/lib/finale/client";
+import { withToolAudit } from "@/lib/agents/tool-registry";
 import Fuse from "fuse.js";
 
 export interface MatchResult {
@@ -137,10 +138,15 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
     if (invoice.vendorName && invoice.invoiceDate) {
         try {
             const finaleClient = new FinaleClient();
-            const candidates = await finaleClient.findPOByVendorAndDate(
-                invoice.vendorName,
-                invoice.invoiceDate,
-                30  // 30-day window around invoice date
+            const candidates = await withToolAudit(
+                "findPOByVendorAndDate",
+                { agent: "invoice-po-matcher" },
+                { vendorName: invoice.vendorName, invoiceDate: invoice.invoiceDate, windowDays: 30 },
+                () => finaleClient.findPOByVendorAndDate(
+                    invoice.vendorName,
+                    invoice.invoiceDate,
+                    30  // 30-day window around invoice date
+                ),
             );
 
             // Filter to "Committed" or open POs within 10% of invoice total
@@ -168,7 +174,12 @@ export async function matchInvoiceToPO(invoice: InvoiceData): Promise<MatchResul
                     let bestScore = -1;
                     for (const candidate of plausible) {
                         try {
-                            const summary = await finaleClient.getOrderSummary(candidate.orderId);
+                            const summary = await withToolAudit(
+                                "getOrderSummary",
+                                { agent: "invoice-po-matcher" },
+                                { orderId: candidate.orderId },
+                                () => finaleClient.getOrderSummary(candidate.orderId),
+                            );
                             if (!summary?.lineItems?.length) continue;
 
                             const poWords = new Set<string>(
