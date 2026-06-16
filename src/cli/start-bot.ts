@@ -321,7 +321,7 @@ bot.action('skip_uline_friday', (ctx) => {
 });
 
 // Text Fallbacks for approvals
-bot.hears(/^\\/approve_(.+)$/, async (ctx) => {
+bot.hears(/^\/approve_(.+)$/, async (ctx) => {
     const approvalId = ctx.match[1];
     console.log(`🔑 Approval text command: ${approvalId}`);
     try {
@@ -336,7 +336,7 @@ bot.hears(/^\\/approve_(.+)$/, async (ctx) => {
     }
 });
 
-bot.hears(/^\\/reject_(.+)$/, async (ctx) => {
+bot.hears(/^\/reject_(.+)$/, async (ctx) => {
     const approvalId = ctx.match[1];
     console.log(`➡️ Rejection text command: ${approvalId}`);
     try {
