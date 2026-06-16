@@ -60,6 +60,10 @@ export const TRACKING_PATTERNS = {
     // Requires the number to be preceded by a carrier name, "tracking", "PRO", or "pallet"
     // context to avoid false positives on random hyphenated numbers.
     ltlPro: /(?<=\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*[-–:]\s*|tracking\s*[#:]?\s*|PRO\s*[#\-]?\s*|pallet\w*\s+|shipped?\s+(?:via|by)\s+))(\d{6,15}-\d{1,3})\b/i,
+    // TRK# / TRACK# keyword prefix — catches tracking numbers in OCR invoice text
+    // where the carrier pattern doesn't match but the number has a TRK/TRACK label.
+    // Examples: TRK# 8051904063, TRACK# ABC123456789, TRK: XF1234567890
+    trk: /\b(?:TRK|TRACK)\s*[#:]?\s*([0-9A-Z]{8,25})\b/i,
 };
 
 // ──────────────────────────────────────────────────

@@ -8,28 +8,41 @@ import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
 
+// Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
+let lastInvalidationCheck = 0;
+let consecutiveFailures = 0;
+const CIRCUIT_BREAKER_THRESHOLD = 2;
+const CIRCUIT_BREAKER_RESET_MS = 15 * 60 * 1000; // 15 minutes
+let circuitBreakerUntil = 0;
+const INVALIDATION_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
 export async function GET(req: NextRequest) {
     // Auto-detect cross-process database PO changes and invalidate SWR cache dynamically
-    try {
-        const supabase = createClient();
-        if (supabase && resaleSlot.at > 0) {
-            const { data } = await supabase
-                .from('purchase_orders')
-                .select('updated_at')
-                .order('updated_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-            
-            if (data?.updated_at) {
-                const lastChange = new Date(data.updated_at).getTime();
-                if (lastChange > resaleSlot.at) {
-                    console.log(`[purchasing/route] Database PO change detected (${new Date(lastChange).toISOString()} > cache at ${new Date(resaleSlot.at).toISOString()}). Invalidating SWR cache.`);
-                    invalidatePurchasingCaches();
+    // Throttled to reduce load on Unhealthy nano Supabase instance
+    if (Date.now() - lastInvalidationCheck > INVALIDATION_CHECK_INTERVAL) {
+        try {
+            const supabase = createClient();
+            if (supabase && resaleSlot.at > 0) {
+                const { data } = await supabase
+                    .from('purchase_orders')
+                    .select('updated_at')
+                    .order('updated_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                
+                if (data?.updated_at) {
+                    const lastChange = new Date(data.updated_at).getTime();
+                    if (lastChange > resaleSlot.at) {
+                        console.log(`[purchasing/route] Database PO change detected (${new Date(lastChange).toISOString()} > cache at ${new Date(resaleSlot.at).toISOString()}). Invalidating SWR cache.`);
+                        invalidatePurchasingCaches();
+                    }
                 }
             }
+            lastInvalidationCheck = Date.now();
+        } catch (err: any) {
+            consecutiveFailures++; if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) { circuitBreakerUntil = Date.now() + CIRCUIT_BREAKER_RESET_MS; console.warn('[purchasing/route] Circuit breaker tripped after consecutive failures.'); } console.warn('[purchasing/route] SWR cross-process invalidation check failed:', err.message);
+            lastInvalidationCheck = Date.now(); // still advance to avoid hammering on errors
         }
-    } catch (err: any) {
-        console.warn('[purchasing/route] SWR cross-process invalidation check failed:', err.message);
     }
 
 
@@ -58,10 +71,32 @@ export async function GET(req: NextRequest) {
             }));
             refreshing = refreshing || r.refreshing;
         } catch (err: any) {
-            return NextResponse.json(
-                { error: err.message },
-                { status: 500, headers: { 'Cache-Control': 'no-store' } }
-            );
+            // Resilience fix: fall back to last persisted disk snapshot so the dashboard still loads
+            // even when Supabase nano is under heavy load / unhealthy. No user action required.
+            consecutiveFailures++; if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) { circuitBreakerUntil = Date.now() + CIRCUIT_BREAKER_RESET_MS; console.warn('[purchasing/route] Circuit breaker tripped after consecutive failures.'); } console.warn('[purchasing/route] getPurchasingIntelligence failed, using persisted cache fallback:', err.message);
+            try {
+                const fs = await import('fs');
+                const pathMod = await import('path');
+                const cacheDir = process.env.ARIA_PURCHASING_CACHE_DIR || pathMod.join(process.cwd(), '.aria-cache', 'purchasing');
+                const file = pathMod.join(cacheDir, 'purchasing-resale.json');
+                const raw = fs.readFileSync(file, 'utf8');
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed.value)) {
+                    resaleGroups = parsed.value.map((g: any) => ({
+                        ...g,
+                        items: g.items.map((item: any) => ({ ...item, itemType: item.itemType || 'resale' as const })),
+                    }));
+                    refreshing = true;
+                } else {
+                    throw new Error('no valid persisted value');
+                }
+            } catch (fallbackErr: any) {
+                console.warn('[purchasing/route] Resale disk fallback also failed:', fallbackErr?.message || fallbackErr);
+                return NextResponse.json(
+                    { error: err.message },
+                    { status: 500, headers: { 'Cache-Control': 'no-store' } }
+                );
+            }
         }
     }
 
@@ -74,7 +109,24 @@ export async function GET(req: NextRequest) {
             refreshing = refreshing || r.refreshing;
         } catch (err: any) {
             console.error('[purchasing/route] BOM demand error:', err.message);
-            bomGroups = [];
+            // Fall back to persisted disk snapshot so BOM data still loads
+            // even when Supabase nano is unhealthy. Non-fatal — resale still works.
+            try {
+                const fs = await import('fs');
+                const pathMod = await import('path');
+                const cacheDir = process.env.ARIA_PURCHASING_CACHE_DIR || pathMod.join(process.cwd(), '.aria-cache', 'purchasing');
+                const file = pathMod.join(cacheDir, 'purchasing-bom.json');
+                if (fs.existsSync(file)) {
+                    const raw = fs.readFileSync(file, 'utf8');
+                    const parsed = JSON.parse(raw);
+                    if (Array.isArray(parsed.value)) {
+                        bomGroups = parsed.value;
+                        refreshing = true;
+                    }
+                }
+            } catch {
+                // silent — BOM is non-fatal, resale pipeline continues without it
+            }
         }
     }
 

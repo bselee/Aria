@@ -41,12 +41,20 @@ function getKanbanDbPath(): string {
     return path.join(hermesHome, "kanban", "boards", "purchasing-lifecycle", "kanban.db");
 }
 
-/** Extract lane from the task title (e.g. "Ordering: Draft POs to vendors" → "Ordering") */
+/** Extract lane from the task title with smart fallback for current tasks */
 function extractLane(title: string): Lane {
-    for (const lane of LANES) {
-        if (title.startsWith(lane)) return lane;
-    }
-    return "Tracking"; // default fallback
+    const lower = title.toLowerCase();
+
+    if (lower.includes("order") || lower.includes("draft po")) return "Ordering";
+    if (lower.includes("purchas") || lower.includes("reconcile") || lower.includes("vendor")) return "Purchasing";
+    if (lower.includes("track") || lower.includes("shipment")) return "Tracking";
+    if (lower.includes("receiv") || lower.includes("good")) return "Receiving";
+
+    // Current tasks on the board
+    if (lower.includes("review") || lower.includes("regex")) return "Purchasing";
+    if (lower.includes("fix") || lower.includes("parser")) return "Ordering";
+
+    return "Tracking"; // default
 }
 
 function parseRow(row: Record<string, unknown>): KanbanTask {

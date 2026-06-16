@@ -307,7 +307,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
         // parallel arrays we'll index by SKU position.
         const { productId: _ignore, ...bulk } = data;
         this.productListBulkCache = bulk as Record<string, any[]>;
-        console.log(`[finale] Product list cached: ${this.productListCache!.length} products (with details for 404-fallback)`);
+        console.debug(`[finale] Product list cached: ${this.productListCache!.length} products (with details for 404-fallback)`);
     }
 
     /** Reconstruct a single-product-shaped object by pulling parallel-array

@@ -21,6 +21,7 @@
  */
 
 import { defineJob } from "../registry";
+import { generateAndSendMondayBriefing } from "@/lib/intelligence/monday-briefing";
 import { OpsManager } from "../../lib/intelligence/ops-manager";
 
 const ops = () => OpsManager.singleton;
@@ -824,6 +825,39 @@ defineJob({
     budget: { durationMs: 90_000 },
 });
 
+// HERMIA(2026-06-15): Daily Slack review — queries recent messages directly
+// addressed to Bill (DMs + @Bill mentions) and sends a short summary via TG.
+// Only fires if there are open items to review. No news = silence.
+defineJob({
+    name: "daily-slack-review",
+    schedule: "30 7 * * 1-5", // 7:30 AM weekdays
+    onFail: "log",
+    description: "7:30 AM Mon-Fri: daily Slack review of addressed messages (DM/@Bill) — unresponded count + SKUs.",
+    handler: async () => {
+        const { getAddressedRequests, formatAddressedReview } =
+            await import("@/lib/slack/addressed-message-watcher");
+        const { sendTelegramNotify } = await import(
+            "@/lib/intelligence/telegram-notify"
+        );
+        try {
+            const report = await getAddressedRequests(24);
+            const msg = formatAddressedReview(report);
+            if (msg) {
+                await sendTelegramNotify(msg);
+            } else {
+                console.log(
+                    "[daily-slack-review] No addressed messages in last 24h — silent.",
+                );
+            }
+        } catch (err: any) {
+            console.warn(
+                `[daily-slack-review] failed: ${err?.message ?? err}`,
+            );
+        }
+    },
+    budget: { durationMs: 30_000 },
+});
+
 //HERMIA(2026-06-11): Stockout driver — proactive countdown that creates drafts
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
@@ -912,4 +946,49 @@ defineJob({
         const { runSystemHeartbeat } = await import("@/lib/ops/heartbeat");
         await runSystemHeartbeat();
     },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Monday Briefing Cron (new 2026-06-15)
+// Runs only on Mondays at 8:00 AM MDT. Sends formatted email to Bill.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "monday-briefing",
+    schedule: "0 8 * * 1",  // Monday 8:00 AM
+    onFail: "telegram-will",
+    description: "Monday morning status overview: last-week purchases, upcoming needs, Slack SKU status, industry pulse. Emails bill.selee@buildasoil.com.",
+    handler: async () => {
+        const { generateAndSendMondayBriefing } = await import(
+            "@/lib/intelligence/monday-briefing"
+        );
+        await generateAndSendMondayBriefing();
+    },
+    budget: { durationMs: 120_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AP Email Watcher (added 2026-06-15)
+// Constant monitoring for vendor invoices and pricing/shipping reconciliation.
+// Runs every 15 minutes using the ap token.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "ap-email-watch",
+    schedule: "*/15 * * * *",
+    onFail: "telegram-will",
+    description: "Constant Gmail monitoring for vendor invoices (Thirsty Earth, etc.) and auto-reconcile pricing/shipping to Finale POs. Uses ap token. Runs every 15 minutes.",
+    handler: async () => {
+        const { exec } = await import('child_process');
+        await new Promise((resolve, reject) => {
+            exec('node --import tsx src/cli/run-ap-pipeline.ts', { cwd: process.cwd() }, (error, stdout, stderr) => {
+                if (error) {
+                    console.error('AP pipeline error:', error);
+                    reject(error);
+                } else {
+                    console.log('AP pipeline output:', stdout);
+                    resolve(stdout);
+                }
+            });
+        });
+    },
+    budget: { durationMs: 120_000 },
 });

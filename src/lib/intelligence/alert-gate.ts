@@ -89,33 +89,24 @@ export function isBusinessHours(timezone: string = TZ): boolean {
 }
 
 /**
- * Send alert only during business hours (Mon-Fri 8 AM–5 PM Denver).
- * Outside hours: message is logged but not sent.
+ * Former Telegram alert gated by business hours. Replaced with console.log
+ * as part of the alert-gate migration. All non-critical alerts now log to
+ * console and/or write to Supabase tables instead of sending Telegram messages.
  *
- * @param bot - Telegraf instance
- * @param chatId - Telegram chat ID
- * @param message - Message text
- * @param options - Telegram send options (parse_mode, etc.)
- * @returns Message object if sent, null if gated
+ * Only crash-loop-detector (criticalAlert) and Bill.com forward failures
+ * (criticalAlert) still send Telegram at any time.
+ *
+ * @returns null (always — no Telegram sent)
  */
 export async function businessHoursAlert(
-  bot: Telegraf,
-  chatId: string,
+  _bot: Telegraf,
+  _chatId: string,
   message: string,
-  options?: { parse_mode?: 'Markdown' | 'HTML' }
-): Promise<any | null> {
-  if (!isBusinessHours()) {
-    const preview = message.slice(0, 80).replace(/\n/g, ' ');
-    console.log(`[alert-gate] 🔇 Gated (outside business hours): "${preview}..."`);
-    return null;
-  }
-
-  try {
-    return await bot.telegram.sendMessage(chatId, message, options);
-  } catch (err: any) {
-    console.warn(`[alert-gate] Send failed:`, err.message);
-    return null;
-  }
+  _options?: { parse_mode?: 'Markdown' | 'HTML' }
+): Promise<null> {
+  const preview = message.slice(0, 120).replace(/\n/g, ' ');
+  console.log(`[alert-gate] (was businessHoursAlert): "${preview}..."`);
+  return null;
 }
 
 /**

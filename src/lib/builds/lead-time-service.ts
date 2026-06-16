@@ -3,16 +3,28 @@
  * @purpose Unified, cached lead time lookup for purchase order ETA calculations.
  *          Shared by: calendar sync, reorder engine, and build risk analysis.
  *
- * Priority chain (per vendor/SKU):
- *   1. Vendor median — last 90 days of completed POs (≥3 data points required)
- *   2. SKU product lead time — Finale product REST (if sku provided)
- *   3. 14-day global default
+ *          Priority chain (per vendor/SKU):
+ *            0. Policy override — vendor_reorder_policies.lead_time_override_days
+ *               (highest priority; authoritative manual value for pre-PO production
+ *               vendors such as Colorful Packaging where Finale only measures
+ *               post-PO receipt time)
+ *            1. Vendor median — last 90 days of completed POs (≥3 data points required)
+ *            2. SKU product lead time — Finale product REST (if sku provided)
+ *            3. 14-day global default
  *
- * Cache TTL: 4 hours (same as calendar sync cron interval).
- * One Finale GraphQL call fills the entire vendor map; subsequent lookups are instant.
+ *          Cache TTL: 4 hours (same as calendar sync cron interval).
+ *          One Finale GraphQL call + one Supabase query fills everything.
+ * @author  Hermia
+ * @created 2026-06-10
+ * @updated 2026-06-15 — Added policy override as priority 0 to fix Colorful-style
+ *          mismatches where observed median (post-PO) was overriding manual 60d value.
+ * @deps    finale/client, supabase
+ * @env     none
  */
 
 import { FinaleClient, finaleClient } from '../finale/client';
+import { createClient } from '../supabase';
+import { withToolAudit } from '../agents/tool-registry';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -20,8 +32,8 @@ import { FinaleClient, finaleClient } from '../finale/client';
 
 export interface LeadTimeResult {
     days: number;
-    provenance: 'vendor_median' | 'sku_product' | 'default';
-    label: string; // e.g. "13d median · vendor history" | "7d (Finale)" | "14d default"
+    provenance: 'policy_override' | 'vendor_median' | 'sku_product' | 'default';
+    label: string; // e.g. "60d policy override" | "13d median · vendor history" | "7d (Finale)" | "14d default"
 }
 
 export interface LeadTimeDistribution {
@@ -37,26 +49,81 @@ export interface LeadTimeDistribution {
 export class LeadTimeService {
     private cache: Map<string, number> | null = null; // normalized vendorName → medianDays
     private cacheAt = 0;
+    private policyCache: Map<string, number> | null = null; // normalized vendorName → overrideDays
+    private policyCacheAt = 0;
     static readonly TTL = 4 * 60 * 60 * 1000; // 4 hours
 
-    /**
-     * Pre-warm the vendor history cache.
+    /** 
+     * Pre-warm the vendor history + policy caches.
      * Call once before bulk operations (calendar sync, reorder engine run).
      * No-op if cache is fresh (within TTL).
      */
     async warmCache(): Promise<void> {
         const now = Date.now();
-        if (this.cache && now - this.cacheAt < LeadTimeService.TTL) return;
+        if (this.cache && this.policyCache && now - this.cacheAt < LeadTimeService.TTL) return;
 
         try {
             const finale = finaleClient;
-            this.cache = await finale.getVendorLeadTimeHistory(90);
+            this.cache = await withToolAudit(
+                "getVendorLeadTimeHistory",
+                { agent: "lead-time-service" },
+                { daysBack: 90 },
+                () => finale.getVendorLeadTimeHistory(90),
+            );
             this.cacheAt = now;
             console.log(`[LeadTimeService] Cache warmed — ${this.cache.size} vendor(s) with history`);
+
+            await this.loadPolicyOverrides();
         } catch (err: any) {
             console.warn(`[LeadTimeService] Cache warm failed: ${err.message} — falling back to defaults`);
-            this.cache = new Map(); // empty but non-null so we don't retry immediately
+            this.cache = new Map();
             this.cacheAt = now;
+            this.policyCache = new Map();
+            this.policyCacheAt = now;
+        }
+    }
+
+    /** 
+     * Load (or refresh) policy overrides from Supabase.
+     * Only vendors with explicit lead_time_override_days set are cached.
+     * Separate TTL check so policies can be warm independently if needed.
+     */
+    private async loadPolicyOverrides(): Promise<void> {
+        const now = Date.now();
+        if (this.policyCache && now - this.policyCacheAt < LeadTimeService.TTL) return;
+
+        try {
+            const db = createClient();
+            if (!db) {
+                this.policyCache = new Map();
+                this.policyCacheAt = now;
+                return;
+            }
+
+            const { data, error } = await db
+                .from('vendor_reorder_policies')
+                .select('vendor_name, lead_time_override_days')
+                .not('lead_time_override_days', 'is', null);
+
+            if (error || !data) {
+                this.policyCache = new Map();
+                this.policyCacheAt = now;
+                return;
+            }
+
+            this.policyCache = new Map<string, number>();
+            for (const row of data as Array<{ vendor_name: string | null; lead_time_override_days: number | null }>) {
+                if (row.vendor_name && row.lead_time_override_days && row.lead_time_override_days > 0) {
+                    const key = row.vendor_name.trim().toLowerCase();
+                    this.policyCache.set(key, row.lead_time_override_days);
+                }
+            }
+            this.policyCacheAt = now;
+            console.log(`[LeadTimeService] Policy overrides loaded — ${this.policyCache.size} vendor(s)`);
+        } catch (err: any) {
+            console.warn(`[LeadTimeService] Policy load failed: ${err.message} — falling back`);
+            this.policyCache = new Map();
+            this.policyCacheAt = now;
         }
     }
 
@@ -68,8 +135,23 @@ export class LeadTimeService {
      * @param sku         Finale SKU to query if vendor history is unavailable
      */
     async getForVendor(vendorName: string, sku?: string): Promise<LeadTimeResult> {
-        // Ensure cache is warm (no-op if fresh)
+        // Ensure caches are warm
         if (!this.cache) await this.warmCache();
+        if (!this.policyCache) await this.loadPolicyOverrides();
+
+        // 0. Policy override (highest — manual authoritative value)
+        if (this.policyCache && vendorName) {
+            const key = vendorName.trim().toLowerCase();
+            for (const [cacheKey, days] of this.policyCache.entries()) {
+                if (cacheKey === key || cacheKey.includes(key) || key.includes(cacheKey)) {
+                    return {
+                        days,
+                        provenance: 'policy_override',
+                        label: `${days}d policy override`,
+                    };
+                }
+            }
+        }
 
         // 1. Vendor history median
         if (this.cache && vendorName) {
@@ -130,10 +212,12 @@ export class LeadTimeService {
         return null;
     }
 
-    /** Invalidate the cache (e.g. after receiving a PO — lead time history just changed). */
+    /** Invalidate both caches (e.g. after receiving a PO — lead time history just changed). */
     invalidate(): void {
         this.cache = null;
         this.cacheAt = 0;
+        this.policyCache = null;
+        this.policyCacheAt = 0;
     }
 }
 

@@ -5,10 +5,15 @@
  *          fresh subject, ship confirmation from a different system, etc.
  *
  * Strategy chain (highest confidence wins, first hit returns):
- *   1. Subject contains PO number explicitly
- *   2. Body or attachment filename contains PO number
- *   3. Sender domain matches vendor + that vendor has exactly one unacked PO
- *      sent within 30 days (date proximity + domain uniqueness)
+ *   1. Subject contains PO number explicitly (tuned for "Ref IUSA... | PO ####")
+ *   2. Body or attachment filename contains PO number (or "multiple orders" / confirmation)
+ *   3. Sender domain match (relaxed for multi-order vendors like CR Minerals 4-5 orders/PO,
+ *      Covico, Marion Ag who reply separately per order/line)
+ *
+ * Vendor profiles:
+ * - CR Minerals: typically 4-5 orders per PO → expect multiple separate replies
+ * - Covico/Invico: consolidated multi-order POs with internal Ref numbers
+ * - Marion Ag: always responds separately per order
  *
  * Returns enough evidence to write vendor_acknowledged_at + vendor_ack_source
  * to purchase_orders with confidence.
@@ -22,6 +27,13 @@ export interface VendorReplyMatch {
     subject: string;
     fromEmail: string;
     evidenceDetail: string;         // human-readable why-it-matched
+    qtyVariance?: {
+        mentionedShipped: number;
+        ordered?: number;
+        sku?: string;
+        mismatch: boolean;
+        rawText: string;
+    };
 }
 
 export interface POTarget {
@@ -104,8 +116,27 @@ export function matchPOAgainstInbox(
     const digits = target.poNumber.replace(/^PO-?/i, '');
     if (!digits) return blank();
 
-    const poRegex = new RegExp(`\\b(?:PO|Order|Order\\s*#)?\\s*[#-]?\\s*${digits}\\b`, 'i');
+    // Tuned regex (2026-06-15): handles Covico/Invico "Ref IUSA26942 | PO 124392",
+    // multi-order/consolidated POs, and Marion Ag split-reply patterns.
+    // Also catches "Order Confirmation" + PO# in body.
+    const poRegex = new RegExp(
+        `\\b(?:PO|Order|Order\\s*#|Ref\\s*[A-Z0-9]+\\s*\\|?\\s*PO)?\\s*[#-]?\\s*${digits}\\b` +
+        `|${digits}.*?(?:multiple|orders?|consolidated|confirmation)`,
+        'i'
+    );
     const domains = target.vendorDomainHints.map(d => d.toLowerCase());
+    // Known multi-order vendors (CR Minerals typically 4-5 orders per PO,
+    // Covico/Invico consolidated). These vendors often send separate replies
+    // per order/line. We relax the "sole unacked PO" rule for them in Pass 3.
+    const MULTI_ORDER_VENDORS = new Set([
+        "cr minerals", "covico", "invico", "marion ag", "marionag", "diamond gypsum", "diamondgypsum", "diamond k"
+    ]);
+    const isMultiOrderVendor = MULTI_ORDER_VENDORS.has(
+        (target.vendorName || "").toLowerCase()
+    ) || domains.some(d =>
+        d.includes("cr") || d.includes("covico") || d.includes("invico") || d.includes("marion")
+    );
+
 
     // Pass 1: explicit PO# in subject
     for (const msg of inboundMessages) {
@@ -148,9 +179,10 @@ export function matchPOAgainstInbox(
         }
     }
 
-    // Pass 3: sender-domain unique-PO match. Only valid when this PO is the
-    // *only* unacked PO for that vendor in the recent window — the caller
-    // is responsible for ensuring `target` is the unique candidate.
+    // Pass 3: sender-domain match.
+    // For multi-order vendors (CR Minerals 4-5 orders/PO, Covico, Marion Ag)
+    // we accept any domain match (they send separate replies per order).
+    // For normal vendors we still require uniqueness (caller responsibility).
     if (domains.length > 0) {
         for (const msg of inboundMessages) {
             const headers = msg.payload?.headers ?? [];
@@ -166,7 +198,9 @@ export function matchPOAgainstInbox(
                     gmailMessageId: msg.id,
                     subject: extractSubject(headers),
                     fromEmail: from,
-                    evidenceDetail: `Sole open PO for vendor domain ${fromDomain}`,
+                    evidenceDetail: isMultiOrderVendor
+                    ? `Domain match for multi-order vendor ${fromDomain} (CR Minerals / Covico style)`
+                    : `Sole open PO for vendor domain ${fromDomain}`,
                 };
             }
         }
@@ -184,5 +218,48 @@ function blank(): VendorReplyMatch {
         subject: '',
         fromEmail: '',
         evidenceDetail: '',
+    };
+}
+
+function detectQtyVariance(body: string, orderedQty?: number): VendorReplyMatch['qtyVariance'] | undefined {
+    const lower = body.toLowerCase();
+
+    // Patterns for variance language: "90x instead of 80x", "sent 90 received 80", "90 instead of 80", "extra 10", "short 5"
+    const varianceRegex = /(?:sent|shipped|received|got)\s*(\d+)\s*(?:x|pcs|units|bags|pots|ea)?\s*(?:instead of|vs|versus|not|of)\s*(\d+)|(\d+)\s*(?:instead of|vs|versus)\s*(\d+)|extra\s*(\d+)|short\s*(\d+)/i;
+
+    const match = lower.match(varianceRegex);
+    if (!match) return undefined;
+
+    let mentionedShipped = 0;
+    let mentionedOrdered = orderedQty;
+
+    // Extract numbers from common patterns
+    if (match[1] && match[2]) {
+        mentionedShipped = parseInt(match[1], 10);
+        mentionedOrdered = parseInt(match[2], 10);
+    } else if (match[3] && match[4]) {
+        mentionedShipped = parseInt(match[3], 10);
+        mentionedOrdered = parseInt(match[4], 10);
+    } else if (match[5]) {
+        // "extra 10" — assume shipped = ordered + extra
+        mentionedShipped = (orderedQty || 0) + parseInt(match[5], 10);
+    } else if (match[6]) {
+        mentionedShipped = (orderedQty || 0) - parseInt(match[6], 10);
+    }
+
+    if (mentionedShipped === 0) return undefined;
+
+    const mismatch = mentionedOrdered !== undefined && mentionedShipped !== mentionedOrdered;
+
+    // Try to extract SKU context (simple heuristic near the numbers)
+    const skuMatch = body.match(/\b([A-Z0-9]{3,15})\b/g);
+    const sku = skuMatch ? skuMatch.find(s => /[A-Z]/.test(s) && /\d/.test(s)) : undefined;
+
+    return {
+        mentionedShipped,
+        ordered: mentionedOrdered,
+        sku,
+        mismatch,
+        rawText: match[0],
     };
 }

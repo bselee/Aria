@@ -460,4 +460,41 @@ describe('TRACKING_PATTERNS', () => {
             expect(match3![1]).toBe('1701387444');
         });
     });
+
+    describe('trk pattern (TRK#/TRACK# fallback)', () => {
+        it('should match TRK# followed by a tracking number', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRK# 8051904063')).toBe(true);
+        });
+
+        it('should match TRK# without space (e.g. TRK#8051904063)', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRK#8051904063')).toBe(true);
+        });
+
+        it('should match TRACK# prefix', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRACK# ABC123456789')).toBe(true);
+        });
+
+        it('should match TRK: (colon separator)', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRK: XF1234567890')).toBe(true);
+        });
+
+        it('should match TRK with space only (no #)', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRK 123456789012345')).toBe(true);
+        });
+
+        it('should capture the tracking number in group 1', () => {
+            const pattern = new RegExp(TRACKING_PATTERNS.trk.source, 'i');
+            const m = 'TRK# 8051904063'.match(pattern);
+            expect(m).not.toBeNull();
+            expect(m![1]).toBe('8051904063');
+        });
+
+        it('should not match numbers shorter than 8 digits', () => {
+            expect(TRACKING_PATTERNS.trk.test('TRK# 12345')).toBe(false);
+        });
+
+        it('should not match TRK when part of another word', () => {
+            expect(TRACKING_PATTERNS.trk.test('intrk 12345678')).toBe(false);
+        });
+    });
 });

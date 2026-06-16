@@ -1,5 +1,6 @@
 import { createClient } from '../supabase';
 import { FinaleClient } from '../finale/client';
+import { withToolAudit } from '../agents/tool-registry';
 import { assessPurchasingGroups } from './assessment-service';
 import { buildDraftPOItemsFromAssessment } from './draft-po-policy';
 
@@ -12,7 +13,12 @@ export async function scanAxiomDemand(finaleClient: FinaleClient) {
 
     console.log('[axiom-scanner] Starting Axiom demand scan...');
     // 1. Get purchasing intelligence
-    const groups = await finaleClient.getPurchasingIntelligence();
+    const groups = await withToolAudit(
+        "getPurchasingIntelligence",
+        { agent: "axiom-scanner" },
+        {},
+        () => finaleClient.getPurchasingIntelligence(),
+    );
     
     // 2. Filter for Axiom group
     const axiomGroup = groups.find(g => g.vendorName?.toLowerCase().includes('axiom'));

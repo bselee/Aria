@@ -82,7 +82,7 @@ Extract ALL fields from the invoice with exact values — do not round or interp
 
 - Payment terms: exact text as written (Net 30, 2/10 Net 30, Due on Receipt, etc.)
 - **PO numbers**: Look in ALL of these locations — dedicated "PO Number" field, "Customer Reference", "Reference", "Your Ref", "Memo", "Notes", "Order #", and header text. Many vendors put the PO in a memo/reference field, not a labeled PO box. If multiple candidate numbers exist, prefer the one that looks like a Finale PO (4+ digits, numeric).
-- **Tracking numbers**: Scan the ENTIRE invoice text for tracking numbers — they often appear unlabeled in shipping sections, at the bottom of the page, or in small-print reference lines. Common formats: UPS (starts with "1Z"), FedEx (12 or 15 digits, often starting "96"), USPS (20-22 digits starting 94/91/82), DHL (10 digits), and freight PRO numbers. Extract ALL found tracking numbers — the system deduplicates. Also check for a "Ship Date" anywhere in the document.
+- **Tracking numbers**: Scan the ENTIRE invoice text for tracking numbers — they often appear unlabeled in shipping sections, at the bottom of the page, or in small-print reference lines. Common formats: UPS (starts with "1Z"), FedEx (12 or 15 digits, often starting "96"), USPS (20-22 digits starting 94/91/82), DHL (10 digits), and freight PRO numbers. Also look for labels like "TRK#", "TRK", or "TRACK#" that may prefix a tracking number. Extract ALL found tracking numbers — the system deduplicates. Also check for a "Ship Date" anywhere in the document.
 - BOL numbers, PRO numbers
 - Due date: calculate from invoice date + terms if not explicitly stated
 

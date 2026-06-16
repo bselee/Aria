@@ -50,7 +50,7 @@ import { writeReconciliationOutcome } from "../runtime/observability/reconciliat
  */
 import { type VendorRoutingRule, matchVendorRouting } from "./ap/vendor-router";
 import { detectAutopay } from "./ap/autopay-detector";
-import { businessHoursAlert } from "./alert-gate";
+import { businessHoursAlert, criticalAlert } from "./alert-gate";
 import { classifyInvoice, type ClassificationResult } from "@/config/invoice-classification";
 
 function countMeaningfulLineItems(invoice: InvoiceData): number {
@@ -818,9 +818,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
                             const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, buffer);
                             if (!forwarded) {
-                                // Critical: Bill.com never received the invoice — alert Will immediately
+                                // Critical: Bill.com never received the invoice — alert Will immediately (bypasses business-hours gate)
                                 try {
-                                    await businessHoursAlert(this.bot, 
+                                    await criticalAlert(this.bot, 
                                         process.env.TELEGRAM_CHAT_ID || "",
                                         `🚨 * BILL\\.COM FORWARD FAILED *\nFile: \`${part.filename!}\`\nSubject: _${subject}_\nFrom: ${from}\n\n⚠️ Invoice was NOT received by Bill\\.com\\. Please forward manually\\.`,
                                         { parse_mode: "MarkdownV2" }

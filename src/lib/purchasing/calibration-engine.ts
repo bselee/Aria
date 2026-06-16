@@ -22,6 +22,7 @@
 
 import { createClient } from "../supabase";
 import { finaleClient } from "../finale/client";
+import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
 
 interface RecRow {
     id: number;
@@ -79,7 +80,12 @@ export async function attachReceivedPOsToRecommendations(daysBack = 30): Promise
     const db = createClient();
     if (!db) return out;
 
-    const recentPOs = await finaleClient.getRecentPurchaseOrders(daysBack);
+    const recentPOs = await withToolAudit(
+        "getRecentPurchaseOrders",
+        { agent: "calibration-engine" },
+        { daysBack },
+        () => finaleClient.getRecentPurchaseOrders(daysBack),
+    );
     const received: ReceivedPO[] = recentPOs
         .filter(po => po.receiveDate && po.status?.toLowerCase() === "completed")
         .map(po => ({

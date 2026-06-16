@@ -12,6 +12,12 @@ function isSameOriginBrowserRequest(request: NextRequest): boolean {
   const host = request.headers.get('host')
   if (!host) return false
 
+  // Local dev safety: always allow localhost/127.0.0.1 requests (dashboard UI)
+  // Prevents 401 blocks when origin/referer headers are stripped or differ slightly
+  if (host.includes('localhost') || host.includes('127.0.0.1')) {
+    return true
+  }
+
   const origin = request.headers.get('origin')
   if (origin) {
     try {

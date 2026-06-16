@@ -9,6 +9,13 @@
 export async function register() {
     if (process.env.NEXT_RUNTIME !== 'nodejs') return;
 
-    const { startPurchasingPrewarm } = await import('@/lib/purchasing/cache');
-    startPurchasingPrewarm();
+    try {
+        const { startPurchasingPrewarm } = await import('@/lib/purchasing/cache');
+        startPurchasingPrewarm();
+    } catch (err: any) {
+        // Instrumentation chunk resolution can fail on some builds/restarts
+        // (e.g. './chunks/_instrument_src_lib_purchasing_cache_ts.js').
+        // Prewarm is best-effort; dashboard still works via on-demand SWR + disk fallback.
+        console.warn('[instrumentation] Failed to start purchasing prewarm (chunk issue):', err?.message || err);
+    }
 }

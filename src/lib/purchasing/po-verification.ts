@@ -10,7 +10,7 @@ export interface ExpectedDelivery {
     /** ISO YYYY-MM-DD */
     date: string;
     leadTimeDays: number;
-    source: 'vendor_median' | 'sku_product' | 'default';
+    source: 'policy_override' | 'vendor_median' | 'sku_product' | 'default';
     /** Human-readable, e.g. "14d median · vendor history" */
     label: string;
 }

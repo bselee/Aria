@@ -60,7 +60,7 @@ function inferCacheKey(slot: CacheSlot): CacheKey | null {
     return null;
 }
 
-function readPersistedSnapshot(key: CacheKey): PersistedSnapshot | null {
+export function readPersistedSnapshot(key: CacheKey): PersistedSnapshot | null {
     try {
         const parsed = JSON.parse(readFileSync(cacheFile(key), 'utf8')) as Partial<PersistedSnapshot>;
         if (!Number.isFinite(parsed.at) || !Array.isArray(parsed.value)) return null;
@@ -87,6 +87,21 @@ async function persistSnapshot(key: CacheKey, value: PurchasingGroup[], at: numb
     }
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('fetcher timeout')), ms);
+    promise.then(v => { clearTimeout(timer); resolve(v); }).catch(err => { clearTimeout(timer); reject(err); });
+  });
+}
+
+/**
+ * Background fetch timeout (ms). Increased from 25s to 180s (3min) for resilience
+ * on large scans (7881+ products, BOM + resale pipelines). Prevents premature
+ * timeout during peak load while still bounding runaway fetches.
+ * @env FETCH_TIMEOUT_MS can be overridden via env if needed (future).
+ */
+const FETCH_TIMEOUT_MS = 180000;
+
 export async function readSWR(
     slot: CacheSlot,
     fetcher: () => Promise<PurchasingGroup[]>,
@@ -100,11 +115,17 @@ export async function readSWR(
     if (stale && !slot.promise) {
         slot.promise = (async () => {
             try {
-                const v = await fetcher();
+                const v = await withTimeout(fetcher(), FETCH_TIMEOUT_MS);
                 slot.value = v;
                 slot.at = Date.now();
                 if (cacheKey) void persistSnapshot(cacheKey, v, slot.at);
                 return v;
+            } catch (err: any) {
+                // Resilience: log timeout or fetch errors but do not propagate rejection.
+                // Prevents unhandledRejection spam that was causing dashboard instability / ISE.
+                // Keeps previous stale value; next prewarm or bust will retry.
+                console.error(`[purchasing/cache] background ${cacheKey || 'unknown'} fetch failed:`, err?.message || err);
+                // Optionally could set an error flag on slot, but for now graceful degrade.
             } finally {
                 slot.promise = null;
             }

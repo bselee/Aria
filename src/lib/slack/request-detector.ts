@@ -43,6 +43,12 @@ const MIN_AGE_MS = 15_000;
 /** How far back to look on each poll (ms). */
 const LOOKBACK_MS = 120_000;
 
+/** How often to poll DMs (ms) — every 5 min to keep API calls low. */
+const DM_POLL_INTERVAL_MS = 300_000;
+
+/** Max DM channels to track (cap to stay within rate limits). */
+const MAX_DM_CHANNELS = 20;
+
 /**
  * Heuristic: does Bill's message look like a data request (not just chatter)?
  * 2026-06-09 — used to decide whether to process his Slack messages in
@@ -244,6 +250,8 @@ export class SlackRequestDetector {
     private seenCache = new Set<string>(); // "channelId:messageTs"
     private ownerUserId: string | null;
     private startedAt = Date.now();
+    private dmChannelIds: string[] = []; // cached IM channel IDs
+    private lastDMPoll = 0; // timestamp of last DM poll
 
     constructor(userToken: string, botToken: string) {
         this.reader = new WebClient(userToken);
@@ -287,11 +295,19 @@ export class SlackRequestDetector {
         await this.pollAll().catch((err) =>
             console.warn(`[slack-detector] First poll failed: ${err.message}`),
         );
+        this.pollDMs().catch((err) =>
+            console.warn(`[slack-detector] First DM poll failed: ${err.message}`),
+        );
 
         this.interval = setInterval(() => {
             this.pollAll().catch((err) =>
                 console.warn(
                     `[slack-detector] Poll failed: ${err.message}`,
+                ),
+            );
+            this.pollDMs().catch((err) =>
+                console.warn(
+                    `[slack-detector] DM poll failed: ${err.message}`,
                 ),
             );
         }, POLL_INTERVAL_MS);
@@ -411,6 +427,108 @@ export class SlackRequestDetector {
         }
     }
 
+    // ── DM Polling ──────────────────────────────────────────────────────
+
+    /**
+     * Discover IM (DM) channels for the reader token.
+     * Caches up to MAX_DM_CHANNELS, sorted by most recent activity.
+     */
+    private async discoverDMs(): Promise<void> {
+        try {
+            const result = await this.reader.conversations.list({
+                types: "im",
+                limit: MAX_DM_CHANNELS,
+            });
+            this.dmChannelIds = ((result.channels || []) as any[])
+                .filter((ch: any) => ch.id)
+                .map((ch: any) => ch.id as string);
+            console.log(
+                `[slack-detector] Discovered ${this.dmChannelIds.length} DM channels`,
+            );
+        } catch (err: any) {
+            console.warn(
+                `[slack-detector] DM discovery failed: ${err.message}`,
+            );
+        }
+    }
+
+    /**
+     * Poll all cached DM channels for new messages.
+     * Runs on DM_POLL_INTERVAL_MS cadence to stay under rate limits.
+     * Records all messages as addressed_to_bill + is_dm.
+     */
+    private async pollDMs(): Promise<void> {
+        const now = Date.now();
+        if (now - this.lastDMPoll < DM_POLL_INTERVAL_MS) return;
+        this.lastDMPoll = now;
+
+        // Discover DMs on first poll or if cache is empty
+        if (this.dmChannelIds.length === 0) {
+            await this.discoverDMs();
+            if (this.dmChannelIds.length === 0) return;
+        }
+
+        const oldest = Math.floor((now - LOOKBACK_MS) / 1000);
+        const oldestStr = String(oldest);
+
+        for (const chId of this.dmChannelIds) {
+            try {
+                const result = await this.reader.conversations.history({
+                    channel: chId,
+                    oldest: oldestStr,
+                    limit: 10,
+                });
+
+                const messages = (result.messages || []) as any[];
+                const lastPoll = this.lastPollTs[chId] || (now - LOOKBACK_MS);
+
+                for (const msg of messages) {
+                    const mTs = parseFloat(msg.ts || "0") * 1000;
+                    if (mTs <= lastPoll || mTs <= this.startedAt) continue;
+                    if (msg.subtype === "bot_message" || msg.bot_id) continue;
+
+                    const text = (msg.text || "") as string;
+                    if (!text.trim()) continue;
+
+                    const userId = msg.user as string | undefined;
+                    // Skip messages from Bill himself (he's the owner)
+                    if (userId && this.ownerUserId && userId === this.ownerUserId) continue;
+
+                    const dedupKey = `${chId}:${msg.ts}`;
+                    if (this.seenCache.has(dedupKey)) continue;
+                    this.seenCache.add(dedupKey);
+
+                    const ts = msg.ts as string;
+                    const msgAge = Date.now() - parseFloat(ts) * 1000;
+                    if (msgAge < MIN_AGE_MS) continue;
+
+                    // Record DM with addressed_to_bill + is_dm flags
+                    const skus = extractSKUs(text);
+                    await this.recordRequest(
+                        "DM",
+                        chId,
+                        ts,
+                        userId,
+                        text,
+                        skus,
+                        true,  // addressedToBill
+                        true,  // isDm
+                    ).catch(() => {});
+
+                    console.log(
+                        `[slack-detector] DM from ${userId}: "${text.slice(0, 60)}"`,
+                    );
+                }
+
+                this.lastPollTs[chId] = now;
+            } catch (err: any) {
+                const errCode = err?.data?.error || "";
+                if (errCode === "ratelimited") continue;
+                // Quiet skip for inaccessible DMs
+            }
+        }
+    }
+
     // ── Message Processing ────────────────────────────────────────────────
 
     private async processMessage(
@@ -453,6 +571,21 @@ export class SlackRequestDetector {
         // for the data-request case where Bill doesn't include a SKU
         // but wants to know something.
         const userId = msg.user as string | undefined;
+
+        // Detect whether Bill was @-mentioned in a channel message.
+        // If someone addresses Bill directly, flag it for the daily review,
+        // even if it's not an SKU request or a data-request-looking message.
+        let addressedToBill = false;
+        if (
+            this.ownerUserId &&
+            new RegExp(`<@${this.ownerUserId}>`).test(text)
+        ) {
+            addressedToBill = true;
+            console.log(
+                `[slack-detector] #${channelName}: @Bill mention detected`,
+            );
+        }
+
         if (userId && this.ownerUserId && userId === this.ownerUserId) {
             if (!looksLikeDataRequest(text)) return;
             console.log(`[slack-detector] Processing Bill's message (data request): "${text.slice(0, 80)}"`);
@@ -480,6 +613,7 @@ export class SlackRequestDetector {
                 }
                 await this.recordRequest(
                     channelName, channelId, ts, userId, text, [],
+                    addressedToBill,
                 ).catch(() => {});
                 return; // PO branch handled, don't fall through to SKU branch
             }
@@ -549,6 +683,7 @@ export class SlackRequestDetector {
             userId,
             text,
             resolvedSkus.map(s => s.finaleSku),
+            addressedToBill,
         ).catch(() => {});
 
         // No open PO found — render per-vendor draft POs in TG DM only.
@@ -911,6 +1046,8 @@ export class SlackRequestDetector {
         userId: string | undefined,
         text: string,
         skus: string[],
+        addressedToBill: boolean = false,
+        isDm: boolean = false,
     ): Promise<void> {
         const db = createClient();
         if (!db) return;
@@ -943,6 +1080,8 @@ export class SlackRequestDetector {
                 items_requested: skus,
                 status: "pending",
                 created_at: new Date().toISOString(),
+                addressed_to_bill: addressedToBill,
+                is_dm: isDm,
             })
             .then(() => {
                 console.log(

@@ -70,19 +70,10 @@ export interface DefaultInboxInvoiceResult {
 
 // ── Telegram alert (fetch-based, no Telegraf dependency) ──────────────────────
 
+/** Replaced Telegram send with console.log — invoice alerts go to dashboard/ops logs. */
 async function sendTelegramAlert(html: string): Promise<void> {
-    if (!isBusinessHours()) { console.log(`[default-inbox-invoice] Gated (outside business hours)`); return; }
-    const token  = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) return;
-    try {
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ chat_id: chatId, text: html, parse_mode: "HTML" }),
-            signal:  AbortSignal.timeout(5000),
-        });
-    } catch { /* non-fatal */ }
+    const preview = html.slice(0, 120).replace(/\n/g, ' ');
+    console.log(`[default-inbox-invoice] Alert (would have sent Telegram): "${preview}..."`);
 }
 
 // ── PO# extraction (regex-first, no LLM) ─────────────────────────────────────

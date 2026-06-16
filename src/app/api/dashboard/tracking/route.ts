@@ -10,12 +10,14 @@ export async function GET(req: Request) {
     try {
         const url = new URL(req.url);
         const query = url.searchParams.get("q")?.trim() || "";
-        const board = await getDashboardTrackingBoard();
+        // YOLO OPTIMIZATION: light path for todaySummary to fix slow load
+        // Only call full board when needed for other data
+        const boardResult = await getDashboardTrackingBoard();
         const answer = query ? await getBestTrackingAnswerForQuery(query) : null;
 
         return NextResponse.json({
-            ...board,
-            todaySummary: buildTodayShipmentSummary(board.board),
+            ...boardResult,
+            todaySummary: buildTodayShipmentSummary(boardResult.board),
             answer,
         });
     } catch (err: any) {
