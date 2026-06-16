@@ -533,34 +533,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn(`[boot] AP polling boot run failed (non-fatal): ${e.message}`);
     }
 
-    // ── Crash-recovery alert ─────────────────────────────────────────
-    try {
-        const { sendCriticalTelegramNotify } = await import('../lib/intelligence/telegram-notify');
-        const uptimeSec = Math.round((Date.now() - BOT_START_TIME) / 1000);
-        // grep last 50 lines of PM2 error log for TransformError (esbuild syntax crash)
-        const { execSync } = await import('child_process');
-        let crashReason = '';
-        try {
-            const errTail = execSync(
-                'pm2 logs aria-bot --err --lines 50 --nostream 2>/dev/null',
-                { encoding: 'utf8', timeout: 5000 }
-            );
-            const lines = errTail.split('\n').filter(l => l.includes('ERROR:') || l.includes('Syntax error'));
-            if (lines.length > 0) {
-                crashReason = ' ⚠️ Was crash-looping: ' + lines[lines.length - 1].trim();
-            }
-        } catch { /* pm2 not available in test — non-fatal */ }
-
-        if (crashReason) {
-            await sendCriticalTelegramNotify(
-                `🔄 Aria bot restarted (${uptimeSec}s uptime).` + crashReason
-            );
-        }
-    } catch (e: any) {
-        console.warn(`[boot] crash-recovery alert failed (non-fatal): ${e.message}`);
-    }
-    // ── End crash-recovery alert ──────────────────────────────────────
-    // ── End boot-time warmup ────────────────────────────────────────
+    // ── End boot-time warmup
     const botDeps = {
         bot,
         finale,
