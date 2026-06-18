@@ -7,10 +7,14 @@
  *          Does NOT attempt to impersonate Bill or chat. Just data:
  *            EM5L106 → PO-12345, ETA 6/10
  *
- *          When nothing is on order: silent — 👀 + record only.
+ *          Emoji protocol: 👀 (seen) → reply as Bill → ✅ (done) / 💚 (action taken).
+ *          Bucket 2: non-SKU requests → natural clarification reply.
  *
  * @author  Hermia
  * @created 2026-06-04
+ * @updated 2026-06-16 — Bucket 1 auto-post (SKU+PO → reply as Bill),
+ *          emoji protocol (👀→✅/💚), tracking link embedding,
+ *          Bucket 2 clarification for non-SKU addressed messages.
  * @deps    @slack/web-api, @/lib/finale/client, @/lib/supabase
  * @env     SLACK_BOT_TOKEN, SLACK_ACCESS_TOKEN, SLACK_OWNER_USER_ID,
  *          FINALE_BASE_URL, FINALE_ACCOUNT_PATH
@@ -605,7 +609,7 @@ export class SlackRequestDetector {
                         if (po && po.orderId) {
                             await this.addEyesReaction(channelId, ts).catch(() => {});
                             await this.postSinglePOInfo(channelId, channelName, ts, po);
-                            await this.replaceWithAck(channelId, ts).catch(() => {});
+                            await this.setAckEmoji(channelId, ts, "post").catch(() => {});
                         }
                     } catch {
                         // PO not found or getOrderDetails unavailable — silent
@@ -620,7 +624,35 @@ export class SlackRequestDetector {
 
             // Extract SKUs
         const rawTokens = extractSKUs(text);
-        if (rawTokens.length === 0) return;
+        if (rawTokens.length === 0) {
+            // Bucket 2: Non-SKU request addressed to Bill.
+            // Instead of complete silence, post a natural clarification
+            // when the message is a DM or @mention.
+            if (addressedToBill && text.trim().length > 10) {
+                // 👀 — signal we saw it
+                await this.addEyesReaction(channelId, ts).catch(() => {});
+
+                // Rotate through natural phrasings so it doesn't sound automated
+                const clarifications = [
+                    `Which SKU is that?`,
+                    `Which product SKUs are those?`,
+                    `Can you send the SKU numbers?`,
+                    `Got it — which SKU(s)?`,
+                ];
+                const pick = clarifications[Math.floor(Math.random() * clarifications.length)];
+                console.log(
+                    `[slack-detector] #: Non-SKU request, posting clarification: ""`,
+                );
+                await this.recordRequest(
+                    channelName, channelId, ts, userId, text, [],
+                    true, // addressedToBill — yes, even though we couldn't resolve
+                ).catch(() => {});
+                // ✅ — acknowledged, but needs Bill's follow-up
+                await this.setAckEmoji(channelId, ts, "post").catch(() => {});
+                return;
+            }
+            return;
+        }
 
         // Resolve aliases — "0811 BAGS" → SBD21410811, "BAV5LBBAG" → same, etc.
         // Falls back to the raw token when no alias match (Finale will attempt lookup).
@@ -668,7 +700,7 @@ export class SlackRequestDetector {
                     );
 
                     // Replace 👀 with random ack emoji
-                    await this.replaceWithAck(channelId, ts).catch(() => {});
+                    await this.setAckEmoji(channelId, ts, "post").catch(() => {});
                 }
             } catch {
                 // SKU not found in Finale — complete silence
@@ -841,10 +873,157 @@ export class SlackRequestDetector {
         // If !foundInFinale: complete silence, no trace in Slack
     }
 
+
+    private async postOrderInfo(
+        channelId: string,
+        channelName: string,
+        threadTs: string,
+        sku: string,
+        pos: any[],
+        productName?: string,
+    ): Promise<void> {
+        const maxPOs = Math.min(pos.length, 3);
+        const lines: string[] = [];
+
+        for (let i = 0; i < maxPOs; i++) {
+            const po = pos[i];
+            const eta = po.expectedDelivery
+                ? new Date(po.expectedDelivery).toLocaleDateString("en-US", {
+                      month: "numeric",
+                      day: "numeric",
+                      timeZone: "UTC",
+                  })
+                : "TBD";
+            const url = buildFinalePOUrl(po.orderId);
+            const stateLabel = formatPOStateLabel(po.status);
+            const line = `*${sku} - <${url}|${po.orderId}> - ETA (${eta})${stateLabel}*`;
+            lines.push(line);
+        }
+
+        const text = lines.join("\n");
+
+        // Auto-post as Bill: SKU + open PO is high confidence.
+        const posted = await this.postAsBill(channelId, threadTs, text);
+
+        if (posted) {
+            // Check for tracking info and add as follow-up
+            const firstPo = pos[0];
+            if (firstPo && firstPo.orderId) {
+                const tracking = await this.getTrackingInfo(firstPo.orderId);
+                if (tracking) {
+                    await this.postAsBill(channelId, threadTs, `Tracking: ${tracking}`);
+                }
+            }
+            // ✅ — reply posted, addressed
+            await this.setAckEmoji(channelId, threadTs, "post").catch(() => {});
+        } else {
+            // Auto-post failed — fall back to TG draft
+            const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
+            await sendTelegramNotify(
+                `[Slack Draft — auto-post FAILED]\n` +
+                `#${channelName} — reply to ${sku} request\n` +
+                `Draft:\n${text}\n` +
+                `→ ${slackLink}\n` +
+                `Say "post it" to approve or post manually.`
+            ).catch(() => {});
+        }
+
+        console.log(
+            `[slack-detector] Post ${posted ? "auto-posted" : "draft sent to TG"}: ${sku} → ${pos.length} PO(s)`,
+        );
+    }
+
+    /**
+     * Post a threaded reply when a PO NUMBER (not SKU) is referenced.
+     * Invoice-aware: checks if an invoice exists (vendor invoiced = goods shipped).
+     */
+    private async postSinglePOInfo(
+        channelId: string,
+        channelName: string,
+        threadTs: string,
+        po: any,
+    ): Promise<void> {
+        const items = po.orderItemList || [];
+        const itemNames = items.map((l: any) => l.productId || "?").join(", ");
+        const url = buildFinalePOUrl(po.orderId);
+
+        // Check invoices table for ship date
+        let shippedLine: string | null = null;
+        try {
+            const db = createClient();
+            if (db) {
+                const { data } = await db
+                    .from("invoices")
+                    .select("invoice_date, vendor_name, freight, tracking_notes")
+                    .eq("po_number", po.orderId)
+                    .limit(1);
+                if (data && data.length > 0) {
+                    const inv = data[0];
+                    const shipDate = inv.invoice_date;
+                    const vendor = inv.vendor_name || po.vendor || "";
+                    const ms = shipDate ? new Date(shipDate).getTime() : 0;
+                    const daysSince = ms ? Math.floor((Date.now() - ms) / 86_400_000) : -1;
+                    const shipLabel = daysSince === 0 ? "today" :
+                                      daysSince === 1 ? "yesterday" :
+                                      daysSince > 1 ? `${daysSince}d ago (${new Date(ms).toLocaleDateString("en-US", { month: "numeric", day: "numeric" })})` :
+                                      "";
+                    const track = inv.tracking_notes || "";
+                    shippedLine = `*${po.orderId} shipped ${shipLabel}: ${vendor} — ${items.length} items: ${itemNames}*` +
+                        (track ? `\nTracking: ${track}` : `\nNo tracking yet`);
+                }
+            }
+        } catch { /* silent */ }
+
+        const text = shippedLine || (() => {
+            const totalOrdered = items.reduce((s: number, l: any) => s + (l.quantityOrdered || 0), 0);
+            const totalReceived = items.reduce((s: number, l: any) => s + (l.quantityReceived || 0), 0);
+            const expected = po.receiveDate
+                ? new Date(po.receiveDate).toLocaleDateString("en-US", {
+                      month: "numeric", day: "numeric", timeZone: "UTC",
+                  })
+                : "TBD";
+            const stateLabel = formatPOStateLabel(po.statusId);
+            return `*${po.orderId}${stateLabel} — expected ${expected}, ${totalReceived}/${totalOrdered} received (${items.length} items: ${itemNames})*\n<${url}|Finale>`;
+        })();
+
+        // Auto-post as Bill: PO number reference is high confidence.
+        const posted = await this.postAsBill(channelId, threadTs, text);
+
+        if (posted) {
+            if (po && po.orderId) {
+                const tracking = await this.getTrackingInfo(po.orderId);
+                if (tracking) {
+                    await this.postAsBill(channelId, threadTs, `Tracking: ${tracking}`);
+                }
+            }
+            await this.setAckEmoji(channelId, threadTs, "post").catch(() => {});
+        } else {
+            const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
+            await sendTelegramNotify(
+                `[Slack Draft — auto-post FAILED]\n` +
+                `#${channelName} — PO# ${po.orderId} lookup reply\n` +
+                `Draft:\n${text}\n` +
+                `→ ${slackLink}\n` +
+                `Say "post it" to approve or edit first.`
+            ).catch(() => {});
+
+            console.log(
+                `[slack-detector] Draft sent to TG: PO# ${po.orderId} (auto-post FAILED)`,
+            );
+        }
+    }
+
     // ── Actions ───────────────────────────────────────────────────────────
 
-    /** Three ack emojis picked from randomly to vary the response */
-    private readonly ACK_EMOJIS = ["+1", "white_check_mark", "ok_hand"];
+    /** Resolution levels for ack emoji selection */
+    private readonly ACK_EMOJIS = {
+        /** ✅ — reply posted in thread, item is addressed */
+        post: "white_check_mark",
+        /** 💚 — resolution action taken (draft PO created, tracking found) */
+        action: "green_heart",
+        /** 👍 — simple thank-you or informational fulfilled */
+        info: "+1",
+    } as const;
 
     private async addEyesReaction(
         channelId: string,
@@ -867,12 +1046,17 @@ export class SlackRequestDetector {
     }
 
     /**
-     * Remove 👀 and add a random ack emoji from the set.
-     * Varies the response so it doesn't look automated.
+     * Remove 👀 and add the appropriate ack emoji based on resolution level.
+     *
+     * Levels:
+     *   "post"   → ✅ — reply posted in thread, item is addressed
+     *   "action" → 💚 — resolution action taken (draft PO, tracking found)
+     *   "info"   → 👍 — simple thank-you or informational fulfilled
      */
-    private async replaceWithAck(
+    private async setAckEmoji(
         channelId: string,
         ts: string,
+        level: keyof typeof this.ACK_EMOJIS = "post",
     ): Promise<void> {
         // Remove 👀 (best-effort)
         try {
@@ -885,13 +1069,12 @@ export class SlackRequestDetector {
             // not always possible to remove — move on
         }
 
-        // Add a random ack emoji
-        const pick = this.ACK_EMOJIS[Math.floor(Math.random() * this.ACK_EMOJIS.length)];
+        const emoji = this.ACK_EMOJIS[level];
         try {
             await this.writer.reactions.add({
                 channel: channelId,
                 timestamp: ts,
-                name: pick,
+                name: emoji,
             });
         } catch {
             // reaction may already exist — fine
@@ -899,143 +1082,79 @@ export class SlackRequestDetector {
     }
 
     /**
-     * Post a threaded reply with PO info.
-     *
-     * Bill's voice — short, direct, no fluff:
-     *   EM108 → PO-124849, ETA TBD
-     *   EM108 → PO-124849 (ETA 6/10) + PO-124850 (ETA 6/15)
+     * Post a threaded reply AS BILL SELEE using the user (xoxp) token.
+     * The reader client is Bill's personal token — posts as @Bill Selee.
+     * Returns true if the post succeeded.
      */
-    private async postOrderInfo(
+    private async postAsBill(
         channelId: string,
-        channelName: string,
         threadTs: string,
-        sku: string,
-        pos: any[],
-        productName?: string,
-    ): Promise<void> {
-        // 2026-06-09: Reformatted per Bill's spec — "sounds like purchase
-        // sensei bill, not Ai generated". One line per PO. BOLD via Slack
-        // mrkdwn (`*text*`). Format: `*SKU - <url|PO#XXXXXX> - ETA (date)*`.
-        // Cap at 3 POs to keep the thread tight; if more, the first 3 are
-        // enough to confirm "we have orders" — a separate escalation can
-        // handle the rare multi-PO SKU.
-        //
-        // 2026-06-09 (cont.): state labels — DRAFT and COMMITTED get
-        // explicit `(STATE)` markers so Bill can tell at a glance which
-        // POs are still being assembled vs already sent. SENT / OPEN /
-        // PARTIAL are normal states and get no label.
-        const maxPOs = Math.min(pos.length, 3);
-        const lines: string[] = [];
-
-        for (let i = 0; i < maxPOs; i++) {
-            const po = pos[i];
-            const eta = po.expectedDelivery
-                ? new Date(po.expectedDelivery).toLocaleDateString("en-US", {
-                      month: "numeric",
-                      day: "numeric",
-                      timeZone: "UTC",
-                  })
-                : "TBD";
-            const url = buildFinalePOUrl(po.orderId);
-            const stateLabel = formatPOStateLabel(po.status);
-            const line = `*${sku} - <${url}|${po.orderId}> - ETA (${eta})${stateLabel}*`;
-            lines.push(line);
+        text: string,
+    ): Promise<boolean> {
+        try {
+            const result = await this.reader.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text,
+                mrkdwn: true,
+                unfurl_links: true,
+                unfurl_media: true,
+            });
+            if (result.ok) {
+                console.log(`[slack-detector] Posted as Bill in thread: "${text.slice(0, 80)}"`);
+                return true;
+            }
+            console.warn(`[slack-detector] chat.postMessage not ok: ${JSON.stringify(result)}`);
+            return false;
+        } catch (err: any) {
+            console.warn(`[slack-detector] postAsBill failed: ${err.message}`);
+            return false;
         }
-
-        const text = lines.join("\n");
-
-        // HERMIA(2026-06-11): DISABLED auto-post as Bill. Now sends draft
-        // to Bill via TG for review/approval before posting. Bot still reacts
-        // with 👀 (via addEyesReaction) so the requester knows we saw it.
-        // Bill reviews the draft and tells Hermia to post, or posts himself.
-        const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
-        await sendTelegramNotify(
-            `[Slack Draft]\n` +
-            `#${channelName} — reply to ${sku} request\n` +
-            `Draft:\n${text}\n` +
-            `→ ${slackLink}\n` +
-            `Say "post it" to approve or edit first.`
-        ).catch(() => {});
-
-        console.log(
-            `[slack-detector] Draft sent to TG: ${sku} → ${pos.length} PO(s) (NOT auto-posted)`,
-        );
     }
 
-                /**
-                * Post a threaded reply when a PO NUMBER (not SKU) is referenced.
-                * Invoice-aware: checks if an invoice exists (vendor invoiced = goods shipped).
-                * If shipped: "PO 124833 shipped today — Grassroots Fabric Pots, 4 items"
-                * If not: "PO 124833 — expected 5/29, 0/4 received, 4 items: GLP114, …"
-                *
-                * HERMIA(2026-06-09): Branson asked about PO 124833 which had already
-                * been invoiced (ship date today) — the original code said "expected 5/29,
-                * 0 received" which is wrong. Invoice ship date = truth.
-                */
-                private async postSinglePOInfo(
-                channelId: string,
-                channelName: string,
-                threadTs: string,
-                po: any,
-                ): Promise<void> {
-                const items = po.orderItemList || [];
-                const itemNames = items.map((l: any) => l.productId || "?").join(", ");
-                const url = buildFinalePOUrl(po.orderId);
-
-                // Check invoices table — if an invoice exists with a ship date,
-                // the vendor has shipped regardless of what Finale PO status says.
-                let shippedLine: string | null = null;
-                try {
-                const db = createClient();
-                if (db) {
-                    const { data } = await db
-                        .from("invoices")
-                        .select("invoice_date, vendor_name, freight, tracking_notes")
-                        .eq("po_number", po.orderId)
-                        .limit(1);
-                    if (data && data.length > 0) {
-                        const inv = data[0];
-                        const shipDate = inv.invoice_date;
-                        const vendor = inv.vendor_name || po.vendor || "";
-                        const ms = shipDate ? new Date(shipDate).getTime() : 0;
-                        const daysSince = ms ? Math.floor((Date.now() - ms) / 86_400_000) : -1;
-                        const shipLabel = daysSince === 0 ? "today" :
-                                          daysSince === 1 ? "yesterday" :
-                                          daysSince > 1 ? `${daysSince}d ago (${new Date(ms).toLocaleDateString("en-US", { month: "numeric", day: "numeric" })})` :
-                                          "";
-                        const track = inv.tracking_notes || "";
-                        shippedLine = `*${po.orderId} shipped ${shipLabel}: ${vendor} — ${items.length} items: ${itemNames}*` +
-                            (track ? `\nTracking: ${track}` : `\nNo tracking yet`);
-                    }
+    /**
+     * Look up tracking info for a PO from the invoices table.
+     * Returns a formatted tracking snippet or null.
+     */
+    private async getTrackingInfo(orderId: string): Promise<string | null> {
+        try {
+            const { createClient } = await import("../supabase");
+            const db = createClient();
+            if (!db) return null;
+            const { data } = await db
+                .from("invoices")
+                .select("tracking_notes, vendor_name, carrier")
+                .eq("po_number", orderId)
+                .limit(1);
+            if (data && data.length > 0) {
+                const inv = data[0];
+                const tracking = (inv.tracking_notes || "").trim();
+                if (tracking) {
+                    const carrier = (inv.carrier || "").trim();
+                    const link = this.buildTrackingUrl(carrier, tracking);
+                    if (link) return `<${link}|${carrier} ${tracking}>`;
+                    return `(tracking: ${tracking})`;
                 }
-                } catch { /* silent — fall through to expected-date reply */ }
+            }
+            return null;
+        } catch {
+            return null;
+        }
+    }
 
-                const text = shippedLine || (() => {
-                const totalOrdered = items.reduce((s: number, l: any) => s + (l.quantityOrdered || 0), 0);
-                const totalReceived = items.reduce((s: number, l: any) => s + (l.quantityReceived || 0), 0);
-                const expected = po.receiveDate
-                    ? new Date(po.receiveDate).toLocaleDateString("en-US", {
-                          month: "numeric", day: "numeric", timeZone: "UTC",
-                      })
-                    : "TBD";
-                const stateLabel = formatPOStateLabel(po.statusId);
-                return `*${po.orderId}${stateLabel} — expected ${expected}, ${totalReceived}/${totalOrdered} received (${items.length} items: ${itemNames})*\n<${url}|Finale>`;
-                })();
-
-                // HERMIA(2026-06-11): DISABLED auto-post as Bill. Send draft to TG for approval.
-                const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
-                await sendTelegramNotify(
-                    `[Slack Draft]\n` +
-                    `#${channelName} — PO# ${po.orderId} lookup reply\n` +
-                    `Draft:\n${text}\n` +
-                    `→ ${slackLink}\n` +
-                    `Say "post it" to approve or edit first.`
-                ).catch(() => {});
-
-                console.log(
-                    `[slack-detector] Draft sent to TG: PO# ${po.orderId} (NOT auto-posted)`,
-                );
-                }
+    /**
+     * Build a tracking URL from carrier name and tracking number.
+     * Supports carriers commonly used by BuildASoil vendors.
+     */
+    private buildTrackingUrl(carrier: string, tracking: string): string | null {
+        const c = carrier.toLowerCase();
+        const t = encodeURIComponent(tracking.trim());
+        if (c.includes("fedex")) return `https://www.fedex.com/fedextrack/?trknbr=${t}`;
+        if (c.includes("ups")) return `https://www.ups.com/track?tracknum=${t}`;
+        if (c.includes("usps")) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${t}`;
+        // LTL / freight / AAA Cooper — no standard public URL
+        return null;
+    }
 
     // ── Persistence ──────────────────────────────────────────────────────
 

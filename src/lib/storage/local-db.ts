@@ -99,6 +99,38 @@ export function getLocalDb() {
         -- KAIZEN(2026-06-01): Crash-safe PO lifecycle cache (write-ahead log)
         -- Written FIRST in transitionLifecycleState before Supabase. Survives
         -- process crashes. Boot-hydrated on restart to catch missed transitions.
+        -- KAIZEN(2026-06-18): Local-first AP invoice forwarding queue.
+        -- Replaces Supabase ap_inbox_queue as the PRIMARY store for the critical
+        -- path (Gmail -> Bill.com). Supabase is optional sync, not a dependency.
+        -- Dedup is enforced by UNIQUE(gmail_message_id, pdf_filename).
+        --
+        -- LIFECYCLE: FORWARDED -> RECONCILED -> COMPLETE
+        --   FORWARDED:  PDF sent to Bill.com via Gmail (critical path done)
+        --   RECONCILED: Invoice matched to a Finale PO, pricing/shipping verified
+        --   COMPLETE:   Invoice fully processed, archived, no further action needed
+        --   ERROR:      Forward or processing failed (check error_message)
+        CREATE TABLE IF NOT EXISTS ap_local_forwards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gmail_message_id TEXT NOT NULL,
+            email_from TEXT,
+            email_subject TEXT,
+            pdf_filename TEXT NOT NULL,
+            pdf_content_hash TEXT NOT NULL,
+            billcom_sent_message_id TEXT,
+            status TEXT NOT NULL DEFAULT 'FORWARDED',
+            reconciliation_status TEXT DEFAULT NULL,
+            matched_po_number TEXT,
+            reconciliation_notes TEXT,
+            error_message TEXT,
+            forwarded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reconciled_at DATETIME,
+            completed_at DATETIME,
+            UNIQUE(gmail_message_id, pdf_filename)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ap_fwd_status ON ap_local_forwards(status);
+        CREATE INDEX IF NOT EXISTS idx_ap_fwd_hash ON ap_local_forwards(pdf_content_hash);
+        CREATE INDEX IF NOT EXISTS idx_ap_fwd_recon ON ap_local_forwards(reconciliation_status);
+
         CREATE TABLE IF NOT EXISTS po_lifecycle_cache (
             po_number TEXT PRIMARY KEY,
             lifecycle_state TEXT NOT NULL DEFAULT 'ORDERED',
@@ -107,6 +139,25 @@ export function getLocalDb() {
             synced_to_supabase INTEGER DEFAULT 0
         );
     `);
+
+    // ── Lightweight migrations (ALTER TABLE for columns added after initial creation) ──
+    // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we check pragma.
+    const apCols = dbInstance.pragma("table_info(ap_local_forwards)") as Array<{ name: string }>;
+    const apColNames = new Set(apCols.map(c => c.name));
+    const apMigrations: Array<[string, string]> = [
+        ["reconciliation_status", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_status TEXT DEFAULT NULL"],
+        ["matched_po_number", "ALTER TABLE ap_local_forwards ADD COLUMN matched_po_number TEXT"],
+        ["reconciliation_notes", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_notes TEXT"],
+        ["reconciled_at", "ALTER TABLE ap_local_forwards ADD COLUMN reconciled_at DATETIME"],
+        ["completed_at", "ALTER TABLE ap_local_forwards ADD COLUMN completed_at DATETIME"],
+        ["vendor_routing_action", "ALTER TABLE ap_local_forwards ADD COLUMN vendor_routing_action TEXT"],
+        ["verified", "ALTER TABLE ap_local_forwards ADD COLUMN verified INTEGER DEFAULT 0"],
+    ];
+    for (const [col, sql] of apMigrations) {
+        if (!apColNames.has(col)) {
+            try { dbInstance.exec(sql); } catch { /* already exists */ }
+        }
+    }
 
     return dbInstance;
 }

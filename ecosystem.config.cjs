@@ -72,8 +72,9 @@ module.exports = {
             // Prevents the 256MB error log problem from free-tier rate limit spam.
             max_size: "10M",
             retain: 5,
-            // Graceful shutdown: give the bot 5s to clean up Telegram polling
-            kill_timeout: 5000,
+            // Graceful shutdown: give the bot 15s to persist chat history
+            // and clean up browser sessions before SIGKILL
+            kill_timeout: 15000,
         },
         {
             // ─── Aria Dashboard (Next.js production mode) ───

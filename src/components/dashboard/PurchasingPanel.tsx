@@ -708,80 +708,70 @@ export default function PurchasingPanel() {
     async function handleCreateOne(group: PurchasingGroup, ignoreCommitGuards?: boolean) {
         const pid = group.vendorPartyId;
 
-        // Strict Guard: check for 30-day supply minimum and exact case multiple snaps
-        if (!ignoreCommitGuards) {
-            const violations: Array<{
-                productId: string;
-                productName: string;
-                currentQty: number;
-                min30dQty: number;
-                increment: number | null;
-                lastPurchaseQty: number | null;
-            }> = [];
+        // ── Gather all warnings (informational, not blocking) ────────────
+        // Collect concerns about this order: 30-day coverage gaps, case
+        // multiple mismatches, open PO overlaps, and vendor cycle info.
+        // Show them in ONE dialog — user decides, not the guardrails.
+        const warnings: string[] = [];
+        const selectedItems = group.items.filter(
+            i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod)
+        );
 
-            group.items
-                .filter(i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod))
-                .forEach(i => {
-                    const currentQty = qtys[pid]?.[i.productId] ?? i.suggestedQty;
-                    const dailyRate = i.dailyRate ?? 0;
-                    const min30dQty = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
-                    const increment = i.orderIncrementQty ?? null;
+        // 30-day supply + case multiple warnings
+        const coverageGaps: string[] = [];
+        for (const i of selectedItems) {
+            const currentQty = qtys[pid]?.[i.productId] ?? i.suggestedQty;
+            const dailyRate = i.dailyRate ?? 0;
+            const min30d = dailyRate > 0 ? Math.ceil(dailyRate * 30) : 0;
+            const increment = i.orderIncrementQty ?? null;
 
-                    const under30d = currentQty < min30dQty;
-                    const notCaseMultiple = increment && increment > 1 && (currentQty % increment !== 0);
-
-                    if (under30d || notCaseMultiple) {
-                        violations.push({
-                            productId: i.productId,
-                            productName: i.productName,
-                            currentQty,
-                            min30dQty,
-                            increment,
-                            lastPurchaseQty: i.lastPurchaseQty ?? null,
-                        });
-                    }
-                });
-
-            if (violations.length > 0) {
-                setValidationModal({ group, violations });
-                return;
+            if (currentQty < min30d && min30d > 0) {
+                coverageGaps.push(`${i.productId}: ${currentQty} ordered, ${min30d} needed for 30d coverage`);
+            } else if (increment && increment > 1 && (currentQty % increment !== 0)) {
+                coverageGaps.push(`${i.productId}: ${currentQty} not a multiple of case size ${increment}`);
             }
         }
+        if (coverageGaps.length > 0) {
+            warnings.push(`${coverageGaps.length} SKU(s) may need more coverage:\n${coverageGaps.join('\n')}`);
+        }
 
-        // Soft guard: warn if any selected SKU already has open POs covering it.
-        // Catches the muscle-memory double-order on rows where Aria is suggesting
-        // a top-up rather than a fresh order.
-        const selectedItemsWithOpenPOs = group.items.filter(item =>
-            !isSnoozed(item.productId)
-            && checked[pid]?.[item.productId]
-            && item.openPOs
-            && item.openPOs.length > 0
-        );
-        if (selectedItemsWithOpenPOs.length > 0) {
-            const lines = selectedItemsWithOpenPOs.map(item => {
-                const pos = item.openPOs.map(p => {
+        // Open PO overlaps
+        const itemsWithPOs = selectedItems.filter(i => i.openPOs && i.openPOs.length > 0);
+        if (itemsWithPOs.length > 0) {
+            const lines = itemsWithPOs.map(i => {
+                const poList = i.openPOs.map(p => {
                     const d = openPosDetail.get(p.orderId);
-                    const eta = d?.expectedDate ? ` · ETA ${new Date(d.expectedDate).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}` : '';
-                    return `PO ${p.orderId} (qty ${p.quantity}${eta})`;
+                    const daysAgo = p.orderDate ? Math.round((Date.now() - new Date(p.orderDate).getTime()) / 86400000) : null;
+                    const ago = daysAgo != null ? ` (${daysAgo}d ago)` : '';
+                    return `PO ${p.orderId}${ago} qty ${p.quantity}`;
                 }).join(', ');
-                return `  • ${item.productId}: ${pos}`;
+                return `  ${i.productId}: ${poList}`;
             }).join('\n');
+            warnings.push(`Already has open POs:\n${lines}`);
+        }
+
+        // Vendor cycle info
+        if (group.vendorCycle?.blockingPO) {
+            const bp = group.vendorCycle.blockingPO;
+            const daysAgo = bp.orderDate ? Math.round((Date.now() - new Date(bp.orderDate).getTime()) / 86400000) : null;
+            warnings.push(`PO #${bp.orderId} ordered ${daysAgo != null ? daysAgo + 'd ago' : 'recently'}`);
+        }
+
+        // ── Show one warning dialog, then create ─────────────────────────
+        if (warnings.length > 0 && !ignoreCommitGuards) {
             const proceed = window.confirm(
-                `${selectedItemsWithOpenPOs.length} SKU(s) already have open POs in flight:\n\n${lines}\n\n` +
-                `Aria still recommends ordering more (incremental need beyond what's coming).\n\n` +
-                `Create a new draft PO anyway?`
+                `Order for ${group.vendorName}:\n\n${warnings.join('\n\n')}\n\nCreate draft PO anyway?`
             );
             if (!proceed) return;
         }
 
         setCreatingPO(p => new Set(p).add(pid));
         try {
-            const result = await createVendorPO(group, ignoreCommitGuards);
+            const result = await createVendorPO(group, true); // always bypass server guards after user confirms
             if (result) {
                 setCreatedPOs(p => ({ ...p, [pid]: result }));
                 setCreatedPODetails(p => ({ ...p, [pid]: result }));
-                // Bridge: notify Purchases pane that a new draft PO was created
-                const selItems = group.items.filter(i => checked[pid]?.[i.productId]);
+                const selItems = selectedItems;
                 const totalUnits = selItems.reduce((s, i) => s + (qtys[pid]?.[i.productId] ?? i.assessment?.recommendedQty ?? i.suggestedQty), 0);
                 lifecycle.notifyDraft({
                     vendorName: group.vendorName,
@@ -789,9 +779,6 @@ export default function PurchasingPanel() {
                     itemCount: selItems.length || group.items.length,
                     totalUnits,
                 });
-                // HERMIA(2026-05-28): Auto-advance to Review & Send modal.
-                // Bill never needs to leave the dashboard or open Finale.
-                // Draft created → review opens immediately → one click to commit.
                 if (result.orderId) {
                     await load(true);
                     await handleReviewAndSend(result.orderId);
@@ -800,25 +787,6 @@ export default function PurchasingPanel() {
             }
             await load(true);
         } catch (e: any) {
-            // HERMIA(2026-05-28): When server-side commit guard blocks the draft,
-            // surface a confirmation dialog to force past the guard instead of
-            // just showing a red error banner. The client-side check (30d simple)
-            // can pass while the server's full check (lead_time + 30d coverage)
-            // still rejects — in that case, user should be able to force-through.
-            const isDraftBlocked = /Draft blocked/i.test(e.message || "");
-            const isRoutineLocked = /routine|active PO/i.test(e.message || "");
-            if ((isDraftBlocked || isRoutineLocked) && !ignoreCommitGuards) {
-                const proceed = window.confirm(
-                    `PO guard for ${group.vendorName}:\n\n${e.message}\n\n` +
-                    `Aria's safety check recommends a larger quantity or more items.\n` +
-                    `Force create a draft PO with your selected quantities?\n\n` +
-                    `(OK = force create · Cancel = abort)`
-                );
-                if (proceed) {
-                    handleCreateOne(group, true);
-                    return;
-                }
-            }
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
             setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
@@ -1121,6 +1089,39 @@ export default function PurchasingPanel() {
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g));
     const displayGroups = showSnoozed ? sortedGroups : activeGroups;
 
+    // ── Helpers ──────────────────────────────────────────────────────────
+    /** Map Finale PO status to a human-readable label */
+    function poStatusLabel(status: string): string {
+        const s = status.toLowerCase();
+        if (s.includes('draft') || s.includes('created')) return 'Draft';
+        if (s.includes('sent')) return 'Sent';
+        if (s.includes('committed') || s.includes('locked')) return 'Committed';
+        if (s.includes('received') || s.includes('partial')) return 'Received';
+        return status;
+    }
+
+    /** Build a clear badge label from vendor cycle info */
+    function cycleBadgeText(vc: VendorCycle): string {
+        const po = vc.blockingPO?.orderId ? `#${vc.blockingPO.orderId}` : '';
+        const st = vc.blockingPO?.status ? poStatusLabel(vc.blockingPO.status) : '';
+        if (po && st) return `${st} PO ${po}`;
+        if (po) return `PO ${po}`;
+        if (vc.decision === 'routine_locked') return 'Active PO';
+        if (vc.decision === 'reuse_draft') return 'Reuse Draft';
+        return '';
+    }
+
+    /** An item is covered if existing PO incoming + stock ≥ lead_time + 30d demand */
+    function itemIsCovered(item: PurchasingItem): boolean {
+        if (!item.openPOs || item.openPOs.length === 0) return false;
+        const incoming = item.stockOnOrder ?? 0;
+        const onHand = item.stockOnHand ?? 0;
+        const daily = item.dailyRate ?? 0;
+        const lead = item.leadTimeDays ?? 14;
+        const needed = daily * (lead + 30);
+        return (onHand + incoming) >= needed && needed > 0;
+    }
+
     // Phase 2: Decision Dossier flyout payload — snapshot group + derived props
     // (placed after displayGroups so useMemo factory sees initialized const)
     const flyoutPayload = React.useMemo(() => {
@@ -1139,11 +1140,7 @@ export default function PurchasingPanel() {
             hasDraftPO: !!createdPOs[pid],
             vendorCycleBadge: group.vendorCycle && group.vendorCycle.decision !== "clear"
                 ? {
-                    text: group.vendorCycle.decision === "routine_locked"
-                        ? `cycle locked${group.vendorCycle.blockingPO?.orderId ? ` - PO ${group.vendorCycle.blockingPO.orderId}` : ""}`
-                        : group.vendorCycle.decision === "exception_allowed"
-                        ? `exception allowed${group.vendorCycle.exceptionEvidence?.[0]?.reason ? ` - ${group.vendorCycle.exceptionEvidence[0].reason.replace(/_/g, " ")}` : ""}`
-                        : `reuse draft${group.vendorCycle.blockingPO?.orderId ? ` - PO ${group.vendorCycle.blockingPO.orderId}` : ""}`,
+                    text: cycleBadgeText(group.vendorCycle),
                     className: group.vendorCycle.decision === "routine_locked"
                         ? "text-amber-200 border-amber-500/40 bg-amber-500/10"
                         : group.vendorCycle.decision === "exception_allowed"
@@ -1161,7 +1158,9 @@ export default function PurchasingPanel() {
                 ...group,
                 items: hasDraftPO
                     ? []
-                    : sortItemsByNeed(group.items.filter(item => itemMatchesFocus(item) && itemMatchesLifecycle(item))),
+                    : sortItemsByNeed(group.items.filter(item =>
+                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item)
+                    )),
             };
         })
         .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
@@ -1983,11 +1982,7 @@ export default function PurchasingPanel() {
                                     const vendorCycle = group.vendorCycle;
                                     const vendorCycleBadge = vendorCycle && vendorCycle.decision !== "clear"
                                         ? {
-                                            text: vendorCycle.decision === "routine_locked"
-                                                ? `cycle locked${vendorCycle.blockingPO?.orderId ? ` - PO ${vendorCycle.blockingPO.orderId}` : ""}`
-                                                : vendorCycle.decision === "exception_allowed"
-                                                ? `exception allowed${vendorCycle.exceptionEvidence?.[0]?.reason ? ` - ${vendorCycle.exceptionEvidence[0].reason.replace(/_/g, " ")}` : ""}`
-                                                : `reuse draft${vendorCycle.blockingPO?.orderId ? ` - PO ${vendorCycle.blockingPO.orderId}` : ""}`,
+                                            text: cycleBadgeText(vendorCycle),
                                             className: vendorCycle.decision === "routine_locked"
                                                 ? "text-amber-200 border-amber-500/40 bg-amber-500/10"
                                                 : vendorCycle.decision === "exception_allowed"

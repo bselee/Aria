@@ -29,7 +29,10 @@ export interface ActivePurchase extends FullPO {
     trackingSource?: string | null;
     typicalTrackingSource?: string | null;
     vendorOrdersEmail?: string | null;
-}
+    invoiceStatus?: string;
+        invoiceId?: string;
+        hasDiscrepancies?: boolean;
+    }
 
 function addDays(dateStr: string, days: number): string {
     const d = new Date(dateStr);
@@ -115,131 +118,161 @@ export async function loadActivePurchases(
         } catch (e: any) {
             console.warn("[purchasing] active purchases tracking fetch failed:", e.message);
         }
-    }
 
-    const completionSignals = await loadPOCompletionSignalIndex(supabase, poNumbers);
-    const activePos: ActivePurchase[] = [];
-
-    for (const po of pos) {
-        if (!po.orderId) continue;
-        if (po.orderId.toLowerCase().includes("dropship")) continue;
-
-        const status = (po.status || "").toLowerCase();
-        if (!["committed", "completed"].includes(status)) continue;
-
-        const shipments = (shipmentMap.get(po.orderId) || []).map((shipment) => {
-            const classification = classifyShipmentEvidence(shipment);
-            return {
-                ...shipment,
-                evidenceLevel: classification.level,
-                evidenceReason: classification.reason,
-            };
-        });
-        const confirmedShipments = shipments.filter((shipment) => shipment.evidenceLevel === "confirmed");
-        const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
-            status: po.status,
-            receiveDate: po.receiveDate,
-            shipments: po.shipments,
-        });
-        const isReceived = hasPurchaseOrderReceipt({
-            status: po.status,
-            receiveDate: po.receiveDate,
-            shipments: po.shipments,
-        });
-        const completionSignal = completionSignals.get(po.orderId);
-        const completionState = derivePOCompletionState({
-            finaleReceived: isReceived,
-            trackingDelivered: confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered"),
-            hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
-            reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
-            freightResolved: completionSignal?.freightResolved || false,
-            unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
-        });
-
-        if (
-            completionState === "complete" &&
-            isReceived &&
-            !shouldKeepReceivedPurchase(resolvedReceiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)
-        ) {
-            continue;
+        // Fetch invoice statuses for all PO numbers
+        const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean }>();
+        if (supabase && poNumbers.length > 0) {
+            try {
+                for (let i = 0; i < poNumbers.length; i += 100) {
+                    const chunk = poNumbers.slice(i, i + 100);
+                    const { data: invData } = await supabase
+                        .from("invoices")
+                        .select("po_number, status, id, discrepancies")
+                        .in("po_number", chunk);
+                    for (const inv of invData || []) {
+                        invoiceMap.set(inv.po_number, {
+                            status: inv.status,
+                            id: inv.id,
+                            hasDiscrepancies: Array.isArray(inv.discrepancies) && inv.discrepancies.length > 0,
+                        });
+                    }
+                }
+            } catch (e: any) {
+                console.warn("[purchasing] invoice fetch failed:", e.message);
+            }
         }
 
-        let expectedDate: string;
-        let leadProvenance: string;
+        const completionSignals = await loadPOCompletionSignalIndex(supabase, poNumbers);
+        const activePos: ActivePurchase[] = [];
 
-        let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
-        if (po.orderDate) {
-            lt = await leadTimeService.getForVendor(po.vendorName);
-            expectedDate = addDays(po.orderDate, lt.days);
-            leadProvenance = lt.label;
-        } else {
-            expectedDate = new Date().toISOString().split("T")[0];
-            leadProvenance = "14d default";
+        for (const po of pos) {
+            if (!po.orderId) continue;
+            if (po.orderId.toLowerCase().includes("dropship")) continue;
+
+            const status = (po.status || "").toLowerCase();
+            if (!["committed", "completed"].includes(status)) continue;
+
+            const shipments = (shipmentMap.get(po.orderId) || []).map((shipment) => {
+                const classification = classifyShipmentEvidence(shipment);
+                return {
+                    ...shipment,
+                    evidenceLevel: classification.level,
+                    evidenceReason: classification.reason,
+                };
+            });
+            const confirmedShipments = shipments.filter((shipment) => shipment.evidenceLevel === "confirmed");
+            const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
+                status: po.status,
+                receiveDate: po.receiveDate,
+                shipments: po.shipments,
+            });
+            const isReceived = hasPurchaseOrderReceipt({
+                status: po.status,
+                receiveDate: po.receiveDate,
+                shipments: po.shipments,
+            });
+            const completionSignal = completionSignals.get(po.orderId);
+            const completionState = derivePOCompletionState({
+                finaleReceived: isReceived,
+                trackingDelivered: confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered"),
+                hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
+                reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
+                freightResolved: completionSignal?.freightResolved || false,
+                unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
+            });
+
+            if (
+                completionState === "complete" &&
+                isReceived
+            ) {
+                // Fully received + reconciled → moved to RCV column. Don't show here.
+                continue;
+            }
+
+            let expectedDate: string;
+            let leadProvenance: string;
+
+            let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
+            if (po.orderDate) {
+                lt = await leadTimeService.getForVendor(po.vendorName);
+                expectedDate = addDays(po.orderDate, lt.days);
+                leadProvenance = lt.label;
+            } else {
+                expectedDate = new Date().toISOString().split("T")[0];
+                leadProvenance = "14d default";
+            }
+
+            const poLifecycle = lifecycleMap.get(po.orderId);
+            const vendorPromisedEta =
+                // LLM-extracted vendor-stated ETA wins when present (high or medium confidence).
+                (poLifecycle?.vendor_stated_eta &&
+                    (poLifecycle?.vendor_stated_eta_confidence === 'high' ||
+                     poLifecycle?.vendor_stated_eta_confidence === 'medium')
+                        ? poLifecycle.vendor_stated_eta
+                        : null) ??
+                poLifecycle?.last_eta_update?.estimated_delivery_at ??
+                poLifecycle?.last_eta_update?.eta ??
+                poLifecycle?.last_eta_update?.date ??
+                null;
+            const etaProfile = deriveVendorEtaProfile({
+                vendorName: po.vendorName,
+                orderDate: po.orderDate || new Date().toISOString().slice(0, 10),
+                fallbackLeadDays: lt?.days ?? 14,
+                fallbackLabel: lt?.label ?? "14d default",
+                fallbackSource: lt?.provenance ?? "default",
+                vendorPromisedEta,
+                shipments: confirmedShipments.map((shipment) => ({
+                    estimated_delivery_at: shipment.estimated_delivery_at,
+                    delivered_at: shipment.delivered_at,
+                    created_at: shipment.created_at,
+                })),
+            });
+            const sentVerification = derivePOSentVerification({
+                poNumber: po.orderId,
+                purchaseOrder: poLifecycle,
+                sendRows: poSendMap.get(po.orderId) || [],
+                hasTracking: (trackingMap.get(po.orderId)?.length || 0) > 0 || shipments.length > 0,
+            });
+
+            const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
+            const invoiceInfo = invoiceMap.get(po.orderId);
+
+            activePos.push({
+                ...po,
+                receiveDate: resolvedReceiveDate,
+                expectedDate: etaProfile.expectedDate || expectedDate,
+                leadProvenance: etaProfile.label || leadProvenance,
+                isReceived,
+                completionState,
+                trackingNumbers: trackingMap.get(po.orderId) || [],
+                shipments,
+                lifecycleStage: poLifecycle?.lifecycle_stage || undefined,
+                lastMovementSummary: poLifecycle?.last_movement_summary || null,
+                trackingUnavailableAt: poLifecycle?.tracking_unavailable_at || null,
+                trackingRequestedAt: poLifecycle?.tracking_requested_at || null,
+                vendorAcknowledgedAt: poLifecycle?.vendor_acknowledged_at || null,
+                humanReplyDetectedAt: poLifecycle?.human_reply_detected_at || null,
+                sentVerification,
+                etaProfile,
+                trackingPaused: poLifecycle?.tracking_paused || false,
+                trackingSource: poLifecycle?.tracking_source || null,
+                typicalTrackingSource: vendorProfile?.typical_tracking_source || null,
+                vendorOrdersEmail: vendorProfile?.orders_email || vendorProfile?.vendor_emails?.[0] || null,
+                invoiceStatus: invoiceInfo?.status || undefined,
+                                invoiceId: invoiceInfo?.id || undefined,
+                                hasDiscrepancies: invoiceInfo?.hasDiscrepancies || false,
+            });
         }
 
-        const poLifecycle = lifecycleMap.get(po.orderId);
-        const vendorPromisedEta =
-            // LLM-extracted vendor-stated ETA wins when present (high or medium confidence).
-            (poLifecycle?.vendor_stated_eta &&
-                (poLifecycle?.vendor_stated_eta_confidence === 'high' ||
-                 poLifecycle?.vendor_stated_eta_confidence === 'medium')
-                    ? poLifecycle.vendor_stated_eta
-                    : null) ??
-            poLifecycle?.last_eta_update?.estimated_delivery_at ??
-            poLifecycle?.last_eta_update?.eta ??
-            poLifecycle?.last_eta_update?.date ??
-            null;
-        const etaProfile = deriveVendorEtaProfile({
-            vendorName: po.vendorName,
-            orderDate: po.orderDate || new Date().toISOString().slice(0, 10),
-            fallbackLeadDays: lt?.days ?? 14,
-            fallbackLabel: lt?.label ?? "14d default",
-            fallbackSource: lt?.provenance ?? "default",
-            vendorPromisedEta,
-            shipments: confirmedShipments.map((shipment) => ({
-                estimated_delivery_at: shipment.estimated_delivery_at,
-                delivered_at: shipment.delivered_at,
-                created_at: shipment.created_at,
-            })),
-        });
-        const sentVerification = derivePOSentVerification({
-            poNumber: po.orderId,
-            purchaseOrder: poLifecycle,
-            sendRows: poSendMap.get(po.orderId) || [],
-            hasTracking: (trackingMap.get(po.orderId)?.length || 0) > 0 || shipments.length > 0,
+        activePos.sort((a, b) => {
+            const da = new Date(a.orderDate || 0).getTime();
+            const db = new Date(b.orderDate || 0).getTime();
+            return db - da;
         });
 
-        const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
-
-        activePos.push({
-            ...po,
-            receiveDate: resolvedReceiveDate,
-            expectedDate: etaProfile.expectedDate || expectedDate,
-            leadProvenance: etaProfile.label || leadProvenance,
-            isReceived,
-            completionState,
-            trackingNumbers: trackingMap.get(po.orderId) || [],
-            shipments,
-            lifecycleStage: poLifecycle?.lifecycle_stage || undefined,
-            lastMovementSummary: poLifecycle?.last_movement_summary || null,
-            trackingUnavailableAt: poLifecycle?.tracking_unavailable_at || null,
-            trackingRequestedAt: poLifecycle?.tracking_requested_at || null,
-            vendorAcknowledgedAt: poLifecycle?.vendor_acknowledged_at || null,
-            humanReplyDetectedAt: poLifecycle?.human_reply_detected_at || null,
-            sentVerification,
-            etaProfile,
-            trackingPaused: poLifecycle?.tracking_paused || false,
-            trackingSource: poLifecycle?.tracking_source || null,
-            typicalTrackingSource: vendorProfile?.typical_tracking_source || null,
-            vendorOrdersEmail: vendorProfile?.orders_email || vendorProfile?.vendor_emails?.[0] || null,
-        });
+        return activePos;
     }
 
-    activePos.sort((a, b) => {
-        const da = new Date(a.orderDate || 0).getTime();
-        const db = new Date(b.orderDate || 0).getTime();
-        return db - da;
-    });
-
-    return activePos;
+    // No supabase — return empty
+    return [];
 }

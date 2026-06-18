@@ -816,6 +816,13 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                             // 2. Forward strictly to buildasoilap@bill.com IMMEDIATELY
                             // This ensures Bill.com gets the invoice perfectly regardless of our PO matching logic
+                            // NOTE: Dedup for the PRODUCTION path lives in ap-identifier.ts (3 layers:
+                            // message_id, cross-inbox, PDF content hash) + ap-forwarder.ts status lock.
+                            // This old path (processInvoiceBuffer) is only reached via /apretry and
+                            // ap-autonomous-poll for some vendors. Sender-based 48h dedup was removed
+                            // 2026-06-18 (Hermia) — it suppressed legitimate same-vendor invoices
+                            // (FedEx, Uline, Ferticell send multiple invoices in 48h) and no-ops when
+                            // Supabase is unavailable (the `if (supabase)` guard skips it entirely).
                             const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, buffer);
                             if (!forwarded) {
                                 // Critical: Bill.com never received the invoice — alert Will immediately (bypasses business-hours gate)

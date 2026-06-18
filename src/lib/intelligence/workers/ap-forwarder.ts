@@ -178,24 +178,51 @@ export class APForwarderAgent {
                     }
 
                     // HERMIA(2026-06-10): Guard against null pdf_filename/pdf_path
-                    // These records were likely created by vendor routing without full PDF
-                    // metadata. Can't forward without a file — mark as error and skip.
-                    if (!item.pdf_filename || !item.pdf_path) {
-                        console.warn(`   ⚠️ Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
-                        await supabase
-                            .from('ap_inbox_queue')
-                            .update({
-                                status: 'ERROR_FORWARDING',
-                                updated_at: new Date().toISOString(),
-                            })
-                            .eq('id', item.id);
-                        // Release the lock back — don't keep retrying forever
-                        await supabase
-                            .from('ap_inbox_queue')
-                            .update({ status: item.status })
-                            .eq('id', item.id);
-                        continue;
-                    }
+                                        // These records were likely created by vendor routing without full PDF
+                                        // metadata. Can't forward without a file — mark as error and skip.
+                                        if (!item.pdf_filename || !item.pdf_path) {
+                                            // HERMIA(2026-06-16): Dropship items from QuickBooks have no PDF to
+                                            // forward — they are payment notifications, not invoices. Mark them
+                                            // as FORWARDED (graceful completion) instead of ERROR_FORWARDING to
+                                            // break the infinite retry loop (forwarder now fetches ERROR_FORWARDING).
+                                            if ((item.extracted_json as any)?.vendor_routing_action === "dropship") {
+                                                console.log(`     🚚 Dropship (no PDF — notification only): ${item.email_subject?.slice(0, 60)}`);
+                                                await supabase
+                                                    .from('ap_inbox_queue')
+                                                    .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
+                                                    .eq('id', item.id);
+                                                await this.logActivity(supabase, item.email_from, item.email_subject, 'DROPSHIP',
+                                                    `Dropship notification (QuickBooks) — no PDF to forward, marked complete`, {
+                                                        vendor_routing_action: "dropship",
+                                                        vendor_name: (item.extracted_json as any)?.vendor_name,
+                                                    });
+                                                await supabase
+                                                    .from('email_inbox_queue')
+                                                    .update({ processed_by_ap: true })
+                                                    .eq('gmail_message_id', sourceMessageId);
+                                                await this.finalizeSourceEmailIfReady(supabase, gmail, {
+                                                    gmailMessageId: sourceMessageId,
+                                                    addLabels: ["Invoice Forward"],
+                                                    expectedForwardCount: (item.extracted_json as any)?.expected_forward_count,
+                                                });
+                                                continue;
+                                            }
+                                            // Non-dropship items without PDF — genuine error, mark for retry
+                                            console.warn(`   ⚠️ Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
+                                            await supabase
+                                                .from('ap_inbox_queue')
+                                                .update({
+                                                    status: 'ERROR_FORWARDING',
+                                                    updated_at: new Date().toISOString(),
+                                                })
+                                                .eq('id', item.id);
+                                            // Release the lock back — don't keep retrying forever
+                                            await supabase
+                                                .from('ap_inbox_queue')
+                                                .update({ status: item.status })
+                                                .eq('id', item.id);
+                                            continue;
+                                        }
 
                     console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from}`);
 

@@ -28,10 +28,24 @@ const ops = () => OpsManager.singleton;
 
 defineJob({
     name: "ap-polling",
-    schedule: "*/15 * * * *",
+    schedule: "0 8,12,17 * * *",
     onFail: "telegram-will",
     description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
     handler: async () => {
+        // HERMIA(2026-06-18): Local-first forwarding — scans Gmail directly, forwards
+        // invoice PDFs to Bill.com, tracks dedup in local SQLite. Zero Supabase
+        // dependency for the critical path. Runs FIRST so invoices always forward
+        // even when Supabase is down (PGRST002 / free-tier exhaustion).
+        try {
+            const { runLocalApForward } = await import("@/lib/intelligence/workers/ap-local-forwarder");
+            await runLocalApForward();
+        } catch (err: any) {
+            console.error("[ap-polling] Local forwarder error:", err?.message ?? err);
+        }
+
+        // The Supabase-based pipeline (identifier + forwarder + PO reconciliation)
+        // still runs for dashboard visibility and PO matching, but is no longer
+        // the critical path — the local forwarder handles Gmail -> Bill.com.
         const o = ops();
         if (!o) return;
         await o.pollAPInbox();
@@ -943,28 +957,62 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AP Email Watcher (added 2026-06-15)
-// Constant monitoring for vendor invoices and pricing/shipping reconciliation.
-// Runs every 15 minutes using the ap token.
+// Scans Watcher (added 2026-06-16)
+// Monitor _FREIGHT/Documents/Scans/ for new scanned PDFs.
+// CR_ / CRMIN_ → Slack @parker with PU100 stock-on-order info.
+// Benny_ → Email PDF to buildasoilap@bill.com.
+// Runs every 6 hours (4x/day) during business hours.
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
-    name: "ap-email-watch",
-    schedule: "*/15 * * * *",
-    onFail: "telegram-will",
-    description: "Constant Gmail monitoring for vendor invoices (Thirsty Earth, etc.) and auto-reconcile pricing/shipping to Finale POs. Uses ap token. Runs every 15 minutes.",
+    name: "scans-watcher",
+    schedule: "0 */6 * * *",
+    onFail: "log",
+    description: "Check _FREIGHT/Documents/Scans/ for new CR Minerals Pumice invoices (Slack @parker) or Benny invoices (email to Bill.com).",
     handler: async () => {
-        const { exec } = await import('child_process');
-        await new Promise((resolve, reject) => {
-            exec('node --import tsx src/cli/run-ap-pipeline.ts', { cwd: process.cwd() }, (error, stdout, stderr) => {
-                if (error) {
-                    console.error('AP pipeline error:', error);
-                    reject(error);
-                } else {
-                    console.log('AP pipeline output:', stdout);
-                    resolve(stdout);
-                }
-            });
-        });
+        const { runScansWatch } = await import("@/lib/scans-watcher");
+        const result = await runScansWatch();
+        if (result.scanned > 0 || result.errors > 0) {
+            console.log(`[scans-watcher] ${result.scanned} scanned, ${result.processed} processed, ${result.slackNotifications} Slack, ${result.emailForwards} email, ${result.errors} errors`);
+            for (const d of result.details) console.log(`  ${d}`);
+        }
     },
-    budget: { durationMs: 120_000 },
+    budget: { durationMs: 60_000 },
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PO Reply Watcher — checks Gmail threads for vendor replies to sent POs.
+// Runs every 30 min during business hours. When a vendor replies, updates
+// purchase_orders (vendor_acknowledged_at, human_reply_detected_at) and
+// transitions lifecycle to ACKNOWLEDGED. No LLM calls, Gmail API only.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "po-reply-watcher",
+    schedule: "*/30 7-18 * * 1-5",
+    onFail: "log",
+    description: "Watch Gmail threads for vendor replies to sent POs (30min, M-F 7AM-6PM MT).",
+    handler: async () => {
+        const { runPOReplyWatcher } = await import("@/lib/purchasing/po-reply-watcher");
+        const detections = await runPOReplyWatcher();
+        if (detections.length > 0) {
+            console.log(
+                `[po-reply-watcher] ${detections.length} vendor reply(s) detected: ` +
+                detections.map(d => `${d.poNumber} (${d.vendorName})`).join(", ")
+            );
+        }
+    },
+    budget: { durationMs: 90_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
+// This job ran `run-ap-pipeline.ts` (a MANUAL diagnostic script) every 15 min.
+// That script has NO dedup: it finds the most-recent invoice PDF in Gmail and
+// forwards it to buildasoilap@bill.com on EVERY run — re-forwarding the same
+// invoice repeatedly (the "Fwd: Fwd: Fwd: Fwd:" chains in the Sent folder).
+// It also competed with the production `ap-polling` cron (which has 3 dedup
+// layers in ap-identifier.ts: message_id, cross-inbox, PDF content hash).
+//
+// The production `ap-polling` job (above) is the correct, dedup-safe pipeline.
+// Do NOT re-enable this without first adding a Bill.com forward-dedup check to
+// run-ap-pipeline.ts (query ap_activity_log / Gmail Sent before forwarding).
+// ─────────────────────────────────────────────────────────────────────────────

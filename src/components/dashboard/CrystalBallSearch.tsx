@@ -220,6 +220,13 @@ export function CrystalBallSearch({ onSelect, onVendorSelect }: CrystalBallSearc
                                 } else if (R < item.leadTimeDays + 30) {
                                     runwayColor = "text-amber-500";
                                 }
+
+                                // Decision summary: next order date + qty + stockout
+                                const nextOrderDate = item.projections?.find((p: any) => p.needsOrder)?.orderByDate
+                                    ?? item.projectedNextOrderDate ?? null;
+                                const suggestedQty = Math.round(item.recommendation?.suggestedQty ?? 0);
+                                const stockoutDate = item.projectedStockoutDate ?? null;
+                                const needsOrder = R < (item.leadTimeDays ?? 14);
                                 
                                 return (
                                     <button
@@ -249,6 +256,22 @@ export function CrystalBallSearch({ onSelect, onVendorSelect }: CrystalBallSearc
                                             <div className="text-[9px] text-zinc-600 truncate">
                                                 Vendor: {item.vendorName}
                                             </div>
+                                            {/* Decision row: order qty, next order date, stockout */}
+                                            {needsOrder && suggestedQty > 0 ? (
+                                                <div className="text-[9px] font-mono text-amber-400 truncate mt-0.5">
+                                                    Order {suggestedQty.toLocaleString()} by {nextOrderDate ?? "now"}
+                                                    {stockoutDate ? ` · Runs out ${stockoutDate}` : ""}
+                                                </div>
+                                            ) : nextOrderDate ? (
+                                                <div className="text-[9px] font-mono text-emerald-500 truncate mt-0.5">
+                                                    Order by {nextOrderDate}
+                                                    {stockoutDate ? ` · Runs out ${stockoutDate}` : ""}
+                                                </div>
+                                            ) : stockoutDate ? (
+                                                <div className="text-[9px] font-mono text-zinc-500 truncate mt-0.5">
+                                                    Runs out {stockoutDate}
+                                                </div>
+                                            ) : null}
                                         </div>
                                         
                                         <div className="text-right shrink-0 flex flex-col items-end gap-0.5 justify-center h-full">

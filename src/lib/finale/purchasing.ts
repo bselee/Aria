@@ -1713,30 +1713,24 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         const orderId = data.orderId;
         if (!orderId) throw new Error('Finale returned no orderId');
 
-        // ── Post-creation verification: ensure all products are linked ──────
-        // DECISION(2026-03-23): Finale silently drops product linkage when the
-        // productUrl doesn't resolve internally (even if pre-validation passed).
-        // Verify and auto-cancel if any line items are missing products.
+        // ── Post-creation verification: detect unlinked products ──────────
+        // DECISION(2026-03-23, revised 2026-06-18): Finale silently drops product
+        // linkage when the productUrl doesn't resolve internally. Previously we
+        // auto-cancelled the entire PO — this meant one broken SKU blocked the
+        // entire order. Now we warn but keep the PO alive so the operator can
+        // fix the SKU in Finale and manually add it. The unlinked items are
+        // reported in the return value.
         const createdItems = data.orderItemList || [];
         const unlinkedItems = createdItems.filter((i: any) => !i.productUrl);
         if (unlinkedItems.length > 0) {
-            console.error(`[finale] ⚠️ PO #${orderId}: ${unlinkedItems.length}/${createdItems.length} items have no product linked — cancelling PO`);
-            try {
-                await fetch(`${this.apiBase}/${this.accountPath}/api/order/${orderId}`, {
-                    method: 'PUT',
-                    headers: {
-                        Authorization: this.authHeader,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ statusId: 'ORDER_CANCELLED' }),
-                });
-                console.log(`[finale] Auto-cancelled broken PO #${orderId}`);
-            } catch (cancelErr: any) {
-                console.error(`[finale] Failed to auto-cancel PO #${orderId}:`, cancelErr.message);
-            }
-            throw new Error(
-                `PO #${orderId} created but ${unlinkedItems.length} products failed to link. ` +
-                `PO auto-cancelled. Check that all SKUs exist in Finale.`
+            console.warn(
+                `[finale] ⚠️ PO #${orderId}: ${unlinkedItems.length}/${createdItems.length} items have no product linked. ` +
+                `PO kept alive — fix SKUs in Finale and add manually.`
+            );
+            // Report which SKUs failed to link so the operator can fix them
+            duplicateWarnings.push(
+                `⚠️ ${unlinkedItems.length} item(s) failed to link in Finale. ` +
+                `PO #${orderId} created without them. Fix SKUs in Finale and add manually.`
             );
         }
 

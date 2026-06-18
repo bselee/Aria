@@ -30,7 +30,7 @@ import {
     TRACKING_PATTERNS,
     extractTrackingNumbers,
 } from "@/lib/carriers/tracking-service";
-import { upsertShipmentEvidence } from "@/lib/tracking/shipment-intelligence";
+import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
 import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -344,7 +344,7 @@ async function processMessage(
     // --- Upsert to shipments table ---
     for (const poNum of poNumbers.length > 0 ? poNumbers : [null]) {
         try {
-            await upsertShipmentEvidence({
+          await tracking.shipmentIntelligence.upsertShipmentEvidence({
                 trackingNumber: encodedTracking,
                 poNumber: poNum,
                 vendorName: null, // Will be resolved by carrier-poll or manual
@@ -366,7 +366,7 @@ async function processMessage(
     // If no PO number in email, still record the tracking with no PO link
     if (poNumbers.length === 0) {
         try {
-            await upsertShipmentEvidence({
+          await tracking.shipmentIntelligence.upsertShipmentEvidence({
                 trackingNumber: encodedTracking,
                 poNumber: null,
                 vendorName: null,

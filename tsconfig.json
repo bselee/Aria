@@ -1,46 +1,44 @@
 {
-    "compilerOptions": {
-        "target": "ES2017",
-        "lib": [
-            "dom",
-            "dom.iterable",
-            "esnext"
-        ],
-        "allowJs": true,
-        "skipLibCheck": true,
-        "strict": true,
-        "noEmit": true,
-        "esModuleInterop": true,
-        "module": "esnext",
-        "moduleResolution": "node",
-        "resolveJsonModule": true,
-        "isolatedModules": true,
-        "jsx": "preserve",
-        "incremental": true,
-        "plugins": [
-            {
-                "name": "next"
-            }
-        ],
-        "paths": {
-            "@/*": [
-                "./src/*"
-            ]
-        }
-    },
-    "include": [
-        "next-env.d.ts",
-        "src/**/*.ts",
-        "src/**/*.tsx",
-        ".next/types/**/*.ts"
+  "compilerOptions": {
+    "target": "ES2015",
+    "esModuleInterop": true,
+    "jsx": "preserve",
+    "baseUrl": ".",
+    "allowJs": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "lib": [
+      "dom",
+      "es2015.collection",
+      "es2015.promise"
     ],
-    "exclude": [
-        "node_modules",
-        "*.ts",
-        "src/cli",
-        "scripts",
-        "tools",
-        "supabase",
-        "migrations"
+    "strict": false,
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@/lib/*": [
+        "./src/lib/*"
+      ]
+    },
+    "noEmit": true,
+    "incremental": true,
+    "isolatedModules": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
     ]
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "next-env.d.ts",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
 }

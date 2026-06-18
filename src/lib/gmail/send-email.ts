@@ -14,10 +14,43 @@ export interface GmailPdfEmailResult {
     messageId: string | null;
     threadId: string | null;
     fromAddress: string | null;
+    verified: boolean;
+    verifyError?: string;
 }
 
 function encodeHeader(value: string): string {
     return value.replace(/\r?\n/g, " ").trim();
+}
+
+/**
+ * After sending, wait for Gmail to index then verify the message appeared
+ * in Sent with the correct PDF attachment. Returns verified=true on success.
+ */
+async function verifyGmailSent(gmail: any, messageId: string, pdfFilename?: string): Promise<{ verified: boolean; error?: string }> {
+    try {
+        await new Promise(r => setTimeout(r, 2000));
+        const msg = await gmail.users.messages.get({
+            userId: "me",
+            id: messageId,
+            format: "full",
+        });
+        if (!msg.data?.payload) return { verified: false, error: "Sent message not found" };
+
+        if (pdfFilename) {
+            let found = false;
+            const walk = (part: any) => {
+                if (!part) return;
+                if (part.filename === pdfFilename && part.mimeType === "application/pdf") found = true;
+                if (part.parts) for (const sp of part.parts) walk(sp);
+            };
+            walk(msg.data.payload);
+            if (!found) return { verified: false, error: `PDF ${pdfFilename} not found in sent message` };
+        }
+
+        return { verified: true };
+    } catch (e: any) {
+        return { verified: false, error: e.message };
+    }
 }
 
 export async function sendGmailPdfEmail(input: GmailPdfEmailInput): Promise<GmailPdfEmailResult> {
@@ -66,18 +99,23 @@ export async function sendGmailPdfEmail(input: GmailPdfEmailInput): Promise<Gmai
         requestBody: { raw },
     });
 
+    const messageId = sent.data.id ?? null;
+    const threadId = sent.data.threadId ?? null;
+
+    // Verify the sent message in Gmail Sent folder
+    const verify = messageId ? await verifyGmailSent(gmail, messageId, input.pdfFilename) : { verified: false, error: "No message ID" };
+
     return {
-        messageId: sent.data.id ?? null,
-        threadId: sent.data.threadId ?? null,
+        messageId,
+        threadId,
         fromAddress,
+        verified: verify.verified,
+        verifyError: verify.error,
     };
 }
 
 // ──────────────────────────────────────────────────
 // TEXT-ONLY EMAIL (no PDF attachment)
-// HERMIA(2026-05-28): Belt+braces fallback. When PDFKit fails to generate
-// a PO PDF (bundled Next.js env, missing fonts), we still email the vendor
-// a plain-text summary of the PO so nothing ships into the void.
 // ──────────────────────────────────────────────────
 
 export interface GmailTextEmailInput {
@@ -91,6 +129,8 @@ export interface GmailTextEmailResult {
     messageId: string | null;
     threadId: string | null;
     fromAddress: string | null;
+    verified: boolean;
+    verifyError?: string;
 }
 
 export async function sendTextOnlyGmailEmail(input: GmailTextEmailInput): Promise<GmailTextEmailResult> {
@@ -127,9 +167,17 @@ export async function sendTextOnlyGmailEmail(input: GmailTextEmailInput): Promis
         requestBody: { raw },
     });
 
+    const messageId = sent.data.id ?? null;
+    const threadId = sent.data.threadId ?? null;
+
+    // Verify the sent message in Gmail Sent folder
+    const verify = messageId ? await verifyGmailSent(gmail, messageId) : { verified: false, error: "No message ID" };
+
     return {
-        messageId: sent.data.id ?? null,
-        threadId: sent.data.threadId ?? null,
+        messageId,
+        threadId,
         fromAddress,
+        verified: verify.verified,
+        verifyError: verify.error,
     };
 }

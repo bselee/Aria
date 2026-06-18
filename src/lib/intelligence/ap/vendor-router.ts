@@ -1,85 +1,92 @@
 /**
  * @file    src/lib/intelligence/ap/vendor-router.ts
- * @purpose Deterministic vendor routing rules — runs BEFORE LLM classification
- *          to save API calls and ensure correctness for known senders.
- * @author  Will / Antigravity / Hermia
- * @created 2026-05-28
+ * @purpose Minimal vendor routing rules. Core principle: ALL PDF invoices forward
+ *          to Bill.com. Only skip: internal emails, Bill.com self-notifications,
+ *          FedEx past-due notices, Amazon order confirmations, own statements.
+ *          Dropship markers are PO-matching hints only — still forward.
+ * @author  Hermia
+ * @created 2026-05-28 (extracted from ap-agent.ts)
+ * @updated 2026-06-18 (Bill Selee: stripped autopay — forward all PDFs)
  * @deps    none (pure config + matcher)
- * @extracted-from src/lib/intelligence/ap-agent.ts lines 49-160
  */
 
 // ─── Vendor Routing Rules ────────────────────────────────────────────────────
-// Deterministic routing for known vendor types.
-// - 'autopay'       → vendor is on autopay or recurring subscription; mark read, no Bill.com forward
-// - 'dropship'      → forward to Bill.com, mark read, skip PO matching/reconciliation
-// - 'ignore'        → skip entirely (e.g., internal forwarded emails from Will's inbox)
-// - 'amazon_order'  → route to Amazon order parser for tracking + Slack request matching
+// Actions:
+//   'forward'       → forward to Bill.com, attempt PO matching (default for all PDFs)
+//   'dropship'      → forward to Bill.com, skip PO matching (no Finale PO exists)
+//   'skip'          → mark read, do NOT forward (internal, self-notifications, non-invoice)
+//   'amazon_order'  → route to Amazon order parser (separate pipeline)
+//
+// DESIGN DECISION (2026-06-18, Bill Selee):
+//   ALL PDF invoices are forwarded to Bill.com identically.
+//   Skips are for: prepaid/online vendors (no discoverable amount to forward),
+//   internal emails, Bill.com self-notifications, FedEx past-due notices,
+//   Amazon tracking, and own statements.
+//   FedEx is the corrected exception: was wrongly marked autopay.
+//   Invoice PDFs from noreply@fedex.com flow through to forwarding + PO matching.
 
 export interface VendorRoutingRule {
     match: {
         domain?: string;
         fromExact?: string;
         senderContains?: string;
-        /** Match when the email subject contains this string (case-insensitive). */
         subjectContains?: string;
     };
-    action: 'autopay' | 'dropship' | 'ignore' | 'amazon_order';
+    action: 'forward' | 'dropship' | 'skip' | 'amazon_order';
     label: string;
 }
 
 export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
-    // ── Autopay / recurring (mark read, no Bill.com forward) ─────────────
-    { match: { domain: 'wwex.com' }, action: 'autopay', label: 'Worldwide Express (Autopay)' },
-    { match: { senderContains: 'pioneer propane' }, action: 'autopay', label: 'Pioneer Propane' },
-    { match: { domain: 'gorgias.com' }, action: 'autopay', label: 'Gorgias' },
-    { match: { senderContains: 'gorgias' }, action: 'autopay', label: 'Gorgias' },
-    { match: { domain: 'google.com' }, action: 'autopay', label: 'Google' },
-    { match: { senderContains: 'google workspace' }, action: 'autopay', label: 'Google Workspace' },
-    { match: { senderContains: 'google cloud' }, action: 'autopay', label: 'Google Cloud' },
+    // ── Skip: internal emails ──────────────────────────────────────────
+    { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'skip', label: 'Internal (bill.selee)' },
 
-    // HERMIA(2026-06-10): FedEx is credit-card autopay — never forward to Bill.com
-    { match: { domain: 'fedex.com' }, action: 'autopay', label: 'FedEx (Credit Card Autopay)' },
+    // ── Skip: Bill.com self-notifications ──────────────────────────────
+    { match: { domain: 'inform.bill.com' }, action: 'skip', label: 'Bill.com Self-Notification' },
 
-    // ── Amazon (route to order parser for tracking) ──────────────────────
+    // ── Skip: prepaid / online-only vendors ─────────────────────────────
+    // These are paid via online portal — no discoverable invoice amount to forward.
+    { match: { domain: 'wwex.com' }, action: 'skip', label: 'Worldwide Express (Prepaid Online)' },
+    { match: { senderContains: 'pioneer propane' }, action: 'skip', label: 'Pioneer Propane (Prepaid)' },
+    { match: { domain: 'gorgias.com' }, action: 'skip', label: 'Gorgias (Prepaid)' },
+    { match: { senderContains: 'gorgias' }, action: 'skip', label: 'Gorgias (Prepaid)' },
+    { match: { domain: 'google.com' }, action: 'skip', label: 'Google (Prepaid)' },
+    { match: { senderContains: 'google workspace' }, action: 'skip', label: 'Google Workspace (Prepaid)' },
+    { match: { senderContains: 'google cloud' }, action: 'skip', label: 'Google Cloud (Prepaid)' },
+    { match: { senderContains: 'culligan' }, action: 'skip', label: 'Culligan Water (Prepaid)' },
+    { match: { senderContains: 'terminix' }, action: 'skip', label: 'Terminix (Prepaid)' },
+
+    // ── Skip: FedEx past-due notices (no invoice PDF) ──────────────────
+    // Invoice PDFs come from noreply@fedex.com and flow through normally.
+    { match: { fromExact: 'billingonline@fedex.com' }, action: 'skip', label: 'FedEx Past Due (No Invoice)' },
+
+    // ── Skip: BuildASoil own statements ────────────────────────────────
+    { match: { subjectContains: 'build a soil statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
+    { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
+
+    // ── Amazon: route to order parser ──────────────────────────────────
     { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },
     { match: { senderContains: 'ship-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Shipping' },
     { match: { senderContains: 'shipment-tracking@amazon' }, action: 'amazon_order', label: 'Amazon Tracking' },
     { match: { senderContains: 'order-update@amazon' }, action: 'amazon_order', label: 'Amazon Order Update' },
 
-    // ── Dropship vendors (forward to Bill.com, no PO matching) ──────────
+    // ── Dropship: forward to Bill.com, skip PO matching ────────────────
+    // These vendors dropship directly to customers — no Finale PO exists.
+    // Still forwarded to Bill.com for payment processing.
     { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
     { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
-    // HERMIA(2026-06-10): Domain-based match (no space issue with domain evergreengrowers.com)
     { match: { domain: 'evergreengrowers.com' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
     { match: { senderContains: 'ferticell' }, action: 'dropship', label: 'Ferticell (Dropship)' },
 
-    // ── QuickBooks dropship vendors (subject-based — vendor name only in subject line) ──
+    // QuickBooks variants
     { match: { senderContains: 'quickbooks', subjectContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship via QuickBooks)' },
     { match: { senderContains: 'quickbooks', subjectContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship via QuickBooks)' },
     { match: { senderContains: 'quickbooks', subjectContains: 'fert' }, action: 'dropship', label: 'Ferticell (Dropship via QuickBooks)' },
-
-    // ── Internal ignores ────────────────────────────────────────────────
-    { match: { fromExact: 'bill.selee@buildasoil.com' }, action: 'ignore', label: 'Internal (bill.selee)' },
-
-    // ── Autopay / paid elsewhere (mark read, log for audit, NO Bill.com forward) ──
-    // Culligan Water: bottled-water service, paid on autopay. Logged for visibility
-    // but never forwarded to Bill.com and never PO-matched.
-    { match: { senderContains: 'culligan' }, action: 'autopay', label: 'Culligan Water (Autopay — Paid, No Forward)' },
-    { match: { senderContains: 'terminix' }, action: 'autopay', label: 'Terminix (Autopay)' },
-
-    // ── Internal documents / statements (archive, no forward) ────────────
-    // BuildASoil's own statements and internal documents should never reach Bill.com
-    { match: { subjectContains: 'build a soil statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
-    { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'autopay', label: 'BuildASoil Statement (Internal)' },
-
-    // HERMIA(2026-06-10): Bill.com self-notifications — never re-forward back to Bill.com
-    { match: { domain: 'inform.bill.com' }, action: 'ignore', label: 'Bill.com Self-Notification (Ignore)' },
 ];
 
 /**
  * Match an email sender against vendor routing rules.
- * Returns the first matching rule or null.
+ * Returns the first matching rule or null (null = default forward + PO matching).
  */
 export function matchVendorRouting(
     fromEmail: string,
@@ -95,14 +102,12 @@ export function matchVendorRouting(
         if (rule.match.domain && domain === rule.match.domain) return rule;
         if (rule.match.fromExact && email === rule.match.fromExact.toLowerCase()) return rule;
         if (rule.match.senderContains && (email.includes(rule.match.senderContains) || name.includes(rule.match.senderContains))) {
-            // If rule also has a subjectContains requirement, check that too
             if (rule.match.subjectContains) {
                 if (subjectLower.includes(rule.match.subjectContains.toLowerCase())) return rule;
-                continue; // sender matched but subject didn't — keep looking
+                continue;
             }
             return rule;
         }
-        // Subject-only match (no sender filter but subject matches)
         if (rule.match.subjectContains && !rule.match.senderContains && !rule.match.domain && !rule.match.fromExact) {
             if (subjectLower.includes(rule.match.subjectContains.toLowerCase())) return rule;
         }

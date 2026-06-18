@@ -5,6 +5,7 @@ import { loadDraftedPORecSummaries } from "@/lib/purchasing/calibration";
 import { createClient } from "@/lib/supabase";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
+import { syncPOETA } from "@/lib/purchasing/po-eta-sync";
 
 export const dynamic = "force-dynamic";
 
@@ -344,6 +345,72 @@ export async function POST(req: Request) {
                 messageId: sendRes.data.id,
                 threadId: sendRes.data.threadId,
             });
+        }
+
+        // Action 5: Set ETA (update expected delivery date)
+        console.log("[active-purchases POST] action:", action, "checking set_eta");
+        if (action === "set_eta") {
+            const etaDate = String(body.etaDate || "").trim();
+            if (!etaDate || !/^\d{4}-\d{2}-\d{2}$/.test(etaDate)) {
+                return NextResponse.json({ error: "etaDate required (YYYY-MM-DD)" }, { status: 400 });
+            }
+
+            // Push to Finale directly using already-imported FinaleClient
+            try {
+                const finale = new FinaleClient();
+                await finale.updateOrderDueDate(orderId, etaDate);
+            } catch (e: any) {
+                console.warn("[set_eta] Finale dueDate push failed:", e.message);
+            }
+
+            // Also store in purchase_orders as vendor_stated_eta override
+            const { error: upsertErr } = await db.from("purchase_orders").upsert({
+                po_number: orderId,
+                vendor_stated_eta: etaDate,
+                vendor_stated_eta_confidence: "high",
+                vendor_stated_eta_extracted_at: now,
+                vendor_stated_eta_rationale: "Manually set from dashboard",
+                updated_at: now,
+            }, { onConflict: "po_number" });
+
+            if (upsertErr) throw upsertErr;
+
+            return NextResponse.json({
+                ok: true,
+                orderId,
+                etaProfile: {
+                    expectedDate: etaDate,
+                    source: "vendor_reply_eta",
+                    confidence: "high",
+                    label: `ETA ${etaDate} - manual`,
+                },
+            });
+        }
+
+        // Action 6: Approve Reconciliation
+        if (action === "approve_reconciliation") {
+            const invoiceId = String(body.invoiceId || "").trim();
+
+            // Update invoices table: status = 'matched_approved' where po_number = orderId
+            const { error: invErr } = await db
+                .from("invoices")
+                .update({ status: "matched_approved", updated_at: now })
+                .eq("po_number", orderId);
+
+            if (invErr) throw invErr;
+
+            // Update purchase_orders: lifecycle_stage = 'reconciled'
+            const { error: poErr } = await db
+                .from("purchase_orders")
+                .upsert({
+                    po_number: orderId,
+                    lifecycle_stage: "reconciled",
+                    updated_at: now,
+                }, { onConflict: "po_number" });
+
+            if (poErr) throw poErr;
+
+            return NextResponse.json({ ok: true, orderId });
         }
 
         return NextResponse.json({ error: "unhandled action" }, { status: 400 });

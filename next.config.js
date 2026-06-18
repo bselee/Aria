@@ -16,8 +16,10 @@
  * the CLI/lib boundary fix is sufficient for now.
  */
 
+const path = require('path');
+
 /**
- * Regex for packages that require Node built-ins (http, https, net, tls,
+ * Regex for packages that require Node built-ins
  * crypto, stream, etc.) and MUST be externalized from the webpack server
  * bundle. Next.js's `serverExternalPackages` only handles top-level packages
  * in node_modules/. These patterns catch nested transitive dependencies
@@ -89,6 +91,7 @@ const nextConfig = {
         'pdfkit',
     ],
     webpack: (config, { isServer }) => {
+      config.resolve.alias['@'] = isServer ? path.join(__dirname, 'src') : path.join(__dirname, '..', 'src');
         if (isServer) {
             // HERMIA(2026-06-11): Externalize the googleapis runtime stack
             // from the server webpack bundle. These packages require Node

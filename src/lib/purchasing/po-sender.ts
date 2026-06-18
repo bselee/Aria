@@ -578,6 +578,7 @@ export async function commitAndSendPO(
     let emailError: string | undefined;
     let emailVia: POEmailVia | null = null;
     let gmailMessageId: string | null = null;
+    let gmailThreadId: string | null = null;
     let gmailFromAddress: string | null = null;
 
     // Prefer Finale-native email because it carries Finale's PO render. If the
@@ -614,9 +615,14 @@ export async function commitAndSendPO(
                 sentAt = new Date().toISOString();
                 emailVia = 'gmail-fallback';
                 gmailMessageId = gmailResult.messageId;
+                gmailThreadId = gmailResult.threadId;
                 gmailFromAddress = gmailResult.fromAddress;
                 emailError = undefined;
-                verificationIssues.push(`Gmail fallback sent PO PDF to ${vendorEmail}`);
+                if (gmailResult.verified) {
+                    verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — verified in Sent`);
+                } else {
+                    verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — NOT verified: ${gmailResult.verifyError || 'unknown'}`);
+                }
             } catch (gmailErr: any) {
                 // HERMIA(2026-06-10): Text-only fallback kept as safety net. PDFKit is
                 // now stable, but if generation fails we still send a readable text email
@@ -639,6 +645,7 @@ export async function commitAndSendPO(
                     sentAt = new Date().toISOString();
                     emailVia = 'gmail-fallback';
                     gmailMessageId = textGmailResult.messageId;
+                    gmailThreadId = textGmailResult.threadId;
                     gmailFromAddress = textGmailResult.fromAddress;
                     emailError = `PDF generation failed (${gmailErr?.message ?? String(gmailErr)}) — sent text-only email.`;
                     verificationIssues.push(`Text-only Gmail fallback sent to ${vendorEmail}`);
@@ -792,6 +799,7 @@ export async function commitAndSendPO(
                 sent_at: sentAt,
                 triggered_by: triggeredBy,
                 gmail_message_id: gmailMessageId,
+                gmail_thread_id: gmailThreadId,
                 metadata: {
                     orderId,
                     vendorEmail,

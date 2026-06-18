@@ -1235,6 +1235,76 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     }
 
     /**
+     * Update the dueDate (expected delivery) on a Finale purchase order.
+     *
+     * Uses the standard GET → unlock → modify → POST → restore pattern.
+     * Idempotent: if the dueDate already matches, returns false without touching Finale.
+     *
+     * @param orderId  - Finale order ID (e.g. "PO-124931")
+     * @param dueDate  - ISO date string "YYYY-MM-DD" (time component auto-appended)
+     * @returns true if the PO was updated, false if already matching or errored
+     */
+    async updateOrderDueDate(orderId: string, dueDate: string): Promise<boolean> {
+        let shouldRestore = false;
+        let originalStatus = "ORDER_LOCKED";
+        let writeError: Error | null = null;
+        let restoreError: Error | null = null;
+
+        try {
+            const currentPO = await (this as any).getOrderDetails(orderId);
+
+            // Compare existing dueDate (Finale returns various formats — compare date portion)
+            const existingDate = currentPO.dueDate
+                ? new Date(currentPO.dueDate).toISOString().slice(0, 10)
+                : null;
+            const newDate = dueDate.slice(0, 10);
+
+            if (existingDate === newDate) {
+                return false; // idempotent — already set
+            }
+
+            shouldRestore = true;
+            originalStatus = await this.unlockForEditing(currentPO, orderId);
+
+            // Finale expects "YYYY-MM-DDT00:00:00" format
+            currentPO.dueDate = `${newDate}T00:00:00`;
+
+            const encodedId = encodeURIComponent(orderId);
+            await this.post(`/${this.accountPath}/api/order/${encodedId}`, currentPO);
+        } catch (err: any) {
+            writeError = err instanceof Error ? err : new Error(String(err));
+        } finally {
+            if (shouldRestore) {
+                try {
+                    await this.restoreOrderStatus(orderId, originalStatus);
+                } catch (err: any) {
+                    restoreError = err instanceof Error ? err : new Error(String(err));
+                    console.error(
+                        `[FinaleClient] CRITICAL: Failed to restore PO ${orderId} after dueDate update: ${restoreError.message}`
+                    );
+                }
+            }
+        }
+
+        if (restoreError) {
+            console.warn(
+                `[FinaleClient] dueDate update for PO ${orderId} failed steady-state validation`
+            );
+            return false;
+        }
+
+        if (writeError) {
+            console.warn(
+                `[FinaleClient] Failed to update dueDate on PO ${orderId}: ${writeError.message}`
+            );
+            return false;
+        }
+
+        console.log(`[FinaleClient] Updated dueDate on PO ${orderId} → ${dueDate.slice(0, 10)}`);
+        return true;
+    }
+
+    /**
      * Resolve a Finale PO by its orderId and return a summary for matching.
      * Enriches the raw data with supplier name for easier correlation.
      */

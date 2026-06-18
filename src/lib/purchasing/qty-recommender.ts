@@ -569,8 +569,8 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         const pctThreshold = input.overbuyReviewPct ?? 50;
         const dollarsThreshold = input.overbuyReviewDollars ?? 1000;
         if (overbuyPct >= pctThreshold || overbuyDollars >= dollarsThreshold) {
-            const reason = `Large overbuy from ordering constraints: +${Math.round(overbuyQty)} eaches (${Math.round(overbuyPct)}%)` +
-                (overbuyDollars > 0 ? `, approx $${overbuyDollars.toFixed(0)}` : "");
+            const reason = `MOQ overbuy: +${Math.round(overbuyQty)} extra units` +
+                (overbuyDollars > 0 ? ` (+$${overbuyDollars.toFixed(0)})` : "");
             reviewReasons.push(reason);
             trace.push({
                 step: "review",
@@ -651,7 +651,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     if (suggestedQty > 0 && lastPurchaseQty !== null && lastPurchaseQty > 0) {
         const deviationPct = Math.round(((suggestedQty - lastPurchaseQty) / lastPurchaseQty) * 100);
         if (Math.abs(deviationPct) >= 50) {
-            const reason = `Quantity deviates significantly from last order (${lastPurchaseQty.toLocaleString()} units): ${deviationPct > 0 ? '+' : ''}${deviationPct}%`;
+            const reason = `Last order was ${lastPurchaseQty} units — this order is ${deviationPct > 0 ? '+' : ''}${deviationPct}% different`;
             reviewReasons.push(reason);
             trace.push({
                 step: "historical_deviation",

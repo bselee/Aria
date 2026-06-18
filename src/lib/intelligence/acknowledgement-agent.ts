@@ -614,7 +614,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                 const isBusinessHours = hour >= 6 && hour <= 22; // 6am - 10pm MT
 
                 try {
-                    const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                    const { sendTelegramNotify } = await import('./telegram-notify');
                     const lines: string[] = [];
 
                     if (requiresHumanBatch.length === 1) {

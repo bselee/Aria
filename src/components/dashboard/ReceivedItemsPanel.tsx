@@ -128,6 +128,37 @@ export default function ReceivedItemsPanel() {
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
+
+    async function approveReconciliation(orderId: string, invoiceId?: string) {
+        setApprovingReconcile(prev => new Set(prev).add(orderId));
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    action: "approve_reconciliation",
+                    orderId,
+                    invoiceId,
+                }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "Failed to approve reconciliation");
+            // Update local apMap
+            setApMap(prev => ({
+                ...prev,
+                [orderId]: { label: "Approved ✓", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" },
+            }));
+        } catch (e: any) {
+            console.error("Approve reconciliation error:", e.message);
+        } finally {
+            setApprovingReconcile(prev => {
+                const next = new Set(prev);
+                next.delete(orderId);
+                return next;
+            });
+        }
+    }
 
     // Resizable height — persisted
     const containerRef = useRef<HTMLDivElement>(null);
@@ -340,10 +371,21 @@ export default function ReceivedItemsPanel() {
                                                 </span>
                                             )}
                                             {apStatus && (
-                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
-                                                    {apStatus.label}
-                                                </span>
-                                            )}
+                                                                                            apStatus.label === "PENDING" ? (
+                                                                                                <button
+                                                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
+                                                                                                    disabled={approvingReconcile.has(po.orderId)}
+                                                                                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
+                                                                                                    title="Approve reconciliation"
+                                                                                                >
+                                                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : apStatus.label}
+                                                                                                </button>
+                                                                                            ) : (
+                                                                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
+                                                                                                    {apStatus.label}
+                                                                                                </span>
+                                                                                            )
+                                                                                        )}
                                             {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
                                         </div>
                                         {/* Line 2: PO# + SKUs */}

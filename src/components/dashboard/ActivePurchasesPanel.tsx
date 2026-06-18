@@ -52,10 +52,13 @@ type ActivePurchase = {
         label: string;
     };
     trackingPaused?: boolean;
-    trackingSource?: string | null;
-    typicalTrackingSource?: string | null;
-    vendorOrdersEmail?: string | null;
-};
+        trackingSource?: string | null;
+        typicalTrackingSource?: string | null;
+        vendorOrdersEmail?: string | null;
+        invoiceStatus?: string;
+                invoiceId?: string;
+                hasDiscrepancies?: boolean;
+            };
 
 type ApiResponse = {
     purchases: ActivePurchase[];
@@ -144,6 +147,8 @@ export default function ActivePurchasesPanel() {
     const [pokeEmail, setPokeEmail] = useState("");
     const [pokeBody, setPokeBody] = useState("");
     const [actionLoading, setActionLoading] = useState<string | null>(null);
+    const [editingEta, setEditingEta] = useState<string | null>(null);
+    const [etaSaving, setEtaSaving] = useState<string | null>(null);
 
     // PO_ARRIVAL_AT_RISK index from ap_activity_log (last 24h). Drives the
     // rose/amber outline + AT-RISK pill on affected POs. Activity-first
@@ -293,6 +298,28 @@ export default function ActivePurchasesPanel() {
         const tid = setTimeout(() => setDraftFlash(null), 4000);
         return () => clearTimeout(tid);
     }, [lifecycle.lastDraft, fetchPurchases]);
+
+    async function handleSetEta(orderId: string, etaDate: string) {
+        setEtaSaving(orderId);
+        setError(null);
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "set_eta", orderId, etaDate }),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || "ETA update failed");
+            setPurchases((prev) => prev.map((po) => po.orderId === orderId
+                ? { ...po, etaProfile: json.etaProfile, expectedDate: etaDate }
+                : po));
+            setEditingEta(null);
+        } catch (e: any) {
+            setError(e.message);
+        } finally {
+            setEtaSaving(null);
+        }
+    }
 
     async function markSentVerified(orderId: string) {
         setVerifyingSent((prev) => new Set(prev).add(orderId));
@@ -596,39 +623,40 @@ export default function ActivePurchasesPanel() {
                                     : "";
 
                                 let statusLabel = "In Transit";
-                                let statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
+                                                                let statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
 
-                                if (isReceived) {
-                                    statusLabel = "Received";
-                                    statusColor = "text-emerald-400 bg-emerald-500/10 border-emerald-500/30";
-                                } else if (isCancelled) {
-                                    statusLabel = "Cancelled";
-                                    statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
-                                } else if (po.lifecycleStage === 'sent') {
-                                    statusLabel = "Sent";
-                                    statusColor = "text-zinc-400 bg-zinc-500/10 border-zinc-500/30";
-                                } else if (po.lifecycleStage === 'vendor_acknowledged') {
-                                    statusLabel = "Awaiting Tracking";
-                                    statusColor = "text-yellow-400 bg-yellow-500/10 border-yellow-500/30";
-                                } else if (po.lifecycleStage === 'tracking_unavailable') {
-                                    statusLabel = "Tracking Unavailable";
-                                    statusColor = "text-orange-400 bg-orange-500/10 border-orange-500/30";
-                                } else if (po.lifecycleStage === 'ap_follow_up') {
-                                    statusLabel = "AP Review";
-                                    statusColor = "text-purple-400 bg-purple-500/10 border-purple-500/30";
-                                } else if (po.lifecycleStage === 'moving_with_tracking' && confirmedShipments.length > 0) {
-                                    statusLabel = po.lastMovementSummary ? `Moving — ${po.lastMovementSummary}` : "In Transit";
-                                    statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
-                                } else if (po.lifecycleStage === 'moving_with_tracking') {
-                                    statusLabel = "Candidate Tracking";
-                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
-                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
-                                    statusLabel = "Out Today";
-                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
-                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
-                                    statusLabel = "Delivered";
-                                    statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
-                                }
+                                                                if (isReceived && po.completionState && (po.completionState.includes('received_pending_invoice') || po.completionState.includes('received_pending_reconciliation'))) {
+                                                                    const pendingInvoice = po.completionState.includes('received_pending_invoice');
+                                                                    statusLabel = pendingInvoice ? "Received — needs invoice" : "Received — needs approval";
+                                                                    statusColor = pendingInvoice ? "text-amber-300 bg-amber-500/10 border-amber-500/30" : "text-orange-300 bg-orange-500/10 border-orange-500/30";
+                                                                } else if (isReceived) {
+                                                                    statusLabel = "Received ✓";
+                                                                    statusColor = "text-emerald-400 bg-emerald-500/10 border-emerald-500/30";
+                                                                } else if (isCancelled) {
+                                                                    statusLabel = "Cancelled";
+                                                                    statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
+                                                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
+                                                                    statusLabel = "Out Today";
+                                                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
+                                                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {
+                                                                    statusLabel = "Delivered";
+                                                                    statusColor = "text-cyan-300 bg-cyan-500/10 border-cyan-500/30";
+                                                                } else if (po.lifecycleStage === 'sent') {
+                                                                    statusLabel = "Sent — awaiting ack";
+                                                                    statusColor = "text-zinc-400 bg-zinc-500/10 border-zinc-500/30";
+                                                                } else if (po.lifecycleStage === 'vendor_acknowledged') {
+                                                                    statusLabel = "Acknowledged";
+                                                                    statusColor = "text-emerald-400 bg-emerald-500/10 border-emerald-500/30";
+                                                                } else if (po.lifecycleStage === 'moving_with_tracking') {
+                                                                    statusLabel = "In Transit";
+                                                                    statusColor = "text-blue-400 bg-blue-500/10 border-blue-500/30";
+                                                                } else if (po.lifecycleStage === 'tracking_unavailable') {
+                                                                    statusLabel = "No Tracking";
+                                                                    statusColor = "text-orange-400 bg-orange-500/10 border-orange-500/30";
+                                                                } else if (po.lifecycleStage === 'ap_follow_up') {
+                                                                    statusLabel = "AP Follow-up";
+                                                                    statusColor = "text-purple-400 bg-purple-500/10 border-purple-500/30";
+                                                                }
 
                                 const expISO = effectiveExpected(po);
                                 const overdue = isOverdue(po);
@@ -718,6 +746,31 @@ export default function ActivePurchasesPanel() {
                                                     ✓ Vendor ack
                                                 </span>
                                             )}
+                                            {(() => {
+                                                                                            const isMatchedApproved = po.invoiceStatus === 'reconciled' || po.invoiceStatus === 'matched_approved';
+                                                                                            const isReview = po.invoiceStatus === 'matched_review';
+                                                                                            if (isMatchedApproved && po.hasDiscrepancies) return (
+                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-blue-500/10 text-blue-300/90 border-blue-500/30 shrink-0">
+                                                                                                    Invoice ±
+                                                                                                </span>
+                                                                                            );
+                                                                                            if (isMatchedApproved) return (
+                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-300/90 border-emerald-500/30 shrink-0">
+                                                                                                    Invoice ✓
+                                                                                                </span>
+                                                                                            );
+                                                                                            if (isReview) return (
+                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-600/20 text-amber-200 border-amber-500/50 shrink-0">
+                                                                                                    Invoice — review
+                                                                                                </span>
+                                                                                            );
+                                                                                            if (po.isReceived && !po.invoiceStatus) return (
+                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-600/20 text-zinc-400 border-zinc-500/30 shrink-0">
+                                                                                                    Awaiting invoice
+                                                                                                </span>
+                                                                                            );
+                                                                                            return null;
+                                                                                        })()}
                                             {daysOut != null && !po.isReceived && !overdue && (() => {
                                                 // PO Aging color-code: green <7d, yellow 7-14d, orange 14-21d, red >21d
                                                 const agingColor = daysOut < 7
@@ -763,12 +816,54 @@ export default function ActivePurchasesPanel() {
                                                 </span>
                                             ) : (
                                                 <span>
-                                                    Exp: <span className={`${overdue ? 'text-rose-300' : etaTone}`}>{fmtDate(po.expectedDate)}</span>{" "}
+                                                    Exp:{" "}
+                                                    {editingEta === po.orderId ? (
+                                                        <input
+                                                            type="date"
+                                                            className="w-[120px] px-1 py-0 text-[11px] font-mono bg-zinc-800 border border-amber-500/50 rounded text-amber-200 focus:outline-none focus:border-amber-400"
+                                                            defaultValue={po.etaProfile?.expectedDate || po.expectedDate}
+                                                            autoFocus
+                                                            onBlur={(e) => {
+                                                                const val = e.target.value;
+                                                                if (val && val !== (po.etaProfile?.expectedDate || po.expectedDate)) {
+                                                                    handleSetEta(po.orderId, val);
+                                                                } else {
+                                                                    setEditingEta(null);
+                                                                }
+                                                            }}
+                                                            onKeyDown={(e) => {
+                                                                if (e.key === "Enter") {
+                                                                    const val = (e.target as HTMLInputElement).value;
+                                                                    if (val) handleSetEta(po.orderId, val);
+                                                                } else if (e.key === "Escape") {
+                                                                    setEditingEta(null);
+                                                                }
+                                                            }}
+                                                            disabled={etaSaving === po.orderId}
+                                                        />
+                                                    ) : (
+                                                        <button
+                                                            className={`cursor-pointer hover:underline decoration-dotted underline-offset-2 ${overdue ? 'text-rose-300' : etaTone}`}
+                                                            onClick={() => { if (!po.isReceived) setEditingEta(po.orderId); }}
+                                                            title="Click to change ETA"
+                                                        >
+                                                            {fmtDate(po.etaProfile?.expectedDate || po.expectedDate)}
+                                                        </button>
+                                                    )}{" "}
                                                     <span className="opacity-60">({po.etaProfile?.label || po.leadProvenance})</span>
                                                 </span>
                                             )}
 
-                                            <span className="text-zinc-700">·</span>
+                                                                                        {(() => {
+                                                                                            if (!po.sentVerification?.verified) return <span className="text-[10px] text-zinc-600 italic">Next: Verify PO was sent</span>;
+                                                                                            if (!po.vendorAcknowledgedAt) return <span className="text-[10px] text-zinc-600 italic">Next: Awaiting vendor confirmation</span>;
+                                                                                            if (po.lifecycleStage === 'moving_with_tracking' && !po.isReceived) return <span className="text-[10px] text-zinc-600 italic">Next: Track shipment</span>;
+                                                                                            if (po.isReceived && !po.invoiceStatus) return <span className="text-[10px] text-zinc-600 italic">Next: Match invoice</span>;
+                                                                                            if (po.invoiceStatus === 'matched_review') return <span className="text-[10px] text-zinc-600 italic">Next: Review and approve reconciliation</span>;
+                                                                                            return null;
+                                                                                        })()}
+
+                                                                                        <span className="text-zinc-700">·</span>
                                             {sentVerified ? (
                                                 <span
                                                     className="inline-flex items-center gap-1 text-emerald-300 shrink-0"

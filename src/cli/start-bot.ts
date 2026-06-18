@@ -79,6 +79,7 @@ import {
     handleOrderAbandon,
 } from './handlers/order-actions';
 import { isBusinessHours } from '../lib/intelligence/alert-gate';
+import { installShutdownGuard, restoreChatHistory } from '../lib/persistence/shutdown-guard';
 
 // ===========================================================================
 // HELPERS
@@ -188,7 +189,10 @@ bot.start((ctx) => {
 
 const BOT_START_TIME = new Date();
 
-// Shared chat history tracking
+// ── Chat state — initialized empty, populated at boot ──────────────────
+// chatHistory and chatLastActive are populated asynchronously inside the
+// boot IIFE below. Until then they are empty — the GC interval starts
+// empty and doesn't do real work until chat data arrives.
 const chatHistory: Record<string, any[]> = {};
 const chatLastActive: Record<string, number> = {};
 
@@ -386,6 +390,30 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         .catch((err: any) => console.error('❌ Bot launch error:', err.message));
 
     console.log('✅ ARIA IS LIVE AND LISTENING');
+
+    // ── Restore chat history from prior shutdown snapshot ────────────────
+    // If the previous session gracefully persisted its chatHistory to
+    // Supabase on SIGTERM, restore it here so conversation continuity
+    // survives restarts. Best-effort — starts fresh if no snapshot exists
+    // or Supabase was unavailable.
+    try {
+        const restored = await restoreChatHistory();
+        const totalChats = Object.keys(restored.chats).length;
+        if (totalChats > 0) {
+            const totalMsgs = Object.values(restored.chats).reduce((s, m) => s + m.length, 0);
+            console.log(`[boot] Chat history restored: ${totalChats} chat(s), ${totalMsgs} message(s)`);
+            for (const [chatId, messages] of Object.entries(restored.chats)) {
+                chatHistory[chatId] = messages;
+                if (restored.lastActive[chatId]) {
+                    chatLastActive[chatId] = restored.lastActive[chatId];
+                }
+            }
+        } else {
+            console.log('[boot] No chat history snapshot found — starting fresh');
+        }
+    } catch (err: any) {
+        console.warn(`[boot] Chat history restore failed (non-fatal): ${err.message}`);
+    }
 
     bot.telegram.setMyCommands([
         { command: 'issues', description: 'Open issues — blocking-me-first' },
@@ -644,7 +672,42 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         } catch { /* non-critical */ }
     }, CRON_WATCHDOG_INTERVAL);
 
+    // ── Install graceful shutdown guard ──────────────────────────────────
+    // Persists chatHistory to Supabase before SIGTERM/SIGINT so the next
+    // boot can restore conversation continuity. Also cleans up BrowserBase
+    // sessions. The signal handlers replaced below are from
+    // installShutdownGuard — it removes the old ones and installs new ones
+    // that save state before exiting.
+    // NOTE: The old `process.once('SIGINT', ...)` and `process.once('SIGTERM', ...)`
+    // at module level are replaced by installShutdownGuard below.
+    const shutdownGuardCleanup = installShutdownGuard(chatHistory, chatLastActive, {
+        timeoutSeconds: 10,
+        cleanupHooks: [
+            async () => {
+                // Close active BrowserBase sessions on shutdown
+                try {
+                    const { BrowserbaseManager } = await import('../lib/scraping/browserbase-manager');
+                    const mgr = BrowserbaseManager.getInstance();
+                    await mgr.closeAllSessions();
+                    console.log('[shutdown-guard] BrowserBase sessions closed');
+                } catch {
+                    // BrowserbaseManager may not be imported yet — that's fine
+                }
+            },
+        ],
+    });
+
+    console.log('[boot] Graceful shutdown guard installed (chatHistory will persist on exit)');
+
 })();
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// These are now replaced by installShutdownGuard above — but keep module-level
+// stubs as safety net in case the boot IIFE fails before reaching that point.
+process.once('SIGINT', () => {
+    console.log('[safety-net] SIGINT — process exiting');
+    process.exit(0);
+});
+process.once('SIGTERM', () => {
+    console.log('[safety-net] SIGTERM — process exiting');
+    process.exit(0);
+});
