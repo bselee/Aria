@@ -957,18 +957,27 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scans Watcher (added 2026-06-16)
-// Monitor _FREIGHT/Documents/Scans/ for new scanned PDFs.
-// CR_ / CRMIN_ → Slack @parker with PU100 stock-on-order info.
+// Scans Watcher — CR/CRMIN & Benny scan processing (added 2026-06-16)
+// CR_ / CRMIN_ → DM Parker the PDF with PU100 stock-on-order info.
 // Benny_ → Email PDF to buildasoilap@bill.com.
-// Runs every 6 hours (4x/day) during business hours.
+// Runs every 6 hours during business hours (M-F 7AM-6PM MT).
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "scans-watcher",
-    schedule: "0 */6 * * *",
+    schedule: "0 */6 * * 1-5", // M-F only — no weekends
     onFail: "log",
-    description: "Check _FREIGHT/Documents/Scans/ for new CR Minerals Pumice invoices (Slack @parker) or Benny invoices (email to Bill.com).",
+    description: "Check _FREIGHT/Documents/Scans/ for new CR Minerals Pumice invoices (DM Parker with PDF + stock info) or Benny invoices (email to Bill.com).",
     handler: async () => {
+        // Business hours gate: skip if outside 7AM-6PM MT
+        const now = new Date();
+        const hourMT = new Date(
+            now.toLocaleString("en-US", { timeZone: "America/Denver" })
+        ).getHours();
+        if (hourMT < 7 || hourMT >= 18) {
+            console.log(`[scans-watcher] Outside business hours (${hourMT} MT) — skipping.`);
+            return;
+        }
+
         const { runScansWatch } = await import("@/lib/scans-watcher");
         const result = await runScansWatch();
         if (result.scanned > 0 || result.errors > 0) {
@@ -1001,11 +1010,38 @@ defineJob({
         }
     },
     budget: { durationMs: 90_000 },
-});
+    });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
-// This job ran `run-ap-pipeline.ts` (a MANUAL diagnostic script) every 15 min.
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Reconciliation Auto-Apply Watcher — automatically applies auto_approve/
+    // no_change reconciliation results to Finale POs. Gated by the same
+    // PO_AUTO_COMPLETE_ENABLED env var as po-auto-complete (dry-runs when disabled).
+    // Runs once per hour at :15 — reconciliation events aren't that frequent.
+    // ─────────────────────────────────────────────────────────────────────────────
+    defineJob({
+        name: "reconciliation-auto-apply",
+        schedule: "15 * * * *",
+        onFail: "telegram-will",
+        description: "Auto-apply auto_approve/no_change reconciliation results to Finale POs (hourly at :15).",
+        handler: async () => {
+            const { runReconciliationAutoApply } = await import(
+                "@/lib/purchasing/reconciliation-auto-apply"
+            );
+            const stats = await runReconciliationAutoApply();
+            if (stats.scanned > 0 || stats.applied > 0 || stats.errors > 0) {
+                console.log(
+                    `[reconciliation-auto-apply] scanned=${stats.scanned}, ` +
+                        `applied=${stats.applied}, alreadyApplied=${stats.alreadyApplied}, ` +
+                        `errors=${stats.errors}, dryRun=${stats.dryRun}`,
+                );
+            }
+        },
+        budget: { durationMs: 60_000 },
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
+    // This job ran `run-ap-pipeline.ts` (a MANUAL diagnostic script) every 15 min.
 // That script has NO dedup: it finds the most-recent invoice PDF in Gmail and
 // forwards it to buildasoilap@bill.com on EVERY run — re-forwarding the same
 // invoice repeatedly (the "Fwd: Fwd: Fwd: Fwd:" chains in the Sent folder).
