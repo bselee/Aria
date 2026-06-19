@@ -367,6 +367,41 @@ export async function runReconciliationAutoApply(): Promise<AutoApplyStats> {
             feeChanges.length > 0 ||
             !!trackingUpdate;
 
+        // ── Guardrail: PO-level dollar cap ────────────────────────────
+        // If totalDollarImpact exceeds $5,000, don't auto-apply — the
+        // cumulative changes are large enough that a human should verify.
+        const DOLLAR_CAP = 5000;
+        const totalImpact = result.totalDollarImpact ?? 0;
+        const exceedsDollarCap = hasChanges && totalImpact > DOLLAR_CAP;
+
+        // ── Guardrail: Per-SKU qty sanity ─────────────────────────────
+        // Catch absurd quantities (OCR error: 1,000,000 units) or
+        // absurd line totals ($1M single line). These are NEVER correct.
+        const QTY_SANITY_MAX = 100_000;
+        const LINE_TOTAL_SANITY_MAX = 100_000;
+        let sanityViolation: string | null = null;
+        for (const pc of priceChanges) {
+            const qty = pc.quantity ?? 0;
+            const lineTotal = qty * (pc.invoicePrice ?? 0);
+            if (qty > QTY_SANITY_MAX) {
+                sanityViolation = `${pc.productId}: qty ${qty.toLocaleString()} exceeds sanity max (${QTY_SANITY_MAX.toLocaleString()})`;
+                break;
+            }
+            if (lineTotal > LINE_TOTAL_SANITY_MAX) {
+                sanityViolation = `${pc.productId}: line total $${lineTotal.toLocaleString()} exceeds sanity max ($${LINE_TOTAL_SANITY_MAX.toLocaleString()})`;
+                break;
+            }
+        }
+
+        // ── Guardrail: block message ──────────────────────────────────
+        const guardrailBlocked = exceedsDollarCap || sanityViolation !== null;
+        let blockReason: string | null = null;
+        if (exceedsDollarCap) {
+            blockReason = `Total dollar impact $${totalImpact.toLocaleString()} exceeds auto-apply cap of $${DOLLAR_CAP.toLocaleString()}. Review in dashboard RCV column and approve manually.`;
+        } else if (sanityViolation) {
+            blockReason = `Quantity sanity check failed: ${sanityViolation}. Review invoice in dashboard RCV column.`;
+        }
+
         // ── Dry-run path ─────────────────────────────────────────────
         if (stats.dryRun) {
             const changeSummary = hasChanges
@@ -377,6 +412,37 @@ export async function runReconciliationAutoApply(): Promise<AutoApplyStats> {
                 `[reconciliation-auto-apply] DRY-RUN would apply to PO ${orderId} ` +
                     `(invoice=${invoiceNumber}, vendor=${vendorName}, ${changeSummary})`,
             );
+            continue;
+        }
+
+        // ── Guardrail block ── If guardrails trip, write block row instead of applying
+        if (guardrailBlocked) {
+            console.warn(
+                `[reconciliation-auto-apply] BLOCKED PO ${orderId} (${vendorName}): ${blockReason}`,
+            );
+            stats.errors++;
+            try {
+                if (sb) {
+                    await sb.from("ap_activity_log").insert({
+                        email_from: vendorName,
+                        email_subject: `PO ${orderId} auto-apply blocked`,
+                        intent: "RECONCILIATION_BLOCKED",
+                        action_taken: blockReason!,
+                        metadata: {
+                            orderId,
+                            invoiceNumber,
+                            vendorName,
+                            blockReason,
+                            totalDollarImpact: totalImpact,
+                            priceChangeCount: priceChanges.length,
+                            feeChangeCount: feeChanges.length,
+                            sanityViolation,
+                        },
+                    });
+                }
+            } catch (logErr: any) {
+                console.warn(`[reconciliation-auto-apply] Block row write failed: ${logErr.message}`);
+            }
             continue;
         }
 
