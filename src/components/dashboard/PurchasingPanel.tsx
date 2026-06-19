@@ -216,6 +216,111 @@ function runwayColor(days: number) {
     if (days < 90) return "text-green-400";
     return "text-zinc-500";
 }
+
+// ── Lifecycle summary helpers ─────────────────────────────────────────────
+
+type VendorLifecycleSummary = {
+    totalPOs: number;
+    stageCounts: Record<string, number>;
+    earliestETA: string | null;
+    stuckCount: number;
+    stuckStage: string | null; // most severe stuck stage
+    hasDeliveredNotReceived: boolean;
+};
+
+/**
+ * Aggregate lifecycle data across ALL open POs for a vendor group.
+ * Scans every item's openPOs, looks up the detail, and produces a compact
+ * status summary for the collapsed vendor row.
+ */
+function vendorLifecycleSummary(
+    items: PurchasingItem[],
+    detailMap: Map<string, OpenPODetail>,
+): VendorLifecycleSummary | null {
+    const poSet = new Set<string>();
+    const stages: Record<string, number> = {};
+    let earliestETA: string | null = null;
+    let stuckCount = 0;
+    let worstStuckStage: string | null = null;
+    let hasDeliveredNotReceived = false;
+
+    for (const item of items) {
+        for (const po of item.openPOs ?? []) {
+            if (poSet.has(po.orderId)) continue;
+            poSet.add(po.orderId);
+            const d = detailMap.get(po.orderId);
+            if (!d) continue;
+
+            const stage = d.lifecycleStage ?? "unknown";
+            stages[stage] = (stages[stage] ?? 0) + 1;
+
+            // Track stuck conditions
+            const isStuck =
+                stage === "noncomm" ||
+                stage === "tracking_unavailable" ||
+                stage === "stalled" ||
+                stage === "ap_follow_up" ||
+                stage === "human_escalated";
+            if (isStuck) {
+                stuckCount++;
+                // Rank stuck severity: noncomm > human_escalated > tracking_unavailable > ap_follow_up > stalled
+                const severity = ["noncomm", "human_escalated", "tracking_unavailable", "ap_follow_up", "stalled"];
+                for (const s of severity) {
+                    if (stage === s) { worstStuckStage = s; break; }
+                }
+            }
+
+            // Delivered but not yet received in Finale
+            if (stage === "delivered" && !d.isReceived) {
+                hasDeliveredNotReceived = true;
+            }
+
+            // Track earliest ETA
+            if (d.expectedDate && (!earliestETA || d.expectedDate < earliestETA)) {
+                earliestETA = d.expectedDate;
+            }
+        }
+    }
+
+    if (poSet.size === 0) return null;
+
+    return {
+        totalPOs: poSet.size,
+        stageCounts: stages,
+        earliestETA,
+        stuckCount,
+        stuckStage: worstStuckStage,
+        hasDeliveredNotReceived,
+    };
+}
+
+/** Stuck-stage labels for next-action guidance. */
+const STUCK_LABELS: Record<string, { label: string; tone: string; action: string }> = {
+    noncomm:              { label: "Unresponsive", tone: "text-rose-300 border-rose-500/40 bg-rose-500/10", action: "Escalate vendor" },
+    human_escalated:      { label: "Escalated",    tone: "text-purple-300 border-purple-500/40 bg-purple-500/10", action: "Review escalation" },
+    tracking_unavailable: { label: "No Tracking",  tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: "Request tracking" },
+    ap_follow_up:         { label: "AP Follow-up", tone: "text-cyan-300 border-cyan-500/40 bg-cyan-500/10", action: "Follow up" },
+    stalled:              { label: "Stalled",      tone: "text-zinc-300 border-zinc-600/40 bg-zinc-800/40", action: "Check status" },
+};
+
+/**
+ * Categorize a PO's lifecycle stage into one of a few compact buckets
+ * so the collapsed row gets a readable summary.
+ */
+function lifecycleStageBucket(stage: string | undefined): { emoji: string; text: string; tone: string } | null {
+    if (!stage) return null;
+    switch (stage) {
+        case "sent":              return { emoji: "🕐", text: "Sent",     tone: "text-cyan-400" };
+        case "vendor_acknowledged": return { emoji: "✋", text: "Acked",   tone: "text-cyan-300" };
+        case "moving_with_tracking": return { emoji: "📦", text: "In Transit", tone: "text-emerald-300" };
+        case "delivered":         return { emoji: "✅", text: "Delivered", tone: "text-emerald-400" };
+        case "noncomm":           return { emoji: "🚫", text: "Unresponsive", tone: "text-rose-300" };
+        case "tracking_unavailable": return { emoji: "🔍", text: "No Tracking", tone: "text-amber-300" };
+        case "human_escalated":   return { emoji: "🚨", text: "Escalated", tone: "text-purple-300" };
+        case "ap_follow_up":      return { emoji: "💬", text: "AP Follow", tone: "text-cyan-300" };
+        default:                  return { emoji: "🔄", text: stage.replace(/_/g, " "), tone: "text-zinc-400" };
+    }
+}
 function timeAgo(iso: string) {
     const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
     return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
@@ -2083,6 +2188,70 @@ export default function PurchasingPanel() {
                                                             {diffCount} qty diff
                                                         </span>
                                                     )}
+                                                    {/* ── Lifecycle summary: open POs + tracking status ── */}
+                                                    {!vSnoozed && (() => {
+                                                        const ls = vendorLifecycleSummary(group.items, openPosDetail);
+                                                        if (!ls) return null;
+                                                        const buckets: Array<{ emoji: string; text: string; tone: string }> = [];
+                                                        // One bucket per unique lifecycle stage present
+                                                        const stageOrder = ["sent", "vendor_acknowledged", "moving_with_tracking", "delivered", "noncomm", "tracking_unavailable", "human_escalated", "ap_follow_up", "stalled"];
+                                                        for (const s of stageOrder) {
+                                                            const cnt = ls.stageCounts[s];
+                                                            if (cnt && cnt > 0) {
+                                                                const meta = lifecycleStageBucket(s);
+                                                                if (meta) buckets.push(meta);
+                                                            }
+                                                        }
+
+                                                        const etaStr = ls.earliestETA
+                                                            ? new Date(ls.earliestETA).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+                                                            : null;
+
+                                                        return (
+                                                            <span
+                                                                className="text-[10px] font-mono shrink-0 flex items-center gap-1"
+                                                                title={
+                                                                    `${ls.totalPOs} PO${ls.totalPOs !== 1 ? 's' : ''} in flight\n` +
+                                                                    buckets.map(b => `${b.emoji} ${b.text}`).join('\n') +
+                                                                    (etaStr ? `\n📅 Earliest ETA: ${etaStr}` : '') +
+                                                                    (ls.stuckCount > 0 ? `\n⚠ ${ls.stuckCount} stuck — action needed` : '') +
+                                                                    (ls.hasDeliveredNotReceived ? '\n✅ Delivered — verify receipt in Finale' : '')
+                                                                }
+                                                            >
+                                                                {/* Total POs badge */}
+                                                                <span className="text-zinc-400">📋</span>
+                                                                <span className="text-zinc-400">{ls.totalPOs} PO{ls.totalPOs !== 1 ? 's' : ''}</span>
+                                                                {/* Individual stage chips — max 3 to avoid overflow */}
+                                                                <span className="text-zinc-600 mx-0.5">·</span>
+                                                                {buckets.slice(0, 3).map((b, i) => (
+                                                                    <span key={i} className={`${b.tone}`}>
+                                                                        {b.emoji} {b.text}
+                                                                    </span>
+                                                                ))}
+                                                                {buckets.length > 3 && (
+                                                                    <span className="text-zinc-500">+{buckets.length - 3}</span>
+                                                                )}
+                                                                {/* Stuck count — red if any */}
+                                                                {ls.stuckCount > 0 && (
+                                                                    <span className="text-rose-300 border border-rose-500/30 rounded px-1 ml-1">
+                                                                        ⚠ {ls.stuckCount} stuck
+                                                                    </span>
+                                                                )}
+                                                                {/* Earliest ETA */}
+                                                                {etaStr && ls.stuckCount === 0 && (
+                                                                    <span className="text-emerald-300/80">
+                                                                        📅 {etaStr}
+                                                                    </span>
+                                                                )}
+                                                                {/* Delivered-not-received */}
+                                                                {ls.hasDeliveredNotReceived && (
+                                                                    <span className="text-emerald-400 border border-emerald-500/30 rounded px-1">
+                                                                        ✅ Rcv in Finale
+                                                                    </span>
+                                                                )}
+                                                            </span>
+                                                        );
+                                                    })()}
                                                     {/* Affected FGs across this vendor's BOM items */}
                                                     {!vSnoozed && (() => {
                                                         const fgs = new Map<string, string>();
@@ -2550,6 +2719,32 @@ export default function PurchasingPanel() {
                                                                                                 {pieces.length > 0 && <span className="text-zinc-500 shrink-0">·</span>}
                                                                                                 <span className="truncate">{pieces.join(' · ')}</span>
                                                                                                 {!detail && <span className="text-[9.5px] text-zinc-500 italic shrink-0">no tracking detail</span>}
+                                                                                                {/* Stuck/blocked next-action guidance */}
+                                                                                                {(detail && (
+                                                                                                    detail.lifecycleStage === "noncomm" ||
+                                                                                                    detail.lifecycleStage === "tracking_unavailable" ||
+                                                                                                    detail.lifecycleStage === "human_escalated" ||
+                                                                                                    detail.lifecycleStage === "ap_follow_up" ||
+                                                                                                    detail.lifecycleStage === "stalled" ||
+                                                                                                    (detail.lifecycleStage === "delivered" && !detail.isReceived)
+                                                                                                )) && (() => {
+                                                                                                    if (detail!.lifecycleStage === "delivered" && !detail!.isReceived) {
+                                                                                                        return (
+                                                                                                            <span className="text-[10px] font-mono shrink-0 text-emerald-400 border border-emerald-500/30 bg-emerald-500/10 rounded px-1 ml-auto" title="Carrier shows delivered but Finale has no receipt. Verify physical receipt and mark received.">
+                                                                                                                ✅ Verify receipt →
+                                                                                                            </span>
+                                                                                                        );
+                                                                                                    }
+                                                                                                    const stuckMeta = STUCK_LABELS[detail!.lifecycleStage!];
+                                                                                                    if (stuckMeta) {
+                                                                                                        return (
+                                                                                                            <span className={`text-[10px] font-mono shrink-0 rounded px-1 ml-auto ${stuckMeta.tone}`} title={`Stuck: ${stuckMeta.action}.`}>
+                                                                                                                🚫 {stuckMeta.action}
+                                                                                                            </span>
+                                                                                                        );
+                                                                                                    }
+                                                                                                    return null;
+                                                                                                })()}
                                                                                             </div>
                                                                                         );
                                                                                     })}
