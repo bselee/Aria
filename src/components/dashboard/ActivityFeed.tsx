@@ -18,7 +18,7 @@ import {
     Webhook, BotMessageSquare, ChevronDown, ChevronRight,
     Check, X, Pause, RotateCcw, CreditCard,
     FileQuestion, Ban, Loader2, Send, TrendingUp, Sparkles,
-    MessageSquare
+    MessageSquare, CalendarDays, RefreshCw
 } from "lucide-react";
 
 // ──────────────────────────────────────────────────
@@ -181,8 +181,183 @@ function ReconciliationDetail({ metadata }: { metadata: any }) {
 }
 
 // ──────────────────────────────────────────────────
-// DISMISS MENU
+// AUTO-APPLY / VENDOR DISCREPANCY DETAIL
 // ──────────────────────────────────────────────────
+
+function AutoApplyDetail({ intent, metadata }: { intent: string; metadata: any }) {
+    if (!metadata) return null;
+
+    // RECONCILIATION_AUTO_APPLIED
+    if (intent === "RECONCILIATION_AUTO_APPLIED") {
+        const applied = metadata.applied ?? [];
+        const skipped = metadata.skipped ?? [];
+        const errors = metadata.errors ?? [];
+        const hasFreight = metadata.hasFreightChange;
+
+        return (
+            <div className="mt-3 space-y-2 font-mono text-xs">
+                {metadata.overallVerdict && (
+                    <div className="flex items-center gap-1.5">
+                        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border text-emerald-400 bg-emerald-500/10 border-emerald-500/20">
+                            {metadata.overallVerdict}
+                        </span>
+                    </div>
+                )}
+                <div className="text-zinc-500 uppercase tracking-wider text-[10px]">
+                    Changes Applied
+                </div>
+                {applied.length > 0 && (
+                    <div className="space-y-0.5">
+                        {applied.map((item: string, i: number) => (
+                            <div key={i} className="flex items-center gap-1.5 text-emerald-400">
+                                <Check className="w-3 h-3 shrink-0" />
+                                <span>{item}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                {skipped.length > 0 && (
+                    <div>
+                        <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-0.5">Skipped</div>
+                        {skipped.map((item: string, i: number) => (
+                            <div key={i} className="flex items-center gap-1.5 text-amber-400">
+                                <AlertCircle className="w-3 h-3 shrink-0" />
+                                <span>{item}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                {errors.length > 0 && (
+                    <div>
+                        <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-0.5">Errors</div>
+                        {errors.map((item: string, i: number) => (
+                            <div key={i} className="flex items-center gap-1.5 text-rose-400">
+                                <AlertCircle className="w-3 h-3 shrink-0" />
+                                <span>{item}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                {hasFreight && (
+                    <div className="text-blue-400 flex items-center gap-1">
+                        <Send className="w-3 h-3" /> Freight change applied
+                    </div>
+                )}
+                {metadata.priceChangeCount > 0 && (
+                    <div className="text-zinc-400">
+                        {metadata.priceChangeCount} price change{metadata.priceChangeCount !== 1 ? "s" : ""}
+                        {metadata.feeChangeCount > 0 && ` · ${metadata.feeChangeCount} fee change${metadata.feeChangeCount !== 1 ? "s" : ""}`}
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // RECONCILIATION_BLOCKED
+    if (intent === "RECONCILIATION_BLOCKED") {
+        const dollarImpact = metadata.totalDollarImpact ?? 0;
+        const sanityViolation = metadata.sanityViolation;
+
+        return (
+            <div className="mt-3 space-y-2 font-mono text-xs">
+                <div className="flex items-center gap-2">
+                    <span className="text-amber-400 font-bold">
+                        {fmtDollars(dollarImpact)}
+                    </span>
+                    <span className="text-zinc-500">total dollar impact</span>
+                </div>
+                {metadata.priceChangeCount > 0 && (
+                    <div className="text-zinc-400">
+                        {metadata.priceChangeCount} price change{metadata.priceChangeCount !== 1 ? "s" : ""}
+                        {metadata.feeChangeCount > 0 && ` · ${metadata.feeChangeCount} fee change${metadata.feeChangeCount !== 1 ? "s" : ""}`}
+                    </div>
+                )}
+                {sanityViolation && (
+                    <div className="flex items-center gap-1.5 text-rose-400 bg-rose-500/10 px-2 py-1 rounded">
+                        <AlertCircle className="w-3 h-3 shrink-0" />
+                        <span>Sanity check failed: {sanityViolation}</span>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // RECONCILIATION_ERROR
+    if (intent === "RECONCILIATION_ERROR") {
+        return (
+            <div className="mt-3 space-y-1 font-mono text-xs">
+                <div className="flex items-center gap-1.5 text-rose-400">
+                    <AlertCircle className="w-3 h-3 shrink-0" />
+                    <span className="text-zinc-400">Error:</span>
+                    <span>{metadata.error ?? "Unknown error"}</span>
+                </div>
+            </div>
+        );
+    }
+
+    // VENDOR_QTY_DISCREPANCY_EMAILED
+    if (intent === "VENDOR_QTY_DISCREPANCY_EMAILED") {
+        const shortLines = metadata.shortShipmentLines ?? [];
+        return (
+            <div className="mt-3 space-y-1 font-mono text-xs">
+                {shortLines.length > 0 && (
+                    <div>
+                        <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-0.5">Short Shipment Lines</div>
+                        {shortLines.map((sl: any, i: number) => (
+                            <div key={i} className="flex items-center gap-2 text-zinc-300">
+                                <span className="text-amber-400">⚠</span>
+                                <span>{sl.sku || sl.productId || sl.item}</span>
+                                {sl.ordered !== undefined && sl.received !== undefined && (
+                                    <span className="text-zinc-500">
+                                        ordered {sl.ordered} · received {sl.received}
+                                    </span>
+                                )}
+                                {sl.shortQty !== undefined && (
+                                    <span className="text-rose-400">short {sl.shortQty}</span>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                )}
+                {metadata.gmailMessageId && (
+                    <div className="text-zinc-500 flex items-center gap-1">
+                        <Send className="w-3 h-3" />
+                        Email sent via Gmail
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // VENDOR_QTY_DISCREPANCY_RESOLVED
+    if (intent === "VENDOR_QTY_DISCREPANCY_RESOLVED") {
+        return (
+            <div className="mt-3 font-mono text-xs">
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                    <span>Vendor replied — qty discrepancy resolved</span>
+                </div>
+            </div>
+        );
+    }
+
+    // VENDOR_QTY_DISCREPANCY_ESCALATED
+    if (intent === "VENDOR_QTY_DISCREPANCY_ESCALATED") {
+        return (
+            <div className="mt-3 font-mono text-xs">
+                <div className="flex items-center gap-1.5 text-rose-400">
+                    <AlertCircle className="w-3 h-3 shrink-0" />
+                    <span>No reply in 7 days — requires manual follow-up</span>
+                </div>
+            </div>
+        );
+    }
+
+    return null;
+}
+
+// ──────────────────────────────────────────────────
+// DISMISS MENU
 
 function DismissMenu({ onDismiss, loading }: { onDismiss: (reason: string) => void; loading: boolean }) {
     return (
@@ -558,6 +733,16 @@ export default function ActivityFeed() {
     const [logs, setLogs] = useState<ActivityLog[]>([]);
     const [loading, setLoading] = useState(true);
     const [expandedId, setExpandedId] = useState<string | null>(null);
+    const [activeFilter, setActiveFilter] = useState<string>("all");
+    const [summary, setSummary] = useState<{
+        autoApplied: number;
+        blocked: number;
+        errors: number;
+        emailed: number;
+        resolved: number;
+        escalated: number;
+        total: number;
+    } | null>(null);
 
     useEffect(() => {
         const supabase = createBrowserClient();
@@ -598,11 +783,27 @@ export default function ActivityFeed() {
             .subscribe();
 
         return () => {
-            supabase.removeChannel(subscription);
-        };
-    }, []);
+                    supabase.removeChannel(subscription);
+                };
+            }, []);
 
-    // Per-row UI state for the PO_ARRIVAL_AT_RISK action buttons. Keyed by
+            // Fetch activity summary for auto-apply banner
+            useEffect(() => {
+                const fetchSummary = async () => {
+                    try {
+                        const res = await fetch("/api/dashboard/activity-summary");
+                        if (res.ok) {
+                            const data = await res.json();
+                            setSummary(data);
+                        }
+                    } catch { /* ignore */ }
+                };
+                fetchSummary();
+                const id = setInterval(fetchSummary, 60_000);
+                return () => clearInterval(id);
+            }, []);
+
+            // Per-row UI state for the PO_ARRIVAL_AT_RISK action buttons. Keyed by
     // activity row id so independent rows don't share spinners or errors.
     const [poRiskBusy, setPoRiskBusy] = useState<Record<string, "draft" | "snooze" | "followup" | null>>({});
     const [poRiskError, setPoRiskError] = useState<Record<string, string | null>>({});
@@ -707,7 +908,65 @@ export default function ActivityFeed() {
     const hiddenCount = logs.length - actionableLogs.length;
 
     return (
-        <div className="space-y-6 relative before:absolute before:inset-0 before:ml-4 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-zinc-800 before:to-transparent">
+        <div className="space-y-4 px-4 py-2">
+            {/* ── Auto-Apply Summary Banner ── */}
+            {summary && (
+                <div className="flex items-center gap-3 px-3 py-2 rounded-lg bg-zinc-900/50 border border-zinc-800/60">
+                    <CalendarDays className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-wider shrink-0">Auto-Apply (24h)</span>
+                    {summary.autoApplied > 0 && (
+                        <span className="text-[10px] font-mono text-emerald-400">{summary.autoApplied} applied</span>
+                    )}
+                    {summary.blocked > 0 && (
+                        <span className="text-[10px] font-mono text-amber-400">{summary.blocked} blocked</span>
+                    )}
+                    {summary.errors > 0 && (
+                        <span className="text-[10px] font-mono text-rose-400">{summary.errors} error{summary.errors !== 1 ? 's' : ''}</span>
+                    )}
+                    {summary.emailed > 0 && (
+                        <span className="text-[10px] font-mono text-cyan-400">{summary.emailed} emailed</span>
+                    )}
+                    {summary.escalated > 0 && (
+                        <span className="text-[10px] font-mono text-rose-300 font-semibold">{summary.escalated} escalated</span>
+                    )}
+                    {summary.total === 0 && (
+                        <span className="text-[10px] font-mono text-zinc-600">no events</span>
+                    )}
+                    <div className="flex-1" />
+                    <RefreshCw className="w-3 h-3 text-zinc-600 hover:text-zinc-400 cursor-pointer transition-colors"
+                        onClick={() => {
+                            fetch("/api/dashboard/activity-summary")
+                                .then(r => r.json())
+                                .then(setSummary)
+                                .catch(() => {});
+                        }} />
+                </div>
+            )}
+
+            {/* ── Filter Pills ── */}
+            <div className="flex items-center gap-1.5 px-1">
+                {[
+                    { key: "all", label: "All" },
+                    { key: "needs_review", label: "Needs Review" },
+                    { key: "auto_applied", label: "Auto-Applied" },
+                    { key: "blocked", label: "Blocked" },
+                    { key: "errors", label: "Errors" },
+                ].map(f => (
+                    <button key={f.key}
+                        onClick={() => setActiveFilter(f.key)}
+                        className={`text-[10px] font-mono px-2 py-1 rounded-full border transition-colors ${
+                            activeFilter === f.key
+                                ? "bg-zinc-700/50 text-zinc-200 border-zinc-600"
+                                : "bg-transparent text-zinc-600 border-zinc-800 hover:text-zinc-400 hover:border-zinc-700"
+                        }`}
+                    >
+                        {f.label}
+                    </button>
+                ))}
+            </div>
+
+            {/* ── Timeline ── */}
+            <div className="space-y-6 relative before:absolute before:inset-0 before:ml-4 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-zinc-800 before:to-transparent">
             {hiddenCount > 0 && (
                 <div className="text-center">
                     <span className="text-[10px] font-mono text-zinc-600 bg-zinc-900/50 px-2 py-0.5 rounded-full">
@@ -720,9 +979,15 @@ export default function ActivityFeed() {
                 let dotColor = "bg-zinc-700 ring-zinc-900";
                 let Icon = BotMessageSquare;
 
-                const isError = log.action_taken.toLowerCase().includes("failed") || log.action_taken.toLowerCase().includes("error");
-                const needsReview = log.action_taken.toLowerCase().includes("review") || log.action_taken.toLowerCase().includes("flagged");
-                const isSuccess = log.action_taken.toLowerCase().includes("applied") || (log.intent === "RECONCILIATION" && !needsReview);
+                const isError = log.intent === "RECONCILIATION_ERROR" || log.action_taken.toLowerCase().includes("failed") || log.action_taken.toLowerCase().includes("error");
+                const isAutoApplied = log.intent === "RECONCILIATION_AUTO_APPLIED";
+                const isBlocked = log.intent === "RECONCILIATION_BLOCKED";
+                const isEmailed = log.intent === "VENDOR_QTY_DISCREPANCY_EMAILED";
+                const isResolved = log.intent === "VENDOR_QTY_DISCREPANCY_RESOLVED";
+                const isEscalated = log.intent === "VENDOR_QTY_DISCREPANCY_ESCALATED";
+                const isAutoApplyIntent = isAutoApplied || isBlocked || isError || isEmailed || isResolved || isEscalated;
+                const needsReview = log.action_taken.toLowerCase().includes("review") || log.action_taken.toLowerCase().includes("flagged") || isBlocked || isEscalated;
+                const isSuccess = isAutoApplied || isResolved || log.action_taken.toLowerCase().includes("applied") || (log.intent === "RECONCILIATION" && !needsReview);
                 const isJunk = log.intent === "ADVERTISEMENT" || log.action_taken.toLowerCase().includes("archived");
                 const isReviewed = !!log.reviewed_at && log.reviewed_action !== "paused";
                 const isPaused = log.reviewed_action === "paused";
@@ -733,11 +998,32 @@ export default function ActivityFeed() {
                 const isPOSoon = isPOAtRisk && poSeverity === "soon_at_risk";
                 const isExpanded = expandedId === log.id;
 
+                // ── Filter by active filter ──
+                if (activeFilter === "needs_review" && !(isBlocked || isEscalated || needsReview)) return null;
+                if (activeFilter === "auto_applied" && !isAutoApplied) return null;
+                if (activeFilter === "blocked" && !isBlocked) return null;
+                if (activeFilter === "errors" && !isError) return null;
+
                 if (isPOAtRisk && !isPOSoon) {
                     dotColor = "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.7)] ring-zinc-900";
                     Icon = AlertCircle;
                 } else if (isPOSoon) {
                     dotColor = "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.6)] ring-zinc-900";
+                    Icon = AlertCircle;
+                } else if (isAutoApplied) {
+                    dotColor = "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)] ring-zinc-900";
+                    Icon = CheckCircle2;
+                } else if (isBlocked) {
+                    dotColor = "bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.5)] ring-zinc-900";
+                    Icon = AlertCircle;
+                } else if (isEmailed) {
+                    dotColor = "bg-cyan-500 shadow-[0_0_10px_rgba(6,182,212,0.5)] ring-zinc-900";
+                    Icon = Send;
+                } else if (isResolved) {
+                    dotColor = "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)] ring-zinc-900";
+                    Icon = CheckCircle2;
+                } else if (isEscalated) {
+                    dotColor = "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.7)] ring-zinc-900";
                     Icon = AlertCircle;
                 } else if (isError) {
                     dotColor = "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.5)] ring-zinc-900";
@@ -793,6 +1079,32 @@ export default function ActivityFeed() {
                                                                                 {log.metadata?.classification === 'real_invoice' && (
                                                                                     <span className="text-[10px] font-mono px-1 py-px rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
                                                                                         🔍 NEEDS ANALYSIS
+                                                                                    </span>
+                                                                                )}
+                                                                                {/* Auto-apply intent badges */}
+                                                                                {isAutoApplied && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                                                                                        ✅ AUTO-APPLIED
+                                                                                    </span>
+                                                                                )}
+                                                                                {isBlocked && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                                                                                        ⚠️ BLOCKED
+                                                                                    </span>
+                                                                                )}
+                                                                                {isEmailed && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+                                                                                        📧 VENDOR EMAILED
+                                                                                    </span>
+                                                                                )}
+                                                                                {isResolved && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                                                                                        ✅ RESOLVED
+                                                                                    </span>
+                                                                                )}
+                                                                                {isEscalated && (
+                                                                                    <span className="text-[10px] font-mono px-1 py-px rounded bg-rose-500/10 text-rose-300 border border-rose-500/20">
+                                                                                        🚨 ESCALATED
                                                                                     </span>
                                                                                 )}
                                                                                 {/* Review status badges */}
@@ -976,13 +1288,19 @@ export default function ActivityFeed() {
                                     <ReconciliationDetail metadata={log.metadata} />
                                 )}
 
-                                {/* Action buttons for RECONCILIATION entries */}
+                                {/* Expanded auto-apply details */}
+                                {isExpanded && isAutoApplyIntent && (
+                                    <AutoApplyDetail intent={log.intent} metadata={log.metadata} />
+                                )}
+
+                                {/* Action buttons for RECONCILIATION entries — skip auto-apply intents */}
                                 <ReconciliationActions log={log} onAction={handleAction} />
                             </div>
                         </div>
                     </div>
                 );
             })}
+        </div>
         </div>
     );
 }
