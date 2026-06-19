@@ -370,22 +370,6 @@ export default function ReceivedItemsPanel() {
                                                     {receiptBadge(po)!.label}
                                                 </span>
                                             )}
-                                            {apStatus && (
-                                                                                            apStatus.label === "PENDING" ? (
-                                                                                                <button
-                                                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
-                                                                                                    disabled={approvingReconcile.has(po.orderId)}
-                                                                                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
-                                                                                                    title="Approve reconciliation"
-                                                                                                >
-                                                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : apStatus.label}
-                                                                                                </button>
-                                                                                            ) : (
-                                                                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${apStatus.cls}`}>
-                                                                                                    {apStatus.label}
-                                                                                                </span>
-                                                                                            )
-                                                                                        )}
                                             {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
                                         </div>
                                         {/* Line 2: PO# + SKUs */}
@@ -457,76 +441,90 @@ export default function ReceivedItemsPanel() {
                                                 ))}
                                             </div>
                                         )}
-                                        {/* Review checklist and fulfillment indicators */}
-                                        <div className="mt-2.5 pt-2 border-t border-zinc-800/50 flex flex-col md:flex-row md:items-center justify-between gap-3 bg-zinc-900/10 p-2 rounded">
-                                            {/* Left: What is left to receive or if fully fulfilled */}
-                                            <div className="text-[11px] font-mono shrink-0">
-                                                {(() => {
-                                                    const status = getDynamicReceiptStatus(po);
-                                                    if (status === "full") {
-                                                        return (
-                                                            <div className="flex items-center gap-1.5 text-emerald-400">
-                                                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                                                                <span>PO Fulfilled</span>
-                                                            </div>
-                                                        );
-                                                    } else {
-                                                        const openLines = po.items.filter(item => (item.openQuantity ?? 0) > 0);
-                                                        if (openLines.length === 0) {
-                                                            return <span className="text-zinc-500">Fully Received</span>;
-                                                        }
-                                                        return (
-                                                            <div className="space-y-0.5">
-                                                                <span className="text-amber-300 font-semibold">Remaining to Receive:</span>
-                                                                {openLines.map(item => (
-                                                                    <div key={item.productId} className="text-zinc-400 text-[10px]">
-                                                                        {item.productId}: <span className="text-amber-200">-{fmtQty(item.openQuantity)}</span> left
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        );
-                                                    }
-                                                })()}
-                                            </div>
+                                        {/* ── PO Lifecycle State: next-action guidance ── */}
+                                        <div className="mt-2.5 pt-2 border-t border-zinc-800/50 flex flex-wrap items-center gap-2 bg-zinc-900/10 px-2.5 py-2 rounded">
+                                            {(() => {
+                                                const receiptStatus = getDynamicReceiptStatus(po);
+                                                const apLabel = apStatus?.label || "";
+                                                const isPartial = receiptStatus === "partial";
+                                                const hasOpenQty = po.items.some(i => (i.openQuantity ?? 0) > 0);
+                                                const hasInvoice = apLabel !== "UNMATCHED" && apLabel !== "";
+                                                const isReconciled = apLabel === "RECONCILED" || apLabel === "RECONCILED ±" || receiptStatus === "full" && apLabel === "RECONCILED";
+                                                const isPendingReview = apLabel === "PENDING";
+                                                const hasDiscrepancy = apLabel === "RECONCILED ±";
+                                                const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
 
-                                            {/* Right: Autonomous System Check Status Indicators */}
-                                            <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono bg-zinc-950/40 px-2.5 py-1.5 rounded border border-zinc-800/40">
-                                                <div className="flex items-center gap-1 text-emerald-400">
-                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                                                    <span>Auto-Shipping Verified</span>
-                                                </div>
-                                                <span className="text-zinc-800">·</span>
-                                                <div className="flex items-center gap-1 text-emerald-400">
-                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                                                    <span>Invoice Pricing Matching</span>
-                                                </div>
-                                                <span className="text-zinc-800">·</span>
-                                                {(() => {
-                                                    const rawStatus = String(po.receiptStatus || "").toLowerCase();
-                                                    const isCompletedState = rawStatus === "full" || rawStatus === "received";
-                                                    const dynamicStatus = getDynamicReceiptStatus(po);
+                                                // ── State classification ──
+                                                // Each state has: emoji, label, tone (for badge), and action (plain English)
+                                                let state: { emoji: string; label: string; tone: string; action: string } | null = null;
 
-                                                    if (isCompletedState) {
-                                                        return (
-                                                            <div className="flex items-center gap-1 text-emerald-400/90 font-semibold">
-                                                                <span>⚡ PO Completed</span>
-                                                            </div>
-                                                        );
-                                                    } else if (dynamicStatus === "full") {
-                                                        return (
-                                                            <div className="flex items-center gap-1 text-cyan-400 font-semibold animate-pulse">
-                                                                <span>⚡ Auto-Complete Ready</span>
-                                                            </div>
-                                                        );
-                                                    } else {
-                                                        return (
-                                                            <div className="flex items-center gap-1 text-amber-400/90 font-semibold">
-                                                                <span>Waiting for Backorders</span>
-                                                            </div>
-                                                        );
-                                                    }
-                                                })()}
-                                            </div>
+                                                if (isComplete) {
+                                                    state = { emoji: "✅", label: "COMPLETE", tone: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", action: "PO closed — no action needed" };
+                                                } else if (hasDiscrepancy && isReconciled) {
+                                                    state = { emoji: "⚠️", label: "RECONCILED ±", tone: "text-blue-400 border-blue-500/30 bg-blue-500/10", action: "Reconciled with pricing differences — verify final amounts" };
+                                                } else if (hasDiscrepancy) {
+                                                    state = { emoji: "⚠️", label: "PRICE DISCREPANCY", tone: "text-rose-300 border-rose-500/40 bg-rose-500/10", action: "Invoice $ differs from PO $ — resolve with vendor before closing" };
+                                                } else if (isPendingReview) {
+                                                    state = { emoji: "🔍", label: "MATCH INVOICE", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: "Invoice matched — review line items and approve reconciliation" };
+                                                } else if (isPartial && hasOpenQty) {
+                                                    state = { emoji: "🔄", label: "PARTIAL", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: "Partial receipt — backorder remains. No action until remaining arrives" };
+                                                } else if (hasInvoice) {
+                                                    state = { emoji: "📋", label: "VERIFY RECEIPT", tone: "text-cyan-300 border-cyan-500/40 bg-cyan-500/10", action: "Received in full — verify invoice matches PO qty & price" };
+                                                } else {
+                                                    state = { emoji: "📋", label: "RECEIVED", tone: "text-zinc-400 border-zinc-600/40 bg-zinc-800/40", action: "Receipt recorded — awaiting invoice match" };
+                                                }
+
+                                                return (
+                                                    <>
+                                                        {/* Left: State badge + action */}
+                                                        <div className="flex items-center gap-2 shrink-0">
+                                                            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${state.tone}`} title={state.action}>
+                                                                {state.emoji} {state.label}
+                                                            </span>
+                                                            <span className="text-[10px] font-mono text-zinc-400 truncate max-w-[200px]" title={state.action}>
+                                                                {state.action}
+                                                            </span>
+                                                        </div>
+
+                                                        {/* Right: Verification badges */}
+                                                        <div className="flex-1" />
+                                                        <div className="flex flex-wrap items-center gap-1.5 text-[9px] font-mono shrink-0">
+                                                            {po.items.some(i => (i.receivedQuantity ?? 0) > 0) && (
+                                                                <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+                                                                    <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
+                                                                    {po.items.reduce((s, i) => s + (i.receivedQuantity ?? 0), 0)} units rcvd
+                                                                </span>
+                                                            )}
+                                                            {isPartial && hasOpenQty && (
+                                                                <span className="text-amber-300/80 px-1 py-0.5 rounded border border-amber-500/20 bg-amber-500/5">
+                                                                    {po.items.reduce((s, i) => s + (i.openQuantity ?? 0), 0)} open
+                                                                </span>
+                                                            )}
+                                                            {hasInvoice && !isPendingReview && !hasDiscrepancy && (
+                                                                <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+                                                                    <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
+                                                                    Invoice Matched
+                                                                </span>
+                                                            )}
+                                                            {isPendingReview && apStatus && (
+                                                                <button
+                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
+                                                                    disabled={approvingReconcile.has(po.orderId)}
+                                                                    className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
+                                                                    title="Approve reconciliation"
+                                                                >
+                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
+                                                                </button>
+                                                            )}
+                                                            {hasDiscrepancy && (
+                                                                <span className="flex items-center gap-1 text-rose-300/80 px-1 py-0.5 rounded border border-rose-500/20 bg-rose-500/5">
+                                                                    ⚠️ Price mismatch
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </>
+                                                );
+                                            })()}
                                         </div>
                                     </div>
                                 );
