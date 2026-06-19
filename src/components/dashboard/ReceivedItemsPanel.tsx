@@ -91,24 +91,54 @@ function receiptBadge(po: ReceivedPO): { label: string; cls: string } | null {
 }
 
 function receiveSortValue(po: ReceivedPO): number {
-    const parsed = parseDenverDate(po.receiveDateTime || po.receiveDate);
+    const parsed = parseDenverDate(po.receiveDate || po.receiveDateTime);
     return parsed?.getTime() ?? 0;
 }
 
 function partialDiscrepancy(po: ReceivedPO): string | null {
     const status = getDynamicReceiptStatus(po);
     if (status !== "partial" || po.items.length === 0) return null;
-    const skuList = po.items
-        .filter(item => item.openQuantity == null || item.openQuantity > 0)
-        .map(item => item.productId)
-        .filter(Boolean);
-    if (skuList.length === 0) return "partial receipt";
-    if (skuList.length <= 2) return `short on ${skuList.join(", ")}`;
-    return `short on ${skuList.slice(0, 2).join(", ")} +${skuList.length - 2} more`;
+    
+    const shortItems = po.items
+        .filter(item => item.openQuantity == null || item.openQuantity > 0);
+    
+    if (shortItems.length === 0) return "partial receipt";
+    
+    const details = shortItems.slice(0, 2).map(item => {
+        const ordered = item.orderedQuantity ?? item.quantity;
+        const open = item.openQuantity;
+        if (open !== undefined && open > 0) {
+            return `${item.productId} short ${fmtQty(open)} of ${fmtQty(ordered)}`;
+        }
+        return `${item.productId} ×${fmtQty(ordered)}`;
+    });
+    
+    let result = details.join(", ");
+    if (shortItems.length > 2) result += ` +${shortItems.length - 2} more`;
+    return result;
 }
 
 function fmtQty(n: number | null | undefined): string {
     return Number(n || 0).toLocaleString();
+}
+
+function getNextActionText(po: ReceivedPO, apLabel: string): string {
+    const receiptStatus = getDynamicReceiptStatus(po);
+    const isPartial = receiptStatus === "partial";
+    const hasOpenQty = po.items.some(i => (i.openQuantity ?? 0) > 0);
+    const hasInvoice = apLabel !== "UNMATCHED" && apLabel !== "";
+    const isReconciled = apLabel === "RECONCILED" || apLabel === "RECONCILED ±" || receiptStatus === "full" && apLabel === "RECONCILED";
+    const isPendingReview = apLabel === "PENDING";
+    const hasDiscrepancy = apLabel === "RECONCILED ±";
+    const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
+
+    if (isComplete) return "✅ PO closed — no action needed";
+    if (hasDiscrepancy && isReconciled) return "⚠️ Reconciled with pricing differences — verify final amounts";
+    if (hasDiscrepancy) return "⚠️ Invoice $ differs from PO $ — resolve with vendor";
+    if (isPendingReview) return "🔍 Invoice matched — review & approve reconciliation";
+    if (isPartial && hasOpenQty) return "🔄 Partial receipt — backorder remains";
+    if (hasInvoice) return "📋 Verify invoice matches PO qty & price";
+    return "📋 Awaiting invoice match";
 }
 
 function hasPartialLineQuantities(po: ReceivedPO): boolean {
@@ -410,20 +440,42 @@ export default function ReceivedItemsPanel() {
                                                     </span>
                                                 );
                                             })}
+                                            {(() => {
+                                                const apLabel = apStatus?.label || "";
+                                                const txt = getNextActionText(po, apLabel);
+                                                const short = txt.replace(/ —.*$/, "");
+                                                return (
+                                                    <span className="text-[10px] font-mono text-zinc-500 italic shrink-0">· {short}</span>
+                                                );
+                                            })()}
                                         </div>
-                                        {hasPartialLineQuantities(po) && (
+                                        {/* Always show item breakdown when we know ordered quantities */}
+                                        {po.items.length > 0 && po.items.some(i => (i.orderedQuantity ?? i.quantity) > 0) && (
                                             <div className="mt-1.5 space-y-0.5">
                                                 {po.items.map((item) => {
                                                     const ordered = item.orderedQuantity ?? item.quantity;
-                                                    const received = item.receivedQuantity ?? 0;
-                                                    const open = item.openQuantity ?? Math.max(0, ordered - received);
+                                                    const received = item.receivedQuantity;
+                                                    const open = item.openQuantity;
+                                                    const hasReceivedData = received !== undefined;
                                                     return (
-                                                        <div key={`${po.orderId}-${item.productId}-partial`} className="text-[10.5px] font-mono text-amber-200/90">
-                                                            {item.productId} ordered {fmtQty(ordered)}
-                                                            <span className="text-zinc-500"> · </span>
-                                                            received {fmtQty(received)}
-                                                            <span className="text-zinc-500"> · </span>
-                                                            open {fmtQty(open)}
+                                                        <div key={`${po.orderId}-${item.productId}-detail`} className="text-[10.5px] font-mono">
+                                                            <span className="text-zinc-200">{item.productId}</span>
+                                                            <span className="text-zinc-500"> ordered </span>
+                                                            <span className="text-zinc-300">{fmtQty(ordered)}</span>
+                                                            {hasReceivedData ? (
+                                                                <>
+                                                                    <span className="text-zinc-500"> · received </span>
+                                                                    <span className="text-cyan-300">{fmtQty(received)}</span>
+                                                                    {(open ?? 0) > 0 && (
+                                                                        <>
+                                                                            <span className="text-zinc-500"> · </span>
+                                                                            <span className="text-rose-300">short {fmtQty(open)}</span>
+                                                                        </>
+                                                                    )}
+                                                                </>
+                                                            ) : (
+                                                                <span className="text-zinc-600"> · received unknown</span>
+                                                            )}
                                                         </div>
                                                     );
                                                 })}
@@ -476,13 +528,10 @@ export default function ReceivedItemsPanel() {
 
                                                 return (
                                                     <>
-                                                        {/* Left: State badge + action */}
+                                                        {/* Left: State badge only (action text on Line 2) */}
                                                         <div className="flex items-center gap-2 shrink-0">
                                                             <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${state.tone}`} title={state.action}>
                                                                 {state.emoji} {state.label}
-                                                            </span>
-                                                            <span className="text-[10px] font-mono text-zinc-400 truncate max-w-[200px]" title={state.action}>
-                                                                {state.action}
                                                             </span>
                                                         </div>
 
