@@ -735,9 +735,10 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
             items: order.items.map((item) => {
                 const orderedQuantity = item.orderedQuantity ?? item.quantity;
                 if (!hasLineReceiptQuantities) {
+                    // Preserve any receivedQuantity that may have come from GraphQL
                     return { ...item, orderedQuantity };
                 }
-                const receivedQuantity = receivedBySku.get(item.productId) ?? 0;
+                const receivedQuantity = receivedBySku.get(item.productId) ?? item.receivedQuantity ?? 0;
                 const receivedInWindow = windowReceivedBySku.get(item.productId) ?? 0;
                 return {
                     ...item,

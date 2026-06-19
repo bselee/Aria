@@ -449,8 +449,8 @@ export default function ReceivedItemsPanel() {
                                                 );
                                             })()}
                                         </div>
-                                        {/* Always show item breakdown when we know ordered quantities */}
-                                        {po.items.length > 0 && po.items.some(i => (i.orderedQuantity ?? i.quantity) > 0) && (
+                                        {/* For PARTIAL receipts: show per-item detail breakdown */}
+                                        {getDynamicReceiptStatus(po) === "partial" && po.items.length > 0 && (
                                             <div className="mt-1.5 space-y-0.5">
                                                 {po.items.map((item) => {
                                                     const ordered = item.orderedQuantity ?? item.quantity;

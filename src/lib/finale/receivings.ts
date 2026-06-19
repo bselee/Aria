@@ -79,6 +79,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             status
                                             receiveDate
                                         }
+                                        shipmentUrlList
                                         total
                                         supplier { name }
                                         itemList(first: 50) {
