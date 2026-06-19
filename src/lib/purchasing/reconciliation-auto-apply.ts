@@ -393,13 +393,37 @@ export async function runReconciliationAutoApply(): Promise<AutoApplyStats> {
             }
         }
 
+        // ── Guardrail: Per-line price change ceiling ───────────────────
+        // The reconciler uses AUTO_APPROVE_PERCENT=100% ("invoice is truth")
+        // but the auto-apply watcher is stricter. Any single line item with
+        // >15% price change or >$1,000 single-line dollar impact is blocked.
+        // This catches the $2.60→$8.00 (207%) errors that the reconciler's
+        // magnitude ceiling (10×) is too loose to catch.
+        const PER_LINE_PERCENT_CEILING = 0.15;
+        const PER_LINE_DOLLAR_CEILING = 1000;
+        let linePriceViolation: string | null = null;
+        for (const pc of priceChanges) {
+            const pct = Math.abs(pc.percentChange ?? 0);
+            const impact = Math.abs(pc.dollarImpact ?? 0);
+            if (pct > PER_LINE_PERCENT_CEILING && pc.verdict !== "no_change") {
+                linePriceViolation = `${pc.productId}: price changed ${(pct * 100).toFixed(1)}% ($${pc.poPrice?.toFixed(2)} → $${pc.invoicePrice?.toFixed(2)}) — exceeds ${(PER_LINE_PERCENT_CEILING * 100).toFixed(0)}% auto-apply ceiling. Vendor price may have changed or OCR misread.`;
+                break;
+            }
+            if (impact > PER_LINE_DOLLAR_CEILING && pc.verdict !== "no_change") {
+                linePriceViolation = `${pc.productId}: single-line impact $${impact.toLocaleString()} exceeds $${PER_LINE_DOLLAR_CEILING.toLocaleString()} per-line cap. Large change on one SKU — verify before applying.`;
+                break;
+            }
+        }
+
         // ── Guardrail: block message ──────────────────────────────────
-        const guardrailBlocked = exceedsDollarCap || sanityViolation !== null;
+        const guardrailBlocked = exceedsDollarCap || sanityViolation !== null || linePriceViolation !== null;
         let blockReason: string | null = null;
         if (exceedsDollarCap) {
             blockReason = `Total dollar impact $${totalImpact.toLocaleString()} exceeds auto-apply cap of $${DOLLAR_CAP.toLocaleString()}. Review in dashboard RCV column and approve manually.`;
         } else if (sanityViolation) {
             blockReason = `Quantity sanity check failed: ${sanityViolation}. Review invoice in dashboard RCV column.`;
+        } else if (linePriceViolation) {
+            blockReason = linePriceViolation;
         }
 
         // ── Dry-run path ─────────────────────────────────────────────
@@ -437,6 +461,7 @@ export async function runReconciliationAutoApply(): Promise<AutoApplyStats> {
                             priceChangeCount: priceChanges.length,
                             feeChangeCount: feeChanges.length,
                             sanityViolation,
+                            linePriceViolation,
                         },
                     });
                 }
