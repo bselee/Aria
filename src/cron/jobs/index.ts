@@ -1037,10 +1037,38 @@ defineJob({
             }
         },
         budget: { durationMs: 60_000 },
-    });
+            });
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
+            // ─────────────────────────────────────────────────────────────────────────────
+            // Vendor Qty Discrepancy Handler — auto-email vendors when reconciliation
+            // detects a short shipment qty discrepancy, monitor for reply, escalate after 7d.
+            // ─────────────────────────────────────────────────────────────────────────────
+            defineJob({
+                name: "vendor-qty-discrepancy",
+                schedule: "*/30 8-17 * * 1-5",  // every 30 min during business hours
+                onFail: "telegram-will",
+                description:
+                    "Handle qty discrepancies between invoice and received qty — email vendor, detect replies, escalate after 7d.",
+                handler: async () => {
+                    const { runVendorQtyDiscrepancyHandler } = await import(
+                        "@/lib/purchasing/vendor-qty-discrepancy"
+                    );
+                    const stats = await runVendorQtyDiscrepancyHandler();
+                    if (
+                        stats.scanned > 0 ||
+                        stats.emailed > 0 ||
+                        stats.resolved > 0
+                    ) {
+                        console.log(
+                            `[vendor-qty-discrepancy] scanned=${stats.scanned}, emailed=${stats.emailed}, resolved=${stats.resolved}, errors=${stats.errors}`,
+                        );
+                    }
+                },
+                budget: { durationMs: 90_000 },
+            });
+
+            // ─────────────────────────────────────────────────────────────────────────────
+            // AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
     // This job ran `run-ap-pipeline.ts` (a MANUAL diagnostic script) every 15 min.
 // That script has NO dedup: it finds the most-recent invoice PDF in Gmail and
 // forwards it to buildasoilap@bill.com on EVERY run — re-forwarding the same
