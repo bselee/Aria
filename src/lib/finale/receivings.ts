@@ -79,7 +79,6 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             status
                                             receiveDate
                                         }
-                                        shipmentUrlList
                                         total
                                         supplier { name }
                                         itemList(first: 50) {
@@ -119,9 +118,9 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 const allShipmentIds = (po.shipmentList || [])
                     .map((shipment: any) => String(shipment?.shipmentId || ""))
                     .filter(Boolean);
-                const urls: string[] = Array.isArray(po?.shipmentUrlList) && po.shipmentUrlList.length > 0
-                    ? po.shipmentUrlList
-                    : allShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
+                // shipmentUrlList was removed from Finale GraphQL schema (2026-06-22).
+                // Always construct URLs from shipmentList[].shipmentId.
+                const urls: string[] = allShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
 
                 const details = await Promise.all(urls.map(async (url) => {
                     try {
@@ -1354,7 +1353,9 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     description: adj.description || "",
                     amount: adj.amount || 0,
                 })),
-                shipmentUrls: po.shipmentUrlList || [],
+                // shipmentUrlList removed from Finale GraphQL schema (2026-06-22).
+                // Use shipmentList IDs to construct URLs.
+                shipmentUrls: (po.shipmentList || []).map((s: any) => `/${this.accountPath}/api/shipment/${encodeURIComponent(String(s?.shipmentId || ""))}`).filter(Boolean),
                 orderUrl: po.orderUrl,
             };
         } catch (err: any) {

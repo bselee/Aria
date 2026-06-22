@@ -2353,7 +2353,9 @@ export async function applyReconciliation(
                     { orderId: result.orderId },
                     () => client.getOrderDetails(result.orderId),
                 );
-                const shipUrls = poDetails.shipmentUrlList || [];
+                // shipmentUrlList removed from Finale GraphQL schema (2026-06-22).
+                // Use shipmentList IDs to construct URLs.
+                const shipUrls = (poDetails.shipmentList || []).map((s: any) => `/${client.accountPath}/api/shipment/${encodeURIComponent(String(s?.shipmentId || ""))}`).filter(Boolean);
 
                 if (shipUrls.length > 0) {
                     const firstShipment = shipUrls[0];
