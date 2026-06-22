@@ -87,6 +87,12 @@ module.exports = {
             // CURRENT: Production mode (`next build` once, then `next start`). Idle RSS
             // ~150MB, +3MB after warming three pages. --max-old-space-size=1024 caps
             // V8 heap at 1GB; max_memory_restart at 768M restarts well before that.
+            //
+            // HERMIA(2026-06-22): Added exp_backoff_restart_delay + min_uptime to stop
+            // restart cascade (was hitting 27+ restarts). The dashboard was crashing
+            // during the LLM calendar-parse phase on boot, and without backoff it
+            // would restart instantly — making the cold-scan never complete and the
+            // ordering screen permanently empty.
             name: "aria-dashboard",
             cwd: __dirname,
             script: "node_modules\\next\\dist\\bin\\next",
@@ -94,6 +100,11 @@ module.exports = {
             env: {
                 NODE_ENV: "production",
             },
+            restart_delay: 5000,
+            min_uptime: "30s",
+            exp_backoff_restart_delay: 10000,
+            max_restarts: 20,
+            kill_timeout: 15000,
             // Note: no log rotation caps here (dashboard logs are quiet in prod).
             // Add max_size/retain if they ever grow.
         },

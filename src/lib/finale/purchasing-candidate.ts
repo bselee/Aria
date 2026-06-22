@@ -48,5 +48,10 @@ export function shouldIncludePurchasingCandidate(candidate: PurchasingCandidateS
     if (positive(candidate.finaleDemandPerDay)) return true;
     // Path 3: Our own purchase order history (aria-tracked POs)
     if (candidate.ariaPOHistory?.hasHistory) return true;
+    // Path 4: Consumption history — Finale tracks how much was consumed even
+    // when it can't compute demand signals (e.g., job supplies like DASH101).
+    // SKUs with consumption > 0 are actively used and should be admitted;
+    // Aria's downstream pipeline will determine if ordering is needed.
+    if (positive(candidate.finaleConsumptionQty)) return true;
     return false;
 }

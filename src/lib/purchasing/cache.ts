@@ -100,7 +100,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * timeout during peak load while still bounding runaway fetches.
  * @env FETCH_TIMEOUT_MS can be overridden via env if needed (future).
  */
-const FETCH_TIMEOUT_MS = 180000;
+const FETCH_TIMEOUT_MS = 900000; // 15 min — cold scan of 730 candidates needs ~12 min
 
 export async function readSWR(
     slot: CacheSlot,
@@ -175,13 +175,15 @@ export async function prewarmPurchasingCaches(): Promise<void> {
     const client = new FinaleClient();
     try {
         const { prewarmForwardDemand } = await import('./forward-demand');
-        // Resale doesn't depend on calendar forward demand — start it
-        // immediately. The BOM scan DOES read forward demand, so we await
-        // that first to avoid the first BOM cache landing without 📅 data.
-        const resalePromise = readSWR(resaleSlot, () => client.getPurchasingIntelligence(365), false);
+        // HERMIA(2026-06-19): Run resale first, then BOM — NOT concurrently.
+        // Both share the same FinaleCoreClient rate limiter (500ms between ALL
+        // requests). When run in parallel, each scan gets ~1 req/sec effective
+        // throughput, pushing a 12-min scan past 24 minutes and exceeding the
+        // fetch timeout. Sequential execution preserves 2 req/sec per scan.
+        const resaleResult = await readSWR(resaleSlot, () => client.getPurchasingIntelligence(365), false);
         await prewarmForwardDemand(30).catch(() => undefined);
-        const bomPromise = readSWR(bomSlot, () => client.getBOMDemand(90), false);
-        await Promise.allSettled([resalePromise, bomPromise]);
+        const bomResult = await readSWR(bomSlot, () => client.getBOMDemand(90), false);
+        await Promise.allSettled([resaleResult, bomResult]);
     } finally {
         stash.prewarmRunning = false;
     }

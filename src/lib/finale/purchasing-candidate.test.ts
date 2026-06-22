@@ -36,7 +36,7 @@ describe("shouldIncludePurchasingCandidate (v2.8 multi-signal OR gate)", () => {
                 finaleConsumptionQty: 3,
                 finaleDemandQty: 0,
                 finaleDemandPerDay: 0,
-            })).toBe(false);
+            })).toBe(true); // Path 4: consumption > 0 admits it
 
             expect(shouldIncludePurchasingCandidate({
                 finaleReorderQty: 0,

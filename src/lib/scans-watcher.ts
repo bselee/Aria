@@ -4,8 +4,9 @@
  *          and route them based on filename prefix:
  *
  *          CR_ / CRMIN_ / CR (CR Minerals pumice invoices):
- *            → Slack @parker with a brief "Yo Park — Pumice scan" + reference
- *              to most recent CR Minerals PO (SKU PU100)
+ *            → DM Parker the PDF directly with stock-on-order info.
+ *              Uses SLACK_BOT_TOKEN so the message appears from @Purchase bot,
+ *              not impersonating Bill. No public channel posts.
  *
  *          Benny_ (Benny's invoices):
  *            → Email to buildasoilap@bill.com (same as AP invoice forwarding)
@@ -19,8 +20,10 @@
  *
  * @author  Hermia
  * @created 2026-06-16
+ * @updated 2026-06-19 — DM Parker with PDF; uses SLACK_BOT_TOKEN not user token.
+ *          Removed public channel post (was impersonating Bill in #purchase-orders).
  * @deps    @slack/web-api, @googleapis/gmail (sendGmailPdfEmail)
- * @env     SLACK_ACCESS_TOKEN, SLACK_BOT_TOKEN, SLACK_OWNER_USER_ID
+ * @env     SLACK_BOT_TOKEN, SLACK_OWNER_USER_ID
  *          GMAIL tokens for "default" and "ap" slots
  */
 
@@ -35,10 +38,9 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 const SCANS_DIR = "C:\\Users\\BuildASoil\\OneDrive\\_FREIGHT\\Documents\\Scans";
 const STATE_FILE = path.join(process.cwd(), "data", "scans-watcher-state.json");
 
-/** Parker McMahon's Slack user ID needs resolving — fallback is their name mention */
+/** Parker McMahon's Slack user ID — resolved at runtime, cached per run */
 let PARKER_SLACK_ID: string | null = null;
 const PARKER_NAME = "Parker McMahon";
-const PURCHASE_ORDERS_CHANNEL = "#purchase-orders";
 
 // Max age for a "most recent" CR Minerals PO query (look back 90 days)
 const CR_PO_LOOKBACK_DAYS = 90;
@@ -93,7 +95,7 @@ function classifyFile(basename: string, fullPath: string): ClassifiedFile {
         upper.startsWith("CR_DELIV_") ||
         basename.match(/^CR[A-Za-z]*_\d+/i)
     ) {
-        return { basename, fullPath, action: "slack_parker_cr", label: "CR Minerals — notify Parker" };
+        return { basename, fullPath, action: "slack_parker_cr", label: "CR Minerals — DM Parker with PDF" };
     }
 
     // Benny patterns: Benny_, Benny
@@ -132,60 +134,83 @@ function classifyFile(basename: string, fullPath: string): ClassifiedFile {
     return { basename, fullPath, action: "unknown", label: "Unclassified scan" };
 }
 
-// ── Slack: Message Parker ───────────────────────────────────────────────────
+// ── Slack: DM Parker the CR Minerals scan + PDF ────────────────────────────
 
 /**
- * Send a Slack DM to Parker about a new CR Minerals scan.
- * Uses the existing purchase-orders channel thread pattern — posts in
- * #purchase-orders as a heads-up.
+ * DM Parker the CR Minerals scan PDF with stock-on-order info.
+ * Opens a DM channel, uploads the PDF so Parker can open it directly,
+ * and includes the stock context as the message caption.
+ *
+ * Uses SLACK_BOT_TOKEN (bot) — posts as @Purchase bot, NOT as Bill Selee.
+ * This is intentional: automated scan forwarding should not impersonate Bill.
  */
 async function notifyParkerAboutCRScan(
-    slackUserToken: string,
+    slackBotToken: string,
+    pdfPath: string,
     className: string,
     crPoInfo: string,
 ): Promise<void> {
-    const slack = new WebClient(slackUserToken);
+    const slack = new WebClient(slackBotToken);
 
-    // Find Parker's user ID if we haven't cached it
+    // Resolve Parker's Slack user ID (cached per run)
     if (!PARKER_SLACK_ID) {
         try {
-            const usersList = await slack.users.list();
+            const usersList = await slack.users.list({ limit: 200 });
             const parker = usersList.members?.find(
                 (m) => m.real_name === PARKER_NAME || m.name === "parker" || m.name?.toLowerCase().includes("parker"),
             );
             PARKER_SLACK_ID = parker?.id ?? null;
         } catch (err) {
             console.warn(`[scans-watcher] Could not resolve Parker's Slack ID: ${(err as Error).message}`);
+            return;
         }
     }
 
-    const mention = PARKER_SLACK_ID ? `<@${PARKER_SLACK_ID}>` : `@${PARKER_NAME}`;
-
-    // Find #purchase-orders channel
-    let poChannelId: string | null = null;
-    try {
-        const convList = await slack.conversations.list({ types: "public_channel,private_channel", limit: 200 });
-        poChannelId = convList.channels?.find((c) => c.name === "purchase-orders")?.id ?? null;
-    } catch (err) {
-        console.warn(`[scans-watcher] Could not resolve #purchase-orders: ${(err as Error).message}`);
-    }
-
-    if (!poChannelId) {
-        console.warn(`[scans-watcher] Cannot post — #purchase-orders channel not found`);
+    if (!PARKER_SLACK_ID) {
+        console.warn(`[scans-watcher] Parker's Slack ID not resolvable — skipping DM`);
         return;
     }
 
-    const message = `${mention} Yo Park — Pumice scan dropped in Scans: ${className}\n${crPoInfo}`;
-
+    // Open a DM (IM) channel with Parker
+    let dmChannelId: string;
     try {
-        await slack.chat.postMessage({
-            channel: poChannelId,
-            text: message,
-            unfurl_links: false,
+        const dm = await slack.conversations.open({
+            users: PARKER_SLACK_ID,
         });
-        console.log(`[scans-watcher] ✓ Posted CR scan notification for ${className}`);
+        dmChannelId = (dm as any).channel?.id;
+        if (!dmChannelId) {
+            console.warn(`[scans-watcher] Could not open DM with Parker`);
+            return;
+        }
     } catch (err) {
-        console.error(`[scans-watcher] Failed to post Slack message: ${(err as Error).message}`);
+        console.error(`[scans-watcher] Failed to open DM: ${(err as Error).message}`);
+        return;
+    }
+
+    // Upload the PDF file to the DM. The initial_comment becomes the
+    // message caption that accompanies the file in Slack.
+    try {
+        await slack.files.upload({
+            channels: dmChannelId,
+            file: fs.createReadStream(pdfPath),
+            filename: className,
+            title: `CR Minerals — ${className}`,
+            initial_comment: crPoInfo,
+        });
+        console.log(`[scans-watcher] ✓ DM'd Parker with ${className} (${crPoInfo})`);
+    } catch (err) {
+        console.error(`[scans-watcher] Failed to upload file to Parker DM: ${(err as Error).message}`);
+
+        // Fallback: text-only message if file upload fails
+        try {
+            await slack.chat.postMessage({
+                channel: dmChannelId,
+                text: `New CR scan: ${className}\n${crPoInfo}`,
+            });
+            console.log(`[scans-watcher] ✓ Fallback DM (no file) sent for ${className}`);
+        } catch (fallbackErr) {
+            console.error(`[scans-watcher] Fallback DM also failed: ${(fallbackErr as Error).message}`);
+        }
     }
 }
 
@@ -323,7 +348,7 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
 
     // Load state
     const state = loadState();
-    const slackToken = process.env.SLACK_ACCESS_TOKEN;
+    const slackBotToken = process.env.SLACK_BOT_TOKEN;
 
     // Ensure scans directory exists
     if (!fs.existsSync(SCANS_DIR)) {
@@ -373,15 +398,15 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
         try {
             switch (classified.action) {
                 case "slack_parker_cr": {
-                    if (slackToken) {
-                        await notifyParkerAboutCRScan(slackToken, basename, crPoInfo);
+                    if (slackBotToken) {
+                        await notifyParkerAboutCRScan(slackBotToken, fullPath, basename, crPoInfo);
                         result.slackNotifications++;
                     } else {
-                        result.details.push(`SLACK_ACCESS_TOKEN not set — cannot notify about ${basename}`);
+                        result.details.push(`SLACK_BOT_TOKEN not set — cannot notify Parker about ${basename}`);
                         result.errors++;
                     }
                     result.processed++;
-                    result.details.push(`✓ ${basename} → Slack @parker (CR Minerals)`);
+                    result.details.push(`✓ ${basename} → DM Parker (CR Minerals)`);
                     break;
                 }
 

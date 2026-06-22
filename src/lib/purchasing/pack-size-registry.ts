@@ -5,15 +5,17 @@
  *          Used by purchasing intelligence, draft PO creation, and reconcilers.
  * @author  Will / Antigravity
  * @created 2026-05-11
- * @updated 2026-05-11
+ * @updated 2026-06-19
  *
- *          Uses pg directly via DATABASE_URL because the @supabase/supabase-js
- *          fetch path was throwing "TypeError: fetch failed" inside the Next.js
- *          server (Node 20 + Next 15 fetch wrapper interaction). pg is also
- *          faster for hot paths like getPurchasingIntelligence.
+ *          HERMIA(2026-06-19): Replaced direct pg Pool with Supabase JS client.
+ *          The old pg Pool (max:4) was leaking connections across prewarm cycles,
+ *          exhausting the nano-tier Supavisor pooler (200 conn limit) and causing
+ *          ECHECKOUTTIMEOUT/EDBHANDLEREXITED that blocked the purchasing scan.
+ *          Supabase JS client uses a single shared connection via the service role
+ *          key — no pool management needed.
  */
 
-import { Pool } from "pg";
+import { createClient } from "../supabase";
 
 export interface PackSizeRecord {
     sku: string;
@@ -24,90 +26,50 @@ export interface PackSizeRecord {
     notes: string | null;
 }
 
-let _pool: Pool | null = null;
-
-function getPool(): Pool | null {
-    if (_pool) return _pool;
-    const connectionString = process.env.DATABASE_URL;
-    if (!connectionString) {
-        console.warn("[pack-size] DATABASE_URL missing — registry disabled");
-        return null;
-    }
-    _pool = new Pool({
-        connectionString,
-        max: 4,
-        idleTimeoutMillis: 30_000,
-    });
-    _pool.on("error", (err) => {
-        console.warn("[pack-size] pool error:", err.message);
-    });
-    return _pool;
-}
-
-function rowToRecord(row: {
-    sku: string;
-    units_per_pack: number;
-    pack_unit: string;
-    ea_unit_price: string | number | null;
-    source: string | null;
-    notes: string | null;
-}): PackSizeRecord {
-    return {
-        sku: row.sku,
-        unitsPerPack: Number(row.units_per_pack),
-        packUnit: row.pack_unit,
-        eaUnitPrice: row.ea_unit_price == null ? null : Number(row.ea_unit_price),
-        source: row.source,
-        notes: row.notes,
-    };
-}
-
 /**
- * Fetch a single pack-size record by SKU.
- * Returns null if the SKU is not registered.
- */
-export async function getPackSize(sku: string): Promise<PackSizeRecord | null> {
-    const pool = getPool();
-    if (!pool) return null;
-    try {
-        const { rows } = await pool.query(
-            "SELECT sku, units_per_pack, pack_unit, ea_unit_price, source, notes FROM sku_pack_sizes WHERE sku = $1 LIMIT 1",
-            [sku],
-        );
-        if (rows.length === 0) return null;
-        return rowToRecord(rows[0]);
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[pack-size] getPackSize error for ${sku}:`, msg);
-        return null;
-    }
-}
-
-/**
- * Batch-fetch pack sizes for many SKUs in one query.
+ * Fetch all pack-size records in one batch (table has ~68 rows — tiny).
  * Returns a Map<sku, PackSizeRecord>.
+ * Uses Supabase JS client (single shared connection) instead of a direct
+ * pg Pool to avoid connection-leak issues that were exhausting the nano-tier
+ * Supavisor pooler during prewarm scans.
  */
 export async function getPackSizes(
     skus: string[],
 ): Promise<Map<string, PackSizeRecord>> {
     const result = new Map<string, PackSizeRecord>();
-    const pool = getPool();
-    if (!pool || skus.length === 0) return result;
+    if (skus.length === 0) return result;
+    const db = createClient();
+    if (!db) return result;
 
     try {
-        const { rows } = await pool.query(
-            "SELECT sku, units_per_pack, pack_unit, ea_unit_price, source, notes FROM sku_pack_sizes WHERE sku = ANY($1::text[])",
-            [skus],
-        );
-        for (const row of rows) {
-            const rec = rowToRecord(row);
-            result.set(rec.sku, rec);
+        const { data, error } = await db
+            .from("sku_pack_sizes")
+            .select("sku, units_per_pack, pack_unit, ea_unit_price, source, notes");
+        if (error) {
+            console.warn("[pack-size] getPackSizes error:", error.message);
+            return result;
+        }
+        for (const row of data ?? []) {
+            result.set(row.sku, {
+                sku: row.sku,
+                unitsPerPack: Number(row.units_per_pack),
+                packUnit: row.pack_unit,
+                eaUnitPrice: row.ea_unit_price == null ? null : Number(row.ea_unit_price),
+                source: row.source,
+                notes: row.notes,
+            });
         }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn("[pack-size] getPackSizes error:", msg);
     }
     return result;
+}
+
+/** @deprecated Use getPackSizes() — Supabase JS client replaces pg Pool. */
+async function getPackSize(sku: string): Promise<PackSizeRecord | null> {
+    const map = await getPackSizes([sku]);
+    return map.get(sku) ?? null;
 }
 
 /**

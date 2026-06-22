@@ -2769,6 +2769,31 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
 
+                    // HERMIA(2026-06-19): Fallback velocity for job-supply/consumable SKUs
+                    // that pass the candidate gate (Finale suggests reorder) but have no
+                    // sales/purchase/demand velocity tracked in Finale. Derive a conservative
+                    // daily rate from on-hand stock ÷ reorder-cycle, letting the recommender
+                    // produce a valid order suggestion instead of silently dropping the SKU.
+                    //
+                    // Validated against: RMC102 (Rootwise 8oz, 70 stock, 30d lead), DASH101
+                    // (thermal labels, 40 stock, 14d lead), XWC (extra wrap, 0 stock, 11d lead).
+                    // PAL100 excluded — local vendor (Smith Pallets, 3-5d lead), not Finale-tracked.
+                    if (dailyRate === 0 && (stockOnHand ?? 0) > 0 && (candidate.finaleReorderQty ?? 0) > 0) {
+                        const conservDays = Math.max(
+                            candidate.finaleStockoutDays != null && candidate.finaleStockoutDays > 0
+                                ? candidate.finaleStockoutDays
+                                : 90,
+                            leadTimeDays * 2,
+                            30,
+                        );
+                        const rawRate = Math.round((stockOnHand ?? 0) / conservDays);
+                        dailyRate = Math.max(1, rawRate);
+                        rateSource = "none";
+                        console.log(`[purchasing] ${sku}: dailyRate=0 but reorderQty=${
+                            candidate.finaleReorderQty
+                        } stock=${stockOnHand} — fallback velocity ${dailyRate}/d (base ${conservDays}d horizon)`);
+                    }
+
                     if (dailyRate === 0) continue; // no actual movement within windows
 
 
