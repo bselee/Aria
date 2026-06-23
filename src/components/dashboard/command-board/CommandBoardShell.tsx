@@ -80,18 +80,12 @@ function PurchasingLifecyclePanel() {
                 </div>
             </section>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-purchases">
-                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
-                    Purchases
-                </div>
-                <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
+                <div className="h-full min-h-0 overflow-hidden">
                     <ActivePurchasesPanel />
                 </div>
             </section>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-rcv">
-                <div className="px-3 py-1.5 border-b border-zinc-800/70 text-xs font-mono font-semibold uppercase text-zinc-100">
-                    RCV
-                </div>
-                <div className="h-[calc(100%-30px)] min-h-0 overflow-hidden">
+                <div className="h-full min-h-0 overflow-hidden">
                     <ReceivedItemsPanel />
                 </div>
             </section>

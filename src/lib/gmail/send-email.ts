@@ -8,6 +8,8 @@ export interface GmailPdfEmailInput {
     pdfBuffer: Buffer;
     pdfFilename: string;
     tokenName?: "default" | "ap";
+    /** Bill must be copied on all outgoing POs for tracking. */
+    cc?: string;
 }
 
 export interface GmailPdfEmailResult {
@@ -69,6 +71,7 @@ export async function sendGmailPdfEmail(input: GmailPdfEmailInput): Promise<Gmai
     const lines = [
         ...(fromAddress ? [`From: ${encodeHeader(fromAddress)}`] : []),
         `To: ${encodeHeader(input.to)}`,
+        ...(input.cc ? [`Cc: ${encodeHeader(input.cc)}`] : []),
         `Subject: ${encodeHeader(input.subject)}`,
         "MIME-Version: 1.0",
         `Content-Type: multipart/mixed; boundary="${boundary}"`,
@@ -123,6 +126,7 @@ export interface GmailTextEmailInput {
     subject: string;
     body: string;
     tokenName?: "default" | "ap";
+    cc?: string;
 }
 
 export interface GmailTextEmailResult {
@@ -148,6 +152,7 @@ export async function sendTextOnlyGmailEmail(input: GmailTextEmailInput): Promis
     const lines = [
         ...(fromAddress ? [`From: ${encodeHeader(fromAddress)}`] : []),
         `To: ${encodeHeader(input.to)}`,
+        ...(input.cc ? [`Cc: ${encodeHeader(input.cc)}`] : []),
         `Subject: ${encodeHeader(input.subject)}`,
         "MIME-Version: 1.0",
         'Content-Type: text/plain; charset="UTF-8"',

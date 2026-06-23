@@ -20,6 +20,8 @@ export interface PurchasingCandidateContext {
     finishedGoodsCoverageDays?: number | null;
     minimumOrderQty?: number | null;
     minimumOrderValue?: number | null;
+    /** True when vendor is cycle-locked — suppress all orders. */
+    vendorCycleLocked?: boolean;
 }
 
 export function buildPurchasingCandidate(
@@ -55,5 +57,6 @@ export function buildPurchasingCandidate(
         finaleConsumptionQty: item.finaleConsumptionQty,
         isBulkDelivery: item.isBulkDelivery,
         reorderMethod: item.reorderMethod ?? "default",
+        vendorCycleLocked: context.vendorCycleLocked ?? false,
     };
 }

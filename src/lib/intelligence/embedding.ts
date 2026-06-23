@@ -1,36 +1,31 @@
 /**
  * @file    embedding.ts
  * @purpose Centralized embedding module — generates 1024-dimensional vectors
- *          for memory search. Uses OpenAI text-embedding-3-small with local
- *          deterministic hashing unit-vector fallback.
+ *          for memory search. DECISION(2026-06-23): Switched from OpenAI to
+ *          OpenRouter (text-embedding-3-small) to match Honcho's config and
+ *          avoid OpenAI quota exhaustion. Falls back to local deterministic
+ *          hashing when OpenRouter is unavailable.
  * @author  Will / Antigravity / Hermia
  * @created 2026-02-24
- * @updated 2026-06-01
- * @deps    openai
- * @env     OPENAI_API_KEY
+ * @updated 2026-06-23
+ * @deps    none (fetch-based)
+ * @env     OPENROUTER_API_KEY
  */
 
-import OpenAI from 'openai';
+import { createHash } from 'crypto';
 
-let client: OpenAI | null = null;
-
-const EMBEDDING_MODEL = 'text-embedding-3-small';
+const EMBEDDING_MODEL = 'openai/text-embedding-3-small'; // OpenRouter path
 const EMBEDDING_DIMENSIONS = 1024;
 const MAX_INPUT_CHARS = 8000;
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 2;
 
-// Circuit breaker: when provider issues occur, skip all calls for DEAD_TIMEOUT_MS
+// Circuit breaker: when provider issues occur, skip all calls for deadTimeoutMs.
+// DECISION(2026-06-23): Reduced from 10min to 30s. The 10min cooldown was
+// excessive — a transient quota hiccup blocked the entire embedding pipeline
+// for 10 minutes, starving every cron job in the single-threaded event loop.
+// 30s is enough to let quota reset without killing cron cadence.
 let deadUntil = 0;
-const DEAD_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-
-function getOpenAIClient(): OpenAI {
-    if (!client) {
-        const apiKey = process.env.OPENAI_API_KEY;
-        if (!apiKey) throw new Error('OPENAI_API_KEY not set — required for embeddings');
-        client = new OpenAI({ apiKey });
-    }
-    return client;
-}
+const DEAD_TIMEOUT_MS = 30 * 1000; // 30 seconds
 
 /**
  * Deterministic 1024-dimensional local embedding fallback.
@@ -72,7 +67,6 @@ export function generateLocalFallbackEmbedding(text: string): number[] {
     for (const token of tokens) {
         const h = hashString(token);
         const index = h % dimensions;
-        // Deterministic sign (+1 or -1) to prevent bias
         const sign = (hashString(token + "_sign") % 2 === 0) ? 1 : -1;
         vector[index] += sign;
     }
@@ -97,8 +91,8 @@ export function generateLocalFallbackEmbedding(text: string): number[] {
 }
 
 /**
- * Generate an embedding vector from text using OpenAI text-embedding-3-small.
- * If OpenAI is unavailable, offline, or quota-limited, falls back to the deterministic local vectorizer.
+ * Generate an embedding vector from text using OpenRouter (text-embedding-3-small).
+ * Falls back to local deterministic hashing on any failure.
  *
  * @param   text  - Input text to embed (truncated to 8000 chars internally)
  * @returns Float array (1024d)
@@ -109,56 +103,78 @@ export async function embed(text: string): Promise<number[] | null> {
     }
     if (deadUntil && Date.now() >= deadUntil) {
         deadUntil = 0;
-        console.log('🔄 Embedding circuit breaker reset — retrying OpenAI...');
+        console.log('🔄 Embedding circuit breaker reset — retrying OpenRouter...');
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
-        // Fallback silently if API key is not configured (e.g. testing / local dev)
         return generateLocalFallbackEmbedding(text);
     }
 
     try {
-        const openai = getOpenAIClient();
         const truncatedText = text.slice(0, MAX_INPUT_CHARS);
 
         for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
             try {
-                const result = await openai.embeddings.create({
-                    model: EMBEDDING_MODEL,
-                    input: truncatedText,
-                    dimensions: EMBEDDING_DIMENSIONS,
-                });
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 8000);
 
+                const resp = await fetch('https://openrouter.ai/api/v1/embeddings', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`,
+                        'HTTP-Referer': 'https://aria.buildasoil.com',
+                        'X-Title': 'Aria',
+                    },
+                    body: JSON.stringify({
+                        model: EMBEDDING_MODEL,
+                        input: truncatedText,
+                        dimensions: EMBEDDING_DIMENSIONS,
+                    }),
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+
+                if (!resp.ok) {
+                    const errText = await resp.text().catch(() => '');
+                    const is429 = resp.status === 429;
+                    const isQuota = errText.includes('quota') || errText.includes('exceeded') || resp.status === 402;
+
+                    if (is429 && !isQuota && attempt < MAX_RETRIES - 1) {
+                        const backoffMs = Math.pow(2, attempt + 1) * 1000;
+                        console.warn(`⏳ Embedding rate-limited (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${backoffMs / 1000}s...`);
+                        await new Promise(resolve => setTimeout(resolve, backoffMs));
+                        continue;
+                    }
+
+                    if (isQuota) {
+                        deadUntil = Date.now() + DEAD_TIMEOUT_MS;
+                        console.warn(`🛑 Embedding provider circuit-broken for ${DEAD_TIMEOUT_MS / 1000}s (quota exhausted). Memory calls will fall back to local embedding.`);
+                    } else if (attempt === 0) {
+                        console.error(`❌ Embedding unavailable: HTTP ${resp.status} — ${errText.slice(0, 120)}`);
+                    }
+                    return generateLocalFallbackEmbedding(text);
+                }
+
+                const result = await resp.json();
                 const embedding = result?.data?.[0]?.embedding;
                 if (!embedding || !Array.isArray(embedding)) {
-                    console.warn('⚠️ OpenAI returned no embedding data');
+                    console.warn('⚠️ OpenRouter returned no embedding data');
                     return generateLocalFallbackEmbedding(text);
                 }
                 return embedding;
             } catch (err: any) {
                 const msg = err?.message || '';
-                const is429 = err?.status === 429 || msg.includes('429') || msg.includes('rate limit');
-                const isQuotaExceeded = msg.includes('quota') || msg.includes('exceeded') || msg.includes('billing') || msg.includes('insufficient');
-
-                if (is429 && !isQuotaExceeded && attempt < MAX_RETRIES - 1) {
-                    const backoffMs = Math.pow(2, attempt + 1) * 1000;
-                    console.warn(`⏳ Embedding rate-limited (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${backoffMs / 1000}s...`);
-                    await new Promise(resolve => setTimeout(resolve, backoffMs));
+                if (attempt < MAX_RETRIES - 1 && (msg.includes('timeout') || msg.includes('abort'))) {
+                    console.warn(`⏳ Embedding timeout (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying...`);
                     continue;
                 }
-
-                if (isQuotaExceeded) {
-                    deadUntil = Date.now() + DEAD_TIMEOUT_MS;
-                    console.warn('🛑 Embedding provider circuit-broken for 10 min (quota exhausted). Memory calls will fall back to local embedding.');
-                } else if (attempt === 0) {
-                    console.error(`❌ Embedding unavailable: ${msg.slice(0, 120)}`);
-                }
-                return generateLocalFallbackEmbedding(text);
+                throw err;
             }
         }
     } catch (err: any) {
-        console.error(`❌ OpenAI client error: ${err.message}`);
+        console.error(`❌ Embedding fetch error: ${err.message?.slice(0, 120)}`);
         return generateLocalFallbackEmbedding(text);
     }
     return generateLocalFallbackEmbedding(text);
@@ -166,7 +182,7 @@ export async function embed(text: string): Promise<number[] | null> {
 
 /**
  * Generate an embedding optimized for search queries (vs passage storage).
- * OpenAI text-embedding-3-small handles query/passage distinction implicitly
+ * OpenRouter text-embedding-3-small handles query/passage distinction implicitly
  * through training — no separate inputType parameter needed.
  *
  * @param   query - Search query text

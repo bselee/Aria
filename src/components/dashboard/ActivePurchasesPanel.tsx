@@ -149,6 +149,7 @@ export default function ActivePurchasesPanel() {
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [editingEta, setEditingEta] = useState<string | null>(null);
     const [etaSaving, setEtaSaving] = useState<string | null>(null);
+    const [expandedPOs, setExpandedPOs] = useState<Set<string>>(new Set());
 
     // PO_ARRIVAL_AT_RISK index from ap_activity_log (last 24h). Drives the
     // rose/amber outline + AT-RISK pill on affected POs. Activity-first
@@ -680,8 +681,7 @@ export default function ActivePurchasesPanel() {
                                         onClick={(e) => {
                                             const target = e.target as HTMLElement;
                                             if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
-                                            lifecycle.setLockedFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds });
-                                            setTimelineOrderId(po.orderId);
+                                            setExpandedPOs(prev => { const next = new Set(prev); expandedPOs.has(po.orderId) ? next.delete(po.orderId) : next.add(po.orderId); return next; });
                                         }}
                                         className={`px-4 py-3 border-b border-zinc-800/40 transition-colors group relative cursor-pointer ${overdue ? 'border-l-2 border-l-rose-500/60' : ''} ${poBg ? poBg : !atRisk ? "hover:bg-zinc-800/20" : ""} ${riskRing}`}
                                     >
@@ -794,7 +794,11 @@ export default function ActivePurchasesPanel() {
                                                     ${po.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                                                 </span>
                                             )}
+                                            <ChevronDown className={`w-3 h-3 text-zinc-600 transition-transform shrink-0 ${expandedPOs.has(po.orderId) ? 'rotate-180' : ''}`} />
                                         </div>
+
+                                        {/* Detail section — hidden until expanded */}
+                                        {expandedPOs.has(po.orderId) && (<>
 
                                         {/* Line 2: Links and Schedule text */}
                                         <div className="mt-1 flex items-center gap-x-2 gap-y-1 flex-wrap text-[11px] font-mono text-[var(--dash-l2)]">
@@ -1228,6 +1232,7 @@ export default function ActivePurchasesPanel() {
                                                 </div>
                                             );
                                         })()}
+                                        </>)}
                                     </div>
                                 );
                             })}

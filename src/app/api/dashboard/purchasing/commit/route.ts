@@ -13,10 +13,11 @@ import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
  * POST /api/dashboard/purchasing/commit
  *
  * Actions:
- *   action=review       → fetch PO details + vendor email, store pending, return review data
- *   action=send         → commit in Finale + send email (requires sendId from review step)
- *   action=cancel       → discard pending send session, PO stays as draft in Finale
- *   action=cancel-draft → cancel the PO in Finale (ORDER_CREATED → ORDER_CANCELED)
+ *   action=review      → fetch PO details + vendor email, store pending, return review data
+ *   action=send        → commit in Finale + send email (requires sendId from review step)
+ *   action=send-direct → combined review+send — commits and emails in one call (no modal)
+ *   action=cancel      → discard pending send session, PO stays as draft in Finale
+ *   action=cancel-draft→ cancel the PO in Finale (ORDER_CREATED → ORDER_CANCELED)
  */
 export async function POST(req: NextRequest) {
     try {
@@ -63,6 +64,30 @@ export async function POST(req: NextRequest) {
                 sendId,
                 ...(warnings.length > 0 ? { warning: warnings.join('; ') } : {}),
             });
+
+        } else if (action === 'send-direct') {
+            // Combined review+send: commits PO and emails vendor in one call.
+            // No modal — used by the Send button on draft confirmation rows.
+            const { orderId, vendorPartyId } = body;
+            if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+
+            const client = new FinaleClient();
+            const review = await client.getDraftPOForReview(orderId);
+
+            if (!review.canCommit) {
+                return NextResponse.json({ error: `PO #${orderId} is not in draft status` }, { status: 409 });
+            }
+
+            const { email, source } = await lookupVendorOrderEmail(review.vendorName, review.vendorPartyId);
+            if (!email) {
+                return NextResponse.json({ error: `No vendor email on file for ${review.vendorName}` }, { status: 400 });
+            }
+
+            const sendId = await storePendingPOSend(orderId, review, email, source, { channel: 'dashboard' });
+            const result = await executePOSendAction({ sendId, triggeredBy: 'dashboard', skipEmail: false });
+            invalidatePurchasingCaches().catch(() => {});
+
+            return NextResponse.json({ status: result.status, userMessage: result.userMessage, details: result.details });
 
         } else if (action === 'send') {
             const { sendId } = body;

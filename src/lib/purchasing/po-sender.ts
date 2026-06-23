@@ -14,7 +14,7 @@ import { renderPurchaseOrderPdf } from './po-email-pdf';
 import { sendGmailPdfEmail, sendTextOnlyGmailEmail } from '../gmail/send-email';
 import { transitionLifecycleState } from './po-lifecycle';
 
-type POEmailVia = 'finale-native' | 'gmail-fallback';
+type POEmailVia = 'gmail' | 'finale-native' | 'gmail-fallback' | 'gmail-text-only';
 
 // ──────────────────────────────────────────────────
 // IN-MEMORY PENDING STORE (24h TTL)
@@ -530,28 +530,37 @@ export async function commitAndSendPO(
             throw new Error(`PO #${orderId} has no line items — refusing to commit/send`);
         }
 
-        // 1. Commit in Finale
-    //    a previous attempt that crashed mid-send, skip the commit and proceed
-    //    directly to send. This is the retry path that turns a stuck "locked
-    //    but unsent" PO back into a recoverable state.)
-    const finale = new FinaleClient();
-    const verificationIssues: string[] = [];
-    let finalStatus = 'ORDER_LOCKED';
-    let committed = true;
-    let committedAt = new Date().toISOString();
-    try {
-        await finale.commitDraftPO(orderId);
-    } catch (err: any) {
-        const msg = err?.message ?? String(err);
-        // commitDraftPO throws when status is anything other than ORDER_CREATED.
-        // If it's already ORDER_LOCKED we treat that as success-equivalent —
-        // someone else (or a previous attempt) already committed.
-        if (/ORDER_LOCKED/.test(msg)) {
-            verificationIssues.push(`commit skipped: PO already ORDER_LOCKED (retrying email)`);
-        } else {
-            throw err;
+        // 1. Commit in Finale — with retry for API flakiness
+        //    DECISION(2026-06-23): Finale REST API produces intermittent 502/fetch-failed
+        //    errors. Retry up to 3 times with exponential backoff. If the PO is already
+        //    ORDER_LOCKED (previous attempt crashed mid-send), skip commit and proceed
+        //    directly to send.
+        const finale = new FinaleClient();
+        const verificationIssues: string[] = [];
+        let finalStatus = 'ORDER_LOCKED';
+        let committed = true;
+        let committedAt = new Date().toISOString();
+        const MAX_COMMIT_RETRIES = 3;
+        for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt++) {
+            try {
+                await finale.commitDraftPO(orderId);
+                break; // success
+            } catch (err: any) {
+                const msg = err?.message ?? String(err);
+                if (/ORDER_LOCKED/.test(msg)) {
+                    verificationIssues.push(`commit skipped: PO already ORDER_LOCKED (retrying email)`);
+                    break;
+                }
+                if (attempt < MAX_COMMIT_RETRIES - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[po-sender] commitDraftPO retry ${attempt + 1}/${MAX_COMMIT_RETRIES} for ${orderId} after ${delay}ms: ${msg}`);
+                    await new Promise(r => setTimeout(r, delay));
+                } else {
+                    console.error(`[po-sender] commitDraftPO exhausted ${MAX_COMMIT_RETRIES} retries for ${orderId}: ${msg}`);
+                    throw err;
+                }
+            }
         }
-    }
 
     // 1b. Post-commit verification — re-fetch and confirm status flipped to ORDER_LOCKED
     try {
@@ -567,10 +576,11 @@ export async function commitAndSendPO(
         verificationIssues.push(`post-commit re-fetch failed: ${err?.message ?? String(err)}`);
     }
 
-    // 2. Send the PO. Try Finale's native email action first (it bundles the
-    //    Finale-rendered PDF). If that's unavailable — Finale REST does not
-    //    expose an email action URL on the order object — fall back to Gmail
-    //    with a self-rendered PDF so the vendor still receives the PO.
+    // 2. Send the PO. DECISION(2026-06-23): Gmail is now the primary email
+    //    path. Finale's native email requires FINALE_PO_EMAIL_ACTION_TEMPLATE
+    //    which is unset and unreliable. Gmail renders its own PDF, verifies
+    //    delivery via Sent folder check, and records messageId for thread tracking.
+    //    Finale native remains as fallback — if Gmail fails, try Finale email.
     let emailSent = false;
     let pdfAttached = false;
     let sentAt: string | null = null;
@@ -581,77 +591,71 @@ export async function commitAndSendPO(
     let gmailThreadId: string | null = null;
     let gmailFromAddress: string | null = null;
 
-    // Prefer Finale-native email because it carries Finale's PO render. If the
-    // native endpoint is unavailable, Gmail fallback keeps the vendor thread
-    // moving with an attached PO PDF and records the send source explicitly.
     if (!skipEmail && vendorEmail) {
         const { subject, body } = generatePOEmailBody(review);
+        // ── Primary: Gmail with self-rendered PDF ────────────────────────
         try {
-            const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
-                toEmail: vendorEmail,
+            const pdfBuffer = await renderPurchaseOrderPdf(review);
+            const gmailResult = await sendGmailPdfEmail({
+                to: vendorEmail,
+                cc: "bill.selee@buildasoil.com",
                 subject,
                 body,
+                pdfBuffer,
+                pdfFilename: `BuildASoil-PO-${orderId}.pdf`,
             });
-            emailSent = sendResult.sent;
-            pdfAttached = sendResult.pdfAttached;
-            finaleEmailActionUrl = sendResult.actionUrl;
+            emailSent = true;
+            pdfAttached = true;
             sentAt = new Date().toISOString();
-            emailVia = 'finale-native';
-        } catch (err: any) {
-            const finaleNativeError = err?.message ?? String(err);
-            emailError = finaleNativeError;
-            verificationIssues.push(`Finale native email unavailable: ${finaleNativeError}`);
+            emailVia = 'gmail';
+            gmailMessageId = gmailResult.messageId;
+            gmailThreadId = gmailResult.threadId;
+            gmailFromAddress = gmailResult.fromAddress;
+            emailError = undefined;
+            if (gmailResult.verified) {
+                verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — verified in Sent`);
+            } else {
+                verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — NOT verified: ${gmailResult.verifyError || 'unknown'}`);
+            }
+        } catch (gmailErr: any) {
+            console.warn(`[po-sender] Gmail primary send failed for ${orderId}: ${gmailErr?.message ?? String(gmailErr)}`);
+            // ── Fallback: Finale native email ────────────────────────────
             try {
-                const pdfBuffer = await renderPurchaseOrderPdf(review);
-                const gmailResult = await sendGmailPdfEmail({
-                    to: vendorEmail,
+                const sendResult = await finale.sendPurchaseOrderEmail(orderId, {
+                    toEmail: vendorEmail,
                     subject,
                     body,
-                    pdfBuffer,
-                    pdfFilename: `BuildASoil-PO-${orderId}.pdf`,
                 });
-                emailSent = true;
-                pdfAttached = true;
+                emailSent = sendResult.sent;
+                pdfAttached = sendResult.pdfAttached;
+                finaleEmailActionUrl = sendResult.actionUrl;
                 sentAt = new Date().toISOString();
-                emailVia = 'gmail-fallback';
-                gmailMessageId = gmailResult.messageId;
-                gmailThreadId = gmailResult.threadId;
-                gmailFromAddress = gmailResult.fromAddress;
+                emailVia = 'finale-native';
                 emailError = undefined;
-                if (gmailResult.verified) {
-                    verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — verified in Sent`);
-                } else {
-                    verificationIssues.push(`Gmail sent PO PDF to ${vendorEmail} — NOT verified: ${gmailResult.verifyError || 'unknown'}`);
-                }
-            } catch (gmailErr: any) {
-                // HERMIA(2026-06-10): Text-only fallback kept as safety net. PDFKit is
-                // now stable, but if generation fails we still send a readable text email
-                // rather than nothing. The error is surfaced prominently so the operator
-                // knows PDF sending degraded.
-                // ╔══════════════════════════════════════════════════════╗
-                // ║ WARNING: PDF generation failed — falling back to    ║
-                // ║ text-only email. Check renderPurchaseOrderPdf().    ║
-                // ╚══════════════════════════════════════════════════════╝
-                console.warn('[PO-SENDER] PDF generation failed, sending text-only email:', gmailErr?.message ?? String(gmailErr));
-                const textOnlyBody = generateTextOnlyPOEmail(review);
+                verificationIssues.push(`Finale native email fallback sent to ${vendorEmail}`);
+            } catch (finaleErr: any) {
+                emailError = `Gmail failed (${gmailErr?.message ?? String(gmailErr)}); Finale failed (${finaleErr?.message ?? String(finaleErr)})`;
+                // ── Last resort: text-only Gmail ────────────────────────
                 try {
+                    const textOnlyBody = generateTextOnlyPOEmail(review);
                     const textGmailResult = await sendTextOnlyGmailEmail({
                         to: vendorEmail,
+                        cc: "bill.selee@buildasoil.com",
                         subject,
                         body: textOnlyBody,
                     });
                     emailSent = true;
                     pdfAttached = false;
                     sentAt = new Date().toISOString();
-                    emailVia = 'gmail-fallback';
+                    emailVia = 'gmail-text-only';
                     gmailMessageId = textGmailResult.messageId;
                     gmailThreadId = textGmailResult.threadId;
                     gmailFromAddress = textGmailResult.fromAddress;
-                    emailError = `PDF generation failed (${gmailErr?.message ?? String(gmailErr)}) — sent text-only email.`;
+                    emailError = `PDF generation failed — sent text-only email.`;
                     verificationIssues.push(`Text-only Gmail fallback sent to ${vendorEmail}`);
                 } catch (textErr: any) {
-                    emailError = `Finale native failed (${finaleNativeError}); Gmail fallback failed (${gmailErr?.message ?? String(gmailErr)})`;
-                    verificationIssues.push(`Gmail fallback failed: ${gmailErr?.message ?? String(gmailErr)} — PO is committed in Finale; send manually from there.`);
+                    emailError = `All email paths failed: Gmail PDF (${gmailErr?.message ?? ''}), Finale native (${finaleErr?.message ?? ''}), Gmail text (${textErr?.message ?? ''})`;
+                    verificationIssues.push(`PO #${orderId} is committed in Finale — all email paths failed. Send manually.`);
                 }
             }
         }
@@ -932,6 +936,7 @@ export async function retrySendEmail(
             const pdfBuffer = await renderPurchaseOrderPdf(review);
             const gmailResult = await sendGmailPdfEmail({
                 to: vendorEmail,
+                cc: "bill.selee@buildasoil.com",
                 subject,
                 body,
                 pdfBuffer,

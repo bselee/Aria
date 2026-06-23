@@ -34,12 +34,14 @@ type CacheStash = {
     bom: CacheSlot;
     prewarmTimer: NodeJS.Timeout | null;
     prewarmRunning: boolean;
+    lastPrewarmMs: number; // cold-start cooldown — avoid flooding Finale on rapid restarts
 };
 const stash: CacheStash = ((globalThis as any).__aria_purchasing_cache ??= {
     resale: { value: null, at: 0, promise: null },
     bom: { value: null, at: 0, promise: null },
     prewarmTimer: null,
     prewarmRunning: false,
+    lastPrewarmMs: 0,
 }) as CacheStash;
 
 export const resaleSlot = stash.resale;
@@ -171,7 +173,12 @@ export function invalidatePurchasingCaches(): void {
  */
 export async function prewarmPurchasingCaches(): Promise<void> {
     if (stash.prewarmRunning) return;
+    // Cold-start cooldown: skip if last prewarm was < 5 minutes ago.
+    // Prevents rapid PM2 restarts from flooding Finale with full scans.
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    if (Date.now() - stash.lastPrewarmMs < COOLDOWN_MS) return;
     stash.prewarmRunning = true;
+    stash.lastPrewarmMs = Date.now();
     const client = new FinaleClient();
     try {
         const { prewarmForwardDemand } = await import('./forward-demand');

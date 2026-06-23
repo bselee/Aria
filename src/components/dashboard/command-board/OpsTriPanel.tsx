@@ -44,12 +44,14 @@ const ROWS: RowDef[] = [
         label: "Active Purchases",
         sub: "POs in flight — placed but not yet received",
         render: () => <ActivePurchasesPanel />,
+        alwaysOpen: true,
     },
     {
         id: "receivings",
         label: "Receivings",
         sub: "what arrived this week",
         render: () => <ReceivedItemsPanel />,
+        alwaysOpen: true,
     },
 ];
 

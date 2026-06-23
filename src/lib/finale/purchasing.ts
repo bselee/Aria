@@ -1667,13 +1667,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         }
 
         // ── Step 3: Build PO payload ─────────────────────────────────────────
-        // DECISION(2026-03-19): Set dueDate to today + 14 days as default expected
-        // arrival. This populates the expected arrival date directly on the PO in
-        // Finale — calendar sync, OOS reports, and ordering UI all read this field.
-        // Vendor actual lead time may differ; Will can adjust in Finale if needed.
-        const dueDate14d = new Date();
-        dueDate14d.setDate(dueDate14d.getDate() + 14);
-        const dueDateStr = dueDate14d.toISOString().split('T')[0] + 'T00:00:00';
+        // DECISION(2026-06-23): Compute dueDate from actual vendor lead times
+        // instead of hardcoded 14 days. Uses max lead time across all items.
+        // Falls back to 14 days if no lead time data available.
+        const itemLeadTimes = items
+            .map(i => (i as any).leadTimeDays)
+            .filter((lt: any) => typeof lt === 'number' && lt > 0);
+        const maxLeadDays = itemLeadTimes.length > 0 ? Math.max(...itemLeadTimes) : 14;
+        const dueDate = new Date();
+        dueDate.setDate(dueDate.getDate() + maxLeadDays);
+        const dueDateStr = dueDate.toISOString().split('T')[0] + 'T00:00:00';
 
         const payload: Record<string, any> = {
             orderTypeId: 'PURCHASE_ORDER',

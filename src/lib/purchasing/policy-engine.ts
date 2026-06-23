@@ -22,6 +22,8 @@ export interface PurchasingCandidateInput {
     minimumOrderQty: number | null;
     minimumOrderValue: number | null;
     unitPrice: number;
+    /** True when the vendor has a committed PO in the cycle window — suppress all orders. */
+    vendorCycleLocked?: boolean;
 }
 
 function hasHealthyFinishedGoodsCoverage(days: number | null): boolean {
