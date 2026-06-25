@@ -147,6 +147,7 @@ export default function ActivePurchasesPanel() {
     const [pokeEmail, setPokeEmail] = useState("");
     const [pokeBody, setPokeBody] = useState("");
     const [actionLoading, setActionLoading] = useState<string | null>(null);
+    const [filterOverdue, setFilterOverdue] = useState(false);
     const [editingEta, setEditingEta] = useState<string | null>(null);
     const [etaSaving, setEtaSaving] = useState<string | null>(null);
     const [expandedPOs, setExpandedPOs] = useState<Set<string>>(new Set());
@@ -500,6 +501,7 @@ export default function ActivePurchasesPanel() {
 
     const visiblePurchases = purchases
         .filter((po) => !dismissed.has(po.orderId))
+        .filter((po) => !filterOverdue || isOverdue(po))
         .sort((a, b) => {
             // Received → bottom (most recent at top of the received pile)
             if (a.isReceived !== b.isReceived) return a.isReceived ? 1 : -1;
@@ -535,6 +537,20 @@ export default function ActivePurchasesPanel() {
                     <span className="text-xs font-mono px-1.5 py-0.5 rounded border bg-blue-500/10 text-blue-400 border-blue-500/20">
                         {visiblePurchases.length} POs
                     </span>
+                )}
+
+                {!loading && purchases.filter(isOverdue).length > 0 && (
+                    <button
+                        onClick={() => setFilterOverdue(!filterOverdue)}
+                        className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors cursor-pointer ${
+                            filterOverdue
+                                ? "bg-red-500/20 text-red-300 border-red-500/40"
+                                : "bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20"
+                        }`}
+                        title={filterOverdue ? "Showing overdue only — click to show all" : "Past expected delivery date — click to filter"}
+                    >
+                        {purchases.filter(isOverdue).length} overdue
+                    </button>
                 )}
 
                 {dismissed.size > 0 && (
