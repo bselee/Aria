@@ -1066,8 +1066,30 @@ export default function ActivePurchasesPanel() {
                                                          }`}
                                                      >
                                                          ✉ Poke Vendor
-                                                     </button>
-                                                 )}
+                                                         </button>
+                                                         )}
+
+                                                         {/* Close stale PO — for l3_escalated or sent POs overdue >14d */}
+                                                         {!po.isReceived && (po.lifecycleStage === 'l3_escalated' || (overdue && daysLate > 14 && po.lifecycleStage === 'sent')) && (
+                                                         <button
+                                                         onClick={async (e) => {
+                                                             e.stopPropagation();
+                                                             if (!confirm(`Close PO ${po.orderId} as stale? This marks it closed in Aria but does NOT cancel it in Finale.`)) return;
+                                                             try {
+                                                                 const res = await fetch('/api/dashboard/active-purchases', {
+                                                                     method: 'POST',
+                                                                     headers: { 'Content-Type': 'application/json' },
+                                                                     body: JSON.stringify({ action: 'close_stale', orderId: po.orderId, reason: `stale — ${daysLate}d overdue, stage=${po.lifecycleStage}` }),
+                                                                 });
+                                                                 if (res.ok) dismissPurchase(po.orderId);
+                                                             } catch { /* ignore */ }
+                                                         }}
+                                                         className="px-1.5 py-0.5 rounded border transition-colors bg-rose-500/10 border-rose-500/30 text-rose-400 hover:bg-rose-500/20"
+                                                         title="Close this PO in Aria (does not cancel in Finale)"
+                                                         >
+                                                         ✕ Close {daysLate}d stale
+                                                         </button>
+                                                         )}
                                              </div>
                                          </div>
 

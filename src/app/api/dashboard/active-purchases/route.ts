@@ -413,6 +413,28 @@ export async function POST(req: Request) {
             return NextResponse.json({ ok: true, orderId });
         }
 
+        // Action 7: Close stale PO — mark lifecycle as closed_stale without cancelling in Finale
+        if (action === "close_stale") {
+            const { error: upErr } = await db.from("purchase_orders").upsert({
+                po_number: orderId,
+                lifecycle_stage: "closed_stale",
+                updated_at: now,
+            }, { onConflict: "po_number" });
+
+            if (upErr) throw upErr;
+
+            // Audit log entry for the change
+            await db.from("ap_activity_log").insert({
+                email_from: "dashboard",
+                email_subject: `PO ${orderId} closed as stale`,
+                intent: "PO_CLOSED_STALE",
+                action_taken: `Manually closed stale PO ${orderId} — no vendor response after escalation. PO remains open in Finale.`,
+                metadata: { orderId, closedAt: now, reason: body.reason || "stale" },
+            });
+
+            return NextResponse.json({ ok: true, orderId, lifecycle_stage: "closed_stale" });
+        }
+
         return NextResponse.json({ error: "unhandled action" }, { status: 400 });
 
     } catch (err: any) {
