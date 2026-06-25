@@ -145,6 +145,41 @@ export async function loadActivePurchases(
         const completionSignals = await loadPOCompletionSignalIndex(supabase, poNumbers);
         const activePos: ActivePurchase[] = [];
 
+        // ── Self-heal: fix lifecycle_stage mismatches ──────────────────
+        // POs where Finale says received but Supabase still says "sent"
+        // These are POs that arrived but their lifecycle was never updated.
+        const healMismatches: Array<{ po_number: string; lifecycle_stage: string; last_movement_summary: string; updated_at: string }> = [];
+        for (const po of pos) {
+            if (!po.orderId) continue;
+            const isRcvd = hasPurchaseOrderReceipt({ status: po.status, receiveDate: po.receiveDate, shipments: po.shipments });
+            if (!isRcvd) continue;
+            const lifecycle = lifecycleMap.get(po.orderId);
+            if (!lifecycle) continue;
+            const stage = lifecycle.lifecycle_stage;
+            // Heal: Finale says received, but lifecycle is stuck at sent/acked/tracking_unavailable
+            if (stage === 'sent' || stage === 'vendor_acknowledged' || stage === 'tracking_unavailable' || stage === 'ap_follow_up') {
+                healMismatches.push({
+                    po_number: po.orderId,
+                    lifecycle_stage: 'received',
+                    last_movement_summary: `Auto-healed ${new Date().toISOString().slice(0,10)}: Finale reports received but lifecycle was stuck at "${stage}"`,
+                    updated_at: new Date().toISOString(),
+                });
+                // Update the in-memory lifecycle so the per-PO loop below uses the healed value
+                lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: 'received' });
+            }
+        }
+        if (healMismatches.length > 0 && supabase) {
+            try {
+                for (let i = 0; i < healMismatches.length; i += 100) {
+                    const chunk = healMismatches.slice(i, i + 100);
+                    await supabase.from('purchase_orders').upsert(chunk, { onConflict: 'po_number' });
+                }
+                console.log(`[active-purchases] Self-healed ${healMismatches.length} PO lifecycle_stage mismatches (stuck→received)`);
+            } catch (e: any) {
+                console.warn('[active-purchases] Self-heal upsert failed:', e.message);
+            }
+        }
+
         for (const po of pos) {
             if (!po.orderId) continue;
             if (po.orderId.toLowerCase().includes("dropship")) continue;
