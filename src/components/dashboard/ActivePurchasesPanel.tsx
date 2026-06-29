@@ -875,7 +875,15 @@ export default function ActivePurchasesPanel() {
                                             )}
 
                                                                                         {(() => {
-                                                                                            if (po.invoiceStatus === 'matched_review') return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300">🔍 Pending Approval</span>;
+                                                                                            if (po.invoiceStatus === 'matched_review') return (
+                                                                                                <span className="inline-flex items-center gap-1.5">
+                                                                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300">🔍 Pending Approval</span>
+                                                                                                    <button
+                                                                                                        onClick={e => { e.stopPropagation(); fetch("/api/dashboard/active-purchases", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "approve_reconciliation", orderId: po.orderId, invoiceId: po.invoiceId || "" }) }).then(r => r.ok && fetchPurchases(true)); }}
+                                                                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors cursor-pointer"
+                                                                                                    >Approve</button>
+                                                                                                </span>
+                                                                                            );
                                                                                             if (!po.sentVerification?.verified) return <span className="text-[10px] text-zinc-600 italic">Next: Verify PO was sent</span>;
                                                                                             if (!po.vendorAcknowledgedAt) return <span className="text-[10px] text-zinc-600 italic">Next: Awaiting vendor confirmation</span>;
                                                                                             if (po.lifecycleStage === 'moving_with_tracking' && !po.isReceived) return <span className="text-[10px] text-zinc-600 italic">Next: Track shipment</span>;

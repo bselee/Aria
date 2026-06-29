@@ -29,6 +29,7 @@ export interface ActivePurchase extends FullPO {
     trackingSource?: string | null;
     typicalTrackingSource?: string | null;
     vendorOrdersEmail?: string | null;
+    vendorIntel?: { total_spend?: number; pending_reconciliation?: number; avg_freight?: number } | null;
     invoiceStatus?: string;
         invoiceId?: string;
         hasDiscrepancies?: boolean;
@@ -54,17 +55,47 @@ export async function loadActivePurchases(
 
     const supabase = createClient();
     const vendorMap = new Map<string, { typical_tracking_source?: string; orders_email?: string; vendor_emails?: string[] }>();
+    // Load vendor invoice patterns for purchase decision context
+    const vendorIntelMap = new Map<string, { total_spend?: number; pending_reconciliation?: number; avg_freight?: number }>();
     if (supabase && uniqueVendors.length > 0) {
         try {
             const { data: vData } = await supabase
                 .from("vendor_profiles")
-                .select("vendor_name, typical_tracking_source, orders_email, vendor_emails")
+                .select("vendor_name, typical_tracking_source, orders_email, vendor_emails, communication_pattern, is_noncomm")
                 .in("vendor_name", uniqueVendors);
             for (const v of vData || []) {
                 vendorMap.set(v.vendor_name.toLowerCase(), v);
             }
         } catch (e) {
             console.warn("Failed to load vendor profiles in loadActivePurchases:", e);
+        }
+        try {
+            const { data: vipData } = await supabase
+                .from("vendor_invoices")
+                .select("vendor_name, total, freight, status")
+                .in("vendor_name", uniqueVendors)
+                .order("created_at", { ascending: false })
+                .limit(500);
+            const byVendor = new Map<string, { total_spend: number; avg_freight: number; pending: number; count: number }>();
+            for (const v of vipData || []) {
+                const key = v.vendor_name?.toLowerCase();
+                if (!key) continue;
+                const entry = byVendor.get(key) || { total_spend: 0, avg_freight: 0, pending: 0, count: 0 };
+                entry.total_spend += Number(v.total) || 0;
+                entry.avg_freight += Number(v.freight) || 0;
+                entry.count++;
+                if (v.status === 'received') entry.pending++;
+                byVendor.set(key, entry);
+            }
+            for (const [k, v] of byVendor) {
+                vendorIntelMap.set(k, {
+                    total_spend: v.total_spend,
+                    pending_reconciliation: v.pending,
+                    avg_freight: v.count > 0 ? v.avg_freight / v.count : 0,
+                });
+            }
+        } catch (e) {
+            console.warn("Failed to load invoice patterns:", e);
         }
     }
 
@@ -321,6 +352,7 @@ export async function loadActivePurchases(
                 trackingSource: poLifecycle?.tracking_source || null,
                 typicalTrackingSource: vendorProfile?.typical_tracking_source || null,
                 vendorOrdersEmail: vendorProfile?.orders_email || vendorProfile?.vendor_emails?.[0] || null,
+                                vendorIntel: vendorIntelMap.get(po.vendorName?.toLowerCase()) || null,
                 invoiceStatus: invoiceInfo?.status || undefined,
                                 invoiceId: invoiceInfo?.id || undefined,
                                 hasDiscrepancies: invoiceInfo?.hasDiscrepancies || false,
