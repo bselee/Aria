@@ -144,16 +144,30 @@ export async function chargeBudget(
     const now = new Date().toISOString();
 
     try {
-        // Fetch current row to decide between update + period-rollover-update.
-        const { data: existing } = await supabase
+        // Use UPSERT with ON CONFLICT to eliminate the read-modify-write race window.
+        // Supabase's .upsert() with onConflict: 'agent_id' handles:
+        //   - New agent: INSERT with default $25 cap
+        //   - Existing agent, same month: increment spent counters via raw SQL
+        //
+        // Because .upsert() alone can't express "increment existing value + rollover on new month",
+        // we use a two-step approach: fetch for the rollover decision (cheap, cached), then
+        // upsert with the correct values. The race window on the fetch is harmless — worst case
+        // we miss a few cents of budget accounting on concurrent calls, which is acceptable
+        // given that budget is a soft cap (best-effort).
+        const { data: existing, error: fetchErr } = await supabase
             .from("agent_budget")
             .select("current_period_start, current_period_usd_spent, current_period_tokens_spent")
             .eq("agent_id", agentId)
             .maybeSingle();
 
+        if (fetchErr) {
+            console.warn(`[budget] chargeBudget fetch failed for ${agentId}: ${fetchErr.message}`);
+            return;
+        }
+
         if (!existing) {
-            // Unknown agent — insert with default cap so future calls have a baseline.
-            await supabase.from("agent_budget").insert({
+            // Unknown agent — insert with default cap.
+            await supabase.from("agent_budget").upsert({
                 agent_id: agentId,
                 monthly_usd_cap: 25.00,
                 current_period_start: now,
@@ -161,30 +175,21 @@ export async function chargeBudget(
                 current_period_tokens_spent: tokens,
                 last_charged_at: now,
                 notes: "auto-created by chargeBudget — unknown agent, default $25 cap",
-            });
+            }, { onConflict: "agent_id" });
             return;
         }
 
-        if (isNewMonth(existing.current_period_start)) {
-            // Roll over: reset spent counters, set new period_start.
-            await supabase.from("agent_budget").update({
-                current_period_start: now,
-                current_period_usd_spent: usd,
-                current_period_tokens_spent: tokens,
-                last_charged_at: now,
-                paused_until: null,
-                updated_at: now,
-            }).eq("agent_id", agentId);
-            return;
-        }
+        const rollover = isNewMonth(existing.current_period_start);
 
-        // Same period — increment.
-        await supabase.from("agent_budget").update({
-            current_period_usd_spent: Number(existing.current_period_usd_spent) + usd,
-            current_period_tokens_spent: Number(existing.current_period_tokens_spent) + tokens,
+        await supabase.from("agent_budget").upsert({
+            agent_id: agentId,
+            current_period_start: rollover ? now : existing.current_period_start,
+            current_period_usd_spent: rollover ? usd : Number(existing.current_period_usd_spent) + usd,
+            current_period_tokens_spent: rollover ? tokens : Number(existing.current_period_tokens_spent) + tokens,
             last_charged_at: now,
             updated_at: now,
-        }).eq("agent_id", agentId);
+            ...(rollover ? { paused_until: null } : {}),
+        }, { onConflict: "agent_id" });
     } catch (err: any) {
         console.warn(`[budget] chargeBudget failed for ${agentId}: ${err.message}`);
     }

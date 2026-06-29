@@ -515,11 +515,11 @@ defineJob({
     handler: async () => { await ops()?.checkMissingReconciliationRuns(); },
 });
 
-// HERMIA(2026-05-28): 5m → 15m. Task closure is hygiene, not urgent.
-// Saves ~192 invocations/day.
+// HERMIA(2026-06-24): 15m → 30m. Task closure is hygiene, not urgent.
+// Saves ~96 invocations/day. Supabase free-tier friendliness.
 defineJob({
     name: "close-finished-tasks",
-    schedule: "*/15 * * * *",
+    schedule: "*/30 * * * *",
     onFail: "log",
     description: "Hygiene: close completed agent_task rows (every 15m).",
     handler: async () => { await ops()?.runCloseFinishedTasks(); },
@@ -545,11 +545,11 @@ defineJob({
     handler: async () => { await ops()?.runTaskSelfHealer(); },
 });
 
-// HERMIA(2026-05-28): 5m → 15m. Issue projection rarely finds new work per cycle.
-// Saves ~192 invocations/day.
+// HERMIA(2026-06-24): 15m → 30m. Issue projection rarely finds new work per cycle.
+// Saves ~96 invocations/day. Supabase free-tier friendliness.
 defineJob({
     name: "issue-projection",
-    schedule: "*/15 * * * *",
+    schedule: "*/30 * * * *",
     onFail: "log",
     description: "Phase 1 issue ledger projection (every 15m).",
     handler: async () => { await ops()?.runIssueProjection(); },
@@ -607,12 +607,11 @@ defineJob({
     },
 });
 
-// HERMIA(2026-05-28): Cognitive Round — the "soul" of Aria.
-// Surveys all state, makes priority decisions, logs to SQLite.
-// Runs every 15 min, right before ap-polling.
+// HERMIA(2026-06-24): 15m → 30m. Cognitive round rarely needs sub-30-min latency.
+// Saves ~96 invocations/day. Supabase free-tier friendliness.
 defineJob({
     name: "cognitive-round",
-        schedule: "*/15 * * * *",
+        schedule: "*/30 * * * *",
         onFail: "log",
         description: "Cognitive Round: survey state, decide priorities, log decisions (every 15m).",
         handler: async () => {

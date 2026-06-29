@@ -169,7 +169,7 @@ export async function notifyInternalAPSlack(
         `*Invoice #:* ${invoiceNo ? invoiceNo : "_see thread / attachment_"}`,
         `*Thread:* ${gmailThreadUrl(input.gmailThreadId)}`,
         ``,
-        `Aria auto-acknowledged the first ping (Fridays speech), but they're following up. Please review and reply with a real status.`,
+        `Auto-acknowledged the first ping (Fridays speech), but they're following up. Please review and reply with a real status.`,
     ];
     const text = lines.join("\n");
     try {

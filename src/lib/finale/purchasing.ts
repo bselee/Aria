@@ -2696,14 +2696,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
                     const suppliers: any[] = prodData.supplierList || [];
                     const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
-                    if (!mainSupplier?.supplierPartyUrl) continue;
+                    if (!mainSupplier?.supplierPartyUrl) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: no supplierPartyUrl`); continue; }
 
                     // Step B: Resolve supplier and check exclusions (_partyCacheShared keeps this fast after first hit)
                     const party = await resolveParty(mainSupplier.supplierPartyUrl);
-                    if (party.isManufactured || party.isDropship) continue;
+                    if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] party=${party.groupName} mfg=${party.isManufactured} drop=${party.isDropship}`);
+                    if (party.isManufactured || party.isDropship) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: mfg/dropship`); continue; }
 
                     // Skip products flagged "Do not reorder" in Finale
-                    if (FinaleProductsClient.isDoNotReorder(prodData)) continue;
+                    if (FinaleProductsClient.isDoNotReorder(prodData)) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: DNR`); continue; }
 
                     // Step C: Single combined GraphQL request — purchase history + sales history + open POs
                     const activity = await this.getProductActivity(sku, daysBack);
@@ -2826,8 +2827,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         console.log(`[purchasing] ${sku}: stockAvailable=${finaleAvailable} < stockOnHand=${rawStockOnHand} — committed=${committedQty.toFixed(2)} — using effectiveStock=${effectiveStock.toFixed(2)}`);
                     }
                     if (effectiveStock === 0 && stockOnHand === null) {
-                        console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku}, skipping`);
-                        continue;
+                        // HERMIA(2026-06-25): Some SKUs (RMC102, BLM212) have
+                        // reorderQty and demand data in the productViewConnection
+                        // but null stock in REST/GraphQL product activity. Don't
+                        // drop them — use a conservative stock estimate of 0
+                        // and let the recommender handle zero-stock logic.
+                        console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku} (reorderQty=${candidate.finaleReorderQty}), using 0 — item kept in pipeline`);
                     }
 
                     const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
@@ -3102,9 +3107,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     });
                 } catch {
                     // Skip products that error — non-fatal
+                    console.warn(`[finale] getPurchasingIntelligence: SKU ${sku} skipped — error caught in worker loop`);
                 }
                 // 100ms breathing room between SKUs — keeps sustained load ~180 req/min
-                await new Promise(r => setTimeout(r, 100));
+                // HERMIA(2026-06-25): REMOVED — the rate limiter in FinaleCoreClient
+                // (500ms between ALL requests globally) already paces requests far more
+                // aggressively. Adding 100ms per SKU on top of that increases cold-scan
+                // time from ~12min to ~18min, causing 20-min timeouts for R-prefixed
+                // SKUs like RMC102.
+                // await new Promise(r => setTimeout(r, 100));
             }
         }));
 

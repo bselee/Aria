@@ -102,7 +102,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * timeout during peak load while still bounding runaway fetches.
  * @env FETCH_TIMEOUT_MS can be overridden via env if needed (future).
  */
-const FETCH_TIMEOUT_MS = 900000; // 15 min — cold scan of 730 candidates needs ~12 min
+const FETCH_TIMEOUT_MS = 1_500_000; // 25 min — cold scan of 728 candidates needs ~12-15 min
 
 export async function readSWR(
     slot: CacheSlot,

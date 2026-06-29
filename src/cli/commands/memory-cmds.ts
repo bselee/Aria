@@ -18,7 +18,7 @@ import { getCmdText } from './types';
  */
 const rememberCommand: BotCommand = {
     name: 'remember',
-    description: 'Store a fact in Aria\'s memory',
+    description: 'Store a fact in memory',
     handler: async (ctx, _deps) => {
         const text = getCmdText(ctx).replace(/^\/remember\s*/, '').trim();
         if (!text) {
@@ -45,7 +45,7 @@ const rememberCommand: BotCommand = {
  */
 const recallCommand: BotCommand = {
     name: 'recall',
-    description: 'Search Aria\'s memory',
+    description: 'Search memory',
     handler: async (ctx, _deps) => {
         const query = getCmdText(ctx).replace(/^\/recall\s*/, '').trim();
         if (!query) {
@@ -74,7 +74,7 @@ const recallCommand: BotCommand = {
 };
 
 /**
- * /seed — Initialize Aria's memory with known vendor patterns.
+ description: 'Initialize memory with vendor patterns',
  */
 const seedCommand: BotCommand = {
     name: 'seed',

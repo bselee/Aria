@@ -197,20 +197,20 @@ export class CommsService {
       }
 
       const lines: string[] = [];
-      lines.push("📊 *Weekly Reorder Retro — Aria vs Finale*");
+      lines.push("📊 *Weekly Reorder Retro — Model vs Finale*");
       lines.push(`Calibrated samples: ${summary.totalSamples} (${summary.coveredSamples} comparable to Finale)`);
       if (summary.medianAriaErrorPct != null) {
-        lines.push(`Aria median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);
+        lines.push(`Model median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);
       }
       if (summary.medianFinaleErrorPct != null) {
         lines.push(`Finale median error: ${summary.medianFinaleErrorPct >= 0 ? "+" : ""}${summary.medianFinaleErrorPct.toFixed(0)}%`);
       }
-      lines.push(`Aria under Finale: ${summary.ariaUnderFinaleCount} · Aria over: ${summary.ariaOverFinaleCount}`);
+      lines.push(`Under Finale: ${summary.ariaUnderFinaleCount} · Over: ${summary.ariaOverFinaleCount}`);
 
       if (summary.bestAriaWins.length > 0) {
-        lines.push("\n*Best Aria wins (saved over Finale):*");
+        lines.push("\n*Best saves over Finale:*");
         for (const w of summary.bestAriaWins.slice(0, 3)) {
-          lines.push(`  • ${w.productId} (${w.vendorName ?? "?"}) — Aria ${w.ariaErrorPct >= 0 ? "+" : ""}${w.ariaErrorPct}% vs Finale ${w.finaleErrorPct >= 0 ? "+" : ""}${w.finaleErrorPct}%`);
+          lines.push(`  • ${w.productId} (${w.vendorName ?? "?"}) — ${w.ariaErrorPct >= 0 ? "+" : ""}${w.ariaErrorPct}% vs Finale ${w.finaleErrorPct >= 0 ? "+" : ""}${w.finaleErrorPct}%`);
         }
       }
       if (summary.worstAriaMisses.length > 0) {

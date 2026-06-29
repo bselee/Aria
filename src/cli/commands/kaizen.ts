@@ -84,14 +84,14 @@ const voiceCommand: BotCommand = {
     handler: async (ctx, deps) => {
         if (!deps.elevenLabsKey) return ctx.reply('❌ ElevenLabs API key not configured.');
 
-        ctx.reply('🎙️ Aria is thinking... (Voice generation in progress)');
+        ctx.reply('🎙️ Thinking... (Voice generation in progress)');
 
         try {
             const { unifiedTextGeneration } = await import('../../lib/intelligence/llm');
             const { default: axios } = await import('axios');
 
             // Get the system prompt for voice content generation
-            const SYSTEM_PROMPT = `You are Aria — the AI operations assistant for BuildASoil.`;
+            const SYSTEM_PROMPT = `You're the operations assistant for BuildASoil.`;
 
             let textToSpeak = await unifiedTextGeneration({
                 system: SYSTEM_PROMPT + "\n\nLimit your response to a single, clever sentence under 25 words for a voice greeting.",

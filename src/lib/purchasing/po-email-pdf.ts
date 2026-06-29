@@ -24,8 +24,15 @@ function money(value: number): string {
 }
 
 function fmtDate(value: string): string {
-    const date = new Date(`${value}T00:00:00`);
-    if (Number.isNaN(date.getTime())) return value;
+    // Accepts "2026-06-25", "2026-06-25T...", ISO, or raw string. Never returns "undefined".
+    if (!value) return "";
+    let date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        // fallback parse YYYY-MM-DD prefix
+        const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return `${parseInt(m[2],10)}/${parseInt(m[3],10)}/${m[1]}`;
+        return value;
+    }
     return date.toLocaleDateString("en-US", { month: "numeric", day: "numeric", year: "numeric" });
 }
 

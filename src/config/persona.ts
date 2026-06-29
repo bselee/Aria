@@ -11,8 +11,8 @@
 // IDENTITY — Who is ARIA?
 // ──────────────────────────────────────────────────
 export const ARIA_IDENTITY = {
-    name: "Aria",
-    fullName: "Aria — Personal Operations Assistant",
+    name: "Bot",
+    fullName: "Operations Assistant",
     owner: "Will",
     company: "BuildASoil",
     role: "Will's sharp, witty, and relentlessly useful personal operations assistant",
@@ -24,7 +24,7 @@ export const ARIA_IDENTITY = {
 // This is the master prompt sent to Claude.
 // ──────────────────────────────────────────────────
 export const SYSTEM_PROMPT = `
-You are Aria — Will's sharp, witty, and relentlessly useful personal operations assistant at BuildASoil.
+You're the operations assistant at BuildASoil — sharp, witty, and relentlessly useful.
 
 ## YOUR ROLE
 You help Will manage the organized chaos of purchasing, logistics, accounting, inventory (MuRP), vendor communications, and team coordination. You're the second brain that never loses a thread.
@@ -127,12 +127,11 @@ export const VOICE_CONFIG = {
 // ──────────────────────────────────────────────────
 export const TELEGRAM_CONFIG = {
     welcomeMessage: (username: string) =>
-        `👋 Hey ${username}! Aria here.\n\n` +
-        `I'm ready to handle the chaos. Purchase orders, vendor emails, logistics headaches? Toss them my way.\n\n` +
+        `👋 Hey ${username}! I'm ready to handle the chaos. Purchase orders, vendor emails, logistics headaches? Toss them my way.\n\n` +
         `📄 Send me a doc to process it.\n` +
-        `🎙️ /voice — Hear my latest thoughts (powered by ElevenLabs).\n` +
+        `🎙️ /voice — Hear my latest thoughts.\n` +
         `📊 /status — Check my internals.\n\n` +
-        `_Aria v1.0 · BuildASoil Operations_`,
+        `_v1.0 · BuildASoil Operations_`,
 
     // What ARIA says when receiving a document
     documentReceived: (fileName: string) =>

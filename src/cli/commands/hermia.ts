@@ -275,12 +275,12 @@ const shipCommand: BotCommand = {
 
         try {
             if (target === "bot") {
-                await ctx.reply("🔄 Shipping aria-bot…");
+                await ctx.reply("🔄 Shipping bot…");
                 const { exec } = await import("child_process");
                 const { promisify } = await import("util");
                 const execAsync = promisify(exec);
                 const result = await execAsync("pm2 restart aria-bot", { timeout: 30000 });
-                await ctx.reply(`✅ aria-bot restarted\n\`${(result.stdout || result.stderr).slice(0, 200)}\``, { parse_mode: "Markdown" });
+                await ctx.reply("✅ bot restarted");
             } else {
                 await ctx.reply("🔨 Building + shipping dashboard…");
                 const { exec } = await import("child_process");

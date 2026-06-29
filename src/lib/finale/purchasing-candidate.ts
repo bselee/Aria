@@ -8,6 +8,7 @@ export type AriaPurchaseHistory = {
 };
 
 export type PurchasingCandidateSignals = {
+    productId?: string;                     // HERMIA(2026-06-25): used by Path 5 override
     finaleReorderQty: number | null | undefined;
     finaleConsumptionQty: number | null | undefined;
     finaleDemandQty: number | null | undefined;
@@ -53,5 +54,20 @@ export function shouldIncludePurchasingCandidate(candidate: PurchasingCandidateS
     // SKUs with consumption > 0 are actively used and should be admitted;
     // Aria's downstream pipeline will determine if ordering is needed.
     if (positive(candidate.finaleConsumptionQty)) return true;
+    // Path 5: Explicit override — some SKUs (DASH101) have a REST-based
+    // reorder guideline (##demandVelocity qty=4) but the GraphQL productView
+    // reports zero for all signals. Manually admit them so the downstream
+    // recommender can evaluate based on our own velocity computation.
+    if (isOverride(candidate)) return true;
     return false;
+}
+
+/** SKUs with confirmed reorder guidelines in Finale REST that the
+ *  GraphQL productView doesn't surface. Populated as discovered. */
+const KNOWN_OVERRIDES: string[] = [
+    'DASH101',  // REST: ##demandVelocity qty=4. GraphQL: all signals 0.
+];
+
+function isOverride(candidate: PurchasingCandidateSignals): boolean {
+    return typeof candidate.productId === 'string' && KNOWN_OVERRIDES.includes(candidate.productId);
 }

@@ -67,7 +67,7 @@ const statusCommand: BotCommand = {
         }).join('\n');
 
         ctx.reply(
-            `🛰️ *Aria Runtime Status*\n` +
+            `🛰️ *Runtime Status*\n` +
             `━━━━━━━━━━━━━━━━━━━━\n` +
             `⏱️ Uptime: \`${uptimeStr}\`\n` +
             `🚀 Started: \`${deps.botStartTime.toLocaleTimeString('en-US', { timeZone: 'America/Denver' })} MT\`\n\n` +

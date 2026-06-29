@@ -409,7 +409,7 @@ export function generatePOEmailBody(review: DraftPOReview): { subject: string; b
     const datePart = Number.isNaN(date.getTime())
         ? review.orderDate
         : `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
-    const subject = `BuildASoil PO # ${review.orderId} - ${review.vendorName} - ${datePart}`;
+    const subject = `BuildASoil PO #${review.orderId} - ${review.vendorName} - ${datePart}`;
 
     const body = [
         `Hi ${review.vendorName},`,

@@ -3,7 +3,6 @@
  * @purpose Local-first AP invoice forwarder — scans Gmail directly, forwards
  *          invoice PDFs to Bill.com, tracks dedup in local SQLite.
  *          Zero Supabase dependency for the critical path.
- * @author  Hermia
  * @created 2026-06-18
  * @updated 2026-06-18 (Bill Selee: simplified — forward all PDFs, skip no-PDF emails,
  *          removed autopay concept. All vendors with PDF invoices forwarded identically.)
@@ -418,7 +417,7 @@ async function forwardToBillCom(
     const boundary = "b_aria_local_fwd_" + crypto.randomBytes(8).toString("hex");
 
     const forwardBody = [
-        "Forwarded invoice (Aria AP local pipeline).",
+        "Forwarded invoice.",
         "",
         `Sent From: ${emailFrom}`,
         `Original Subject: ${emailSubject}`,

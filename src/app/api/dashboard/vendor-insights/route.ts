@@ -11,6 +11,7 @@
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase";
+import { cachedQuery } from "@/lib/supabase/cache";
 
 type LogEntry = {
     reviewed_action: string | null;
@@ -33,23 +34,29 @@ export async function GET(req: Request) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 
-        // Query all reconciliation entries for this vendor
-        const { data } = await supabase
-            .from("ap_activity_log")
-            .select("reviewed_action, dismiss_reason, metadata, created_at")
-            .eq("intent", "RECONCILIATION")
-            .ilike("email_from", `%${vendor}%`)
-            .order("created_at", { ascending: false })
-            .limit(50);
+        // Query all reconciliation entries for this vendor (cached 30s)
+        const { data } = await cachedQuery(`vendor-insights:${vendor}`, () =>
+            supabase
+                .from("ap_activity_log")
+                .select("reviewed_action, dismiss_reason, metadata, created_at")
+                .eq("intent", "RECONCILIATION")
+                .ilike("email_from", `%${vendor}%`)
+                .order("created_at", { ascending: false })
+                .limit(50)
+                .then(r => ({ data: r.data, error: r.error }))
+        ) as any;
 
         const logs = (data || []) as LogEntry[];
 
-        // Also fetch vendor profile for Phase 3 threshold data
-        const { data: vendorProfile } = await supabase
-            .from("vendor_profiles")
-            .select("auto_approve_threshold, default_dismiss_action, reconciliation_count, approval_count")
-            .ilike("vendor_name", `%${vendor}%`)
-            .single();
+        // Also fetch vendor profile for Phase 3 threshold data (cached 30s)
+        const { data: vendorProfile } = await cachedQuery(`vendor-profile:${vendor}`, () =>
+            supabase
+                .from("vendor_profiles")
+                .select("auto_approve_threshold, default_dismiss_action, reconciliation_count, approval_count")
+                .ilike("vendor_name", `%${vendor}%`)
+                .single()
+                .then(r => ({ data: r.data, error: r.error }))
+        ) as any;
 
         const threshold = vendorProfile?.auto_approve_threshold ?? null;
 
