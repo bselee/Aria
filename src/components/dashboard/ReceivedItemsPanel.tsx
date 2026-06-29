@@ -551,6 +551,35 @@ export default function ReceivedItemsPanel() {
                                                             </span>
                                                         </div>
 
+                                                        {/* Expanded approval card — shows exactly what is being approved */}
+                                                        {rec?.hasPendingApproval && rec?.matchedInvoice && (
+                                                            <div className="mt-2 w-full bg-amber-500/5 border border-amber-500/20 rounded px-2.5 py-2">
+                                                                <div className="text-[10px] font-mono text-amber-300/80 mb-1">Invoice {rec.matchedInvoice.invoice_number} from {po.supplier}</div>
+                                                                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[11px] font-mono">
+                                                                    <span className="text-zinc-500">Subtotal</span>
+                                                                    <span className="text-zinc-300 text-right">{rec.matchedInvoice.subtotal != null ? '$' + rec.matchedInvoice.subtotal.toFixed(2) : '—'}</span>
+                                                                    <span className="text-zinc-500">Freight</span>
+                                                                    <span className="text-zinc-300 text-right">+{rec.matchedInvoice.freight != null ? '$' + rec.matchedInvoice.freight.toFixed(2) : '$0.00'}</span>
+                                                                    <span className="text-zinc-500">Tax</span>
+                                                                    <span className="text-zinc-300 text-right">+{rec.matchedInvoice.tax != null ? '$' + rec.matchedInvoice.tax.toFixed(2) : '$0.00'}</span>
+                                                                    <span className="border-t border-zinc-700/50 pt-0.5 text-zinc-400">Total</span>
+                                                                    <span className="border-t border-zinc-700/50 pt-0.5 text-amber-300 text-right font-semibold">{rec.matchedInvoice.total != null ? '$' + rec.matchedInvoice.total.toFixed(2) : '—'}</span>
+                                                                </div>
+                                                                {rec.matchedInvoice.total != null && po.total > 0 && rec.matchedInvoice.total !== po.total && (
+                                                                    <div className="mt-1 text-[10px] font-mono text-rose-400">
+                                                                        {rec.matchedInvoice.total > po.total ? '+' : ''}{Math.abs(rec.matchedInvoice.total - po.total).toFixed(2)} vs PO total {po.total}
+                                                                    </div>
+                                                                )}
+                                                                <button
+                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId, rec!.matchedInvoice!.invoice_number); }}
+                                                                    disabled={approvingReconcile.has(po.orderId)}
+                                                                    className={`mt-2 w-full text-center text-[11px] font-mono font-semibold px-2 py-1 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait bg-amber-500/10 border-amber-500/30 text-amber-400/50' : 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'}`}
+                                                                >
+                                                                    {approvingReconcile.has(po.orderId) ? 'Applying...' : 'Approve & Apply to Finale'}
+                                                                </button>
+                                                            </div>
+                                                        )}
+
                                                         {/* Right: Verification badges */}
                                                         <div className="flex-1" />
                                                         <div className="flex flex-wrap items-center gap-1.5 text-[9px] font-mono shrink-0">
