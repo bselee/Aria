@@ -269,6 +269,28 @@ export default function ReceivedItemsPanel() {
                     map[id] = { label, cls };
                 }
                 setApMap(map);
+
+                // Also fetch pending approvals from ap_pending_approvals
+                supabase
+                    .from("ap_pending_approvals")
+                    .select("order_id, invoice_number, vendor_name, status")
+                    .eq("status", "pending")
+                    .order("created_at", { ascending: false })
+                    .limit(30)
+                    .then(paRes => {
+                        const paData = (paRes as any).data;
+                        if (!paData) return;
+                        const paMap: ApStatusMap = {};
+                        for (const pa of paData) {
+                            if (!pa.order_id || paMap[pa.order_id]) continue;
+                            paMap[pa.order_id] = {
+                                label: "PENDING",
+                                cls: "text-amber-300 border-amber-500/40 bg-amber-500/10",
+                            };
+                        }
+                        // Merge: pending approvals override invoice status
+                        setApMap(prev => ({ ...prev, ...paMap }));
+                    });
             });
     }, []);
 
