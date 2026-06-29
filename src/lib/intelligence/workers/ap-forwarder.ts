@@ -4,6 +4,7 @@ import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../supabase";
 import { applyMessageLabelPolicy } from "../gmail-policy";
 import { APAgent } from "../ap-agent";
+import { writeInvoiceSummary } from "../../obsidian/bridge";
 
 /**
  * @file ap-forwarder.ts
@@ -246,7 +247,7 @@ export class APForwarderAgent {
                     // invoice/amount context so Bill.com can match bills even if OCR
                     // struggles with unusual PDF formats. Include only present fields.
                     const ej = (item.extracted_json || {}) as Record<string, any>;
-                    const bodyLines = ["Forwarded invoice (Aria AP pipeline).", ""];
+                    const bodyLines = ["Forwarded invoice.", ""];
                     const fields: Array<[string, string | undefined | null]> = [
                         ["Vendor", item.vendor_name],
                         ["Invoice #", item.invoice_number || ej.invoice_number],
@@ -414,6 +415,30 @@ export class APForwarderAgent {
 
                     if (processingResult.success) {
                         console.log(`   ✅ Successfully forwarded and processed ${item.pdf_filename}`);
+
+                        // ── Obsidian bridge: write invoice summary to vault ──
+                        // Non-blocking, silently caught — vault sync is best-effort.
+                        try {
+                            const extractedJson = item.extracted_json || {};
+                            writeInvoiceSummary({
+                                vendorName: extractedJson.vendor_name || item.email_from || "Unknown",
+                                invoiceNumber: extractedJson.invoice_number || "unknown",
+                                invoiceDate: extractedJson.invoice_date || new Date().toISOString().split("T")[0],
+                                dueDate: extractedJson.due_date || null,
+                                poNumber: extractedJson.po_number || null,
+                                total: Number(extractedJson.total) || 0,
+                                subtotal: Number(extractedJson.subtotal) || 0,
+                                freight: Number(extractedJson.freight) || 0,
+                                tax: Number(extractedJson.tax) || 0,
+                                status: "received",
+                                lineItemCount: Array.isArray(extractedJson.line_items) ? extractedJson.line_items.length : 0,
+                                source: "email_attachment",
+                                reconciledAt: null,
+                                notes: null,
+                            });
+                        } catch {
+                            // Non-critical — vault sync failure should never block AP pipeline
+                        }
                     } else {
                         console.warn(`   ⚠️ Forwarded ${item.pdf_filename}, but downstream invoice processing needs review`);
                     }
