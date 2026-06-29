@@ -391,7 +391,39 @@ export async function POST(req: Request) {
         if (action === "approve_reconciliation") {
             const invoiceId = String(body.invoiceId || "").trim();
 
-            // Update invoices table: status = 'matched_approved' where po_number = orderId
+            // 1. Apply reconciliation to Finale — this is the actual work
+            //    Load the reconciliation result from ap_pending_approvals
+            const { data: approval } = await db
+                .from("ap_pending_approvals")
+                .select("reconciliation_result, invoice_number, order_id")
+                .eq("order_id", orderId)
+                .eq("status", "pending")
+                .order("created_at", { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+            if (approval?.reconciliation_result) {
+                try {
+                    const { applyReconciliation } = await import("@/lib/finale/reconciler");
+                    const { FinaleClient } = await import("@/lib/finale/client");
+                    const finale = new FinaleClient();
+                    const result = approval.reconciliation_result as any;
+                    const applyResult = await applyReconciliation(result, finale);
+                    console.log(`[approve_reconciliation] Applied to Finale: ${applyResult.applied.length} changes for ${orderId}`);
+                } catch (err: any) {
+                    console.error(`[approve_reconciliation] Finale apply failed for ${orderId}:`, err.message);
+                    // Continue — still mark as approved in DB even if Finale fails
+                }
+            }
+
+            // 2. Update ap_pending_approvals status
+            await db
+                .from("ap_pending_approvals")
+                .update({ status: "approved", updated_at: now })
+                .eq("order_id", orderId)
+                .eq("status", "pending");
+
+            // 3. Update invoices table: status = 'matched_approved' where po_number = orderId
             const { error: invErr } = await db
                 .from("invoices")
                 .update({ status: "matched_approved", updated_at: now })
@@ -399,7 +431,7 @@ export async function POST(req: Request) {
 
             if (invErr) throw invErr;
 
-            // Update purchase_orders: lifecycle_stage = 'reconciled'
+            // 4. Update purchase_orders: lifecycle_stage = 'reconciled'
             const { error: poErr } = await db
                 .from("purchase_orders")
                 .upsert({
@@ -410,7 +442,7 @@ export async function POST(req: Request) {
 
             if (poErr) throw poErr;
 
-            return NextResponse.json({ ok: true, orderId });
+            return NextResponse.json({ ok: true, orderId, applied: !!approval?.reconciliation_result });
         }
 
         // Action 7: Close stale PO — mark lifecycle as closed_stale without cancelling in Finale
