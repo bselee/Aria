@@ -31,6 +31,13 @@ type ReceivedPO = {
         items: Array<{ productId: string; quantity: number }>;
     }>;
     finaleUrl: string;
+    _reconciliation?: {
+        invoices: Array<{ invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string }>;
+        outcomes: Array<{ outcome: string; created_at: string; resolved_at: string | null }>;
+        hasPendingApproval: boolean;
+        hasAutoApplied: boolean;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string } | null;
+    };
 };
 
 type TrackingTodaySummary = {
@@ -498,6 +505,7 @@ export default function ReceivedItemsPanel() {
                                             {(() => {
                                                 const receiptStatus = getDynamicReceiptStatus(po);
                                                 const apLabel = apStatus?.label || "";
+                                                const rec = po._reconciliation;
                                                 const isPartial = receiptStatus === "partial";
                                                 const hasOpenQty = po.items.some(i => (i.openQuantity ?? 0) > 0);
                                                 const hasInvoice = apLabel !== "UNMATCHED" && apLabel !== "";
@@ -507,10 +515,18 @@ export default function ReceivedItemsPanel() {
                                                 const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
 
                                                 // ── State classification ──
-                                                // Each state has: emoji, label, tone (for badge), and action (plain English)
+                                                // Checks _reconciliation first (direct from API), falls back to apStatus
                                                 let state: { emoji: string; label: string; tone: string; action: string } | null = null;
 
-                                                if (isComplete) {
+                                                if (rec?.hasAutoApplied && rec?.matchedInvoice) {
+                                                    state = { emoji: "✅", label: "APPLIED", tone: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number} — $${rec.matchedInvoice.total?.toFixed(2)} applied to PO` };
+                                                } else if (rec?.hasPendingApproval && rec?.matchedInvoice) {
+                                                    state = { emoji: "🔍", label: "PENDING APPROVAL", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number}: $${rec.matchedInvoice.total?.toFixed(2)} vs PO $${po.total?.toLocaleString()} — review` };
+                                                } else if (rec?.matchedInvoice) {
+                                                    state = { emoji: "📋", label: "MATCHED", tone: "text-cyan-300 border-cyan-500/40 bg-cyan-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)} matched` };
+                                                } else if (rec) {
+                                                    state = { emoji: "📋", label: "AWAITING MATCH", tone: "text-zinc-400 border-zinc-600/40 bg-zinc-800/40", action: "No invoice matched yet" };
+                                                } else if (isComplete) {
                                                     state = { emoji: "✅", label: "COMPLETE", tone: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", action: "PO closed — no action needed" };
                                                 } else if (hasDiscrepancy && isReconciled) {
                                                     state = { emoji: "⚠️", label: "RECONCILED ±", tone: "text-blue-400 border-blue-500/30 bg-blue-500/10", action: "Reconciled with pricing differences — verify final amounts" };
@@ -560,6 +576,16 @@ export default function ReceivedItemsPanel() {
                                                                     onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
                                                                     disabled={approvingReconcile.has(po.orderId)}
                                                                     className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
+                                                                    title="Approve reconciliation"
+                                                                >
+                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
+                                                                </button>
+                                                            )}
+                                                            {rec?.hasPendingApproval && !apStatus && (
+                                                                <button
+                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
+                                                                    disabled={approvingReconcile.has(po.orderId)}
+                                                                    className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors text-amber-300 border-amber-500/40 bg-amber-500/10 ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'}`}
                                                                     title="Approve reconciliation"
                                                                 >
                                                                     {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
