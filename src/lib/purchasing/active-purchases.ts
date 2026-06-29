@@ -137,6 +137,34 @@ export async function loadActivePurchases(
                         });
                     }
                 }
+
+                // Also check ap_pending_approvals — any PO with a pending approval
+                // gets invoiceStatus = 'matched_review' so the dashboard shows
+                // "Next: Review and approve reconciliation"
+                for (let i = 0; i < poNumbers.length; i += 100) {
+                    const chunk = poNumbers.slice(i, i + 100);
+                    const { data: paData } = await supabase
+                        .from("ap_pending_approvals")
+                        .select("order_id")
+                        .eq("status", "pending")
+                        .in("order_id", chunk);
+                    for (const pa of paData || []) {
+                        if (pa.order_id && !invoiceMap.has(pa.order_id)) {
+                            invoiceMap.set(pa.order_id, {
+                                status: "matched_review",
+                                id: "",
+                                hasDiscrepancies: false,
+                            });
+                        } else if (pa.order_id && invoiceMap.has(pa.order_id)) {
+                            // Override: pending approval always shows as matched_review
+                            const existing = invoiceMap.get(pa.order_id)!;
+                            invoiceMap.set(pa.order_id, {
+                                ...existing,
+                                status: "matched_review",
+                            });
+                        }
+                    }
+                }
             } catch (e: any) {
                 console.warn("[purchasing] invoice fetch failed:", e.message);
             }
