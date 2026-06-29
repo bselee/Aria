@@ -7,6 +7,7 @@ const supabaseMock: any = {
     eq: vi.fn(),
     insert: vi.fn(),
     update: vi.fn(),
+    upsert: vi.fn(),
     maybeSingle: vi.fn(),
 };
 
@@ -16,6 +17,7 @@ function resetChain() {
     supabaseMock.eq.mockReturnValue(supabaseMock);
     supabaseMock.insert.mockReturnValue(supabaseMock);
     supabaseMock.update.mockReturnValue(supabaseMock);
+    supabaseMock.upsert.mockReturnValue(supabaseMock);
 }
 
 vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
@@ -121,10 +123,10 @@ describe("chargeBudget", () => {
     it("inserts a new row for an unknown agent", async () => {
         supabaseMock.maybeSingle.mockResolvedValueOnce({ data: null, error: null });
         await chargeBudget("brand-new-agent", "gpt-4o", 100, 200);
-        expect(supabaseMock.insert).toHaveBeenCalledTimes(1);
-        const insertArgs = supabaseMock.insert.mock.calls[0][0];
-        expect(insertArgs.agent_id).toBe("brand-new-agent");
-        expect(insertArgs.current_period_tokens_spent).toBe(300);
+        expect(supabaseMock.upsert).toHaveBeenCalledTimes(1);
+        const upsertArgs = supabaseMock.upsert.mock.calls[0][0];
+        expect(upsertArgs.agent_id).toBe("brand-new-agent");
+        expect(upsertArgs.current_period_tokens_spent).toBe(300);
     });
 
     it("rolls over the period when the stored start is from a previous month", async () => {
@@ -135,12 +137,12 @@ describe("chargeBudget", () => {
             error: null,
         });
         await chargeBudget("ap-agent", "gpt-4o", 100, 200);
-        const updateArgs = supabaseMock.update.mock.calls[0][0];
+        const upsertArgs = supabaseMock.upsert.mock.calls[0][0];
         // After rollover, spent should equal JUST this call's cost (not accumulated).
-        expect(updateArgs.current_period_usd_spent).toBeGreaterThan(0);
-        expect(updateArgs.current_period_usd_spent).toBeLessThan(1);
-        expect(updateArgs.current_period_tokens_spent).toBe(300);
-        expect(updateArgs.paused_until).toBeNull();
+        expect(upsertArgs.current_period_usd_spent).toBeGreaterThan(0);
+        expect(upsertArgs.current_period_usd_spent).toBeLessThan(1);
+        expect(upsertArgs.current_period_tokens_spent).toBe(300);
+        expect(upsertArgs.paused_until).toBeNull();
     });
 
     it("increments same-period spent + tokens", async () => {
@@ -149,9 +151,9 @@ describe("chargeBudget", () => {
             error: null,
         });
         await chargeBudget("ap-agent", "gpt-4o-mini", 1000, 500);
-        const updateArgs = supabaseMock.update.mock.calls[0][0];
+        const upsertArgs = supabaseMock.upsert.mock.calls[0][0];
         // gpt-4o-mini @ 0.0008 / 1k tokens × 1500 tokens = $0.0012 added
-        expect(updateArgs.current_period_usd_spent).toBeCloseTo(5.0012, 4);
-        expect(updateArgs.current_period_tokens_spent).toBe(2500);
+        expect(upsertArgs.current_period_usd_spent).toBeCloseTo(5.0012, 4);
+        expect(upsertArgs.current_period_tokens_spent).toBe(2500);
     });
 });

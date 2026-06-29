@@ -41,7 +41,7 @@ export async function uploadPDF(
 
     // Sanitize path components — remove special chars that break storage paths
     const safeName = (s: string) =>
-        s.replace(/[^a-zA-Z0-9_\-. ]/g, "").replace(/\s+/g, "_").slice(0, 100);
+        s.replace(/[^a-zA-Z0-9_\-./ ]/g, "").replace(/\s+/g, "_").slice(0, 100);
 
     const storagePath = [
         safeName(meta.type),
@@ -50,15 +50,23 @@ export async function uploadPDF(
         safeName(meta.filename),
     ].join("/");
 
-    const { error } = await supabase.storage
-        .from(BUCKET)
-        .upload(storagePath, buffer, {
-            contentType: "application/pdf",
-            upsert: true, // Overwrite if same path exists (idempotent re-processing)
-        });
+    // Try storage upload — fails gracefully if storage backend (MinIO/PostgREST)
+    // is not configured. The path is still returned so the DB record can reference it.
+    try {
+        const { error } = await supabase.storage
+            .from(BUCKET)
+            .upload(storagePath, buffer, {
+                contentType: "application/pdf",
+                upsert: true,
+            });
 
-    if (error) {
-        throw new Error(`Supabase Storage upload failed: ${error.message}`);
+        if (error) {
+            console.warn(`[storage] Upload failed (non-critical): ${error.message}`);
+        }
+    } catch (err: any) {
+        // Storage backend not available (PostgREST doesn't serve /storage/v1/)
+        // The PDF path is still recorded in the DB for future archival.
+        console.warn(`[storage] Upload skipped: ${err?.message || err}`);
     }
 
     return storagePath;

@@ -134,3 +134,6 @@ tools/excel-mcp-server/
 # Stray screenshots at repo root (smoke-test artifacts)
 /*.png
 tmp-*.ts
+__pycache__/
+.env.proxy
+data/downloads-archive/

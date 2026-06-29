@@ -207,10 +207,16 @@ function parseCsvLine(line: string): string[] {
 
 async function readArtifact(bucket: string, artifactPath: string): Promise<Buffer> {
     const supabase = createClient();
-    if (!supabase) throw new Error("Supabase not configured");
-    const { data, error } = await supabase.storage.from(bucket).download(artifactPath);
-    if (error || !data) throw new Error(`Artifact download failed: ${error?.message ?? "missing artifact"}`);
-    return Buffer.from(await data.arrayBuffer());
+    if (!supabase) throw new Error("Database not configured");
+    try {
+        const { data, error } = await supabase.storage.from(bucket).download(artifactPath);
+        if (error || !data) throw new Error(`Artifact download failed: ${error?.message ?? "missing artifact"}`);
+        return Buffer.from(await data.arrayBuffer());
+    } catch (err: any) {
+        // Storage backend (MinIO/PostgREST) may not be configured for downloads.
+        // Re-throw with a clear message so callers can handle gracefully.
+        throw new Error(`Artifact unavailable (${artifactPath}): ${err?.message || err}`);
+    }
 }
 
 async function materializeFedexArtifact(intake: StatementIntakeRecord): Promise<StatementIntakeRecord> {
