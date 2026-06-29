@@ -1,0 +1,31 @@
+{
+  "apps": [
+    {
+      "name": "aria-bot",
+      "script": "src/cli/start-bot.ts",
+      "interpreter": "npx",
+      "interpreter_args": "tsx",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 20,
+      "restart_delay": 5000
+    },
+    {
+      "name": "aria-dashboard",
+      "script": "node_modules/next/dist/bin/next",
+      "args": "start -p 3001",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 5000
+    },
+    {
+      "name": "wsl-proxy",
+      "script": "scripts/wsl-proxy.js",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 5000
+    }
+  ]
+}
