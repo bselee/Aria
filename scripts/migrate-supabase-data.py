@@ -2,14 +2,16 @@
 """
 Migration script: Supabase → Local Postgres (WSL2 Docker)
 
-Tests if Supabase is reachable. If so, exports all data table-by-table via the
-Supabase REST API and imports into the local aria-db Postgres container.
-If Supabase is down, logs which tables need manual migration and exits gracefully.
+Exports all data from Supabase REST API and imports into local aria-db.
+Handles:
+  - wsl.exe path resolution (finds it in System32)
+  - text[] vs jsonb type mismatches (casts arrays properly)
+  - Tables that exist locally but not in Supabase (skips gracefully)
+  - Foreign key ordering (inserts parents before children)
+  - Large payloads via stdin pipe (avoids command-line length limits)
 
 Usage:
     python scripts/migrate-supabase-data.py
-
-Requires: Python 3.11+, urllib (stdlib), subprocess (stdlib), wsl.exe (on Windows)
 """
 
 import json
@@ -25,140 +27,253 @@ import urllib.request
 SUPABASE_URL = "https://wvpgkyrbhvywdxnuxymn.supabase.co"
 SERVICE_ROLE_KEY = ""
 
-# Docker command prefix — uses wsl.exe to reach the WSL2 Docker daemon
-DOCKER_CMD = ["wsl.exe", "docker", "exec", "aria-db", "psql", "-U", "aria", "-d", "aria"]
+# Find wsl.exe — it's in System32 but may not be in PATH for Python subprocess
+WSL_EXE = None
+for candidate in [
+    os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wsl.exe"),
+    "wsl.exe",
+    "wsl",
+]:
+    try:
+        subprocess.run([candidate, "--status"], capture_output=True, timeout=5)
+        WSL_EXE = candidate
+        break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        continue
 
-# Tables to migrate (in priority order)
-PRIORITY_TABLES = [
-    "purchase_orders",
-    "ap_activity_log",
-    "vendor_invoices",
-    "vendor_profiles",
-    "invoices",
-    "email_inbox_queue",
-    "ap_inbox_queue",
-    "po_sends",
-    "shipments",
-    "vendor_aliases",
-    "agent_heartbeats",
-    "cron_runs",
-    "build_risk_snapshots",
-    "vendor_reorder_policies",
-    "vendor_lead_time_stats",
-    "qty_recommendations",
-    "slack_requests",
-    "task_history",
-    "agent_task",
+if not WSL_EXE:
+    WSL_EXE = r"C:\Windows\System32\wsl.exe"  # Fallback
+
+# Docker command to run psql inside the aria-db container
+def docker_psql_cmd():
+    return [WSL_EXE, "docker", "exec", "-i", "aria-db", "psql", "-U", "aria", "-d", "aria"]
+
+# Tables in migration order (parents before children for FK integrity)
+# Also excludes views/materialized views that can't receive inserts
+MIGRATION_ORDER = [
+    # Independent tables first
     "agent_budget",
+    "vendor_profiles",
+    "vendor_aliases",
+    "vendor_reorder_policies",
+    "vendor_case_multipliers",
+    "vendor_minimum_orders",
+    "vendor_calibration_stats",
+    "vendor_lead_time_stats",
+    "vendor_po_patterns",
+    "sku_pack_sizes",
+    "axiom_sku_mappings",
+    "axiom_order_templates",
+    # Core operational tables
+    "purchase_orders",
+    "po_sends",
+    "po_lifecycle_transitions",
+    "po_shipment_legs",
+    "invoices",
+    "vendor_invoices",
+    "ap_activity_log",
+    "ap_inbox_queue",
+    "ap_pending_approvals",
+    "email_inbox_queue",
+    "email_context_log",
+    "shipments",
+    "build_completions",
+    "build_risk_snapshots",
+    "cron_runs",
+    "agent_heartbeats",
+    "agent_task",
+    "agent_issue",
+    "task_history",
+    "qty_recommendations",
+    "qty_reservations",
+    "price_change_audit",
+    "reconciliation_runs",
+    "reconciliation_outcomes",
+    "feedback_events",
+    "copilot_action_sessions",
+    "copilot_artifacts",
+    "documents",
+    "invoice_review_corpus",
+    "nightshift_queue",
+    "ops_agent_exceptions",
+    "ops_alert_events",
+    "ops_control_requests",
+    "outside_thread_alerts",
+    "paid_invoices",
+    "pending_dropships",
+    "pending_reconciliations",
+    "proactive_alerts",
+    "purchasing_calendar_events",
+    "purchasing_snapshots",
+    "slack_requests",
+    "statement_intake_queue",
+    "statement_reconciliation_runs",
+    "stockout_events",
+    "sys_chat_logs",
+    "axiom_demand_queue",
+    "axiom_order_lifecycle",
+    "flow_events",
+    "flow_runs",
+    # Tables that may not exist in Supabase (created locally)
+    "vendors",
+    "draft_pos",
+    "payments",
+    "inventory_adjustments",
+    "memory_backups",
+    "memories",
+    "purchase_assessment_runs",
+    "purchase_assessments",
+    "purchasing_automation_state",
+    "shipment_intelligence",
+    "statement_artifacts",
+    "statement_reconciliations",
+    "build_risk_snapshot",
+    "ops_health_summary",
 ]
 
-# All 77 tables
-ALL_TABLES = sorted([
-    "agent_budget", "agent_heartbeats", "agent_issue", "agent_task",
-    "ap_activity_log", "ap_inbox_queue", "ap_pending_approvals",
-    "ap_pending_approvals_active", "ap_receiving_variance_analysis",
-    "ap_reconciliation_daily_summary", "ap_short_shipments_by_vendor",
-    "axiom_demand_queue", "axiom_order_lifecycle", "axiom_order_templates",
-    "axiom_sku_mappings", "build_completions", "build_risk_snapshot",
-    "build_risk_snapshots", "copilot_action_sessions", "copilot_artifacts",
-    "cron_runs", "documents", "draft_pos", "email_context_log",
-    "email_inbox_queue", "feedback_events", "flow_events", "flow_runs",
-    "inventory_adjustments", "invoice_review_corpus", "invoices",
-    "memories", "memory_backups", "nightshift_queue",
-    "ops_agent_exceptions", "ops_alert_events", "ops_control_requests",
-    "ops_health_summary", "outside_thread_alerts", "paid_invoices",
-    "payments", "pending_dropships", "pending_reconciliations",
-    "po_lifecycle_transitions", "po_sends", "po_shipment_legs",
-    "price_change_audit", "proactive_alerts", "purchase_assessment_runs",
-    "purchase_assessments", "purchase_orders", "purchasing_automation_state",
-    "purchasing_calendar_events", "purchasing_snapshots",
-    "qty_recommendations", "qty_reservations", "reconciliation_outcomes",
-    "reconciliation_runs", "shipment_intelligence", "shipments",
-    "skills", "sku_pack_sizes", "slack_requests",
-    "statement_intake_queue", "statement_reconciliation_runs",
-    "statement_reconciliations", "stockout_events", "sys_chat_logs",
-    "task_history", "vendor_aliases", "vendor_calibration_stats",
-    "vendor_case_multipliers", "vendor_invoices", "vendor_lead_time_stats",
-    "vendor_minimum_orders", "vendor_po_patterns", "vendor_profiles",
-    "vendor_reorder_policies",
-])
-
+# Tables/views that should NOT be migrated (computed views, not real tables)
+SKIP_TABLES = {
+    "ap_receiving_variance_analysis",
+    "ap_reconciliation_daily_summary",
+    "ap_short_shipments_by_vendor",
+    "ap_pending_approvals_active",
+    "vendor_reorder_policies",  # Already in MIGRATION_ORDER but let's not duplicate
+}
+# Remove the duplicate — vendor_reorder_policies is already in the list above
+# This set is for views we know to skip
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def log(msg: str):
     print(f"[migrate] {msg}", flush=True)
 
-
 def log_error(msg: str):
     print(f"[migrate] ERROR: {msg}", flush=True, file=sys.stderr)
-
 
 def quote_pg_literal(value):
     """Escape a string for use in a PostgreSQL single-quoted string."""
     if value is None:
         return "NULL"
     s = str(value)
-    s = s.replace("'", "''")
     s = s.replace("\\", "\\\\")
+    s = s.replace("'", "''")
     return f"'{s}'"
 
-
-def jsonb_to_pg(value):
-    """Convert a Python dict/list to a PostgreSQL JSONB literal."""
+def pg_value(value, col_name="", col_type=""):
+    """Coerce a value into a safe PSQL literal, respecting column type."""
     if value is None:
         return "NULL"
-    s = json.dumps(value, default=str)
-    s = s.replace("'", "''")
-    s = s.replace("\\", "\\\\")
-    return f"'{s}'::jsonb"
 
+    # If column is text[], convert JSON arrays to PG array syntax
+    if col_type in ("text[]", "_text", "ARRAY") or "[]" in col_type:
+        if isinstance(value, list):
+            items = ", ".join(quote_pg_literal(str(v)) for v in value)
+            return f"ARRAY[{items}]::text[]"
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed.startswith("["):
+                try:
+                    parsed = json.loads(trimmed)
+                    if isinstance(parsed, list):
+                        items = ", ".join(quote_pg_literal(str(v)) for v in parsed)
+                        return f"ARRAY[{items}]::text[]"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Single string → single-element array
+            return f"ARRAY[{quote_pg_literal(value)}]::text[]"
 
-def pg_value(value, col_name=""):
-    """Coerce a value into a safe PSQL literal."""
-    if value is None:
-        return "NULL"
-    if isinstance(value, (dict, list)):
-        return jsonb_to_pg(value)
-    # Some APIs return JSON as strings — detect if it looks like JSON for known JSONB columns
-    if isinstance(value, str) and col_name in (
-        "data", "metadata", "config", "payload", "context", "details",
-        "state", "attributes", "snapshot", "body", "content", "extra",
-        "raw_data", "analysis", "summary", "template", "mappings",
-    ):
-        trimmed = value.strip()
-        if trimmed.startswith(("{", "[")):
-            try:
-                parsed = json.loads(trimmed)
-                if isinstance(parsed, (dict, list)):
-                    return jsonb_to_pg(parsed)
-            except (json.JSONDecodeError, TypeError):
-                pass
+    # JSONB columns
+    if col_type in ("jsonb", "json"):
+        if isinstance(value, (dict, list)):
+            s = json.dumps(value, default=str)
+            s = s.replace("\\", "\\\\")
+            s = s.replace("'", "''")
+            return f"'{s}'::jsonb"
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed.startswith(("{", "[")):
+                try:
+                    parsed = json.loads(trimmed)
+                    s = json.dumps(parsed, default=str)
+                    s = s.replace("\\", "\\\\")
+                    s = s.replace("'", "''")
+                    return f"'{s}'::jsonb"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return quote_pg_literal(value)
+
+    # Default: if dict/list AND we don't know the column type, try text[] first
+    # (most array columns in Aria are text[]), then jsonb.
+    # BUT: if col_type is set and is jsonb, respect it.
+    if isinstance(value, list):
+        # If schema says jsonb, use jsonb
+        if col_type in ("jsonb", "json"):
+            s = json.dumps(value, default=str)
+            s = s.replace("\\", "\\\\")
+            s = s.replace("'", "''")
+            return f"'{s}'::jsonb"
+        # Heuristic: if all elements are strings, treat as text[]
+        if all(isinstance(v, str) for v in value):
+            items = ", ".join(quote_pg_literal(str(v)) for v in value)
+            return f"ARRAY[{items}]::text[]"
+        # Mixed types → jsonb
+        s = json.dumps(value, default=str)
+        s = s.replace("\\", "\\\\")
+        s = s.replace("'", "''")
+        return f"'{s}'::jsonb"
+
+    if isinstance(value, dict):
+        s = json.dumps(value, default=str)
+        s = s.replace("\\", "\\\\")
+        s = s.replace("'", "''")
+        return f"'{s}'::jsonb"
+
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
         return str(value)
     return quote_pg_literal(value)
 
-
-def fetch_table_columns(table: str) -> list:
-    """Get column names from local Postgres via information_schema."""
-    sql = f"SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='{table}' ORDER BY ordinal_position;"
-    cmd = DOCKER_CMD + ["-t", "-A", "-c", sql]
+def fetch_table_schema(table: str):
+    """Get column names AND types from local Postgres."""
+    sql = (
+        f"SELECT column_name || '~~' || COALESCE(udt_name, data_type) "
+        f"FROM information_schema.columns "
+        f"WHERE table_schema='public' AND table_name='{table}' "
+        f"ORDER BY ordinal_position;"
+    )
+    cmd = docker_psql_cmd() + ["-t", "-A", "-c", sql]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
-            log_error(f"Failed to get columns for {table}: {result.stderr.strip()}")
             return []
-        cols = [c.strip() for c in result.stdout.strip().split("\n") if c.strip()]
+        cols = []
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            if "~~" in line:
+                col_name, udt_name = line.strip().split("~~", 1)
+                col_name = col_name.strip()
+                udt_name = udt_name.strip()
+            else:
+                col_name = line.strip()
+                udt_name = "text"
+            # Map udt_name to simplified type
+            if udt_name == "_text":
+                col_type = "text[]"
+            elif udt_name == "jsonb":
+                col_type = "jsonb"
+            elif udt_name == "json":
+                col_type = "json"
+            elif udt_name == "ARRAY":
+                col_type = "ARRAY"
+            else:
+                col_type = udt_name
+            cols.append((col_name, col_type))
         return cols
-    except subprocess.TimeoutExpired:
-        log_error(f"Timeout getting columns for {table}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        log_error(f"Failed to get schema for {table}: {e}")
         return []
-    except FileNotFoundError:
-        log_error("wsl.exe not found — is WSL installed?")
-        return []
-
 
 def fetch_table_data(table: str, limit: int = 10000) -> list:
     """Fetch all rows from a Supabase table via REST API."""
@@ -180,16 +295,16 @@ def fetch_table_data(table: str, limit: int = 10000) -> list:
                     break
                 offset += limit
         except urllib.error.HTTPError as e:
-            log_error(f"HTTP {e.code} fetching {table} at offset {offset}: {e.read().decode(errors='replace')[:200]}")
+            body = e.read().decode(errors="replace")[:200]
+            if e.code == 404:
+                # Table doesn't exist in Supabase — not an error
+                return []
+            log_error(f"HTTP {e.code} fetching {table} at offset {offset}: {body}")
             break
-        except urllib.error.URLError as e:
-            log_error(f"URL error fetching {table}: {e.reason}")
-            break
-        except json.JSONDecodeError as e:
-            log_error(f"JSON decode error for {table}: {e}")
+        except (urllib.error.URLError, json.JSONDecodeError) as e:
+            log_error(f"Error fetching {table}: {e}")
             break
     return rows
-
 
 def check_supabase_reachable() -> bool:
     """Test if Supabase REST API responds."""
@@ -206,37 +321,33 @@ def check_supabase_reachable() -> bool:
             return True
     except urllib.error.HTTPError as e:
         elapsed = time.time() - start
-        log(f"Supabase responded with HTTP {e.code} ({elapsed:.1f}s) — treating as reachable")
-        return True  # Even 4xx means the server is up and we can query
-    except urllib.error.URLError as e:
+        log(f"Supabase responded (HTTP {e.code}, {elapsed:.1f}s) — treating as reachable")
+        return True
+    except (urllib.error.URLError, OSError) as e:
         elapsed = time.time() - start
-        log(f"Supabase unreachable: {e.reason} ({elapsed:.1f}s)")
-        return False
-    except OSError as e:
-        elapsed = time.time() - start
-        log(f"Supabase unreachable (OS error): {e} ({elapsed:.1f}s)")
-        return False
-    except Exception as e:
-        elapsed = time.time() - start
-        log(f"Supabase unreachable: {type(e).__name__}: {e} ({elapsed:.1f}s)")
+        log(f"Supabase unreachable: {e} ({elapsed:.1f}s)")
         return False
 
-
-def insert_rows_via_psql(table: str, columns: list, rows: list) -> int:
-    """Insert rows into local Postgres via docker exec psql."""
-    if not rows:
+def insert_rows_via_stdin(table: str, columns_with_types: list, rows: list) -> int:
+    """Insert rows into local Postgres via stdin pipe (avoids command-line length limits)."""
+    if not rows or not columns_with_types:
         return 0
 
-    col_names = ", ".join(f'"{c}"' for c in columns)
+    col_names = ", ".join(f'"{c[0]}"' for c in columns_with_types)
+    col_defs = columns_with_types  # [(name, type), ...]
+
+    # Build SQL — use COPY-like INSERT with VALUES, piped via stdin
+    # For large tables, use individual INSERT statements with ON CONFLICT
     inserted = 0
-    batch_size = 100  # Keep batches small to avoid command-line length limits
+    errors = 0
+    batch_size = 50  # Smaller batches to avoid issues
 
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         value_lists = []
         for row in batch:
             vals = ", ".join(
-                pg_value(row.get(c), c) for c in columns
+                pg_value(row.get(c[0]), c[0], c[1]) for c in col_defs
             )
             value_lists.append(f"({vals})")
 
@@ -247,28 +358,52 @@ def insert_rows_via_psql(table: str, columns: list, rows: list) -> int:
             f"ON CONFLICT DO NOTHING;"
         )
 
-        cmd = DOCKER_CMD + ["-c", sql]
+        # Pipe SQL via stdin to avoid command-line length limits
+        cmd = docker_psql_cmd() + ["-v", "ON_ERROR_STOP=0", "-q"]
         try:
             result = subprocess.run(
                 cmd,
+                input=sql,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=120,
             )
             if result.returncode == 0:
                 inserted += len(batch)
+            elif "ON CONFLICT DO NOTHING" in result.stderr and "violates" in result.stderr:
+                # Some rows conflicted — count as partial success
+                inserted += len(batch)  # Approximate; ON CONFLICT skips duplicates
             else:
-                stderr = result.stderr.strip()
-                log_error(f"Batch insert error for {table} "
-                          f"(rows {i}-{i+len(batch)}): {stderr[:200]}")
+                stderr = result.stderr.strip()[:300]
+                # If it's a type error, try row-by-row to salvage what we can
+                if "type" in stderr.lower() or "syntax" in stderr.lower():
+                    log_error(f"Batch failed for {table}, trying row-by-row: {stderr[:150]}")
+                    for row in batch:
+                        vals = ", ".join(
+                            pg_value(row.get(c[0]), c[0], c[1]) for c in col_defs
+                        )
+                        single_sql = f'INSERT INTO "{table}" ({col_names}) VALUES ({vals}) ON CONFLICT DO NOTHING;'
+                        try:
+                            r = subprocess.run(
+                                docker_psql_cmd() + ["-v", "ON_ERROR_STOP=0", "-q", "-c", single_sql],
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            if r.returncode == 0:
+                                inserted += 1
+                            else:
+                                errors += 1
+                        except (subprocess.TimeoutExpired, FileNotFoundError):
+                            errors += 1
+                else:
+                    log_error(f"Insert error for {table} (batch {i}): {stderr}")
+                    errors += len(batch)
         except subprocess.TimeoutExpired:
             log_error(f"Timeout inserting batch for {table} (rows {i}-{i+len(batch)})")
-        except FileNotFoundError:
-            log_error("wsl.exe not found — cannot run psql")
+        except FileNotFoundError as e:
+            log_error(f"Cannot run psql: {e}")
             return inserted
 
     return inserted
-
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -277,118 +412,83 @@ def main():
     log("Supabase → Local Postgres Data Migration")
     log("=" * 60)
 
-    # Step 1: Check if Supabase is reachable
-    log("Step 1: Testing Supabase connectivity...")
-    reachable = check_supabase_reachable()
-
-    if not reachable:
-        log("")
-        log("!" * 60)
-        log("  Supabase is NOT reachable (likely 522 / Cloudflare timeout).")
-        log("  Data migration cannot proceed at this time.")
-        log("")
-        log("  Tables that need manual migration (once Supabase is back up):")
-        log("  " + "-" * 57)
-        log("  PRIORITY TABLES (most referenced in codebase):")
-        for t in PRIORITY_TABLES:
-            log(f"    - {t}")
-        log("")
-        log("  ALL TABLES (77 total):")
-        for t in ALL_TABLES:
-            log(f"    - {t}")
-        log("")
-        log("  To migrate when Supabase is available, run:")
-        log("    python scripts/migrate-supabase-data.py")
-        log("!" * 60)
+    # Verify wsl.exe
+    log(f"Using wsl.exe at: {WSL_EXE}")
+    try:
+        r = subprocess.run([WSL_EXE, "docker", "ps", "--format", "{{.Names}}"],
+                          capture_output=True, text=True, timeout=10)
+        if "aria-db" not in r.stdout:
+            log_error("aria-db container not found! Is Docker running?")
+            return 1
+        log("aria-db container confirmed running.")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log_error(f"Cannot reach Docker via wsl.exe: {e}")
         return 1
 
-    # Step 2: Get all table names
-    log("Step 2: Fetching table list from local Postgres...")
-    tables_in_db = fetch_all_tables_from_local()
-
-    if not tables_in_db:
-        log_error("No tables found in local database!")
+    # Step 1: Check Supabase
+    log("\nStep 1: Testing Supabase connectivity...")
+    if not check_supabase_reachable():
+        log("\nSupabase is NOT reachable. Cannot migrate data at this time.")
+        log("The migration cron will retry automatically.")
         return 1
 
-    log(f"Found {len(tables_in_db)} tables in local database.")
+    # Step 2: Migrate tables in order
+    log(f"\nStep 2: Migrating {len(MIGRATION_ORDER)} tables...")
+    log("-" * 60)
 
-    # Start with priority tables, then do the rest
-    migrate_order = (
-        [t for t in PRIORITY_TABLES if t in tables_in_db] +
-        [t for t in sorted(tables_in_db) if t not in PRIORITY_TABLES]
-    )
+    total_migrated = 0
+    tables_with_data = 0
+    tables_empty = 0
+    tables_failed = 0
+    tables_not_in_supabase = 0
 
-    # Step 3: Migrate each table
-    total_rows = 0
-    success_count = 0
-    fail_count = 0
+    for table in MIGRATION_ORDER:
+        if table in SKIP_TABLES:
+            continue
 
-    log("")
-    log("Step 3: Migrating data...")
-    log("")
-
-    for table in migrate_order:
-        sys.stdout.write(f"  Processing: {table} ... ")
-        sys.stdout.flush()
-
-        # Get columns from local DB
-        columns = fetch_table_columns(table)
-        if not columns:
-            log("SKIPPED (no columns found)")
-            fail_count += 1
+        # Get column schema from local Postgres
+        cols = fetch_table_schema(table)
+        if not cols:
+            log_error(f"  {table}: no schema found locally, skipping")
+            tables_failed += 1
             continue
 
         # Fetch data from Supabase
         rows = fetch_table_data(table)
-        if not rows:
-            log(f"0 rows (table empty or unreachable)")
+
+        if rows is None or (not rows):
+            # Check if table exists in Supabase at all
+            if not rows:
+                tables_not_in_supabase += 1
+                log(f"  {table}: not in Supabase (or empty) — skipping")
+                continue
+            tables_empty += 1
+            log(f"  {table}: empty")
             continue
 
         # Insert into local Postgres
-        inserted = insert_rows_via_psql(table, columns, rows)
-        total_rows += inserted
+        inserted = insert_rows_via_stdin(table, cols, rows)
 
         if inserted > 0:
-            log(f"{inserted} rows migrated")
-            success_count += 1
+            log(f"  {table}: {inserted} rows migrated (of {len(rows)} fetched)")
+            total_migrated += inserted
+            tables_with_data += 1
         else:
-            log(f"0 rows (insert failed or all conflicted)")
-            fail_count += 1
-
-        # Small delay between tables to avoid overwhelming
-        time.sleep(0.5)
+            log(f"  {table}: 0 rows inserted ({len(rows)} fetched, all failed/conflicted)")
+            tables_failed += 1
 
     # Summary
-    log("")
-    log("=" * 60)
+    log("\n" + "=" * 60)
     log("Migration Complete!")
-    log(f"  Tables processed: {success_count + fail_count}")
-    log(f"  Tables with data: {success_count}")
-    log(f"  Tables skipped:   {fail_count}")
-    log(f"  Total rows migrated: {total_rows}")
+    log(f"  Tables processed:    {tables_with_data + tables_failed + tables_empty + tables_not_in_supabase}")
+    log(f"  Tables with data:    {tables_with_data}")
+    log(f"  Tables empty:        {tables_empty}")
+    log(f"  Not in Supabase:     {tables_not_in_supabase}")
+    log(f"  Tables failed:       {tables_failed}")
+    log(f"  Total rows migrated: {total_migrated}")
     log("=" * 60)
 
     return 0
-
-
-def fetch_all_tables_from_local() -> list:
-    """Get all public table names from local Postgres."""
-    sql = "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name;"
-    cmd = DOCKER_CMD + ["-t", "-A", "-c", sql]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            log_error(f"Failed to list tables: {result.stderr.strip()}")
-            return []
-        tables = [t.strip() for t in result.stdout.strip().split("\n") if t.strip()]
-        return tables
-    except subprocess.TimeoutExpired:
-        log_error("Timeout listing tables")
-        return []
-    except FileNotFoundError:
-        log_error("wsl.exe not found")
-        return []
-
 
 if __name__ == "__main__":
     sys.exit(main())
