@@ -875,11 +875,11 @@ export default function ActivePurchasesPanel() {
                                             )}
 
                                                                                         {(() => {
+                                                                                            if (po.invoiceStatus === 'matched_review') return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300">🔍 Pending Approval</span>;
                                                                                             if (!po.sentVerification?.verified) return <span className="text-[10px] text-zinc-600 italic">Next: Verify PO was sent</span>;
                                                                                             if (!po.vendorAcknowledgedAt) return <span className="text-[10px] text-zinc-600 italic">Next: Awaiting vendor confirmation</span>;
                                                                                             if (po.lifecycleStage === 'moving_with_tracking' && !po.isReceived) return <span className="text-[10px] text-zinc-600 italic">Next: Track shipment</span>;
                                                                                             if (po.isReceived && !po.invoiceStatus) return <span className="text-[10px] text-zinc-600 italic">Next: Match invoice</span>;
-                                                                                            if (po.invoiceStatus === 'matched_review') return <span className="text-[10px] text-zinc-600 italic">Next: Review and approve reconciliation</span>;
                                                                                             return null;
                                                                                         })()}
 
