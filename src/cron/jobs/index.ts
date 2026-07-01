@@ -1011,6 +1011,26 @@ defineJob({
     budget: { durationMs: 90_000 },
     });
 
+// HERMIA(2026-07-01): Post acknowledged POs with tracking numbers to Slack.
+// Runs after po-reply-watcher has had a chance to detect vendor replies (which
+// runs at :00 and :30). Posts ETA to #purchase-orders in Bill's format:
+// *Ordered <link|PO-####> ETA mm/dd*
+defineJob({
+    name: "post-eta-to-slack",
+    schedule: "45 8-18 * * 1-5",  // :45 past each hour, Mon-Fri 8AM-6PM
+    onFail: "log",
+    description: "Post acknowledged POs with tracking numbers to #purchase-orders with ETA (45min past hour, M-F 8AM-6PM MT).",
+    handler: async () => {
+        const { postETAtoSlack } = await import("@/cli/post-eta-to-slack");
+        const { posted, results } = await postETAtoSlack();
+        const errors = results.filter(r => r.action === "error").length;
+        if (posted > 0 || errors > 0) {
+            console.log(`[post-eta-to-slack] ${posted} posted, ${results.filter(r => r.action === "skipped_no_eta").length} skipped (no ETA), ${errors} errors`);
+        }
+    },
+    budget: { durationMs: 60_000 },
+});
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Reconciliation Auto-Apply Watcher — automatically applies auto_approve/
     // no_change reconciliation results to Finale POs. Gated by the same

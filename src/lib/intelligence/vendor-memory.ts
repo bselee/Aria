@@ -34,6 +34,13 @@ export interface VendorPattern {
     learnedFrom?: string;       // Source: "telegram_upload", "email_attachment", "manual"
     confidence: number;         // 0-1, how confident we are in this pattern
     feeLabelMap?: Record<string, string>;  // H2/M3: vendor-specific fee label → Finale fee type
+    // Phase 2: Vendor-specific expected fee defaults — fee types this vendor always charges
+    expectedFeeDefaults?: Array<{
+        feeType: keyof typeof import('../finale/products').FinaleProductsClient.FINALE_FEE_TYPES;
+        typicalAmount: number;       // 0 if unknown — updated after each reconciliation
+        occurrences: number;         // How many times this fee type has been observed
+        lastObserved: string;        // ISO date
+    }>;
 }
 
 /**
@@ -75,6 +82,7 @@ export async function storeVendorPattern(pattern: VendorPattern): Promise<void> 
             text: embeddingText,
             updated_at: new Date().toISOString(),
             feeLabelMap: pattern.feeLabelMap ? JSON.stringify(pattern.feeLabelMap) : '',
+            expectedFeeDefaults: pattern.expectedFeeDefaults ? JSON.stringify(pattern.expectedFeeDefaults) : '',
         };
 
         upsertVector(NAMESPACE, id, new Float32Array(vector), metadata);
