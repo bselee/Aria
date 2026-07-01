@@ -11,4 +11,4 @@
  * @see     src/lib/db.ts for the replacement PostgREST client (no Supabase SDK).
  */
 
-export { createClient, resetClient } from "./db";
+export { createClient, createClient as createBrowserClient, resetClient } from "./db";
