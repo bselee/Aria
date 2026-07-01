@@ -1,4 +1,13 @@
-import { createClient } from "../supabase";
+/**
+ * @file    purchasing-automation-state.ts
+ * @purpose Local SQLite-based purchasing automation state store.
+ *          Replaces Supabase-based storage for vendor automation state.
+ *          Each vendor's automation state is stored as a JSON blob in SQLite.
+ * @created 2026-07-01 — migrated from Supabase to SQLite
+ * @deps    src/lib/storage/local-db.ts
+ */
+
+import { getLocalDb } from "./local-db";
 import type { VendorFeedbackMemory } from "../purchasing/recommendation-feedback";
 
 export interface PurchasingAutomationStateInput {
@@ -61,46 +70,50 @@ function mapPurchasingAutomationState(row: any): PurchasingAutomationStateRecord
     };
 }
 
+function ensureTable(): void {
+    const db = getLocalDb();
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS purchasing_automation_state (
+            vendor_key TEXT PRIMARY KEY,
+            vendor_name TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+}
+
 export async function getPurchasingAutomationState(vendorName: string): Promise<PurchasingAutomationStateRecord | null> {
-    const supabase = createClient();
-    if (!supabase) {
-        console.warn("[purchasing-automation-state] Supabase unavailable");
+    try {
+        ensureTable();
+        const db = getLocalDb();
+        const vendorKey = normalizeVendorAutomationKey(vendorName);
+        const row = db.prepare(
+            `SELECT payload_json FROM purchasing_automation_state WHERE vendor_key = ?`
+        ).get(vendorKey) as { payload_json: string } | undefined;
+
+        if (!row) return null;
+        return mapPurchasingAutomationState(JSON.parse(row.payload_json));
+    } catch (err: any) {
+        console.error("[purchasing-automation-state] Fetch failed:", err.message);
         return null;
     }
-
-    const vendorKey = normalizeVendorAutomationKey(vendorName);
-    const { data, error } = await supabase
-        .from("purchasing_automation_state")
-        .select("*")
-        .eq("vendor_key", vendorKey)
-        .maybeSingle();
-
-    if (error) {
-        console.error("[purchasing-automation-state] Fetch failed:", error.message);
-        return null;
-    }
-
-    return mapPurchasingAutomationState(data);
 }
 
 export async function upsertPurchasingAutomationState(input: PurchasingAutomationStateInput): Promise<string | null> {
-    const supabase = createClient();
-    if (!supabase) {
-        console.warn("[purchasing-automation-state] Supabase unavailable");
+    try {
+        ensureTable();
+        const db = getLocalDb();
+        const payload = buildPurchasingAutomationStatePayload(input);
+        const vendorKey = normalizeVendorAutomationKey(input.vendorName);
+
+        db.prepare(`
+            INSERT OR REPLACE INTO purchasing_automation_state (vendor_key, vendor_name, payload_json, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+        `).run(vendorKey, input.vendorName, JSON.stringify(payload));
+
+        return vendorKey;
+    } catch (err: any) {
+        console.error("[purchasing-automation-state] Upsert failed:", err.message);
         return null;
     }
-
-    const payload = buildPurchasingAutomationStatePayload(input);
-    const { data, error } = await supabase
-        .from("purchasing_automation_state")
-        .upsert(payload, { onConflict: "vendor_key" })
-        .select("vendor_key")
-        .single();
-
-    if (error) {
-        console.error("[purchasing-automation-state] Upsert failed:", error.message);
-        return null;
-    }
-
-    return data?.vendor_key ?? null;
 }

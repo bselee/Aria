@@ -25,7 +25,8 @@ import { createClient } from "../../supabase";
 import { z } from "zod";
 import { unifiedObjectGeneration, unifiedTextGeneration } from "../llm";
 import { recall } from "../memory";
-import { detectPaidInvoice, parsePaidInvoice } from "../inline-invoice-parser";
+import { detectPaidInvoice, parsePaidInvoice, detectInlineInvoice } from "../inline-invoice-parser";
+import { handleInlineInvoice } from "../inline-invoice-handler";
 import { getPreClassification } from "../nightshift-agent";
 import { FinaleClient } from "../../finale/client";
 import { requestDraftPOApproval } from "../../command-board/po-approval-task";
@@ -576,6 +577,16 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                     vendor_routing_action: "dropship",
                                     vendor_name: routingRule.label,
                                 });
+                            // FIX(2026-06-29): Archive source email immediately.
+                            // Same rationale as INVOICE queueing — prevents double-forward
+                            // from ap-local-forwarder.ts on subsequent cron ticks.
+                            try {
+                                await gmail.users.messages.modify({
+                                    userId: "me",
+                                    id: m.gmail_message_id,
+                                    requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                                });
+                            } catch (e) { /* ignore — non-critical */ }
                         } catch (e: any) {
                             console.error(`     ❌ Dropship queue failed: ${e.message}`);
                         }
@@ -797,6 +808,71 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         gmailMessageId: m.gmail_message_id,
                     });
                     continue;
+                }
+
+                // ── INLINE INVOICE DETECTION ──────────────────────────────────
+                // DECISION(2026-06-29): Vendors like Ed Zybura / Organic AG Products
+                // send casual text-only emails with cost breakdowns (no PDF).
+                // detectInlineInvoice catches them; the handler parses, finds the
+                // correlating PO in Finale, generates a PDF, and forwards to Bill.com.
+                // Must run BEFORE PDF collection — these emails have no PDF parts.
+                const bodyText = m.body_text || snippet;
+                if (intent === "INVOICE" && !hasPdfAttachment) {
+                    const isInline = detectInlineInvoice(bodyText, false, subject);
+                    if (isInline) {
+                        console.log(`     🧾 Inline invoice detected (${from}) — routing to handler...`);
+                        try {
+                            const emailDate = m.internalDate
+                                ? new Date(Number(m.internalDate)).toISOString().split("T")[0]
+                                : new Date().toISOString().split("T")[0];
+
+                            const result = await handleInlineInvoice({
+                                gmail,
+                                gmailMessageId: m.gmail_message_id,
+                                from,
+                                subject,
+                                body: bodyText,
+                                date: emailDate,
+                            });
+
+                            if (result.success) {
+                                console.log(`     ✅ Inline invoice handled — forwarded as ${result.invoiceNumber} (PO ${result.poNumber || "N/A"})`);
+                                await this.logActivity(supabase, from, subject, "INLINE_INVOICE",
+                                    `Auto-generated PDF invoice ${result.invoiceNumber} from inline text. PO ${result.poNumber || "not found"}. Forwarded to Bill.com: ${result.forwardedMessageId}`,
+                                    {
+                                        reasonCode: "inline_invoice_handled",
+                                        sourceInbox,
+                                        gmailMessageId: m.gmail_message_id,
+                                        poNumber: result.poNumber,
+                                        invoiceNumber: result.invoiceNumber,
+                                        totalAmount: result.totalAmount,
+                                        forwardedMessageId: result.forwardedMessageId,
+                                    }
+                                );
+                                // Archive the source email — handler already forwarded to Bill.com
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me",
+                                        id: m.gmail_message_id,
+                                        requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+                                    });
+                                } catch (e) { /* ignore */ }
+                            } else {
+                                console.warn(`     ⚠️ Inline invoice handler failed: ${result.error}`);
+                                await this.logActivity(supabase, from, subject, "INLINE_INVOICE_FAILED",
+                                    `Handler error: ${result.error} — leaving unread for human review`,
+                                    { reasonCode: "inline_invoice_failed", sourceInbox, gmailMessageId: m.gmail_message_id }
+                                );
+                            }
+                        } catch (err: any) {
+                            console.error(`     ❌ Inline invoice handler exception: ${err.message}`);
+                            await this.logActivity(supabase, from, subject, "INLINE_INVOICE_ERROR",
+                                `Unhandled error: ${err.message}`,
+                                { reasonCode: "inline_invoice_exception", sourceInbox, gmailMessageId: m.gmail_message_id }
+                            );
+                        }
+                        continue;
+                    }
                 }
 
                 // --- INVOICE QUEUEING (ap inbox only) ---
@@ -1078,7 +1154,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 if (processedAnyPDF) {
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
-                    const logNote = `Queued for Bill.com forward (${pdfNames}); awaiting send verification before archiving source email`;
+                    const logNote = `Queued for Bill.com forward (${pdfNames}); source email archived`;
                     await this.logActivity(supabase, from, subject, intent, logNote, {
                         reasonCode: "queued_for_billcom",
                         sourceInbox,
@@ -1086,6 +1162,26 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         attachments: pdfNames,
                         queueStatus: "PENDING_FORWARD",
                     });
+                    // FIX(2026-06-29): Archive source email immediately after queuing.
+                    // Previously we waited for send verification (ap-forwarder.ts), but
+                    // the forwarder is rate-limited (10 items/run) and a second forwarder
+                    // (ap-local-forwarder.ts) also scans Gmail for UNREAD emails. Leaving
+                    // the email unread after queuing caused the local forwarder to find the
+                    // same invoice on the next cron tick and forward it to Bill.com AGAIN.
+                    // ap_inbox_queue is the canonical forwarding queue — no reason to keep
+                    // the source email unread.
+                    try {
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId: m.gmail_message_id,
+                            addLabels: ["Invoice Forward"],
+                            removeLabels: ["INBOX", "UNREAD"],
+                        });
+                    } catch (e) {
+                        // Non-critical — the local forwarder will pick up the slack in a
+                        // worst case, but the queue dedup in ap_inbox_queue is the guard.
+                        console.warn(`     ⚠️ Failed to archive source email after queuing: ${(e as Error).message}`);
+                    }
                 } else if (pdfParts.length === 0) {
                     console.log(`     ⚠️ No PDF found on ${intent}. Leaving unread for human check.`);
                     const policy = getAPMissingPdfPolicy(sourceInbox, intent);

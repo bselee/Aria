@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 import {
     claimNextOpsControlRequest,
     completeOpsControlRequest,
@@ -9,7 +9,7 @@ import {
     fetchOpsHealthSummary,
 } from "../lib/ops/control-plane-db";
 import { buildOpsHealthDecision } from "../lib/ops/control-plane";
-import { getSupabaseProjectStatus } from "../lib/ops/bot-control-plane";
+import { getPostgrestProjectStatus } from "../lib/ops/bot-control-plane";
 
 function getArg(flag: string): string | null {
     const index = process.argv.indexOf(flag);
@@ -19,10 +19,10 @@ function getArg(flag: string): string | null {
 
 async function main(): Promise<void> {
     const command = process.argv[2];
-    const supabase = createClient();
+    const db = createClient();
 
-    if (!supabase) {
-        throw new Error("Supabase client not available");
+    if (!db) {
+        throw new Error("Database client not available");
     }
 
     if (command === "lease") {
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
             .split(",")
             .map((value) => value.trim())
             .filter(Boolean) as Array<"watchdog" | "aria-bot" | "all">;
-        const leased = await claimNextOpsControlRequest(supabase, { consumer, targets });
+        const leased = await claimNextOpsControlRequest(db, { consumer, targets });
         console.log(JSON.stringify(leased ?? null));
         return;
     }
@@ -41,7 +41,7 @@ async function main(): Promise<void> {
         const consumer = getArg("--consumer") || "watchdog";
         const result = getArg("--result");
         if (!id) throw new Error("--id is required");
-        await completeOpsControlRequest(supabase, {
+        await completeOpsControlRequest(db, {
             id,
             consumer,
             result: result ? { result } : {},
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
         const consumer = getArg("--consumer") || "watchdog";
         const errorMessage = getArg("--error") || "unknown failure";
         if (!id) throw new Error("--id is required");
-        await failOpsControlRequest(supabase, {
+        await failOpsControlRequest(db, {
             id,
             consumer,
             errorMessage,
@@ -66,8 +66,8 @@ async function main(): Promise<void> {
     }
 
     if (command === "health") {
-        const summary = await fetchOpsHealthSummary(supabase);
-        const projectStatus = await getSupabaseProjectStatus();
+        const summary = await fetchOpsHealthSummary(db);
+        const projectStatus = await getPostgrestProjectStatus();
         const decision = summary ? buildOpsHealthDecision({
             projectStatus,
             staleCrons: summary.stale_crons || [],

@@ -1,17 +1,14 @@
 /**
  * @file    vendor-invoices.ts
  * @purpose Centralised read/write helpers for the vendor_invoices table.
- *          Every intake channel (email attachments, portal scrapers, CSV imports,
- *          sandbox drops, payment confirmations) calls upsertVendorInvoice() so
- *          that one table is the single source of truth for cost research.
+ *          Replaced Supabase client with PostgREST client (src/lib/db.ts).
  * @author  Will / Antigravity
  * @created 2026-03-17
- * @updated 2026-03-17
- * @deps    supabase/client
- * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * @updated 2026-07-01 — migrated from Supabase to PostgREST client
+ * @deps    src/lib/db
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

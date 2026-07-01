@@ -10,7 +10,6 @@
  */
 
 import { HEARTBEAT_PROBES, type ProbeResult, type ProbeSpec } from "@/lib/ops/heartbeat-probes";
-import { sendTelegramNotify, sendCriticalTelegramNotify } from "@/lib/intelligence/telegram-notify";
 
 /** Re-alert suppression window: a given probe failure is not re-sent within this span. */
 const ALERT_WINDOW_MS = 30 * 60_000;
@@ -99,6 +98,7 @@ export async function runSystemHeartbeat(): Promise<void> {
         const message = formatAlert(newFailures);
         const anyCritical = newFailures.some((f) => f.spec.critical);
         try {
+            const { sendTelegramNotify, sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
             if (anyCritical) {
                 await sendCriticalTelegramNotify(message);
             } else {

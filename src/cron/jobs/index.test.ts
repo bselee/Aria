@@ -27,6 +27,7 @@ const EXPECTED_JOBS = [
     "issue-projection",
     "issue-orchestrator",
     "expire-stale-approvals",
+    "vendor-lead-time-tracker",
 ];
 
 beforeAll(async () => {

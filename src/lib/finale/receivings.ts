@@ -1540,4 +1540,35 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             return [];
         }
     }
+
+    /**
+     * Fetch supplier info for a product from Finale.
+     * Returns the first supplier's party URL and price, or null if no supplier found.
+     * Used as a fallback when updateOrderItemPrice doesn't return a supplierPartyUrl.
+     *
+     * @param productId - SKU to look up
+     * @returns The supplier's party URL and price, or null
+     */
+    async getProductSupplierInfo(
+        productId: string
+    ): Promise<{ supplierPartyUrl: string; price: number } | null> {
+        const encodedSku = encodeURIComponent(productId);
+        const url = `/${this.accountPath}/api/product/${encodedSku}`;
+
+        try {
+            const product = await this.get(url);
+            const supplierList = product.supplierList || [];
+            if (supplierList.length > 0) {
+                const firstSupplier = supplierList[0];
+                return {
+                    supplierPartyUrl: firstSupplier.supplierPartyUrl,
+                    price: parseFloat(firstSupplier.price ?? 0),
+                };
+            }
+            return null;
+        } catch (error: any) {
+            console.warn(`⚠️ [FinaleClient] Failed to get supplier info for SKU ${productId}: ${error.message}`);
+            return null;
+        }
+    }
 }

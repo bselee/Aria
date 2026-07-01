@@ -159,7 +159,7 @@ try {
     $controlRequest = Invoke-OpsControlLease
     if ($controlRequest) {
         if ($controlRequest.command -eq "restart_bot") {
-            Restart-AriaBot "Supabase control plane requested restart: $($controlRequest.reason)"
+            Restart-AriaBot "Control plane requested restart: $($controlRequest.reason)"
             Complete-OpsControlRequest -RequestId $controlRequest.id -Result "watchdog_restart_completed"
         }
         else {

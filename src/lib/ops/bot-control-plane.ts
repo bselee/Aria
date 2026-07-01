@@ -1,8 +1,8 @@
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import {
     buildHeartbeatRecord,
     buildOpsHealthDecision,
-    isSupabaseProjectReady,
+    isProjectReady,
     type OpsControlCommand,
 } from "./control-plane";
 import {

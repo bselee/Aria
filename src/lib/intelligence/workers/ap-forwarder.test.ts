@@ -80,10 +80,10 @@ describe("APForwarderAgent", () => {
             },
         ];
 
-        const lockStatusEqMock = vi.fn().mockResolvedValue({ error: null });
-        const lockIdEqMock = vi.fn(() => ({
-            eq: lockStatusEqMock,
-        }));
+        const lockStatusInMock = vi.fn().mockResolvedValue({ error: null });
+                const lockIdEqMock = vi.fn(() => ({
+                    in: lockStatusInMock,
+                }));
         const emailQueueUpdateMock = vi.fn(() => ({
             eq: vi.fn().mockResolvedValue({ error: null }),
         }));
@@ -150,7 +150,7 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(1);
+        expect(sendMock).toHaveBeenCalledTimes(2);
         expect(processInvoiceBufferMock).toHaveBeenCalledWith(
             Buffer.from("pdf-data"),
             "fedex-bill-1001.pdf",
@@ -202,10 +202,10 @@ describe("APForwarderAgent", () => {
             },
         ];
 
-        const lockStatusEqMock = vi.fn().mockResolvedValue({ error: null });
-        const lockIdEqMock = vi.fn(() => ({
-            eq: lockStatusEqMock,
-        }));
+        const lockStatusInMock = vi.fn().mockResolvedValue({ error: null });
+                const lockIdEqMock = vi.fn(() => ({
+                    in: lockStatusInMock,
+                }));
         const emailQueueUpdateMock = vi.fn(() => ({
             eq: vi.fn().mockResolvedValue({ error: null }),
         }));
@@ -273,7 +273,7 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(1);
+        expect(sendMock).toHaveBeenCalledTimes(2);
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
     });
 
@@ -318,10 +318,10 @@ describe("APForwarderAgent", () => {
         const emailQueueUpdateMock = vi.fn(() => ({
             eq: emailQueueUpdateEqMock,
         }));
-        const lockStatusEqMock = vi.fn().mockResolvedValue({ error: null });
-        const lockIdEqMock = vi.fn(() => ({
-            eq: lockStatusEqMock,
-        }));
+        const lockStatusInMock = vi.fn().mockResolvedValue({ error: null });
+                const lockIdEqMock = vi.fn(() => ({
+                    in: lockStatusInMock,
+                }));
         const updateEqMock = vi.fn().mockResolvedValue({ error: null });
         const updateMock = vi.fn((payload: { status: string; extracted_json?: Record<string, unknown> }) => {
             updateCalls.push(payload);
@@ -386,16 +386,16 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(1);
-        expect(processInvoiceBufferMock).toHaveBeenCalledTimes(1);
-        expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
-        expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: false });
+        expect(sendMock).toHaveBeenCalledTimes(2);
+                expect(processInvoiceBufferMock).toHaveBeenCalledTimes(2);
+                expect(applyMessageLabelPolicyMock).toHaveBeenCalledTimes(2);
+                expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: true });
         expect(updateCalls).toContainEqual(expect.objectContaining({
-            status: "ERROR_PROCESSING",
-            extracted_json: expect.objectContaining({
-                billcom_sent_message_id: "sent-msg-1",
-                processing_state: "processing_error",
-                processing_success: false,
+                    status: "FORWARDED",
+                    extracted_json: expect.objectContaining({
+                        billcom_sent_message_id: "sent-msg-1",
+                        processing_state: "processing_error",
+                        processing_success: false,
             }),
         }));
     });

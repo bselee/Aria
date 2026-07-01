@@ -35,6 +35,8 @@ export const ALL_PANEL_IDS = [
         "daily-ops-summary",
         "po-lifecycle",
         "basauto-requests",
+        "dedup-activity",
+        "reconciliation",
     ] as const;
 
 export type PanelId = (typeof ALL_PANEL_IDS)[number];
@@ -63,7 +65,7 @@ export const DEFAULT_LAYOUT: DashboardLayout = {
         "tracking-board",
     ],
     midRight: ["purchasing", "purchasing-calendar"],
-    right: ["activity", "build-schedule", "oversight", "recent-runs", "vendor-scorecard", "daily-ops-summary", "po-lifecycle"],
+    right: ["activity", "build-schedule", "oversight", "recent-runs", "vendor-scorecard", "daily-ops-summary", "po-lifecycle", "dedup-activity", "reconciliation"],
 };
 
 export const LAYOUT_STORAGE_KEY = "aria-dash-layout";

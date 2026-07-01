@@ -1,4 +1,12 @@
-import { createClient } from "../supabase";
+/**
+ * @file    invoice-review-corpus.ts
+ * @purpose Local SQLite-based invoice review corpus store.
+ *          Replaces Supabase-based storage for invoice review samples.
+ * @created 2026-07-01 — migrated from Supabase to SQLite
+ * @deps    src/lib/storage/local-db.ts
+ */
+
+import { getLocalDb } from "./local-db";
 
 export interface ReviewedInvoiceFields {
     vendorName?: string | null;
@@ -73,24 +81,32 @@ export function buildInvoiceReviewSamplePayload(input: InvoiceReviewSampleInput)
     };
 }
 
+function ensureTable(): void {
+    const db = getLocalDb();
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS invoice_review_corpus (
+            vendor_invoice_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+}
+
 export async function upsertInvoiceReviewSample(input: InvoiceReviewSampleInput): Promise<string | null> {
-    const supabase = createClient();
-    if (!supabase) {
-        console.warn("[invoice-review-corpus] Supabase unavailable");
+    try {
+        ensureTable();
+        const db = getLocalDb();
+        const payload = buildInvoiceReviewSamplePayload(input);
+
+        db.prepare(`
+            INSERT OR REPLACE INTO invoice_review_corpus (vendor_invoice_id, payload_json, updated_at)
+            VALUES (?, ?, datetime('now'))
+        `).run(input.vendorInvoiceId, JSON.stringify(payload));
+
+        return input.vendorInvoiceId;
+    } catch (err: any) {
+        console.error("[invoice-review-corpus] Upsert failed:", err.message);
         return null;
     }
-
-    const payload = buildInvoiceReviewSamplePayload(input);
-    const { data, error } = await supabase
-        .from("invoice_review_corpus")
-        .upsert(payload, { onConflict: "vendor_invoice_id" })
-        .select("id")
-        .single();
-
-    if (error) {
-        console.error("[invoice-review-corpus] Upsert failed:", error.message);
-        return null;
-    }
-
-    return data?.id ?? null;
 }

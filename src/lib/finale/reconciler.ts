@@ -1096,6 +1096,14 @@ export interface ReconciliationResult {
     notes?: string;             // Non-blocking informational notes (e.g., balance validation warning)
     report?: ReconciliationReport;  // Structured audit report — populated at end of reconcileInvoiceToPO()
     populateItems?: Array<{ productId: string; quantity: number; unitPrice: number; description: string }>;  // Set when PO is empty draft — items to add on approval
+    // Gap 1: SKU base cost update status — tracks whether the underlying SKU supplier pricing was synced
+    skuCostUpdateStatus?: 'updated' | 'not_found' | 'skipped';
+    // Gap 2: Residual gap — difference between PO projected total and invoice total after all adjustments
+    residualGap?: number;
+    residualGapNote?: string;
+    // Phase 2: Perfect Match Certification — set during applyReconciliation
+    certification?: 'certified_match' | 'applied_unverified' | 'failed';
+    certificationGap?: number;  // Dollar gap that caused unverified status
 }
 
 // ————————————————————————————————————————————————————————————
@@ -1437,6 +1445,23 @@ export async function reconcileInvoiceToPO(
             .filter((fc) => fc.feeType !== "FREIGHT")
             .reduce((sum, fc) => sum + Math.abs(fc.amount - fc.existingAmount), 0);
 
+    // GAP 2 FIX: Residual gap — compare PO projected total against invoice total
+    const poSubtotal = poSummary.items?.reduce((s, i) => s + (i.unitPrice * i.quantity), 0) || 0;
+    const poFeeTotal = poSummary.adjustments?.reduce((s, a) => s + a.amount, 0) || 0;
+    const invoiceSubtotal = invoice.lineItems?.reduce((s, li) => s + (li.unitPrice * li.qty), 0) || 0;
+    const invoiceFeeTotal = feeChanges.reduce((s, f) => s + f.amount, 0);
+
+    const projectedPOTotal = poSubtotal + poFeeTotal;
+    const expectedPOTotal = invoiceSubtotal + invoiceFeeTotal;
+    const residualGap = Math.abs(projectedPOTotal - expectedPOTotal);
+    const residualGapNote = residualGap > 5.0
+        ? `⚠️ Residual gap: $${residualGap.toFixed(2)} — PO projected total ($${projectedPOTotal.toFixed(2)}) differs from invoice-derived total ($${expectedPOTotal.toFixed(2)})`
+        : undefined;
+
+    if (residualGap > 5.0) {
+        warnings.push(residualGapNote!);
+    }
+
     // 5. Aggregate impact gate — REMOVED (2026-05-20).
     // DECISION: Invoice = source of truth. Dollar caps were blocking every real
     // invoice. TOTAL_IMPACT_CAP_DOLLARS is now Infinity. This block is a no-op
@@ -1529,6 +1554,9 @@ export async function reconcileInvoiceToPO(
         warnings,
         vendorNote,
         notes: balanceNote,
+        skuCostUpdateStatus: undefined,  // Set during applyReconciliation — will be populated on next read
+        residualGap,
+        residualGapNote,
         report: buildReconciliationReport(invoice, poSummary, priceChanges, feeChanges, balanceCheck, overallVerdict, warnings, matchStrategy),
     };
 }
@@ -2284,6 +2312,7 @@ export async function applyReconciliation(
 
             // NEW(2026-03-18): Sync the underlying SKU supplier pricing so FUTURE orders are correct
             let skuBaseUpdated = false;
+            let skuCostStatus: ReconciliationResult['skuCostUpdateStatus'] = 'skipped';
             if (updateRes.supplierPartyUrl) {
                 skuBaseUpdated = await withToolAudit(
                     "finale_update_product_supplier_price",
@@ -2291,6 +2320,27 @@ export async function applyReconciliation(
                     { productId: pc.productId, supplierPartyUrl: updateRes.supplierPartyUrl, newPrice: pc.invoicePrice },
                     () => client.updateProductSupplierPrice(pc.productId, updateRes.supplierPartyUrl!, pc.invoicePrice),
                 );
+                skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
+            } else {
+                // GAP 1 FIX: supplierPartyUrl is null — try to look it up from Finale product data
+                const supplierInfo = await client.getProductSupplierInfo(pc.productId);
+                if (supplierInfo && supplierInfo.supplierPartyUrl) {
+                    skuBaseUpdated = await withToolAudit(
+                        "finale_update_product_supplier_price",
+                        auditCtx,
+                        { productId: pc.productId, supplierPartyUrl: supplierInfo.supplierPartyUrl, newPrice: pc.invoicePrice },
+                        () => client.updateProductSupplierPrice(pc.productId, supplierInfo.supplierPartyUrl, pc.invoicePrice),
+                    );
+                    skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
+                } else {
+                    // Could not determine supplier URL — log warning for dashboard visibility
+                    console.warn(`⚠️ [reconciler] SKU cost not updated for ${pc.productId}: no supplier info found in Finale`);
+                    skuCostStatus = 'not_found';
+                }
+            }
+            // Store the per-product status; use the first one's status as the overall result status
+            if (!result.skuCostUpdateStatus || skuCostStatus === 'updated') {
+                result.skuCostUpdateStatus = skuCostStatus;
             }
 
             applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
@@ -2333,6 +2383,45 @@ export async function applyReconciliation(
         } catch (err: any) {
             errors.push(`Fee ${fc.description}: Failed â€” ${err.message}`);
         }
+    }
+
+    // GAP 2 FIX: Residual gap check — after all line-item and fee adjustments,
+    // compute the projected PO total and compare against the invoice total.
+    if (result.invoiceTotal != null && result.invoiceTotal > 0) {
+        // Sum the applied price changes: projected PO subtotal from invoice prices
+        const appliedPriceChanges = result.priceChanges.filter(pc =>
+            pc.verdict === "auto_approve" ||
+            ((pc.verdict === "needs_approval" || pc.verdict === "short_shipment_hold") &&
+                approvedItems?.includes(pc.productId))
+        );
+        const projectedSubtotal = appliedPriceChanges.reduce(
+            (sum, pc) => sum + (pc.invoicePrice * pc.quantity), 0
+        );
+
+        // Sum the applied fee changes
+        const appliedFeeChanges = result.feeChanges.filter(fc =>
+            fc.verdict === "auto_approve" ||
+            (fc.verdict === "needs_approval" && approvedFeeTypes?.includes(fc.feeType))
+        );
+        const projectedFees = appliedFeeChanges.reduce(
+            (sum, fc) => sum + fc.amount, 0
+        );
+
+        const projectedTotal = projectedSubtotal + projectedFees;
+        const gap = Math.abs(projectedTotal - result.invoiceTotal);
+
+        result.residualGap = parseFloat(gap.toFixed(2));
+
+        if (gap > 5) {
+            const pct = result.invoiceTotal > 0 ? ((gap / result.invoiceTotal) * 100).toFixed(1) : "?";
+            result.residualGapNote = `Residual gap $${gap.toFixed(2)} (${pct}%) after all adjustments — PO projected total $${projectedTotal.toFixed(2)} vs invoice $${result.invoiceTotal.toFixed(2)}`;
+            applied.push(`⚠️  Residual gap: $${gap.toFixed(2)} — PO projected $${projectedTotal.toFixed(2)} vs invoice $${result.invoiceTotal.toFixed(2)}`);
+        } else {
+            applied.push(`✅ Residual gap check: $${gap.toFixed(2)} — within tolerance`);
+        }
+    } else {
+        result.residualGap = 0;
+        skipped.push("Residual gap: skipped — invoice total unavailable");
     }
 
     // 3. Apply tracking updates (with deduplication)

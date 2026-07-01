@@ -3,13 +3,13 @@
  * @purpose L0-L4 memory taxonomy manager.
  *
  * HERMIA(2026-05-28): Migrated all Pinecone calls to local SQLite memory-store.ts.
+ * HERMIA(2026-07-01): Removed all Supabase backup writes. SQLite is the sole store.
  * insight-index, aria-memory, and session-archive namespaces now use memory_vectors table.
  */
 
 import { embed, embedQuery } from "./embedding";
 import { upsertVector, queryVectors } from "@/lib/storage/memory-store";
 import { getLocalDb } from "@/lib/storage/local-db";
-import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
 export type MemoryLayer = "L0" | "L1" | "L2" | "L3" | "L4";
 
@@ -48,16 +48,7 @@ export interface SessionSummary {
 }
 
 // HERMIA(2026-05-28): Pinecone client removed. All vector ops now use memory-store.ts.
-
-function getSupabase() {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!url || !key) {
-        console.warn("Supabase env vars missing, memory-layer writes may fail");
-        return null;
-    }
-    return createSupabaseClient(url, key);
-}
+// HERMIA(2026-07-01): Supabase backup removed. SQLite is the sole store.
 
 export class MemoryLayerManager {
     async loadMetaRules(): Promise<MetaRule[]> {
@@ -154,17 +145,6 @@ export class MemoryLayerManager {
                 expiresAt: expiresAt ?? "",
                 stored_at: new Date().toISOString(),
             });
-
-            const supabase = getSupabase();
-            if (supabase) {
-                await supabase.from("memories").upsert({
-                    id: key,
-                    category,
-                    data,
-                    expires_at: expiresAt,
-                    created_at: new Date().toISOString(),
-                });
-            }
         } catch (err: any) {
             console.error("L2 remember() failed:", err.message);
         }
@@ -235,47 +215,77 @@ export class MemoryLayerManager {
             console.error("L4 archiveSession() failed:", err.message);
         }
 
-        const supabase = getSupabase();
-        if (!supabase) return;
-
+        // Also write to local task_history table for durability
         try {
-            await supabase.from("task_history").insert({
-                agent_name: summary.agentName,
-                task_type: summary.taskType,
-                input_summary: summary.inputSummary,
-                output_summary: summary.outputSummary,
-                status: summary.status,
-                skill_id: summary.skillId ?? null,
-                created_at: summary.createdAt,
-            });
+            const db = getLocalDb();
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS task_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    agent_name TEXT,
+                    task_type TEXT,
+                    input_summary TEXT,
+                    output_summary TEXT,
+                    status TEXT,
+                    skill_id TEXT,
+                    created_at TEXT
+                )
+            `);
+            db.prepare(`
+                INSERT INTO task_history (session_id, agent_name, task_type, input_summary, output_summary, status, skill_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                sessionId,
+                summary.agentName,
+                summary.taskType,
+                summary.inputSummary,
+                summary.outputSummary,
+                summary.status,
+                summary.skillId ?? null,
+                summary.createdAt,
+            );
         } catch (err: any) {
             console.error("L4 archiveSession() task_history insert failed:", err.message);
         }
     }
 
     async loadRecentSessions(limit = 10): Promise<SessionSummary[]> {
-        const supabase = getSupabase();
-        if (!supabase) return [];
-
         try {
-            const { data, error } = await supabase
-                .from("task_history")
-                .select("*")
-                .order("created_at", { ascending: false })
-                .limit(limit);
+            const db = getLocalDb();
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS task_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    agent_name TEXT,
+                    task_type TEXT,
+                    input_summary TEXT,
+                    output_summary TEXT,
+                    status TEXT,
+                    skill_id TEXT,
+                    created_at TEXT
+                )
+            `);
+            const rows = db.prepare(
+                "SELECT * FROM task_history ORDER BY created_at DESC LIMIT ?"
+            ).all(limit) as Array<{
+                id: number;
+                session_id: string;
+                agent_name: string;
+                task_type: string;
+                input_summary: string;
+                output_summary: string;
+                status: string;
+                skill_id: string | null;
+                created_at: string;
+            }>;
 
-            if (error) {
-                console.error("L4 loadRecentSessions() Supabase error:", error.message);
-                return [];
-            }
-
-            return (data || []).map((row: any) => ({
-                sessionId: row.id,
+            return rows.map((row) => ({
+                sessionId: row.session_id,
                 agentName: row.agent_name,
                 taskType: row.task_type,
                 inputSummary: row.input_summary,
                 outputSummary: row.output_summary,
-                status: row.status,
+                status: row.status as "success" | "failure" | "shadow",
                 skillId: row.skill_id ?? undefined,
                 createdAt: row.created_at,
             }));

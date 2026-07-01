@@ -52,6 +52,9 @@ const NODE_RUNTIME_EXTERNALS = [
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+    // Lock workspace root to this project — prevents Next.js from traversing
+    // parent directories when a stray package-lock.json exists at ~/BuildASoil/.
+    outputFileTracingRoot: __dirname,
     async redirects() {
         return [
             {

@@ -1,460 +1,345 @@
 /**
  * @file    inline-invoice-handler.ts
- * @purpose Handles inline invoice emails (no PDF) from the default inbox
- *          (bill.selee@buildasoil.com). Extracts invoice data via LLM,
- *          matches to an existing Finale PO or creates a draft PO with
- *          all details (line items, freight, dates). Notifies via Telegram.
- *
- *          IMPORTANT: This handler is ONLY called from the AcknowledgementAgent
- *          which runs on the default inbox (bill.selee@buildasoil.com).
- *          Invoices from this inbox should NEVER flow to Bill.com — they go
- *          to PO creation/matching only. Bill.com forwarding is exclusively
- *          handled by the AP Identifier on the ap@buildasoil.com inbox.
- *
- * @author  Will
- * @created 2026-03-12
- * @updated 2026-03-23
- * @deps    inline-invoice-parser, finale/client, storage/vendor-invoices, telegraf
- *
- * DECISION(2026-03-23): Removed all Bill.com forwarding and auto-reply logic.
- * The default inbox should NEVER send invoices to Bill.com — that is the AP
- * inbox's job. All inline invoices detected here route to PO creation/matching.
+ * @purpose Autonomous handler for inline (text-only) vendor invoices like
+ *          Ed Zybura / Organic AG Products. Detects casual cost breakdowns
+ *          in email bodies, finds the correlating Finale PO, generates a
+ *          proper PDF invoice, and forwards it to Bill.com via Gmail.
+ *          Zero Supabase dependency — uses direct Gmail + Finale GraphQL.
+ * @author  Hermia
+ * @created 2026-06-29
+ * @deps    inline-invoice-parser, invoice-generator, @googleapis/gmail
+ * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH, FINALE_BASE_URL
+ *          BILL_COM_FORWARD_EMAIL (default: buildasoilap@bill.com)
  */
 
-import { parseInlineInvoice, detectInlineInvoice } from './inline-invoice-parser';
-import { FinaleClient } from '../finale/client';
-import { createClient } from '../supabase';
-import { upsertVendorInvoice } from '../storage/vendor-invoices';
-import type { Telegraf, Context } from 'telegraf';
+import { detectInlineInvoice, parseInlineInvoice } from "./inline-invoice-parser";
+import { generateInvoicePDF } from "../pdf/invoice-generator";
+import type { InvoiceData } from "../pdf/invoice-parser";
+import { createHash, randomBytes } from "crypto";
 
-const supabase = createClient();
+const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 
-export class InlineInvoiceHandler {
-    constructor(private readonly bot: Telegraf<Context>) { }
+// ─── Finale GraphQL Helpers ─────────────────────────────────────────────────
 
-    /**
-     * Processes an email body for inline invoice data. If detected, extracts
-     * all details via LLM, matches or creates a draft PO in Finale, and
-     * notifies via Telegram. Never forwards to Bill.com.
-     *
-     * @returns { processed: boolean, logs: string[] }
-     */
-    async process(
-        bodyText: string,
-        subject: string,
-        fromEmail: string,
-        messageId: string,
-        threadId: string,
-        hasPdfAttachment: boolean
-    ): Promise<{ processed: boolean; logs: string[] }> {
-        const logs: string[] = [];
+interface FinalePO {
+    orderId: string;
+    status: string;
+    orderDate: string;
+    supplier: { name: string };
+    totalAmount?: { amount: string };
+}
 
-        try {
-            // Gate 1: Heuristic Detection
-            if (!detectInlineInvoice(bodyText, hasPdfAttachment, subject)) {
-                logs.push("Skipped: No inline invoice patterns detected.");
-                return { processed: false, logs };
+/**
+ * Build Finale GraphQL auth header from environment variables.
+ */
+function finaleAuthHeader(): string {
+    const apiKey = process.env.FINALE_API_KEY || "";
+    const apiSecret = process.env.FINALE_API_SECRET || "";
+    return `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString("base64")}`;
+}
+
+/**
+ * Get the Finale GraphQL endpoint URL.
+ */
+function finaleGraphqlUrl(): string {
+    const base = process.env.FINALE_BASE_URL || "https://app.finaleinventory.com";
+    const account = process.env.FINALE_ACCOUNT_PATH || "";
+    return `${base}/${account}/api/graphql`;
+}
+
+/**
+ * Search Finale for purchase orders from a supplier within a date window.
+ * Returns POs sorted by date descending.
+ *
+ * @param supplierKeywords - Terms to match against supplier name (e.g. ["organic ag", "zybura"])
+ * @param daysBack          - How many days back to search (default 120)
+ * @returns Matching POs, newest first
+ */
+async function findPOsBySupplier(
+    supplierKeywords: string[],
+    daysBack: number = 120
+): Promise<FinalePO[]> {
+    const now = new Date();
+    const begin = new Date(now);
+    begin.setDate(begin.getDate() - daysBack);
+    const beginStr = begin.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    const endStr = now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+    const query = {
+        query: `{
+            orderViewConnection(
+                first: 200
+                type: ["PURCHASE_ORDER"]
+                orderDate: { begin: "${beginStr}", end: "${endStr}" }
+                sort: [{ field: "orderDate", mode: "desc" }]
+            ) {
+                edges { node {
+                    orderId status orderDate
+                    supplier { name }
+                    totalAmount { amount }
+                }}
             }
+        }`,
+    };
 
-            // Gate 2: LLM Extraction — get structured line items, freight, dates
-            logs.push("Detected inline invoice data. Extracting...");
+    const res = await fetch(finaleGraphqlUrl(), {
+        method: "POST",
+        headers: {
+            Authorization: finaleAuthHeader(),
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(query),
+    });
 
-    
+    if (!res.ok) {
+        throw new Error(`Finale API returned ${res.status}: ${await res.text().then(t => t.substring(0, 200))}`);
+    }
 
-            // ── COLORFUL PACKAGING SHORTCUT ──────────────────────────────
-            // Credit-card paid vendor — never Bill.com. PO# is typically in
-            // the subject line (e.g., "Packaging Bags #124481" or "PO-124481").
-            // Extract PO#, match to Finale, update pricing + add freight.
-            const isColorful = /colorful\s*packaging/i.test(subject) ||
-                               /colorful\s*packaging/i.test(fromEmail) ||
-                               /colorfulpackaging\.com/i.test(bodyText) ||
-                               /colorfulpackaging\.com/i.test(fromEmail);
+    const json: any = await res.json();
+    if (json.errors?.length > 0) {
+        throw new Error(`Finale GraphQL error: ${json.errors[0].message}`);
+    }
 
-            if (isColorful) {
-                logs.push("📦 Colorful Packaging detected — extracting PO# and pricing");
-                try {
-                    // Extract PO# from subject or body
-                    // Patterns: "#124481", "PO-124481", "PO 124481", "Packaging Bags #124481"
-                    const poMatch = (subject + ' ' + bodyText).match(/(?:PO[-\s#]?|#)(\d{5,6})/i);
-                    const poNumber = poMatch ? poMatch[1] : null;
+    const edges: any[] = json.data?.orderViewConnection?.edges || [];
+    const allPOs: FinalePO[] = edges.map((e: any) => ({
+        orderId: String(e.node.orderId),
+        status: e.node.status,
+        orderDate: e.node.orderDate,
+        supplier: e.node.supplier,
+        totalAmount: e.node.totalAmount,
+    }));
 
-                    if (poNumber) {
-                        logs.push(`  Found PO reference: #${poNumber}`);
-                    }
+    // Filter by supplier name keywords
+    const lowerKeys = supplierKeywords.map(k => k.toLowerCase());
+    return allPOs.filter(po =>
+        lowerKeys.some(kw => (po.supplier?.name || "").toLowerCase().includes(kw))
+    );
+}
 
-                    // LLM extract pricing and shipping from email body
-                    const invoiceData = await parseInlineInvoice(bodyText, subject, fromEmail);
-                    const total = invoiceData.total || invoiceData.amountDue || 0;
-                    const freight = invoiceData.freight || 0;
-                    const invoiceNumber = invoiceData.invoiceNumber || 'UNKNOWN';
-                    const productTotal = total - freight; // EXW price (product cost excluding shipping)
+/**
+ * Find the most likely correlating PO for Ed's invoice.
+ *
+ * Strategy (per Bill, 2026-06-29):
+ *   "You can look and see the PO date as the exact one that's going to be
+ *    next in line." — Find the most recent PO from Organic AG Products
+ *    that has NOT yet been reconciled (non-CLOSED status preferred) or
+ *    the most recent by date if all are closed.
+ *
+ * @returns PO number string, or null if not found
+ */
+async function findCorrelatingPO(): Promise<string | null> {
+    try {
+        const keywords = ["organic ag", "organicag", "zybura", "ed ag"];
+        const pos = await findPOsBySupplier(keywords, 120);
 
-                    logs.push(`  Invoice: ${invoiceNumber} — Total $${total.toFixed(2)} (product $${productTotal.toFixed(2)} + freight $${freight.toFixed(2)})`);
-
-                    // Dedup check
-                    let alreadyProcessed = false;
-                    try {
-                        const { data: existing } = await supabase
-                            .from('vendor_invoices')
-                            .select('id, po_number')
-                            .eq('vendor_name', 'Colorful Packaging')
-                            .eq('invoice_number', invoiceNumber)
-                            .limit(1);
-
-                        if (existing && existing.length > 0 && existing[0].po_number) {
-                            logs.push(`⚠️ DEDUP: Already processed ${invoiceNumber} → PO #${existing[0].po_number}`);
-                            alreadyProcessed = true;
-                        }
-                    } catch { /* table may not exist */ }
-
-                    if (!alreadyProcessed) {
-                        const finale = new FinaleClient();
-
-                        if (poNumber) {
-                            // Match to existing PO and update pricing + freight
-                            try {
-                                const summary = await finale.getOrderSummary(poNumber);
-                                if (summary) {
-                                    logs.push(`✅ Matched PO #${summary.orderId} (status: ${summary.status}, current total: $${summary.total.toFixed(2)})`);
-
-                                    // ── PRICING UPDATE ──────────────────────────────
-                                    // Colorful Packaging invoices show a lump product cost
-                                    // (e.g., $1,050 for 3000pcs). We split evenly across
-                                    // PO line items: $1050 / 3000 = $0.35/ea.
-                                    const poDetails = await finale.getOrderDetails(poNumber);
-                                    // DECISION(2026-03-23): Filter to real product lines only.
-                                    // Finale POs include phantom header/shipment rows in orderItemList
-                                    // that have no productId. Only update items with a real SKU.
-                                    const poItems = ((poDetails.orderItemList || []) as Array<{
-                                        productId?: string;
-                                        unitPrice?: number;
-                                        quantity?: number;
-                                    }>).filter(item => !!item.productId);
-
-                                    // Total PO qty across real line items only
-                                    const totalPOQty = poItems.reduce((sum, item) => sum + (item.quantity || 0), 0);
-
-                                    if (totalPOQty > 0 && productTotal > 0) {
-                                        const perUnit = Math.round((productTotal / totalPOQty) * 10000) / 10000; // 4-decimal precision
-                                        logs.push(`  📊 Per-unit price: $${productTotal.toFixed(2)} ÷ ${totalPOQty} qty = $${perUnit.toFixed(4)}/ea`);
-
-                                        let priceUpdates: string[] = [];
-                                        for (const item of poItems) {
-                                            const oldPrice = item.unitPrice ?? 0;
-                                            if (Math.abs(oldPrice - perUnit) > 0.001) {
-                                                try {
-                                                    await finale.updateOrderItemPrice(
-                                                        summary.orderId,
-                                                        item.productId!,
-                                                        perUnit
-                                                    );
-                                                    priceUpdates.push(`${item.productId}: $${oldPrice.toFixed(4)} → $${perUnit.toFixed(4)}`);
-                                                } catch (priceErr: any) {
-                                                    logs.push(`  ⚠️ Price update failed for ${item.productId}: ${priceErr.message}`);
-                                                }
-                                            } else {
-                                                logs.push(`  ✓ ${item.productId} already at $${perUnit.toFixed(4)}`);
-                                            }
-                                        }
-
-                                        if (priceUpdates.length > 0) {
-                                            logs.push(`  ✅ Updated pricing: ${priceUpdates.join(', ')}`);
-                                        }
-                                    } else {
-                                        logs.push(`  ⚠️ Cannot compute per-unit: totalPOQty=${totalPOQty}, productTotal=$${productTotal.toFixed(2)}`);
-                                    }
-
-                                    // Add freight if present
-                                    if (freight > 0) {
-                                        try {
-                                            await finale.addOrderAdjustment(
-                                                summary.orderId,
-                                                'FREIGHT',
-                                                freight,
-                                                `Freight - Colorful Packaging ${invoiceNumber}`
-                                            );
-                                            logs.push(`  + Added freight: $${freight.toFixed(2)}`);
-                                        } catch (freightErr: any) {
-                                            logs.push(`  ⚠️ Freight add failed: ${freightErr.message}`);
-                                        }
-                                    }
-
-                                    // Archive to vendor_invoices
-                                    try {
-                                        await upsertVendorInvoice({
-                                            vendor_name: 'Colorful Packaging',
-                                            invoice_number: invoiceNumber,
-                                            invoice_date: invoiceData.invoiceDate ?? null,
-                                            po_number: summary.orderId,
-                                            subtotal: productTotal,
-                                            freight,
-                                            tax: 0,
-                                            total,
-                                            status: 'reconciled',
-                                            source: 'email_attachment',
-                                            source_ref: `colorful-auto-${messageId}`,
-                                            line_items: invoiceData.lineItems?.map(li => ({
-                                                sku: li.sku || li.description || 'PACKAGING',
-                                                description: li.description || '',
-                                                qty: li.qty || 0,
-                                                unit_price: li.unitPrice || 0,
-                                                ext_price: li.total || 0,
-                                            })) || [],
-                                            raw_data: { subject, fromEmail, invoiceData } as unknown as Record<string, unknown>,
-                                        });
-                                    } catch { /* dedup collision */ }
-
-                                    // Telegram notification
-                                    const chatId = process.env.TELEGRAM_CHAT_ID;
-                                    if (chatId && this.bot) {
-                                        const perUnitDisplay = totalPOQty > 0 && productTotal > 0
-                                            ? `$${productTotal.toFixed(2)} ÷ ${totalPOQty} = <b>$${(productTotal / totalPOQty).toFixed(4)}/ea</b>`
-                                            : 'N/A';
-                                        const skuLines = poItems
-                                            .map(item => `  • ${item.productId}: ${item.quantity} × $${(productTotal / totalPOQty).toFixed(4)}`)
-                                            .join('\n');
-                                        const msg = [
-                                            `📦 <b>Colorful Packaging — PO Updated</b>`,
-                                            ``,
-                                            `<b>PO #</b>${summary.orderId}`,
-                                            `<b>Invoice:</b> ${invoiceNumber}`,
-                                            `<b>Product:</b> $${productTotal.toFixed(2)}`,
-                                            `<b>Per Unit:</b> ${perUnitDisplay}`,
-                                            `<b>Freight:</b> $${freight.toFixed(2)}`,
-                                            `<b>Total DDP:</b> $${total.toFixed(2)}`,
-                                            skuLines ? `\n<b>PO Line Items:</b>\n${skuLines}` : null,
-                                            `\n✅ Pricing + freight updated.`,
-                                        ].filter(Boolean).join('\n');
-
-                                        await this.bot.telegram.sendMessage(chatId, msg, { parse_mode: 'HTML' });
-                                    }
-
-                                    return { processed: true, logs };
-                                }
-                            } catch (matchErr: any) {
-                                logs.push(`⚠️ PO lookup for #${poNumber} failed: ${matchErr.message}`);
-                            }
-                        }
-
-                        // No PO match — fall through to generic draft PO creation below
-                        logs.push("No PO match — falling through to draft PO creation");
-                    } else {
-                        return { processed: true, logs };
-                    }
-                } catch (cpErr: any) {
-                    logs.push(`⚠️ Colorful Packaging handler error: ${cpErr.message}. Falling back to generic.`);
-                }
-            }
-
-            const invoiceData = await parseInlineInvoice(bodyText, subject, fromEmail);
-
-            if (invoiceData.confidence === 'low' && invoiceData.total === 0) {
-                logs.push("Skipped: LLM could not extract valid invoice data (confidence low, total 0).");
-                return { processed: false, logs };
-            }
-
-            const total = invoiceData.total || invoiceData.amountDue || 0;
-            const freight = invoiceData.freight || 0;
-            const invoiceNumber = invoiceData.invoiceNumber || 'UNKNOWN';
-
-            logs.push(`Extracted: ${invoiceData.vendorName} — Invoice ${invoiceNumber} — $${total.toFixed(2)} (${invoiceData.lineItems?.length || 0} line items)`);
-
-            // ── PO MATCHING ──────────────────────────────────────────────
-            const finale = new FinaleClient();
-            let matchedPO: { orderId: string; total: number; status: string } | null = null;
-
-            // 1a. Direct PO# lookup if the invoice references one
-            if (invoiceData.poNumber) {
-                try {
-                    const summary = await finale.getOrderSummary(invoiceData.poNumber);
-                    if (summary) {
-                        matchedPO = { orderId: summary.orderId, total: summary.total, status: summary.status };
-                        logs.push(`✅ Matched by PO# ${summary.orderId} (status: ${summary.status})`);
-                    }
-                } catch {
-                    logs.push(`⚠️ Direct PO# lookup for ${invoiceData.poNumber} failed, trying fuzzy match...`);
-                }
-            }
-
-            // 1b. Fuzzy match by vendor name + date + amount
-            if (!matchedPO) {
-                try {
-                    const candidates = await finale.findPOByVendorAndDate(
-                        invoiceData.vendorName,
-                        invoiceData.invoiceDate || new Date().toISOString().split('T')[0],
-                        60 // 60-day window
-                    );
-                    if (candidates.length > 0) {
-                        const amountMatch = candidates.find(c =>
-                            Math.abs(c.total - total) < 1.00
-                        );
-                        const best = amountMatch || candidates[0];
-                        matchedPO = { orderId: best.orderId, total: best.total, status: best.status };
-                        logs.push(`✅ Fuzzy-matched to PO #${best.orderId} ($${best.total.toFixed(2)}, ${best.status})`);
-                    }
-                } catch (e: any) {
-                    logs.push(`⚠️ Fuzzy PO match failed: ${e.message}`);
-                }
-            }
-
-            // ── DRAFT PO CREATION (if no existing match) ─────────────────
-            let draftInfo: { orderId: string; finaleUrl: string } | null = null;
-            let skipDraftCreation = false;
-
-            // DEDUP GUARD: prevent creating multiple POs for the same vendor/invoice
-            if (!matchedPO) {
-                try {
-                    // Check vendor_invoices table
-                    const { data: existingVI } = await supabase
-                        .from('vendor_invoices')
-                        .select('id, po_number')
-                        .eq('vendor_name', invoiceData.vendorName)
-                        .eq('invoice_number', invoiceNumber)
-                        .limit(1);
-
-                    if (existingVI && existingVI.length > 0 && existingVI[0].po_number) {
-                        logs.push(`⚠️ DEDUP: PO #${existingVI[0].po_number} already exists for this invoice. Skipping draft creation.`);
-                        matchedPO = { orderId: existingVI[0].po_number, total, status: 'Draft' };
-                        skipDraftCreation = true;
-                    }
-                } catch { /* table may not exist */ }
-
-                // Also check paid_invoices table
-                if (!skipDraftCreation) {
-                    try {
-                        const { data: existingPaid } = await supabase
-                            .from('paid_invoices')
-                            .select('id, po_number')
-                            .eq('vendor_name', invoiceData.vendorName)
-                            .eq('invoice_number', invoiceNumber)
-                            .not('po_number', 'is', null)
-                            .limit(1);
-
-                        if (existingPaid && existingPaid.length > 0 && existingPaid[0].po_number) {
-                            logs.push(`⚠️ DEDUP: PO #${existingPaid[0].po_number} already exists in paid_invoices. Skipping.`);
-                            matchedPO = { orderId: existingPaid[0].po_number, total, status: 'Draft' };
-                            skipDraftCreation = true;
-                        }
-                    } catch { /* table may not exist */ }
-                }
-            }
-
-            if (!matchedPO && !skipDraftCreation) {
-                try {
-                    let vendorPartyId = await finale.findVendorPartyByName(invoiceData.vendorName);
-
-                    // Axiom-specific fallback: try alternate names
-                    if (!vendorPartyId && invoiceData.vendorName.toLowerCase().includes('axiom')) {
-                        vendorPartyId = await finale.findVendorPartyByName('Axiom Print');
-                        if (!vendorPartyId) vendorPartyId = await finale.findVendorPartyByName('Axiom');
-                    }
-
-                    if (vendorPartyId) {
-                        // DISABLED(2026-05-11): Auto PO creation removed — inline invoices must flow through approval.
-                        // Previously auto-created a draft PO with placeholder SKU(s) here.
-                        logs.push(`📝 Draft PO creation disabled — ${invoiceData.vendorName} invoice ${invoiceNumber} flagged for manual review`);
-                        draftInfo = { orderId: 'MANUAL-REVIEW', finaleUrl: '' };
-                    } else {
-                        logs.push(`⚠️ Could not find vendor party for "${invoiceData.vendorName}" — no draft PO created`);
-                    }
-                } catch (err: any) {
-                    logs.push(`❌ Draft PO creation failed: ${err.message}`);
-                }
-            }
-
-            // ── TELEGRAM NOTIFICATION ────────────────────────────────────
-            const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId && this.bot) {
-                const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-                const lineItemSummary = invoiceData.lineItems?.length > 0
-                    ? invoiceData.lineItems.map((li: any) =>
-                        `  • ${li.description || li.sku || '?'} — qty ${li.qty} × $${(li.unitPrice || 0).toFixed(2)}`
-                    ).join('\n')
-                    : null;
-
-                let message: string;
-                if (matchedPO) {
-                    message = [
-                        `✅ <b>Invoice → PO Matched</b>`,
-                        ``,
-                        `<b>Vendor:</b> ${escHtml(invoiceData.vendorName)}`,
-                        `<b>Invoice:</b> ${escHtml(invoiceNumber)} — $${total.toFixed(2)}`,
-                        `<b>Matched:</b> PO #${matchedPO.orderId} ($${matchedPO.total.toFixed(2)}, ${matchedPO.status})`,
-                        freight > 0 ? `<b>Freight:</b> $${freight.toFixed(2)}` : '',
-                    ].filter(Boolean).join('\n');
-                } else if (draftInfo && draftInfo.orderId !== 'MANUAL-REVIEW') {
-                    message = [
-                        `📝 <b>Invoice → Draft PO Created</b>`,
-                        ``,
-                        `<b>Vendor:</b> ${escHtml(invoiceData.vendorName)}`,
-                        `<b>Invoice:</b> ${escHtml(invoiceNumber)} — $${total.toFixed(2)}`,
-                        freight > 0 ? `<b>Freight:</b> $${freight.toFixed(2)}` : '',
-                        lineItemSummary ? `\n<b>Items:</b>\n${escHtml(lineItemSummary)}` : '',
-                        ``,
-                        `📝 Draft PO #${draftInfo.orderId} — verify and commit`,
-                        `<a href="${draftInfo.finaleUrl}">Open in Finale →</a>`,
-                    ].filter(Boolean).join('\n');
-                } else if (draftInfo) {
-                    message = [
-                        `📝 <b>Invoice — Manual Review Needed</b>`,
-                        ``,
-                        `<b>Vendor:</b> ${escHtml(invoiceData.vendorName)}`,
-                        `<b>Invoice:</b> ${escHtml(invoiceNumber)} — $${total.toFixed(2)}`,
-                        ``,
-                        `⏸️ Draft PO creation disabled — manual approval required.`,
-                    ].filter(Boolean).join('\n');
-                } else {
-                    message = [
-                        `🔍 <b>Inline Invoice — Manual Review Needed</b>`,
-                        ``,
-                        `<b>Vendor:</b> ${escHtml(invoiceData.vendorName)}`,
-                        `<b>Invoice:</b> ${escHtml(invoiceNumber)} — $${total.toFixed(2)}`,
-                        ``,
-                        `❌ Could not find vendor in Finale — no draft PO created.`,
-                    ].filter(Boolean).join('\n');
-                }
-
-                try {
-                    await this.bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
-                } catch (tgErr: any) {
-                    console.warn('⚠️ Telegram alert failed:', tgErr.message);
-                }
-            }
-
-            // ── ACTIVITY LOG ─────────────────────────────────────────────
-            await supabase.from('ap_activity_log').insert([{
-                vendor_name: invoiceData.vendorName,
-                activity_type: 'inline_invoice_po',
-                description: matchedPO
-                    ? `Invoice ${invoiceNumber} matched to PO #${matchedPO.orderId}`
-                    : draftInfo
-                        ? `Draft PO #${draftInfo.orderId} created from invoice ${invoiceNumber}`
-                        : `Invoice ${invoiceNumber} — vendor not found, manual review needed`,
-                details: {
-                    type: 'inline_invoice_po',
-                    success: !!matchedPO || !!draftInfo,
-                    invoiceNumber,
-                    total,
-                    freight,
-                    lineItemCount: invoiceData.lineItems?.length || 0,
-                }
-            }]).then(() => { }).catch(() => { });
-
-            return { processed: true, logs };
-
-        } catch (e: any) {
-            logs.push(`❌ Error processing inline invoice: ${e.message}`);
-            console.error('[InlineInvoiceHandler] ERROR: ', e);
-
-            if (process.env.TELEGRAM_CHAT_ID) {
-                await this.bot.telegram.sendMessage(
-                    process.env.TELEGRAM_CHAT_ID,
-                    `❌ **Aria Inline Invoice Error**\n\nFailed to process inline invoice from ${fromEmail}: ${e.message}`,
-                    { parse_mode: 'Markdown' }
-                ).catch(console.error);
-            }
-            return { processed: false, logs };
+        if (pos.length === 0) {
+            console.warn("   ⚠️ No Organic AG POs found in Finale (120-day window)");
+            return null;
         }
+
+        // Prefer the most recent non-CLOSED PO
+        const openPO = pos.find(po => po.status !== "CLOSED" && po.status !== "CANCELLED");
+        if (openPO) {
+            console.log(`   ✅ Found open PO ${openPO.orderId} (${openPO.status}) — ${openPO.orderDate}`);
+            return openPO.orderId;
+        }
+
+        // Fallback: most recent by date
+        const latest = pos[0];
+        console.log(`   ⚠️ All Organic AG POs closed. Using latest: PO ${latest.orderId} (${latest.orderDate})`);
+        return latest.orderId;
+    } catch (err: any) {
+        console.warn(`   ⚠️ Finale PO search failed: ${err.message}`);
+        return null;
+    }
+}
+
+// ─── Bill.com Forwarding ────────────────────────────────────────────────────
+
+/**
+ * Forward a PDF invoice to Bill.com via Gmail, matching the same MIME format
+ * used by ap-local-forwarder.ts.
+ *
+ * @param gmail           - Authenticated Gmail API client
+ * @param emailSubject    - Original email subject (used as "Fwd: <subject>")
+ * @param emailFrom       - Original sender email
+ * @param pdfFilename     - Desired filename for the attached PDF
+ * @param pdfBuffer       - PDF bytes
+ * @returns Sent Gmail message ID, or null on failure
+ */
+async function forwardToBillCom(
+    gmail: any,
+    emailSubject: string,
+    emailFrom: string,
+    pdfFilename: string,
+    pdfBuffer: Buffer,
+): Promise<string | null> {
+    const rawBase64 = pdfBuffer.toString("base64");
+    const chunkedBase64 = rawBase64.match(/.{1,76}/g)?.join("\r\n") || rawBase64;
+    const boundary = "b_aria_inline_" + randomBytes(8).toString("hex");
+
+    const forwardBody = [
+        "Forwarded invoice (auto-generated from vendor email).",
+        "",
+        `Vendor: ${emailFrom}`,
+        `Original Subject: ${emailSubject}`,
+        `PDF: ${pdfFilename}`,
+    ].join("\r\n");
+
+    const mimeMessage = [
+        `To: ${BILL_COM_EMAIL}`,
+        `Subject: Fwd: ${emailSubject}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
+        ``,
+        `--${boundary}`,
+        `Content-Type: text/plain; charset="UTF-8"`,
+        ``,
+        forwardBody,
+        ``,
+        `--${boundary}`,
+        `Content-Type: application/pdf; name="${pdfFilename}"`,
+        `Content-Transfer-Encoding: base64`,
+        `Content-Disposition: attachment; filename="${pdfFilename}"`,
+        ``,
+        chunkedBase64,
+        `--${boundary}--`,
+    ].join("\r\n");
+
+    const sendResult = await gmail.users.messages.send({
+        userId: "me",
+        requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") },
+    });
+
+    return sendResult.data.id || null;
+}
+
+// ─── Main Handler ───────────────────────────────────────────────────────────
+
+export interface InlineInvoiceParams {
+    /** Authenticated Gmail API client for the source inbox */
+    gmail: any;
+    /** Gmail message ID of the source email */
+    gmailMessageId: string;
+    /** Sender email address (e.g. "Ed Zybura <ed@organicag.com>") */
+    from: string;
+    /** Email subject line */
+    subject: string;
+    /** Email body text (plain text) */
+    body: string;
+    /** Date the email was received (YYYY-MM-DD) */
+    date: string;
+}
+
+export interface InlineInvoiceResult {
+    success: boolean;
+    /** Sent Gmail message ID if forwarded successfully */
+    forwardedMessageId?: string;
+    /** Correlating PO number found (or null if not found) */
+    poNumber?: string | null;
+    /** Invoice number extracted/assigned */
+    invoiceNumber?: string;
+    /** Total amount extracted */
+    totalAmount?: number;
+    error?: string;
+}
+
+/**
+ * Handle an inline invoice email: parse, find PO, generate PDF, forward to Bill.com.
+ *
+ * Designed to be called from ap-identifier.ts when an email is detected as an
+ * inline invoice (detectInlineInvoice returns true). Completely autonomous —
+ * no Supabase dependency, no manual steps.
+ *
+ * @param params - Email context and Gmail client
+ * @returns Result with success status and metadata
+ */
+export async function handleInlineInvoice(
+    params: InlineInvoiceParams
+): Promise<InlineInvoiceResult> {
+    const { gmail, gmailMessageId, from, subject, body, date } = params;
+
+    console.log(`📧 Inline Invoice Handler — ${from} — ${subject.slice(0, 60)}`);
+
+    // ── Step 0: Pre-flight check ──────────────────────────────────────────
+    if (!detectInlineInvoice(body, false, subject)) {
+        return { success: false, error: "Email does not match inline invoice pattern" };
+    }
+
+    try {
+        // ── Step 1: Parse invoice via LLM ──────────────────────────────────
+        console.log(`   🔍 LLM parsing...`);
+        const data = await parseInlineInvoice(body, subject, from);
+
+        // ── Step 2: Extract amounts from raw body (Ed's format: BREAK DOWN $X) ──
+        const sm = body.match(/BREAK\s*DOWN\s*\$?(\d[\d,]*)/i);
+        const fm = body.match(/FREIGHT.*?\$?(\d+\.?\d*)/i);
+        const tm = body.match(/TOTAL\s*\$?([\d,]+\.?\d*)/i);
+        const subtotal = sm ? parseFloat(sm[1].replace(/,/g, "")) : (data.subtotal || 0);
+        const freight = fm ? parseFloat(fm[1].replace(/,/g, "")) : (data.freight || 0);
+        const total = tm ? parseFloat(tm[1].replace(/,/g, "")) : (data.total || subtotal + freight);
+
+        console.log(`   📊 Parsed: $${subtotal.toFixed(2)} + $${freight.toFixed(2)} = $${total.toFixed(2)}`);
+
+        // ── Step 3: Find correlating PO ────────────────────────────────────
+        console.log(`   🔍 Searching Finale for Organic AG PO...`);
+        const poNumber = data.poNumber || await findCorrelatingPO();
+        if (poNumber) {
+            console.log(`   📎 Correlated to PO ${poNumber}`);
+        }
+
+        // ── Step 4: Assemble invoice data for PDF generation ───────────────
+        const invNumber = data.invoiceNumber !== "UNKNOWN" && data.invoiceNumber
+            ? data.invoiceNumber
+            : subject.match(/INVOICE\s+#?(\d+)/i)?.[1] || "UNKNOWN";
+
+        const invoiceData: InvoiceData = {
+            documentType: "invoice",
+            invoiceNumber: invNumber,
+            vendorName: data.vendorName || "Organic AG Products",
+            vendorEmail: from.match(/<([^>]+)>/)?.[1] || from,
+            poNumber: poNumber || undefined,
+            invoiceDate: date,
+            lineItems: data.lineItems?.length ? data.lineItems : [{
+                description: poNumber
+                    ? `Organic AG Products — PO ${poNumber} — per Ed Zybura ${date}`
+                    : `Organic AG Products — per Ed Zybura ${date}`,
+                qty: 1,
+                unitPrice: subtotal,
+                total: subtotal,
+            }],
+            subtotal,
+            freight,
+            total,
+            amountDue: total,
+            notes: data.notes || "Auto-generated from vendor email. Paper copy to follow per Ed.",
+            confidence: "medium",
+        };
+
+        // ── Step 5: Generate PDF ──────────────────────────────────────────
+        console.log(`   📄 Generating PDF invoice...`);
+        const pdfBuffer = await generateInvoicePDF(invoiceData, date);
+
+        // ── Step 6: Forward to Bill.com ────────────────────────────────────
+        const safeFilename = `Organic_AG_Invoice_${invNumber.replace(/[^a-zA-Z0-9_-]/g, "_")}.pdf`;
+        console.log(`   📤 Forwarding to ${BILL_COM_EMAIL} (${(pdfBuffer.length / 1024).toFixed(1)} KB)...`);
+        const sentMessageId = await forwardToBillCom(gmail, subject, from, safeFilename, pdfBuffer);
+
+        if (!sentMessageId) {
+            return { success: false, error: "Failed to send forward to Bill.com" };
+        }
+
+        console.log(`   ✅ Forwarded! Gmail message ID: ${sentMessageId}`);
+
+        return {
+            success: true,
+            forwardedMessageId: sentMessageId,
+            poNumber,
+            invoiceNumber: invNumber,
+            totalAmount: total,
+        };
+    } catch (err: any) {
+        console.error(`   ❌ Inline invoice handler failed: ${err.message}`);
+        return { success: false, error: err.message };
     }
 }

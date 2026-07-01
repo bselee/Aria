@@ -138,6 +138,28 @@ export function getLocalDb() {
             triggered_by TEXT,
             synced_to_supabase INTEGER DEFAULT 0
         );
+
+        -- KAIZEN(2026-07-01): Bill.com reference data — imported from bill.com CSV exports.
+        -- Used as a dedup check in ap-forwarder.ts to skip invoices already in Bill.com.
+        -- UNIQUE(invoice_number, vendor_name) prevents both import-time and query-time dupes.
+        CREATE TABLE IF NOT EXISTS billcom_bills_ref (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_number TEXT NOT NULL,
+            vendor_name TEXT NOT NULL,
+            invoice_amount REAL,
+            invoice_date TEXT,
+            due_date TEXT,
+            po_number TEXT,
+            chart_of_account TEXT,
+            bill_type TEXT,
+            payment_status TEXT,
+            currency TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(invoice_number, vendor_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_billcom_ref_vendor ON billcom_bills_ref(vendor_name);
+        CREATE INDEX IF NOT EXISTS idx_billcom_ref_invoice ON billcom_bills_ref(invoice_number);
     `);
 
     // ── Lightweight migrations (ALTER TABLE for columns added after initial creation) ──

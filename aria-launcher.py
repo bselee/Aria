@@ -12,8 +12,9 @@ NODE = r"C:\Program Files\nodejs\node.exe"
 NO_WIN = 0x08000000
 
 def start(name, cmd):
-    print(f"  {name}...", end=" ", flush=True)
-    p = subprocess.Popen(cmd, cwd=ARIA, shell=True,
+    print(f"  {name}... ", end="", flush=True)
+    # list form, shell=False = zero cmd.exe windows ever
+    p = subprocess.Popen(cmd, cwd=ARIA,
                          creationflags=NO_WIN,
                          stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL,
@@ -23,22 +24,19 @@ def start(name, cmd):
 
 if __name__ == "__main__":
     os.chdir(ARIA)
-    print("Aria — no-window launcher\n")
-    
-    procs = [
-        start("wsl-proxy", f'"{NODE}" scripts/wsl-proxy.js'),
-        start("dashboard", f'"{NODE}" node_modules/next/dist/bin/next start -p 3001'),
-        # npx spawns a child, but CREATE_NO_WINDOW suppresses its cmd.exe flash
-        start("aria-bot", f'npx tsx src/cli/start-bot.ts'),
-    ]
-    
-    print(f"\n{len(procs)} processes running. Close this window to stop all.\n")
-    
+    # PostgREST health gate — bail if down (WSL2 Docker local DB)
     try:
-        while True:
-            time.sleep(10)
-    except KeyboardInterrupt:
-        print("\nStopping...")
-        for p in procs:
-            p.terminate()
-    print("Done.")
+        import urllib.request, ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        urllib.request.urlopen("http://localhost:3000", timeout=2, context=ctx)
+    except:
+        print("PostgREST down — aborting launch")
+        sys.exit(1)
+
+    # Fire-and-forget starter — Task Scheduler + watchdog handle restarts
+    start("wsl-proxy", [NODE, "scripts/wsl-proxy.js"])
+    start("dashboard", [NODE, "node_modules/next/dist/bin/next", "start", "-p", "3001"])
+    start("aria-bot", [NODE, "node_modules/tsx/dist/cli.mjs", "src/cli/start-bot.ts"])
+    # Exit immediately — watchdog monitors health every 2 minutes

@@ -27,6 +27,8 @@ import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
 import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
 import BasautoPanel from "@/components/dashboard/BasautoPanel";
+import DedupActivityPanel from "@/components/dashboard/DedupActivityPanel";
+import ReconciliationPanel from "@/components/dashboard/ReconciliationPanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -38,6 +40,7 @@ export type PanelDefinition = {
 };
 
 export const PANEL_DEFINITIONS: PanelDefinition[] = [
+
     {
         id: "build-risk",
         label: "Build Risk",
@@ -137,6 +140,18 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
             label: "BASAUTO Requests",
             short: "BASAUTO",
             render: () => <BasautoPanel />,
+        },
+        {
+            id: "dedup-activity",
+            label: "Duplicate Suppression",
+            short: "Dedup",
+            render: () => <DedupActivityPanel />,
+        },
+        {
+            id: "reconciliation",
+            label: "Reconciliation",
+            short: "Recon",
+            render: () => <ReconciliationPanel />,
         },
     ];
 

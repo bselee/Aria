@@ -1067,6 +1067,29 @@ defineJob({
             });
 
             // ─────────────────────────────────────────────────────────────────────────────
+            // Vendor Lead Time Tracker — nightly 10 PM
+            // 4-layer pipeline: persist observed P50/P90, detect drift alerts,
+            // auto-update policy overrides (opt-in), cross-validate BAS Auto data.
+            // Only sends consolidated Telegram report when there's something to say.
+            // ─────────────────────────────────────────────────────────────────────────────
+            defineJob({
+                name: "vendor-lead-time-tracker",
+                schedule: "0 22 * * *",
+                onFail: "telegram-will",
+                description: "Nightly vendor lead-time tracking (4 layers): persist stats, drift alerts, auto-update overrides, BAS cross-validation. 10 PM.",
+                handler: async () => {
+                    const { runLeadTimeTracker } = await import("@/lib/purchasing/lead-time-tracker");
+                    const result = await runLeadTimeTracker();
+                    console.log(
+                        `[vendor-lead-time-tracker] persisted=${result.statsPersisted}, ` +
+                        `drifts=${result.driftAlerts.length}, autoUpdates=${result.autoUpdates.length}, ` +
+                        `basMismatches=${result.basCrossValidations.length}, errors=${result.errors.length}`
+                    );
+                },
+                budget: { durationMs: 120_000 },
+            });
+
+            // ─────────────────────────────────────────────────────────────────────────────
             // AP Email Watcher — DISABLED 2026-06-18 (Hermia review)
     // This job ran `run-ap-pipeline.ts` (a MANUAL diagnostic script) every 15 min.
 // That script has NO dedup: it finds the most-recent invoice PDF in Gmail and
@@ -1075,7 +1098,58 @@ defineJob({
 // It also competed with the production `ap-polling` cron (which has 3 dedup
 // layers in ap-identifier.ts: message_id, cross-inbox, PDF content hash).
 //
-// The production `ap-polling` job (above) is the correct, dedup-safe pipeline.
-// Do NOT re-enable this without first adding a Bill.com forward-dedup check to
-// run-ap-pipeline.ts (query ap_activity_log / Gmail Sent before forwarding).
 // ─────────────────────────────────────────────────────────────────────────────
+
+// HERMIA(2026-07-01): Weekly bill.com reference data refresh.
+// Step 1: Download AllBillsPage.csv from bill.com (via Playwright + running Chrome
+// or saved cookie profile). If Chrome is unavailable (e.g. weekend server), logs
+// a warning and re-imports the last downloaded CSV instead.
+// Step 2: Import the CSV into SQLite billcom_bills_ref table.
+// Runs Sunday 7 AM — before business hours but after any weekend batch.
+defineJob({
+    name: "billcom-ref-import",
+    schedule: "0 7 * * 0",  // Sunday 7 AM
+    onFail: "log",
+    description: "Sunday 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    handler: async () => {
+        try {
+            // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
+            const { main: downloadBillComRef } = await import("@/cli/download-billcom-ref");
+            await downloadBillComRef();
+        } catch (err: any) {
+            console.warn(`[billcom-ref-import] Download step warning: ${err?.message ?? err}`);
+            console.warn("[billcom-ref-import] Proceeding with import of existing CSV...");
+        }
+
+        try {
+            // Step 2: Import existing CSV into SQLite
+            const { main: importBillComRef } = await import("@/cli/import-billcom-ref");
+            await importBillComRef();
+        } catch (err: any) {
+            console.error(`[billcom-ref-import] Import step failed: ${err?.message ?? err}`);
+        }
+
+        // Step 3: Clean up old ap_activity_log entries (keep 90 days)
+        try {
+            const { createClient } = await import("@/lib/supabase");
+            const supabase = createClient();
+            if (supabase) {
+                const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+                const { data, error } = await supabase
+                    .from("ap_activity_log")
+                    .delete()
+                    .lt("created_at", cutoff);
+                if (error) {
+                    console.warn(`[billcom-ref-import] Log cleanup warning: ${error.message}`);
+                } else {
+                    const count = typeof data === 'number' ? data : (Array.isArray(data) ? data.length : 0);
+                    console.log(`[billcom-ref-import] Log cleanup: removed entries older than 90 days`);
+                }
+            }
+        } catch (err: any) {
+            console.warn(`[billcom-ref-import] Log cleanup skipped: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
+

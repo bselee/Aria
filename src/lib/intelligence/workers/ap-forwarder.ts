@@ -5,6 +5,7 @@ import { createClient } from "../../supabase";
 import { applyMessageLabelPolicy } from "../gmail-policy";
 import { APAgent } from "../ap-agent";
 import { writeInvoiceSummary } from "../../obsidian/bridge";
+import { getLocalDb } from "../../storage/local-db";
 
 /**
  * @file ap-forwarder.ts
@@ -68,16 +69,89 @@ export class APForwarderAgent {
     }
 
     private async verifySentMessage(gmail: any, sentMessageId: string): Promise<void> {
-        const sentMessage = await gmail.users.messages.get({
-            userId: "me",
-            id: sentMessageId,
-            format: "metadata",
-        });
-        const labelIds: string[] = sentMessage.data.labelIds || [];
-        if (!labelIds.includes("SENT")) {
-            throw new Error(`Gmail did not confirm SENT state for ${sentMessageId}`);
+            const sentMessage = await gmail.users.messages.get({
+                userId: "me",
+                id: sentMessageId,
+                format: "metadata",
+            });
+            const labelIds: string[] = sentMessage.data.labelIds || [];
+            if (!labelIds.includes("SENT")) {
+                throw new Error(`Gmail did not confirm SENT state for ${sentMessageId}`);
+            }
         }
-    }
+
+        /**
+         * Check local SQLite ap_local_forwards to see if the local forwarder
+         * (runLocalApForward) already forwarded this invoice to Bill.com.
+         * 
+         * The local forwarder runs FIRST in the ap-polling cron. Without this
+         * cross-system guard, the Supabase pipeline forwards the same invoice
+         * a second time — producing duplicate Bill.com entries ("Fwd: Fwd:" chains).
+         *
+         * Two-layer dedup:
+         *   Layer 1 (hash): When pdfContentHash is available, check ap_local_forwards
+         *                    for any FORWARDED record with that hash (no time limit).
+         *                    Catches same PDF arriving via different emails/subjects.
+         *   Layer 2 (fallback): email_from + email_subject + pdf_filename (exact match)
+         *                       within the last 72 hours. Used when hash is unavailable
+         *                       (legacy records before pdf_content_hash was populated).
+         */
+        private isAlreadyForwardedLocally(
+            emailFrom: string,
+            emailSubject: string,
+            pdfFilename: string,
+            pdfContentHash?: string,
+        ): boolean {
+            try {
+                const db = getLocalDb();
+
+                // Layer 1: content hash — catches same PDF via different emails/subjects
+                if (pdfContentHash) {
+                    const byHash = db.prepare(
+                        `SELECT 1 FROM ap_local_forwards
+                         WHERE pdf_content_hash = ?
+                         AND status = 'FORWARDED'`
+                    ).get(pdfContentHash);
+                    if (byHash) return true;
+                }
+
+                // Layer 2: fallback — email + subject + filename within 72 hours
+                const row = db.prepare(
+                    `SELECT 1 FROM ap_local_forwards
+                     WHERE email_from = ? AND email_subject = ? AND pdf_filename = ?
+                     AND status = 'FORWARDED'
+                     AND forwarded_at > datetime('now', '-72 hours')`
+                ).get(emailFrom, emailSubject, pdfFilename);
+                return !!row;
+            } catch {
+                return false; // DB error → assume not forwarded (safe default)
+            }
+        }
+
+        /**
+         * Check billcom_bills_ref table to see if this vendor+invoice already
+         * exists in Bill.com. The reference data is imported weekly from the
+         * Bill.com CSV export.
+         *
+         * Uses LOWER() comparison on vendor_name for case-insensitive matching.
+         * invoice_number is compared exactly (Bill.com preserves case).
+         */
+        private isAlreadyInBillCom(fromEmail: string, pdfFilename: string, invoiceNumber?: string, vendorName?: string): boolean {
+            try {
+                const db = getLocalDb();
+                if (invoiceNumber && vendorName) {
+                    // Check by vendor + invoice number (strongest match)
+                    const row = db.prepare(
+                        `SELECT 1 FROM billcom_bills_ref
+                         WHERE LOWER(vendor_name) = LOWER(?) AND invoice_number = ?`
+                    ).get(vendorName.trim(), invoiceNumber.trim());
+                    if (row) return true;
+                }
+                return false;
+            } catch {
+                return false;
+            }
+        }
 
     private isQueueItemSentToBillCom(relatedItem: any): boolean {
         const sentMessageId = relatedItem.extracted_json?.billcom_sent_message_id;
@@ -174,9 +248,39 @@ export class APForwarderAgent {
                         .in('status', ['PENDING_FORWARD', 'ERROR_FORWARDING']);
 
                     if (lockError) {
-                        console.error(`   ❌ Failed to lock item ${item.id}:`, lockError.message);
-                        continue;
-                    }
+                                            console.error(`   ❌ Failed to lock item ${item.id}:`, lockError.message);
+                                            continue;
+                                        }
+
+                                        // ── Cross-system dedup: check local SQLite ──────────────────
+                                        // The local forwarder (ap-local-forwarder.ts) runs FIRST in the
+                                        // ap-polling cron. If it already forwarded this invoice, the
+                                        // Supabase pipeline must NOT send a duplicate to Bill.com.
+                                        const pdfHash = item.pdf_content_hash as string | undefined;
+                                        if (
+                                            item.email_from &&
+                                            item.email_subject &&
+                                            item.pdf_filename &&
+                                            this.isAlreadyForwardedLocally(item.email_from, item.email_subject, item.pdf_filename, pdfHash)
+                                        ) {
+                                            const dedupReason = pdfHash
+                                                ? `content-hash dedup (${pdfHash.slice(0, 12)}...)`
+                                                : 'email+subject+filename dedup';
+                                            console.log(`   ⏭️ Already forwarded locally: ${item.pdf_filename} (${dedupReason}) — marking FORWARDED, skip`);
+                                            await supabase
+                                                .from('ap_inbox_queue')
+                                                .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
+                                                .eq('id', item.id);
+                                            await this.logActivity(
+                                                supabase,
+                                                item.email_from,
+                                                item.email_subject,
+                                                item.intent || 'INVOICE',
+                                                `Suppressed duplicate: already forwarded by local pipeline (${item.pdf_filename})`,
+                                                { reasonCode: "local_forwarder_dedup", gmailMessageId: sourceMessageId },
+                                            );
+                                            continue;
+                                        }
 
                     // HERMIA(2026-06-10): Guard against null pdf_filename/pdf_path
                                         // These records were likely created by vendor routing without full PDF
@@ -223,9 +327,33 @@ export class APForwarderAgent {
                                                 .update({ status: item.status })
                                                 .eq('id', item.id);
                                             continue;
-                                        }
+                                                    }
 
-                    console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from}`);
+                                                    // Layer 3: Bill.com reference check — does this vendor+invoice already exist?
+                                                    const billcomExists = this.isAlreadyInBillCom(
+                                                        item.email_from,
+                                                        item.pdf_filename,
+                                                        item.invoice_number,
+                                                        item.vendor_name,
+                                                    );
+                                                    if (billcomExists) {
+                                                        console.log(`   ⏭️ Already in Bill.com: vendor=${item.vendor_name} inv=${item.invoice_number} — skipping forward`);
+                                                        await supabase
+                                                            .from('ap_inbox_queue')
+                                                            .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
+                                                            .eq('id', item.id);
+                                                        await this.logActivity(
+                                                            supabase,
+                                                            item.email_from,
+                                                            item.email_subject,
+                                                            item.intent || 'INVOICE',
+                                                            `Suppressed: already in Bill.com (${item.pdf_filename})`,
+                                                            { reasonCode: "billcom_ref_dedup", invoiceNumber: item.invoice_number, vendorName: item.vendor_name },
+                                                        );
+                                                        continue;
+                                                    }
+
+                                            console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from}`);
 
                     // Download PDF from Supabase Storage
                     const { data: fileData, error: downloadError } = await supabase.storage

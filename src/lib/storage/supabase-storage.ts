@@ -1,32 +1,28 @@
 /**
  * @file    supabase-storage.ts
- * @purpose Uploads PDFs and other documents to Supabase Storage.
- *          Provides a clean API for the attachment handler
- *          to archive files with structured paths.
+ * @purpose Local filesystem storage for PDFs and other documents.
+ *          Replaces Supabase Storage. Files are stored under
+ *          local/storage/{type}/{vendor}/{date}/{filename}.
  * @author  Aria (Antigravity)
  * @created 2026-03-10
- * @updated 2026-03-10
- * @deps    supabase/client
- * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * @updated 2026-07-01 — migrated from Supabase Storage to local filesystem
+ * @deps    fs, path
  */
 
-import { createClient } from "../supabase";
+import * as fs from "fs";
+import * as path from "path";
 
-const BUCKET = "documents";
+const STORAGE_ROOT = path.join(process.cwd(), "local", "storage");
 
 /**
- * Uploads a PDF buffer to Supabase Storage and returns the storage path.
+ * Writes a PDF buffer to the local filesystem and returns the storage path.
  *
  * Files are stored under a structured path:
- *   documents/{type}/{vendor}/{date}/{filename}
- *
- * If the upload fails the error is thrown — callers should catch and degrade
- * gracefully (the upload is never critical-path for reconciliation).
+ *   local/storage/{type}/{vendor}/{date}/{filename}
  *
  * @param   buffer   - Raw PDF bytes
  * @param   meta     - Structured metadata used to build the storage path
- * @returns Storage path string (e.g., "INVOICE/acme/2026-03-10/inv-12345.pdf")
- * @throws  {Error}  If Supabase Storage upload fails
+ * @returns Storage path string (e.g., "local/storage/INVOICE/acme/2026-03-10/inv-12345.pdf")
  */
 export async function uploadPDF(
     buffer: Buffer,
@@ -37,37 +33,25 @@ export async function uploadPDF(
         filename: string;
     }
 ): Promise<string> {
-    const supabase = createClient();
-
-    // Sanitize path components — remove special chars that break storage paths
+    // Sanitize path components
     const safeName = (s: string) =>
         s.replace(/[^a-zA-Z0-9_\-./ ]/g, "").replace(/\s+/g, "_").slice(0, 100);
 
-    const storagePath = [
+    const relativePath = [
         safeName(meta.type),
         safeName(meta.vendor),
         meta.date,
         safeName(meta.filename),
     ].join("/");
 
-    // Try storage upload — fails gracefully if storage backend (MinIO/PostgREST)
-    // is not configured. The path is still returned so the DB record can reference it.
-    try {
-        const { error } = await supabase.storage
-            .from(BUCKET)
-            .upload(storagePath, buffer, {
-                contentType: "application/pdf",
-                upsert: true,
-            });
+    const fullPath = path.join(STORAGE_ROOT, relativePath);
 
-        if (error) {
-            console.warn(`[storage] Upload failed (non-critical): ${error.message}`);
-        }
+    try {
+        await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+        await fs.promises.writeFile(fullPath, buffer);
     } catch (err: any) {
-        // Storage backend not available (PostgREST doesn't serve /storage/v1/)
-        // The PDF path is still recorded in the DB for future archival.
-        console.warn(`[storage] Upload skipped: ${err?.message || err}`);
+        console.warn(`[storage] Local write failed (non-critical): ${err?.message || err}`);
     }
 
-    return storagePath;
+    return path.join("local", "storage", relativePath).replace(/\\/g, "/");
 }
