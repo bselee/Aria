@@ -2,9 +2,9 @@ import { createClient } from "../db";
 import {
     buildHeartbeatRecord,
     buildOpsHealthDecision,
-    isProjectReady,
     type OpsControlCommand,
 } from "./control-plane";
+
 import {
     claimNextOpsControlRequest,
     completeOpsControlRequest,
@@ -90,7 +90,11 @@ export async function recordBotHeartbeatOnce(
 
     await upsertAgentHeartbeat(supabase, heartbeat);
 
-    if (!isSupabaseProjectReady(projectStatus)) {
+    const ready = (() => {
+        const s = (projectStatus || "").trim().toUpperCase();
+        return s === "ACTIVE" || s === "ACTIVE_HEALTHY";
+    })();
+    if (!ready) {
         logger.warn(`[ops-control] Supabase project not fully ready (${projectStatus || "UNKNOWN"})`);
     }
 
