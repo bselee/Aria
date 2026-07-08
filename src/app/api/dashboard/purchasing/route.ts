@@ -1,4 +1,4 @@
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
@@ -193,12 +193,7 @@ export async function GET(req: NextRequest) {
             recentPOs: vendorCyclePOs,
         });
 
-        return {
-            vendorName: group.vendorName,
-            vendorPartyId: group.vendorPartyId,
-            urgency: group.urgency,
-            vendorCycle,
-            items: group.items.map(line => {
+        const modifiedItems = group.items.map(line => {
             const matchingDraftPO = recentPOs.find(po => 
                 isDraftPO(po) && 
                 po.items?.some((i: any) => i.productId === line.item.productId)
@@ -215,14 +210,46 @@ export async function GET(req: NextRequest) {
                 };
             }
 
+            // HERMIA(2026-07-08): A Draft PO already in Finale counts as coverage
+            // even though getProductActivity() filters it out (only Committed/Locked
+            // are "open" POs). Override urgency + assessment so the item doesn't
+            // appear as "needs ordering" when a draft with sufficient qty exists.
+            const hasDraftCoverage = draftPOInfo != null
+                && draftPOInfo.quantity >= Math.max(1, line.item.suggestedQty ?? 1);
+
             return {
                 ...line.item,
                 candidate: line.candidate,
-                assessment: line.assessment,
+                assessment: hasDraftCoverage ? {
+                    ...line.assessment,
+                    decision: 'hold' as const,
+                    recommendedQty: 0,
+                    reasonCodes: ['recent_draft_exists'] as Array<'recent_draft_exists'>,
+                    explanation: `Draft PO #${draftPOInfo!.orderId} already covers this item with ${draftPOInfo!.quantity} units.`,
+                } : line.assessment,
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
+                urgency: hasDraftCoverage ? ('ok' as const) : line.item.urgency,
             };
-        }),
+        });
+
+        // Recalculate group urgency from modified items so a group whose items
+        // are all covered by draft POs doesn't keep showing a stale critical badge.
+        const worstUrgency = (): 'critical' | 'warning' | 'watch' | 'ok' => {
+            const rank: Record<string, number> = { critical: 4, warning: 3, watch: 2, ok: 1 };
+            let worst: 'critical' | 'warning' | 'watch' | 'ok' = 'ok';
+            for (const item of modifiedItems) {
+                if ((rank[item.urgency] ?? 0) > (rank[worst] ?? 0)) worst = item.urgency;
+            }
+            return worst;
+        };
+
+        return {
+            vendorName: group.vendorName,
+            vendorPartyId: group.vendorPartyId,
+            urgency: worstUrgency(),
+            vendorCycle,
+            items: modifiedItems,
         };
     });
 
