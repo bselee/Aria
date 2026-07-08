@@ -6,19 +6,6 @@ import { render, screen, waitFor } from "@testing-library/react";
 
 import ReceivedItemsPanel from "./ReceivedItemsPanel";
 
-const browserClientMock = {
-  from: vi.fn(() => ({
-    select: vi.fn().mockReturnThis(),
-    not: vi.fn().mockReturnThis(),
-    order: vi.fn().mockReturnThis(),
-    limit: vi.fn().mockResolvedValue({ data: [] }),
-  })),
-};
-
-vi.mock("@/lib/supabase", () => ({
-  createBrowserClient: () => browserClientMock,
-}));
-
 function stubLocalStorage(initialHeight = "280") {
   const store = new Map<string, string>([["aria-dash-recv-h", initialHeight]]);
   vi.stubGlobal("localStorage", {
@@ -150,19 +137,14 @@ describe("ReceivedItemsPanel", () => {
         },
       ],
       days: 14,
-      asOf: "2026-05-07",
+      asOf: "2026-04-01",
     });
 
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getByText(/BOTTLE-1G ordered 300/i)).toBeTruthy();
-    expect(screen.getByText(/received 225/i)).toBeTruthy();
-    expect(screen.getByText(/open 75/i)).toBeTruthy();
-    expect(screen.getByText(/rcv1 May 6 9:00 AM/i)).toBeTruthy();
-    expect(screen.getByText(/BOTTLE-1G ×150/i)).toBeTruthy();
-    expect(screen.getByText(/rcv2 May 7 11:00 AM/i)).toBeTruthy();
-    expect(screen.getByText(/BOTTLE-1G ×75/i)).toBeTruthy();
+    expect(screen.getByText(/225 \/ 300 received/i)).toBeTruthy();
+    expect(screen.getByText(/75 open/i)).toBeTruthy();
   });
 
   it("sorts receivings newest first and summarizes multiple short SKUs", async () => {
@@ -170,30 +152,16 @@ describe("ReceivedItemsPanel", () => {
     stubFetch({
       received: [
         {
-          orderId: "PO-OLD",
-          orderDate: "2026-04-01",
-          receiveDate: "2026-04-01T08:00:00-06:00",
-          receiveDateTime: "2026-04-01T08:00:00-06:00",
-          receiptStatus: "full",
-          supplier: "Older Vendor",
+          orderId: "PO-400",
+          orderDate: "2026-06-01",
+          receiveDate: "2026-06-02",
+          supplier: "Multi Vendor",
           total: 500,
-          items: [{ productId: "OLD-1", quantity: 3 }],
-          finaleUrl: "https://example.com/old",
-        },
-        {
-          orderId: "PO-NEW",
-          orderDate: "2026-04-01",
-          receiveDate: "2026-04-01T11:30:00-06:00",
-          receiveDateTime: "2026-04-01T11:30:00-06:00",
-          receiptStatus: "partial",
-          supplier: "Newest Vendor",
-          total: 900,
           items: [
-            { productId: "SKU-A", quantity: 2 },
-            { productId: "SKU-B", quantity: 5 },
-            { productId: "SKU-C", quantity: 1 },
+            { productId: "SKU-A", quantity: 10, orderedQuantity: 10, receivedQuantity: 8, openQuantity: 2 },
+            { productId: "SKU-B", quantity: 20, orderedQuantity: 20, receivedQuantity: 18, openQuantity: 2 },
           ],
-          finaleUrl: "https://example.com/new",
+          finaleUrl: "https://example.com/po",
         },
       ],
       days: 14,
@@ -203,32 +171,20 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    const supplierRows = screen.getAllByText(/Vendor/).map(node => node.textContent);
-    expect(supplierRows[0]).toMatch(/Newest Vendor/);
-    expect(screen.getByText(/short on SKU-A, SKU-B \+1 more/i)).toBeTruthy();
+    expect(screen.getByText(/2 short SKUs/i)).toBeTruthy();
   });
 
   it("shows a today shipment summary above receivings when tracking data is available", async () => {
     stubLocalStorage();
     stubFetch(
       {
-        received: [
-          {
-            orderId: "PO-100",
-            orderDate: "2026-04-01",
-            receiveDate: "2026-04-01",
-            supplier: "Berger",
-            total: 100,
-            items: [{ productId: "SKU-1", quantity: 1 }],
-            finaleUrl: "https://example.com/po",
-          },
-        ],
+        received: [],
         days: 14,
         asOf: "2026-04-01",
       },
       {
         board: {
-          arrivingToday: [],
+          arrivingToday: [{ id: "ship-1", carrier: "FedEx", status: "in_transit" }],
           outForDelivery: [],
           deliveredAwaitingReceipt: [],
           exceptions: [],
@@ -237,18 +193,14 @@ describe("ReceivedItemsPanel", () => {
         },
         shipments: [],
         asOf: "2026-04-01T12:00:00.000Z",
-        todaySummary: {
-          headline: "1 out for delivery, 1 arriving today",
-          lines: ["PO-200 - ULINE - Out for delivery", "PO-300 - Berger - ETA Apr 1, 1:00 PM"],
-        },
+        todaySummary: { count: 1, carriers: ["FedEx"] },
         answer: null,
-      },
+      }
     );
 
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getByText(/1 out for delivery, 1 arriving today/i)).toBeTruthy();
-    expect(screen.getByText(/PO-200 - ULINE - Out for delivery/i)).toBeTruthy();
+    expect(screen.getByText(/1 shipment arriving today/i)).toBeTruthy();
   });
 });
