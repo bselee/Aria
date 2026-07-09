@@ -312,19 +312,21 @@ export class APForwarderAgent {
                                                 });
                                                 continue;
                                             }
-                                            // Non-dropship items without PDF — genuine error, mark for retry
-                                            console.warn(`   ⚠️ Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
+                                            // Non-dropship items without PDF — permanent error.
+                                            // Set ERROR_FORWARDING but do NOT restore original status
+                                            // (that would create an infinite retry loop).
+                                            console.warn(`   Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
                                             await supabase
                                                 .from('ap_inbox_queue')
                                                 .update({
                                                     status: 'ERROR_FORWARDING',
                                                     updated_at: new Date().toISOString(),
+                                                    extracted_json: {
+                                                        ...(item.extracted_json || {}),
+                                                        permanent_error: true,
+                                                        error_reason: 'missing_pdf_metadata',
+                                                    },
                                                 })
-                                                .eq('id', item.id);
-                                            // Release the lock back — don't keep retrying forever
-                                            await supabase
-                                                .from('ap_inbox_queue')
-                                                .update({ status: item.status })
                                                 .eq('id', item.id);
                                             continue;
                                                     }

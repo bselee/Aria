@@ -377,7 +377,7 @@ export const HEARTBEAT_PROBES: ProbeSpec[] = [
     { name: "bot-alive", category: "process", critical: true, probe: probeBotAlive },
     { name: "slack-poller-alive", category: "process", critical: false, probe: probeSlackPollerAlive },
     // Cron freshness (informational)
-    { name: "ap-polling-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("ap-polling-fresh", "ap-polling", 0.5) },
+    { name: "ap-polling-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("ap-polling-fresh", "ap-polling", 20) },
     { name: "build-risk-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("build-risk-fresh", "build-risk", 26, { weekdaysOnly: true }) },
     { name: "email-tracking-ingest-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("email-tracking-ingest-fresh", "email-tracking-ingest", 4) },
 ];

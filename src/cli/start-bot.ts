@@ -386,6 +386,23 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
     }
 
+    // ── Module health check ────────────────────────────────────────────
+    // Verify all critical AP modules can load before launching the bot.
+    // If any fail, Telegram alert is sent from inside verifyCriticalModules.
+    try {
+        const { verifyCriticalModules } = await import("../lib/ops/module-health-check");
+        const health = await verifyCriticalModules();
+        if (!health.healthy) {
+            console.error(`[boot] ❌ ${health.failures.length} critical module(s) failed health check — AP pipeline may be degraded`);
+            // Continue booting anyway — partial functionality is better than none.
+            // The Telegram alert from verifyCriticalModules tells Bill what's broken.
+        } else {
+            console.log(`[boot] ✅ All ${health.checked} critical modules loaded OK`);
+        }
+    } catch (e: any) {
+        console.warn(`[boot] Module health check failed to run (non-fatal): ${e.message}`);
+    }
+
     bot.launch({ dropPendingUpdates: true })
         .catch((err: any) => console.error('❌ Bot launch error:', err.message));
 

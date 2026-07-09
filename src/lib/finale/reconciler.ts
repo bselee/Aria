@@ -1311,6 +1311,42 @@ export async function reconcileInvoiceToPO(
         }
     }
 
+    // ————————————————— Guard 1: Vendor correlation ——————————————————————————————————————
+    // Verify the invoice vendor plausibly matches this PO's supplier.
+    // Falls back to PO# reference and SKU overlap when names diverge.
+    // Runs BEFORE Guard 0.5 (empty PO population) to prevent a mismatched
+    // vendor's items from being populated onto the wrong PO.
+    const vendorCorrelation = validateVendorCorrelation(invoice, poSummary, orderId);
+    let vendorNote: string | undefined;
+
+    if (!vendorCorrelation.pass) {
+        // Low confidence — no name, PO#, or SKU evidence. Escalate for human review.
+        const vendorMismatchWarnings = [...warnings, vendorCorrelation.note];
+        return {
+            orderId,
+            invoiceNumber: invoice.invoiceNumber,
+            vendorName: invoice.vendorName,
+            invoiceTotal: invoice.total,
+            priceChanges: [],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "needs_approval",
+            summary: buildReconciliationSummary(
+                orderId, invoice, [], [], null, 0, "needs_approval",
+                vendorMismatchWarnings
+            ),
+            totalDollarImpact: 0,
+            autoApplicable: false,
+            warnings: vendorMismatchWarnings,
+            vendorNote: vendorCorrelation.note,
+            report: buildReconciliationReport(invoice, poSummary, [], [], balanceCheck, "needs_approval", vendorMismatchWarnings),
+        };
+    } else if (vendorCorrelation.confidence !== "high") {
+        // Medium confidence — proceed but surface the mismatch in the summary.
+        warnings.push(vendorCorrelation.note);
+        vendorNote = vendorCorrelation.note;
+    }
+
     // ————————————————— Guard 0.5: Empty PO — try to populate from invoice items ——————————
     // Draft POs often have no items yet. Instead of surfacing a useless needs_approval
     // (where approving does nothing), try to resolve invoice SKUs in Finale and offer
@@ -1391,45 +1427,10 @@ export async function reconcileInvoiceToPO(
         };
     }
 
-    // ————————————————— Guard 1: Vendor correlation ——————————————————————————————————————
-    // Verify the invoice vendor plausibly matches this PO's supplier.
-    // Falls back to PO# reference and SKU overlap when names diverge.
-    const vendorCorrelation = validateVendorCorrelation(invoice, poSummary, orderId);
-    let vendorNote: string | undefined;
-
-    if (!vendorCorrelation.pass) {
-        // Low confidence — no name, PO#, or SKU evidence. Escalate for human review.
-        const vendorMismatchWarnings = [...warnings, vendorCorrelation.note];
-        return {
-            orderId,
-            invoiceNumber: invoice.invoiceNumber,
-            vendorName: invoice.vendorName,
-            priceChanges: [],
-            feeChanges: [],
-            trackingUpdate: null,
-            overallVerdict: "needs_approval",
-            summary: buildReconciliationSummary(
-                orderId, invoice, [], [], null, 0, "needs_approval",
-                vendorMismatchWarnings
-            ),
-            totalDollarImpact: 0,
-            autoApplicable: false,
-            warnings: vendorMismatchWarnings,
-            vendorNote: vendorCorrelation.note,
-            report: buildReconciliationReport(invoice, poSummary, [], [], balanceCheck, "needs_approval", vendorMismatchWarnings),
-        };
-    } else if (vendorCorrelation.confidence !== "high") {
-        // Medium confidence — proceed but surface the mismatch in the summary.
-        // Dollar-impact escalation for medium confidence is applied after totalDollarImpact
-        // is calculated (see step 5.5 below).
-        warnings.push(vendorCorrelation.note);
-        vendorNote = vendorCorrelation.note;
-    }
-
     // 1. Compare line item prices (includes Guard 2: overbill check)
     const priceChanges = reconcileLineItems(invoice, poSummary, receivedQtyMap, totalReceived);
 
-    // 2. Compare fees (includes Guard 3: fee dollar threshold)
+
     const feeChanges = reconcileFees(invoice, poSummary, vendorFeeLabelMap);
 
     // 3. Check for tracking info
@@ -1876,7 +1877,7 @@ function reconcileLineItems(
         // Guard 2: Quantity overbill — never auto-approve if invoice qty > PO qty.
         // Even a tiny price change is suspicious when the vendor is billing for
         // more units than were ordered.
-        if (false && invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
+        if (invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
             pVerdict = "needs_approval";
             pReason += ` | ⚠️  OVERBILL: Invoice qty ${invLine.qty} > PO qty ${poLine.quantity} — may be billed for more units than ordered.`;
         }
@@ -2603,10 +2604,19 @@ async function saveTrackingNumbers(
         const supabase = createClient();
         if (!supabase) return;
 
-        // Update the invoice record with tracking numbers
+        // Update the invoice record with tracking numbers (append, not overwrite)
+        // Use RPC to merge arrays via array_append to avoid clobbering existing tracking data.
+        // Fallback: read existing, merge, write back.
+        const { data: existing } = await supabase
+            .from("invoices")
+            .select("tracking_numbers")
+            .eq("invoice_number", invoiceNumber)
+            .maybeSingle();
+        const existingTracking = (existing as any)?.tracking_numbers as string[] || [];
+        const merged = [...new Set([...existingTracking, ...trackingNumbers])];
         await supabase
             .from("invoices")
-            .update({ tracking_numbers: trackingNumbers })
+            .update({ tracking_numbers: merged })
             .eq("invoice_number", invoiceNumber);
     } catch (err: any) {
         console.warn(`âš ï¸ Failed to save tracking numbers: ${err.message}`);

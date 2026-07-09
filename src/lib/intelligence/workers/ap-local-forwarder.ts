@@ -42,7 +42,7 @@ import pdfParse from "pdf-parse";
 
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 const MAX_EMAILS_PER_CYCLE = 20;
-const DEDUP_NAMESPACE = "ap_forwarded_message";
+const OCR_TIMEOUT_MS = 30_000; // 30s timeout for pdf-parse on corrupted/large PDFs
 
 /**
  * Parse a Gmail From header into { email, name }.
@@ -107,7 +107,14 @@ const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
  */
 async function checkPaidInvoiceBlock(pdfBuffer: Buffer): Promise<{ blocked: boolean; reason?: string; rawText?: string }> {
     try {
-        const parsed = await pdfParse(pdfBuffer, { max: 0 });
+        // Wrap pdf-parse in a timeout to prevent corrupted/malicious PDFs
+        // from hanging the pipeline indefinitely.
+        const parsed = await Promise.race([
+            pdfParse(pdfBuffer, { max: 0 }),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("OCR timeout")), OCR_TIMEOUT_MS)
+            ),
+        ]);
         const text: string = (parsed?.text || "").toString();
 
         if (text.length < 5) {
@@ -516,28 +523,62 @@ export async function checkForBounces(gmail: any): Promise<string[]> {
                 // Bounce notifications often contain the original subject or message ID
                 const snippet = (msgRes.data.snippet || "").toLowerCase();
                 if (snippet.includes("buildasoilap@bill.com") || snippet.includes("delivery status notification")) {
-                    // Find any forwarded invoice that matches this bounce
+                    // Find the specific forwarded invoice that matches this bounce.
+                    // Bounce emails contain the original Message-ID in headers —
+                    // extract it and match against our sent message IDs.
+                    const messageIdHeader = headers.find((h: any) => h.name === "In-Reply-To" || h.name === "References")?.value || "";
+                    const referencedMessageId = messageIdHeader.trim().split(/\s+/)[0];
+
                     try {
                         const db = getLocalDb();
-                        // Mark any unverified forwards as ERROR (bounce detected)
-                        const unverified = db.prepare(
-                            `SELECT billcom_sent_message_id, pdf_filename, gmail_message_id
-                             FROM ap_local_forwards
-                             WHERE status = 'FORWARDED' AND verified = 0
-                             AND forwarded_at > datetime('now', '-24 hours')`
-                        ).all() as Array<{ billcom_sent_message_id: string; pdf_filename: string; gmail_message_id: string }>;
 
-                        for (const fwd of unverified) {
-                            // Check if the bounce snippet references this forward's subject
-                            // This is a heuristic — bounces don't always contain the exact message ID
-                            bouncedIds.push(fwd.billcom_sent_message_id);
-                            db.prepare(
-                                `UPDATE ap_local_forwards
-                                 SET status = 'ERROR',
-                                     error_message = 'Bounce detected: ' || ?
-                                 WHERE billcom_sent_message_id = ?`
-                            ).run(subject.slice(0, 100), fwd.billcom_sent_message_id);
-                            console.warn(`   [AP-Local] ⚠️ Bounce detected for ${fwd.pdf_filename}: ${subject.slice(0, 60)}`);
+                        if (referencedMessageId) {
+                            // Precise match: the bounce references a specific sent message
+                            const fwd = db.prepare(
+                                `SELECT billcom_sent_message_id, pdf_filename, gmail_message_id
+                                 FROM ap_local_forwards
+                                 WHERE status = 'FORWARDED' AND verified = 0
+                                 AND billcom_sent_message_id = ?
+                                 AND forwarded_at > datetime('now', '-24 hours')`
+                            ).get(referencedMessageId) as { billcom_sent_message_id: string; pdf_filename: string; gmail_message_id: string } | undefined;
+
+                            if (fwd) {
+                                bouncedIds.push(fwd.billcom_sent_message_id);
+                                db.prepare(
+                                    `UPDATE ap_local_forwards
+                                     SET status = 'ERROR',
+                                         error_message = 'Bounce detected: ' || ?
+                                     WHERE billcom_sent_message_id = ?`
+                                ).run(subject.slice(0, 100), fwd.billcom_sent_message_id);
+                                console.warn(`   [AP-Local] Bounce detected for ${fwd.pdf_filename}: ${subject.slice(0, 60)}`);
+                            }
+                        } else {
+                            // No Message-ID reference — try matching by original subject
+                            // Extract "Fwd:" subject from the bounce snippet
+                            const fwdSubjectMatch = snippet.match(/fwd:\s*(.{10,80})/i);
+                            if (fwdSubjectMatch) {
+                                const fwdSubject = fwdSubjectMatch[1];
+                                const fwd = db.prepare(
+                                    `SELECT billcom_sent_message_id, pdf_filename, gmail_message_id
+                                     FROM ap_local_forwards
+                                     WHERE status = 'FORWARDED' AND verified = 0
+                                     AND email_subject LIKE '%' || ? || '%'
+                                     AND forwarded_at > datetime('now', '-24 hours')`
+                                ).get(fwdSubject) as { billcom_sent_message_id: string; pdf_filename: string; gmail_message_id: string } | undefined;
+
+                                if (fwd) {
+                                    bouncedIds.push(fwd.billcom_sent_message_id);
+                                    db.prepare(
+                                        `UPDATE ap_local_forwards
+                                         SET status = 'ERROR',
+                                             error_message = 'Bounce detected (subject match): ' || ?
+                                         WHERE billcom_sent_message_id = ?`
+                                    ).run(subject.slice(0, 100), fwd.billcom_sent_message_id);
+                                    console.warn(`   [AP-Local] Bounce detected for ${fwd.pdf_filename}: ${subject.slice(0, 60)}`);
+                                }
+                            }
+                            // If we can't correlate, do NOT flag all forwards —
+                            // better to miss a bounce than to nuke 20 valid forwards.
                         }
                     } catch { /* non-critical */ }
                 }
@@ -567,145 +608,128 @@ export async function runReconciliationHandoff(): Promise<{
     pending: number;
 }> {
     const summary = { checked: 0, reconciled: 0, autoCompleted: 0, pending: 0 };
-    console.log("🔄 [AP-Reconcile] Checking forwarded invoices for PO matching...");
+    console.log("[AP-Reconcile] Checking forwarded invoices for PO matching (real engine)...");
 
     try {
         const db = getLocalDb();
-        /**
-         * Reconciliation handoff: match forwarded invoices to Finale POs using the real reconciler engine.
-         *
-         * Lifecycle: FORWARDED -> RECONCILED / REVIEW -> COMPLETE
-         * - Dropship invoices auto-complete (no PO to match).
-         * - For other invoices, extract PO number from email subject.
-         * - Call reconcileInvoiceToPO (real engine) for price/fee change detection.
-         * - Auto-applicable changes are applied; review items are flagged.
-         * - OCR text is required - older records without it are skipped with a warning.
-         *
-         * @returns Summary of reconciliation actions
-         */
-        export async function runReconciliationHandoff(): Promise<{
-            checked: number;
-            reconciled: number;
-            autoCompleted: number;
-            pending: number;
-        }> {
-            const summary = { checked: 0, reconciled: 0, autoCompleted: 0, pending: 0 };
-            console.log("[AP-Reconcile] Checking forwarded invoices for PO matching (real engine)...");
 
-            try {
-                const db = getLocalDb();
+        const forwarded = db.prepare(
+            `SELECT id, gmail_message_id, email_from, email_subject, pdf_filename,
+                    vendor_routing_action, ocr_raw_text, reconciliation_verdict
+             FROM ap_local_forwards
+             WHERE status = 'FORWARDED'
+             AND (reconciliation_status IS NULL OR reconciliation_status = '')
+             ORDER BY forwarded_at ASC`
+        ).all() as Array<{
+            id: number;
+            gmail_message_id: string;
+            email_from: string;
+            email_subject: string;
+            pdf_filename: string;
+            vendor_routing_action: string | null;
+            ocr_raw_text: string | null;
+            reconciliation_verdict: string | null;
+        }>;
 
-                const forwarded = db.prepare(
-                    \`SELECT id, gmail_message_id, email_from, email_subject, pdf_filename,
-                            vendor_routing_action, ocr_raw_text, reconciliation_verdict
-                     FROM ap_local_forwards
-                     WHERE status = 'FORWARDED'
-                     AND (reconciliation_status IS NULL OR reconciliation_status = '')
-                     ORDER BY forwarded_at ASC\`
-                ).all() as Array<{
-                    id: number;
-                    gmail_message_id: string;
-                    email_from: string;
-                    email_subject: string;
-                    pdf_filename: string;
-                    vendor_routing_action: string | null;
-                    ocr_raw_text: string | null;
-                    reconciliation_verdict: string | null;
-                }>;
-
-                summary.checked = forwarded.length;
-                if (forwarded.length === 0) {
-                    console.log("   [AP-Reconcile] No forwarded invoices pending reconciliation.");
-                    return summary;
-                }
-
-                const { FinaleClient } = await import("@/lib/finale/client");
-                const { reconcileInvoiceToPO } = await import("@/lib/finale/reconciler");
-                const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
-                const finaleClient = new FinaleClient();
-
-                for (const inv of forwarded) {
-                    if (inv.vendor_routing_action === "dropship") {
-                        db.prepare(
-                            \`UPDATE ap_local_forwards
-                             SET reconciliation_status = 'COMPLETE',
-                                 reconciliation_notes = 'Dropship - no PO matching required',
-                                 reconciled_at = datetime('now'),
-                                 completed_at = datetime('now')
-                             WHERE id = ?\`
-                        ).run(inv.id);
-                        summary.autoCompleted++;
-                        continue;
-                    }
-
-                    if (inv.reconciliation_verdict) {
-                        if (inv.reconciliation_verdict === "auto_applicable") summary.reconciled++;
-                        else summary.pending++;
-                        continue;
-                    }
-
-                    const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
-                    if (!poMatch) {
-                        summary.pending++;
-                        continue;
-                    }
-
-                    const poNumber = poMatch[1].padStart(5, "0");
-
-                    if (!inv.ocr_raw_text || inv.ocr_raw_text.length < 5) {
-                        console.warn(\`   [AP-Reconcile] No cached OCR for \${inv.pdf_filename} - older record, manual review needed\`);
-                        summary.pending++;
-                        continue;
-                    }
-
-                    try {
-                        const invoiceData = await parseInvoice(inv.ocr_raw_text);
-                        const reconResult = await reconcileInvoiceToPO(invoiceData, poNumber, finaleClient);
-
-                        const verdict = reconResult.autoApplicable
-                            ? "auto_applicable"
-                            : (reconResult.overallVerdict || "REVIEW");
-                        const newStatus = verdict === "auto_applicable" ? "RECONCILED" : "REVIEW";
-
-                        db.prepare(
-                            \`UPDATE ap_local_forwards
-                             SET reconciliation_status = ?,
-                                 matched_po_number = ?,
-                                 reconciliation_notes = ?,
-                                 reconciliation_result_json = ?,
-                                 reconciliation_verdict = ?,
-                                 reconciled_at = datetime('now')
-                             WHERE id = ?\`
-                        ).run(
-                            newStatus,
-                            poNumber,
-                            reconResult.summary || \`Reconciled via invoice engine (verdict: \${verdict})\`,
-                            JSON.stringify(reconResult),
-                            verdict,
-                            inv.id
-                        );
-
-                        if (verdict === "auto_applicable") {
-                            summary.reconciled++;
-                        } else {
-                            summary.pending++;
-                        }
-                    } catch (e: any) {
-                        summary.pending++;
-                    }
-                }
-
-                console.log(
-                    \`[AP-Reconcile] Done: checked=\${summary.checked} reconciled=\${summary.reconciled} \` +
-                    \`autoCompleted=\${summary.autoCompleted} pending=\${summary.pending}\`,
-                );
-            } catch (e: any) {
-                console.error(\`   [AP-Reconcile] Error: \${e.message}\`);
-            }
-
+        summary.checked = forwarded.length;
+        if (forwarded.length === 0) {
+            console.log("   [AP-Reconcile] No forwarded invoices pending reconciliation.");
             return summary;
         }
 
+        const { FinaleClient } = await import("@/lib/finale/client");
+        const { reconcileInvoiceToPO } = await import("@/lib/finale/reconciler");
+        const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
+        const finaleClient = new FinaleClient();
+
+        for (const inv of forwarded) {
+            if (inv.vendor_routing_action === "dropship") {
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = 'COMPLETE',
+                         reconciliation_notes = 'Dropship - no PO matching required',
+                         reconciled_at = datetime('now'),
+                         completed_at = datetime('now')
+                     WHERE id = ?`
+                ).run(inv.id);
+                summary.autoCompleted++;
+                continue;
+            }
+
+            if (inv.reconciliation_verdict) {
+                if (inv.reconciliation_verdict === "auto_applicable") summary.reconciled++;
+                else summary.pending++;
+                continue;
+            }
+
+            const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
+            if (!poMatch) {
+                summary.pending++;
+                continue;
+            }
+
+            const poNumber = poMatch[1].padStart(5, "0");
+
+            if (!inv.ocr_raw_text || inv.ocr_raw_text.length < 5) {
+                console.warn(`   [AP-Reconcile] No cached OCR for ${inv.pdf_filename} - older record, manual review needed`);
+                summary.pending++;
+                continue;
+            }
+
+            try {
+                const invoiceData = await parseInvoice(inv.ocr_raw_text);
+                const reconResult = await reconcileInvoiceToPO(invoiceData, poNumber, finaleClient);
+
+                const verdict = reconResult.autoApplicable
+                    ? "auto_applicable"
+                    : (reconResult.overallVerdict || "REVIEW");
+                const newStatus = verdict === "auto_applicable" ? "RECONCILED" : "REVIEW";
+
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = ?,
+                         matched_po_number = ?,
+                         reconciliation_notes = ?,
+                         reconciliation_result_json = ?,
+                         reconciliation_verdict = ?,
+                         reconciled_at = datetime('now')
+                     WHERE id = ?`
+                ).run(
+                    newStatus,
+                    poNumber,
+                    reconResult.summary || `Reconciled via invoice engine (verdict: ${verdict})`,
+                    JSON.stringify(reconResult),
+                    verdict,
+                    inv.id
+                );
+
+                if (verdict === "auto_applicable") {
+                    summary.reconciled++;
+                } else {
+                    summary.pending++;
+                }
+            } catch (e: any) {
+                summary.pending++;
+            }
+        }
+
+        console.log(
+            `[AP-Reconcile] Done: checked=${summary.checked} reconciled=${summary.reconciled} ` +
+            `autoCompleted=${summary.autoCompleted} pending=${summary.pending}`,
+        );
+    } catch (e: any) {
+        console.error(`   [AP-Reconcile] Error: ${e.message}`);
+    }
+
+    return summary;
+}
+
+/**
+ * Mark a Gmail message as processed (remove UNREAD + INBOX, add label).
+ * Called after all PDFs in an email have been forwarded to Bill.com.
+ */
+async function markEmailProcessed(gmail: any, messageId: string, labelId: string = "Invoice Forward"): Promise<void> {
+    try {
         await gmail.users.messages.modify({
             userId: "me",
             id: messageId,

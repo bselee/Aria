@@ -71,13 +71,13 @@ export async function detectAndAlertCrashLoop(bot: Telegraf): Promise<void> {
         }
 
         // Record this boot's heartbeat
-        await supabase.from("agent_heartbeats").upsert({
+        await supabase.from("agent_heartbeats").insert({
             agent_name: "ops-manager",
             heartbeat_at: new Date().toISOString(),
             status: "starting",
             metadata: { restartCount, windowStart },
             updated_at: new Date().toISOString(),
-        }, { onConflict: "agent_name" });
+        });
 
     } catch (err: any) {
         console.warn(`[CrashLoop] Detection failed (non-fatal): ${err.message}`);

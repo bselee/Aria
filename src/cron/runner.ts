@@ -114,7 +114,14 @@ export async function runJobOnce(
             signal: ac.signal,
         }));
         result = { status: "succeeded", durationMs: Date.now() - startMs };
-        await runObservabilityHooks(jobName, "success", result, startedAtIso);
+            // Reset consecutive failure counter on success
+            try {
+                const { recordCronSuccess } = await import("../lib/ops/module-health-check");
+                recordCronSuccess(jobName);
+            } catch {
+                // non-fatal
+            }
+            await runObservabilityHooks(jobName, "success", result, startedAtIso);
     } catch (err: any) {
         const aborted = ac.signal.aborted;
         result = {
@@ -210,6 +217,15 @@ async function runObservabilityHooks(
 }
 
 async function routeFailure(jobName: string, mode: string, result: RunResult): Promise<void> {
+    // ── Consecutive failure tracking ──────────────────────────────────
+    // Records to local SQLite and sends Telegram alert after 3 strikes.
+    try {
+        const { recordCronFailure } = await import("../lib/ops/module-health-check");
+        await recordCronFailure(jobName, `${result.failureReason ?? "unknown"}: ${result.failureMessage ?? ""}`);
+    } catch {
+        // non-fatal — failure tracking is best-effort
+    }
+
     if (mode === "silent") return;
     if (mode === "log") {
         console.warn(`[cron:${jobName}] FAILED ${result.failureReason}: ${result.failureMessage}`);

@@ -868,7 +868,7 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
         throw new Error(`Shipment upsert failed: ${error.message}`);
     }
 
-    if (input.poNumber && classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
+    if (data && input.poNumber && classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
         await syncLegacyPurchaseOrderTracking(input.poNumber);
         await syncPOLifecycleFromShipment(input.poNumber, data as ShipmentRecord);
     }

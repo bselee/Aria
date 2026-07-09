@@ -120,7 +120,7 @@ class QueryBuilder {
           `${col}=${op}.${val.map((v: any) => encodeURIComponent(String(v))).join(",")}`
         );
     } else {
-      this._filters.push(`${col}=${op}.${encodeURIComponent(String(val))}`);
+      this._filters.push(`${col}=${op}.${val}`);
     }
     return this;
   }
@@ -166,7 +166,7 @@ class QueryBuilder {
     return this.addFilter(col, "overlap", val);
   }
   not(col: string, op: FilterOp, val: any): this {
-    this._filters.push(`not.${col}=${op}.${encodeURIComponent(String(val))}`);
+    this._filters.push(`not.${col}=${op}.${val}`);
     return this;
   }
 
