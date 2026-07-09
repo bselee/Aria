@@ -11,7 +11,8 @@ setTimeout(() => ctrl.abort(), 8000);
     const resp = await fetch(apiUrl, {
       method: 'PATCH',
       headers: {
-        apikey: ***        Authorization: *** `${key}`,
+        apikey: key,
+        Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
         Prefer: 'return=representation',
       },
