@@ -127,6 +127,13 @@ export function getLocalDb() {
             completed_at DATETIME,
             UNIQUE(gmail_message_id, pdf_filename)
         );
+
+        -- Migration: add columns that may not exist on older DBs (safe — IF NOT EXISTS pattern)
+        -- sqlite ALTER TABLE ADD COLUMN IF NOT EXISTS came in 3.35.0 (2021-03-12).
+        -- Windows builds often lag; use a safe try/catch at runtime instead.
+        -- Columns: ocr_raw_text (for reconciliation engine), vendor_routing_action (skip/dropship tracking),
+        -- reconciliation_verdict, reconciliation_result_json (real engine output).
+
         CREATE INDEX IF NOT EXISTS idx_ap_fwd_status ON ap_local_forwards(status);
         CREATE INDEX IF NOT EXISTS idx_ap_fwd_hash ON ap_local_forwards(pdf_content_hash);
         CREATE INDEX IF NOT EXISTS idx_ap_fwd_recon ON ap_local_forwards(reconciliation_status);
@@ -174,6 +181,10 @@ export function getLocalDb() {
         ["completed_at", "ALTER TABLE ap_local_forwards ADD COLUMN completed_at DATETIME"],
         ["vendor_routing_action", "ALTER TABLE ap_local_forwards ADD COLUMN vendor_routing_action TEXT"],
         ["verified", "ALTER TABLE ap_local_forwards ADD COLUMN verified INTEGER DEFAULT 0"],
+        // Phase 3 (2026-07-09): OCR caching + real reconciliation engine output
+        ["ocr_raw_text", "ALTER TABLE ap_local_forwards ADD COLUMN ocr_raw_text TEXT"],
+        ["reconciliation_verdict", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_verdict TEXT"],
+        ["reconciliation_result_json", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_result_json TEXT"],
     ];
     for (const [col, sql] of apMigrations) {
         if (!apColNames.has(col)) {

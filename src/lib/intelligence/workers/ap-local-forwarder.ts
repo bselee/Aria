@@ -35,6 +35,7 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/supabase";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
+import { isDuplicate } from "@/lib/intelligence/ap-dedup";
 import * as crypto from "crypto";
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
@@ -104,7 +105,7 @@ const PDF_BLOCK_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
  * Returns { blocked: false } if the invoice looks legitimate.
  * If OCR fails, defaults to NOT blocked (safe: forward rather than skip).
  */
-async function checkPaidInvoiceBlock(pdfBuffer: Buffer): Promise<{ blocked: boolean; reason?: string }> {
+async function checkPaidInvoiceBlock(pdfBuffer: Buffer): Promise<{ blocked: boolean; reason?: string; rawText?: string }> {
     try {
         const parsed = await pdfParse(pdfBuffer, { max: 0 });
         const text: string = (parsed?.text || "").toString();
@@ -113,17 +114,17 @@ async function checkPaidInvoiceBlock(pdfBuffer: Buffer): Promise<{ blocked: bool
             // Unparseable PDF — likely fully scanned image. Don't block.
             // We'd need vision-model OCR to extract text from scanned PDFs,
             // which is expensive. Default: forward (safe).
-            return { blocked: false };
+            return { blocked: false, rawText: text };
         }
 
         for (const rule of PDF_BLOCK_PATTERNS) {
             if (rule.pattern.test(text)) {
                 console.log(`   [AP-Local] 🚫 BLOCKED: ${rule.reason} — not forwarding`);
-                return { blocked: true, reason: rule.reason };
+                return { blocked: true, reason: rule.reason, rawText: text };
             }
         }
 
-        return { blocked: false };
+        return { blocked: false, rawText: text };
     } catch (e: any) {
         // pdf-parse failure — scanned PDF or corrupt file. Don't block.
         console.warn(`   [AP-Local] OCR check failed: ${e.message} — forwarding anyway (safe default)`);
@@ -175,36 +176,9 @@ function extractPdfAttachments(payload: any): Array<{ filename: string; buffer: 
     return pdfs;
 }
 
-/**
- * Check local SQLite for an existing forward by message_id + filename or PDF hash.
- * Returns true if this PDF has already been forwarded to Bill.com.
- */
-function isAlreadyForwarded(gmailMessageId: string, pdfFilename: string, pdfHash: string): boolean {
-    try {
-        const db = getLocalDb();
-
-        // Layer 1: message_id + filename
-        const byKey = db.prepare(
-            `SELECT 1 FROM ap_local_forwards
-             WHERE gmail_message_id = ? AND pdf_filename = ?
-             AND status = 'FORWARDED'`
-        ).get(gmailMessageId, pdfFilename);
-        if (byKey) return true;
-
-        // Layer 2: content hash (catches re-uploads of same PDF)
-        const byHash = db.prepare(
-            `SELECT 1 FROM ap_local_forwards
-             WHERE pdf_content_hash = ?
-             AND status = 'FORWARDED'`
-        ).get(pdfHash);
-        if (byHash) return true;
-
-        return false;
-    } catch (e: any) {
-        console.error("   [AP-Local] Dedup check failed:", e.message);
-        return false; // on DB error, assume not seen — safer to forward than skip
-    }
-}
+// ── Dedup delegate → src/lib/intelligence/ap-dedup.ts ──
+// isAlreadyForwarded() replaced by canonical isDuplicate() from ap-dedup.
+// Layer 1: gmail_message_id + pdf_filename, Layer 2: pdf_content_hash.
 
 /**
  * Record a successful forward in local SQLite.
@@ -218,15 +192,16 @@ function recordForward(
     pdfHash: string,
     billcomSentMessageId: string,
     vendorRoutingAction?: string,
+    rawOcrText?: string,
 ): void {
     try {
         const db = getLocalDb();
         db.prepare(
             `INSERT OR REPLACE INTO ap_local_forwards
              (gmail_message_id, email_from, email_subject, pdf_filename, pdf_content_hash,
-              billcom_sent_message_id, status, vendor_routing_action, forwarded_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'FORWARDED', ?, datetime('now'))`
-        ).run(gmailMessageId, emailFrom, emailSubject, pdfFilename, pdfHash, billcomSentMessageId, vendorRoutingAction || null);
+              billcom_sent_message_id, status, vendor_routing_action, ocr_raw_text, forwarded_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'FORWARDED', ?, ?, datetime('now'))`
+        ).run(gmailMessageId, emailFrom, emailSubject, pdfFilename, pdfHash, billcomSentMessageId, vendorRoutingAction || null, rawOcrText || null);
     } catch (e: any) {
         console.error("   [AP-Local] Failed to record forward:", e.message);
     }
@@ -596,120 +571,139 @@ export async function runReconciliationHandoff(): Promise<{
 
     try {
         const db = getLocalDb();
-
-        // Get all FORWARDED invoices that haven't been reconciled yet
-        const forwarded = db.prepare(
-            `SELECT * FROM ap_local_forwards
-             WHERE status = 'FORWARDED'
-             AND (reconciliation_status IS NULL OR reconciliation_status = '')
-             ORDER BY forwarded_at ASC`
-        ).all() as Array<{
-            id: number;
-            gmail_message_id: string;
-            email_from: string;
-            email_subject: string;
-            pdf_filename: string;
-            vendor_routing_action: string | null;
-        }>;
-
-        summary.checked = forwarded.length;
-        if (forwarded.length === 0) {
-            console.log("   [AP-Reconcile] No forwarded invoices pending reconciliation.");
-            return summary;
-        }
-
-        // ── Dynamic import to avoid circular deps ──
-        const { FinaleClient } = await import("@/lib/finale/client");
-        const finaleClient = new FinaleClient();
-
-        for (const inv of forwarded) {
-            // Auto-complete dropship invoices (no PO to match)
-            if (inv.vendor_routing_action === "dropship") {
-                db.prepare(
-                    `UPDATE ap_local_forwards
-                     SET reconciliation_status = 'COMPLETE',
-                         reconciliation_notes = 'Dropship — no PO matching required',
-                         reconciled_at = datetime('now'),
-                         completed_at = datetime('now')
-                     WHERE id = ?`
-                ).run(inv.id);
-                summary.autoCompleted++;
-                console.log(`   [AP-Reconcile] ✅ Auto-completed dropship: ${inv.pdf_filename}`);
-                continue;
-            }
-
-            // Try to extract PO number from email subject
-            // Patterns: PO-12345, PO12345, PO 12345, Purchase Order 12345, P.O. 12345
-            const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
-
-            if (!poMatch) {
-                // No PO number in subject — leave for manual matching
-                summary.pending++;
-                console.log(`   [AP-Reconcile] ⏳ No PO# in subject: ${inv.pdf_filename} — "${inv.email_subject.slice(0, 50)}"`);
-                continue;
-            }
-
-            const poNumber = poMatch[1].padStart(5, "0");
+        /**
+         * Reconciliation handoff: match forwarded invoices to Finale POs using the real reconciler engine.
+         *
+         * Lifecycle: FORWARDED -> RECONCILED / REVIEW -> COMPLETE
+         * - Dropship invoices auto-complete (no PO to match).
+         * - For other invoices, extract PO number from email subject.
+         * - Call reconcileInvoiceToPO (real engine) for price/fee change detection.
+         * - Auto-applicable changes are applied; review items are flagged.
+         * - OCR text is required - older records without it are skipped with a warning.
+         *
+         * @returns Summary of reconciliation actions
+         */
+        export async function runReconciliationHandoff(): Promise<{
+            checked: number;
+            reconciled: number;
+            autoCompleted: number;
+            pending: number;
+        }> {
+            const summary = { checked: 0, reconciled: 0, autoCompleted: 0, pending: 0 };
+            console.log("[AP-Reconcile] Checking forwarded invoices for PO matching (real engine)...");
 
             try {
-                // Verify PO exists in Finale
-                const poDetails = await finaleClient.getOrderDetails(poNumber);
+                const db = getLocalDb();
 
-                if (poDetails) {
-                    // PO found — mark reconciled
-                    db.prepare(
-                        `UPDATE ap_local_forwards
-                         SET reconciliation_status = 'RECONCILED',
-                             matched_po_number = ?,
-                             reconciliation_notes = 'Auto-matched: PO# found in email subject',
-                             reconciled_at = datetime('now')
-                         WHERE id = ?`
-                    ).run(poNumber, inv.id);
-                    summary.reconciled++;
-                    console.log(`   [AP-Reconcile] ✅ Reconciled ${inv.pdf_filename} → PO ${poNumber}`);
-                } else {
-                    summary.pending++;
-                    console.log(`   [AP-Reconcile] ⏳ PO ${poNumber} not found in Finale for ${inv.pdf_filename}`);
+                const forwarded = db.prepare(
+                    \`SELECT id, gmail_message_id, email_from, email_subject, pdf_filename,
+                            vendor_routing_action, ocr_raw_text, reconciliation_verdict
+                     FROM ap_local_forwards
+                     WHERE status = 'FORWARDED'
+                     AND (reconciliation_status IS NULL OR reconciliation_status = '')
+                     ORDER BY forwarded_at ASC\`
+                ).all() as Array<{
+                    id: number;
+                    gmail_message_id: string;
+                    email_from: string;
+                    email_subject: string;
+                    pdf_filename: string;
+                    vendor_routing_action: string | null;
+                    ocr_raw_text: string | null;
+                    reconciliation_verdict: string | null;
+                }>;
+
+                summary.checked = forwarded.length;
+                if (forwarded.length === 0) {
+                    console.log("   [AP-Reconcile] No forwarded invoices pending reconciliation.");
+                    return summary;
                 }
+
+                const { FinaleClient } = await import("@/lib/finale/client");
+                const { reconcileInvoiceToPO } = await import("@/lib/finale/reconciler");
+                const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
+                const finaleClient = new FinaleClient();
+
+                for (const inv of forwarded) {
+                    if (inv.vendor_routing_action === "dropship") {
+                        db.prepare(
+                            \`UPDATE ap_local_forwards
+                             SET reconciliation_status = 'COMPLETE',
+                                 reconciliation_notes = 'Dropship - no PO matching required',
+                                 reconciled_at = datetime('now'),
+                                 completed_at = datetime('now')
+                             WHERE id = ?\`
+                        ).run(inv.id);
+                        summary.autoCompleted++;
+                        continue;
+                    }
+
+                    if (inv.reconciliation_verdict) {
+                        if (inv.reconciliation_verdict === "auto_applicable") summary.reconciled++;
+                        else summary.pending++;
+                        continue;
+                    }
+
+                    const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
+                    if (!poMatch) {
+                        summary.pending++;
+                        continue;
+                    }
+
+                    const poNumber = poMatch[1].padStart(5, "0");
+
+                    if (!inv.ocr_raw_text || inv.ocr_raw_text.length < 5) {
+                        console.warn(\`   [AP-Reconcile] No cached OCR for \${inv.pdf_filename} - older record, manual review needed\`);
+                        summary.pending++;
+                        continue;
+                    }
+
+                    try {
+                        const invoiceData = await parseInvoice(inv.ocr_raw_text);
+                        const reconResult = await reconcileInvoiceToPO(invoiceData, poNumber, finaleClient);
+
+                        const verdict = reconResult.autoApplicable
+                            ? "auto_applicable"
+                            : (reconResult.overallVerdict || "REVIEW");
+                        const newStatus = verdict === "auto_applicable" ? "RECONCILED" : "REVIEW";
+
+                        db.prepare(
+                            \`UPDATE ap_local_forwards
+                             SET reconciliation_status = ?,
+                                 matched_po_number = ?,
+                                 reconciliation_notes = ?,
+                                 reconciliation_result_json = ?,
+                                 reconciliation_verdict = ?,
+                                 reconciled_at = datetime('now')
+                             WHERE id = ?\`
+                        ).run(
+                            newStatus,
+                            poNumber,
+                            reconResult.summary || \`Reconciled via invoice engine (verdict: \${verdict})\`,
+                            JSON.stringify(reconResult),
+                            verdict,
+                            inv.id
+                        );
+
+                        if (verdict === "auto_applicable") {
+                            summary.reconciled++;
+                        } else {
+                            summary.pending++;
+                        }
+                    } catch (e: any) {
+                        summary.pending++;
+                    }
+                }
+
+                console.log(
+                    \`[AP-Reconcile] Done: checked=\${summary.checked} reconciled=\${summary.reconciled} \` +
+                    \`autoCompleted=\${summary.autoCompleted} pending=\${summary.pending}\`,
+                );
             } catch (e: any) {
-                summary.pending++;
-                console.warn(`   [AP-Reconcile] Finale lookup failed for PO ${poNumber}: ${e.message}`);
+                console.error(\`   [AP-Reconcile] Error: \${e.message}\`);
             }
-        }
 
-        console.log(
-            `🔄 [AP-Reconcile] Done: checked=${summary.checked} reconciled=${summary.reconciled} ` +
-            `autoCompleted=${summary.autoCompleted} pending=${summary.pending}`,
-        );
-    } catch (e: any) {
-        console.error(`   [AP-Reconcile] Error: ${e.message}`);
-    }
-
-    return summary;
-}
-
-/**
- * Mark a Gmail message as processed: remove UNREAD + INBOX, add "Invoice Forward" label.
- * This prevents reprocessing on the next cycle.
- */
-async function markEmailProcessed(gmail: any, messageId: string): Promise<void> {
-    try {
-        // Find or create the "Invoice Forward" label
-        const labelsRes = await gmail.users.labels.list({ userId: "me" });
-        let labelId = labelsRes.data.labels?.find(
-            (l: any) => l.name?.toLowerCase() === "invoice forward",
-        )?.id;
-
-        if (!labelId) {
-            const created = await gmail.users.labels.create({
-                userId: "me",
-                requestBody: {
-                    name: "Invoice Forward",
-                    labelListVisibility: "labelShow",
-                    messageListVisibility: "show",
-                },
-            });
-            labelId = created.data.id;
+            return summary;
         }
 
         await gmail.users.messages.modify({
@@ -850,7 +844,7 @@ export async function runLocalApForward(): Promise<{
                 const pdfHash = crypto.createHash("sha256").update(pdfBuffer).digest("hex");
 
                 // Dedup check
-                if (isAlreadyForwarded(gmailMessageId, pdf.filename, pdfHash)) {
+                if (isDuplicate(gmailMessageId, pdf.filename, pdfHash)) {
                     console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdf.filename} (msg ${gmailMessageId})`);
                     summary.skipped++;
                     continue;
@@ -886,6 +880,7 @@ export async function runLocalApForward(): Promise<{
                     recordForward(
                         gmailMessageId, from, subject, pdf.filename, pdfHash, sentId,
                         skipReconciliation ? "dropship" : undefined,
+                        paidCheck.rawText,
                     );
                     await syncToSupabase(from, subject, pdf.filename, sentId);
                     summary.forwarded++;
