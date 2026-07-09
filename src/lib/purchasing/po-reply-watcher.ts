@@ -19,6 +19,8 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "@/lib/supabase";
+import { upsertShipmentEvidence } from "@/lib/tracking/shipment-intelligence";
+import { syncPOETA } from "./po-eta-sync";
 
 /** Sent emails from our side come from these addresses. */
 const OUR_ADDRESSES = new Set([
@@ -94,17 +96,65 @@ function extractTrackingNumbers(text: string): string[] {
     const upsRe = /(1Z[A-Z0-9]{16})/gi;
     let m;
     while ((m = upsRe.exec(text)) !== null) found.push(m[1].toUpperCase());
-    // FedEx: 12 or 15 digits
-    const fedexRe = /\b(\d{12,15})\b/g;
-    while ((m = fedexRe.exec(text)) !== null) {
-        // Skip if it looks like a phone number (starts with area codes)
-        if (!/^\d{3}\d{3}\d{4}$/.test(m[1])) found.push(m[1]);
-    }
-    // USPS: 20-22 digits (e.g., 9400 1112 3456 7890 1234 56)
-    const uspsRe = /\b(\d{20,22})\b/g;
+    // FedEx: 12-15 digits or 96XXXXXXXXXXXXXXX format
+    const fedexRe = /\b(96\d{18}|\d{15}|\d{12})\b/g;
+    while ((m = fedexRe.exec(text)) !== null) found.push(m[1]);
+    // USPS: 20-22 digits
+    const uspsRe = /\b(94|92|93|95)\d{20}\b/g;
     while ((m = uspsRe.exec(text)) !== null) found.push(m[1]);
-    // Remove duplicates
+    // DHL: JD + 18 digits
+    const dhlRe = /\bJD\d{18}\b/gi;
+    while ((m = dhlRe.exec(text)) !== null) found.push(m[1].toUpperCase());
+    // LTL PRO numbers
+    const proRe = /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi;
+    while ((m = proRe.exec(text)) !== null) found.push(m[1]);
+    // Generic tracking keyword patterns
+    const genericRe = /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi;
+    while ((m = genericRe.exec(text)) !== null) found.push(m[1].toUpperCase());
+
     return [...new Set(found)];
+}
+
+/**
+ * Extract ETA dates from vendor reply body text.
+ * Matches patterns like: "ETA 7/15", "expected ship date July 20, 2026",
+ * "delivery by Aug 1", "shipping 07/15/2026".
+ * Returns the earliest date found, or null if none detected.
+ */
+function extractETADate(text: string): string | null {
+    const patterns: RegExp[] = [
+        // "ETA 7/15/2026" or "ETA: July 20" or "ETA 07/15"
+        /\bETA[\s:]*(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/i,
+        /\bETA[\s:]*(\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b/i,
+        // "expected ship date 7/15" or "expected delivery July 20"
+        /\bexpected\s+(?:ship|delivery|arrival)\s+(?:date|by)?[\s:]*(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/i,
+        /\bexpected\s+(?:ship|delivery|arrival)\s+(?:date|by)?[\s:]*(\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b/i,
+        // "delivery by Aug 1" or "arriving on July 20, 2026"
+        /\b(?:delivery|arriving|ships?)\s+(?:by|on|date)[\s:]*(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/i,
+        /\b(?:delivery|arriving|ships?)\s+(?:by|on|date)[\s:]*(\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b/i,
+        // "shipping 07/15/2026" or "will ship 7/15"
+        /\b(?:will\s+)?(?:ship|shipping|send)\s+(?:on|date|by)?[\s:]*(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/i,
+        // "tracking will be available by 7/20"
+        /\b(?:available|ready)\s+by\s+(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/i,
+    ];
+
+    const candidates: Date[] = [];
+
+    for (const re of patterns) {
+        const m = re.exec(text);
+        if (m) {
+            const parsed = new Date(m[1]);
+            if (!isNaN(parsed.getTime()) && parsed > new Date()) {
+                candidates.push(parsed);
+            }
+        }
+    }
+
+    if (candidates.length === 0) return null;
+
+    // Return earliest date
+    candidates.sort((a, b) => a.getTime() - b.getTime());
+    return candidates[0].toISOString().slice(0, 10);
 }
 
 /**
@@ -285,12 +335,22 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
                 `[po-reply-watcher] DETECTED vendor reply for ${send.po_number}: "${snippet.slice(0, 80)}"`
             );
 
-            // Extract reply body and search for tracking numbers
+            // Extract reply body, tracking numbers, and ETA dates
             const replyBody = extractTextFromPayload(msg.payload);
             const foundTracking = extractTrackingNumbers(replyBody);
+            const foundETA = extractETADate(replyBody);
 
             try {
-                // If tracking numbers found, merge with existing
+                // Build update payload
+                const updatePayload: Record<string, any> = {
+                    lifecycle_stage: "ACKNOWLEDGED",
+                    vendor_acknowledged_at: new Date(msgTime).toISOString(),
+                    human_reply_detected_at: new Date(msgTime).toISOString(),
+                    last_movement_summary: snippet,
+                    updated_at: new Date().toISOString(),
+                };
+
+                // Merge tracking numbers if found
                 if (foundTracking.length > 0) {
                     const { data: existingPO } = await supabase
                         .from("purchase_orders")
@@ -300,36 +360,49 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
 
                     const existingTNs: string[] = existingPO?.tracking_numbers || [];
                     const merged = [...new Set([...existingTNs, ...foundTracking])];
+                    updatePayload.tracking_numbers = merged;
 
-                    await supabase
-                        .from("purchase_orders")
-                        .update({
-                            lifecycle_stage: "ACKNOWLEDGED",
-                            vendor_acknowledged_at: new Date(msgTime).toISOString(),
-                            human_reply_detected_at: new Date(msgTime).toISOString(),
-                            last_movement_summary: snippet,
-                            tracking_numbers: merged,
-                            updated_at: new Date().toISOString(),
-                        })
-                        .eq("po_number", send.po_number);
+                    console.log(
+                        `[po-reply-watcher] Extracted ${foundTracking.length} tracking number(s) from vendor reply for ${send.po_number}: ${foundTracking.join(", ")}`
+                    );
 
-                    if (foundTracking.length > 0) {
-                        console.log(
-                            `[po-reply-watcher] Extracted ${foundTracking.length} tracking number(s) from vendor reply for ${send.po_number}: ${foundTracking.join(", ")}`
-                        );
+                    // Register each tracking number for carrier polling
+                    for (const tn of foundTracking) {
+                        try {
+                            await upsertShipmentEvidence({
+                                trackingNumber: tn,
+                                statusCategory: "in_transit",
+                                statusDisplay: "Vendor reply — awaiting carrier scan",
+                                poNumbers: [send.po_number],
+                                vendorNames: [send.vendor_name],
+                                source: "po-reply-watcher",
+                            } as any);
+                        } catch (regErr: any) {
+                            console.warn(`[po-reply-watcher] Shipment registration failed for ${tn}:`, regErr.message);
+                        }
                     }
-                } else {
-                    await supabase
-                        .from("purchase_orders")
-                        .update({
-                            lifecycle_stage: "ACKNOWLEDGED",
-                            vendor_acknowledged_at: new Date(msgTime).toISOString(),
-                            human_reply_detected_at: new Date(msgTime).toISOString(),
-                            last_movement_summary: snippet,
-                            updated_at: new Date().toISOString(),
-                        })
-                        .eq("po_number", send.po_number);
                 }
+
+                // Store vendor-stated ETA if found
+                if (foundETA) {
+                    updatePayload.vendor_stated_eta = foundETA;
+                    updatePayload.vendor_stated_eta_confidence = "high";
+                    console.log(
+                        `[po-reply-watcher] Extracted ETA ${foundETA} from vendor reply for ${send.po_number}`
+                    );
+
+                    // Push ETA to Finale
+                    try {
+                        await syncPOETA(send.po_number, foundETA, "vendor-reply");
+                    } catch (etaErr: any) {
+                        console.warn(`[po-reply-watcher] ETA sync failed for ${send.po_number}:`, etaErr.message);
+                    }
+                }
+
+                await supabase
+                    .from("purchase_orders")
+                    .update(updatePayload)
+                    .eq("po_number", send.po_number);
             } catch (updErr: any) {
                 console.warn(`[po-reply-watcher] Failed to update purchase_orders for ${send.po_number}:`, updErr.message);
             }

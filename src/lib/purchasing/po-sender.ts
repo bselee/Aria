@@ -13,6 +13,7 @@ import type { CommitVerification } from './po-verification';
 import { renderPurchaseOrderPdf } from './po-email-pdf';
 import { sendGmailPdfEmail, sendTextOnlyGmailEmail } from '../gmail/send-email';
 import { transitionLifecycleState } from './po-lifecycle';
+import { syncPOETA } from './po-eta-sync';
 
 type POEmailVia = 'gmail' | 'finale-native' | 'gmail-fallback' | 'gmail-text-only';
 
@@ -830,6 +831,43 @@ export async function commitAndSendPO(
                     emailSent,
                     gmailMessageId,
                 });
+
+                // Phase 2 (2026-07-09): Capture baseline ETA at PO send time.
+                // Uses vendor lead_time_override_days to set an initial dueDate in Finale
+                // before any vendor reply or tracking data arrives.
+                if (emailSent) {
+                    try {
+                        const leadDb = createClient();
+                        if (leadDb && review.vendorPartyId) {
+                            const { data: policy } = await leadDb
+                                .from("vendor_reorder_policies")
+                                .select("lead_time_override_days")
+                                .eq("vendor_party_id", review.vendorPartyId)
+                                .maybeSingle();
+
+                            const leadDays = (policy as any)?.lead_time_override_days;
+                            if (leadDays && leadDays > 0) {
+                                const eta = new Date();
+                                eta.setDate(eta.getDate() + leadDays);
+                                const etaStr = eta.toISOString().slice(0, 10);
+
+                                await leadDb
+                                    .from("purchase_orders")
+                                    .update({
+                                        vendor_stated_eta: etaStr,
+                                        vendor_stated_eta_confidence: "auto",
+                                    })
+                                    .eq("po_number", orderId);
+
+                                // Push to Finale dueDate
+                                await syncPOETA(orderId, etaStr, "po-send-baseline");
+                            }
+                        }
+                    } catch (etaErr: any) {
+                        // Non-blocking — ETA capture is best-effort at send time
+                        console.warn(`[po-sender] Baseline ETA capture failed for PO ${orderId}: ${etaErr.message}`);
+                    }
+                }
             }
 
             // Session lifecycle: full success closes the session ('confirmed').
