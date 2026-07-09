@@ -3105,9 +3105,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         // Zero extra API calls: getVendorOnTimeRate() reads the in-process cache.
                         vendorOnTimeRate: this.getVendorOnTimeRate(party.groupName),
                     });
-                } catch {
-                    // Skip products that error — non-fatal
-                    console.warn(`[finale] getPurchasingIntelligence: SKU ${sku} skipped — error caught in worker loop`);
+                } catch (err) {
+                    // Skip products that error — non-fatal, but surface the cause
+                    const msg = err instanceof Error ? err.message : String(err);
+                    console.warn(`[finale] getPurchasingIntelligence: SKU ${sku} skipped — ${msg}`);
                 }
                 // 100ms breathing room between SKUs — keeps sustained load ~180 req/min
                 // HERMIA(2026-06-25): REMOVED — the rate limiter in FinaleCoreClient
