@@ -18,7 +18,7 @@ dotenv.config({ path: ".env.local" });
 
 import { pathToFileURL } from "url";
 import { gmail as GmailApi } from "@googleapis/gmail";
-import { createClient } from "@supabase/supabase-js";
+import { createClient } from "@/lib/db";
 import { PDFDocument } from "pdf-lib";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 // HERMIA(2026-05-28): Vendor-specific PDF manipulation removed per Will's directive.
@@ -146,7 +146,7 @@ async function sendToBillCom(
 }
 
 async function archiveInvoice(
-    supabase: any,
+    client: any,
     invoice: ExtractedInvoice,
     sourceMessageId: string,
     sourceSubject: string,
@@ -194,7 +194,6 @@ async function main() {
         console.log(messageId
             ? `Fetching exact AAA Cooper statement ${messageId} from ap@buildasoil.com...`
             : "Searching ap@buildasoil.com for AAA Cooper statements...");
-
         const statements = await fetchAAACooperStatements(gmail as any, { messageId, inboxOnly });
         if (statements.length === 0) {
             console.log("\nNo AAA Cooper statements to process.");
@@ -207,10 +206,7 @@ async function main() {
             : `   Found ${statements.length} AAA Cooper email(s); fetching attachments...`);
         console.log(`\nProcessing up to ${messageId ? 1 : limit} statement email(s)...\n`);
 
-        const supabase = createClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY!,
-        );
+        const client = createClient();
 
         let totalInvoices = 0;
         let totalPagesDiscarded = 0;
@@ -291,7 +287,7 @@ async function main() {
                         };
 
                         await sendToBillCom(gmail, extInvoice);
-                        await archiveInvoice(supabase, extInvoice, '', '');
+                        await archiveInvoice(client, extInvoice, '', '');
                         run.recordInvoiceProcessed();
                         console.log(`   ✅ Forwarded: ${change.filename}`);
                     } catch (err: any) {

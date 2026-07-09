@@ -1,5 +1,3 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
-
 export interface APActivityRow {
     intent: string;
     created_at: string;
@@ -70,16 +68,16 @@ export function buildPOCompletionSignalIndex(rows: APActivityRow[], poNumbers: s
 }
 
 export async function loadPOCompletionSignalIndex(
-    supabase: SupabaseClient | null | undefined,
+    client: any | null | undefined,
     poNumbers: string[],
     lookbackDays = 120
 ): Promise<Map<string, POCompletionSignal>> {
-    if (!supabase || poNumbers.length === 0) return new Map();
+    if (!client || poNumbers.length === 0) return new Map();
 
     const cutoff = new Date();
     cutoff.setUTCDate(cutoff.getUTCDate() - lookbackDays);
 
-    const { data } = await supabase
+    const { data } = await client
         .from("ap_activity_log")
         .select("intent, created_at, metadata")
         .in("intent", ["RECONCILIATION", "RECONCILIATION_ERROR"])
