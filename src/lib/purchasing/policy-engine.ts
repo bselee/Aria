@@ -73,6 +73,14 @@ function orderPointDays(input: PurchasingCandidateInput): number {
 
 function isOnOrderCoverageHealthy(input: PurchasingCandidateInput): boolean {
     if ((input.stockOnOrder ?? 0) <= 0) return false;
+    const daily = Math.max(input.directDemand, 0) + Math.max(input.bomDemand, 0);
+    const onHand = Math.max(input.stockOnHand, 0);
+    const onOrder = Math.max(input.stockOnOrder, 0);
+    // Prefer supply math over adjustedRunway field — that field can lag open-PO credit.
+    if (daily > 0) {
+        const needToOrderPoint = daily * orderPointDays(input);
+        if (onHand + onOrder >= needToOrderPoint) return true;
+    }
     const runway = resolveRunway(input);
     if (runway === null) {
         // Inbound supply, no demand signal — treat as covered.
@@ -142,7 +150,12 @@ function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: nu
     const daily = Math.max(input.directDemand, 0) + Math.max(input.bomDemand, 0);
 
     if (onOrder > 0) {
-        const residual = Math.max(0, effectiveQty);
+        // Reorder shortfall = gap to order point after open PO credit (not full target cover).
+        const supply = onHand + onOrder;
+        const residualFromSupply = daily > 0
+            ? Math.max(0, daily * point - supply)
+            : Math.max(0, effectiveQty);
+        const residual = Math.min(Math.max(0, effectiveQty), residualFromSupply);
         const dailyPart = daily > 0 ? ` at ${daily.toFixed(2)}/day` : "";
         // Open PO does not cover need → this is a reorder of the shortfall (can be critical).
         const critical = runway !== null && runway < lead;
@@ -308,12 +321,38 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
         });
     }
 
-    const orderMeta = buildOrderExplanation(input, effectiveQty);
+    // Cap residual reorder qty to order-point shortfall when open PO already exists.
+    let orderQty = effectiveQty;
+    if ((input.stockOnOrder ?? 0) > 0) {
+        const daily = sharedDemand;
+        if (daily > 0) {
+            const supply = Math.max(input.stockOnHand, 0) + Math.max(input.stockOnOrder, 0);
+            const residualAtPoint = Math.max(0, daily * orderPointDays(input) - supply);
+            orderQty = Math.min(effectiveQty, residualAtPoint);
+        }
+        if (orderQty <= 0) {
+            const runway = resolveRunway(input);
+            return createPurchasingAssessment({
+                vendorName: input.vendorName,
+                productId: input.productId,
+                decision: "hold",
+                recommendedQty: 0,
+                confidence: "high",
+                reasonCodes: ["on_order_already_covers_need"],
+                explanation:
+                    `Hold: ${fmtQty(input.stockOnOrder)} on order already covers near-term need ` +
+                    `(runway ${fmtDays(runway)}, on hand ${fmtQty(input.stockOnHand)}). Chase that PO if delayed — do not re-order.`,
+                metrics: m(),
+            });
+        }
+    }
+
+    const orderMeta = buildOrderExplanation(input, orderQty);
     return createPurchasingAssessment({
         vendorName: input.vendorName,
         productId: input.productId,
         decision: "order",
-        recommendedQty: effectiveQty,
+        recommendedQty: orderQty,
         confidence: orderMeta.confidence,
         reasonCodes: orderMeta.reasonCodes,
         explanation: orderMeta.explanation,

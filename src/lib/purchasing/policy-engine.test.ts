@@ -117,6 +117,39 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.explanation).toMatch(/Order soon|Buy /);
     });
 
+
+    it("holds residual reorder when open PO + on hand already cover order point", () => {
+        // RAWWORM-style: huge open PO + stock, stale suggested still wants 84k
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            productId: "RAWWORMCASTINGS",
+            stockOnHand: 53140,
+            stockOnOrder: 42000,
+            adjustedRunwayDays: 26.6,
+            leadTimeDays: 14,
+            suggestedQty: 84000,
+            directDemand: 1716.24,
+        }));
+        expect(assessment.decision).toBe("hold");
+        expect(assessment.recommendedQty).toBe(0);
+        expect(assessment.reasonCodes).toContain("on_order_already_covers_need");
+    });
+
+    it("caps residual reorder qty to order-point shortfall, not full suggested", () => {
+        // daily 10, lead 14 → OP 44d need 440; on hand 0 + open 400 → short 40
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            stockOnHand: 0,
+            stockOnOrder: 400,
+            adjustedRunwayDays: 20,
+            leadTimeDays: 14,
+            suggestedQty: 200,
+            directDemand: 10,
+        }));
+        expect(assessment.decision).toBe("order");
+        expect(assessment.reasonCodes).toContain("residual_reorder");
+        expect(assessment.recommendedQty).toBe(40);
+        expect(assessment.explanation).toMatch(/still short by 40/i);
+    });
+
     it("labels residual reorder when open PO exists but runway still short", () => {
         const assessment = assessPurchasingCandidate(makeCandidate({
             stockOnHand: 0,
