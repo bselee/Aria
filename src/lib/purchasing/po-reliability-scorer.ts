@@ -304,8 +304,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
 
 /**
  * Returns true if at least one PO has delivery evidence.
- * Used to skip a SKU from the Ordering panel — if a deliverable PO exists,
- * supply is on the way and reordering is not needed.
+ * Used as a lifecycle/chase signal — not the sole gate for supply credit.
  */
 export function hasDeliverablePO(pos: OpenPOReliable[]): boolean {
     return pos.some(po => po.isDeliverable);
@@ -313,11 +312,36 @@ export function hasDeliverablePO(pos: OpenPOReliable[]): boolean {
 
 /**
  * Sum of quantities from deliverable POs only.
- * Stuck POs (no ack, stale tracking, ghost) contribute 0 to stockOnOrder
- * so the recommender treats the supply as unavailable.
+ * Lifecycle view: how much supply has forward-motion evidence.
  */
 export function deliverableStockOnOrder(pos: OpenPOReliable[]): number {
     return pos
         .filter(po => po.isDeliverable)
         .reduce((sum, po) => sum + po.quantity, 0);
+}
+
+/**
+ * HERMIA(2026-07-10): Demand-side supply credit for reorder math.
+ *
+ * Finale Committed/Locked open PO qty is real supply on the timeline.
+ * Zeroing stuck POs caused false re-order recommendations (labels/print:
+ * PO 500 on ribbon, stockOnOrder=0, suggested 250 again).
+ *
+ * Rule: credit ALL open PO quantities toward coverage. Stuck lifecycle is a
+ * chase/escalation signal in Purchases — not a reason to place a second PO
+ * for the same demand window.
+ */
+export function coverageStockOnOrder(
+    openPOs: Array<{ quantity: number }>,
+    enriched?: OpenPOReliable[],
+): number {
+    const finaleTotal = openPOs.reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
+    if (!enriched || enriched.length === 0) return finaleTotal;
+    const deliverable = deliverableStockOnOrder(enriched);
+    return Math.max(finaleTotal, deliverable);
+}
+
+/** True when at least one open PO lacks deliverability evidence (chase needed). */
+export function hasStuckOpenPO(pos: OpenPOReliable[]): boolean {
+    return pos.some(po => !po.isDeliverable);
 }

@@ -1,3 +1,7 @@
+/**
+ * @file    policy-engine.test.ts
+ * @purpose Unit tests for precise purchasing decision gates
+ */
 import { describe, expect, it } from "vitest";
 
 import {
@@ -32,6 +36,8 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.decision).toBe("order");
         expect(assessment.reasonCodes).toContain("direct_demand_support");
         expect(assessment.recommendedQty).toBe(240);
+        expect(assessment.explanation).toMatch(/Order now|Order soon|Buy /);
+        expect(assessment.explanation).toMatch(/4/);
     });
 
     it("holds BOM-heavy components when finished goods already have healthy coverage", () => {
@@ -76,6 +82,71 @@ describe("assessPurchasingCandidate", () => {
 
         expect(assessment.decision).toBe("hold");
         expect(assessment.reasonCodes).toContain("on_order_already_covers_need");
+        expect(assessment.explanation).toMatch(/on order/i);
+    });
+
+    it("holds when runway is past lead+30 even if recommender suggested a floor qty", () => {
+        // ULINE-style false need: adj 150d, historical floor still suggests boxes
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            productId: "S-4122",
+            stockOnHand: 741,
+            stockOnOrder: 0,
+            adjustedRunwayDays: 151,
+            leadTimeDays: 7,
+            suggestedQty: 1000,
+            directDemand: 4.9,
+        }));
+
+        expect(assessment.decision).toBe("hold");
+        expect(assessment.reasonCodes).toContain("runway_healthy");
+        expect(assessment.recommendedQty).toBe(0);
+        expect(assessment.explanation).toMatch(/order point/i);
+    });
+
+    it("orders inside the lead+30 window", () => {
+        // lead 14 + 30 = 44; adj 40 → still order soon
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            adjustedRunwayDays: 40,
+            leadTimeDays: 14,
+            suggestedQty: 100,
+            stockOnHand: 200,
+            directDemand: 5,
+        }));
+
+        expect(assessment.decision).toBe("order");
+        expect(assessment.explanation).toMatch(/Order soon|Buy /);
+    });
+
+    it("labels residual top-up when open PO exists but runway still short", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            stockOnHand: 0,
+            stockOnOrder: 40,
+            adjustedRunwayDays: 4,
+            leadTimeDays: 14,
+            suggestedQty: 100,
+            directDemand: 10,
+        }));
+
+        expect(assessment.decision).toBe("order");
+        expect(assessment.reasonCodes).toContain("residual_top_up");
+        expect(assessment.explanation).toMatch(/Top-up/i);
+    });
+
+    it("holds micro-velocity noise that invents multi-year supply", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            productId: "OAG227",
+            stockOnHand: 0,
+            stockOnOrder: 0,
+            adjustedRunwayDays: 0,
+            leadTimeDays: 14,
+            suggestedQty: 5,
+            directDemand: 0.006,
+            bomDemand: 0,
+            unitPrice: 3000,
+        }));
+
+        expect(assessment.decision).toBe("hold");
+        expect(assessment.reasonCodes).toContain("micro_velocity_noise");
     });
 
     it("routes to manual review when pack sizing forces large overbuy", () => {
@@ -97,6 +168,7 @@ describe("assessPurchasingCandidate", () => {
             suggestedQty: 25,
             unitPrice: 0.5,
             minimumOrderValue: 100,
+            adjustedRunwayDays: 5,
         }));
 
         expect(assessment.decision).toBe("hold");
@@ -109,14 +181,14 @@ describe("assessPurchasingCandidate", () => {
             productId: "FWE102",
             directDemand: 0.1,
             stockOnHand: 13,
-            adjustedRunwayDays: 130,
+            adjustedRunwayDays: 10,
+            leadTimeDays: 14,
             suggestedQty: 0,
         }));
 
         expect(assessment.decision).toBe("hold");
         expect(assessment.recommendedQty).toBe(0);
         expect(assessment.reasonCodes).toContain("no_order_quantity_recommended");
-        expect(assessment.explanation).toContain("No reorder quantity is recommended");
     });
 
     it("keeps manual items actionable when movement still supports reorder", () => {
@@ -136,6 +208,7 @@ describe("assessPurchasingCandidate", () => {
             bomDemand: 20,
             finishedGoodsCoverageDays: 12,
             suggestedQty: 200,
+            adjustedRunwayDays: 5,
         }) as any);
 
         expect(assessment.decision).toBe("order");

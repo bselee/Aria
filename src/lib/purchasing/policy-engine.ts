@@ -1,10 +1,23 @@
+/**
+ * @file    policy-engine.ts
+ * @purpose Per-SKU purchasing decision gate: order vs hold with precise, human-readable reasons.
+ * @author  Hermia
+ * @created 2026-05-26
+ * @updated 2026-07-10 — runway-healthy hold, micro-velocity guard, numeric explanations
+ */
 import {
     createPurchasingAssessment,
     type PurchasingAssessment,
+    type PurchasingReasonCode,
 } from "./policy-types";
 
 const HEALTHY_FINISHED_GOODS_COVERAGE_DAYS = 30;
 const PACK_OVERBUY_MANUAL_REVIEW_RATIO = 3;
+/** Days of post-lead buffer before we treat runway as comfortable (no order needed). */
+const RUNWAY_SAFETY_BUFFER_DAYS = 30;
+/** If suggested supply days exceed this at tiny daily rate, treat as noise. */
+const MICRO_VELOCITY_MAX_SUPPLY_DAYS = 180;
+const MICRO_VELOCITY_MAX_DAILY = 0.05;
 
 export interface PurchasingCandidateInput {
     vendorName: string;
@@ -24,6 +37,8 @@ export interface PurchasingCandidateInput {
     unitPrice: number;
     /** True when the vendor has a committed PO in the cycle window — suppress all orders. */
     vendorCycleLocked?: boolean;
+    /** Optional raw need before pack/historical floors (when known). */
+    rawNeededEaches?: number | null;
 }
 
 function hasHealthyFinishedGoodsCoverage(days: number | null): boolean {
@@ -42,17 +57,130 @@ function isPackOverbuy(input: PurchasingCandidateInput, effectiveQty: number): b
     return effectiveQty / input.suggestedQty >= PACK_OVERBUY_MANUAL_REVIEW_RATIO;
 }
 
+function resolveRunway(input: PurchasingCandidateInput): number | null {
+    if (input.adjustedRunwayDays !== null && Number.isFinite(input.adjustedRunwayDays)) {
+        return input.adjustedRunwayDays;
+    }
+    const daily = Math.max(input.directDemand, 0) + Math.max(input.bomDemand, 0);
+    if (daily <= 0) return null;
+    return (Math.max(input.stockOnHand, 0) + Math.max(input.stockOnOrder, 0)) / daily;
+}
+
+function orderPointDays(input: PurchasingCandidateInput): number {
+    const lead = Math.max(0, input.leadTimeDays ?? 14);
+    return lead + RUNWAY_SAFETY_BUFFER_DAYS;
+}
+
 function isOnOrderCoverageHealthy(input: PurchasingCandidateInput): boolean {
     if ((input.stockOnOrder ?? 0) <= 0) return false;
-    if (input.adjustedRunwayDays === null) return false;
-
+    const runway = resolveRunway(input);
+    if (runway === null) {
+        // Inbound supply, no demand signal — treat as covered.
+        return true;
+    }
     const baselineCoverage = Math.max(input.leadTimeDays ?? 0, HEALTHY_FINISHED_GOODS_COVERAGE_DAYS);
-    return input.adjustedRunwayDays >= baselineCoverage;
+    return runway >= baselineCoverage;
+}
+
+/**
+ * Runway already covers lead + 30d safety → do not recommend a new PO.
+ * Historical floors / target-cover top-ups must not keep comfortable stock on the Order list.
+ */
+function isRunwayHealthy(input: PurchasingCandidateInput): boolean {
+    const runway = resolveRunway(input);
+    if (runway === null) return false;
+    return runway >= orderPointDays(input);
 }
 
 function isUneconomicOrder(input: PurchasingCandidateInput, effectiveQty: number): boolean {
     if (!input.minimumOrderValue || input.minimumOrderValue <= 0) return false;
     return effectiveQty * input.unitPrice < input.minimumOrderValue;
+}
+
+/** Tiny burn + multi-year suggested supply = velocity noise, not a real buy. */
+function isMicroVelocityNoise(input: PurchasingCandidateInput, effectiveQty: number): boolean {
+    const daily = Math.max(input.directDemand, 0) + Math.max(input.bomDemand, 0);
+    if (daily <= 0 || daily > MICRO_VELOCITY_MAX_DAILY) return false;
+    if (effectiveQty <= 0) return false;
+    const supplyDays = effectiveQty / daily;
+    return supplyDays > MICRO_VELOCITY_MAX_SUPPLY_DAYS;
+}
+
+function fmtDays(n: number | null | undefined): string {
+    if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+    if (n >= 100) return `${Math.round(n)}d`;
+    return `${Math.round(n * 10) / 10}d`;
+}
+
+function fmtQty(n: number): string {
+    return Math.round(n).toLocaleString("en-US");
+}
+
+function metricsOf(input: PurchasingCandidateInput, directDemand: number, bomDemand: number) {
+    return {
+        directDemand,
+        bomDemand,
+        sharedDemand: directDemand + bomDemand,
+        stockOnHand: input.stockOnHand,
+        stockOnOrder: input.stockOnOrder,
+        adjustedRunwayDays: input.adjustedRunwayDays,
+        finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
+        leadTimeDays: input.leadTimeDays,
+    };
+}
+
+function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: number): {
+    reasonCodes: PurchasingReasonCode[];
+    explanation: string;
+    confidence: "high" | "medium" | "low";
+} {
+    const runway = resolveRunway(input);
+    const lead = input.leadTimeDays ?? 14;
+    const point = orderPointDays(input);
+    const onOrder = input.stockOnOrder ?? 0;
+    const onHand = input.stockOnHand ?? 0;
+    const daily = Math.max(input.directDemand, 0) + Math.max(input.bomDemand, 0);
+
+    if (onOrder > 0) {
+        const residual = Math.max(0, effectiveQty);
+        return {
+            reasonCodes: ["residual_top_up"],
+            confidence: "medium",
+            explanation:
+                `Top-up: ${fmtQty(onOrder)} already on open PO, still need ${fmtQty(residual)} more ` +
+                `for cover (on hand ${fmtQty(onHand)}, runway ${fmtDays(runway)}, order-by when < ${fmtDays(point)}).`,
+        };
+    }
+
+    if (runway !== null && runway < lead) {
+        return {
+            reasonCodes: ["direct_demand_support", "runway_below_lead"],
+            confidence: "high",
+            explanation:
+                `Order now: runway ${fmtDays(runway)} is below lead ${fmtDays(lead)}. ` +
+                `On hand ${fmtQty(onHand)}${daily > 0 ? ` at ${daily.toFixed(2)}/day` : ""}. ` +
+                `Buy ${fmtQty(effectiveQty)} to restore cover.`,
+        };
+    }
+
+    if (runway !== null && runway < point) {
+        return {
+            reasonCodes: ["direct_demand_support"],
+            confidence: "high",
+            explanation:
+                `Order soon: runway ${fmtDays(runway)} is inside the order window ` +
+                `(lead ${fmtDays(lead)} + ${RUNWAY_SAFETY_BUFFER_DAYS}d buffer = ${fmtDays(point)}). ` +
+                `On hand ${fmtQty(onHand)}. Buy ${fmtQty(effectiveQty)}.`,
+        };
+    }
+
+    return {
+        reasonCodes: ["direct_demand_support"],
+        confidence: "medium",
+        explanation:
+            `Buy ${fmtQty(effectiveQty)}: demand supports a reorder ` +
+            `(runway ${fmtDays(runway)}, on hand ${fmtQty(onHand)}, lead ${fmtDays(lead)}).`,
+    };
 }
 
 export function assessPurchasingCandidate(input: PurchasingCandidateInput): PurchasingAssessment {
@@ -61,6 +189,7 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
     const bomDemand = Math.max(input.bomDemand, 0);
     const sharedDemand = directDemand + bomDemand;
     const healthyFgCoverage = hasHealthyFinishedGoodsCoverage(input.finishedGoodsCoverageDays);
+    const m = () => metricsOf(input, directDemand, bomDemand);
 
     if (isPackOverbuy(input, effectiveQty)) {
         return createPurchasingAssessment({
@@ -70,21 +199,15 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             recommendedQty: effectiveQty,
             confidence: "medium",
             reasonCodes: ["pack_size_forced_overbuy"],
-            explanation: "Vendor pack sizing would force a material overbuy, so this needs manual review.",
-            metrics: {
-                directDemand,
-                bomDemand,
-                sharedDemand,
-                stockOnHand: input.stockOnHand,
-                stockOnOrder: input.stockOnOrder,
-                adjustedRunwayDays: input.adjustedRunwayDays,
-                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-                leadTimeDays: input.leadTimeDays,
-            },
+            explanation:
+                `Pack size would force ~${fmtQty(effectiveQty)} vs need ~${fmtQty(input.suggestedQty)} ` +
+                `(≥${PACK_OVERBUY_MANUAL_REVIEW_RATIO}×). Review before ordering.`,
+            metrics: m(),
         });
     }
 
     if (isOnOrderCoverageHealthy(input)) {
+        const runway = resolveRunway(input);
         return createPurchasingAssessment({
             vendorName: input.vendorName,
             productId: input.productId,
@@ -92,17 +215,10 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             recommendedQty: 0,
             confidence: "high",
             reasonCodes: ["on_order_already_covers_need"],
-            explanation: "Existing on-order inventory already covers the near-term need.",
-            metrics: {
-                directDemand,
-                bomDemand,
-                sharedDemand,
-                stockOnHand: input.stockOnHand,
-                stockOnOrder: input.stockOnOrder,
-                adjustedRunwayDays: input.adjustedRunwayDays,
-                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-                leadTimeDays: input.leadTimeDays,
-            },
+            explanation:
+                `Hold: ${fmtQty(input.stockOnOrder)} on order already covers near-term need ` +
+                `(runway ${fmtDays(runway)}, on hand ${fmtQty(input.stockOnHand)}). Chase that PO if delayed — do not re-order.`,
+            metrics: m(),
         });
     }
 
@@ -114,17 +230,44 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             recommendedQty: 0,
             confidence: "high",
             reasonCodes: ["fg_coverage_sufficient", "bom_demand_suppressed"],
-            explanation: "Finished goods already have healthy coverage, so BOM-driven reorder pressure is suppressed.",
-            metrics: {
-                directDemand,
-                bomDemand,
-                sharedDemand,
-                stockOnHand: input.stockOnHand,
-                stockOnOrder: input.stockOnOrder,
-                adjustedRunwayDays: input.adjustedRunwayDays,
-                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-                leadTimeDays: input.leadTimeDays,
-            },
+            explanation:
+                `Hold: finished goods have ≥${HEALTHY_FINISHED_GOODS_COVERAGE_DAYS}d coverage ` +
+                `(${fmtDays(input.finishedGoodsCoverageDays)}). BOM pull is suppressed.`,
+            metrics: m(),
+        });
+    }
+
+    // Phantom qty from historical floors with comfortable runway → hold
+    if (isRunwayHealthy(input)) {
+        const runway = resolveRunway(input);
+        const point = orderPointDays(input);
+        return createPurchasingAssessment({
+            vendorName: input.vendorName,
+            productId: input.productId,
+            decision: "hold",
+            recommendedQty: 0,
+            confidence: "high",
+            reasonCodes: ["runway_healthy"],
+            explanation:
+                `Hold: runway ${fmtDays(runway)} is past the order point (${fmtDays(point)} = lead + ${RUNWAY_SAFETY_BUFFER_DAYS}d). ` +
+                `On hand ${fmtQty(input.stockOnHand)}, on order ${fmtQty(input.stockOnOrder)}. No buy needed yet.`,
+            metrics: m(),
+        });
+    }
+
+    if (isMicroVelocityNoise(input, effectiveQty)) {
+        const daily = sharedDemand;
+        return createPurchasingAssessment({
+            vendorName: input.vendorName,
+            productId: input.productId,
+            decision: "hold",
+            recommendedQty: 0,
+            confidence: "medium",
+            reasonCodes: ["micro_velocity_noise"],
+            explanation:
+                `Hold: burn ${daily.toFixed(3)}/day is near-zero; suggested ${fmtQty(effectiveQty)} is ` +
+                `${Math.round(effectiveQty / daily)}d of supply (noise). Confirm real demand before buying.`,
+            metrics: m(),
         });
     }
 
@@ -136,17 +279,10 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             recommendedQty: 0,
             confidence: "medium",
             reasonCodes: ["order_economics_unclear"],
-            explanation: "This recommendation falls below a practical vendor order value and should wait for batching or review.",
-            metrics: {
-                directDemand,
-                bomDemand,
-                sharedDemand,
-                stockOnHand: input.stockOnHand,
-                stockOnOrder: input.stockOnOrder,
-                adjustedRunwayDays: input.adjustedRunwayDays,
-                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-                leadTimeDays: input.leadTimeDays,
-            },
+            explanation:
+                `Hold: line value $${(effectiveQty * input.unitPrice).toFixed(0)} is below vendor min ` +
+                `$${(input.minimumOrderValue ?? 0).toFixed(0)}. Batch with other SKUs or wait.`,
+            metrics: m(),
         });
     }
 
@@ -158,37 +294,22 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             recommendedQty: 0,
             confidence: "high",
             reasonCodes: ["no_order_quantity_recommended"],
-            explanation: "No reorder quantity is recommended after current stock, open POs, and target cover are applied.",
-            metrics: {
-                directDemand,
-                bomDemand,
-                sharedDemand,
-                stockOnHand: input.stockOnHand,
-                stockOnOrder: input.stockOnOrder,
-                adjustedRunwayDays: input.adjustedRunwayDays,
-                finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-                leadTimeDays: input.leadTimeDays,
-            },
+            explanation:
+                `Hold: after stock (${fmtQty(input.stockOnHand)}) and open POs (${fmtQty(input.stockOnOrder)}), ` +
+                `recommended qty is 0.`,
+            metrics: m(),
         });
     }
 
+    const orderMeta = buildOrderExplanation(input, effectiveQty);
     return createPurchasingAssessment({
         vendorName: input.vendorName,
         productId: input.productId,
         decision: "order",
         recommendedQty: effectiveQty,
-        confidence: "high",
-        reasonCodes: ["direct_demand_support"],
-        explanation: "Current demand and supply position support placing a reorder now.",
-        metrics: {
-            directDemand,
-            bomDemand,
-            sharedDemand,
-            stockOnHand: input.stockOnHand,
-            stockOnOrder: input.stockOnOrder,
-            adjustedRunwayDays: input.adjustedRunwayDays,
-            finishedGoodsCoverageDays: input.finishedGoodsCoverageDays,
-            leadTimeDays: input.leadTimeDays,
-        },
+        confidence: orderMeta.confidence,
+        reasonCodes: orderMeta.reasonCodes,
+        explanation: orderMeta.explanation,
+        metrics: m(),
     });
 }

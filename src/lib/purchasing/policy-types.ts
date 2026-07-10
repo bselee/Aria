@@ -1,3 +1,10 @@
+/**
+ * @file    policy-types.ts
+ * @purpose Shared types for purchasing assessment decisions and reason codes.
+ * @author  Hermia
+ * @created 2026-05-26
+ * @updated 2026-07-10 — runway_healthy, residual_top_up, micro_velocity, runway_below_lead
+ */
 export type PurchasingDecision = "order" | "reduce" | "hold" | "manual_review";
 
 export type PurchasingReasonCode =
@@ -9,7 +16,12 @@ export type PurchasingReasonCode =
     | "pack_size_forced_overbuy"
     | "order_economics_unclear"
     | "mapping_missing"
-    | "recent_draft_exists";
+    | "recent_draft_exists"
+    | "no_order_quantity_recommended"
+    | "runway_healthy"
+    | "residual_top_up"
+    | "micro_velocity_noise"
+    | "runway_below_lead";
 
 export interface PurchasingAssessmentMetrics {
     directDemand: number;
@@ -36,7 +48,7 @@ export interface PurchasingAssessment {
 export interface VendorAutomationPolicy {
     trustedVendors: string[];
     defaultLookbackDays: number;
-    autoDraftCooldownHours: number;
+    autoDraftDelayHours: number;
 }
 
 const EMPTY_METRICS: PurchasingAssessmentMetrics = {
@@ -53,7 +65,7 @@ const EMPTY_METRICS: PurchasingAssessmentMetrics = {
 export const DEFAULT_VENDOR_AUTOMATION_POLICY: VendorAutomationPolicy = {
     trustedVendors: ["ULINE", "Axiom", "Sustainable Village"],
     defaultLookbackDays: 14,
-    autoDraftCooldownHours: 24,
+    autoDraftDelayHours: 24,
 };
 
 export function createPurchasingAssessment(

@@ -32,6 +32,24 @@ export function buildPurchasingCandidate(
     const directDemand = context.directDemand ?? (knownDemand > 0 ? knownDemand : Math.max(item.salesVelocity, 0));
     const bomDemand = context.bomDemand ?? Math.max(knownDemand - directDemand, 0);
 
+    // HERMIA(2026-07-10): openPOs can lead Finale stockOnOrder (label/print POs
+    // often show on the ribbon while Finale stock-on-order still reads 0). Use
+    // the higher of the two so policy hold fires and Ordering stops offering
+    // another Order when a live PO already covers the SKU.
+    const openPoQty = (item.openPOs ?? []).reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
+    const stockOnOrder = Math.max(item.stockOnOrder ?? 0, openPoQty);
+    const dailyForRunway = Math.max(item.dailyRate ?? 0, directDemand + bomDemand, 0.0001);
+    const stockOnHand = item.stockOnHand ?? 0;
+    let adjustedRunwayDays: number | null = Number.isFinite(item.adjustedRunwayDays)
+        ? item.adjustedRunwayDays
+        : null;
+    if (openPoQty > (item.stockOnOrder ?? 0)) {
+        // Recompute runway from the higher on-order signal so coverage holds work.
+        adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyForRunway;
+    } else if (adjustedRunwayDays === null && stockOnOrder > 0) {
+        adjustedRunwayDays = (stockOnHand + stockOnOrder) / dailyForRunway;
+    }
+
     return {
         vendorName: item.supplierName,
         vendorPartyId: item.supplierPartyId,
@@ -39,9 +57,9 @@ export function buildPurchasingCandidate(
         productName: item.productName,
         directDemand,
         bomDemand,
-        stockOnHand: item.stockOnHand,
-        stockOnOrder: item.stockOnOrder,
-        adjustedRunwayDays: Number.isFinite(item.adjustedRunwayDays) ? item.adjustedRunwayDays : null,
+        stockOnHand,
+        stockOnOrder,
+        adjustedRunwayDays,
         finishedGoodsCoverageDays: context.finishedGoodsCoverageDays ?? null,
         leadTimeDays: Number.isFinite(item.leadTimeDays) ? item.leadTimeDays : null,
         suggestedQty: item.suggestedQty,

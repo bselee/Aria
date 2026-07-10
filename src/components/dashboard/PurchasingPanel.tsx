@@ -801,10 +801,12 @@ export default function PurchasingPanel() {
         // When Quick Draft or ORDER ALL: use all eligible items, not just checked ones.
         // Only draft items the policy engine says to order (assessment.decision === 'order').
         const selected = group.items.filter(i =>
-            !isSnoozed(i.productId) &&
-            canIncludeInDraftPO(i.reorderMethod) &&
-            (i as any).assessment?.decision === 'order'
-        );
+                    !isSnoozed(i.productId) &&
+                    canIncludeInDraftPO(i.reorderMethod) &&
+                    !itemIsCovered(i) &&
+                    !i.draftPO &&
+                    (i as any).assessment?.decision === 'order'
+                );
         const hasChecked = selected.some(i => checked[pid]?.[i.productId]);
         const items = (ignoreCommitGuards || !hasChecked ? selected : selected.filter(i => checked[pid]?.[i.productId]))
             .map(i => ({ productId: i.productId, quantity: i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false, leadTimeDays: (i as any).leadTimeDays ?? null }));
@@ -1216,15 +1218,23 @@ export default function PurchasingPanel() {
     }
 
     /** An item is covered if existing PO incoming + stock ≥ lead_time + 30d demand */
-    function itemIsCovered(item: PurchasingItem): boolean {
-        if (!item.openPOs || item.openPOs.length === 0) return false;
-        const incoming = item.stockOnOrder ?? 0;
-        const onHand = item.stockOnHand ?? 0;
-        const daily = item.dailyRate ?? 0;
-        const lead = item.leadTimeDays ?? 14;
-        const needed = daily * (lead + 30);
-        return (onHand + incoming) >= needed && needed > 0;
-    }
+        function itemIsCovered(item: PurchasingItem): boolean {
+            if (!item.openPOs || item.openPOs.length === 0) return false;
+            // Prefer openPOs qty when Finale stockOnOrder lags (common on labels/print).
+            const openQty = item.openPOs.reduce((s, po) => s + Math.max(0, po.quantity || 0), 0);
+            const incoming = Math.max(item.stockOnOrder ?? 0, openQty);
+            const onHand = item.stockOnHand ?? 0;
+            const daily = item.dailyRate ?? 0;
+            const lead = item.leadTimeDays ?? 14;
+            const needed = daily * (lead + 30);
+            if (needed > 0 && (onHand + incoming) >= needed) return true;
+            // Also cover when open PO qty alone meets or exceeds Aria's suggested reorder.
+            if (openQty >= Math.max(1, item.suggestedQty ?? 1)) return true;
+            // Policy already held for on-order coverage.
+            if ((item.assessment?.reasonCodes ?? []).includes("on_order_already_covers_need")) return true;
+            if ((item.assessment?.reasonCodes ?? []).includes("recent_draft_exists")) return true;
+            return false;
+        }
 
     // Phase 2: Decision Dossier flyout payload — snapshot group + derived props
     // (placed after displayGroups so useMemo factory sees initialized const)
@@ -2180,45 +2190,66 @@ export default function PurchasingPanel() {
                                                             </div>
                                                         );
                                                     }
-                                                    // Order button: reads intent from whether you expanded
-                                                    if (!vSnoozed && activeItems.some(i => canIncludeInDraftPO(i.reorderMethod))) {
-                                                        const wasInspected = expanded.has(pid);
-                                                        return (
-                                                            <button
-                                                                onClick={async () => {
-                                                                    if (wasInspected) {
-                                                                        // You reviewed — draft only for safety
-                                                                        handleCreateOne(group, true);
-                                                                    } else {
-                                                                        // You trust it — draft + commit + send
-                                                                        try {
-                                                                            const result = await createVendorPO(group, true);
-                                                                            if (result?.orderId) {
-                                                                                setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                                                                const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                    method: 'POST',
-                                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                                    body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                                                                });
-                                                                                if (res.ok) {
-                                                                                    setSentPOs(p => new Set(p).add(result.orderId!));
-                                                                                    setCompletedVendors(p => new Set(p).add(pid));
-                                                                                } else {
-                                                                                    setCompletedVendors(p => new Set(p).add(pid));
-                                                                                    setError('Draft created — send failed. Click Send to retry.');
-                                                                                }
-                                                                            }
-                                                                        } catch (e: any) { setError(e.message); }
-                                                                    }
-                                                                }}
-                                                                disabled={anyCreating}
-                                                                className="text-[10px] font-mono px-2 py-1 rounded border bg-emerald-900/30 hover:bg-emerald-800/40 text-emerald-300 border-emerald-800 transition-colors disabled:opacity-40 shrink-0"
-                                                                title={wasInspected ? "Draft only — you reviewed this vendor" : "Draft, commit, and send"}
-                                                            >
-                                                                Order
-                                                            </button>
-                                                        );
-                                                    }
+                                                    // Order button: only when something still needs ordering (not already on open/draft PO)
+                                                                                                        const orderableItems = activeItems.filter(i =>
+                                                                                                            canIncludeInDraftPO(i.reorderMethod)
+                                                                                                            && !itemIsCovered(i)
+                                                                                                            && !i.draftPO
+                                                                                                            && (i as any).assessment?.decision === "order"
+                                                                                                        );
+                                                                                                        const coveredOnly = activeItems.length > 0 && orderableItems.length === 0
+                                                                                                            && activeItems.some(i => itemIsCovered(i) || !!i.draftPO || (i.openPOs?.length ?? 0) > 0);
+                                                                                                        if (!vSnoozed && coveredOnly) {
+                                                                                                            return (
+                                                                                                                <span
+                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border border-cyan-700/40 bg-cyan-950/30 text-cyan-300 shrink-0"
+                                                                                                                    title="Open or draft POs already cover this vendor. Manage them in Purchases."
+                                                                                                                >
+                                                                                                                    On PO
+                                                                                                                </span>
+                                                                                                            );
+                                                                                                        }
+                                                                                                        if (!vSnoozed && orderableItems.length > 0) {
+                                                                                                            const wasInspected = expanded.has(pid);
+                                                                                                            return (
+                                                                                                                <button
+                                                                                                                    onClick={async () => {
+                                                                                                                        if (wasInspected) {
+                                                                                                                            // You reviewed — draft only for safety
+                                                                                                                            handleCreateOne(group, true);
+                                                                                                                        } else {
+                                                                                                                            // You trust it — draft + commit + send
+                                                                                                                            try {
+                                                                                                                                const result = await createVendorPO(group, true);
+                                                                                                                                if (result?.orderId) {
+                                                                                                                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
+                                                                                                                                    const res = await fetch('/api/dashboard/purchasing/commit', {
+                                                                                                                                        method: 'POST',
+                                                                                                                                        headers: { 'Content-Type': 'application/json' },
+                                                                                                                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
+                                                                                                                                    });
+                                                                                                                                    if (res.ok) {
+                                                                                                                                        setSentPOs(p => new Set(p).add(result.orderId!));
+                                                                                                                                        setCompletedVendors(p => new Set(p).add(pid));
+                                                                                                                                    } else {
+                                                                                                                                        setCompletedVendors(p => new Set(p).add(pid));
+                                                                                                                                        setError('Draft created — send failed. Click Send to retry.');
+                                                                                                                                    }
+                                                                                                                                    await load(true);
+                                                                                                                                } else {
+                                                                                                                                    setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
+                                                                                                                                }
+                                                                                                                            } catch (e: any) { setError(e.message); }
+                                                                                                                        }
+                                                                                                                    }}
+                                                                                                                    disabled={anyCreating}
+                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border bg-emerald-900/30 hover:bg-emerald-800/40 text-emerald-300 border-emerald-800 transition-colors disabled:opacity-40 shrink-0"
+                                                                                                                    title={wasInspected ? "Draft only — you reviewed this vendor" : "Draft, commit, and send"}
+                                                                                                                >
+                                                                                                                    Order
+                                                                                                                </button>
+                                                                                                            );
+                                                                                                        }
                                                     return null;
                                                 })()}
                                                 <button onClick={() => toggleExpand(pid)}
@@ -2256,14 +2287,20 @@ export default function PurchasingPanel() {
                                                         .filter(item => showSnoozed || !isSnoozed(item.productId))
                                                         .map(item => {
                                                             const itemSnoozed = isSnoozed(item.productId);
-                                                            const draftBlocked = !canIncludeInDraftPO(item.reorderMethod) || !!item.draftPO;
-                                                            const isChecked = !itemSnoozed && !draftBlocked && (groupChecked[item.productId] ?? false);
-                                                            const qty = groupQtys[item.productId] ?? item.suggestedQty;
-                                                            const rc = runwayColor(item.runwayDays);
-                                                            const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
-                                                            const iKey = item.productId;
-                                                            const methodBadge = reorderMethodBadge(item.reorderMethod);
-                                                            const openOrderId = item.openPOs[0]?.orderId;
+                                                                                                                        const hasOpenPo = (item.openPOs?.length ?? 0) > 0;
+                                                                                                                        const coveredByOpenPo = itemIsCovered(item)
+                                                                                                                            || (hasOpenPo
+                                                                                                                                && item.assessment?.decision === "hold"
+                                                                                                                                && ((item.assessment?.reasonCodes ?? []).includes("on_order_already_covers_need")
+                                                                                                                                    || (item.assessment?.reasonCodes ?? []).includes("recent_draft_exists")));
+                                                                                                                        const draftBlocked = !canIncludeInDraftPO(item.reorderMethod) || !!item.draftPO || coveredByOpenPo;
+                                                                                                                        const isChecked = !itemSnoozed && !draftBlocked && (groupChecked[item.productId] ?? false);
+                                                                                                                        const qty = groupQtys[item.productId] ?? item.suggestedQty;
+                                                                                                                        const rc = runwayColor(item.runwayDays);
+                                                                                                                        const isBundle = !itemSnoozed && item.urgency === "watch" && hasActionable;
+                                                                                                                        const iKey = item.productId;
+                                                                                                                        const methodBadge = reorderMethodBadge(item.reorderMethod);
+                                                                                                                        const openOrderId = item.openPOs[0]?.orderId;
                                                             const itemMatch = lifecycle.checkMatchDetails({
                                                                 vendorName: group.vendorName,
                                                                 orderId: openOrderId,
@@ -2293,13 +2330,17 @@ export default function PurchasingPanel() {
                                                                     <div className="flex items-start gap-3">
                                                                         {!itemSnoozed && (
                                                                             <input type="checkbox" checked={isChecked}
-                                                                                onChange={() => toggleItem(pid, iKey)}
-                                                                                disabled={draftBlocked}
-                                                                                title={item.draftPO ? `Draft PO #${item.draftPO.orderId} already exists` : undefined}
-                                                                                className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
-                                                                                    : item.urgency === "warning" ? "accent-yellow-400"
-                                                                                        : "accent-zinc-400"
-                                                                                    } disabled:opacity-40`} />
+                                                                                                                                                            onChange={() => toggleItem(pid, iKey)}
+                                                                                                                                                            disabled={draftBlocked}
+                                                                                                                                                            title={item.draftPO
+                                                                                                                                                                ? `Draft PO #${item.draftPO.orderId} already exists`
+                                                                                                                                                                : coveredByOpenPo
+                                                                                                                                                                    ? `Already on PO #${item.openPOs?.[0]?.orderId ?? "?"} — blocked to prevent duplicate`
+                                                                                                                                                                    : undefined}
+                                                                                                                                                            className={`mt-1 flex-shrink-0 w-3.5 h-3.5 rounded ${item.urgency === "critical" ? "accent-red-500"
+                                                                                                                                                                : item.urgency === "warning" ? "accent-yellow-400"
+                                                                                                                                                                    : "accent-zinc-400"
+                                                                                                                                                                } disabled:opacity-40`} />
                                                                         )}
                                                                         {itemSnoozed && <div className="mt-1 w-3.5 h-3.5" />}
 
@@ -2363,24 +2404,42 @@ export default function PurchasingPanel() {
                                                                                         Review
                                                                                     </span>
                                                                                 )}
-                                                                                {!itemSnoozed && item.commitGuard && (
-                                                                                    <span
-                                                                                        className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
-                                                                                            item.commitGuard.decision === "commit"
-                                                                                                ? "text-emerald-300 border-emerald-500/35 bg-emerald-500/10"
-                                                                                                : item.commitGuard.decision === "draft_only"
-                                                                                                    ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
-                                                                                                    : "text-red-300 border-red-500/40 bg-red-500/10"
-                                                                                        }`}
-                                                                                        title={`${item.commitGuard.summary} Target: ${item.commitGuard.targetCoverDays}d total (${item.commitGuard.leadTimeDays}d lead + ${item.commitGuard.minimumPostLeadCoverageDays}d supply).`}
-                                                                                    >
-                                                                                        {item.commitGuard.decision === "commit"
-                                                                                            ? "Commit ready"
-                                                                                            : item.commitGuard.decision === "draft_only"
-                                                                                                ? "Draft only"
-                                                                                                : "Blocked"}
-                                                                                    </span>
-                                                                                )}
+                                                                                {!itemSnoozed && (hasOpenPo || coveredByOpenPo || item.draftPO) && (
+                                                                                                                                                                    <span
+                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
+                                                                                                                                                                        title={item.draftPO
+                                                                                                                                                                            ? `Draft PO #${item.draftPO.orderId} already submitted — review/commit that PO, do not re-order`
+                                                                                                                                                                            : `Already ordered on open PO${item.openPOs.length > 1 ? "s" : ""}: ${item.openPOs.map(p => `#${p.orderId} qty ${p.quantity}`).join(", ")}. Order is disabled unless coverage slips.`}
+                                                                                                                                                                    >
+                                                                                                                                                                        {item.draftPO ? "Draft submitted" : "Already on PO"}
+                                                                                                                                                                    </span>
+                                                                                                                                                                )}
+                                                                                                                                                                {!itemSnoozed && item.commitGuard && !hasOpenPo && !item.draftPO && (
+                                                                                                                                                                    <span
+                                                                                                                                                                        className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
+                                                                                                                                                                            item.commitGuard.decision === "commit"
+                                                                                                                                                                                ? "text-emerald-300 border-emerald-500/35 bg-emerald-500/10"
+                                                                                                                                                                                : item.commitGuard.decision === "draft_only"
+                                                                                                                                                                                    ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                                                                                                                                                                                    : "text-red-300 border-red-500/40 bg-red-500/10"
+                                                                                                                                                                        }`}
+                                                                                                                                                                        title={`${item.commitGuard.summary} Target: ${item.commitGuard.targetCoverDays}d total (${item.commitGuard.leadTimeDays}d lead + ${item.commitGuard.minimumPostLeadCoverageDays}d supply).`}
+                                                                                                                                                                    >
+                                                                                                                                                                        {item.commitGuard.decision === "commit"
+                                                                                                                                                                            ? "Commit ready"
+                                                                                                                                                                            : item.commitGuard.decision === "draft_only"
+                                                                                                                                                                                ? "Draft only"
+                                                                                                                                                                                : "Blocked"}
+                                                                                                                                                                    </span>
+                                                                                                                                                                )}
+                                                                                                                                                                {!itemSnoozed && item.commitGuard && hasOpenPo && item.assessment?.decision === "order" && (
+                                                                                                                                                                    <span
+                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-200 border-amber-500/40 bg-amber-500/10"
+                                                                                                                                                                        title="Open PO exists but Aria still sees residual need. Confirm this is intentional top-up before ordering again."
+                                                                                                                                                                    >
+                                                                                                                                                                        Top-up?
+                                                                                                                                                                    </span>
+                                                                                                                                                                )}
 
                                                                                 <div className="flex-1" />
 
@@ -2486,8 +2545,8 @@ export default function PurchasingPanel() {
                                                                                             : null;
                                                                                         return (
                                                                                             <div key={openPo.orderId} className={`flex items-center gap-2 text-[10.5px] font-mono px-2 py-1 rounded border ${chipClass}`}>
-                                                                                                <span className="font-semibold shrink-0">PO {openPo.orderId}</span>
-                                                                                                <span className="text-[10px] opacity-70 shrink-0">qty {openPo.quantity}</span>
+                                                                                                <span className="font-semibold shrink-0 text-cyan-200">Already ordered · PO {openPo.orderId}</span>
+                                                                                                                                                                                                <span className="text-[10px] opacity-70 shrink-0">qty {openPo.quantity}</span>
                                                                                                 {recLink && (
                                                                                                     <span
                                                                                                         className="text-[9.5px] font-mono text-cyan-300/80 border border-cyan-500/30 rounded px-1 shrink-0"

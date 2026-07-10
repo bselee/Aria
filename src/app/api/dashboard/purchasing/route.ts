@@ -6,6 +6,7 @@ import { mergeIntoGroups } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
+import { evaluateOpenPoDuplicateGuard } from '@/lib/purchasing/po-duplicate-guard';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
@@ -211,26 +212,87 @@ export async function GET(req: NextRequest) {
             }
 
             // HERMIA(2026-07-08): A Draft PO already in Finale counts as coverage
-            // even though getProductActivity() filters it out (only Committed/Locked
-            // are "open" POs). Override urgency + assessment so the item doesn't
-            // appear as "needs ordering" when a draft with sufficient qty exists.
-            const hasDraftCoverage = draftPOInfo != null
-                && draftPOInfo.quantity >= Math.max(1, line.item.suggestedQty ?? 1);
+                        // even though getProductActivity() filters it out (only Committed/Locked
+                        // are "open" POs). Override urgency + assessment so the item doesn't
+                        // appear as "needs ordering" when a draft with sufficient qty exists.
+                        const hasDraftCoverage = draftPOInfo != null
+                            && draftPOInfo.quantity >= Math.max(1, line.item.suggestedQty ?? 1);
 
-            return {
-                ...line.item,
-                candidate: line.candidate,
-                assessment: hasDraftCoverage ? {
-                    ...line.assessment,
-                    decision: 'hold' as const,
-                    recommendedQty: 0,
-                    reasonCodes: ['recent_draft_exists'] as Array<'recent_draft_exists'>,
-                    explanation: `Draft PO #${draftPOInfo!.orderId} already covers this item with ${draftPOInfo!.quantity} units.`,
-                } : line.assessment,
-                commitGuard: assessPOCommitGuard(line),
-                draftPO: draftPOInfo,
-                urgency: hasDraftCoverage ? ('ok' as const) : line.item.urgency,
-            };
+                        // HERMIA(2026-07-10): Committed open POs also suppress re-order when
+                        // their qty already covers suggested need OR policy already held for
+                        // on_order_already_covers_need. Keeps ribbon + Order button honest.
+                        const openPoQty = (line.item.openPOs ?? []).reduce(
+                            (sum: number, po: { quantity?: number }) => sum + Math.max(0, po.quantity || 0),
+                            0,
+                        );
+                        const openPoCoversSuggested = openPoQty >= Math.max(1, line.item.suggestedQty ?? 1);
+                        const policyHeldForOnOrder = (line.assessment?.reasonCodes ?? []).includes('on_order_already_covers_need');
+                        const hasOpenPoCoverage = !hasDraftCoverage && (openPoCoversSuggested || policyHeldForOnOrder)
+                            && (line.item.openPOs?.length ?? 0) > 0;
+
+                        let assessment = line.assessment;
+                        let urgency = line.item.urgency;
+                        if (hasDraftCoverage) {
+                            assessment = {
+                                ...line.assessment,
+                                decision: 'hold' as const,
+                                recommendedQty: 0,
+                                reasonCodes: ['recent_draft_exists'] as Array<'recent_draft_exists'>,
+                                explanation: `Draft PO #${draftPOInfo!.orderId} already covers this item with ${draftPOInfo!.quantity} units. Review/commit that PO instead of ordering again.`,
+                            };
+                            urgency = 'ok' as const;
+                        } else if (hasOpenPoCoverage) {
+                            const primaryPo = line.item.openPOs![0];
+                            assessment = {
+                                ...line.assessment,
+                                decision: 'hold' as const,
+                                recommendedQty: 0,
+                                reasonCodes: ['on_order_already_covers_need'] as Array<'on_order_already_covers_need'>,
+                                explanation: `Already on PO #${primaryPo.orderId} (qty ${openPoQty}). Not recommending another order unless coverage slips.`,
+                            };
+                            urgency = 'ok' as const;
+                        }
+
+                        // When covered by open/draft PO, surface open qty as stockOnOrder.
+                        // Any hold decision zeros suggested qty so cards never show "order 1000" while holding.
+                        const covered = hasDraftCoverage || hasOpenPoCoverage;
+                        const displayOnOrder = covered
+                            ? Math.max(line.item.stockOnOrder ?? 0, openPoQty, draftPOInfo?.quantity ?? 0)
+                            : line.item.stockOnOrder;
+                        const isHold = assessment.decision === 'hold' || assessment.decision === 'manual_review';
+                        const displaySuggested = isHold
+                            ? 0
+                            : (assessment.recommendedQty > 0 ? assessment.recommendedQty : line.item.suggestedQty);
+                        // Recompute urgency from runway so CRIT = adj < lead (actionable, not historical floor noise).
+                        const adj = Number.isFinite(line.item.adjustedRunwayDays) ? line.item.adjustedRunwayDays as number : null;
+                        const lead = Number.isFinite(line.item.leadTimeDays) ? (line.item.leadTimeDays as number) : 14;
+                        let displayUrgency: 'critical' | 'warning' | 'watch' | 'ok' = urgency;
+                        if (isHold) {
+                            if ((assessment.reasonCodes ?? []).includes('runway_healthy')
+                                || (assessment.reasonCodes ?? []).includes('on_order_already_covers_need')
+                                || (assessment.reasonCodes ?? []).includes('recent_draft_exists')) {
+                                displayUrgency = 'ok';
+                            } else if ((assessment.reasonCodes ?? []).includes('micro_velocity_noise')) {
+                                displayUrgency = 'watch';
+                            } else {
+                                displayUrgency = 'ok';
+                            }
+                        } else if (adj !== null) {
+                            if (adj < lead) displayUrgency = 'critical';
+                            else if (adj < lead + 30) displayUrgency = 'warning';
+                            else if (adj < lead + 60) displayUrgency = 'watch';
+                            else displayUrgency = 'ok';
+                        }
+                        return {
+                            ...line.item,
+                            stockOnOrder: displayOnOrder,
+                            suggestedQty: displaySuggested,
+                            candidate: line.candidate,
+                            assessment,
+                            commitGuard: assessPOCommitGuard(line),
+                            draftPO: draftPOInfo,
+                            urgency: displayUrgency,
+                        };
         });
 
         // Recalculate group urgency from modified items so a group whose items
@@ -288,7 +350,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -383,13 +445,65 @@ export async function POST(req: NextRequest) {
             );
         }
 
+        // ── Failsafe: open/draft PO already covers SKU ─────────────────────
+        // HERMIA(2026-07-10): Independent of ignoreCommitGuards (lead+30/cycle).
+        // forceTopUp is the ONLY override for intentional extra quantity.
+        const isDraftStatus = (po: any): boolean => {
+            const status = (po.status || '').toLowerCase();
+            return status.includes('draft') || status.includes('created') || status === 'order_created';
+        };
+        const guardItems = items.map((item: any) => {
+            const productId = String(item.productId);
+            const assessed = assessedLines.find(l => l.item.productId === productId);
+            const openPOs = assessed?.item.openPOs ?? [];
+            const matchingDraft = recentPOs.find((po: any) =>
+                isDraftStatus(po) && po.items?.some((i: any) => i.productId === productId),
+            );
+            let draftPO: { orderId: string; quantity: number } | null = null;
+            if (matchingDraft) {
+                const poLine = matchingDraft.items?.find((i: any) => i.productId === productId);
+                draftPO = {
+                    orderId: matchingDraft.orderId,
+                    quantity: poLine ? Number(poLine.quantity) || 0 : 0,
+                };
+            }
+            return {
+                productId,
+                quantity: Number(item.quantity) || 0,
+                openPOs,
+                draftPO,
+            };
+        });
+        const dupGuard = evaluateOpenPoDuplicateGuard(guardItems, { forceTopUp: !!forceTopUp });
+        if (!dupGuard.ok) {
+            console.warn(`[purchasing/route] POST blocked by open/draft PO guard: ${dupGuard.summary}`);
+            return NextResponse.json(
+                {
+                    error: dupGuard.summary,
+                    code: 'OPEN_PO_COVERS_NEED',
+                    blocks: dupGuard.blocks,
+                    hint: 'Open Purchases for that PO, or pass forceTopUp:true for intentional extra quantity.',
+                },
+                { status: 409 },
+            );
+        }
+        if (forceTopUp && dupGuard.blocks.length > 0) {
+            console.warn(`[purchasing/route] forceTopUp: ${dupGuard.summary}`);
+        }
+
         const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
 
-        // Invalidate caches so the next GET shows the new PO. The next read
-        // will SWR-refresh in the background — user still gets a fast response.
+        // Invalidate caches so the next GET shows the new PO.
         invalidatePurchasingCaches();
 
-        return NextResponse.json(result);
+        return NextResponse.json({
+            ...result,
+            duplicateGuard: {
+                forceTopUp: !!forceTopUp,
+                blocks: dupGuard.blocks,
+                summary: dupGuard.summary,
+            },
+        });
     } catch (err: any) {
         return NextResponse.json({ error: err.message }, { status: 500 });
     }

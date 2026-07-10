@@ -27,6 +27,8 @@ import {
     enrichOpenPOs,
     hasDeliverablePO,
     deliverableStockOnOrder,
+    coverageStockOnOrder,
+    hasStuckOpenPO,
     type OpenPOReliable,
 } from "../purchasing/po-reliability-scorer";
 import {
@@ -2194,12 +2196,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const bomEnrichedPOs: OpenPOReliable[] = compActivity.openPOs.length > 0
                         ? await enrichOpenPOs(compActivity.openPOs)
                         : [];
-                    const rawStockOnOrder = deliverableStockOnOrder(bomEnrichedPOs);
-                    // Discount deliverable stockOnOrder by the vendor's historical on-time rate.
-                    // 100% on-time → no discount. 60% on-time → trust only 60% of
-                    // DELIVERABLE open POs as supply we'll have when we need it.
+                    // HERMIA(2026-07-10): Full Finale open PO credit for BOM coverage math.
+                    // On-time rate still soft-discounts only for reliability, never zeros stuck POs.
+                    const rawStockOnOrder = coverageStockOnOrder(compActivity.openPOs, bomEnrichedPOs);
                     const onTimeRate = this.getVendorOnTimeRate(groupName);
-                    const stockOnOrder = rawStockOnOrder * onTimeRate;
+                    // Floor at 50% so chronic late vendors still get partial credit; never 0 from stuck.
+                    const trustedRate = Math.max(0.5, Math.min(1, onTimeRate || 1));
+                    const stockOnOrder = rawStockOnOrder * trustedRate;
 
                     const lt = await leadTimeService.getForVendor(groupName, compSku);
                     const baseLeadTimeDays = lt.days;
@@ -2732,22 +2735,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         ? await enrichOpenPOs(activity.openPOs)
                         : [];
                     const stuckPOs = enrichedOpenPOs.filter(po => !po.isDeliverable);
+
+                    // HERMIA(2026-07-10): Credit Finale open PO qty fully for demand math.
+                    // Stuck lifecycle is a chase signal (Purchases), not zero-supply for reorder.
+                    // Prior: deliverable-only credit zeroed soo while openPOs ribbon still showed qty → false re-order.
+                    const rawStockOnOrder = coverageStockOnOrder(activity.openPOs, enrichedOpenPOs);
                     if (stuckPOs.length > 0) {
                         const stuckSummary = stuckPOs.map(po =>
                             `${po.orderId}(${po.stuckReason}/${po.ageDays}d)`,
                         ).join(", ");
-                        console.log(`[purchasing] ${sku}: ${stuckPOs.length} stuck PO(s) — ${stuckSummary} — SKU remains orderable`);
+                        console.log(`[purchasing] ${sku}: credited open PO qty=${rawStockOnOrder} (Finale); chase stuck: ${stuckSummary}`);
                     }
-
-                    // Open PO supply — ONLY count deliverable POs toward coverage.
-                    // Bulk vendor effective value is recomputed below after policy lookup.
-                    const rawStockOnOrder = deliverableStockOnOrder(enrichedOpenPOs);
-
-                    // DECISION(2026-06-10, Will + Hermia): a PO only exits this SKU from
-                    // Ordering when it's genuinely deliverable — sent, with ack/tracking
-                    // or movement evidence. Stuck/unacknowledged/overdue POs do NOT count;
-                    // the SKU stays in the Ordering panel so Will can reorder if needed.
-                    if (hasDeliverablePO(enrichedOpenPOs)) continue;
+                    // No early skip on deliverable PO — recommender zeros suggestedQty when covered.
+                    // Items with residual need after open PO credit still surface as top-up.
 
                     // Step 4: velocity + runway
                     const purchaseVelocity = activity.purchasedQty / daysBack;
