@@ -117,7 +117,7 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.explanation).toMatch(/Order soon|Buy /);
     });
 
-    it("labels residual top-up when open PO exists but runway still short", () => {
+    it("labels residual reorder when open PO exists but runway still short", () => {
         const assessment = assessPurchasingCandidate(makeCandidate({
             stockOnHand: 0,
             stockOnOrder: 40,
@@ -128,9 +128,10 @@ describe("assessPurchasingCandidate", () => {
         }));
 
         expect(assessment.decision).toBe("order");
-        expect(assessment.reasonCodes).toContain("residual_top_up");
-        expect(assessment.explanation).toMatch(/Top-up math/i);
-        expect(assessment.explanation).toMatch(/residual need/i);
+        expect(assessment.reasonCodes).toContain("residual_reorder");
+        expect(assessment.explanation).toMatch(/Reorder/i);
+        expect(assessment.explanation).toMatch(/still short/i);
+        expect(assessment.reasonCodes).toContain("runway_below_lead");
     });
 
     it("holds micro-velocity noise that invents multi-year supply", () => {

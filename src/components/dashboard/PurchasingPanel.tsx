@@ -2445,9 +2445,9 @@ export default function PurchasingPanel() {
                                                                                                                                                                 {!itemSnoozed && item.commitGuard && hasOpenPo && item.assessment?.decision === "order" && (
                                                                                                                                                                     <span
                                                                                                                                                                         className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-200 border-amber-500/40 bg-amber-500/10"
-                                                                                                                                                                        title="Open PO exists but Aria still sees residual need. Confirm this is intentional top-up before ordering again."
+                                                                                                                                                                        title="Open PO exists but supply still falls short of need. This is a reorder of the shortfall — confirm before ordering again."
                                                                                                                                                                     >
-                                                                                                                                                                        Top-up?
+                                                                                                                                                                        Reorder?
                                                                                                                                                                     </span>
                                                                                                                                                                 )}
 

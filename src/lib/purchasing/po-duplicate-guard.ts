@@ -47,7 +47,7 @@ export interface DuplicateGuardResult {
  * Coverage rule (fail-closed for re-order):
  * - sum(openPOs.quantity) >= requested quantity → block (open_po)
  * - draftPO.quantity >= requested quantity → block (draft_po)
- * - partial open qty < requested is allowed (true residual top-up)
+ * - partial open qty < requested is allowed (true residual reorder shortfall)
  */
 export function evaluateOpenPoDuplicateGuard(
     items: DuplicateGuardItem[],
@@ -105,7 +105,7 @@ export function evaluateOpenPoDuplicateGuard(
             blocks,
             allowedProductIds: items.map(i => String(i.productId)),
             summary: blocks.length > 0
-                ? `forceTopUp: allowing ${blocks.length} covered SKU(s) as intentional top-up`
+                ? `forceTopUp: allowing ${blocks.length} covered SKU(s) as intentional extra reorder`
                 : "forceTopUp: no open/draft coverage conflicts",
         };
     }

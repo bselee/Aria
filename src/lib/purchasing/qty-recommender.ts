@@ -26,7 +26,7 @@ import { roundToCleanQty } from "./cognitive-round";
 //   v2.2-cognitive-round-2026-05-06 — cognitive/historical PO qty rounding
 //   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
 //   v2.7-capped-30d-floor-2026-06-11 — 2× cap on 30d supply floor
-//   v2.8-residual-topup-cap-2026-07-10 — open-PO residual uses order-point window, not full target cover
+//   v2.8-residual-reorder-cap-2026-07-10 — open-PO residual uses order-point window, not full target cover
 export const QTY_FORMULA_VERSION = "v2.8-residual-topup-cap-2026-07-10";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
@@ -363,7 +363,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // we use the FG-traceback total as the primary signal. The dailyRate
     // path is preserved for BOW&SALE / direct-sale components.
     //
-    // v2.8 (2026-07-10): residual top-up cap when open PO already exists.
+    // v2.8 (2026-07-10): residual reorder cap when open PO already exists.
     // Full target cover (e.g. Colorful 90d) sizes a clean-slate buy.
     // When open PO qty is already in flight, only top up to the order-point
     // window (lead + 30d). Prevents RAWWORM-style "open 42k, still need 84k"
@@ -381,7 +381,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     const orderPointDays = leadTimeUsed + ORDER_POINT_BUFFER_DAYS;
     const orderPointUnits = dailyRate * orderPointDays;
     const residualAtOrderPoint = Math.max(0, orderPointUnits - supplyForOrder);
-    // Residual top-up only when an open PO exists AND vendor policy asks for
+    // Residual reorder only when an open PO exists AND vendor policy asks for
     // more cover than the order point (lead+30). Clean-slate buys still use full cover.
     const aggressiveCover = targetCoverDays != null && targetCoverDays > orderPointDays;
     const isResidualTopUp = stockOnOrder > 0 && rawNeededEaches > 0 && aggressiveCover;
@@ -411,9 +411,9 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         const before = rawNeededEaches;
         rawNeededEaches = residualAtOrderPoint;
         trace.push({
-            step: "residual_topup_cap",
+            step: "residual_reorder_cap",
             detail:
-                `Open PO residual: capped ${Math.round(before)} → ${Math.round(rawNeededEaches)} ` +
+                `Open PO shortfall: capped ${Math.round(before)} → ${Math.round(rawNeededEaches)} ` +
                 `(order-point ${orderPointDays}d = lead ${leadTimeUsed}d + ${ORDER_POINT_BUFFER_DAYS}d ` +
                 `needs ${Math.round(orderPointUnits)}; supply ${Math.round(supplyForOrder)} ` +
                 `= on hand ${Math.round(effectiveStock)} + on order ${Math.round(stockOnOrder)}` +
@@ -423,9 +423,9 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         });
     } else if (isResidualTopUp) {
         trace.push({
-            step: "residual_topup_cap",
+            step: "residual_reorder_cap",
             detail:
-                `Open PO residual: ${Math.round(rawNeededEaches)} already within order-point gap ` +
+                `Open PO shortfall: ${Math.round(rawNeededEaches)} already within order-point gap ` +
                 `(${orderPointDays}d needs ${Math.round(orderPointUnits)}; supply ${Math.round(supplyForOrder)}).`,
             value: Math.round(rawNeededEaches),
         });

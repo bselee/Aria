@@ -2747,7 +2747,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         console.log(`[purchasing] ${sku}: credited open PO qty=${rawStockOnOrder} (Finale); chase stuck: ${stuckSummary}`);
                     }
                     // No early skip on deliverable PO — recommender zeros suggestedQty when covered.
-                    // Items with residual need after open PO credit still surface as top-up.
+                    // Items with residual need after open PO credit still surface as residual reorder.
 
                     // Step 4: velocity + runway
                     const purchaseVelocity = activity.purchasedQty / daysBack;

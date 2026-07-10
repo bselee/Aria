@@ -3,7 +3,7 @@
  * @purpose Per-SKU purchasing decision gate: order vs hold with precise, human-readable reasons.
  * @author  Hermia
  * @created 2026-05-26
- * @updated 2026-07-10 — residual top-up math on card; runway-healthy hold
+ * @updated 2026-07-10 — residual reorder language; runway-healthy hold
  */
 import {
     createPurchasingAssessment,
@@ -84,7 +84,7 @@ function isOnOrderCoverageHealthy(input: PurchasingCandidateInput): boolean {
 
 /**
  * Runway already covers lead + 30d safety → do not recommend a new PO.
- * Historical floors / target-cover top-ups must not keep comfortable stock on the Order list.
+ * Historical floors / target-cover extras must not keep comfortable stock on the Order list.
  */
 function isRunwayHealthy(input: PurchasingCandidateInput): boolean {
     const runway = resolveRunway(input);
@@ -144,14 +144,18 @@ function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: nu
     if (onOrder > 0) {
         const residual = Math.max(0, effectiveQty);
         const dailyPart = daily > 0 ? ` at ${daily.toFixed(2)}/day` : "";
-        // residual math on card: cover gap after open PO credit
+        // Open PO does not cover need → this is a reorder of the shortfall (can be critical).
+        const critical = runway !== null && runway < lead;
+        const codes: PurchasingReasonCode[] = ["residual_reorder", "direct_demand_support"];
+        if (critical) codes.push("runway_below_lead");
         return {
-            reasonCodes: ["residual_top_up"],
-            confidence: "medium",
+            reasonCodes: codes,
+            confidence: critical ? "high" : "medium",
             explanation:
-                `Top-up math: on hand ${fmtQty(onHand)} + open PO ${fmtQty(onOrder)} still leaves residual need ${fmtQty(residual)}` +
+                (critical ? "Reorder now (critical): " : "Reorder: ") +
+                `on hand ${fmtQty(onHand)} + open PO ${fmtQty(onOrder)} is still short by ${fmtQty(residual)}` +
                 `${dailyPart} (runway ${fmtDays(runway)} vs order point ${fmtDays(point)}). ` +
-                `Buy ${fmtQty(residual)} only — do not re-cover the open PO.`,
+                `Order ${fmtQty(residual)} more — do not re-cover the open PO.`,
         };
     }
 

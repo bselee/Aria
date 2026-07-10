@@ -3,7 +3,7 @@
  * @purpose Shared types for purchasing assessment decisions and reason codes.
  * @author  Hermia
  * @created 2026-05-26
- * @updated 2026-07-10 — runway_healthy, residual_top_up, micro_velocity, runway_below_lead
+ * @updated 2026-07-10 — runway_healthy, residual_reorder, micro_velocity, runway_below_lead
  */
 export type PurchasingDecision = "order" | "reduce" | "hold" | "manual_review";
 
@@ -19,7 +19,7 @@ export type PurchasingReasonCode =
     | "recent_draft_exists"
     | "no_order_quantity_recommended"
     | "runway_healthy"
-    | "residual_top_up"
+    | "residual_reorder"
     | "micro_velocity_noise"
     | "runway_below_lead";
 

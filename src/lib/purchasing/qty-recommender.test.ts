@@ -474,7 +474,7 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 });
 
-describe("recommendQty — residual top-up cap (v2.8)", () => {
+describe("recommendQty — residual reorder cap (v2.8)", () => {
     it("caps open-PO residual to order-point window, not full aggressive cover", () => {
         // RAWWORM-style: high cover (90d) with large open PO still left a huge residual.
         // daily 1000, lead 14, cover 90 → target 90k
@@ -497,7 +497,7 @@ describe("recommendQty — residual top-up cap (v2.8)", () => {
         expect(result.coverDays).toBe(90);
         // Cap to order-point residual (not 48k full-cover residual)
         expect(result.rawNeededEaches).toBe(2000);
-        const capStep = result.provenance.find(p => p.step === "residual_topup_cap");
+        const capStep = result.provenance.find(p => p.step === "residual_reorder_cap");
         expect(capStep).toBeDefined();
         expect(capStep?.detail).toMatch(/capped/i);
         // 2k raw residual may bump via 2× floor / cognitive snap — keep far below full 48k
