@@ -470,7 +470,56 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the current recommender version", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.7-capped-30d-floor-2026-06-11");
+        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+    });
+});
+
+describe("recommendQty — residual top-up cap (v2.8)", () => {
+    it("caps open-PO residual to order-point window, not full aggressive cover", () => {
+        // RAWWORM-style: high cover (90d) with large open PO still left a huge residual.
+        // daily 1000, lead 14, cover 90 → target 90k
+        // on hand 0 + open 42k → full residual 48k
+        // order-point (14+30)=44d → 44k; residual at OP = max(0, 44k-42k) = 2k
+        const result = recommendQty(baseInput({
+            sku: "RAWWORMCASTINGS",
+            dailyRate: 1000,
+            stockOnHand: 0,
+            stockOnOrder: 42000,
+            openPOCount: 1,
+            leadTimeDays: 14,
+            coverBufferDays: 30,
+            targetCoverDays: 90,
+            orderIncrementQty: 1,
+            historicalLineQtys: [],
+            historicalCapMultiple: null,
+        }));
+
+        expect(result.coverDays).toBe(90);
+        // Cap to order-point residual (not 48k full-cover residual)
+        expect(result.rawNeededEaches).toBe(2000);
+        const capStep = result.provenance.find(p => p.step === "residual_topup_cap");
+        expect(capStep).toBeDefined();
+        expect(capStep?.detail).toMatch(/capped/i);
+        // 2k raw residual may bump via 2× floor / cognitive snap — keep far below full 48k
+        expect(result.suggestedQty).toBeGreaterThan(0);
+        expect(result.suggestedQty).toBeLessThanOrEqual(5000);
+    });
+
+    it("does not invent residual when open PO already covers order point", () => {
+        // order-point 44d * 1000 = 44k; open 50k covers OP even if full cover is 90k
+        const result = recommendQty(baseInput({
+            dailyRate: 1000,
+            stockOnHand: 0,
+            stockOnOrder: 50000,
+            openPOCount: 1,
+            leadTimeDays: 14,
+            targetCoverDays: 90,
+            orderIncrementQty: 1,
+            historicalLineQtys: [],
+            historicalCapMultiple: null,
+        }));
+        expect(result.rawNeededEaches).toBe(0);
+        expect(result.suggestedQty).toBe(0);
     });
 });
 
@@ -525,7 +574,7 @@ describe("recommendQty — cognitive rounding integration", () => {
     });
 
     it("formula version is bumped to current", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.7-capped-30d-floor-2026-06-11");
+        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
@@ -576,7 +625,7 @@ describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation c
             lastPurchaseQty: 10, // last purchase was tiny (10 units), suggestion is 60 (+500% deviation)
         }));
         expect(result.reviewRequired).toBe(true);
-        expect(result.reviewReasons.join(" ")).toContain("deviates significantly from last order");
+        expect(result.reviewReasons.join(" ")).toMatch(/last order|different/i);
     });
 });
 

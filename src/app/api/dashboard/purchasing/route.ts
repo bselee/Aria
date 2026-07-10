@@ -18,12 +18,13 @@ let circuitBreakerUntil = 0;
 const INVALIDATION_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
 export async function GET(req: NextRequest) {
-    // Auto-detect cross-process database PO changes and invalidate SWR cache dynamically
+    // Auto-detect cross-process database PO / receipt changes and invalidate SWR cache
     // Throttled to reduce load on Unhealthy nano Supabase instance
     if (Date.now() - lastInvalidationCheck > INVALIDATION_CHECK_INTERVAL) {
         try {
             const supabase = createClient();
             if (supabase && resaleSlot.at > 0) {
+                const cacheAt = resaleSlot.at;
                 const { data } = await supabase
                     .from('purchase_orders')
                     .select('updated_at')
@@ -33,8 +34,25 @@ export async function GET(req: NextRequest) {
                 
                 if (data?.updated_at) {
                     const lastChange = new Date(data.updated_at).getTime();
-                    if (lastChange > resaleSlot.at) {
-                        console.log(`[purchasing/route] Database PO change detected (${new Date(lastChange).toISOString()} > cache at ${new Date(resaleSlot.at).toISOString()}). Invalidating SWR cache.`);
+                    if (lastChange > cacheAt) {
+                        console.log(`[purchasing/route] Database PO change detected (${new Date(lastChange).toISOString()} > cache at ${new Date(cacheAt).toISOString()}). Invalidating SWR cache.`);
+                        invalidatePurchasingCaches();
+                    }
+                }
+
+                // Receipts logged by po-receiving-watcher (bot process) must also bust
+                // Ordering need math — open PO qty drops when goods hit Finale stock.
+                const { data: receiptRow } = await supabase
+                    .from('ap_activity_log')
+                    .select('created_at')
+                    .eq('intent', 'PO_RECEIVED')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                if (receiptRow?.created_at) {
+                    const lastReceipt = new Date(receiptRow.created_at).getTime();
+                    if (lastReceipt > cacheAt) {
+                        console.log(`[purchasing/route] PO_RECEIVED activity after cache (${new Date(lastReceipt).toISOString()}). Invalidating SWR cache.`);
                         invalidatePurchasingCaches();
                     }
                 }

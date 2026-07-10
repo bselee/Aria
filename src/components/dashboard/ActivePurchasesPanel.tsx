@@ -301,6 +301,35 @@ export default function ActivePurchasesPanel() {
         return () => clearTimeout(tid);
     }, [lifecycle.lastDraft, fetchPurchases]);
 
+    // Ordering "Already ordered · PO #" click → expand + scroll that Purchases row
+    const prevScrollAtRef = useRef<number>(0);
+    useEffect(() => {
+        const req = lifecycle.scrollToOrder;
+        if (!req || req.at === prevScrollAtRef.current) return;
+        prevScrollAtRef.current = req.at;
+        const orderId = String(req.orderId || "").trim();
+        if (!orderId) return;
+
+        setExpandedPOs(prev => {
+            const next = new Set(prev);
+            next.add(orderId);
+            return next;
+        });
+
+        // Two frames: let expand render, then scroll. Retry once if row not mounted yet.
+        const tryScroll = (attempt: number) => {
+            const el = document.querySelector(`[data-order-id="${CSS.escape(orderId)}"]`) as HTMLElement | null;
+            if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "center" });
+                return;
+            }
+            if (attempt < 3) {
+                window.setTimeout(() => tryScroll(attempt + 1), 120 * (attempt + 1));
+            }
+        };
+        requestAnimationFrame(() => requestAnimationFrame(() => tryScroll(0)));
+    }, [lifecycle.scrollToOrder]);
+
     async function handleSetEta(orderId: string, etaDate: string) {
         setEtaSaving(orderId);
         setError(null);
@@ -692,6 +721,7 @@ export default function ActivePurchasesPanel() {
                                 return (
                                     <div
                                         key={po.orderId}
+                                        data-order-id={po.orderId}
                                         onMouseEnter={() => lifecycle.setFocus({ source: "purchases", vendorName: po.vendorName, orderId: po.orderId, productIds: poProductIds })}
                                         onMouseLeave={lifecycle.clearFocus}
                                         onClick={(e) => {

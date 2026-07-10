@@ -3,10 +3,11 @@
 /**
  * @file    PurchasingLifecycleContext.tsx
  * @purpose Focus/hover highlighting context with Click-to-Lock, Debounced Transitions,
- *          and Option C (BOM dependency highlights) to sync matches across panels.
+ *          Option C (BOM dependency highlights), draft/receipt bridges, and
+ *          scroll-to-PO navigation across Ordering / Purchases / RCV.
  * @author  Aria
  * @created 2026-05-19
- * @updated 2026-05-19
+ * @updated 2026-07-10 — requestScrollToOrder + notifyReceipt bridges
  * @deps    react
  */
 
@@ -42,6 +43,17 @@ type DraftEvent = {
     draftedAt: number;
 };
 
+type ScrollToOrderRequest = {
+    orderId: string;
+    source: LifecycleFocusSource;
+    at: number;
+};
+
+type ReceiptEvent = {
+    orderIds: string[];
+    at: number;
+};
+
 type PurchasingLifecycleContextValue = {
     focus: LifecycleFocus | null;
     lockedFocus: LifecycleFocus | null;
@@ -60,6 +72,14 @@ type PurchasingLifecycleContextValue = {
     // Draft event bridge: Ordering → Purchases → Receiving flow
     lastDraft: DraftEvent | null;
     notifyDraft: (event: Omit<DraftEvent, "draftedAt">) => void;
+
+    /** Ordering ribbon click → Purchases scrolls/expands this orderId. */
+    scrollToOrder: ScrollToOrderRequest | null;
+    requestScrollToOrder: (orderId: string, source?: LifecycleFocusSource) => void;
+
+    /** RCV panel saw new receipts → Ordering should bust purchasing cache. */
+    lastReceipt: ReceiptEvent | null;
+    notifyReceipt: (orderIds: string[]) => void;
 };
 
 const PurchasingLifecycleContext = createContext<PurchasingLifecycleContextValue>({
@@ -76,6 +96,10 @@ const PurchasingLifecycleContext = createContext<PurchasingLifecycleContextValue
     checkMatchDetails: () => ({ isDirect: false, isBom: false, isLockedDirect: false, isLockedBom: false }),
     lastDraft: null,
     notifyDraft: () => { },
+    scrollToOrder: null,
+    requestScrollToOrder: () => { },
+    lastReceipt: null,
+    notifyReceipt: () => { },
 });
 
 function normalize(value?: string | null): string {
@@ -90,6 +114,8 @@ export function PurchasingLifecycleProvider({ children }: { children: React.Reac
     const [focus, setFocusState] = useState<LifecycleFocus | null>(null);
     const [lockedFocus, setLockedFocusState] = useState<LifecycleFocus | null>(null);
     const [lastDraft, setLastDraft] = useState<DraftEvent | null>(null);
+    const [scrollToOrder, setScrollToOrder] = useState<ScrollToOrderRequest | null>(null);
+    const [lastReceipt, setLastReceipt] = useState<ReceiptEvent | null>(null);
 
     // Dynamic, non-rendering BOM relationships registry (Option C)
     const bomRelationsRef = useRef<{
@@ -283,6 +309,20 @@ export function PurchasingLifecycleProvider({ children }: { children: React.Reac
         setLastDraft({ ...event, draftedAt: Date.now() });
     }, []);
 
+    // Ordering "Already ordered · PO #" → Purchases scroll/expand that row
+    const requestScrollToOrder = useCallback((orderId: string, source: LifecycleFocusSource = "ordering") => {
+        const id = String(orderId || "").trim();
+        if (!id) return;
+        setScrollToOrder({ orderId: id, source, at: Date.now() });
+    }, []);
+
+    // RCV panel detected new Finale receipts → Ordering cache bust
+    const notifyReceipt = useCallback((orderIds: string[]) => {
+        const ids = (orderIds ?? []).map(String).filter(Boolean);
+        if (ids.length === 0) return;
+        setLastReceipt({ orderIds: ids, at: Date.now() });
+    }, []);
+
     // DECISION(2026-05-19): Register a global keydown listener for the Escape key 
     // inside the provider to clear locked focus and hover focus instantly.
     React.useEffect(() => {
@@ -311,8 +351,12 @@ export function PurchasingLifecycleProvider({ children }: { children: React.Reac
             checkMatchDetails,
             lastDraft,
             notifyDraft,
+            scrollToOrder,
+            requestScrollToOrder,
+            lastReceipt,
+            notifyReceipt,
         }),
-        [focus, lockedFocus, setFocus, clearFocus, setLockedFocus, clearLockedFocus, isMatch, matchesLockedFocus, registerBOM, checkMatchDetails, lastDraft, notifyDraft],
+        [focus, lockedFocus, setFocus, clearFocus, setLockedFocus, clearLockedFocus, isMatch, matchesLockedFocus, registerBOM, checkMatchDetails, lastDraft, notifyDraft, scrollToOrder, requestScrollToOrder, lastReceipt, notifyReceipt],
     );
 
     return (

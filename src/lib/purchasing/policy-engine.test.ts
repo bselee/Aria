@@ -129,7 +129,8 @@ describe("assessPurchasingCandidate", () => {
 
         expect(assessment.decision).toBe("order");
         expect(assessment.reasonCodes).toContain("residual_top_up");
-        expect(assessment.explanation).toMatch(/Top-up/i);
+        expect(assessment.explanation).toMatch(/Top-up math/i);
+        expect(assessment.explanation).toMatch(/residual need/i);
     });
 
     it("holds micro-velocity noise that invents multi-year supply", () => {

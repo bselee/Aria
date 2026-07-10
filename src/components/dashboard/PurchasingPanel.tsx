@@ -753,6 +753,16 @@ export default function PurchasingPanel() {
 
     useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
+    // RCV receipt event → bust ordering cache so need drops same day
+    const prevReceiptAtRef = useRef<number>(0);
+    useEffect(() => {
+        const r = lifecycle.lastReceipt;
+        if (!r || r.at === prevReceiptAtRef.current) return;
+        prevReceiptAtRef.current = r.at;
+        load(true);
+        /* eslint-disable-next-line react-hooks/exhaustive-deps */
+    }, [lifecycle.lastReceipt]);
+
     // Auto-poll while the server reports a background scan in flight. Stops
     // as soon as `refreshing` flips false (cache is warm).
     useEffect(() => {
@@ -2544,7 +2554,22 @@ export default function PurchasingPanel() {
                                                                                             ? Math.round(((recLink.draftedQty - recLink.recommendedQty) / recLink.recommendedQty) * 100)
                                                                                             : null;
                                                                                         return (
-                                                                                            <div key={openPo.orderId} className={`flex items-center gap-2 text-[10.5px] font-mono px-2 py-1 rounded border ${chipClass}`}>
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                key={openPo.orderId}
+                                                                                                onClick={(e) => {
+                                                                                                    e.stopPropagation();
+                                                                                                    lifecycle.setLockedFocus({
+                                                                                                        source: "ordering",
+                                                                                                        vendorName: group.vendorName,
+                                                                                                        orderId: openPo.orderId,
+                                                                                                        productIds: [item.productId],
+                                                                                                    });
+                                                                                                    lifecycle.requestScrollToOrder(openPo.orderId, "ordering");
+                                                                                                }}
+                                                                                                className={`flex items-center gap-2 text-[10.5px] font-mono px-2 py-1 rounded border w-full text-left cursor-pointer hover:brightness-110 ${chipClass}`}
+                                                                                                title={`Jump to PO #${openPo.orderId} in Active Purchases`}
+                                                                                            >
                                                                                                 <span className="font-semibold shrink-0 text-cyan-200">Already ordered · PO {openPo.orderId}</span>
                                                                                                                                                                                                 <span className="text-[10px] opacity-70 shrink-0">qty {openPo.quantity}</span>
                                                                                                 {recLink && (
@@ -2587,7 +2612,8 @@ export default function PurchasingPanel() {
                                                                                                     }
                                                                                                     return null;
                                                                                                 })()}
-                                                                                            </div>
+                                                                                                <span className="text-[9px] text-cyan-400/70 shrink-0 ml-auto">→ Purchases</span>
+                                                                                            </button>
                                                                                         );
                                                                                     })}
                                                                                 </div>

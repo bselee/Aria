@@ -3,7 +3,7 @@
  * @purpose Per-SKU purchasing decision gate: order vs hold with precise, human-readable reasons.
  * @author  Hermia
  * @created 2026-05-26
- * @updated 2026-07-10 — runway-healthy hold, micro-velocity guard, numeric explanations
+ * @updated 2026-07-10 — residual top-up math on card; runway-healthy hold
  */
 import {
     createPurchasingAssessment,
@@ -143,12 +143,15 @@ function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: nu
 
     if (onOrder > 0) {
         const residual = Math.max(0, effectiveQty);
+        const dailyPart = daily > 0 ? ` at ${daily.toFixed(2)}/day` : "";
+        // residual math on card: cover gap after open PO credit
         return {
             reasonCodes: ["residual_top_up"],
             confidence: "medium",
             explanation:
-                `Top-up: ${fmtQty(onOrder)} already on open PO, still need ${fmtQty(residual)} more ` +
-                `for cover (on hand ${fmtQty(onHand)}, runway ${fmtDays(runway)}, order-by when < ${fmtDays(point)}).`,
+                `Top-up math: on hand ${fmtQty(onHand)} + open PO ${fmtQty(onOrder)} still leaves residual need ${fmtQty(residual)}` +
+                `${dailyPart} (runway ${fmtDays(runway)} vs order point ${fmtDays(point)}). ` +
+                `Buy ${fmtQty(residual)} only — do not re-cover the open PO.`,
         };
     }
 

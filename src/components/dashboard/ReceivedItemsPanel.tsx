@@ -166,6 +166,8 @@ export default function ReceivedItemsPanel() {
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
+    /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
+    const knownReceiptIdsRef = useRef<Set<string>>(new Set());
 
     async function approveReconciliation(orderId: string, invoiceId?: string) {
         setApprovingReconcile(prev => new Set(prev).add(orderId));
@@ -307,6 +309,17 @@ export default function ReceivedItemsPanel() {
             const data = await receivingsRes.json();
             if (data.error) throw new Error(data.error);
             const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+
+            // Notify Ordering when new receipt IDs appear so purchasing cache busts.
+            const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
+            const prev = knownReceiptIdsRef.current;
+            if (prev.size > 0) {
+                const fresh = nextIds.filter((id: string) => !prev.has(id));
+                if (fresh.length > 0) {
+                    lifecycle.notifyReceipt(fresh);
+                }
+            }
+            knownReceiptIdsRef.current = new Set(nextIds);
             setPos(sorted);
 
             if (trackingRes.ok) {
@@ -321,7 +334,7 @@ export default function ReceivedItemsPanel() {
             setLoading(false);
             setRefreshing(false);
         }
-    }, []);
+    }, [lifecycle]);
 
     useEffect(() => {
         fetchReceivings();
