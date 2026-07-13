@@ -21,7 +21,7 @@
  * @deps    @/lib/supabase
  */
 
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 /**
  * Loads a map of PO number → po_sent_verified_at (ISO string) for all POs
@@ -50,7 +50,7 @@ export async function loadPOSentTimestamps(daysBack = 365): Promise<Map<string, 
             .gte('po_sent_verified_at', since);
 
         if (error || !data) {
-            console.warn('[lead-time-enricher] Supabase query failed:', error?.message);
+            console.warn('[lead-time-enricher] PostgREST query failed:', error?.message);
             return map;
         }
 

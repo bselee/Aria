@@ -128,6 +128,13 @@ class QueryBuilder {
   eq(col: string, val: any): this {
     return this.addFilter(col, "eq", val);
   }
+  /**
+   * Supabase SDK compatibility: `.filter(column, operator, value)`.
+   * Used heavily for JSON/metadata columns (`metadata->>type`, etc.).
+   */
+  filter(col: string, op: string, val: any): this {
+    return this.addFilter(col, op as FilterOp, val);
+  }
   neq(col: string, val: any): this {
     return this.addFilter(col, "neq", val);
   }
@@ -165,8 +172,20 @@ class QueryBuilder {
   overlaps(col: string, val: any): this {
     return this.addFilter(col, "overlap", val);
   }
-  not(col: string, op: FilterOp, val: any): this {
-    this._filters.push(`not.${col}=${op}.${val}`);
+  /**
+   * Supabase-compatible NOT filter.
+   * PostgREST expects: col=not.op.val  (e.g. po_sent_verified_at=not.is.null)
+   * NOT the inverted form not.col=op.val which triggers PGRST108.
+   */
+  not(col: string, op: string, val: any): this {
+    if (val === null || val === undefined) {
+      if (op === "is") this._filters.push(`${col}=not.is.null`);
+      else this._filters.push(`${col}=not.${op}.null`);
+    } else if (Array.isArray(val) && op === "in") {
+      this._filters.push(`${col}=not.in.(${val.join(",")})`);
+    } else {
+      this._filters.push(`${col}=not.${op}.${val}`);
+    }
     return this;
   }
 
