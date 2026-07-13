@@ -24,8 +24,12 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 const BILL_COM_EMAIL =
   process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 
-/** Statuses that mean "do not send again" */
-const TAKEN = `('FORWARDED', 'CLAIMED', 'PENDING_SEND')`;
+/** Gmail practical attachment limit — block before encode/send. */
+const MAX_PDF_BYTES = 25 * 1024 * 1024;
+
+/** Statuses that mean "do not send again" — always bound as parameters. */
+const TAKEN_STATUS_LIST = ["FORWARDED", "CLAIMED", "PENDING_SEND"] as const;
+const TAKEN_IN_CLAUSE = TAKEN_STATUS_LIST.map(() => "?").join(", ");
 
 export type SingleForwardSource =
   | "local-forwarder"
@@ -118,16 +122,17 @@ export function isAlreadyClaimedOrForwarded(
 ): { hit: boolean; reason: string; billcomSentMessageId?: string | null } {
   const db = getLocalDb();
   expireStaleClaims(db);
+  const taken = [...TAKEN_STATUS_LIST];
 
   // Layer 2 first: content hash (catches same PDF under different names)
   const byHash = db
     .prepare(
       `SELECT status, billcom_sent_message_id FROM ap_local_forwards
        WHERE pdf_content_hash = ?
-         AND status IN ${TAKEN}
+         AND status IN (${TAKEN_IN_CLAUSE})
        LIMIT 1`,
     )
-    .get(pdfHash) as
+    .get(pdfHash, ...taken) as
     | { status: string; billcom_sent_message_id: string | null }
     | undefined;
   if (byHash) {
@@ -144,10 +149,10 @@ export function isAlreadyClaimedOrForwarded(
       `SELECT status, billcom_sent_message_id FROM ap_local_forwards
        WHERE gmail_message_id = ?
          AND pdf_filename IN (?, ?)
-         AND status IN ${TAKEN}
+         AND status IN (${TAKEN_IN_CLAUSE})
        LIMIT 1`,
     )
-    .get(gmailMessageId, pdfFilename, safe) as
+    .get(gmailMessageId, pdfFilename, safe, ...taken) as
     | { status: string; billcom_sent_message_id: string | null }
     | undefined;
   if (byKey) {
@@ -424,6 +429,13 @@ export async function forwardInvoiceOnce(
       status: "blocked",
       reason: "empty PDF buffer",
       pdfContentHash: "",
+    };
+  }
+  if (req.pdfBuffer.length > MAX_PDF_BYTES) {
+    return {
+      status: "blocked",
+      reason: `PDF exceeds ${MAX_PDF_BYTES / (1024 * 1024)}MB limit (${req.pdfBuffer.length} bytes)`,
+      pdfContentHash: sha256Pdf(req.pdfBuffer),
     };
   }
   if (!req.gmailMessageId) {

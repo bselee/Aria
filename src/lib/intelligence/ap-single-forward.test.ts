@@ -166,6 +166,23 @@ describe("forwardInvoiceOnce single-send invariant", () => {
     expect(r.status).toBe("blocked");
   });
 
+  it("blocks PDF over 25MB", async () => {
+    const huge = Buffer.alloc(25 * 1024 * 1024 + 1, 1);
+    const r = await forwardInvoiceOnce({
+      gmailMessageId: "m-huge",
+      emailFrom: "x@y.com",
+      emailSubject: "Big",
+      pdfFilename: "huge.pdf",
+      pdfBuffer: huge,
+      source: "manual",
+      gmail: mockGmail(),
+    });
+    expect(r.status).toBe("blocked");
+    if (r.status === "blocked") {
+      expect(r.reason).toMatch(/25MB/i);
+    }
+  });
+
   it("blocks via billcom_bills_ref vendor+invoice", async () => {
     mem.prepare(
       `INSERT INTO billcom_bills_ref (invoice_number, vendor_name) VALUES (?, ?)`,

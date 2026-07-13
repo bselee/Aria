@@ -10,7 +10,9 @@
 
 import { getLocalDb } from "@/lib/storage/local-db";
 
-const TAKEN_STATUSES = `('FORWARDED', 'CLAIMED', 'PENDING_SEND')`;
+/** Statuses that mean "do not send again" — always bound as parameters. */
+const TAKEN_STATUS_LIST = ["FORWARDED", "CLAIMED", "PENDING_SEND"] as const;
+const TAKEN_IN_CLAUSE = TAKEN_STATUS_LIST.map(() => "?").join(", ");
 
 /**
  * Returns true if this invoice PDF has already been claimed or forwarded.
@@ -22,16 +24,17 @@ export function isDuplicate(
   pdfHash: string,
 ): boolean {
   const db = getLocalDb();
+  const taken = [...TAKEN_STATUS_LIST];
 
   // Layer 2 first: content hash
   const byHash = db
     .prepare(
       `SELECT 1 FROM ap_local_forwards
        WHERE pdf_content_hash = ?
-       AND status IN ${TAKEN_STATUSES}
+       AND status IN (${TAKEN_IN_CLAUSE})
        LIMIT 1`,
     )
-    .get(pdfHash);
+    .get(pdfHash, ...taken);
   if (byHash) return true;
 
   // Layer 1: message_id + filename (original or common sanitize variants)
@@ -39,10 +42,10 @@ export function isDuplicate(
     .prepare(
       `SELECT 1 FROM ap_local_forwards
        WHERE gmail_message_id = ? AND pdf_filename = ?
-       AND status IN ${TAKEN_STATUSES}
+       AND status IN (${TAKEN_IN_CLAUSE})
        LIMIT 1`,
     )
-    .get(gmailMessageId, pdfFilename);
+    .get(gmailMessageId, pdfFilename, ...taken);
 
   return !!byKey;
 }

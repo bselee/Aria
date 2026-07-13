@@ -15,10 +15,9 @@
 import { detectInlineInvoice, parseInlineInvoice } from "./inline-invoice-parser";
 import { generateInvoicePDF } from "../pdf/invoice-generator";
 import type { InvoiceData } from "../pdf/invoice-parser";
-import { createHash, randomBytes } from "crypto";
+import { createHash } from "crypto";
 import { isDuplicate } from "./ap-dedup";
 import { forwardInvoiceOnce } from "./ap-single-forward";
-import { getLocalDb } from "../storage/local-db";
 
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 
@@ -48,34 +47,6 @@ function isAllowedInlineVendor(from: string, subject: string): boolean {
     if (INLINE_INVOICE_SENDER_ALLOWLIST.some((re) => re.test(hay))) return true;
     if (INLINE_INVOICE_SUBJECT_ALLOWLIST.some((re) => re.test(subject))) return true;
     return false;
-}
-
-function recordInlineForward(
-    gmailMessageId: string,
-    emailFrom: string,
-    emailSubject: string,
-    pdfFilename: string,
-    pdfHash: string,
-    billcomSentMessageId: string,
-): void {
-    try {
-        const db = getLocalDb();
-        db.prepare(
-            `INSERT OR IGNORE INTO ap_local_forwards
-             (gmail_message_id, email_from, email_subject, pdf_filename,
-              pdf_content_hash, billcom_sent_message_id, status, vendor_routing_action)
-             VALUES (?, ?, ?, ?, ?, ?, 'FORWARDED', 'inline_invoice')`,
-        ).run(
-            gmailMessageId,
-            emailFrom,
-            emailSubject,
-            pdfFilename,
-            pdfHash,
-            billcomSentMessageId,
-        );
-    } catch (e: any) {
-        console.warn(`   [inline] Failed to record local forward: ${e.message}`);
-    }
 }
 
 // ─── Finale GraphQL Helpers ─────────────────────────────────────────────────
@@ -211,66 +182,6 @@ async function findCorrelatingPO(): Promise<string | null> {
         console.warn(`   ⚠️ Finale PO search failed: ${err.message}`);
         return null;
     }
-}
-
-// ─── Bill.com Forwarding ────────────────────────────────────────────────────
-
-/**
- * Forward a PDF invoice to Bill.com via Gmail, matching the same MIME format
- * used by ap-local-forwarder.ts.
- *
- * @param gmail           - Authenticated Gmail API client
- * @param emailSubject    - Original email subject (used as "Fwd: <subject>")
- * @param emailFrom       - Original sender email
- * @param pdfFilename     - Desired filename for the attached PDF
- * @param pdfBuffer       - PDF bytes
- * @returns Sent Gmail message ID, or null on failure
- */
-async function forwardToBillCom(
-    gmail: any,
-    emailSubject: string,
-    emailFrom: string,
-    pdfFilename: string,
-    pdfBuffer: Buffer,
-): Promise<string | null> {
-    const rawBase64 = pdfBuffer.toString("base64");
-    const chunkedBase64 = rawBase64.match(/.{1,76}/g)?.join("\r\n") || rawBase64;
-    const boundary = "b_aria_inline_" + randomBytes(8).toString("hex");
-
-    const forwardBody = [
-        "Forwarded invoice (auto-generated from vendor email).",
-        "",
-        `Vendor: ${emailFrom}`,
-        `Original Subject: ${emailSubject}`,
-        `PDF: ${pdfFilename}`,
-    ].join("\r\n");
-
-    const mimeMessage = [
-        `To: ${BILL_COM_EMAIL}`,
-        `Subject: Fwd: ${emailSubject}`,
-        `MIME-Version: 1.0`,
-        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-        ``,
-        `--${boundary}`,
-        `Content-Type: text/plain; charset="UTF-8"`,
-        ``,
-        forwardBody,
-        ``,
-        `--${boundary}`,
-        `Content-Type: application/pdf; name="${pdfFilename}"`,
-        `Content-Transfer-Encoding: base64`,
-        `Content-Disposition: attachment; filename="${pdfFilename}"`,
-        ``,
-        chunkedBase64,
-        `--${boundary}--`,
-    ].join("\r\n");
-
-    const sendResult = await gmail.users.messages.send({
-        userId: "me",
-        requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") },
-    });
-
-    return sendResult.data.id || null;
 }
 
 // ─── Main Handler ───────────────────────────────────────────────────────────
