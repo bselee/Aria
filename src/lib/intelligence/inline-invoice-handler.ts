@@ -16,8 +16,67 @@ import { detectInlineInvoice, parseInlineInvoice } from "./inline-invoice-parser
 import { generateInvoicePDF } from "../pdf/invoice-generator";
 import type { InvoiceData } from "../pdf/invoice-parser";
 import { createHash, randomBytes } from "crypto";
+import { isDuplicate } from "./ap-dedup";
+import { forwardInvoiceOnce } from "./ap-single-forward";
+import { getLocalDb } from "../storage/local-db";
 
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
+
+/**
+ * Inline invoice auto-PDF is ONLY for known free-text vendors.
+ * HARD GATE (2026-07-10): Belt Power shipment notifications (and any other
+ * non-Organic-AG no-PDF mail) were matching the loose dollar heuristic, then
+ * this handler always stamped vendorName="Organic AG Products" and forwarded
+ * fabricated invoices to Bill.com under the wrong subject — 9x for one
+ * Belt Power shipment notice on 2026-07-09.
+ */
+const INLINE_INVOICE_SENDER_ALLOWLIST: RegExp[] = [
+    /organicag/i,
+    /organic\s*ag/i,
+    /zybura/i,
+    /ed@organicag/i,
+    /@organicagproducts/i,
+];
+
+const INLINE_INVOICE_SUBJECT_ALLOWLIST: RegExp[] = [
+    /organic\s*ag/i,
+    /zybura/i,
+];
+
+function isAllowedInlineVendor(from: string, subject: string): boolean {
+    const hay = `${from}\n${subject}`;
+    if (INLINE_INVOICE_SENDER_ALLOWLIST.some((re) => re.test(hay))) return true;
+    if (INLINE_INVOICE_SUBJECT_ALLOWLIST.some((re) => re.test(subject))) return true;
+    return false;
+}
+
+function recordInlineForward(
+    gmailMessageId: string,
+    emailFrom: string,
+    emailSubject: string,
+    pdfFilename: string,
+    pdfHash: string,
+    billcomSentMessageId: string,
+): void {
+    try {
+        const db = getLocalDb();
+        db.prepare(
+            `INSERT OR IGNORE INTO ap_local_forwards
+             (gmail_message_id, email_from, email_subject, pdf_filename,
+              pdf_content_hash, billcom_sent_message_id, status, vendor_routing_action)
+             VALUES (?, ?, ?, ?, ?, ?, 'FORWARDED', 'inline_invoice')`,
+        ).run(
+            gmailMessageId,
+            emailFrom,
+            emailSubject,
+            pdfFilename,
+            pdfHash,
+            billcomSentMessageId,
+        );
+    } catch (e: any) {
+        console.warn(`   [inline] Failed to record local forward: ${e.message}`);
+    }
+}
 
 // ─── Finale GraphQL Helpers ─────────────────────────────────────────────────
 
@@ -261,7 +320,18 @@ export async function handleInlineInvoice(
 
     console.log(`📧 Inline Invoice Handler — ${from} — ${subject.slice(0, 60)}`);
 
-    // ── Step 0: Pre-flight check ──────────────────────────────────────────
+    // ── Step 0a: Vendor allowlist (Organic AG / Ed Zybura only) ──────────
+    // The PDF generator and Finale PO lookup are hardcoded to Organic AG.
+    // Never run this path for other vendors — it fabricates wrong bills.
+    if (!isAllowedInlineVendor(from, subject)) {
+        console.log(`   ⏭️ Inline handler skipped — sender not on allowlist: ${from.slice(0, 50)}`);
+        return {
+            success: false,
+            error: `Inline invoice handler only supports Organic AG / Ed Zybura (got: ${from})`,
+        };
+    }
+
+    // ── Step 0b: Pattern pre-flight ───────────────────────────────────────
     if (!detectInlineInvoice(body, false, subject)) {
         return { success: false, error: "Email does not match inline invoice pattern" };
     }
@@ -281,6 +351,11 @@ export async function handleInlineInvoice(
 
         console.log(`   📊 Parsed: $${subtotal.toFixed(2)} + $${freight.toFixed(2)} = $${total.toFixed(2)}`);
 
+        // Refuse zero/garbage totals — do not invent bills
+        if (!total || total <= 0 || !Number.isFinite(total)) {
+            return { success: false, error: `Invalid inline invoice total: ${total}` };
+        }
+
         // ── Step 3: Find correlating PO ────────────────────────────────────
         console.log(`   🔍 Searching Finale for Organic AG PO...`);
         const poNumber = data.poNumber || await findCorrelatingPO();
@@ -292,6 +367,13 @@ export async function handleInlineInvoice(
         const invNumber = data.invoiceNumber !== "UNKNOWN" && data.invoiceNumber
             ? data.invoiceNumber
             : subject.match(/INVOICE\s+#?(\d+)/i)?.[1] || "UNKNOWN";
+
+        if (invNumber === "UNKNOWN") {
+            return {
+                success: false,
+                error: "Inline invoice has no invoice number — refusing to fabricate UNKNOWN bill",
+            };
+        }
 
         const invoiceData: InvoiceData = {
             documentType: "invoice",
@@ -319,21 +401,42 @@ export async function handleInlineInvoice(
         // ── Step 5: Generate PDF ──────────────────────────────────────────
         console.log(`   📄 Generating PDF invoice...`);
         const pdfBuffer = await generateInvoicePDF(invoiceData, date);
-
-        // ── Step 6: Forward to Bill.com ────────────────────────────────────
+        const pdfHash = createHash("sha256").update(pdfBuffer).digest("hex");
         const safeFilename = `Organic_AG_Invoice_${invNumber.replace(/[^a-zA-Z0-9_-]/g, "_")}.pdf`;
-        console.log(`   📤 Forwarding to ${BILL_COM_EMAIL} (${(pdfBuffer.length / 1024).toFixed(1)} KB)...`);
-        const sentMessageId = await forwardToBillCom(gmail, subject, from, safeFilename, pdfBuffer);
 
-        if (!sentMessageId) {
-            return { success: false, error: "Failed to send forward to Bill.com" };
+        // ── Step 6: Forward via single-forward gate (DB claim + one send) ──
+        console.log(`   📤 Forwarding to ${BILL_COM_EMAIL} (${(pdfBuffer.length / 1024).toFixed(1)} KB) via single-gate...`);
+        const once = await forwardInvoiceOnce({
+            gmailMessageId,
+            emailFrom: from,
+            emailSubject: subject,
+            pdfFilename: safeFilename,
+            pdfBuffer,
+            vendorName: "Organic AG Products",
+            invoiceNumber: invNumber,
+            source: "inline-invoice",
+            gmail,
+            vendorRoutingAction: "inline_invoice",
+        });
+
+        if (once.status === "already_forwarded") {
+            console.log(`   ⏭️ Already forwarded inline invoice ${safeFilename} (${once.reason})`);
+            return {
+                success: true,
+                forwardedMessageId: once.existingBillcomMessageId || undefined,
+                poNumber,
+                invoiceNumber: invNumber,
+                totalAmount: total,
+            };
+        }
+        if (once.status !== "forwarded") {
+            return { success: false, error: once.reason || once.status };
         }
 
-        console.log(`   ✅ Forwarded! Gmail message ID: ${sentMessageId}`);
-
+        console.log(`   ✅ Forwarded! Gmail message ID: ${once.billcomSentMessageId}`);
         return {
             success: true,
-            forwardedMessageId: sentMessageId,
+            forwardedMessageId: once.billcomSentMessageId,
             poNumber,
             invoiceNumber: invNumber,
             totalAmount: total,

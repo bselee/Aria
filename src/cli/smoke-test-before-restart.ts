@@ -21,6 +21,7 @@ const SMOKE_TEST_FILES = [
     "@/lib/intelligence/workers/ap-forwarder",
     "@/lib/intelligence/workers/ap-identifier",
     "@/lib/intelligence/ap-dedup",
+    "@/lib/intelligence/ap-single-forward",
     "@/lib/intelligence/ap/vendor-router",
     "@/lib/storage/local-db",
     "@/lib/gmail/auth",

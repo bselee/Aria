@@ -36,6 +36,7 @@ import { ensureGmailToolsRegistered } from "../agents/register-gmail-tools";
 import { ensureMemoryToolsRegistered } from "../agents/register-memory-tools";
 import * as memory from "../memory";
 import { writeReconciliationOutcome } from "../runtime/observability/reconciliation-outcomes";
+import { forwardInvoiceOnce } from "./ap-single-forward";
 
 /**
  * @file    ap-agent.ts
@@ -948,63 +949,29 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         }
     }
 
-    public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, pdfBuffer: Buffer): Promise<boolean> {
-        console.log(`     -> Forwarding ${filename} to buildasoilap@bill.com`);
-
-        if (!pdfBuffer.length) {
-            console.error("     ❌ No PDF data to forward (empty buffer)");
-            return false;
-        }
-
-        // Re-encode as standard base64 with RFC 2045 line chunks (76 chars)
-        const pdfBase64 = pdfBuffer.toString("base64");
-        const chunkedPdfBase64 = pdfBase64.match(/.{1,76}/g)?.join("\r\n") || pdfBase64;
-
-        const boundary = "b_aria_forwarded_bill_" + Math.random().toString(36).substring(2);
-
-        const mimeParts = [
-            `To: buildasoilap@bill.com`,
-            `Subject: Fwd: ${originalSubject}`,
-            `MIME-Version: 1.0`,
-            `Content-Type: multipart/mixed; boundary="${boundary}"`,
-            ``,
-            `--${boundary}`,
-            `Content-Type: text/plain; charset="UTF-8"`,
-            ``,
-            `Forwarded invoice.`,
-            ``,
-            `--${boundary}`,
-            `Content-Type: application/pdf; name="${filename}"`,
-            `Content-Transfer-Encoding: base64`,
-            `Content-Disposition: attachment; filename="${filename}"`,
-            ``,
-            chunkedPdfBase64,
-            `--${boundary}--`,
-        ];
-
-        // Use latin1 so binary PDF bytes are preserved correctly through Buffer round-trip
-        const mimeBuffer = Buffer.from(mimeParts.join("\r\n"), "latin1");
-
-        // Phase 2: this is the most important Gmail write in the AP pipeline
-        // — it's the email that triggers vendor payment via bill.com. Audit
-        // every send with agent attribution + filename context.
-        ensureGmailToolsRegistered();
-
-        try {
-            await withToolAudit(
-                "gmail_send_message",
-                { agent: apIssue.HANDLER.AP_AGENT },
-                { to: "buildasoilap@bill.com", subject: originalSubject, filename, pdfBytes: pdfBuffer.length },
-                () => gmail.users.messages.send({
-                    userId: "me",
-                    requestBody: { raw: mimeBuffer.toString("base64url") },
-                }),
-            );
+    public async forwardToBillCom(gmail: any, originalSubject: string, filename: string, pdfBuffer: Buffer, gmailMessageId?: string): Promise<boolean> {
+        // HERMIA(2026-07-10): ALL Bill.com sends go through the single-forward gate.
+        // Legacy callers without messageId get a stable synthetic id from content hash.
+        const crypto = await import("crypto");
+        const hash = crypto.createHash("sha256").update(pdfBuffer).digest("hex");
+        const msgId = gmailMessageId || `ap-agent-${hash.slice(0, 24)}`;
+        console.log(`     -> Forwarding ${filename} via single-forward gate`);
+        const once = await forwardInvoiceOnce({
+            gmailMessageId: msgId,
+            emailFrom: "ap-agent",
+            emailSubject: originalSubject,
+            pdfFilename: filename,
+            pdfBuffer,
+            source: "ap-agent",
+            gmail,
+        });
+        if (once.status === "already_forwarded") {
+            console.log(`     ⏭️ Already forwarded (${once.reason})`);
             return true;
-        } catch (err: any) {
-            console.error("     ❌ Failed to forward to bill.com:", err.message);
-            return false;
         }
+        if (once.status === "forwarded") return true;
+        console.error(`     ❌ single-forward failed: ${once.reason}`);
+        return false;
     }
 
     public async processInvoiceBuffer(buffer: Buffer, filename: string, subject: string, from: string, supabase: any, _unused = false, messageId?: string, pdfStoragePath: string | null = null) {

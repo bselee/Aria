@@ -6,6 +6,7 @@ import { applyMessageLabelPolicy } from "../gmail-policy";
 import { APAgent } from "../ap-agent";
 import { writeInvoiceSummary } from "../../obsidian/bridge";
 import { getLocalDb } from "../../storage/local-db";
+import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 
 /**
  * @file ap-forwarder.ts
@@ -110,7 +111,7 @@ export class APForwarderAgent {
                     const byHash = db.prepare(
                         `SELECT 1 FROM ap_local_forwards
                          WHERE pdf_content_hash = ?
-                         AND status = 'FORWARDED'`
+                         AND status IN ('FORWARDED', 'CLAIMED', 'PENDING_SEND')`
                     ).get(pdfContentHash);
                     if (byHash) return true;
                 }
@@ -119,7 +120,7 @@ export class APForwarderAgent {
                 const row = db.prepare(
                     `SELECT 1 FROM ap_local_forwards
                      WHERE email_from = ? AND email_subject = ? AND pdf_filename = ?
-                     AND status = 'FORWARDED'
+                     AND status IN ('FORWARDED', 'CLAIMED', 'PENDING_SEND')
                      AND forwarded_at > datetime('now', '-72 hours')`
                 ).get(emailFrom, emailSubject, pdfFilename);
                 return !!row;
@@ -355,7 +356,7 @@ export class APForwarderAgent {
                                                         continue;
                                                     }
 
-                                            console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from}`);
+                                            console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from} (single-forward gate)`);
 
                     // Download PDF from Supabase Storage
                     const { data: fileData, error: downloadError } = await supabase.storage
@@ -367,78 +368,41 @@ export class APForwarderAgent {
                     }
 
                     const buffer = Buffer.from(await fileData.arrayBuffer());
-                    const rawBase64 = buffer.toString('base64');
-                    // RFC 2045 requires base64 to be split into lines no longer than 76 characters.
-                    const chunkedBase64 = rawBase64.match(/.{1,76}/g)?.join("\r\n") || rawBase64;
-
-                    const boundary = "b_aria_fwd_" + Math.random().toString(36).substring(2);
-
-                    // HERMIA(2026-05-28): Enriched forward body — inject extracted vendor/
-                    // invoice/amount context so Bill.com can match bills even if OCR
-                    // struggles with unusual PDF formats. Include only present fields.
-                    const ej = (item.extracted_json || {}) as Record<string, any>;
-                    const bodyLines = ["Forwarded invoice.", ""];
-                    const fields: Array<[string, string | undefined | null]> = [
-                        ["Vendor", item.vendor_name],
-                        ["Invoice #", item.invoice_number || ej.invoice_number],
-                        ["Amount", item.invoice_total != null ? `$${Number(item.invoice_total).toFixed(2)}` : null],
-                        ["Invoice Date", item.invoice_date || ej.invoice_date],
-                        ["PO #", item.po_number],
-                        ["Sent From", item.email_from],
-                        ["PDF", item.pdf_filename],
-                    ];
-                    const present = fields.filter(([, v]) => v != null && String(v).trim() !== "");
-                    if (present.length > 0) {
-                        bodyLines.push("Extracted metadata:");
-                        for (const [label, value] of present) {
-                            bodyLines.push(`  ${label}: ${value}`);
-                        }
-                    }
-                    // Surface multi-invoice split context when applicable.
-                    const splitInfo: string[] = [];
-                    if (ej.expected_forward_count && ej.expected_forward_count > 1) {
-                        splitInfo.push(`Split ${ej.pdf_attachment_index ?? "?"}/${ej.expected_forward_count} of multi-invoice statement`);
-                    }
-                    if (ej.split_invoice_numbers && Array.isArray(ej.split_invoice_numbers)) {
-                        splitInfo.push(`Invoice #s in packet: ${ej.split_invoice_numbers.join(", ")}`);
-                    }
-                    if (splitInfo.length > 0) {
-                        bodyLines.push("");
-                        bodyLines.push("Packet:");
-                        for (const line of splitInfo) bodyLines.push(`  ${line}`);
-                    }
-                    const forwardBody = bodyLines.join("\r\n");
-
-                    const mimeMessage = [
-                        `To: buildasoilap@bill.com`,
-                        `Subject: Fwd: ${item.email_subject}`,
-                        `MIME-Version: 1.0`,
-                        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-                        ``,
-                        `--${boundary}`,
-                        `Content-Type: text/plain; charset="UTF-8"`,
-                        ``,
-                        forwardBody,
-                        ``,
-                        `--${boundary}`,
-                        `Content-Type: application/pdf; name="${item.pdf_filename}"`,
-                        `Content-Transfer-Encoding: base64`,
-                        `Content-Disposition: attachment; filename="${item.pdf_filename}"`,
-                        ``,
-                        chunkedBase64,
-                        `--${boundary}--`
-                    ].join("\r\n");
-
-                    const sendResult = await gmail.users.messages.send({
-                        userId: "me",
-                        requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") }
+                    const once = await forwardInvoiceOnce({
+                        gmailMessageId: sourceMessageId,
+                        emailFrom: item.email_from || '',
+                        emailSubject: item.email_subject || '',
+                        pdfFilename: item.pdf_filename,
+                        pdfBuffer: buffer,
+                        vendorName: item.vendor_name || undefined,
+                        invoiceNumber: item.invoice_number || undefined,
+                        source: 'supabase-forwarder',
+                        gmail,
                     });
-                    sentMessageId = sendResult.data.id || null;
-                    if (!sentMessageId) {
-                        throw new Error(`Gmail send did not return a sent message id for ${item.id}`);
+
+                    if (once.status === 'already_forwarded') {
+                        console.log(`   ⏭️ Single-gate suppressed: ${item.pdf_filename} (${once.reason})`);
+                        await supabase
+                            .from('ap_inbox_queue')
+                            .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
+                            .eq('id', item.id);
+                        await this.logActivity(
+                            supabase,
+                            item.email_from,
+                            item.email_subject,
+                            item.intent || 'INVOICE',
+                            `Suppressed duplicate via single-forward gate (${item.pdf_filename})`,
+                            { reasonCode: 'single_forward_dedup', detail: once.reason, gmailMessageId: sourceMessageId },
+                        );
+                        continue;
                     }
-                    await this.verifySentMessage(gmail, sentMessageId);
+                    if (once.status !== 'forwarded') {
+                        throw new Error(once.reason || once.status);
+                    }
+                    sentMessageId = once.billcomSentMessageId;
                     billComSendVerified = true;
+
+                    const ej = (item.extracted_json || {}) as Record<string, any>;
 
                     // KAIZEN(2026-06-05): Dropship invoices skip PO matching/reconciliation.
                     // The vendor routing in APIdentifier already classified this as dropship;

@@ -36,6 +36,8 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/supabase";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
 import { isDuplicate } from "@/lib/intelligence/ap-dedup";
+import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
+import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
 import * as crypto from "crypto";
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
@@ -71,11 +73,32 @@ function checkVendorRouting(from: string, subject: string): VendorRoutingRule | 
 /**
  * Check if an email is likely from a non-invoice sender (tracking, marketing).
  * Also catches UPS tracking notifications that slip through vendor-router.
+ * HERMIA(2026-07-10): Expanded after Belt Power shipment notices + statements
+ * were forwarded / fabricated into Bill.com bills.
  */
 function isNonInvoiceSender(from: string, subject: string): boolean {
     const fromLower = from.toLowerCase();
+    const subjectLower = subject.toLowerCase();
     // UPS tracking notifications (not UPS Freight invoices)
-    if (fromLower.includes("mcinfo@ups.com") && !subject.toLowerCase().includes("invoice")) {
+    if (fromLower.includes("mcinfo@ups.com") && !subjectLower.includes("invoice")) {
+        return true;
+    }
+    // Non-invoice subject classes (belt-and-suspenders with vendor-router skip rules)
+    const nonInvoiceSubjects = [
+        "shipment notification",
+        "order has shipped",
+        "your order has shipped",
+        "order acknowledgement",
+        "order acknowledgment",
+        "monthly statement",
+        "reminder on overdue",
+        "packing list",
+    ];
+    if (nonInvoiceSubjects.some((s) => subjectLower.includes(s))) {
+        return true;
+    }
+    // Belt Power no-reply is shipment-only (invoices come from remitto@)
+    if (fromLower.includes("no-reply@beltpower.com")) {
         return true;
     }
     return false;
@@ -601,6 +624,16 @@ export async function checkForBounces(gmail: any): Promise<string[]> {
  *
  * @returns Summary of reconciliation actions
  */
+
+/** Only alert on recently forwarded invoices (avoid mass-notify on historical backfill). */
+function shouldNotifyPoUnmatched(forwardedAt: string | null | undefined): boolean {
+    if (!forwardedAt) return false;
+    const normalized = forwardedAt.includes('T') ? forwardedAt : forwardedAt.replace(' ', 'T') + 'Z';
+    const ts = Date.parse(normalized);
+    if (Number.isNaN(ts)) return false;
+    return Date.now() - ts < 48 * 3600 * 1000;
+}
+
 export async function runReconciliationHandoff(): Promise<{
     checked: number;
     reconciled: number;
@@ -615,7 +648,7 @@ export async function runReconciliationHandoff(): Promise<{
 
         const forwarded = db.prepare(
             `SELECT id, gmail_message_id, email_from, email_subject, pdf_filename,
-                    vendor_routing_action, ocr_raw_text, reconciliation_verdict
+                    vendor_routing_action, ocr_raw_text, reconciliation_verdict, forwarded_at
              FROM ap_local_forwards
              WHERE status = 'FORWARDED'
              AND (reconciliation_status IS NULL OR reconciliation_status = '')
@@ -629,6 +662,7 @@ export async function runReconciliationHandoff(): Promise<{
             vendor_routing_action: string | null;
             ocr_raw_text: string | null;
             reconciliation_verdict: string | null;
+            forwarded_at: string | null;
         }>;
 
         summary.checked = forwarded.length;
@@ -664,6 +698,26 @@ export async function runReconciliationHandoff(): Promise<{
 
             const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
             if (!poMatch) {
+                // Bill rule: notify ONLY when we cannot match invoice → PO
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = 'PO_UNMATCHED',
+                         reconciliation_notes = 'No PO# in subject - needs match',
+                         reconciled_at = datetime('now')
+                     WHERE id = ?`
+                ).run(inv.id);
+                if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
+                    try {
+                        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                        await sendTelegramNotify(
+                            `AP: invoice not matched to PO\n` +
+                            `From: ${(inv.email_from || "").slice(0, 60)}\n` +
+                            `Subj: ${(inv.email_subject || "").slice(0, 80)}\n` +
+                            `File: ${inv.pdf_filename}\n` +
+                            `Forwarded once. Needs PO match.`
+                        );
+                    } catch { /* non-fatal */ }
+                }
                 summary.pending++;
                 continue;
             }
@@ -671,7 +725,26 @@ export async function runReconciliationHandoff(): Promise<{
             const poNumber = poMatch[1].padStart(5, "0");
 
             if (!inv.ocr_raw_text || inv.ocr_raw_text.length < 5) {
-                console.warn(`   [AP-Reconcile] No cached OCR for ${inv.pdf_filename} - older record, manual review needed`);
+                console.warn(`   [AP-Reconcile] No cached OCR for ${inv.pdf_filename} - needs manual PO match`);
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = 'PO_UNMATCHED',
+                         reconciliation_notes = 'No OCR text cached — cannot auto-match PO',
+                         reconciled_at = datetime('now')
+                     WHERE id = ?`
+                ).run(inv.id);
+                if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
+                    try {
+                        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                        await sendTelegramNotify(
+                            `AP: invoice not matched to PO\n` +
+                            `From: ${(inv.email_from || "").slice(0, 60)}\n` +
+                            `Subj: ${(inv.email_subject || "").slice(0, 80)}\n` +
+                            `File: ${inv.pdf_filename}\n` +
+                            `Reason: no OCR text for auto match. Forwarded once.`
+                        );
+                    } catch { /* non-fatal */ }
+                }
                 summary.pending++;
                 continue;
             }
@@ -706,6 +779,19 @@ export async function runReconciliationHandoff(): Promise<{
                 if (verdict === "auto_applicable") {
                     summary.reconciled++;
                 } else {
+                    if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
+                        try {
+                            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+                            await sendTelegramNotify(
+                                `AP: invoice needs PO review\n` +
+                                `PO: ${poNumber}\n` +
+                                `From: ${(inv.email_from || "").slice(0, 60)}\n` +
+                                `File: ${inv.pdf_filename}\n` +
+                                `Verdict: ${verdict}\n` +
+                                `Forwarded once.`
+                            );
+                        } catch { /* non-fatal */ }
+                    }
                     summary.pending++;
                 }
             } catch (e: any) {
@@ -728,18 +814,26 @@ export async function runReconciliationHandoff(): Promise<{
  * Mark a Gmail message as processed (remove UNREAD + INBOX, add label).
  * Called after all PDFs in an email have been forwarded to Bill.com.
  */
-async function markEmailProcessed(gmail: any, messageId: string, labelId: string = "Invoice Forward"): Promise<void> {
+async function markEmailProcessed(gmail: any, messageId: string): Promise<void> {
+    // Resolve "Invoice Forward" label by name → real Gmail label id.
+    // Passing the human name as labelId throws: Invalid label: Invoice Forward
     try {
-        await gmail.users.messages.modify({
-            userId: "me",
-            id: messageId,
-            requestBody: {
-                addLabelIds: [labelId],
-                removeLabelIds: ["INBOX", "UNREAD"],
-            },
+        await applyMessageLabelPolicy({
+            gmail,
+            gmailMessageId: messageId,
+            addLabels: ["Invoice Forward"],
+            removeLabels: ["INBOX", "UNREAD"],
         });
     } catch (e: any) {
-        console.warn(`   [AP-Local] Failed to mark email ${messageId} as processed:`, e.message);
+        try {
+            await gmail.users.messages.modify({
+                userId: "me",
+                id: messageId,
+                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+            });
+        } catch (e2: any) {
+            console.warn(`   [AP-Local] Failed to mark email ${messageId} as processed:`, e2.message);
+        }
     }
 }
 
@@ -886,31 +980,41 @@ export async function runLocalApForward(): Promise<{
                     continue;
                 }
 
-                // Forward to Bill.com
+                // Forward to Bill.com — ONLY via single-forward gate (DB claim first).
+                // Gate records FORWARDED/ERROR itself — do not write a second ERROR row
+                // with a different filename (that used to UNIQUE-block retries forever).
                 try {
-                    const safeFilename = sanitizeForwardFilename(pdf.filename);
-                    const sentId = await forwardToBillCom(gmail, subject, from, pdf.filename, pdfBuffer);
-                    if (!sentId) {
-                        throw new Error("Gmail send returned no message ID");
+                    const once = await forwardInvoiceOnce({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: pdf.filename,
+                        pdfBuffer,
+                        source: "local-forwarder",
+                        gmail,
+                        ocrRawText: paidCheck.rawText,
+                        vendorRoutingAction: skipReconciliation ? "dropship" : undefined,
+                    });
+                    if (once.status === "already_forwarded") {
+                        console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdf.filename} (${once.reason})`);
+                        summary.skipped++;
+                        continue;
                     }
-
-                    // ── Post-send verification ────────────────────────────
-                    // Use safeFilename — the sent attachment has the sanitized name
-                    const verified = await verifySentForward(gmail, sentId, safeFilename);
-                    if (!verified) {
-                        console.warn(`   [AP-Local] ⚠️ Sent verification failed for ${safeFilename} (sent ID: ${sentId})`);
+                    if (once.status === "blocked") {
+                        console.log(`   [AP-Local] 🚫 Blocked: ${pdf.filename} (${once.reason})`);
+                        summary.skipped++;
+                        continue;
                     }
-
-                    recordForward(
-                        gmailMessageId, from, subject, pdf.filename, pdfHash, sentId,
-                        skipReconciliation ? "dropship" : undefined,
-                        paidCheck.rawText,
-                    );
-                    await syncToSupabase(from, subject, pdf.filename, sentId);
+                    if (once.status !== "forwarded") {
+                        summary.errors++;
+                        allPdfsForwarded = false;
+                        console.error(`   [AP-Local] ❌ Failed to forward ${pdf.filename}: ${once.reason}`);
+                        continue;
+                    }
+                    await syncToSupabase(from, subject, pdf.filename, once.billcomSentMessageId);
                     summary.forwarded++;
-                    console.log(`   [AP-Local] ✅ Forwarded ${pdf.filename} from ${from.slice(0, 25)}${verified ? "" : " (UNVERIFIED)"}`);
+                    console.log(`   [AP-Local] ✅ Forwarded ${pdf.filename} from ${from.slice(0, 25)} (single-gate)`);
                 } catch (e: any) {
-                    recordError(gmailMessageId, from, subject, pdf.filename, pdfHash, e.message);
                     summary.errors++;
                     allPdfsForwarded = false;
                     console.error(`   [AP-Local] ❌ Failed to forward ${pdf.filename}: ${e.message}`);
