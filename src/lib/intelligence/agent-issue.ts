@@ -127,6 +127,112 @@ export type CreateOrAdvanceArgs = {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/** Open lifecycle states covered by uq_agent_issue_business_flow_open. */
+const OPEN_LIFECYCLES = [
+    "detected",
+    "triaging",
+    "working",
+    "waiting_external",
+    "blocked",
+] as const;
+
+function isUniqueConflict(err: { message?: string; code?: string } | null | undefined): boolean {
+    const msg = (err?.message || "").toLowerCase();
+    const code = String(err?.code || "");
+    return (
+        code === "23505" ||
+        msg.includes("23505") ||
+        msg.includes("already exists") ||
+        msg.includes("duplicate key") ||
+        msg.includes("conflict")
+    );
+}
+
+/**
+ * Find the newest open issue for a business-flow key.
+ * Uses limit(1)+order instead of bare maybeSingle so multi-row races
+ * never blow up with PGRST116 (which previously fell through to insert → 409).
+ */
+async function findOpenIssue(
+    supabase: NonNullable<ReturnType<typeof createClient>>,
+    businessFlowKey: string,
+): Promise<AgentIssue | null> {
+    const { data, error } = await supabase
+        .from("agent_issue")
+        .select("*")
+        .eq("business_flow_key", businessFlowKey)
+        .in("lifecycle_state", [...OPEN_LIFECYCLES])
+        .order("updated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (error) {
+        // Soft: treat lookup failure as "none" so caller can still try create
+        // (create will race-recover on 23505).
+        console.warn("[agent-issue] open lookup failed:", error.message);
+        return null;
+    }
+    return (data as AgentIssue | null) ?? null;
+}
+
+/**
+ * Apply an advance patch to an existing open issue (blocker-safe).
+ */
+async function advanceExisting(
+    supabase: NonNullable<ReturnType<typeof createClient>>,
+    existing: AgentIssue,
+    args: CreateOrAdvanceArgs,
+): Promise<AgentIssue | null> {
+    const isBlocked = existing.lifecycle_state === "blocked";
+
+    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (!isBlocked) {
+        if (args.lifecycleState !== undefined) patch.lifecycle_state = args.lifecycleState;
+        if (args.autonomyState !== undefined) patch.autonomy_state = args.autonomyState;
+        if (args.currentHandler !== undefined) patch.current_handler = args.currentHandler;
+        if (args.nextAction !== undefined) patch.next_action = args.nextAction;
+        // Stamp completed_at when projection moves us into complete and
+        // the existing row hasn't already been stamped — otherwise
+        // listIssues' "complete in last 14d" filter excludes them.
+        if (args.lifecycleState === "complete" && !existing.completed_at) {
+            patch.completed_at = new Date().toISOString();
+        }
+        // Owner is intentionally also gated on !isBlocked (Will, 2026-04-29):
+        // a blocked issue assigned to Will (e.g. via human_approval_required)
+        // must NOT have its owner flipped back to aria by the next projection
+        // cycle. That would weaken the "only clearBlocker() exits the human
+        // decision path" invariant.
+        if (args.owner !== undefined) patch.owner = args.owner;
+    }
+    if (args.priority !== undefined) patch.priority = args.priority;
+    if (args.inputs !== undefined) patch.inputs = args.inputs;
+
+    const { data: updated, error } = await supabase
+        .from("agent_issue")
+        .update(patch)
+        .eq("id", existing.id)
+        .select()
+        .single();
+    if (error) {
+        // Unique conflicts on advance are almost always concurrent writers —
+        // re-read and return the current row rather than spamming logs.
+        if (isUniqueConflict(error)) {
+            const again = await findOpenIssue(supabase, args.businessFlowKey);
+            if (again) return again;
+        }
+        console.warn("[agent-issue] advance failed:", error.message);
+        return null;
+    }
+    if (!isBlocked && args.lifecycleState && args.lifecycleState !== existing.lifecycle_state) {
+        await appendIssueEvent(existing.id, `issue_${args.lifecycleState}`, {
+            task_type: "issue_lifecycle",
+            output_summary: `${existing.lifecycle_state} → ${args.lifecycleState}`,
+            from: existing.lifecycle_state,
+            to: args.lifecycleState,
+        });
+    }
+    return updated as AgentIssue;
+}
+
 /**
  * Create a new issue or advance the existing open one for a business-flow key.
  *
@@ -135,64 +241,18 @@ export type CreateOrAdvanceArgs = {
  * autonomy / handler / next_action are SILENTLY DROPPED. Only `clearBlocker`
  * can move an issue out of blocked. Safe metadata (priority, inputs) still
  * applies so the projection can keep digest counts fresh.
+ *
+ * HERMIA(2026-07-13): race-safe against concurrent issue-projection ticks.
+ * Open lookup uses limit(1). Insert 23505 falls back to advance of the winner.
  */
 export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentIssue | null> {
     if (!hubEnabled()) return null;
     const supabase = createClient();
     if (!supabase) return null;
 
-    // Look up existing OPEN issue for this business-flow key.
-    const { data: existing } = await supabase
-        .from("agent_issue")
-        .select("*")
-        .eq("business_flow_key", args.businessFlowKey)
-        .in("lifecycle_state", ["detected", "triaging", "working", "waiting_external", "blocked"])
-        .maybeSingle();
-
+    const existing = await findOpenIssue(supabase, args.businessFlowKey);
     if (existing) {
-        const isBlocked = existing.lifecycle_state === "blocked";
-
-        const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-        if (!isBlocked) {
-            if (args.lifecycleState !== undefined) patch.lifecycle_state = args.lifecycleState;
-            if (args.autonomyState !== undefined) patch.autonomy_state = args.autonomyState;
-            if (args.currentHandler !== undefined) patch.current_handler = args.currentHandler;
-            if (args.nextAction !== undefined) patch.next_action = args.nextAction;
-            // Stamp completed_at when projection moves us into complete and
-            // the existing row hasn't already been stamped — otherwise
-            // listIssues' "complete in last 14d" filter excludes them.
-            if (args.lifecycleState === "complete" && !existing.completed_at) {
-                patch.completed_at = new Date().toISOString();
-            }
-            // Owner is intentionally also gated on !isBlocked (Will, 2026-04-29):
-            // a blocked issue assigned to Will (e.g. via human_approval_required)
-            // must NOT have its owner flipped back to aria by the next projection
-            // cycle. That would weaken the "only clearBlocker() exits the human
-            // decision path" invariant.
-            if (args.owner !== undefined) patch.owner = args.owner;
-        }
-        if (args.priority !== undefined) patch.priority = args.priority;
-        if (args.inputs !== undefined) patch.inputs = args.inputs;
-
-        const { data: updated, error } = await supabase
-            .from("agent_issue")
-            .update(patch)
-            .eq("id", existing.id)
-            .select()
-            .single();
-        if (error) {
-            console.warn("[agent-issue] advance failed:", error.message);
-            return null;
-        }
-        if (!isBlocked && args.lifecycleState && args.lifecycleState !== existing.lifecycle_state) {
-            await appendIssueEvent(existing.id, `issue_${args.lifecycleState}`, {
-                task_type: "issue_lifecycle",
-                output_summary: `${existing.lifecycle_state} → ${args.lifecycleState}`,
-                from: existing.lifecycle_state,
-                to: args.lifecycleState,
-            });
-        }
-        return updated as AgentIssue;
+        return advanceExisting(supabase, existing, args);
     }
 
     // No existing — create new. Title required.
@@ -222,6 +282,22 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
         .select()
         .single();
     if (insErr) {
+        // Concurrent projection: another worker won the insert. Advance that row.
+        if (isUniqueConflict(insErr)) {
+            const raced = await findOpenIssue(supabase, args.businessFlowKey);
+            if (raced) {
+                return advanceExisting(supabase, raced, args);
+            }
+            // Insert may have completed into a terminal state under race — fetch any row
+            const { data: anyRow } = await supabase
+                .from("agent_issue")
+                .select("*")
+                .eq("business_flow_key", args.businessFlowKey)
+                .order("updated_at", { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            if (anyRow) return anyRow as AgentIssue;
+        }
         console.warn("[agent-issue] create failed:", insErr.message);
         return null;
     }
