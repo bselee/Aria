@@ -21,7 +21,7 @@
  */
 
 const net = require("net");
-const { execSync } = require("child_process");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -45,21 +45,34 @@ const boundPorts = {};
 
 /**
  * Discover the WSL2 VM IP address.
- * Uses `wsl hostname -I` and takes the first IP.
- * Increases timeout to 10s — WSL can be slow to respond after restart.
+ * Tries multiple strategies because distro name / default can vary.
+ *
+ * HERMIA(2026-07-10): Must use execFileSync (argv array) + windowsHide.
+ * execSync("wsl ...") routes through cmd.exe on Windows and pops a console
+ * every 30s — that was stealing keyboard focus constantly.
+ *
+ * HERMIA(2026-07-13): Fall back to bare `wsl hostname -I` when -d Ubuntu fails
+ * or returns empty. Also accept first IPv4 only.
  */
 function discoverWSLIP() {
-  try {
-    const output = execSync("wsl -d Ubuntu -e hostname -I", {
-      encoding: "utf-8",
-      timeout: 10000,
-    }).trim();
-    const ip = output.split(/\s+/)[0];
-    if (ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
-      return ip;
+  const attempts = [
+    ["-d", "Ubuntu", "-e", "hostname", "-I"],
+    ["-e", "hostname", "-I"],
+    ["hostname", "-I"],
+  ];
+  for (const args of attempts) {
+    try {
+      const output = execFileSync("wsl.exe", args, {
+        encoding: "utf-8",
+        timeout: 10000,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+      const ip = output.split(/\s+/).find((part) => /^\d+\.\d+\.\d+\.\d+$/.test(part));
+      if (ip) return ip;
+    } catch {
+      // try next strategy
     }
-  } catch {
-    // WSL might be starting up
   }
   return null;
 }
@@ -67,12 +80,28 @@ function discoverWSLIP() {
 /**
  * Check if a port is actually reachable on localhost.
  * wslrelay.exe sometimes binds a port but doesn't forward connections.
+ * For PostgREST (5434), also require an HTTP response when possible.
  */
 function checkPortReachable(port) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(2000);
     socket.on("connect", () => {
+      // For PostgREST, probe HTTP GET / to catch half-dead relays
+      if (port === 5434) {
+        socket.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
+        let gotData = false;
+        socket.on("data", () => {
+          gotData = true;
+          socket.destroy();
+          resolve(true);
+        });
+        setTimeout(() => {
+          socket.destroy();
+          resolve(gotData);
+        }, 1500);
+        return;
+      }
       socket.destroy();
       resolve(true);
     });
