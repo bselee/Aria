@@ -24,8 +24,13 @@ import urllib.request
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-SUPABASE_URL = "https://wvpgkyrbhvywdxnuxymn.supabase.co"
-SERVICE_ROLE_KEY = ""
+SUPABASE_URL = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL") or "https://wvpgkyrbhvywdxnuxymn.supabase.co"
+# Never hardcode secrets — GitHub push protection rejects sb_secret_* in history.
+SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or ""
+if not SERVICE_ROLE_KEY:
+    raise SystemExit(
+        "Set SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SERVICE_KEY) in the environment"
+    )
 
 # Find wsl.exe — it's in System32 but may not be in PATH for Python subprocess
 WSL_EXE = None
