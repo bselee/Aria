@@ -387,24 +387,39 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     }
 
     // ── Module health check ────────────────────────────────────────────
-    // Verify all critical AP modules can load before launching the bot.
-    // If any fail, Telegram alert is sent from inside verifyCriticalModules.
-    try {
-        const { verifyCriticalModules } = await import("../lib/ops/module-health-check");
-        const health = await verifyCriticalModules();
-        if (!health.healthy) {
-            console.error(`[boot] ❌ ${health.failures.length} critical module(s) failed health check — AP pipeline may be degraded`);
-            // Continue booting anyway — partial functionality is better than none.
-            // The Telegram alert from verifyCriticalModules tells Bill what's broken.
-        } else {
-            console.log(`[boot] ✅ All ${health.checked} critical modules loaded OK`);
+        // Verify all critical AP modules can load before launching the bot.
+        // If any fail, Telegram alert is sent from inside verifyCriticalModules.
+        try {
+            const { verifyCriticalModules } = await import("../lib/ops/module-health-check");
+            const health = await verifyCriticalModules();
+            if (!health.healthy) {
+                console.error(`[boot] ❌ ${health.failures.length} critical module(s) failed health check — AP pipeline may be degraded`);
+                // Continue booting anyway — partial functionality is better than none.
+                // The Telegram alert from verifyCriticalModules tells Bill what's broken.
+            } else {
+                console.log(`[boot] ✅ All ${health.checked} critical modules loaded OK`);
+            }
+        } catch (e: any) {
+            console.warn(`[boot] Module health check failed to run (non-fatal): ${e.message}`);
         }
-    } catch (e: any) {
-        console.warn(`[boot] Module health check failed to run (non-fatal): ${e.message}`);
-    }
 
-    bot.launch({ dropPendingUpdates: true })
-        .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        // ── PostgREST readiness gate ─────────────────────────────────────
+        // Wait for local PostgREST to accept real queries before launching
+        // crons/control-plane. Prevents boot race against WSL Docker cold starts.
+        try {
+            const { waitForPostgrestReady } = await import("../lib/ops/postgrest-ready");
+            const ready = await waitForPostgrestReady({ timeoutMs: 90_000, intervalMs: 2_000 });
+            if (!ready.ready) {
+                console.warn(
+                    `[boot] PostgREST not ready after ${ready.waitedMs}ms (state=${ready.state}) — continuing degraded`,
+                );
+            }
+        } catch (e: any) {
+            console.warn(`[boot] PostgREST readiness wait failed (non-fatal): ${e.message}`);
+        }
+
+        bot.launch({ dropPendingUpdates: true })
+            .catch((err: any) => console.error('❌ Bot launch error:', err.message));
 
     console.log('✅ ARIA IS LIVE AND LISTENING');
 
@@ -473,24 +488,13 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     }
 
     // ── Slack Request Detector ────────────────────────────────────────────
-    // Polls #purchase-orders / #purchasing for SKU requests, looks up Finale
-    // for open POs, posts threaded reply with PO + ETA if on order.
-    try {
-        const mod = await import('../lib/slack/request-detector');
-        const startSlackRequestDetector = mod.startSlackRequestDetector ?? (mod.default as any)?.startSlackRequestDetector;
-        if (typeof startSlackRequestDetector === 'function') {
-            await startSlackRequestDetector();
-            console.log('[boot] Slack Request Detector: ✅ Started');
-        } else {
-            console.warn('[boot] Slack Request Detector: Could not resolve start function');
-        }
-    } catch (err: any) {
-        console.warn('[boot] Slack Request Detector failed (non-fatal):', err.message);
-    }
-    // ── End Slack Request Detector ────────────────────────────────────────
+        // HERMIA(2026-07-13): Disabled. Token revoked / channel discovery broken
+        // for months; boot noise only. File kept at lib/slack/request-detector.ts
+        // for possible future revive. Heartbeat cron also retired.
+        console.log('[boot] Slack Request Detector: disabled (token_revoked / non-functional)');
 
-    // restore approvals
-    try {
+        // restore approvals
+        try {
         // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
         // linger as status='pending' in Supabase (a 2026-03 Uline approval sat
         // 'pending' for 2+ months because the boot loader only skipped them

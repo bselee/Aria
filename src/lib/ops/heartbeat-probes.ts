@@ -370,7 +370,7 @@ export const HEARTBEAT_PROBES: ProbeSpec[] = [
     // Infra (critical)
     { name: "supabase-ping", category: "infra", critical: true, probe: probeSupabasePing },
     { name: "finale-api", category: "infra", critical: true, probe: probeFinaleApi },
-    { name: "gmail-default-token", category: "infra", critical: true, probe: gmailTokenProbe("gmail-default-token", "token.json") },
+    { name: "gmail-default-token", category: "infra", critical: true, probe: gmailTokenProbe("gmail-default-token", "token-default.json") },
     { name: "gmail-ap-token", category: "infra", critical: true, probe: gmailTokenProbe("gmail-ap-token", "ap-token.json") },
     { name: "dashboard-http", category: "infra", critical: true, probe: probeDashboardHttp },
     // Process

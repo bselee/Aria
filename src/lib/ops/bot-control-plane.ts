@@ -1,3 +1,14 @@
+/**
+ * @file    src/lib/ops/bot-control-plane.ts
+ * @purpose Bot-side ops control plane: heartbeats, control-request poll, health eval.
+ *          DB readiness probes local PostgREST only (cloud Supabase removed 2026-07-01).
+ *          Soft-fails when DB is COMING_UP / unreachable — no throw storms.
+ * @author  Aria / Hermia
+ * @created 2026-03 (rewritten 2026-07-13 for local PostgREST)
+ * @deps    ../db, ./control-plane, ./control-plane-db, ./control-plane-runtime, ./postgrest-ready
+ * @env     PGRST_URL | NEXT_PUBLIC_SUPABASE_URL — PostgREST base URL
+ */
+
 import { createClient } from "../db";
 import {
     buildHeartbeatRecord,
@@ -15,6 +26,7 @@ import {
 } from "./control-plane-db";
 import { executeBotControlCommand } from "./control-plane-runtime";
 import { runNightshiftLoop } from "../intelligence/nightshift-agent";
+import { probePostgrestReady } from "./postgrest-ready";
 
 const BOT_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 const BOT_CONTROL_POLL_INTERVAL_MS = 2 * 60 * 1000;
@@ -29,73 +41,66 @@ export interface LoggerLike {
     error: (...args: any[]) => void;
 }
 
-function extractProjectRef(projectUrl: string | null | undefined): string | null {
-    const match = projectUrl?.match(/^https:\/\/([^.]+)\.supabase\.co/i);
-    return match?.[1] ?? null;
+/**
+ * Probe local PostgREST readiness.
+ * ACTIVE only when a real table query succeeds (via probePostgrestReady).
+ */
+export async function getPostgrestProjectStatus(
+    _fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+    const state = await probePostgrestReady(_fetchImpl);
+    if (state === "MISSING_URL") return null;
+    return state;
 }
 
+/** @deprecated Use getPostgrestProjectStatus — kept for external callers. */
 export async function getSupabaseProjectStatus(
     fetchImpl: typeof fetch = fetch,
 ): Promise<string | null> {
-    const projectUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-    const accessToken = process.env.SUPABASE_ACCESS_TOKEN;
-    const projectRef = extractProjectRef(projectUrl);
+    return getPostgrestProjectStatus(fetchImpl);
+}
 
-    if (!projectRef) return null;
-
-    if (accessToken) {
-        try {
-            const response = await fetchImpl(`https://api.supabase.com/v1/projects/${projectRef}`, {
-                headers: { Authorization: `Bearer ${accessToken}` },
-            });
-            if (response.ok) {
-                const data = await response.json() as { status?: string };
-                return data.status || null;
-            }
-        } catch {
-            // Fall back to REST probe below.
-        }
-    }
-
-    if (!projectUrl) return null;
-
-    try {
-        const response = await fetchImpl(`${projectUrl}/rest/v1/`, {
-            method: "HEAD",
-        });
-        return response.status === 401 || response.ok ? "ACTIVE" : "UNKNOWN";
-    } catch {
-        return "UNKNOWN";
-    }
+function isReadyStatus(status: string | null | undefined): boolean {
+    const s = (status || "").trim().toUpperCase();
+    return s === "ACTIVE" || s === "ACTIVE_HEALTHY";
 }
 
 export async function recordBotHeartbeatOnce(
     logger: LoggerLike = console,
 ): Promise<string | null> {
-    const supabase = createClient();
-    if (!supabase) {
-        logger.warn("[ops-control] Supabase unavailable, skipping bot heartbeat");
+    const projectStatus = await getPostgrestProjectStatus();
+
+    if (!isReadyStatus(projectStatus)) {
+        // Soft-fail: do not attempt upsert while schema cache / WSL is flapping
+        logger.warn(
+            `[ops-control] Local PostgREST not ready (${projectStatus || "UNKNOWN"}) — skip heartbeat write`,
+        );
+        return projectStatus;
+    }
+
+    const db = createClient();
+    if (!db) {
+        logger.warn("[ops-control] PostgREST client unavailable, skipping bot heartbeat");
         return null;
     }
 
-    const projectStatus = await getSupabaseProjectStatus();
     const heartbeat = buildHeartbeatRecord({
         agentName: "aria-bot",
         projectStatus,
         metadata: {
             pid: process.pid,
             cwd: process.cwd(),
+            dbPlane: "local-postgrest",
         },
     });
 
-    await upsertAgentHeartbeat(supabase, heartbeat);
-
-    const ready = (() => {
-        const s = (projectStatus || "").trim().toUpperCase();
-        return s === "ACTIVE" || s === "ACTIVE_HEALTHY";
-    })();
-    if (!ready) {
-        logger.warn(`[ops-control] Supabase project not fully ready (${projectStatus || "UNKNOWN"})`);
+    try {
+        await upsertAgentHeartbeat(db, heartbeat);
+    } catch (err: any) {
+        logger.warn(
+            `[ops-control] Heartbeat upsert soft-failed: ${err?.message || err}`,
+        );
+        return projectStatus;
     }
 
     return projectStatus;
@@ -105,13 +110,27 @@ export async function processBotControlRequestsOnce(
     ops: BotOpsSurface,
     logger: LoggerLike = console,
 ): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const projectStatus = await getPostgrestProjectStatus();
+    if (!isReadyStatus(projectStatus)) {
+        // Quiet skip — avoid "Control request poll failed: fetch failed" spam
+        return;
+    }
 
-    const request = await claimNextOpsControlRequest(supabase, {
-        consumer: "aria-bot",
-        targets: ["aria-bot", "all"],
-    });
+    const db = createClient();
+    if (!db) return;
+
+    let request: Awaited<ReturnType<typeof claimNextOpsControlRequest>> = null;
+    try {
+        request = await claimNextOpsControlRequest(db, {
+            consumer: "aria-bot",
+            targets: ["aria-bot", "all"],
+        });
+    } catch (err: any) {
+        logger.warn(
+            `[ops-control] Control claim soft-failed: ${err?.message || err}`,
+        );
+        return;
+    }
 
     if (!request) return;
 
@@ -120,37 +139,65 @@ export async function processBotControlRequestsOnce(
             throw new Error("restart_bot is reserved for the local watchdog");
         }
 
-        const result = await executeBotControlCommand(request.command as Extract<OpsControlCommand, "run_ap_poll_now" | "run_nightshift_now" | "clear_stuck_processing">, {
-            pollAPInbox: () => ops.pollAPInbox(),
-            runNightshiftLoop: () => runNightshiftLoop(),
-            clearStuckProcessing: () => resetStuckProcessing(supabase),
-        });
+        const result = await executeBotControlCommand(
+            request.command as Extract<
+                OpsControlCommand,
+                "run_ap_poll_now" | "run_nightshift_now" | "clear_stuck_processing"
+            >,
+            {
+                pollAPInbox: () => ops.pollAPInbox(),
+                runNightshiftLoop: () => runNightshiftLoop(),
+                clearStuckProcessing: () => resetStuckProcessing(db),
+            },
+        );
 
-        await completeOpsControlRequest(supabase, {
+        await completeOpsControlRequest(db, {
             id: request.id,
             consumer: "aria-bot",
             result: { result },
         });
         logger.log(`[ops-control] Completed ${request.command} (${request.id})`);
     } catch (err: any) {
-        await failOpsControlRequest(supabase, {
-            id: request.id,
-            consumer: "aria-bot",
-            errorMessage: err?.message || "unknown control-plane error",
-            result: { command: request.command },
-        });
-        logger.error(`[ops-control] Failed ${request.command} (${request.id}):`, err?.message || err);
+        try {
+            await failOpsControlRequest(db, {
+                id: request.id,
+                consumer: "aria-bot",
+                errorMessage: err?.message || "unknown control-plane error",
+                result: { command: request.command },
+            });
+        } catch {
+            // DB may have dropped mid-fail — already logged below
+        }
+        logger.error(
+            `[ops-control] Failed ${request.command} (${request.id}):`,
+            err?.message || err,
+        );
     }
 }
 
 export async function evaluateCurrentOpsHealth(logger: LoggerLike = console) {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const projectStatus = await getPostgrestProjectStatus();
+    if (!isReadyStatus(projectStatus)) {
+        logger.warn(
+            `[ops-control] Health eval skipped — PostgREST ${projectStatus || "UNKNOWN"}`,
+        );
+        return null;
+    }
 
-    const summary = await fetchOpsHealthSummary(supabase);
+    const db = createClient();
+    if (!db) return null;
+
+    let summary: Awaited<ReturnType<typeof fetchOpsHealthSummary>> = null;
+    try {
+        summary = await fetchOpsHealthSummary(db);
+    } catch (err: any) {
+        logger.warn(
+            `[ops-control] Health summary soft-failed: ${err?.message || err}`,
+        );
+        return null;
+    }
     if (!summary) return null;
 
-    const projectStatus = await getSupabaseProjectStatus();
     const decision = buildOpsHealthDecision({
         projectStatus,
         staleCrons: summary.stale_crons || [],
@@ -165,7 +212,9 @@ export async function evaluateCurrentOpsHealth(logger: LoggerLike = console) {
     });
 
     if (decision.degraded) {
-        logger.warn(`[ops-control] Current ops health degraded: ${decision.reasons.join(", ")}`);
+        logger.warn(
+            `[ops-control] Current ops health degraded: ${decision.reasons.join(", ")}`,
+        );
     }
 
     return { summary, projectStatus, decision };
@@ -175,12 +224,20 @@ export function startBotControlPlane(
     ops: BotOpsSurface,
     logger: LoggerLike = console,
 ) {
-    const runHeartbeat = () => void recordBotHeartbeatOnce(logger).catch((err) => {
-        logger.error("[ops-control] Bot heartbeat failed:", err?.message || err);
-    });
-    const runControlPoll = () => void processBotControlRequestsOnce(ops, logger).catch((err) => {
-        logger.error("[ops-control] Control request poll failed:", err?.message || err);
-    });
+    const runHeartbeat = () =>
+        void recordBotHeartbeatOnce(logger).catch((err) => {
+            logger.warn(
+                "[ops-control] Bot heartbeat soft-failed:",
+                err?.message || err,
+            );
+        });
+    const runControlPoll = () =>
+        void processBotControlRequestsOnce(ops, logger).catch((err) => {
+            logger.warn(
+                "[ops-control] Control request poll soft-failed:",
+                err?.message || err,
+            );
+        });
 
     runHeartbeat();
     void evaluateCurrentOpsHealth(logger).catch(() => undefined);

@@ -868,57 +868,18 @@ defineJob({
     budget: { durationMs: 120_000 },
 });
 
-// HERMIA(2026-06-11): Slack detector heartbeat — verifies the request-detector
-// loop is alive. Checks two signals:
-//   1. Most recent slack_requests entry age (detector writes on every SKU detection)
-//   2. aria-bot PM2 process uptime (if bot crashed, detector is dead too)
-// During business hours (M-F 8AM-5PM), alerts TG if no detector activity in 90 min.
-// Silent outside business hours and on weekends.
+// HERMIA(2026-07-13): Slack detector retired — token_revoked / non-functional.
+// Job kept registered as a silent no-op so existing schedules/history don't
+// look "missing"; no Telegram noise, no DB probes.
 defineJob({
     name: "slack-detector-heartbeat",
-    schedule: "*/15 8-17 * * 1-5",  // KAIZEN #7: 7-18 → 8-17, Mon-Fri
+    schedule: "0 0 1 1 *", // effectively never (Jan 1 midnight)
     onFail: "log",
-    description: "Slack detector heartbeat: alert if no slack_requests activity >90min during business hours.",
+    description: "RETIRED 2026-07-13 — Slack request detector disabled (token_revoked).",
     handler: async () => {
-        const { createClient } = await import("@/lib/supabase");
-        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");  // KAIZEN #7: downgraded from sendCritical
-        const db = createClient();
-        if (!db) return;
-
-        // Check most recent slack_requests entry
-        const { data: latest } = await db
-            .from("slack_requests")
-            .select("created_at")
-            .order("created_at", { ascending: false })
-            .limit(1);
-
-        if (!latest || latest.length === 0) {
-            // No entries ever — detector may have never worked
-            await sendTelegramNotify(
-                "Slack detector heartbeat: No slack_requests records found. " +
-                "Detector may have never started. Check aria-bot logs."
-            );
-            return;
-        }
-
-        const lastActivity = new Date(latest[0].created_at);
-        const ageMinutes = Math.round((Date.now() - lastActivity.getTime()) / 60_000);
-
-        if (ageMinutes > 90) {
-            // Check if it's actually quiet (no one posted) vs detector dead
-            // We can't distinguish perfectly, but >90 min during business hours
-            // warrants a heads-up
-            await sendTelegramNotify(
-                `Slack detector heartbeat: last slack_requests entry was ${ageMinutes}min ago ` +
-                `(${lastActivity.toLocaleString("en-US", { timeZone: "America/Denver" })}). ` +
-                `This could mean nobody posted, or the detector is dead. ` +
-                `Check: pm2 logs aria-bot --lines 20 | grep slack`
-            );
-        } else {
-            console.log(`[slack-heartbeat] OK — last activity ${ageMinutes}min ago`);
-        }
+        // no-op
     },
-    budget: { durationMs: 30_000 },
+    budget: { durationMs: 5_000 },
 });
 
 // HERMIA(2026-06-11): System heartbeat — proactive liveness probes for every
