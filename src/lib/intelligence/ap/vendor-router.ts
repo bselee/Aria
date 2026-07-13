@@ -2,11 +2,12 @@
  * @file    src/lib/intelligence/ap/vendor-router.ts
  * @purpose Minimal vendor routing rules. Core principle: ALL PDF invoices forward
  *          to Bill.com. Only skip: internal emails, Bill.com self-notifications,
- *          FedEx past-due notices, Amazon order confirmations, own statements.
+ *          FedEx past-due notices, Amazon order confirmations, own statements,
+ *          shipment notices / order acks / vendor statements.
  *          Dropship markers are PO-matching hints only — still forward.
  * @author  Hermia
  * @created 2026-05-28 (extracted from ap-agent.ts)
- * @updated 2026-06-18 (Bill Selee: stripped autopay — forward all PDFs)
+ * @updated 2026-07-10 (Belt Power shipment multi-forward incident — non-invoice skips)
  * @deps    none (pure config + matcher)
  */
 
@@ -21,7 +22,7 @@
 //   ALL PDF invoices are forwarded to Bill.com identically.
 //   Skips are for: prepaid/online vendors (no discoverable amount to forward),
 //   internal emails, Bill.com self-notifications, FedEx past-due notices,
-//   Amazon tracking, and own statements.
+//   Amazon tracking, own statements, and non-invoice classes (shipment/ack/statement).
 //   FedEx is the corrected exception: was wrongly marked autopay.
 //   Invoice PDFs from noreply@fedex.com flow through to forwarding + PO matching.
 
@@ -63,6 +64,24 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { subjectContains: 'build a soil statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
     { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
 
+    // ── Skip: non-invoice email classes (2026-07-10 Belt Power incident) ──
+    // Shipment notices / acks / statements can carry dollar amounts + PDFs.
+    // They are NOT invoices. Inline-invoice-handler was fabricating Organic AG
+    // bills from Belt Power shipment HTML and multi-forwarding to Bill.com.
+    { match: { subjectContains: 'shipment notification' }, action: 'skip', label: 'Shipment Notification (Not Invoice)' },
+    { match: { subjectContains: 'order has shipped' }, action: 'skip', label: 'Ship Confirm (Not Invoice)' },
+    { match: { subjectContains: 'your order has shipped' }, action: 'skip', label: 'Ship Confirm (Not Invoice)' },
+    { match: { subjectContains: 'order acknowledgement' }, action: 'skip', label: 'Order Ack (Not Invoice)' },
+    { match: { subjectContains: 'order acknowledgment' }, action: 'skip', label: 'Order Ack (Not Invoice)' },
+    { match: { subjectContains: 'monthly statement' }, action: 'skip', label: 'Vendor Monthly Statement' },
+    { match: { subjectContains: 'reminder on overdue' }, action: 'skip', label: 'Overdue Reminder (Not Invoice)' },
+    { match: { subjectContains: 'packing list' }, action: 'skip', label: 'Packing List (Not Invoice)' },
+    // Belt Power no-reply is shipment-only; invoices come from remitto@
+    { match: { fromExact: 'no-reply@beltpower.com' }, action: 'skip', label: 'Belt Power No-Reply (Ship Notices)' },
+    { match: { senderContains: 'beltpower', subjectContains: 'statement' }, action: 'skip', label: 'Belt Power Statement' },
+    { match: { senderContains: 'beltpower', subjectContains: 'overdue' }, action: 'skip', label: 'Belt Power Overdue Reminder' },
+    { match: { senderContains: 'beltpower', subjectContains: 'shipment' }, action: 'skip', label: 'Belt Power Shipment' },
+
     // ── Amazon: route to order parser ──────────────────────────────────
     { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },
     { match: { senderContains: 'ship-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Shipping' },
@@ -87,6 +106,10 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
 /**
  * Match an email sender against vendor routing rules.
  * Returns the first matching rule or null (null = default forward + PO matching).
+ *
+ * All specified match fields are ANDed. Domain/fromExact/senderContains are
+ * identity constraints; subjectContains is an optional subject filter.
+ * Pure subjectContains rules (no identity) are allowed.
  */
 export function matchVendorRouting(
     fromEmail: string,
@@ -99,17 +122,19 @@ export function matchVendorRouting(
     const subjectLower = (subject || '').toLowerCase();
 
     for (const rule of VENDOR_ROUTING_RULES) {
-        if (rule.match.domain && domain === rule.match.domain) return rule;
-        if (rule.match.fromExact && email === rule.match.fromExact.toLowerCase()) return rule;
-        if (rule.match.senderContains && (email.includes(rule.match.senderContains) || name.includes(rule.match.senderContains))) {
-            if (rule.match.subjectContains) {
-                if (subjectLower.includes(rule.match.subjectContains.toLowerCase())) return rule;
-                continue;
-            }
-            return rule;
+        const m = rule.match;
+
+        if (m.fromExact && email !== m.fromExact.toLowerCase()) continue;
+        if (m.domain && domain !== m.domain.toLowerCase()) continue;
+        if (m.senderContains) {
+            const needle = m.senderContains.toLowerCase();
+            if (!(email.includes(needle) || name.includes(needle))) continue;
         }
-        if (rule.match.subjectContains && !rule.match.senderContains && !rule.match.domain && !rule.match.fromExact) {
-            if (subjectLower.includes(rule.match.subjectContains.toLowerCase())) return rule;
+        if (m.subjectContains && !subjectLower.includes(m.subjectContains.toLowerCase())) continue;
+
+        // Require at least one constraint so empty match objects never fire
+        if (m.fromExact || m.domain || m.senderContains || m.subjectContains) {
+            return rule;
         }
     }
     return null;

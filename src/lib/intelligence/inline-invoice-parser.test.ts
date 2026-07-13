@@ -65,6 +65,28 @@ describe('detectInlineInvoice', () => {
         // Actually this body has NO matching keywords. $500.00 is present but no keywords.
         expect(detectInlineInvoice(body, false, subject)).toBe(false);
     });
+
+    // Regression 2026-07-10: Belt Power shipment notification was treated as
+    // an inline Organic AG invoice and multi-forwarded to Bill.com.
+    it('should NOT detect Belt Power shipment notification as inline invoice', () => {
+        const body = `Sales Order: 1252242 Customer PO#: GW061626 Total: $1726.01 Shipped via UPS Ground. Tracking 1Z999.`;
+        const subject = 'Shipment Notification: Sales Order: 1252242 Customer PO#: GW061626';
+        expect(detectInlineInvoice(body, false, subject)).toBe(false);
+    });
+
+    it('should NOT detect monthly statement / overdue reminder as inline invoice', () => {
+        const body = 'Your account balance is $500.00. Please remit payment for overdue invoices.';
+        expect(detectInlineInvoice(body, false, 'Monthly Statement for BuildASoil LLC')).toBe(false);
+        expect(detectInlineInvoice(body, false, 'BuildASoil LLC: Reminder on overdue invoices')).toBe(false);
+    });
+
+    it('should NOT treat Customer PO#: alphanumeric as BuildASoil PO-thread', () => {
+        // Only ONE keyword ("total") + dollar. Threshold is 2 unless PO-thread lowers it.
+        // Alphanumeric Customer PO# must NOT lower the threshold.
+        const body = 'Order total $211.19. Ready when you are.';
+        const subject = 'Update Customer PO#: GW061626';
+        expect(detectInlineInvoice(body, false, subject)).toBe(false);
+    });
 });
 
 // ──────────────────────────────────────────────────

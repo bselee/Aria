@@ -524,20 +524,21 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 if (routingRule) {
                     console.log(`     -> Vendor routing match: ${routingRule.label} (${routingRule.action})`);
 
-                    if (routingRule.action === 'ignore') {
-                        // Skip entirely — archive and mark read
-                        try {
-                            await gmail.users.messages.modify({
-                                userId: "me",
-                                id: m.gmail_message_id,
-                                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
-                            });
-                        } catch (e) { /* ignore */ }
-                        await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
-                            `Ignored: ${routingRule.label} — archived without forwarding`);
-                        console.log(`     ⏭️ Ignored (${routingRule.label})`);
-                        continue;
-                    }
+                    // 'skip' is the current vendor-router action; 'ignore' kept as legacy alias
+                                        if (routingRule.action === 'skip' || (routingRule.action as string) === 'ignore') {
+                                            // Skip entirely — archive and mark read (not an invoice)
+                                            try {
+                                                await gmail.users.messages.modify({
+                                                    userId: "me",
+                                                    id: m.gmail_message_id,
+                                                    requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                                                });
+                                            } catch (e) { /* ignore */ }
+                                            await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                                                `Skipped: ${routingRule.label} — archived without forwarding`);
+                                            console.log(`     ⏭️ Skipped (${routingRule.label})`);
+                                            continue;
+                                        }
 
                     if (routingRule.action === 'autopay') {
                         // Autopay / recurring — mark as read, do NOT forward to Bill.com

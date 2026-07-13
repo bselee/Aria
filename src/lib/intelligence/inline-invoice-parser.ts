@@ -32,6 +32,29 @@ import { z } from 'zod';
  * @param   emailSubject     - Optional subject line for PO-thread context
  * @returns true if the email likely contains inline invoice data
  */
+/**
+ * Subjects that are NEVER inline invoices (shipment notices, acks, statements).
+ * Belt Power + other vendors ship these as HTML with dollar amounts — the old
+ * heuristic treated them as Ed Zybura-style cost breakdowns and auto-generated
+ * Organic AG PDFs for Bill.com (2026-07-09 incident).
+ */
+const NON_INLINE_SUBJECT_PATTERNS: RegExp[] = [
+    /\bshipment\s+notification\b/i,
+    /\border\s+has\s+shipped\b/i,
+    /\byour\s+order\s+has\s+shipped\b/i,
+    /\border\s+acknowledg?e?ment\b/i,
+    /\bsales\s+order\b/i,
+    /\bpacking\s+list\b/i,
+    /\btracking\b/i,
+    /\bmonthly\s+statement\b/i,
+    /\bstatement\s+for\b/i,
+    /\breminder\s+on\s+overdue\b/i,
+    /\boverdue\s+invoices?\b/i,
+    /\bpast\s+due\b/i,
+    /\bdo\s+not\s+pay\b/i,
+    /\bthis\s+is\s+not\s+a\s+bill\b/i,
+];
+
 export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean, emailSubject?: string): boolean {
     // DECISION(2026-03-23): Allow PDF-bearing emails from credit-card vendors
     // (Colorful Packaging, Axiom Print) through. Their vendor-specific handlers
@@ -43,6 +66,12 @@ export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean
                                 /axiom\s*print/i.test(emailBody) ||
                                 /uline/i.test(emailBody);
     if (hasPdfAttachment && !isCreditCardVendor) return false;
+
+    // HARD BLOCK: non-invoice email classes (shipment / statement / ack)
+    const subject = emailSubject || '';
+    if (NON_INLINE_SUBJECT_PATTERNS.some((re) => re.test(subject))) {
+        return false;
+    }
 
     const dollarPattern = /\$[\d,]+\.\d{2}/;
     // Also match raw amounts like "1140.77" near money-context words
@@ -64,6 +93,7 @@ export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean
         /\bcharge\s*:/,
         // Vendor-common casual terms (learned from PO #124462)
         /\bbreakdown\b/,
+        /\bbreak\s*down\b/,
         /\bplus\b/,
         /\bground\b/,
         /\bshipp(ed|ing)\b/,
@@ -79,8 +109,9 @@ export function detectInlineInvoice(emailBody: string, hasPdfAttachment: boolean
     // If the email subject references a BuildASoil PO#, this is a vendor replying
     // to an active purchase order. Cost data in PO threads is almost always an
     // invoice/cost breakdown — lower threshold from 2 to 1.
+    // DECISION(2026-07-10): Require numeric PO (not "Customer PO#: GW061626").
     const isPOThread = emailSubject
-        ? /\bPO\s*#?\s*\d+/i.test(emailSubject) || /\bpurchase\s*order\b/i.test(emailSubject)
+        ? /\bPO\s*#?\s*\d{3,}/i.test(emailSubject) || /\bpurchase\s*order\b/i.test(emailSubject)
         : false;
 
     const threshold = isPOThread ? 1 : 2;
