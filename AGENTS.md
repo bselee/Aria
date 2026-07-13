@@ -9,8 +9,13 @@ Aria is a personal AI agent framework that orchestrates purchasing, AP automatio
 - **PM2 Processes**: 
   - `aria-bot` - Telegram bot, cron jobs, autonomous workflows
   - `aria-dashboard` - Next.js dashboard on port 3001
-- **Database**: Supabase (PostgreSQL)
-- **Cron**: 37 scheduled jobs in `src/cron/jobs/index.ts`
+  - `wsl-proxy` - forwards WSL Docker ports to Windows localhost
+- **Database**: Local only (cloud Supabase removed)
+  - PostgREST `http://localhost:5434` (`PGRST_URL`)
+  - Postgres Docker `aria-db` on host port **5433**
+  - SQLite sidecar `aria-local.db` via `src/lib/storage/local-db.ts`
+  - Client: `src/lib/db.ts` (`createClient`); `src/lib/supabase.ts` is a deprecated re-export
+- **Cron**: scheduled jobs in `src/cron/jobs/index.ts`
 
 ## Key Directories
 - `src/cli/` - Telegram bot handlers, CLI commands
@@ -32,12 +37,12 @@ pm2 logs aria-bot
 npm run build
 pm2 restart aria-dashboard
 
-# Database migrations
-cd supabase/migrations
-# Apply new migrations to Supabase
+# Database migrations (SQL files live under supabase/migrations/ — folder name is historical)
+# Prefer: node _run_migration.js <file>  OR  psql to aria-db :5433
+# Env must load from .env.local (PGRST_URL, PGRST_JWT_SECRET, DATABASE_URL)
 
 # Environment
-source .env.local
+# Windows: use --env-file=.env.local with node/tsx; do not rely on `source`
 ```
 
 ## Important Context
@@ -45,12 +50,13 @@ source .env.local
 - **Telegram Commands**: `/order`, `/apsummary`, `/vendor`, `/tracking`, etc.
 - **Autonomous Workflows**: PO escalation, delivery exceptions, vendor coordination run automatically
 - **Browser Automation**: Playwright-based cart filling for Uline/Axiom (headful mode for visibility)
+- **No cloud Supabase** — all DB traffic is local PostgREST/Postgres
 
 ## Common Tasks
 1. Add new cron job: Edit `src/cron/jobs/index.ts`, add `defineJob(...)` block
 2. Add Telegram command: Edit `src/cli/commands/hermia.ts`, add to `hermiaCommands` array
 3. Add dashboard panel: Create component in `src/components/dashboard/`, register in panel registry
-4. Query database: Use Supabase client in TypeScript, migrations in `supabase/migrations/`
+4. Query database: Use `createClient()` from `@/lib/db` (PostgREST). Migrations in `supabase/migrations/`
 
 ## Testing
 ```bash
