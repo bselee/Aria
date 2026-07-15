@@ -902,44 +902,19 @@ export default function ReceivedItemsPanel() {
                                 </button>
                             )}
 
-                            {/* ── Recent auto-completions (audit trail) ── */}
+                            {/* ── Auto-processed summary — full trail in Activity tab ── */}
                             {recentAutoCompletions.length > 0 && !showAllReceived && (
-                                <div className="border-b border-emerald-500/10">
+                                <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
+                                    <span className="text-[10px] font-mono text-emerald-500/50">●</span>
+                                    <span className="text-[10px] font-mono text-zinc-600">
+                                        {recentAutoCompletions.length} auto-completed
+                                    </span>
                                     <button
-                                        onClick={() => setShowCompleted(!showCompleted)}
-                                        className="w-full px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 transition-colors"
+                                        onClick={() => document.querySelector('[role="tab"][aria-label="Activity"]')?.click()}
+                                        className="text-[9px] font-mono text-blue-500/50 hover:text-blue-400 underline underline-offset-2 decoration-blue-500/20 transition-colors"
                                     >
-                                        <span className={showCompleted ? "text-emerald-400" : "text-emerald-400/60"}>●</span>
-                                        <span>{recentAutoCompletions.length} recently completed</span>
-                                        <span className="text-[9px] text-zinc-700">(last 7d)</span>
-                                        <span className="ml-auto">{showCompleted ? "−" : "+"}</span>
+                                        view in Activity
                                     </button>
-                                    {showCompleted && (
-                                        <div className="px-4 pb-2 space-y-1">
-                                            {recentAutoCompletions.map((item, i) => {
-                                                const isError = item.intent === "RECONCILIATION_ERROR";
-                                                return (
-                                                    <div key={i} className={`flex items-center gap-2 text-[10px] font-mono ${isError ? "text-rose-400/70" : "text-zinc-500"}`}>
-                                                        <span>{isError ? "⚠" : "✓"}</span>
-                                                        <span className="text-zinc-400">{item.invoiceNumber || "—"}</span>
-                                                        {item.poNumber && (
-                                                            <a
-                                                                href={`https://app.finaleinventory.com/orders/${item.poNumber}`}
-                                                                target="_blank"
-                                                                rel="noopener noreferrer"
-                                                                onClick={e => e.stopPropagation()}
-                                                                className="text-blue-400/70 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/20"
-                                                            >
-                                                                PO {item.poNumber}
-                                                            </a>
-                                                        )}
-                                                        {item.vendorName && <span className="text-zinc-600">{item.vendorName}</span>}
-                                                        <span className="text-zinc-700 ml-auto">{timeAgo(item.createdAt)}</span>
-                                                    </div>
-                                                );
-                                            })}
-                                        </div>
-                                    )}
                                 </div>
                             )}
                             {pos

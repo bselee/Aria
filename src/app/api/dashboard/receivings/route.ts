@@ -181,7 +181,7 @@ export async function GET(req: NextRequest) {
                 metadata?: any;
             }> = [];
             try {
-                const cutoff = new Date(Date.now() - 7 * 86400 * 1000).toISOString(); // 7 days
+                const cutoff = new Date(Date.now() - 30 * 86400 * 1000).toISOString(); // 30 days
                 const { data: activityLog } = await sb
                     .from('ap_activity_log')
                     .select('intent, created_at, metadata')
