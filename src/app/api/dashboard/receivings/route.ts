@@ -171,6 +171,36 @@ export async function GET(req: NextRequest) {
                 }
             }
 
+            // ── Recent auto-completions (audit trail for auto-processed) ──
+            let recentAutoCompletions: Array<{
+                intent: string;
+                poNumber?: string;
+                invoiceNumber?: string;
+                vendorName?: string;
+                createdAt: string;
+                metadata?: any;
+            }> = [];
+            try {
+                const cutoff = new Date(Date.now() - 7 * 86400 * 1000).toISOString(); // 7 days
+                const { data: activityLog } = await sb
+                    .from('ap_activity_log')
+                    .select('intent, created_at, metadata')
+                    .in('intent', ['RECONCILIATION_AUTO_APPLIED', 'RECONCILIATION_ERROR'])
+                    .gte('created_at', cutoff)
+                    .order('created_at', { ascending: false })
+                    .limit(20);
+                if (activityLog) {
+                    recentAutoCompletions = activityLog.map((row: any) => ({
+                        intent: row.intent,
+                        poNumber: row.metadata?.poNumber || row.metadata?.orderId || '',
+                        invoiceNumber: row.metadata?.invoice || row.metadata?.invoiceNumber || '',
+                        vendorName: row.metadata?.vendorName || '',
+                        createdAt: row.created_at,
+                        metadata: row.metadata,
+                    }));
+                }
+            } catch { /* skip recent completions */ }
+
             // ── Freight classifications for received PO vendors ──
             const freightClasses: Record<string, any> = {};
             for (const v of vendorNames) {
@@ -187,6 +217,7 @@ export async function GET(req: NextRequest) {
                 asOf: todayStr,
                 matchSuggestions,
                 freightClasses,
+                recentAutoCompletions,
             });
         }
 
