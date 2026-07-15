@@ -57,9 +57,9 @@ export async function loadActivePurchases(
     const vendorMap = new Map<string, { typical_tracking_source?: string; orders_email?: string; vendor_emails?: string[] }>();
     // Load vendor invoice patterns for purchase decision context
     const vendorIntelMap = new Map<string, { total_spend?: number; pending_reconciliation?: number; avg_freight?: number }>();
-    if (supabase && uniqueVendors.length > 0) {
+    if (db && uniqueVendors.length > 0) {
         try {
-            const { data: vData } = await supabase
+            const { data: vData } = await db
                 .from("vendor_profiles")
                 .select("vendor_name, typical_tracking_source, orders_email, vendor_emails, communication_pattern, is_noncomm")
                 .in("vendor_name", uniqueVendors);
@@ -70,7 +70,7 @@ export async function loadActivePurchases(
             console.warn("Failed to load vendor profiles in loadActivePurchases:", e);
         }
         try {
-            const { data: vipData } = await supabase
+            const { data: vipData } = await db
                 .from("vendor_invoices")
                 .select("vendor_name, total, freight, status")
                 .in("vendor_name", uniqueVendors)
@@ -105,13 +105,13 @@ export async function loadActivePurchases(
     const lifecycleMap = new Map<string, Record<string, any>>();
     const poSendMap = new Map<string, Array<Record<string, any>>>();
 
-    if (supabase && poNumbers.length > 0) {
+    if (db && poNumbers.length > 0) {
         try {
             for (let i = 0; i < poNumbers.length; i += 100) {
                 const chunk = poNumbers.slice(i, i + 100);
                 // KAIZEN #7: parallelize independent Supabase queries per chunk.
                 const [poRes, sendRes] = await Promise.all([
-                    supabase
+                    db
                         .from("purchase_orders")
                         .select(
                             "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
@@ -120,7 +120,7 @@ export async function loadActivePurchases(
                             "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence, tracking_paused, tracking_source"
                         )
                         .in("po_number", chunk),
-                    supabase
+                    db
                         .from("po_sends")
                         .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
                         .in("po_number", chunk),
@@ -152,11 +152,11 @@ export async function loadActivePurchases(
 
         // Fetch invoice statuses for all PO numbers
         const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean }>();
-        if (supabase && poNumbers.length > 0) {
+        if (db && poNumbers.length > 0) {
             try {
                 for (let i = 0; i < poNumbers.length; i += 100) {
                     const chunk = poNumbers.slice(i, i + 100);
-                    const { data: invData } = await supabase
+                    const { data: invData } = await db
                         .from("invoices")
                         .select("po_number, status, id, discrepancies")
                         .in("po_number", chunk);
@@ -174,7 +174,7 @@ export async function loadActivePurchases(
                 // "Next: Review and approve reconciliation"
                 for (let i = 0; i < poNumbers.length; i += 100) {
                     const chunk = poNumbers.slice(i, i + 100);
-                    const { data: paData } = await supabase
+                    const { data: paData } = await db
                         .from("ap_pending_approvals")
                         .select("order_id")
                         .eq("status", "pending")
@@ -201,7 +201,7 @@ export async function loadActivePurchases(
             }
         }
 
-        const completionSignals = await loadPOCompletionSignalIndex(supabase, poNumbers);
+        const completionSignals = await loadPOCompletionSignalIndex(db, poNumbers);
         const activePos: ActivePurchase[] = [];
 
         // ── Self-heal: fix lifecycle_stage mismatches ──────────────────
@@ -227,7 +227,7 @@ export async function loadActivePurchases(
                 lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: 'received' });
             }
         }
-        if (healMismatches.length > 0 && supabase) {
+        if (healMismatches.length > 0 && db) {
             try {
                 for (let i = 0; i < healMismatches.length; i += 100) {
                     const chunk = healMismatches.slice(i, i + 100);
@@ -368,6 +368,6 @@ export async function loadActivePurchases(
         return activePos;
     }
 
-    // No supabase — return empty
+    // No db — return empty
     return [];
 }
