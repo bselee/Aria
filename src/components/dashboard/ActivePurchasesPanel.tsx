@@ -553,6 +553,23 @@ export default function ActivePurchasesPanel() {
             return (a.orderDate || "").localeCompare(b.orderDate || "");
         });
 
+    // ── Aggregate stats for human-readable alert banner ──
+    const aggTotal = visiblePurchases.length;
+    const aggOverdue = purchases.filter(p => isOverdue(p) && !dismissed.has(p.orderId)).length;
+    const aggUnacknowledged = purchases.filter(p =>
+        !dismissed.has(p.orderId) && !p.isReceived &&
+        p.sentVerification?.verified && !p.vendorAcknowledgedAt
+    ).length;
+    const aggNoTracking = purchases.filter(p =>
+        !dismissed.has(p.orderId) && !p.isReceived &&
+        p.sentVerification?.verified &&
+        !(p.trackingNumbers?.length || p.shipments?.length)
+    ).length;
+    const aggInTransit = purchases.filter(p =>
+        !dismissed.has(p.orderId) && !p.isReceived &&
+        (p.shipments?.length || p.trackingNumbers?.length)
+    ).length;
+
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
@@ -624,19 +641,47 @@ export default function ActivePurchasesPanel() {
                             </button>
                         </div>
                     )}
-                    {loading ? (
-                        <div className="px-4 py-2 space-y-2.5">
-                            {[1, 2, 3].map(i => (
-                                <div key={i} className="flex items-center gap-2.5">
-                                    <div className="skeleton-shimmer h-4" style={{ width: `${35 + i * 12}%` }} />
-                                    <div className="skeleton-shimmer h-3 w-14 ml-auto" />
-                                </div>
-                            ))}
-                        </div>
-                    ) : error ? (
+                                        {/* ── Aggregate Status Banner ── */}
+                                        {!loading && !error && purchases.length > 0 && (
+                                            <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-900/30 flex flex-wrap items-center gap-x-2 gap-y-1">
+                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
+                                                    <span className="font-bold text-blue-400">{purchases.length}</span> Active
+                                                </span>
+                                                {purchases.filter(isOverdue).length > 0 && (
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
+                                                        <span className="font-bold text-rose-400">{purchases.filter(isOverdue).length}</span> Overdue
+                                                    </span>
+                                                )}
+                                                {purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length > 0 && (
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
+                                                        <span className="font-bold text-amber-400">{purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length}</span> Unacknowledged
+                                                    </span>
+                                                )}
+                                                {purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length > 0 && (
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
+                                                        <span className="font-bold text-orange-400">{purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length}</span> No Tracking
+                                                    </span>
+                                                )}
+                                                {purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length > 0 && (
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
+                                                        <span className="font-bold text-cyan-400">{purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length}</span> In Transit
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
+                                        {loading ? (
+                                            <div className="px-4 py-3 space-y-2.5">
+                                                <span className="block text-[10px] font-mono text-zinc-600 pb-1">Loading active purchases…</span>
+                                                {[1, 2, 3].map(i => (
+                                                    <div key={i} className="flex items-center gap-2.5">
+                                                        <div className="skeleton-shimmer h-3 rounded" style={{ width: `${40 + i * 10}%`, maxWidth: '65%' }} />
+                                                        <div className="skeleton-shimmer h-2.5 w-12 ml-auto rounded" />
+                                                    </div>
+                                                ))}
+                                            </div>) : error ? (
                         <div className="px-4 py-3 border-t border-zinc-800/60"><span className="text-xs font-mono text-rose-400">{error}</span></div>
                     ) : visiblePurchases.length === 0 ? (
-                        <div className="px-4 py-3 border-t border-zinc-800/60"><span className="text-xs font-mono text-zinc-600">No active purchases.</span></div>
+                        <div className="px-4 py-3 border-t border-zinc-800/60"><span className="text-xs font-mono text-zinc-500">No active POs — all sent orders are received or not yet in the 60d window</span></div>
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50" style={{ height: bodyHeight }}>
                             {visiblePurchases.map(po => {

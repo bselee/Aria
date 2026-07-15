@@ -174,6 +174,15 @@ function getNextActionText(po: ReceivedPO, apLabel: string): string {
     return "📋 Awaiting invoice match";
 }
 
+function daysSince(dateStr: string | undefined | null): number | null {
+    if (!dateStr) return null;
+    const d = parseDenverDate(dateStr);
+    if (!d) return null;
+    const now = new Date();
+    const diff = now.getTime() - d.getTime();
+    return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
 function hasPartialLineQuantities(po: ReceivedPO): boolean {
     return po.items.some(item => item.receivedQuantity !== undefined || item.receivedInWindow !== undefined);
 }
@@ -567,7 +576,12 @@ export default function ReceivedItemsPanel() {
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
                 <span className="text-[10px] text-[var(--dash-ts)] font-mono">WTD</span>
-                <div className="flex-1" />
+                                {matchSuggestions.length > 0 && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                        {matchSuggestions.length} match{matchSuggestions.length > 1 ? "es" : ""}
+                                    </span>
+                                )}
+                                <div className="flex-1" />
                 {!loading && pos.length > 0 && (
                     <span className="text-xs font-mono text-zinc-500">{pos.length} POs</span>
                 )}
@@ -592,19 +606,62 @@ export default function ReceivedItemsPanel() {
                             <button onClick={() => setModifySuccess(null)} className="text-emerald-400/50 hover:text-emerald-300">✕</button>
                         </div>
                     )}
+                    {!loading && !error && pos.length > 0 && (() => {
+                        const unmatched = pos.filter(p => {
+                            const lbl = apMap[p.orderId]?.label || "";
+                            return lbl === "UNMATCHED" || lbl === "";
+                        }).length;
+                        const partialCount = pos.filter(p => getDynamicReceiptStatus(p) === "partial").length;
+                        const discrepancyCount = pos.filter(p => {
+                            const lbl = apMap[p.orderId]?.label || "";
+                            return lbl === "RECONCILED ±";
+                        }).length;
+                        const pendingCount = pos.filter(p => {
+                            const lbl = apMap[p.orderId]?.label || "";
+                            return lbl === "PENDING";
+                        }).length;
+                        return (
+                            <div className="px-4 py-1.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/30">
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                    {pos.length} Received
+                                </span>
+                                {unmatched > 0 && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                        <span className="text-rose-400 font-semibold">{unmatched}</span> Unmatched
+                                    </span>
+                                )}
+                                {partialCount > 0 && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                        <span className="text-amber-300 font-semibold">{partialCount}</span> Partial
+                                    </span>
+                                )}
+                                {discrepancyCount > 0 && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                        <span className="text-blue-400 font-semibold">{discrepancyCount}</span> Discrepancy
+                                    </span>
+                                )}
+                                {pendingCount > 0 && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                        <span className="text-amber-300 font-semibold">{pendingCount}</span> Pending Approval
+                                    </span>
+                                )}
+                            </div>
+                        );
+                    })()}
                     {loading ? (
-                        <div className="px-4 py-2 space-y-2.5">
+                        <div className="px-4 py-3 space-y-2.5">
+                            <div className="text-[10px] font-mono text-zinc-600 mb-1.5 animate-pulse">Loading received POs...</div>
                             {[1, 2, 3].map(i => (
                                 <div key={i} className="flex items-center gap-2.5">
-                                    <div className="skeleton-shimmer h-3.5" style={{ width: `${30 + i * 12}%` }} />
-                                    <div className="skeleton-shimmer h-3 w-16 ml-auto" />
+                                    <div className="skeleton-shimmer h-3" style={{ width: `${20 + i * 8}%` }} />
+                                    <div className="skeleton-shimmer h-3 w-12 ml-auto" />
                                 </div>
                             ))}
                         </div>
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
                     ) : pos.length === 0 ? (
-                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in 30d window</span></div>
+                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-500">No receipts in the last 30 days — all received POs have been processed</span></div>
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
                             {todaySummary && (
@@ -763,8 +820,21 @@ export default function ReceivedItemsPanel() {
                                     >
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
-                                            <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
-                                            <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
+                                                                                    <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
+                                                                                    {(() => {
+                                                                                        const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
+                                                                                        const ordDays = daysSince(po.orderDate);
+                                                                                        const chips: string[] = [];
+                                                                                        if (rcvDays !== null) chips.push(`rcv ${rcvDays}d`);
+                                                                                        if (ordDays !== null) chips.push(`ord ${ordDays}d`);
+                                                                                        if (chips.length === 0) return null;
+                                                                                        return (
+                                                                                            <span className="text-[10px] font-mono text-zinc-600 shrink-0">
+                                                                                                · {chips.join(" · ")}
+                                                                                            </span>
+                                                                                        );
+                                                                                    })()}
+                                                                                    <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
                                             {receiptBadge(po) && (
                                                 <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${receiptBadge(po)!.cls}`}>
                                                     {receiptBadge(po)!.label}
@@ -810,14 +880,6 @@ export default function ReceivedItemsPanel() {
                                                     </span>
                                                 );
                                             })}
-                                            {(() => {
-                                                const apLabel = apStatus?.label || "";
-                                                const txt = getNextActionText(po, apLabel);
-                                                const short = txt.replace(/ —.*$/, "");
-                                                return (
-                                                    <span className="text-[10px] font-mono text-zinc-500 italic shrink-0">· {short}</span>
-                                                );
-                                            })()}
                                         </div>
                                         {/* For PARTIAL receipts: show per-item detail breakdown */}
                                         {getDynamicReceiptStatus(po) === "partial" && po.items.length > 0 && (
@@ -907,14 +969,20 @@ export default function ReceivedItemsPanel() {
 
                                                 return (
                                                     <>
-                                                        {/* Left: State badge only (action text on Line 2) */}
-                                                        <div className="flex items-center gap-2 shrink-0">
-                                                            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${state.tone}`} title={state.action}>
-                                                                {state.emoji} {state.label}
-                                                            </span>
-                                                        </div>
+                                                        {/* Left: State badge only (action text below) */}
+                                                                                                                <div className="flex items-center gap-2 shrink-0">
+                                                                                                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${state.tone}`} title={state.action}>
+                                                                                                                        {state.emoji} {state.label}
+                                                                                                                    </span>
+                                                                                                                </div>
+                                                                                                                {/* Prominent next-action text line */}
+                                                                                                                <div className="w-full mt-1.5">
+                                                                                                                    <span className="text-[11px] font-mono px-2 py-1 rounded block bg-zinc-800/50 border border-zinc-700/40 text-zinc-300 leading-relaxed">
+                                                                                                                        {state.action}
+                                                                                                                    </span>
+                                                                                                                </div>
 
-                                                        {/* Expanded approval card — shows exactly what is being approved */}
+                                                                                                                {/* Expanded approval card — shows exactly what is being approved */}
                                                         {rec?.hasPendingApproval && rec?.matchedInvoice && (
                                                             <div className="mt-2 w-full bg-amber-500/5 border border-amber-500/20 rounded px-2.5 py-2">
                                                                 <div className="text-[10px] font-mono text-amber-300/80 mb-1">Invoice {rec.matchedInvoice.invoice_number} from {po.supplier}</div>
