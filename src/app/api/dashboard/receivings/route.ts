@@ -132,17 +132,40 @@ export async function GET(req: NextRequest) {
                                 total: Number(inv.total || 0),
                                 lineItems: inv.raw_data?.lineItems || [],
                             });
-                            // Always include the invoice, even with no auto-match candidates
-                            // so the operator can manually assign.
-                            matchSuggestions.push({
-                                invoiceId: inv.id,
-                                invoiceNumber: inv.invoice_number,
-                                vendorName: inv.vendor_name,
-                                invoiceDate: inv.invoice_date,
-                                invoiceTotal: inv.total,
-                                candidates: result.candidates.slice(0, 5),
-                                autoApplyReady: result.autoApplyReady ?? false,
-                            });
+                            // Auto-apply high-confidence matches: score ≥80 and autoApplyReady
+                            const best = result.candidates[0];
+                            const shouldAutoApply = best && best.score >= 80 && result.autoApplyReady;
+
+                            if (shouldAutoApply) {
+                                // Auto-match: link invoice to PO silently
+                                try {
+                                    await sb
+                                        .from('vendor_invoices')
+                                        .update({ po_number: best.orderId, status: 'reconciled', updated_at: new Date().toISOString() })
+                                        .eq('id', inv.id);
+
+                                    // Auto-complete: if no price/qty issues, transition lifecycle
+                                    const { transitionLifecycleState } = await import('@/lib/purchasing/po-lifecycle');
+                                    await transitionLifecycleState(
+                                        best.orderId,
+                                        'RECONCILED',
+                                        'auto-matcher',
+                                        { invoice: inv.invoice_number, score: best.score, reasons: best.reasons }
+                                    );
+                                } catch { /* auto-apply failed silently */ }
+                                // Don't add to suggestions — it's handled
+                            } else {
+                                // Needs human attention: show in suggestions
+                                matchSuggestions.push({
+                                    invoiceId: inv.id,
+                                    invoiceNumber: inv.invoice_number,
+                                    vendorName: inv.vendor_name,
+                                    invoiceDate: inv.invoice_date,
+                                    invoiceTotal: inv.total,
+                                    candidates: result.candidates.slice(0, 5),
+                                    autoApplyReady: result.autoApplyReady ?? false,
+                                });
+                            }
                         } catch { /* skip individual match failures */ }
                     }
                 }

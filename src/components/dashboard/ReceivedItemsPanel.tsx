@@ -223,6 +223,13 @@ export default function ReceivedItemsPanel() {
         unreconciledPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string; lifecycleState: string }>;
     } | null>(null);
     const [unmatchedLoading, setUnmatchedLoading] = useState(false);
+    /** Show all received POs toggle (default: only exceptions) */
+    const [showAllReceived, setShowAllReceived] = useState(false);
+    /** Computed: count of POs needing human attention */
+    const needsReviewCount = pos.filter(p => {
+        const lbl = apMap[p.orderId]?.label || "";
+        return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
+    }).length;
     /** Manual match state: invoiceId → manual PO input */
     const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
 
@@ -867,7 +874,34 @@ export default function ReceivedItemsPanel() {
                                 )}
                             </div>
 
-                            {pos.map(po => {
+                            {/* ── Needs Review / All Received split ── */}
+                            {needsReviewCount > 0 && (
+                                <div className="px-4 py-1.5 border-b border-rose-500/20 bg-rose-500/5 flex items-center gap-2">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                                    <span className="text-[10px] font-mono text-rose-300/90 uppercase tracking-wider">
+                                        {needsReviewCount} need{needsReviewCount > 1 ? "" : "s"} review
+                                    </span>
+                                    <div className="flex-1" />
+                                    <span className="text-[9px] font-mono text-zinc-600">
+                                        {pos.length - needsReviewCount} auto-processed
+                                    </span>
+                                </div>
+                            )}
+                            {pos.length > needsReviewCount && (
+                                <button
+                                    onClick={() => setShowAllReceived(!showAllReceived)}
+                                    className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-b border-zinc-800/40 transition-colors text-left"
+                                >
+                                    {showAllReceived ? "− Show only items needing review" : `+ Show all ${pos.length} received POs`}
+                                </button>
+                            )}
+                            {pos
+                                .filter(po => {
+                                    if (showAllReceived) return true;
+                                    const lbl = apMap[po.orderId]?.label || "";
+                                    return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
+                                })
+                                .map(po => {
                                 const apStatus = apMap[po.orderId];
                                 const dollars = fmtDollars(po.total);
                                 const discrepancy = partialDiscrepancy(po);
