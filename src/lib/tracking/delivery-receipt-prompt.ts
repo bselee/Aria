@@ -70,7 +70,7 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
     const maxCutoff = new Date(now.getTime() - PROMPT_MIN_HOURS * 3600000).toISOString();
 
     // Step 1: Find delivered shipments in the prompt window
-    const { data: shipments, error } = await supabase
+    const { data: shipments, error } = await db
         .from("shipment_intelligence")
         .select("tracking_number, po_numbers, vendor_names, carrier_name, delivered_at, status_category, active")
         .eq("status_category", "delivered")
@@ -90,7 +90,7 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
         return { prompted: 0, skippedAlreadyPrompted: 0, skippedNoCandidates: true, candidates: [] };
     }
 
-    const { data: receivedPOs } = await supabase
+    const { data: receivedPOs } = await db
         .from("purchase_orders")
         .select("po_number, completion_state")
         .in("po_number", allPoNumbers)
@@ -100,7 +100,7 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
 
     // Step 3: Check ap_activity_log for recently prompted/skipped POs
     const skipCutoff = new Date(now.getTime() - SKIP_COOLDOWN_DAYS * 86400000).toISOString();
-    const { data: recentPrompts } = await supabase
+    const { data: recentPrompts } = await db
         .from("ap_activity_log")
         .select("metadata")
         .eq("intent", "RECEIPT_PROMPT")

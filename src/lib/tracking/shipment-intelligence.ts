@@ -619,7 +619,7 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
     const db = createClient();
     if (!db || !poNumber) return;
 
-    const { data: shipments } = await supabase
+    const { data: shipments } = await db
         .from("shipments")
         .select("tracking_number, public_tracking_url")
         .contains("po_numbers", [poNumber])
@@ -629,7 +629,7 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
     const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));
 
     // 1. Sync to local Supabase cache
-    await supabase
+    await db
         .from("purchase_orders")
         .upsert({
             po_number: poNumber,
@@ -677,7 +677,7 @@ async function appendLifecycleTransition(
     const db = createClient();
     if (!db) return;
 
-    const { data: existing } = await supabase
+    const { data: existing } = await db
         .from("purchase_orders")
         .select("lifecycle_transitions")
         .eq("po_number", poNumber)
@@ -686,7 +686,7 @@ async function appendLifecycleTransition(
     const existingTransitions: LifecycleTransitionEntry[] = existing?.lifecycle_transitions || [];
     const updatedTransitions = [...existingTransitions, entry];
 
-    await supabase
+    await db
         .from("purchase_orders")
         .update({ lifecycle_transitions: updatedTransitions })
         .eq("po_number", poNumber);
@@ -713,7 +713,7 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
     const statusCategory = shipment.status_category || null;
 
     // Single atomic read of all columns we need to evaluate + write atomically
-    const { data: existingPO } = await supabase
+    const { data: existingPO } = await db
         .from("purchase_orders")
         .select(
             "tracking_status_summary, lifecycle_stage, vendor_acknowledged_at, " +
@@ -836,7 +836,7 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
     if (!db) return null;
 
     const normalized = normalizeTrackingIdentity(input.trackingNumber);
-    const { data: existing } = await supabase
+    const { data: existing } = await db
         .from("shipments")
         .select("*")
         .eq("tracking_key", normalized.trackingKey)
@@ -876,7 +876,7 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
         ? mergeShipmentEvidence(existing as ShipmentRecord, input)
         : baseRecord;
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("shipments")
         .upsert(merged, { onConflict: "tracking_key" })
         .select("*")
@@ -917,7 +917,7 @@ export async function refreshShipmentStatus(record: ShipmentRecord): Promise<Shi
     const status = await getTrackingStatus(record.tracking_number);
     const updated = mergeTrackingStatus(record, status);
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("shipments")
         .update(updated)
         .eq("tracking_key", record.tracking_key)
@@ -935,7 +935,7 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
     const db = createClient();
     if (!db || poNumbers.length === 0) return [];
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("shipments")
         .select("*")
         .overlaps("po_numbers", poNumbers)
@@ -961,7 +961,7 @@ async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
 
     for (let i = 0; i < poNumbers.length; i += 100) {
         const chunk = poNumbers.slice(i, i + 100);
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("purchase_orders")
             .select("po_number, status")
             .in("po_number", chunk);
@@ -998,7 +998,7 @@ async function listActiveShipmentsRaw(): Promise<ShipmentRecord[]> {
     monday.setUTCHours(0, 0, 0, 0);
     const thisWeekStart = monday.toISOString();
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("shipments")
         .select("*")
         .eq("active", true)
