@@ -64,6 +64,7 @@ type MatchSuggestion = {
         isOpen: boolean;
     }>;
     autoApplyReady: boolean;
+    autoMatched?: boolean;
 };
 
 type FreightClass = {
@@ -765,8 +766,22 @@ export default function ReceivedItemsPanel() {
                                                     </span>
                                                 </div>
 
-                                                {hasCandidates ? (
-                                                    /* ── Auto-suggested candidate(s) ── */
+                                                {hasCandidates && s.autoMatched ? (
+                                                    /* ── Auto-matched → awaiting human completion ── */
+                                                    <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                                                        <span className="text-[10px] font-mono text-emerald-400">✓ Auto-matched</span>
+                                                        <span className="text-[10px] font-mono text-zinc-300">→ PO {best.orderId}</span>
+                                                        <span className="text-[9px] font-mono text-zinc-600">{best.reasons.slice(0, 2).join(" · ")}</span>
+                                                        <div className="flex-1" />
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); approveReconciliation(best.orderId, s.invoiceId); }}
+                                                            disabled={approvingReconcile.has(best.orderId)}
+                                                            className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors font-semibold ${approvingReconcile.has(best.orderId) ? 'opacity-50 cursor-wait bg-zinc-800/40 border-zinc-700/40 text-zinc-500' : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'}`}
+                                                        >
+                                                            Review & Complete PO
+                                                        </button>
+                                                    </div>
+                                                ) : hasCandidates ? (
                                                     <div className="mt-1.5 flex items-center gap-2 flex-wrap">
                                                         {(() => {
                                                             const scoreColor = best.score >= 80 ? "text-emerald-400" : best.score >= 60 ? "text-amber-400" : "text-zinc-400";

@@ -137,23 +137,44 @@ export async function GET(req: NextRequest) {
                             const shouldAutoApply = best && best.score >= 80 && result.autoApplyReady;
 
                             if (shouldAutoApply) {
-                                // Auto-match: link invoice to PO silently
+                                // Auto-match: link invoice to PO, but DON'T complete PO in Finale
+                                // Human must review and click Complete PO to finalize
                                 try {
                                     await sb
                                         .from('vendor_invoices')
-                                        .update({ po_number: best.orderId, status: 'reconciled', updated_at: new Date().toISOString() })
+                                        .update({ po_number: best.orderId, status: 'matched', updated_at: new Date().toISOString() })
                                         .eq('id', inv.id);
 
-                                    // Auto-complete: if no price/qty issues, transition lifecycle
-                                    const { transitionLifecycleState } = await import('@/lib/purchasing/po-lifecycle');
-                                    await transitionLifecycleState(
-                                        best.orderId,
-                                        'RECONCILED',
-                                        'auto-matcher',
-                                        { invoice: inv.invoice_number, score: best.score, reasons: best.reasons }
-                                    );
+                                    // Log the auto-match event — human still needs to complete
+                                    await sb
+                                        .from('ap_activity_log')
+                                        .insert({
+                                            intent: 'RECONCILIATION_AUTO_APPLIED',
+                                            action_taken: `Auto-matched to PO ${best.orderId} — awaiting human review`,
+                                            metadata: {
+                                                invoiceNumber: inv.invoice_number,
+                                                poNumber: best.orderId,
+                                                vendorName: inv.vendor_name,
+                                                score: best.score,
+                                                reasons: best.reasons,
+                                                status: 'needs_review',
+                                            },
+                                            email_from: inv.vendor_name || '',
+                                            email_subject: `Invoice ${inv.invoice_number} auto-matched`,
+                                        });
                                 } catch { /* auto-apply failed silently */ }
-                                // Don't add to suggestions — it's handled
+
+                                // Show in suggestions as auto-matched, not hidden
+                                matchSuggestions.push({
+                                    invoiceId: inv.id,
+                                    invoiceNumber: inv.invoice_number,
+                                    vendorName: inv.vendor_name,
+                                    invoiceDate: inv.invoice_date,
+                                    invoiceTotal: inv.total,
+                                    candidates: result.candidates.slice(0, 5),
+                                    autoApplyReady: true,
+                                    autoMatched: true,  // flag: auto-matched, needs human completion
+                                });
                             } else {
                                 // Needs human attention: show in suggestions
                                 matchSuggestions.push({
