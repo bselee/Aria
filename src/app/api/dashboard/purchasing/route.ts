@@ -24,9 +24,9 @@ export async function GET(req: NextRequest) {
     if (Date.now() - lastInvalidationCheck > INVALIDATION_CHECK_INTERVAL) {
         try {
             const db = createClient();
-            if (supabase && resaleSlot.at > 0) {
+            if (db && resaleSlot.at > 0) {
                 const cacheAt = resaleSlot.at;
-                const { data } = await supabase
+                const { data } = await db
                     .from('purchase_orders')
                     .select('updated_at')
                     .order('updated_at', { ascending: false })
@@ -43,7 +43,7 @@ export async function GET(req: NextRequest) {
 
                 // Receipts logged by po-receiving-watcher (bot process) must also bust
                 // Ordering need math — open PO qty drops when goods hit Finale stock.
-                const { data: receiptRow } = await supabase
+                const { data: receiptRow } = await db
                     .from('ap_activity_log')
                     .select('created_at')
                     .eq('intent', 'PO_RECEIVED')

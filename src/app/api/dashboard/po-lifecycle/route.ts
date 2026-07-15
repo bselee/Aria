@@ -16,7 +16,7 @@ export async function GET() {
             return NextResponse.json({ counts: {} });
         }
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("purchase_orders")
             .select("lifecycle_state");
 

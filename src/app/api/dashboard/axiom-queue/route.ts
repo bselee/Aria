@@ -52,7 +52,7 @@ export async function GET(req: NextRequest) {
     }
 
     try {
-        const { data: rows, error } = await supabase
+        const { data: rows, error } = await db
             .from('axiom_demand_queue')
             .select('*')
             .order('created_at', { ascending: false })

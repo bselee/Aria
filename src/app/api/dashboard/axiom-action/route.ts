@@ -29,14 +29,14 @@ export async function POST(req: NextRequest) {
                 updates.suggested_reorder_qty = qty;
             }
 
-            const { error } = await supabase
+            const { error } = await db
                 .from('axiom_demand_queue')
                 .update(updates)
                 .eq('id', id);
 
             if (error) throw new Error(error.message);
         } else if (action === 'reject') {
-            const { error } = await supabase
+            const { error } = await db
                 .from('axiom_demand_queue')
                 .update({ status: 'rejected', updated_at: new Date().toISOString() })
                 .eq('id', id);
