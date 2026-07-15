@@ -4,13 +4,13 @@
  *          clean Markdown summary for Telegram, covering invoices, match rates,
  *          stuck items, OCR issues, and reconciliation health.
  *
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * @author  Hermia
  * @created 2026-06-05
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -9,13 +9,13 @@ dotenvConfig({ path: '.env.local' });
 
 import { getAuthenticatedClient } from '@/lib/gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 (async () => {
     const auth = await getAuthenticatedClient('default');
     const gmail = GmailApi({ version: 'v1', auth });
-    const supabase = createClient();
-    if (!supabase) { console.error('no supabase'); process.exit(1); }
+    const db = createClient();
+    if (!db) { console.error('no supabase'); process.exit(1); }
 
     // List recent drafts
     const drafts = await gmail.users.drafts.list({ userId: 'me', maxResults: 50 });

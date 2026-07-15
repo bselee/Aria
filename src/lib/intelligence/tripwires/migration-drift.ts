@@ -10,7 +10,7 @@
 
 import { readdir } from "node:fs/promises";
 import path from "node:path";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export type TripwireResult = {
     tripwire: string;

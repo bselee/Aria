@@ -4,11 +4,11 @@
  *          for products that Finale's demand engine has dropped.
  * @author  Hermia
  * @created 2026-06-11
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import type { AriaPurchaseHistory } from "./purchasing-candidate";
 
 /**
@@ -31,8 +31,8 @@ export async function batchLoadAriaPurchaseHistory(
 
     if (productIds.length === 0) return result;
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.warn("[aria-purchase-history] Supabase client not available");
         // Return empty history for all products
         for (const id of productIds) {

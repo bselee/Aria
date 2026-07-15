@@ -51,7 +51,7 @@ vi.mock("../../anthropic", () => ({
     })),
 }));
 
-vi.mock("../../supabase", () => ({
+vi.mock("../../db", () => ({
     createClient: vi.fn(() => ({
         from: (table: string) => {
             if (table !== "vendor_invoices") {

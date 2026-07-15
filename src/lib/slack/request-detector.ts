@@ -15,14 +15,14 @@
  * @updated 2026-06-16 — Bucket 1 auto-post (SKU+PO → reply as Bill),
  *          emoji protocol (👀→✅/💚), tracking link embedding,
  *          Bucket 2 clarification for non-SKU addressed messages.
- * @deps    @slack/web-api, @/lib/finale/client, @/lib/supabase
+ * @deps    @slack/web-api, @/lib/finale/client, @/lib/db
  * @env     SLACK_BOT_TOKEN, SLACK_ACCESS_TOKEN, SLACK_OWNER_USER_ID,
  *          FINALE_BASE_URL, FINALE_ACCOUNT_PATH
  */
 
 import { WebClient } from "@slack/web-api";
 import { FinaleClient } from "../finale/client";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { sendTelegramNotify } from "../intelligence/telegram-notify";
 import { resolveSkuAlias, expandSkuToken } from "../sku-aliases";
 
@@ -749,7 +749,7 @@ export class SlackRequestDetector {
             };
             let snapComps: Record<string, SnapEntry> = {};
             try {
-                const { createClient } = await import("../supabase");
+                const { createClient } = await import("../db");
                 const db = createClient();
                 if (db) {
                     const { data } = await db
@@ -797,7 +797,7 @@ export class SlackRequestDetector {
                     incoming = (c.incomingPOs ?? []).reduce((s, p) => s + (p.quantity ?? 0), 0);
                     need30 = Math.round(c.totalRequiredQty ?? 0);
                     vendor = c.vendorName ?? "Unknown vendor";
-                    leadTime = c.leadTimeDays ?? 14;
+                    leadTime = c.leadTimeDays ?? 21;
                     productName = c.productName ?? null;
                 } else {
                     // Fallback: product-level data already in hand from
@@ -1118,7 +1118,7 @@ export class SlackRequestDetector {
      */
     private async getTrackingInfo(orderId: string): Promise<string | null> {
         try {
-            const { createClient } = await import("../supabase");
+            const { createClient } = await import("../db");
             const db = createClient();
             if (!db) return null;
             const { data } = await db

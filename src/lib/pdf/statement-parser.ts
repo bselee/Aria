@@ -5,7 +5,7 @@
  */
 
 import { z } from "zod";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { unifiedObjectGeneration } from "../intelligence/llm";
 
 export const StatementLineSchema = z.object({
@@ -52,7 +52,7 @@ export async function parseVendorStatement(rawText: string): Promise<StatementDa
  * Identifies missing invoices, payment discrepancies, and balance offsets.
  */
 export async function reconcileStatement(statement: StatementData) {
-    const supabase = createClient();
+    const db = createClient();
 
     const reconciliationLines = await Promise.all(
         statement.lines.map(async (line) => {
@@ -102,7 +102,7 @@ export async function reconcileStatement(statement: StatementData) {
     );
 
     // Save reconciliation result
-    await supabase.from("statement_reconciliations").insert({
+    await db.from("statement_reconciliations").insert({
         vendor_name: statement.vendorName,
         statement_date: statement.statementDate,
         vendor_balance: statement.endingBalance,

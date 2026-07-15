@@ -14,7 +14,7 @@
  */
 
 import type { Context } from "telegraf";
-import { createClient } from "../../lib/supabase";
+import { createClient } from "../../lib/db";
 
 /**
  * Handle 'receipt_confirm_{poNumber}' — Bill confirms the PO was received.
@@ -24,14 +24,14 @@ export async function handleReceiptConfirm(ctx: Context, poNumber: string): Prom
     await ctx.answerCbQuery(`Marking ${poNumber} as received...`);
 
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             await ctx.editMessageText("❌ Database unavailable");
             return;
         }
 
         // Log the confirmation
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Receipt confirmed: PO ${poNumber}`,
             intent: "RECEIPT_CONFIRMED",
@@ -71,14 +71,14 @@ export async function handleReceiptSkip(ctx: Context, poNumber: string): Promise
     await ctx.answerCbQuery(`Skipped — won't prompt again for 7 days`);
 
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             await ctx.editMessageText("❌ Database unavailable");
             return;
         }
 
         // Log the skip — the receipt prompt module checks this for dedup
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Receipt prompt skipped: PO ${poNumber}`,
             intent: "RECEIPT_PROMPT",

@@ -16,7 +16,7 @@ function resetChain() {
     supabaseMock.select.mockReturnValue(supabaseMock);
 }
 
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 import {
     getIssueControlProfile,

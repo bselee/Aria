@@ -6,13 +6,13 @@
  *   cd <project-root>
  *   node --import tsx src/cli/query-unreplied-pos.ts
  *
- * @deps    @/lib/supabase, @/lib/gmail/auth, @googleapis/gmail
+ * @deps    @/lib/db, @/lib/gmail/auth, @googleapis/gmail
  */
 import 'dotenv/config';
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig({ path: '.env.local' });
 
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import { getAuthenticatedClient } from '@/lib/gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';
 
@@ -147,8 +147,8 @@ async function searchPOThread(gmail: any, poNumber: string): Promise<VendorInfo>
 }
 
 (async () => {
-  const supabase = createClient();
-  if (!supabase) {
+  const db = createClient();
+  if (!db) {
     console.error('❌ Supabase client not available — check env vars');
     process.exit(1);
   }

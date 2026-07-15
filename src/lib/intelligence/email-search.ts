@@ -6,7 +6,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * DESIGN:
  *   Searches across both inboxes:
@@ -23,7 +23,7 @@
  *   Returns top 10 results, sorted by recency.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 export interface EmailSearchResult {
     source: "default" | "ap";

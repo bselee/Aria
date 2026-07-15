@@ -67,7 +67,7 @@ function resolveRunway(input: PurchasingCandidateInput): number | null {
 }
 
 function orderPointDays(input: PurchasingCandidateInput): number {
-    const lead = Math.max(0, input.leadTimeDays ?? 14);
+    const lead = Math.max(0, input.leadTimeDays ?? 21);
     return lead + RUNWAY_SAFETY_BUFFER_DAYS;
 }
 
@@ -143,7 +143,7 @@ function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: nu
     confidence: "high" | "medium" | "low";
 } {
     const runway = resolveRunway(input);
-    const lead = input.leadTimeDays ?? 14;
+    const lead = Math.max(0, input.leadTimeDays ?? 21);
     const point = orderPointDays(input);
     const onOrder = input.stockOnOrder ?? 0;
     const onHand = input.stockOnHand ?? 0;

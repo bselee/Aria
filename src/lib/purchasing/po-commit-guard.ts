@@ -50,7 +50,10 @@ export function assessPOCommitGuard(
     const minimumPostLeadCoverageDays = options.minimumPostLeadCoverageDays ?? 30;
     const requireHighConfidence = options.requireHighConfidence ?? true;
     const dailyRate = finitePositive(line.item.dailyRate || line.candidate.directDemand + line.candidate.bomDemand);
-    const leadTimeDays = finitePositive(line.item.leadTimeDays, finitePositive(line.candidate.leadTimeDays, 14));
+    const leadTimeDays = finitePositive(
+        (line.item as any).effectiveLeadTimeDays ?? line.item.leadTimeDays,
+        finitePositive(line.candidate.leadTimeDays, 21),
+    );
     const recommendedQty = Math.max(0, line.assessment.recommendedQty ?? 0);
     const stockOnHand = Math.max(0, line.item.stockOnHand ?? line.candidate.stockOnHand ?? 0);
     const stockOnOrder = Math.max(0, line.item.stockOnOrder ?? line.candidate.stockOnOrder ?? 0);

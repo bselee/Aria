@@ -5,7 +5,7 @@ import "dotenv/config";
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 async function main() {
     const sku = (process.argv[2] || "").toUpperCase();

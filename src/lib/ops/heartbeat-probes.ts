@@ -11,7 +11,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 /**
  * The outcome of running a single probe.

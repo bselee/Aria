@@ -17,7 +17,7 @@ vi.mock("@/lib/intelligence/vendor-memory", () => ({
 }));
 
 // Mock supabase so the audit wrapper doesn't try to write
-vi.mock("@/lib/supabase", () => ({ createClient: () => null }));
+vi.mock("@/lib/db", () => ({ createClient: () => null }));
 
 import { put, get, query, memory } from "./index";
 

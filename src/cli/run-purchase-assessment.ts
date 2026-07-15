@@ -8,7 +8,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { Telegraf } from 'telegraf';
 import { assess, AssessmentResult } from '../lib/purchases/assessor';
-import { createClient } from '../lib/supabase';
+import { createClient } from '../lib/db';
 
 const execAsync = promisify(exec);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -77,8 +77,8 @@ async function main() {
     let runId: string | null = null;
     if (assessmentResult) {
         console.log('  [3/5] Storing snapshot...');
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             console.warn('  ⚠️ No Supabase — skipping storage');
         } else {
             try {
@@ -140,8 +140,8 @@ async function main() {
     let newRequests: any[] = [];
     if (runId && assessmentResult) {
         console.log('  [4/5] Diffing against previous snapshot...');
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             try {
                 const { data: prevRuns, error: prevErr } = await supabase
                     .from('purchase_assessment_runs')

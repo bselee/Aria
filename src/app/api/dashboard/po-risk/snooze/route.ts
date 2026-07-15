@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 const DEFAULT_HOURS = 48;
 const MAX_HOURS = 24 * 14; // 2 weeks
 
 export async function POST(req: Request) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json({ error: "Supabase not configured" }, { status: 503 });
     }
 

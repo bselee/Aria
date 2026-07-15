@@ -1,11 +1,14 @@
 /**
- * @file    supabase-storage.ts
+ * @file    src/lib/storage/supabase-storage.ts
  * @purpose Local filesystem storage for PDFs and other documents.
  *          Replaces Supabase Storage. Files are stored under
  *          local/storage/{type}/{vendor}/{date}/{filename}.
- * @author  Aria (Antigravity)
+ *
+ *          Provides both upload and download operations.
+ *          Used by the AP pipeline to persist and retrieve invoice PDFs.
+ * @author  Hermia
  * @created 2026-03-10
- * @updated 2026-07-01 — migrated from Supabase Storage to local filesystem
+ * @updated 2026-07-15 — added downloadPDF() to complete Supabase Storage replacement
  * @deps    fs, path
  */
 
@@ -13,6 +16,13 @@ import * as fs from "fs";
 import * as path from "path";
 
 const STORAGE_ROOT = path.join(process.cwd(), "local", "storage");
+
+/**
+ * Sanitize a filename component — strip special chars, limit length.
+ */
+function safeName(s: string): string {
+    return s.replace(/[^a-zA-Z0-9_\-./ ]/g, "").replace(/\s+/g, "_").slice(0, 100);
+}
 
 /**
  * Writes a PDF buffer to the local filesystem and returns the storage path.
@@ -33,10 +43,6 @@ export async function uploadPDF(
         filename: string;
     }
 ): Promise<string> {
-    // Sanitize path components
-    const safeName = (s: string) =>
-        s.replace(/[^a-zA-Z0-9_\-./ ]/g, "").replace(/\s+/g, "_").slice(0, 100);
-
     const relativePath = [
         safeName(meta.type),
         safeName(meta.vendor),
@@ -54,4 +60,54 @@ export async function uploadPDF(
     }
 
     return path.join("local", "storage", relativePath).replace(/\\/g, "/");
+}
+
+/**
+ * Read a PDF (or any file) from the local filesystem storage.
+ *
+ * @param   storagePath - Relative storage path (e.g., "local/storage/INVOICE/acme/...")
+ * @returns The file buffer, or null if not found
+ */
+export async function downloadPDF(storagePath: string): Promise<Buffer | null> {
+    try {
+        const fullPath = path.resolve(STORAGE_ROOT, "..", "..", storagePath);
+
+        // Also try direct STORAGE_ROOT join
+        const altPath = path.join(STORAGE_ROOT, storagePath.replace(/^local\/storage\//, ""));
+
+        // Try primary first, then fallback
+        let resolvedPath = fullPath;
+        if (!fs.existsSync(fullPath) && fs.existsSync(altPath)) {
+            resolvedPath = altPath;
+        }
+
+        if (!fs.existsSync(resolvedPath)) {
+            console.warn(`[storage] File not found: ${resolvedPath}`);
+            return null;
+        }
+
+        return await fs.promises.readFile(resolvedPath);
+    } catch (err: any) {
+        console.error(`[storage] Download failed for ${storagePath}: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * Delete a file from local filesystem storage.
+ *
+ * @param storagePath - Relative storage path
+ */
+export async function deleteFile(storagePath: string): Promise<boolean> {
+    try {
+        const fullPath = path.join(STORAGE_ROOT, storagePath.replace(/^local\/storage\//, ""));
+        if (fs.existsSync(fullPath)) {
+            await fs.promises.unlink(fullPath);
+            return true;
+        }
+        return false;
+    } catch (err: any) {
+        console.warn(`[storage] Delete failed for ${storagePath}: ${err.message}`);
+        return false;
+    }
 }

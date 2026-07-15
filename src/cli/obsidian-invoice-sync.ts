@@ -1,19 +1,21 @@
 /**
  * @file    src/cli/obsidian-invoice-sync.ts
- * @purpose CLI tool that queries recent AP activity from Supabase and writes
- *          invoice summaries into the Obsidian vault. Designed to run as a
- *          cron job after the AP pipeline completes.
+ * @purpose CLI tool that queries recent AP activity from the local database
+ *          and writes invoice summaries into the Obsidian vault. Designed to
+ *          run as a cron job after the AP pipeline completes.
  *
- *          Bridge 1 of 3: Aria AP Pipeline → Obsidian Vault
+ *          Bridge 1 of 3: AP Pipeline → Obsidian Vault
+ *
+ *          Uses local PostgREST (port 5434) for vendor_invoices queries.
+ *          No cloud Supabase — fully local.
  *
  * @author  Hermia
  * @created 2026-06-26
- * @deps    supabase, obsidian/bridge
- * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
- *          OBSIDIAN_VAULT_PATH
+ * @updated 2026-07-15 — migrated from Supabase to local PostgREST
+ * @deps    @/lib/db (PostgREST client), @/lib/obsidian/bridge
+ * @env     PGRST_URL (default: http://localhost:5434)
  */
-
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 import {
     writeInvoiceSummary,
     syncInvoiceBatch,
@@ -26,14 +28,14 @@ async function main() {
 
     console.log(`[obsidian-invoice-sync] Syncing invoices since ${since} (${hoursBack}h back)`);
 
-    const supabase = createClient();
-    if (!supabase) {
-        console.error("[obsidian-invoice-sync] Supabase not available — skipping sync.");
-        process.exit(0); // Non-fatal — cron will retry next tick
+    const db = createClient();
+    if (!db) {
+        console.error("[obsidian-invoice-sync] Local PostgREST not available — skipping sync.");
+        process.exit(0);
     }
 
-    // Query vendor_invoices table for recent entries
-    const { data: invoices, error } = await supabase
+    // Query vendor_invoices table for recent entries via PostgREST
+    const { data: invoices, error } = await db
         .from("vendor_invoices")
         .select("*")
         .gte("updated_at", since)
@@ -41,7 +43,7 @@ async function main() {
         .limit(100);
 
     if (error) {
-        console.error(`[obsidian-invoice-sync] Supabase query failed: ${error.message}`);
+        console.error(`[obsidian-invoice-sync] Query failed: ${error.message}`);
         process.exit(1);
     }
 
@@ -52,7 +54,7 @@ async function main() {
 
     console.log(`[obsidian-invoice-sync] Found ${invoices.length} invoices to sync.`);
 
-    // Map Supabase rows to InvoiceSummary format
+    // Map rows to InvoiceSummary format
     const summaries: InvoiceSummary[] = invoices.map((inv: any) => ({
         vendorName: inv.vendor_name || "Unknown",
         invoiceNumber: inv.invoice_number || "unknown",
@@ -76,7 +78,6 @@ async function main() {
         `[obsidian-invoice-sync] Done: ${result.succeeded} synced, ${result.failed} failed.`
     );
 
-    // Log paths for debugging
     for (const p of result.paths) {
         console.log(`  → ${p}`);
     }

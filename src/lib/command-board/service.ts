@@ -19,7 +19,7 @@
  *            deriveLane(task) — exported for unit-testing
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { CRON_JOBS } from "@/lib/scheduler/cron-registry";
 import { listTasks, getById, type AgentTask, type AgentTaskStatus } from "@/lib/intelligence/agent-task";
 import { COMMAND_BOARD_HIERARCHY } from "./catalog";
@@ -110,7 +110,7 @@ function toCard(t: AgentTask, hasChildren: boolean): CommandBoardTaskCard {
 // ── Summary ─────────────────────────────────────────────────────────────────
 
 export async function getCommandBoardSummary(): Promise<CommandBoardSummary> {
-    const supabase = createClient();
+    const db = createClient();
     const lanes: Record<CommandBoardLane, number> = {
         "needs-will": 0,
         "running": 0,
@@ -128,7 +128,7 @@ export async function getCommandBoardSummary(): Promise<CommandBoardSummary> {
     let cronError = 0;
     let cronNeverRun = 0;
 
-    if (supabase) {
+    if (db) {
         try {
             const tasks = await listTasks({ limit: 500 });
             for (const t of tasks) {
@@ -278,8 +278,8 @@ export async function getDashboardTasks(
 export async function getCommandBoardTaskList(
     filters: CommandBoardTaskFilters,
 ): Promise<CommandBoardTaskList> {
-    const supabase = createClient();
-    if (!supabase) return { tasks: [], total: 0 };
+    const db = createClient();
+    if (!db) return { tasks: [], total: 0 };
 
     const lane = filters.lane;
     const limit = Math.min(Math.max(filters.limit ?? 100, 1), 500);
@@ -363,8 +363,8 @@ export async function getCommandBoardTaskList(
 export async function getCommandBoardTaskDetail(
     id: string,
 ): Promise<CommandBoardTaskDetail | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     let row: AgentTask | null = null;
     try {
@@ -439,10 +439,10 @@ type CronRunRow = {
 };
 
 export async function getCommandBoardCrons(): Promise<CommandBoardCron[]> {
-    const supabase = createClient();
+    const db = createClient();
     const latestByName = new Map<string, CronRunRow>();
 
-    if (supabase) {
+    if (db) {
         try {
             const { data } = await supabase
                 .from("cron_runs")
@@ -486,8 +486,8 @@ export async function getCommandBoardCronRuns(
     name: string,
     limit = 50,
 ): Promise<CommandBoardCronRun[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
     try {
         const { data } = await supabase
             .from("cron_runs")
@@ -515,8 +515,8 @@ const HEARTBEAT_FRESH_SECONDS = 5 * 60;
 const HEARTBEAT_STALE_SECONDS = 30 * 60;
 
 export async function getCommandBoardHeartbeats(): Promise<CommandBoardHeartbeat[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
     try {
         const { data } = await supabase
             .from("agent_heartbeats")
@@ -552,8 +552,8 @@ export async function getCommandBoardHeartbeats(): Promise<CommandBoardHeartbeat
 export async function getCommandBoardRuns(
     filters: CommandBoardRunFilters,
 ): Promise<CommandBoardRun[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     const limit = Math.min(Math.max(filters.limit ?? 100, 1), 500);
     const want = filters.source;
@@ -621,8 +621,8 @@ export async function getCommandBoardRuns(
 export async function getCommandBoardControlRequests(
     limit = 100,
 ): Promise<CommandBoardControlRequest[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
     try {
         const { data } = await supabase
             .from("ops_control_requests")
@@ -658,8 +658,8 @@ export type CreateControlRequestArgs = {
 export async function createCommandBoardControlRequest(
     args: CreateControlRequestArgs,
 ): Promise<CommandBoardControlRequest | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
     const row = await createOpsControlRequest(supabase, {
         command: args.command as any,
         target: args.target as any,
@@ -719,8 +719,8 @@ function issueRowToCard(row: AgentIssue, taskCount: number): CommandBoardIssue {
 export async function getCommandBoardIssues(
     filters: CommandBoardIssueFilters = {},
 ): Promise<{ issues: CommandBoardIssue[]; total: number }> {
-    const supabase = createClient();
-    if (!supabase) return { issues: [], total: 0 };
+    const db = createClient();
+    if (!db) return { issues: [], total: 0 };
 
     const rows = await listIssues({
         lifecycleState: filters.lifecycleState,
@@ -746,8 +746,8 @@ export async function getCommandBoardIssues(
 }
 
 export async function getCommandBoardIssueDetail(id: string): Promise<CommandBoardIssueDetail | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const row = await getIssueById(id);
     if (!row) return null;

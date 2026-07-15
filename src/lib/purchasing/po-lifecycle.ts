@@ -7,13 +7,13 @@
  * @author  Hermia
  * @created 2026-06-01
  * @updated 2026-06-01 (added REVIEW, SENT, ACKNOWLEDGED, CANCELLED dispatch stages)
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * All functions are best-effort (try/catch, never throw) so they can
- * be safely called from anywhere in the AP pipeline without blocking.
+ * @deps    @/lib/db
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { getLocalDb } from "@/lib/storage/local-db";
 
 /** Valid lifecycle states */

@@ -35,7 +35,7 @@
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 import { inputHash } from "../lib/intelligence/agent-task-hash";
 
 const PAGE_SIZE = 200;
@@ -46,8 +46,8 @@ async function main() {
         console.log("[recompute-input-hashes] DRY RUN — pass --apply to commit changes.");
     }
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.error("[recompute-input-hashes] Supabase client unavailable. Check .env.local for SUPABASE_SERVICE_ROLE_KEY and NEXT_PUBLIC_SUPABASE_URL.");
         process.exit(1);
     }

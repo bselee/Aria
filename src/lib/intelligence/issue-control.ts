@@ -19,7 +19,7 @@
  *          time via `patchIssueControlProfile()`.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import type { AgentIssue } from "./agent-issue";
 
 export type IssueControlMode =
@@ -102,8 +102,8 @@ export async function patchIssueControlProfile(
     issue: AgentIssue,
     patch: Partial<Omit<IssueControlProfile, "updatedAt">>,
 ): Promise<AgentIssue | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const current = getIssueControlProfile(issue);
     const control: IssueControlProfile = {

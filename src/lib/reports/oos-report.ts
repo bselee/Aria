@@ -11,7 +11,7 @@
  */
 
 import { FinaleClient, type FullPO, type POInfo } from '../finale/client';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { withToolAudit } from '../agents/tool-registry';
 import { getAuthenticatedClient } from '../gmail/auth';
 import { gmail as GmailApi } from '@googleapis/gmail';

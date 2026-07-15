@@ -21,7 +21,7 @@
 import { createHash } from "crypto";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
-import { createClient } from "../../supabase";
+import { createClient } from "../../db";
 import { z } from "zod";
 import { unifiedObjectGeneration, unifiedTextGeneration } from "../llm";
 import { recall } from "../memory";
@@ -209,9 +209,9 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
     }
 
     private async logActivity(supabase: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
-        if (!supabase) return;
+        if (!db) return;
         try {
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: from,
                 email_subject: subject,
                 intent,
@@ -375,9 +375,9 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
     async identifyAndQueue() {
         console.log("🕵️‍♀️ [AP-Identifier] Scanning queue for new invoices...");
         try {
-            const supabase = createClient();
+            const db = createClient();
 
-            if (!supabase) {
+            if (!db) {
                 console.error("   ❌ Supabase client not available.");
                 return;
             }
@@ -559,7 +559,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         // Dropship vendor — queue to ap_inbox_queue with dropship metadata,
                         // skip LLM classification. The AP Forwarder will handle Bill.com.
                         try {
-                            await supabase.from("ap_inbox_queue").insert({
+                            await db.from("ap_inbox_queue").insert({
                                 message_id: m.gmail_message_id,
                                 email_from: from,
                                 email_subject: subject,
@@ -1093,17 +1093,18 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 }
                             }
 
-                            // Upload to Supabase Storage
+                            // Upload to local filesystem storage
                             const storagePath = `${m.gmail_message_id}/${Date.now()}_${capturedFilename}`;
-                            const { error: uploadError } = await supabase.storage
-                                .from('ap_invoices')
-                                .upload(storagePath, queueBuffer, {
-                                    contentType: 'application/pdf',
-                                    upsert: true
-                                });
+                            const { uploadPDF } = await import("../../storage/supabase-storage");
+                            const localPath = await uploadPDF(queueBuffer, {
+                                type: "ap_invoices",
+                                vendor: m.vendor_name || "unknown",
+                                date: new Date().toISOString().split("T")[0],
+                                filename: capturedFilename,
+                            });
 
-                            if (uploadError) {
-                                throw new Error(`Storage upload failed: ${uploadError.message}`);
+                            if (!localPath) {
+                                throw new Error(`Local storage upload failed for ${storagePath}`);
                             }
 
                             // DECISION(2026-03-19): Queue directly as PENDING_FORWARD.
@@ -1114,12 +1115,12 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             // This matches the SOP: "forward immediately, reconcile later."
                             const queueStatus = 'PENDING_FORWARD';
 
-                            const { error: insertError } = await supabase.from("ap_inbox_queue").insert({
+                            const { error: insertError } = await db.from("ap_inbox_queue").insert({
                                 message_id: uniqueMsgId,
                                 email_from: from,
                                 email_subject: subject,
                                 intent: intent,
-                                pdf_path: storagePath,
+                                pdf_path: localPath,
                                 pdf_filename: capturedFilename,
                                 status: queueStatus,
                                 source_inbox: sourceInbox,
@@ -1216,7 +1217,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     handled = false;
                     throw err;
                 } finally {
-                    await supabase.from('email_inbox_queue')
+                    await db.from('email_inbox_queue')
                         .update({ processed_by_ap: handled })
                         .eq('id', m.id);
                 }
@@ -1293,7 +1294,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
         // Step 3: Log to Supabase
         try {
-            await supabase.from('paid_invoices').insert({
+            await db.from('paid_invoices').insert({
                 vendor_name: extracted.vendorName,
                 invoice_number: extracted.invoiceNumber,
                 amount_paid: extracted.amountPaid,

@@ -12,7 +12,7 @@
  *          See .agents/plans/control-plane.md for the full plan.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { inputHash } from "./agent-task-hash";
 import { closesWhenFor, type ClosurePredicate } from "./agent-task-closure";
 
@@ -180,8 +180,8 @@ function eventTypeForStatus(status: AgentTaskStatus): string | null {
  */
 export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<string | null> {
     if (!hubEnabled()) return null;
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     let previousStatus: AgentTaskStatus | null = null;
     let existingId: string | null = null;
@@ -276,8 +276,8 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
     if (!hubEnabled()) {
         throw new Error("incrementOrCreate: HUB_TASKS_ENABLED is off");
     }
-    const supabase = createClient();
-    if (!supabase) throw new Error("incrementOrCreate: supabase client unavailable");
+    const db = createClient();
+    if (!db) throw new Error("incrementOrCreate: supabase client unavailable");
 
     const inputs = args.inputs ?? {};
     const hash = inputHash(inputs);
@@ -400,7 +400,7 @@ async function emitStuckSourceMetaTask(
         return;
     }
 
-    const { data: createdMeta, error: metaErr } = await supabase.from("agent_task").insert({
+    const { data: createdMeta, error: metaErr } = await db.from("agent_task").insert({
         type: "stuck_source",
         source_table: null,
         source_id: null,
@@ -437,8 +437,8 @@ export async function decideApproval(
     decidedBy: string,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const status: AgentTaskStatus = decision === "approve" ? "APPROVED" : "REJECTED";
 
@@ -469,8 +469,8 @@ export async function complete(
     outputs: Record<string, unknown> = {},
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_task")
@@ -499,8 +499,8 @@ export async function complete(
 /** Mark a task FAILED with an error message in outputs.error. */
 export async function fail(taskId: string, errorMessage: string): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_task")
@@ -539,8 +539,8 @@ export async function appendEvent(
     payload: Record<string, unknown> = {},
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     // Status maps to the task_history.status CHECK constraint
     // ('success'|'failure'|'shadow'). Map ledger event_type → bucket.
@@ -560,7 +560,7 @@ export async function appendEvent(
             ? (payload.output_summary as string)
             : "";
 
-    const { error } = await supabase.from("task_history").insert({
+    const { error } = await db.from("task_history").insert({
         task_id: taskId,
         agent_name: typeof payload.agent_name === "string" ? payload.agent_name : "agent-task",
         task_type: typeof payload.task_type === "string" ? payload.task_type : "resolution",
@@ -578,8 +578,8 @@ export async function appendEvent(
 
 /** Read a single hub row by id. */
 export async function getById(taskId: string): Promise<AgentTask | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const { data, error } = await supabase
         .from("agent_task")
@@ -599,8 +599,8 @@ export async function getBySource(
     sourceTable: string,
     sourceId: string,
 ): Promise<AgentTask | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const { data, error } = await supabase
         .from("agent_task")
@@ -617,8 +617,8 @@ export async function getBySource(
 }
 
 export async function listTasks(filters: ListTasksFilters = {}): Promise<AgentTask[]> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         throw new Error("Supabase not configured");
     }
 
@@ -673,8 +673,8 @@ export async function updateBySource(
     patch: Partial<Pick<AgentTask, "status" | "owner" | "priority" | "outputs" | "approval_decision">>,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_task")
@@ -718,8 +718,8 @@ export async function decideApprovalBySource(
     decidedBy: string,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const status: AgentTaskStatus = decision === "approve" ? "APPROVED" : "REJECTED";
 
@@ -765,8 +765,8 @@ export async function setPlaybook(
     state: PlaybookState,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_task")

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const fromMock = vi.fn();
 
-vi.mock("@/lib/supabase", () => ({
+vi.mock("@/lib/db", () => ({
     createClient: () => ({ from: fromMock }),
 }));
 

@@ -22,7 +22,7 @@
  *          completion (no chatter for skips or dry-runs).
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
 import {
     classifyVendorFreightPattern,

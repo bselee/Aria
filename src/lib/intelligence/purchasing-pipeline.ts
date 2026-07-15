@@ -9,7 +9,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { businessHoursAlert } from "./alert-gate";
 
 const execAsync = promisify(exec);

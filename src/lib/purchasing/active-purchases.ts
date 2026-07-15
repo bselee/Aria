@@ -1,6 +1,6 @@
 import { leadTimeService } from "../builds/lead-time-service";
 import type { FinaleClient, FullPO } from "../finale/client";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "./calendar-lifecycle";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
@@ -53,7 +53,7 @@ export async function loadActivePurchases(
     const uniqueVendors = [...new Set(pos.map(p => p.vendorName).filter(Boolean))];
     await Promise.all(uniqueVendors.map(v => leadTimeService.getForVendor(v)));
 
-    const supabase = createClient();
+    const db = createClient();
     const vendorMap = new Map<string, { typical_tracking_source?: string; orders_email?: string; vendor_emails?: string[] }>();
     // Load vendor invoice patterns for purchase decision context
     const vendorIntelMap = new Map<string, { total_spend?: number; pending_reconciliation?: number; avg_freight?: number }>();
@@ -231,7 +231,7 @@ export async function loadActivePurchases(
             try {
                 for (let i = 0; i < healMismatches.length; i += 100) {
                     const chunk = healMismatches.slice(i, i + 100);
-                    await supabase.from('purchase_orders').upsert(chunk, { onConflict: 'po_number' });
+                    await db.from('purchase_orders').upsert(chunk, { onConflict: 'po_number' });
                 }
                 console.log(`[active-purchases] Self-healed ${healMismatches.length} PO lifecycle_stage mismatches (stuck→received)`);
             } catch (e: any) {
@@ -293,7 +293,7 @@ export async function loadActivePurchases(
                 leadProvenance = lt.label;
             } else {
                 expectedDate = new Date().toISOString().split("T")[0];
-                leadProvenance = "14d default";
+                leadProvenance = "21d default";
             }
 
             const poLifecycle = lifecycleMap.get(po.orderId);
@@ -311,8 +311,8 @@ export async function loadActivePurchases(
             const etaProfile = deriveVendorEtaProfile({
                 vendorName: po.vendorName,
                 orderDate: po.orderDate || new Date().toISOString().slice(0, 10),
-                fallbackLeadDays: lt?.days ?? 14,
-                fallbackLabel: lt?.label ?? "14d default",
+                fallbackLeadDays: lt?.days ?? 21,
+                fallbackLabel: lt?.label ?? "21d default",
                 fallbackSource: lt?.provenance ?? "default",
                 vendorPromisedEta,
                 shipments: confirmedShipments.map((shipment) => ({

@@ -5,7 +5,7 @@ const insertMock = vi.fn().mockResolvedValue({ error: null });
 const supabaseMock = {
     from: vi.fn().mockReturnValue({ insert: insertMock }),
 };
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 import {
     registerTool,

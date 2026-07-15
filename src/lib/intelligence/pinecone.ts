@@ -11,7 +11,7 @@
  *          (1024d, real vector search).
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export async function indexOperationalContext(
     id?: string,
@@ -25,8 +25,8 @@ export async function indexOperationalContext(
         return;
     }
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.warn("⚠️ Supabase client unavailable, skipping email_context_log upsert.");
         return;
     }
@@ -35,7 +35,7 @@ export async function indexOperationalContext(
     const now = new Date().toISOString();
 
     try {
-        const { error } = await supabase.from("email_context_log").upsert(
+        const { error } = await db.from("email_context_log").upsert(
             {
                 id,
                 text: truncated,

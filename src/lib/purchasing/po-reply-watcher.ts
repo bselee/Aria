@@ -12,13 +12,13 @@
  *
  * @author  Hermia
  * @created 2026-06-18
- * @deps    @googleapis/gmail, @/lib/gmail/auth, @/lib/supabase, @/lib/storage/local-db
+ * @deps    @googleapis/gmail, @/lib/gmail/auth, @/lib/db, @/lib/storage/local-db
  * @env     GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI
  */
 
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { upsertShipmentEvidence } from "@/lib/tracking/shipment-intelligence";
 import { syncPOETA } from "./po-eta-sync";
 

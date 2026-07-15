@@ -15,7 +15,7 @@
  * @deps    @googleapis/gmail, supabase, gmail/auth
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { lookupVendorOrderEmail } from "./po-sender";

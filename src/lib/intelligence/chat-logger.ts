@@ -1,4 +1,4 @@
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 
 export async function logChatMessage(params: {
   source:    'telegram' | 'slack';

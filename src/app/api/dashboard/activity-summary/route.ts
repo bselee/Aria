@@ -5,19 +5,19 @@
  *          counts grouped by the new auto-apply / vendor-discrepancy intents.
  * @author  Hermia
  * @created 2026-06-19
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
 export const revalidate = 60; // 1-minute cache
 
 export async function GET() {
-    const supabase = createClient();
-    if (!supabase) {
-        return NextResponse.json({ error: "Supabase unavailable" }, { status: 503 });
+    const db = createClient();
+    if (!db) {
+        return NextResponse.json({ error: "Database unavailable" }, { status: 503 });
     }
 
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();

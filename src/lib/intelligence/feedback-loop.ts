@@ -14,7 +14,7 @@
  * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, PINECONE_API_KEY
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ──────────────────────────────────────────────────
 // TYPES

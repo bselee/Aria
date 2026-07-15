@@ -5,18 +5,18 @@
  *          tracking updates, and vendor acknowledgements.
  * @author  Hermia
  * @created 2026-05-29
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export const dynamic = 'force-dynamic';
 
 export const revalidate = 60; // 1-minute cache
 
 export async function GET(req: Request) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json({ error: "Supabase unavailable" }, { status: 503 });
     }
 
@@ -33,19 +33,19 @@ export async function GET(req: Request) {
         cronRuns,
     ] = await Promise.all([
         // Email volume (both inboxes)
-        supabase.from("email_inbox_queue").select("id", { count: "exact", head: true }).gte("created_at", today + "T00:00:00"),
+        db.from("email_inbox_queue").select("id", { count: "exact", head: true }).gte("created_at", today + "T00:00:00"),
         // AP queue activity
-        supabase.from("ap_inbox_queue").select("id, status", { count: "exact" }).gte("created_at", today + "T00:00:00"),
+        db.from("ap_inbox_queue").select("id, status", { count: "exact" }).gte("created_at", today + "T00:00:00"),
         // AP activity log
-        supabase.from("ap_activity_log").select("action, id").gte("created_at", today + "T00:00:00").limit(500),
+        db.from("ap_activity_log").select("action, id").gte("created_at", today + "T00:00:00").limit(500),
         // POs created today
-        supabase.from("purchase_orders").select("po_number", { count: "exact", head: true }).gte("created_at", today + "T00:00:00"),
+        db.from("purchase_orders").select("po_number", { count: "exact", head: true }).gte("created_at", today + "T00:00:00"),
         // POs sent today
-        supabase.from("purchase_orders").select("po_number", { count: "exact", head: true }).gte("po_sent_verified_at", today + "T00:00:00"),
+        db.from("purchase_orders").select("po_number", { count: "exact", head: true }).gte("po_sent_verified_at", today + "T00:00:00"),
         // Receivings today
-        supabase.from("shipments").select("id", { count: "exact", head: true }).gte("delivered_at", today + "T00:00:00"),
+        db.from("shipments").select("id", { count: "exact", head: true }).gte("delivered_at", today + "T00:00:00"),
         // Cron runs today
-        supabase.from("cron_runs").select("job_name, status, id").gte("ran_at", today + "T00:00:00").order("ran_at", { ascending: false }).limit(100),
+        db.from("cron_runs").select("job_name, status, id").gte("ran_at", today + "T00:00:00").order("ran_at", { ascending: false }).limit(100),
     ]);
 
     // AP activity breakdown

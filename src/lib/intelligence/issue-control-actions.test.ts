@@ -17,7 +17,7 @@ function resetChain() {
     supabaseMock.update.mockReturnValue(supabaseMock);
     supabaseMock.insert.mockReturnValue(supabaseMock);
 }
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 // Mock agent-issue helpers so action routing is observable.
 const recordHandoffMock = vi.hoisted(() => vi.fn());

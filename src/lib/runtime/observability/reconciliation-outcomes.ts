@@ -10,7 +10,7 @@
  * Phase 1a Task 3 — runtime observability namespace.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -54,13 +54,13 @@ export interface OutcomeWrite {
  */
 export async function writeReconciliationOutcome(write: OutcomeWrite): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             // Supabase not configured — silently no-op
             return;
         }
 
-        const { error } = await supabase.from("reconciliation_outcomes").insert({
+        const { error } = await db.from("reconciliation_outcomes").insert({
             run_id:       write.runId,
             invoice_id:   write.invoiceId ?? null,
             po_id:        write.poId ?? null,
@@ -86,10 +86,10 @@ export async function resolvePendingReconciliationOutcomeBySource(input: {
     resolvedAt?: Date;
 }): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
-        const { error } = await supabase
+        const { error } = await db
             .from("reconciliation_outcomes")
             .update({
                 resolved_at: (input.resolvedAt ?? new Date()).toISOString(),

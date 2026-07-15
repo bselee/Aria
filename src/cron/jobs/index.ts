@@ -411,6 +411,23 @@ defineJob({
     },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PO Sync — keeps purchase_orders in sync with Finale. Runs every 2h.
+// Without this, purchase_orders only has POs sent through Aria's pipeline.
+// Invoice→PO matching depends on a complete PO mirror.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "po-sync",
+    schedule: "0 */2 * * *",
+    onFail: "telegram-will",
+    description: "Sync purchase_orders from Finale (every 2h) — foundation for invoice→PO matching.",
+    handler: async () => {
+        const { syncPurchaseOrders } = await import("@/lib/purchasing/po-sync");
+        await syncPurchaseOrders(90);
+    },
+    budget: { durationMs: 300_000 },
+});
+
 // po-sweep removed — KAIZEN #5: folded into ap-polling as a post-pass.
 // runPOSweep() remains on OpsManager and is invoked on every ap-polling tick.
 
@@ -646,20 +663,114 @@ defineJob({
         },
 });
 
-// HERMIA(2026-05-28): Memory hot/cold tier sync.
-// Pushes local SQLite vectors to Supabase backup every 6h.
-// Protects against aria-local.db loss/corruption.
+// HERMIA(2026-07-15): Log local memory vector stats.
+// SQLite is the sole store — no cloud sync needed.
 defineJob({
     name: "memory-sync",
     schedule: "0 */6 * * *",
     onFail: "log",
-    description: "Sync local memory vectors to Supabase backup (every 6h).",
+    description: "Log memory vector counts from local SQLite (every 6h).",
     handler: async () => {
-        const { syncMemoryToSupabase } = await import("@/lib/storage/memory-sync");
-        const result = await syncMemoryToSupabase();
-        if (result.synced > 0) {
-            console.log(`[memory-sync] Synced ${result.synced} vectors across ${result.namespaces} namespaces`);
+        const { logMemoryStats } = await import("@/lib/storage/memory-sync");
+        const stats = logMemoryStats();
+        console.log(`[memory-sync] ${stats.length} namespaces in SQLite`, stats.map(s => `${s.namespace}: ${s.count}`).join(", "));
+    },
+});
+
+// HERMIA(2026-07-15): Refresh stale tracking records from carrier APIs.
+// Writes to local SQLite cache (tracking-cache.ts) which is the primary store.
+// Every 30min for active shipments; stale check at 60min.
+defineJob({
+    name: "tracking-refresh",
+    schedule: "*/30 * * * *",
+    onFail: "log",
+    description: "Refresh stale tracking numbers from carrier APIs into local cache.",
+    handler: async () => {
+        const { refreshStaleTrackings, countActiveTrackings } = await import("@/lib/storage/tracking-cache");
+        const active = countActiveTrackings();
+        console.log(`[tracking-refresh] ${active} active tracking records in cache`);
+        const refreshed = await refreshStaleTrackings(60);
+        if (refreshed > 0) {
+            console.log(`[tracking-refresh] Refreshed ${refreshed} tracking records`);
         }
+    },
+});
+
+// HERMIA(2026-07-15): Process the unified sync queue (SQLite → PostgREST).
+// Runs every 60s. Syncs up to 20 records per tick with exponential backoff.
+defineJob({
+    name: "sync-queue",
+    schedule: "* * * * *",
+    onFail: "log",
+    description: "Process sync queue: SQLite → PostgREST (every 60s).",
+    handler: async () => {
+        const { processSyncQueue, getQueueDepth, cleanFailedSyncs } = await import("@/lib/storage/sync-queue");
+        const depth = getQueueDepth();
+        if (depth > 0) {
+            const result = await processSyncQueue(20);
+            if (result.processed > 0) {
+                console.log(`[sync-queue] Processed ${result.processed} (${result.succeeded} ok, ${result.failed} failed). Queue depth: ${depth}`);
+            }
+        }
+        // Daily cleanup of permanently failed tasks
+        const cleaned = cleanFailedSyncs();
+        if (cleaned > 0) {
+            console.log(`[sync-queue] Cleaned ${cleaned} permanently failed tasks`);
+        }
+    },
+});
+
+// HERMIA(2026-07-15): Sync Finale PO data into local SQLite cache.
+// Runs every 15min. Writes to po_cache (SQLite) for sub-ms dashboard queries.
+defineJob({
+    name: "po-finale-sync",
+    schedule: "*/15 * * * *",
+    onFail: "log",
+    description: "Sync Finale PO data into local SQLite cache (every 15min).",
+    handler: async () => {
+        const { default: PQueue } = await import("p-queue");
+        const { upsertPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
+        const { FinaleClient } = await import("@/lib/finale/client");
+        const { enqueueSync } = await import("@/lib/storage/sync-queue");
+
+        const finale = new FinaleClient();
+        const queue = new PQueue({ concurrency: 3 });
+
+        // Fetch recent POs from Finale (last 90 days)
+        const recentPOs = await finale.getRecentPurchaseOrders(90, 200);
+
+        if (!recentPOs || recentPOs.length === 0) {
+            console.log("[po-finale-sync] No recent POs from Finale");
+            return;
+        }
+
+        let synced = 0;
+        for (const po of recentPOs) {
+            queue.add(async () => {
+                try {
+                    upsertPOCache({
+                        po_number: po.orderId || po.po_number,
+                        vendor_name: po.supplier || po.vendor_name || "",
+                        status: po.status,
+                        total_amount: po.total_amount || 0,
+                        line_items: JSON.stringify(po.items || po.lineItems || []),
+                        lifecycle_state: po.lifecycle_state || null,
+                        estimated_eta: po.estimated_delivery_date || po.estimated_eta || null,
+                        created_at: po.created_at || po.createdAt || null,
+                        updated_at: po.updated_at || po.updatedAt || null,
+                    });
+
+                    // Also enqueue for async PostgREST sync
+                    await enqueueSync("purchase_orders", po.orderId || po.po_number, "upsert");
+                    synced++;
+                } catch (err: any) {
+                    console.warn(`[po-finale-sync] Failed to sync PO ${po.orderId}: ${err.message}`);
+                }
+            });
+        }
+
+        await queue.onIdle();
+        console.log(`[po-finale-sync] Synced ${synced}/${recentPOs.length} POs to local cache`);
     },
 });
 
@@ -679,6 +790,48 @@ defineJob({
         if (expired > 0) {
             console.log(`[expire-stale-approvals] Expired ${expired} stale approval(s)`);
         }
+    },
+});
+
+// HERMIA(2026-07-15): SQLite housekeeping — prune stale records, vacuum.
+// Runs daily at 3AM. Reclaims space from old session archives, task history,
+// cognitive rounds, and expired cache entries.
+defineJob({
+    name: "sqlite-housekeeping",
+    schedule: "0 3 * * *",
+    onFail: "log",
+    description: "Prune stale SQLite records and VACUUM (daily 3 AM).",
+    handler: async () => {
+        const { pruneStaleRecords, vacuumDb, getDbFileSize } = await import("@/lib/storage/housekeeping");
+        const beforeSize = getDbFileSize();
+        const result = pruneStaleRecords();
+        const totalRows = result.memory_vectors + result.task_history + result.cognitive_rounds
+            + result.sync_queue + result.po_cache + result.invoice_cache;
+
+        if (totalRows > 0) {
+            const freed = vacuumDb();
+            const afterSize = getDbFileSize();
+            console.log(`[sqlite-housekeeping] Pruned ${totalRows} rows across 6 tables`);
+            console.log(`[sqlite-housekeeping] Before: ${beforeSize.sizeMb} | After: ${afterSize.sizeMb} | Freed: ${freed.freedPages} pages`);
+            console.log(`[sqlite-housekeeping] Detail:`, JSON.stringify(result));
+        } else {
+            console.log(`[sqlite-housekeeping] Nothing to prune. DB size: ${beforeSize.sizeMb}`);
+        }
+    },
+});
+
+// HERMIA(2026-07-15): Daily SQLite backup.
+// Runs daily at 4AM. Keeps 7 days of backups.
+defineJob({
+    name: "sqlite-backup",
+    schedule: "0 4 * * *",
+    onFail: "log",
+    description: "Backup aria-local.db and prune old backups (daily 4 AM).",
+    handler: async () => {
+        const { createLocalBackup, pruneBackups } = await import("@/lib/storage/housekeeping");
+        const backupPath = createLocalBackup();
+        const deleted = pruneBackups(7);
+        console.log(`[sqlite-backup] Created: ${backupPath} | Removed ${deleted} old backup(s)`);
     },
 });
 
@@ -1113,8 +1266,8 @@ defineJob({
         // Step 3: Clean up old ap_activity_log entries (keep 90 days)
         try {
             const { createClient } = await import("@/lib/supabase");
-            const supabase = createClient();
-            if (supabase) {
+            const db = createClient();
+            if (db) {
                 const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
                 const { data, error } = await supabase
                     .from("ap_activity_log")
@@ -1129,6 +1282,31 @@ defineJob({
             }
         } catch (err: any) {
             console.warn(`[billcom-ref-import] Log cleanup skipped: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invoice → PO Auto-Matcher — finds unmatched invoices and suggests PO matches.
+// Runs every 30 min. Auto-applies matches scoring ≥80 with exactly one candidate.
+// Lower-confidence matches queue for human review in the receivings panel.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "invoice-po-auto-match",
+    schedule: "*/30 * * * *",
+    onFail: "telegram-will",
+    description: "Auto-match unmatched vendor invoices to purchase orders (every 30m).",
+    handler: async () => {
+        const { batchMatchUnmatchedInvoices } = await import(
+            "@/lib/purchasing/invoice-po-matcher"
+        );
+        const result = await batchMatchUnmatchedInvoices();
+        if (result.autoMatched.length > 0 || result.needsReview.length > 0) {
+            console.log(
+                `[invoice-po-auto-match] auto-matched=${result.autoMatched.length}, ` +
+                `needs-review=${result.needsReview.length}`
+            );
         }
     },
     budget: { durationMs: 120_000 },

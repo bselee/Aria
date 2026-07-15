@@ -5,7 +5,7 @@
  *          been retried beyond a sane threshold and flags them for review.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * QUERIES (Supabase):
  *   email_inbox_queue — emails awaiting processing
@@ -14,7 +14,7 @@
  *   agent_task         — control-plane tasks (dropship, exceptions)
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Stuck Email Detection ───────────────────────────────────────────────────
 
@@ -35,8 +35,8 @@ export interface StuckEmail {
  * or have been sitting unprocessed for too long. These need human review.
  */
 export async function detectStuckEmails(): Promise<StuckEmail[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     const stuck: StuckEmail[] = [];
     const cutoffTime = new Date(Date.now() - STUCK_THRESHOLD_HOURS * 3600000).toISOString();
@@ -130,7 +130,7 @@ export interface APDailyStats {
  * Get today's AP pipeline statistics.
  */
 export async function getAPDailyStats(): Promise<APDailyStats> {
-    const supabase = createClient();
+    const db = createClient();
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
     const stats: APDailyStats = {
@@ -147,7 +147,7 @@ export async function getAPDailyStats(): Promise<APDailyStats> {
         errors: 0,
     };
 
-    if (!supabase) return stats;
+    if (!db) return stats;
 
     try {
         const { data } = await supabase

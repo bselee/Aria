@@ -22,7 +22,7 @@
  * FLOW: Cron → drafter-agent (creates drafts) → autonomy-engine (detects + notifies)
  */
 
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { FinaleClient, type PurchasingGroup } from '../finale/client';
 import { assessPurchasingGroups, type AssessedPurchasingGroup } from './assessment-service';
 import { buildDraftPOItemsFromAssessment } from './draft-po-policy';

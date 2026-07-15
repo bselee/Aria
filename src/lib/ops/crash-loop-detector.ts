@@ -5,10 +5,10 @@
  *          a Telegram message to Will when crash loop is detected.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, telegraf
+ * @deps    @/lib/db, telegraf
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import type { Telegraf } from "telegraf";
 import { criticalAlert } from "@/lib/intelligence/alert-gate";
 
@@ -24,8 +24,8 @@ const CRASH_LOOP_THRESHOLD = 3; // 3+ restarts in window = crash loop
  */
 export async function detectAndAlertCrashLoop(bot: Telegraf): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         const windowStart = new Date(Date.now() - CRASH_LOOP_WINDOW_MS).toISOString();
 
@@ -71,7 +71,7 @@ export async function detectAndAlertCrashLoop(bot: Telegraf): Promise<void> {
         }
 
         // Record this boot's heartbeat
-        await supabase.from("agent_heartbeats").insert({
+        await db.from("agent_heartbeats").insert({
             agent_name: "ops-manager",
             heartbeat_at: new Date().toISOString(),
             status: "starting",

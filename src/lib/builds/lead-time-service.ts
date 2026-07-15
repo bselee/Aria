@@ -10,7 +10,7 @@
  *               post-PO receipt time)
  *            1. Vendor median — last 90 days of completed POs (≥3 data points required)
  *            2. SKU product lead time — Finale product REST (if sku provided)
- *            3. 14-day global default
+ *            3. 21-day global default
  *
  *          Cache TTL: 4 hours (same as calendar sync cron interval).
  *          One Finale GraphQL call + one Supabase query fills everything.
@@ -23,8 +23,9 @@
  */
 
 import { FinaleClient, finaleClient } from '../finale/client';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { withToolAudit } from '../agents/tool-registry';
+import { DEFAULT_LEAD_TIME_DAYS } from '../constants';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -33,7 +34,7 @@ import { withToolAudit } from '../agents/tool-registry';
 export interface LeadTimeResult {
     days: number;
     provenance: 'policy_override' | 'vendor_median' | 'sku_product' | 'default';
-    label: string; // e.g. "60d policy override" | "13d median · vendor history" | "7d (Finale)" | "14d default"
+    label: string; // e.g. "60d policy override" | "13d median · vendor history" | "7d (Finale)" | "21d default"
 }
 
 export interface LeadTimeDistribution {
@@ -185,9 +186,9 @@ export class LeadTimeService {
 
         // 3. Global default
         return {
-            days: 14,
+            days: DEFAULT_LEAD_TIME_DAYS,
             provenance: 'default',
-            label: '14d default',
+            label: `${DEFAULT_LEAD_TIME_DAYS}d default`,
         };
     }
 

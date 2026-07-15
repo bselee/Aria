@@ -1,6 +1,6 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { getLocalDb, dedupSeen, dedupMark, dedupCount } from "../storage/local-db";
 import { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
@@ -271,9 +271,9 @@ export class OpsManager {
 
         // Record start in cron_runs (fire-and-forget — don\'t block the task)
         try {
-            const supabase = createClient();
-            if (supabase) {
-                const { data } = await supabase.from("cron_runs").insert({
+            const db = createClient();
+            if (db) {
+                const { data } = await db.from("cron_runs").insert({
                     task_name: taskName,
                     status: "running",
                 }).select("id").single();
@@ -290,9 +290,9 @@ export class OpsManager {
             // Update cron_runs with success
             if (cronRunId) {
                 try {
-                    const supabase = createClient();
-                    if (supabase) {
-                        await supabase.from("cron_runs").update({
+                    const db = createClient();
+                    if (db) {
+                        await db.from("cron_runs").update({
                             finished_at: new Date().toISOString(),
                             duration_ms: durationMs,
                             status: "success",
@@ -319,9 +319,9 @@ export class OpsManager {
             // Update cron_runs with failure
             if (cronRunId) {
                 try {
-                    const supabase = createClient();
-                    if (supabase) {
-                        await supabase.from("cron_runs").update({
+                    const db = createClient();
+                    if (db) {
+                        await db.from("cron_runs").update({
                             finished_at: new Date().toISOString(),
                             duration_ms: durationMs,
                             status: "error",
@@ -348,9 +348,9 @@ export class OpsManager {
                             started_at: startedAtIso,
                         },
                     });
-                    const supabase = createClient();
-                    if (supabase) {
-                        await supabase.from("cron_runs")
+                    const db = createClient();
+                    if (db) {
+                        await db.from("cron_runs")
                             .update({ task_id: task.id })
                             .eq("id", cronRunId);
                     }

@@ -6,11 +6,11 @@
  *          Sends clean, actionable HTML or text email to Bill.
  * @author  Hermia
  * @created 2026-06-15
- * @deps    @/lib/supabase, @/lib/gmail/send-email, @/lib/intelligence/notify-via-task (optional)
+ * @deps    @/lib/db, @/lib/gmail/send-email, @/lib/intelligence/notify-via-task (optional)
  * @env     SUPABASE_*, GMAIL OAuth (default slot)
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { sendTextOnlyGmailEmail } from "../gmail/send-email";
 
 // ─────────────────────────────────────────────────────────────────────────────

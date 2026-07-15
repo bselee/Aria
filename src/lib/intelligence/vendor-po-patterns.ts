@@ -5,10 +5,10 @@
  *          fed back to the LLM parser to guide PO number extraction.
  * @author  Hermia
  * @created 2026-06-01
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 /** How many failures before we generate an LLM hint */
 const HINT_THRESHOLD = 3;
@@ -39,13 +39,13 @@ export async function recordMatchFailure(
     if (!vendorName || vendorName === "UNKNOWN") return;
 
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         const now = new Date().toISOString();
 
         // Upsert: increment fail count, update last_failed_at
-        const { error } = await supabase.rpc(
+        const { error } = await db.rpc(
             "upsert_vendor_po_pattern",
             {
                 p_vendor_name: vendorName,
@@ -73,7 +73,7 @@ export async function recordMatchFailure(
                     })
                     .eq("id", existing.id);
             } else {
-                await supabase.from("vendor_po_patterns").insert({
+                await db.from("vendor_po_patterns").insert({
                     vendor_name: vendorName,
                     fail_count: 1,
                     last_failed_at: now,
@@ -113,8 +113,8 @@ export async function recordMatchSuccess(
     if (!vendorName || vendorName === "UNKNOWN" || !poNumber) return;
 
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         const now = new Date().toISOString();
         const example = {
@@ -152,7 +152,7 @@ export async function recordMatchSuccess(
                 })
                 .eq("id", existing.id);
         } else {
-            await supabase.from("vendor_po_patterns").insert({
+            await db.from("vendor_po_patterns").insert({
                 vendor_name: vendorName,
                 examples: [example],
                 success_count: 1,
@@ -191,8 +191,8 @@ export async function getPoPatternHint(
  */
 async function generateHint(vendorName: string): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         // Generate a generic but useful hint based on vendor name
         // In a future iteration, this could analyze actual invoice PDFs
@@ -257,8 +257,8 @@ async function getVendorPattern(
     vendorName: string
 ): Promise<VendorPoPattern | null> {
     try {
-        const supabase = createClient();
-        if (!supabase) return null;
+        const db = createClient();
+        if (!db) return null;
 
         const { data, error } = await supabase
             .from("vendor_po_patterns")
@@ -287,8 +287,8 @@ async function getVendorPattern(
  */
 export async function getAllVendorPatterns(): Promise<VendorPoPattern[]> {
     try {
-        const supabase = createClient();
-        if (!supabase) return [];
+        const db = createClient();
+        if (!db) return [];
 
         const { data, error } = await supabase
             .from("vendor_po_patterns")

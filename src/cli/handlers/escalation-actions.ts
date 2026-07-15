@@ -9,7 +9,7 @@
  */
 
 import type { Context } from "telegraf";
-import { createClient } from "../../lib/supabase";
+import { createClient } from "../../lib/db";
 
 /**
  * Handle 'escalation_replace_{poNumber}' — Bill wants to replace this order
@@ -20,21 +20,21 @@ export async function handleEscalationReplace(ctx: Context, poNumber: string): P
     await ctx.answerCbQuery(`Planning replacement for PO ${poNumber}...`);
 
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             await ctx.editMessageText("❌ Database unavailable");
             return;
         }
 
         // Mark PO for replacement and flag for human review
-        await supabase.from("purchase_orders").update({
+        await db.from("purchase_orders").update({
             lifecycle_stage: "pending_replacement",
             needs_human_review: true,
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
 
         // Log the decision
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Replace vendor: PO ${poNumber}`,
             intent: "ESCALATION_REPLACE",
@@ -67,20 +67,20 @@ export async function handleEscalationDraft(ctx: Context, poNumber: string): Pro
     await ctx.answerCbQuery(`Drafting urgent follow-up for PO ${poNumber}...`);
 
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             await ctx.editMessageText("❌ Database unavailable");
             return;
         }
 
         // Mark for urgent follow-up
-        await supabase.from("purchase_orders").update({
+        await db.from("purchase_orders").update({
             lifecycle_stage: "urgent_followup_requested",
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
 
         // Log the request
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Urgent draft requested: PO ${poNumber}`,
             intent: "ESCALATION_DRAFT",

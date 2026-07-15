@@ -18,7 +18,7 @@
  * @author  Aria
  * @created 2026-05-20
  * @updated 2026-05-20
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 
 import { createClient } from '@/lib/db';

@@ -117,10 +117,10 @@ const budgetCommand: BotCommand = {
 
         try {
             const { createClient } = await import("@/lib/supabase");
-            const supabase = createClient();
+            const db = createClient();
 
-            if (!supabase) {
-                await ctx.reply("❌ Supabase unavailable");
+            if (!db) {
+                await ctx.reply("❌ Database unavailable");
                 return;
             }
 
@@ -216,10 +216,10 @@ const agentsCommand: BotCommand = {
 
         try {
             const { createClient } = await import("@/lib/supabase");
-            const supabase = createClient();
+            const db = createClient();
 
-            if (!supabase) {
-                await ctx.reply("❌ Supabase unavailable");
+            if (!db) {
+                await ctx.reply("❌ Database unavailable");
                 return;
             }
 
@@ -499,8 +499,8 @@ const hermiaCommand: BotCommand = {
 
             // Register heartbeats from current state
             const { createClient } = await import("@/lib/supabase");
-            const supabase = createClient();
-            if (supabase) {
+            const db = createClient();
+            if (db) {
                 const { data: heartbeats } = await supabase
                     .from("agent_heartbeats")
                     .select("agent_name, status, heartbeat_at")
@@ -686,14 +686,14 @@ const hermiaCommand: BotCommand = {
 
                 try {
                     const { createClient } = await import('@/lib/supabase');
-                    const supabase = createClient();
-                    if (!supabase) {
-                        await ctx.reply('❌ Supabase not available.');
+                    const db = createClient();
+                    if (!db) {
+                        await ctx.reply('❌ Database not available.');
                         return;
                     }
 
                     // Write reclassification decision to activity log
-                    const { error } = await supabase.from('ap_activity_log').insert({
+                    const { error } = await db.from('ap_activity_log').insert({
                         email_from: `reclassify-command`,
                         email_subject: `Reclassification: ${identifier} → ${classification}`,
                         intent: 'RECLASSIFICATION',
@@ -746,9 +746,9 @@ const apRetryCommand: BotCommand = {
 
         try {
             const { createClient } = await import("@/lib/supabase");
-            const supabase = createClient();
-            if (!supabase) {
-                await ctx.reply("❌ Supabase not available.");
+            const db = createClient();
+            if (!db) {
+                await ctx.reply("❌ Database not available.");
                 return;
             }
 
@@ -849,7 +849,7 @@ const apRetryCommand: BotCommand = {
                 }
 
                 // Log the retry to activity log
-                const { error: logError } = await supabase.from("ap_activity_log").insert({
+                const { error: logError } = await db.from("ap_activity_log").insert({
                     email_from: `apretry-command`,
                     email_subject: `Retry: ${item.subject || item.message_id}`,
                     intent: "PROCESSING_ERROR",

@@ -10,7 +10,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { finaleClient } from "../finale/client";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 export const READ_TOOL_NAMES = [
     "lookup_product",

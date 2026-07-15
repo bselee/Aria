@@ -181,6 +181,15 @@ export async function prewarmPurchasingCaches(): Promise<void> {
     stash.lastPrewarmMs = Date.now();
     const client = new FinaleClient();
     try {
+        // HERMIA(2026-07-14): Warm lead-time distribution cache BEFORE the
+        // purchasing scan so P90 data is available on the first pass. Without
+        // this, the scan falls back to Finale's native lead time (7-14d) and
+        // urgency/ordering decisions are wrong until the second 25-min cycle.
+        const { leadTimeService } = await import('@/lib/builds/lead-time-service');
+        await leadTimeService.warmCache().catch((err: any) =>
+            console.warn('[purchasing/prewarm] lead-time dist warmup failed (non-fatal):', err?.message || err),
+        );
+
         const { prewarmForwardDemand } = await import('./forward-demand');
         // HERMIA(2026-06-19): Run resale first, then BOM — NOT concurrently.
         // Both share the same FinaleCoreClient rate limiter (500ms between ALL

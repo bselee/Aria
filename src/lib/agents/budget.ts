@@ -14,7 +14,7 @@
  *          rather than hard-fail.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export class BudgetExceededError extends Error {
     constructor(public agentId: string, public capUsd: number, public spentUsd: number) {
@@ -79,8 +79,8 @@ function isNewMonth(periodStart: string | Date): boolean {
  * Call BEFORE invoking an LLM. Throw BudgetExceededError when refused.
  */
 export async function checkBudget(agentId: string): Promise<BudgetCheckResult> {
-    const supabase = createClient();
-    if (!supabase) return { allowed: true, reason: "unknown" };
+    const db = createClient();
+    if (!db) return { allowed: true, reason: "unknown" };
 
     try {
         const { data, error } = await supabase
@@ -136,8 +136,8 @@ export async function chargeBudget(
     inputTokens: number,
     outputTokens: number,
 ): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const usd = estimateCostUsd(model, inputTokens, outputTokens);
     const tokens = inputTokens + outputTokens;
@@ -167,7 +167,7 @@ export async function chargeBudget(
 
         if (!existing) {
             // Unknown agent — insert with default cap.
-            await supabase.from("agent_budget").upsert({
+            await db.from("agent_budget").upsert({
                 agent_id: agentId,
                 monthly_usd_cap: 25.00,
                 current_period_start: now,
@@ -181,7 +181,7 @@ export async function chargeBudget(
 
         const rollover = isNewMonth(existing.current_period_start);
 
-        await supabase.from("agent_budget").upsert({
+        await db.from("agent_budget").upsert({
             agent_id: agentId,
             current_period_start: rollover ? now : existing.current_period_start,
             current_period_usd_spent: rollover ? usd : Number(existing.current_period_usd_spent) + usd,

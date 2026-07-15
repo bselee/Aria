@@ -1,23 +1,27 @@
 /**
- * @file    shutdown-guard.ts
+ * @file    src/lib/persistence/shutdown-guard.ts
  * @purpose Graceful shutdown persistence — persists volatile in-memory state
- *          (chatHistory, pending operations) to Supabase before process exit.
+ *          (chatHistory, pending operations) to local SQLite before process exit.
  *          On Windows shutdown, PM2 sends SIGTERM with kill_timeout.
  *          This module catches the signal and flushes critical state
  *          before the process is killed, then restores it on the next boot.
+ *
+ *          Replaced the old Supabase-backed persistence. SQLite is the sole
+ *          durable store for shutdown snapshots.
+ *
  * @author  Hermia
  * @created 2026-06-16
- * @deps    supabase/createClient, sys_chat_logs table
- * @env     NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * @updated 2026-07-15 — migrated from Supabase to local SQLite
+ * @deps    @/lib/storage/local-db
  *
  * USAGE:
  *   import { installShutdownGuard } from '../lib/persistence/shutdown-guard';
  *   installShutdownGuard(chatHistory, chatLastActive);
  *
  * DESIGN:
- *   - Captures SIGINT/SIGTERM from PM2 (standard on Windows kill_timeout)
+ *   - Captures SIGINT/SIGTERM from PM2
  *   - Serializes chatHistory to sys_chat_logs rows tagged as
- *     'shutdown-snapshot' so boot-time restore can find them
+ *     'shutdown-snapshot' stored in SQLite
  *   - Runs in a best-effort fire-and-forget pattern; will not delay shutdown
  *     past a hard 4-second deadline per operation
  *   - On boot, restoreChatHistory() reads the latest snapshot and reconstructs
@@ -25,20 +29,19 @@
  *
  * SAFETY:
  *   - Shutdown snapshots are compact — one row per chatId
- *   - sys_chat_logs retention already handles cleanup (>90d via housekeeping)
  *   - Old snapshots are cleaned before writing new ones
- *   - If snapshot write fails (timeout/Supabase down), state is simply lost —
+ *   - If snapshot write fails (timeout/SQLite error), state is simply lost —
  *     Aria continues fine, just without chat history
  */
 
-import { createClient } from '../supabase';
+import { getLocalDb } from '@/lib/storage/local-db';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
 const SNAPSHOT_SOURCE = 'shutdown-guard' as const;
 const SNAPSHOT_METADATA_TYPE = 'shutdown-snapshot' as const;
 
-/** Serialisable chat history snapshot shape, stored as metadata */
+/** Serialisable chat history snapshot shape, stored as JSON in SQLite */
 export interface ChatHistorySnapshot {
   /** ISO timestamp when snapshot was taken */
   captured_at: string;
@@ -50,22 +53,31 @@ export interface ChatHistorySnapshot {
   lastActive: Record<string, number>;
 }
 
+/** Ensure the SQLite table exists. Idempotent. */
+function ensureTable(): void {
+  const db = getLocalDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sys_chat_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source TEXT NOT NULL,
+      role TEXT,
+      content TEXT,
+      metadata TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+}
+
 // ── Shutdown Persistence ─────────────────────────────────────────────────
 
 /**
- * Persist chatHistory to Supabase as snapshot rows.
+ * Persist chatHistory to local SQLite as snapshot rows.
  * Best-effort: never throws, never blocks more than 4 seconds.
  */
 export async function persistChatHistorySnapshot(
   chatHistory: Record<string, any[]>,
   chatLastActive: Record<string, number>,
 ): Promise<boolean> {
-  const supabase = createClient();
-  if (!supabase) {
-    console.warn('[shutdown-guard] Supabase unavailable — skipping chat snapshot');
-    return false;
-  }
-
   // Prune: only persist chats with actual messages, cap at last 40 per chat
   const chats: Record<string, Array<{ role: string; content: string }>> = {};
   for (const [chatId, messages] of Object.entries(chatHistory)) {
@@ -89,60 +101,43 @@ export async function persistChatHistorySnapshot(
   const pid = process.pid;
 
   try {
-    // Use AbortController for timeout safety
-    const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), 4000);
+    ensureTable();
+    const db = getLocalDb();
 
     // Delete old snapshots for this source+type combo
-    const { error: deleteError } = await supabase
-      .from('sys_chat_logs')
-      .delete()
-      .eq('source', SNAPSHOT_SOURCE)
-      .filter('metadata->>type', 'eq', SNAPSHOT_METADATA_TYPE);
-
-    if (deleteError) {
-      console.warn(`[shutdown-guard] Delete old snapshot failed (non-fatal): ${deleteError.message}`);
-    }
+    db.prepare(
+      `DELETE FROM sys_chat_logs WHERE source = ? AND json_extract(metadata, '$.type') = ?`
+    ).run(SNAPSHOT_SOURCE, SNAPSHOT_METADATA_TYPE);
 
     // Insert one row per chatId
-    const rows = Object.entries(chats).map(([chatId, messages]) => ({
-      source: SNAPSHOT_SOURCE,
-      role: 'system' as const,
-      content: JSON.stringify(messages),
-      metadata: {
-        type: SNAPSHOT_METADATA_TYPE,
-        chat_id: chatId,
-        last_active: lastActive[chatId] || Date.now(),
-        captured_at: new Date().toISOString(),
-        pid,
-        message_count: messages.length,
-      },
-    }));
+    const insert = db.prepare(
+      `INSERT INTO sys_chat_logs (source, role, content, metadata)
+       VALUES (?, ?, ?, ?)`
+    );
 
-    if (rows.length > 0) {
-      // Insert in batches of 25 to stay under Supabase request limits
-      const BATCH_SIZE = 25;
-      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE);
-        const { error: insertError } = await supabase
-          .from('sys_chat_logs')
-          .insert(batch);
-
-        if (insertError) {
-          console.warn(`[shutdown-guard] Batch insert failed (offset ${i}): ${insertError.message}`);
-        }
+    const tx = db.transaction(() => {
+      for (const [chatId, messages] of Object.entries(chats)) {
+        insert.run(
+          SNAPSHOT_SOURCE,
+          'system',
+          JSON.stringify(messages),
+          JSON.stringify({
+            type: SNAPSHOT_METADATA_TYPE,
+            chat_id: chatId,
+            last_active: lastActive[chatId] || Date.now(),
+            captured_at: new Date().toISOString(),
+            pid,
+            message_count: messages.length,
+          }),
+        );
       }
-    }
+    });
 
-    clearTimeout(timeout);
-    console.log(`[shutdown-guard] Persisted ${rows.length} chat(s) to Supabase`);
+    tx();
+    console.log(`[shutdown-guard] Persisted ${Object.keys(chats).length} chat(s) to local SQLite`);
     return true;
   } catch (err: any) {
-    if (err?.name === 'AbortError') {
-      console.warn('[shutdown-guard] Snapshot timed out (4s) — proceeding with shutdown');
-    } else {
-      console.warn(`[shutdown-guard] Snapshot failed: ${err?.message || err}`);
-    }
+    console.warn(`[shutdown-guard] Snapshot failed: ${err?.message || err}`);
     return false;
   }
 }
@@ -160,26 +155,21 @@ export async function restoreChatHistory(): Promise<{
   chats: Record<string, any[]>;
   lastActive: Record<string, number>;
 }> {
-  const supabase = createClient();
-  if (!supabase) {
-    console.warn('[shutdown-guard] Supabase unavailable — cannot restore chat history');
-    return { chats: {}, lastActive: {} };
-  }
-
   try {
-    const { data, error } = await supabase
-      .from('sys_chat_logs')
-      .select('content, metadata, created_at')
-      .eq('source', SNAPSHOT_SOURCE)
-      .filter('metadata->>type', 'eq', SNAPSHOT_METADATA_TYPE)
-      .order('created_at', { ascending: false });
+    ensureTable();
+    const db = getLocalDb();
 
-    if (error) {
-      console.warn(`[shutdown-guard] Restore query failed: ${error.message}`);
-      return { chats: {}, lastActive: {} };
-    }
+    const rows = db.prepare(
+      `SELECT content, metadata, created_at FROM sys_chat_logs
+       WHERE source = ? AND json_extract(metadata, '$.type') = ?
+       ORDER BY created_at DESC`
+    ).all(SNAPSHOT_SOURCE, SNAPSHOT_METADATA_TYPE) as Array<{
+      content: string;
+      metadata: string;
+      created_at: string;
+    }>;
 
-    if (!data || data.length === 0) {
+    if (!rows || rows.length === 0) {
       console.log('[shutdown-guard] No chat history snapshot found — starting fresh');
       return { chats: {}, lastActive: {} };
     }
@@ -187,8 +177,9 @@ export async function restoreChatHistory(): Promise<{
     const chats: Record<string, any[]> = {};
     const lastActive: Record<string, number> = {};
 
-    for (const row of data) {
-      const metadata = row.metadata as Record<string, any> | null;
+    for (const row of rows) {
+      let metadata: Record<string, any> = {};
+      try { metadata = JSON.parse(row.metadata); } catch { continue; }
       if (!metadata?.chat_id) continue;
 
       // Skip if we already have a newer entry for this chatId
@@ -200,11 +191,7 @@ export async function restoreChatHistory(): Promise<{
           : row.content;
         if (Array.isArray(messages) && messages.length > 0) {
           chats[metadata.chat_id] = messages;
-          if (metadata.last_active) {
-            lastActive[metadata.chat_id] = Number(metadata.last_active);
-          } else {
-            lastActive[metadata.chat_id] = Date.now();
-          }
+          lastActive[metadata.chat_id] = Number(metadata.last_active) || Date.now();
         }
       } catch {
         // Skip malformed entries
@@ -272,7 +259,6 @@ export function installShutdownGuard(
   process.removeAllListeners('SIGINT');
   process.removeAllListeners('SIGTERM');
 
-  // Fire-and-forget with a hard timeout so we never delay exit past the PM2 kill_timeout
   const wrappedHandler = (signal: string) => {
     void handleShutdown(signal).finally(() => {
       process.exit(0);

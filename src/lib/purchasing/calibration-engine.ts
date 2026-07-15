@@ -20,7 +20,7 @@
  *      - bias > +50%        → 0.75 (substantial over-order)
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { finaleClient } from "../finale/client";
 import { withToolAudit, type ToolAuditContext } from "../agents/tool-registry";
 

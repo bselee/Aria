@@ -2,14 +2,19 @@
  * @file    api/dashboard/receivings/route.ts
  * @purpose Returns Finale received POs enriched with local reconciliation data.
  *          For each received PO, shows: matched invoice, price changes,
- *          freight/tax adjustments, and approval status.
- *          Enables one-click "Approve & Apply" from the receivings panel.
- * @updated 2026-06-29 — added reconciliation enrichment
+ *          freight/tax adjustments, approval status, and invoice-PO match suggestions.
+ *
+ *          GET  — received POs + reconciliation + match suggestions
+ *          POST — actions: complete_po, match_invoice, mark_freight_pattern
+ *
+ * @updated 2026-07-14 — added 30d window, match suggestions, PO completion, freight learning
  */
 
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
+import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 
 export function getDenverWeekStart(date: Date): string {
     const denverNow = new Date(date.toLocaleString('en-US', { timeZone: 'America/Denver' }));
@@ -19,14 +24,16 @@ export function getDenverWeekStart(date: Date): string {
     return denverNow.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 }
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
     try {
         const { searchParams } = new URL(req.url);
         const daysParam = searchParams.get('days');
+        const matchInvoiceId = searchParams.get('match_invoice');
 
         const now = new Date();
         const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 
+        const DEFAULT_RECEIVINGS_DAYS = 30;
         const startStr = daysParam
             ? (() => {
                 const days = parseInt(daysParam, 10);
@@ -34,7 +41,11 @@ export async function GET(req: Request) {
                 start.setDate(start.getDate() - days);
                 return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
             })()
-            : getDenverWeekStart(now);
+            : (() => {
+                const start = new Date(now);
+                start.setDate(start.getDate() - DEFAULT_RECEIVINGS_DAYS);
+                return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+            })();
 
         const tomorrow = new Date(now);
         tomorrow.setDate(tomorrow.getDate() + 1);
@@ -46,27 +57,23 @@ export async function GET(req: Request) {
         // Enrich with reconciliation data from local Postgres
         const sb = createClient();
         if (sb && received.length > 0) {
-            // Extract PO numbers from received data
             const poNumbers = received
                 .map((r: any) => r.poNumber || r.orderId)
                 .filter(Boolean);
 
             if (poNumbers.length > 0) {
-                // Fetch vendor invoices matching these POs
                 const { data: invoices } = await sb
                     .from('vendor_invoices')
                     .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at')
                     .in('po_number', poNumbers)
                     .order('created_at', { ascending: false });
 
-                // Fetch reconciliation outcomes for these POs
                 const { data: outcomes } = await sb
                     .from('reconciliation_outcomes')
                     .select('po_id, invoice_id, outcome, outcome_meta, created_at, resolved_at')
                     .in('po_id', poNumbers)
                     .order('created_at', { ascending: false });
 
-                // Build lookup maps
                 const invoiceMap = new Map<string, any[]>();
                 for (const inv of (invoices || [])) {
                     const key = inv.po_number;
@@ -81,7 +88,6 @@ export async function GET(req: Request) {
                     outcomeMap.get(key)!.push(oc);
                 }
 
-                // Attach reconciliation data to each received PO
                 for (const po of received) {
                     const poNum = po.poNumber || po.orderId;
                     (po as any)._reconciliation = {
@@ -97,17 +103,146 @@ export async function GET(req: Request) {
                     };
                 }
             }
+
+            // ── Match suggestions: find unmatched invoices for received PO vendors ──
+            const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
+            let matchSuggestions: any[] = [];
+
+            if (vendorNames.length > 0) {
+                const { data: unmatchedInvoices } = await sb
+                    .from('vendor_invoices')
+                    .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
+                    .is('po_number', null)
+                    .in('vendor_name', vendorNames)
+                    .order('created_at', { ascending: false })
+                    .limit(20);
+
+                if (unmatchedInvoices && unmatchedInvoices.length > 0) {
+                    for (const inv of unmatchedInvoices) {
+                        try {
+                            const result = await findPOCandidates({
+                                id: inv.id,
+                                invoiceNumber: inv.invoice_number,
+                                vendorName: inv.vendor_name,
+                                invoiceDate: inv.invoice_date,
+                                subtotal: Number(inv.subtotal || 0),
+                                freight: Number(inv.freight || 0),
+                                tax: Number(inv.tax || 0),
+                                total: Number(inv.total || 0),
+                                lineItems: inv.raw_data?.lineItems || [],
+                            });
+                            if (result.candidates.length > 0) {
+                                matchSuggestions.push({
+                                    invoiceId: inv.id,
+                                    invoiceNumber: inv.invoice_number,
+                                    vendorName: inv.vendor_name,
+                                    invoiceTotal: inv.total,
+                                    candidates: result.candidates.slice(0, 5),
+                                    autoApplyReady: result.autoApplyReady,
+                                });
+                            }
+                        } catch { /* skip individual match failures */ }
+                    }
+                }
+            }
+
+            // ── Freight classifications for received PO vendors ──
+            const freightClasses: Record<string, any> = {};
+            for (const v of vendorNames) {
+                try {
+                    freightClasses[v] = await getVendorFreightClassification(v);
+                } catch { /* skip */ }
+            }
+
+            return NextResponse.json({
+                received,
+                days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+                range: daysParam ? 'rolling_days' : 'rolling_30d',
+                startDate: startStr,
+                asOf: todayStr,
+                matchSuggestions,
+                freightClasses,
+            });
         }
 
         return NextResponse.json({
             received,
-            days: daysParam ? parseInt(daysParam, 10) : null,
-            range: daysParam ? 'rolling_days' : 'week_to_date',
+            days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+            range: daysParam ? 'rolling_days' : 'rolling_30d',
             startDate: startStr,
             asOf: todayStr,
+            matchSuggestions: [],
+            freightClasses: {},
         });
     } catch (err: any) {
         console.error('Receivings API error:', err.message);
+        return NextResponse.json({ error: err.message }, { status: 500 });
+    }
+}
+
+// ── POST: Complete PO, match invoice, mark freight pattern ──────────────────
+
+export async function POST(req: NextRequest) {
+    try {
+        const body = await req.json();
+        const { action } = body;
+
+        if (action === 'complete_po') {
+            const { orderId, vendorName, hadFreightOnPO, invoiceFreight, freightMatched } = body;
+            if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+
+            const finale = new FinaleClient();
+            const result = await finale.completeOrder(orderId);
+            const finalStatus = result?.finalStatus || 'ORDER_COMPLETED';
+
+            // Record freight evidence for learning
+            await recordFreightEvidence({
+                orderId,
+                vendorName: vendorName || '',
+                hadFreightOnPO: hadFreightOnPO || false,
+                invoiceFreight: invoiceFreight || 0,
+                freightMatched: freightMatched || false,
+                completedBy: 'dashboard',
+            });
+
+            // Invalidate caches so Active Purchases drops this PO
+            const { invalidatePurchasingCaches } = await import('@/lib/purchasing/cache');
+            await invalidatePurchasingCaches();
+
+            return NextResponse.json({ completed: true, orderId, finalStatus });
+        }
+
+        if (action === 'match_invoice') {
+            const { invoiceId, poNumber } = body;
+            if (!invoiceId || !poNumber) {
+                return NextResponse.json({ error: 'invoiceId and poNumber required' }, { status: 400 });
+            }
+
+            const sb = createClient();
+            if (!sb) return NextResponse.json({ error: 'DB unavailable' }, { status: 500 });
+
+            await sb
+                .from('vendor_invoices')
+                .update({ po_number: poNumber })
+                .eq('id', invoiceId);
+
+            return NextResponse.json({ matched: true, invoiceId, poNumber });
+        }
+
+        if (action === 'mark_freight_pattern') {
+            const { vendorName, pattern } = body;
+            if (!vendorName || !pattern) {
+                return NextResponse.json({ error: 'vendorName and pattern required' }, { status: 400 });
+            }
+
+            await markVendorFreightPattern(vendorName, pattern);
+
+            return NextResponse.json({ marked: true, vendorName, pattern });
+        }
+
+        return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
+    } catch (err: any) {
+        console.error('Receivings POST error:', err.message);
         return NextResponse.json({ error: err.message }, { status: 500 });
     }
 }

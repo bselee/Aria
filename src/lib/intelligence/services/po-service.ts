@@ -14,7 +14,7 @@
 
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
-import { createClient } from "../../supabase";
+import { createClient } from "../../db";
 import { getLocalDb, dedupSeen, dedupMark } from "../../storage/local-db";
 import { Telegraf } from "telegraf";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../../google/calendar";
@@ -357,9 +357,9 @@ export class POService {
                 }
 
                 // Upsert into build_completions for the dashboard
-                if (supabase) {
+                if (db) {
                     try {
-                        await supabase.from("build_completions").upsert(
+                        await db.from("build_completions").upsert(
                             {
                                 build_id: build.buildId,
                                 sku: build.sku,
@@ -404,9 +404,9 @@ export class POService {
             const received = await finaleClient.getTodaysReceivedPOs();
             if (received.length === 0) return;
 
-            const supabase = createClient();
+            const db = createClient();
             const alreadyAlertedPoIds = new Set<string>();
-            if (supabase) {
+            if (db) {
                 try {
                     const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
                     const ids = received.map((po: any) => po.orderId);
@@ -432,9 +432,9 @@ export class POService {
                     continue;
                 }
 
-                if (supabase) {
+                if (db) {
                     try {
-                        await supabase.from("ap_activity_log").insert({
+                        await db.from("ap_activity_log").insert({
                             email_from: po.supplier,
                             email_subject: `PO ${po.orderId} received`,
                             intent: "PO_RECEIVED",
@@ -481,7 +481,7 @@ export class POService {
         const counts = { created: 0, updated: 0, skipped: 0, cleared: 0 };
         try {
             const finale = finaleClient;
-            const supabase = createClient();
+            const db = createClient();
             const localDb = getLocalDb();
 
             const [pos] = await Promise.all([
@@ -491,7 +491,7 @@ export class POService {
 
             let missingMultiPOs: string[] = [];
             try {
-                if (supabase) {
+                if (db) {
                     const { data: multiPORows } = await supabase
                         .from("purchase_orders")
                         .select("po_number")
@@ -536,7 +536,7 @@ export class POService {
                     leadProvenance = lt.label;
                 } else {
                     expectedDate = new Date().toISOString().split("T")[0];
-                    leadProvenance = "14d default";
+                    leadProvenance = "21d default";
                 }
 
                 const { getHighConfidenceTrackingForPOs } = await import("../../tracking/shipment-intelligence");
@@ -668,7 +668,7 @@ export class POService {
         try {
             const auth = await getAuthenticatedClient("default");
             const gmail = GmailApi({ version: "v1", auth });
-            const supabase = createClient();
+            const db = createClient();
 
             const since = new Date();
             since.setDate(since.getDate() - 45);
@@ -752,7 +752,7 @@ export class POService {
                     }
                 }
 
-                if (supabase) {
+                if (db) {
                     try {
                         const { data: existing } = await supabase
                             .from("purchase_orders")
@@ -825,7 +825,7 @@ export class POService {
 
                         const willWrite = newOnes.length > 0 || (!alreadyHighConfidence && sentISO) || !!responseAt;
                         if (willWrite) {
-                            await supabase.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
+                            await db.from("purchase_orders").upsert(upsert, { onConflict: "po_number" });
                         }
 
                         if (responseAt && firstResponderAddress && vendorName) {

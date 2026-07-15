@@ -6,7 +6,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * DESIGN:
  *   Queries ap_activity_log for the last 24 hours:
@@ -20,7 +20,7 @@
  *   see which vendors are behaving.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 export interface APSummaryReport {
     periodHours: number;

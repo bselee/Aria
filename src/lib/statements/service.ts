@@ -2,7 +2,7 @@ import path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { extractPDF } from "@/lib/pdf/extractor";
 import { parseVendorStatement } from "@/lib/pdf/statement-parser";
 
@@ -77,8 +77,8 @@ function mapRunRow(row: any): StatementReconciliationRunRecord {
 }
 
 export async function listStatementDashboardData() {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return { queue: [], runs: [], cachedAt: new Date().toISOString() };
     }
 
@@ -103,8 +103,8 @@ export async function listStatementDashboardData() {
 }
 
 export async function launchStatementRun(intakeId: string, triggerSource: string) {
-    const supabase = createClient();
-    if (!supabase) throw new Error("Supabase not configured");
+    const db = createClient();
+    if (!db) throw new Error("Supabase not configured");
 
     const { data: existing } = await supabase
         .from("statement_reconciliation_runs")
@@ -145,8 +145,8 @@ export async function launchStatementRun(intakeId: string, triggerSource: string
 }
 
 export async function launchFedexDownloadRun(triggerSource: string) {
-    const supabase = createClient();
-    if (!supabase) throw new Error("Supabase not configured");
+    const db = createClient();
+    if (!db) throw new Error("Supabase not configured");
 
     const periodEnd = new Date().toISOString().split("T")[0];
     const periodStart = `${periodEnd.slice(0, 8)}01`;
@@ -206,22 +206,19 @@ function parseCsvLine(line: string): string[] {
 }
 
 async function readArtifact(bucket: string, artifactPath: string): Promise<Buffer> {
-    const supabase = createClient();
-    if (!supabase) throw new Error("Database not configured");
     try {
-        const { data, error } = await supabase.storage.from(bucket).download(artifactPath);
-        if (error || !data) throw new Error(`Artifact download failed: ${error?.message ?? "missing artifact"}`);
-        return Buffer.from(await data.arrayBuffer());
+        const { downloadPDF } = await import("../storage/supabase-storage");
+        const data = await downloadPDF(artifactPath);
+        if (!data) throw new Error(`Artifact download failed: missing artifact at ${artifactPath}`);
+        return data;
     } catch (err: any) {
-        // Storage backend (MinIO/PostgREST) may not be configured for downloads.
-        // Re-throw with a clear message so callers can handle gracefully.
         throw new Error(`Artifact unavailable (${artifactPath}): ${err?.message || err}`);
     }
 }
 
 async function materializeFedexArtifact(intake: StatementIntakeRecord): Promise<StatementIntakeRecord> {
-    const supabase = createClient();
-    if (!supabase) throw new Error("Supabase not configured");
+    const db = createClient();
+    if (!db) throw new Error("Supabase not configured");
 
     let candidate = findLatestFedexCsvCandidate();
     let localCsv = candidate?.fullPath ?? null;
@@ -272,19 +269,23 @@ async function materializeFedexArtifact(intake: StatementIntakeRecord): Promise<
 
     const stableCsvPath = archiveFedexCsvToAria(localCsv);
     const artifactPath = `fedex/${Date.now()}_${path.basename(stableCsvPath)}`;
-    const { error: uploadError } = await supabase.storage
-        .from("statement_artifacts")
-        .upload(artifactPath, await readArtifactFile(stableCsvPath), {
-            contentType: "text/csv",
-            upsert: true,
-        });
+    const { uploadPDF } = await import("../../lib/storage/supabase-storage");
+    const localPath = await uploadPDF(
+        await readArtifactFile(stableCsvPath),
+        {
+            type: "statement_artifacts",
+            vendor: "fedex",
+            date: new Date().toISOString().split("T")[0],
+            filename: path.basename(stableCsvPath),
+        },
+    );
 
-    if (uploadError) {
-        throw new Error(`FedEx CSV upload failed: ${uploadError.message}`);
+    if (!localPath) {
+        throw new Error(`FedEx CSV upload failed for ${artifactPath}`);
     }
 
-    await supabase.from("statement_intake_queue").update({
-        artifact_path: artifactPath,
+    await db.from("statement_intake_queue").update({
+        artifact_path: localPath,
         artifact_kind: "csv",
         raw_metadata: {
             ...(intake.rawMetadata ?? {}),
@@ -419,8 +420,8 @@ function canonicalVendorName(name: string): string {
 }
 
 export async function fetchArchivedInvoices(intake: StatementIntakeRecord): Promise<ArchivedVendorInvoice[]> {
-    const supabase = createClient();
-    if (!supabase) throw new Error("Supabase not configured");
+    const db = createClient();
+    if (!db) throw new Error("Supabase not configured");
 
     const canonical = canonicalVendorName(intake.vendorName);
     const effectiveEnd = intake.periodEnd ?? intake.statementDate ?? new Date().toISOString().split("T")[0];
@@ -445,8 +446,8 @@ export async function fetchArchivedInvoices(intake: StatementIntakeRecord): Prom
 }
 
 export async function processQueuedStatementRun(notify?: (message: string) => Promise<void>) {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const { data: runRow } = await supabase
         .from("statement_reconciliation_runs")
@@ -466,7 +467,7 @@ export async function processQueuedStatementRun(notify?: (message: string) => Pr
         .single();
 
     if (intakeError || !intakeRow) {
-        await supabase.from("statement_reconciliation_runs").update({
+        await db.from("statement_reconciliation_runs").update({
             run_status: "error",
             last_error: "Statement intake row missing.",
             finished_at: new Date().toISOString(),
@@ -475,12 +476,12 @@ export async function processQueuedStatementRun(notify?: (message: string) => Pr
     }
 
     const intake = mapIntakeRow(intakeRow);
-    await supabase.from("statement_reconciliation_runs").update({
+    await db.from("statement_reconciliation_runs").update({
         run_status: "processing",
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
     }).eq("id", run.id);
-    await supabase.from("statement_intake_queue").update({
+    await db.from("statement_intake_queue").update({
         status: "processing",
         updated_at: new Date().toISOString(),
     }).eq("id", intake.id);
@@ -496,7 +497,7 @@ export async function processQueuedStatementRun(notify?: (message: string) => Pr
             ? "completed"
             : "needs_review";
 
-        await supabase.from("statement_reconciliation_runs").update({
+        await db.from("statement_reconciliation_runs").update({
             run_status: finalStatus,
             finished_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
@@ -511,7 +512,7 @@ export async function processQueuedStatementRun(notify?: (message: string) => Pr
             last_error: null,
         }).eq("id", run.id);
 
-        await supabase.from("statement_intake_queue").update({
+        await db.from("statement_intake_queue").update({
             status: finalStatus === "completed" ? "reconciled" : "needs_review",
             updated_at: new Date().toISOString(),
             last_error: null,
@@ -533,13 +534,13 @@ export async function processQueuedStatementRun(notify?: (message: string) => Pr
             status: finalStatus,
         };
     } catch (error: any) {
-        await supabase.from("statement_reconciliation_runs").update({
+        await db.from("statement_reconciliation_runs").update({
             run_status: "error",
             finished_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
             last_error: error.message,
         }).eq("id", run.id);
-        await supabase.from("statement_intake_queue").update({
+        await db.from("statement_intake_queue").update({
             status: "error",
             updated_at: new Date().toISOString(),
             last_error: error.message,

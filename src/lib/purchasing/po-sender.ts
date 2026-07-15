@@ -5,7 +5,7 @@
  *          and cached in-memory for fast same-process reads.
  */
 
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { FinaleClient, type DraftPOReview } from '../finale/client';
 import type { CopilotChannel } from '../copilot/types';
 import * as agentTask from '../intelligence/agent-task';

@@ -16,7 +16,7 @@
  * only: POs sent ≥10 days ago are aged out and never poked — Will reviews
  * those manually via /unresponsive or the dashboard.
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { VendorCommsAgent, type VendorCommContext } from "@/lib/intelligence/vendor-comms-agent";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -209,8 +209,8 @@ function uniqueVendorPOs(stale: StalePO[]): Set<string> {
  */
 export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise<FollowupOutcome[]> {
     const dryRun = opts?.dryRun ?? false;
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     const outcomes: FollowupOutcome[] = [];
     const cutoffMax = new Date(Date.now() - WINDOW_MIN_DAYS * 86_400_000).toISOString();
@@ -281,7 +281,7 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
 
         if (match.matched) {
             if (!dryRun) {
-                await supabase.from('purchase_orders').update({
+                await db.from('purchase_orders').update({
                     vendor_acknowledged_at: match.receivedAt,
                     vendor_ack_source: match.source,
                     updated_at: new Date().toISOString(),

@@ -4,7 +4,7 @@
  *          vs monthly cap with 80% warning threshold.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 
 import { NextResponse } from "next/server";
@@ -14,10 +14,10 @@ export const dynamic = "force-dynamic";
 export async function GET() {
     try {
         const { createClient } = await import("@/lib/supabase");
-        const supabase = createClient();
+        const db = createClient();
 
-        if (!supabase) {
-            return NextResponse.json({ agents: [], error: "Supabase unavailable" });
+        if (!db) {
+            return NextResponse.json({ agents: [], error: "Database unavailable" });
         }
 
         const { data, error } = await supabase

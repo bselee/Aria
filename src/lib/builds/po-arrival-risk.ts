@@ -21,7 +21,7 @@
 
 import type { ActivePurchase } from "../purchasing/active-purchases";
 import type { PurchasingItem } from "../finale/client";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 export type VendorCommState =
     | "none"                       // PO sent, vendor silent

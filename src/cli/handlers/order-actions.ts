@@ -9,26 +9,26 @@
  */
 
 import type { Context } from "telegraf";
-import { createClient } from "../../lib/supabase";
+import { createClient } from "../../lib/db";
 
 export async function handleOrderApprove(ctx: Context, poNumber: string): Promise<void> {
     console.log(`✅ Order approve tapped: PO ${poNumber}`);
     await ctx.answerCbQuery("Marking order as placed...");
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         await ctx.editMessageText("❌ Database unavailable");
         return;
     }
 
     try {
-        await supabase.from("purchase_orders").update({
+        await db.from("purchase_orders").update({
             lifecycle_stage: "ordered_browser",
             po_order_placed_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
 
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Order approved: PO ${poNumber}`,
             intent: "BROWSER_ORDER_APPROVED",
@@ -52,14 +52,14 @@ export async function handleOrderAbandon(ctx: Context, poNumber: string): Promis
     console.log(`❌ Order abandon tapped: PO ${poNumber}`);
     await ctx.answerCbQuery("Cart abandoned");
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         await ctx.editMessageText("❌ Database unavailable");
         return;
     }
 
     try {
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Order abandoned: PO ${poNumber}`,
             intent: "BROWSER_ORDER_ABANDONED",

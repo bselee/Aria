@@ -12,7 +12,7 @@
  *          domain trigger before wiring po_lifecycle or invoice_reconcile.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { defineFlow } from "./registry";
 
 // ── Canary: dropship_forward ───────────────────────────────────────────────
@@ -64,7 +64,7 @@ defineFlow({
         check_first_contact: {
             run: async (ctx) => {
                 const sb = (await import("@/lib/supabase")).createClient();
-                if (!sb) return { kind: "retry", reason: "supabase unavailable" };
+                if (!sb) return { kind: "retry", reason: "database unavailable" };
                 const threadId = ctx.inputs["gmail_thread_id"];
                 if (typeof threadId !== "string" || !threadId) {
                     return {
@@ -253,7 +253,7 @@ defineFlow({
             run: async (ctx) => {
                 const sb = createClient();
                 if (!sb) {
-                    return { kind: "retry", reason: "supabase unavailable" };
+                    return { kind: "retry", reason: "database unavailable" };
                 }
                 const gmailId = ctx.inputs["gmail_message_id"];
                 if (typeof gmailId !== "string" || !gmailId) {

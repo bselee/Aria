@@ -6,7 +6,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  *
  * DESIGN:
  *   Runs from cron every 4h on weekdays.
@@ -19,7 +19,7 @@
  *   4. Log to ap_activity_log intent='EXCEPTION_ESCALATED'
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 
 const MAX_PER_RUN = 5;
@@ -45,8 +45,8 @@ export interface ExceptionEscalationResult {
  * Find active delivery exceptions and escalate them.
  */
 export async function escalateDeliveryExceptions(): Promise<ExceptionEscalationResult> {
-    const supabase = createClient();
-    if (!supabase) return { escalated: [], skipped: 0 };
+    const db = createClient();
+    if (!db) return { escalated: [], skipped: 0 };
 
     // Find active exceptions
     const { data: exceptions } = await supabase
@@ -157,7 +157,7 @@ export async function escalateDeliveryExceptions(): Promise<ExceptionEscalationR
         // Log to ap_activity_log for dedup
         for (const e of escalated) {
             try {
-                await supabase.from("ap_activity_log").insert({
+                await db.from("ap_activity_log").insert({
                     email_from: e.vendorName || "unknown",
                     email_subject: `Delivery exception: PO ${e.poNumber} — ${e.trackingNumber}`,
                     intent: "EXCEPTION_ESCALATED",

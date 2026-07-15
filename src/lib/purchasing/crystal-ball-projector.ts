@@ -255,7 +255,7 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
     const stockOnHand = item.stockOnHand ?? 0;
     const rawStockOnOrder = item.stockOnOrder ?? 0;
     const dailyRate = item.dailyRate ?? 0;
-    const leadTimeDays = item.leadTimeDays ?? 14;
+    const leadTimeDays = item.leadTimeDays ?? 21;
     const openPOs = item.openPOs ?? [];
     // DECISION(2026-05-20): Apply vendor on-time rate discount to stockOnOrder.
     // A 100% on-time vendor passes through at full credit; a vendor that delivers

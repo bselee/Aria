@@ -6,7 +6,7 @@
  * @author  Will / Antigravity
  * @created 2026-03-20
  * @updated 2026-03-20
- * @deps    finale-client, supabase, build-risk
+ * @deps    finale-client, db, build-risk
  */
 
 import type { BotCommand, BotDeps } from './types';

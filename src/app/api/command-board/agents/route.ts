@@ -13,7 +13,7 @@ import {
     getCommandBoardTaskList,
 } from "@/lib/command-board/service";
 import { getCurrentlyHandlingCounts, type IssueHandlerCounts } from "@/lib/intelligence/agent-issue";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 type AgentBudgetSummary = {
     monthly_usd_cap: number;

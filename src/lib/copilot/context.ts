@@ -17,7 +17,7 @@
  * keep recent turns verbatim, keep structured artifact summaries only.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import type { ArtifactRef } from "./types";
 
 // ── Constants ─────────────────────────────────────────────────────────────────

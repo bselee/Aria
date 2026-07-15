@@ -30,7 +30,7 @@ function resetChain() {
     supabaseMock.insert.mockReturnValue(supabaseMock);
 }
 
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 import { createOrAdvance, getCurrentlyHandlingCounts, findLinkedOpenTask } from "./agent-issue";
 

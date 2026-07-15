@@ -122,7 +122,12 @@ export interface PurchasingItem {
     runwayDays: number;            // effectiveStock / dailyRate (effectiveStock = min(stockOnHand, stockAvailable) via recommender)
     adjustedRunwayDays: number;    // (effectiveStock + stockOnOrder - reservedQty) / dailyRate
     leadTimeDays: number;
-    leadTimeProvenance: string;    // e.g. "14d (Finale)" | "14d default"
+    leadTimeProvenance: string;    // e.g. "14d (Finale)" | "21d default"
+    /** The lead time the qty recommender actually used (P90 > vendor override > Finale median).
+     *  May differ from `leadTimeDays` when historical lead-time distribution is wider
+     *  than Finale's native estimate. Dashboard urgency recomputation MUST use this
+     *  value when available, not `leadTimeDays`. */
+    effectiveLeadTimeDays?: number;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     draftPO?: {
         orderId: string;

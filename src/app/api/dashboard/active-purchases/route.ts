@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { FinaleClient } from "@/lib/finale/client";
 import { loadActivePurchases } from "@/lib/purchasing/active-purchases";
 import { loadDraftedPORecSummaries } from "@/lib/purchasing/calibration";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { syncPOETA } from "@/lib/purchasing/po-eta-sync";

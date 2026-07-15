@@ -15,7 +15,7 @@
  *   - Memory layer archival via memoryLayerManager
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import {
     recordCronRun,
     type CronRunStatus,
@@ -49,10 +49,10 @@ export async function safeRun(
         console.error(`❌ [${taskName}] failed: ${failureReason}`);
 
         // Log exception to Supabase for supervisor review
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             try {
-                await supabase.from("ops_agent_exceptions").insert({
+                await db.from("ops_agent_exceptions").insert({
                     agent_name: deps.agentName,
                     error_message: failureReason,
                     error_stack: err?.stack?.slice(0, 2000) || "",

@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { InvoiceData } from "@/lib/pdf/invoice-parser";
 import { POData } from "@/lib/pdf/po-parser";
 import { FinaleClient } from "@/lib/finale/client";

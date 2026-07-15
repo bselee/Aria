@@ -167,6 +167,96 @@ export function getLocalDb() {
         );
         CREATE INDEX IF NOT EXISTS idx_billcom_ref_vendor ON billcom_bills_ref(vendor_name);
         CREATE INDEX IF NOT EXISTS idx_billcom_ref_invoice ON billcom_bills_ref(invoice_number);
+
+        -- Boot-time tables for local-first activity logging and shutdown persistence.
+        -- Created here (not lazy) so they survive schema drift and are always available
+        -- to activity-writer.ts and shutdown-guard.ts respectively.
+        CREATE TABLE IF NOT EXISTS ap_activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            intent TEXT NOT NULL,
+            action_taken TEXT,
+            email_from TEXT,
+            metadata TEXT DEFAULT '{}',
+            reviewed_action TEXT,
+            dismiss_reason TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ap_activity_intent ON ap_activity_log(intent);
+        CREATE INDEX IF NOT EXISTS idx_ap_activity_created ON ap_activity_log(created_at);
+
+        CREATE TABLE IF NOT EXISTS sys_chat_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            role TEXT,
+            content TEXT,
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_source ON sys_chat_logs(source);
+
+        -- KAIZEN(2026-07-15): PO and invoice caches for local-first matching.
+        -- Populated by purchasing-cache.ts on read from PostgREST.
+        -- TTL-based expiry: 1h for POs, 24h for invoices.
+        CREATE TABLE IF NOT EXISTS po_cache (
+            po_number TEXT PRIMARY KEY,
+            vendor_name TEXT NOT NULL DEFAULT '',
+            status TEXT,
+            total_amount REAL DEFAULT 0,
+            line_items TEXT DEFAULT '[]',
+            tracking_numbers TEXT DEFAULT '[]',
+            lifecycle_state TEXT,
+            estimated_eta TEXT,
+            po_sent_at TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expire_at TEXT NOT NULL DEFAULT (datetime('now', '+1 hour'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_po_cache_vendor ON po_cache(vendor_name);
+        CREATE INDEX IF NOT EXISTS idx_po_cache_expire ON po_cache(expire_at);
+
+        CREATE TABLE IF NOT EXISTS invoice_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_invoice_id TEXT UNIQUE,
+            vendor_name TEXT NOT NULL,
+            invoice_number TEXT,
+            invoice_date TEXT,
+            due_date TEXT,
+            po_number TEXT,
+            total REAL DEFAULT 0,
+            freight REAL DEFAULT 0,
+            tax REAL DEFAULT 0,
+            status TEXT DEFAULT 'received',
+            line_items TEXT DEFAULT '[]',
+            source TEXT,
+            matched_po TEXT,
+            match_confidence TEXT,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expire_at TEXT NOT NULL DEFAULT (datetime('now', '+24 hours'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_inv_cache_vendor ON invoice_cache(vendor_name);
+        CREATE INDEX IF NOT EXISTS idx_inv_cache_po ON invoice_cache(po_number);
+        CREATE INDEX IF NOT EXISTS idx_inv_cache_expire ON invoice_cache(expire_at);
+
+        -- KAIZEN(2026-07-15): Unified sync queue: SQLite → PostgREST.
+        -- Used by sync-queue.ts for async, retry-capable sync of local cache writes.
+        CREATE TABLE IF NOT EXISTS sync_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            operation TEXT NOT NULL DEFAULT 'upsert',
+            payload_json TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            next_retry_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(table_name, record_id, operation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_retry ON sync_queue(next_retry_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_table ON sync_queue(table_name);
     `);
 
     // ── Lightweight migrations (ALTER TABLE for columns added after initial creation) ──

@@ -136,7 +136,7 @@ function classifyRisk(demand: ComponentDemand, isCraftComponent: boolean = false
     const hasPOs = demand.incomingPOs.length > 0;
     const onHand = demand.onHand ?? 0;
     const needed = demand.totalRequiredQty || 0;
-    const leadTime = demand.leadTimeDays ?? 14; // default 14d when unknown
+    const leadTime = demand.leadTimeDays ?? 21; // default 21d when unknown
 
     // DECISION(2026-03-04): CRAFT builds pull from many vendors and have deep BOMs.
     // Give CRAFT components an extra 7-day buffer on all thresholds so they trigger
@@ -257,10 +257,10 @@ export async function runBuildRiskAnalysis(
     //
     // Thresholds:
     //   FG_COVERAGE_BUFFER_DAYS  = 28  (4-week safety above leadTime)
-    //   LEADTIME_DEFAULT         = 14  (used when component LT unknown)
+    //   LEADTIME_DEFAULT         = 21  (used when component LT unknown)
     //
     const FG_COVERAGE_BUFFER_DAYS = 28;
-    const LEADTIME_DEFAULT = 14;
+    const LEADTIME_DEFAULT = 21;
     const FG_VELOCITY_WINDOW = 90;
     log(`🔍 Fetching FG velocity for coverage filter (${aggregatedBuilds.size} FGs)...`);
     let fgVelocityPreFilter: Map<string, FGVelocity> = new Map();

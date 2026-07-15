@@ -20,7 +20,7 @@ import { BuildParser, type ParsedBuild } from '../intelligence/build-parser';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { getTrackingStatus } from '../carriers/tracking-service';
 
 // ──────────────────────────────────────────────────
@@ -191,11 +191,11 @@ export async function processStockieEmail(): Promise<OOSReportResult | null> {
 
                     // DECISION(2026-03-12): Capture PO details per blocking component
                     // so the email can link directly to the Finale PO page. Refine ETA using live tracking if available.
-                    const supabase = createClient();
+                    const db = createClient();
                     const componentPOs = await Promise.all(profile.incomingPOs.map(async po => {
                         let refinedDelivery = po.expectedDelivery;
-                        if (supabase) {
-                            const { data } = await supabase.from('purchase_orders')
+                        if (db) {
+                            const { data } = await db.from('purchase_orders')
                                 .select('tracking_numbers')
                                 .eq('po_number', po.orderId)
                                 .maybeSingle();

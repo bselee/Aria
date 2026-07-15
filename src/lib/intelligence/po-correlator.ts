@@ -21,7 +21,7 @@
 
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 
@@ -318,7 +318,7 @@ export async function backfillPOSentVerificationFromGmail(
     const records = await scanPOEmails(maxResults, daysBack);
     result.scanned = records.length;
 
-    const supabase = createClient();
+    const db = createClient();
     if (!supabase) {
         console.warn("[po-correlator] backfill: Supabase not configured");
         return result;
@@ -457,7 +457,7 @@ export async function correlatePOsWithInvoices(
 }> {
     console.log(`🔗 [PO-Correlator] Correlating ${poRecords.length} PO(s) with invoices...`);
 
-    const supabase = createClient();
+    const db = createClient();
     const correlated: CorrelationResult[] = [];
     const unmatchedPOs: POEmailRecord[] = [];
 
@@ -642,7 +642,7 @@ export function buildVendorProfiles(poRecords: POEmailRecord[]): VendorProfile[]
  */
 export async function saveVendorProfiles(profiles: VendorProfile[]): Promise<void> {
     try {
-        const supabase = createClient();
+        const db = createClient();
         if (!supabase) return;
 
         for (const profile of profiles) {

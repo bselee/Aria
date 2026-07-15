@@ -5,7 +5,7 @@
  *          PM2 restart. Survives crashes, deploys, and OOM restarts.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * BACKGROUND:
  *   ap-agent.ts currently uses an in-memory Map to hold unmatched invoices
@@ -25,7 +25,7 @@
  *   inputs: { vendorName, invoiceNumber, gmailMessageId, subject, pdfAttachmentId }
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export interface DropshipEntry {
     vendorName: string;
@@ -41,8 +41,8 @@ export interface DropshipEntry {
  * Idempotent — uses incrementOrCreate to dedup on gmail_message_id.
  */
 export async function storeDropship(entry: DropshipEntry): Promise<string | null> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.warn("[DropshipStore] Supabase unavailable — dropship entry lost");
         return null;
     }
@@ -80,8 +80,8 @@ export async function storeDropship(entry: DropshipEntry): Promise<string | null
  * Mark a dropship as forwarded (completed).
  */
 export async function completeDropship(gmailMessageId: string): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     try {
         const { agentTask } = await import("@/lib/intelligence/agent-task");
@@ -98,8 +98,8 @@ export async function completeDropship(gmailMessageId: string): Promise<void> {
  * Get pending dropship entries (for Telegram /tasks view).
  */
 export async function getPendingDropships(): Promise<DropshipEntry[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     try {
         const { data } = await supabase
@@ -134,8 +134,8 @@ export async function getPendingDropships(): Promise<DropshipEntry[]> {
  * Used by ap-agent.ts dedup check before re-processing on crash+repoll.
  */
 export async function hasDropship(gmailMessageId: string): Promise<boolean> {
-    const supabase = createClient();
-    if (!supabase) return false;
+    const db = createClient();
+    if (!db) return false;
 
     try {
         const { count } = await supabase

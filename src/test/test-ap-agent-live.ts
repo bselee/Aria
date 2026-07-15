@@ -9,7 +9,7 @@
 
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 import { parseInvoice } from "../lib/pdf/invoice-parser";
 import { extractPDF } from "../lib/pdf/extractor";
 import { FinaleClient } from "../lib/finale/client";
@@ -143,8 +143,8 @@ async function main() {
 
     // ── Step 4: Supabase Connection & Validations ─────
     console.log("\n4️⃣  Supabase Validation...");
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.error("   ❌ Supabase client is null");
         process.exit(1);
     }
@@ -159,7 +159,7 @@ async function main() {
         // Test vendor_profiles basic write/read
         console.log("   📝 Testing vendor_profiles persistence...");
         const testVendorName = `test-vendor-${Date.now()}`;
-        await supabase.from("vendor_profiles").upsert({
+        await db.from("vendor_profiles").upsert({
             vendor_name: testVendorName,
             vendor_emails: ["test@vendor.com"],
             total_pos: 1,
@@ -167,10 +167,10 @@ async function main() {
             communication_pattern: "no_response",
         }, { onConflict: "vendor_name" });
 
-        const { data: vp } = await supabase.from("vendor_profiles").select("*").eq("vendor_name", testVendorName).single();
+        const { data: vp } = await db.from("vendor_profiles").select("*").eq("vendor_name", testVendorName).single();
         if (vp) {
             console.log(`   ✅ vendor_profiles WRITE & READ successful`);
-            await supabase.from("vendor_profiles").delete().eq("vendor_name", testVendorName);
+            await db.from("vendor_profiles").delete().eq("vendor_name", testVendorName);
         } else {
             console.log(`   ❌ vendor_profiles READ failed`);
         }
@@ -233,7 +233,7 @@ async function main() {
     console.log("\n6️⃣  Duplicate Detection & Audit Trail...");
     try {
         const testInvoiceNum = `DUPE-TEST-${Date.now()}`;
-        const { error: insertErr } = await supabase.from("ap_activity_log").insert({
+        const { error: insertErr } = await db.from("ap_activity_log").insert({
             email_from: "test@vendor.com",
             email_subject: `Invoice ${testInvoiceNum} → PO 999999`,
             intent: "RECONCILIATION",
@@ -263,7 +263,7 @@ async function main() {
             console.log("   ❌ Duplicate detection FAILED");
         }
 
-        await supabase.from("ap_activity_log").delete().eq("action_taken", "Test entry for duplicate detection");
+        await db.from("ap_activity_log").delete().eq("action_taken", "Test entry for duplicate detection");
         console.log("   🧹 Test entry cleaned up");
     } catch (err: any) {
         console.error(`   ❌ Duplicate detection test FAILED: ${err.message}`);

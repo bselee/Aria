@@ -4,7 +4,7 @@
  *          produces zero duplicate side effects. Critical for crash safety.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    vitest, @/lib/supabase
+ * @deps    vitest, @/lib/db
  *
  * Tests the three-gate dedup chain:
  *   1. EmailIngestionWorker — documents.gmail_message_id check

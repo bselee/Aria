@@ -16,7 +16,7 @@
  * upsert, 1 Supabase read, 0-x HTTP (BAS snapshot is local disk).
  */
 
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { finaleClient } from '../finale/client';
 import { sendTelegramNotify } from '../intelligence/telegram-notify';
 import * as fs from 'fs';

@@ -11,7 +11,7 @@ vi.mock("../intelligence/llm", () => ({
 }));
 
 // Mock Supabase so context fetch doesn't require real DB
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: vi.fn().mockReturnValue(null),
 }));
 

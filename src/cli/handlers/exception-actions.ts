@@ -8,7 +8,7 @@
  */
 
 import type { Context } from "telegraf";
-import { createClient } from "../../lib/supabase";
+import { createClient } from "../../lib/db";
 
 /**
  * exception_review_{shipmentId} — Bill wants to review the draft.
@@ -35,9 +35,9 @@ export async function handleExceptionDismiss(ctx: Context, shipmentId: string): 
     console.log(`⏭ Exception dismiss: shipment ${shipmentId}`);
     await ctx.answerCbQuery("Dismissed — won't re-escalate for 7 days");
 
-    const supabase = createClient();
-    if (supabase) {
-        await supabase.from("ap_activity_log").insert({
+    const db = createClient();
+    if (db) {
+        await db.from("ap_activity_log").insert({
             email_from: "telegram-will",
             email_subject: `Exception dismissed: shipment ${shipmentId}`,
             intent: "EXCEPTION_ESCALATED",

@@ -7,7 +7,7 @@
  */
 
 import { Telegraf } from 'telegraf';
-import { createClient } from '../../supabase';
+import { createClient } from '../../db';
 import { finaleClient } from '../../finale/client';
 import { CalendarClient } from '../../google/calendar';
 import { loadActivePurchases } from '../../purchasing/active-purchases';

@@ -1,5 +1,5 @@
 import { upsertFromSource } from "@/lib/intelligence/agent-task";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export type AxiomLifecycleStatus =
     | "needs_spec"
@@ -132,8 +132,8 @@ function goalForAssessment(poNumber: string, assessment: AxiomDraftAssessment, v
 export async function recordAxiomDraftPOCreated(draft: AxiomDraftPO): Promise<AxiomDraftAssessment | null> {
     if (!isAxiomVendorName(draft.vendorName)) return null;
 
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const finaleSkus = uniqueSorted(draft.items.map(item => item.productId));
     if (finaleSkus.length === 0) return null;
@@ -206,8 +206,8 @@ export async function recordAxiomDraftPOCreated(draft: AxiomDraftPO): Promise<Ax
  * This is triggered automatically when a template spec is saved or approved.
  */
 export async function reassessActiveLifecyclesForSKU(sku: string): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     // Find any lifecycle rows in status 'needs_spec' that contain this sku in missing_template_skus
     const { data: lifecycles, error } = await supabase

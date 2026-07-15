@@ -1,15 +1,15 @@
 console.log("Script starting...");
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 
 async function run() {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const query = "124607";
     console.log(`Searching for PO ${query} in logs...`);
-    const { data: logs } = await supabase.from("ap_activity_log").select("*").or(`email_subject.ilike.%${query}%,metadata->>pdf_filename.ilike.%${query}%,metadata->>po_number.ilike.%${query}%`);
+    const { data: logs } = await db.from("ap_activity_log").select("*").or(`email_subject.ilike.%${query}%,metadata->>pdf_filename.ilike.%${query}%,metadata->>po_number.ilike.%${query}%`);
     
     if (logs) {
         logs.forEach(log => {

@@ -6,7 +6,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  *
  * DESIGN:
  *   Runs as part of the po-receiving-watcher cron (every 30 min).
@@ -26,7 +26,7 @@
  *   6. On skip: log skip, don't re-prompt for 7 days
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 
 /** Prompt window: delivered between 24h and 72h ago */
@@ -60,8 +60,8 @@ export interface ReceiptPromptResult {
  * Called from po-receiving-watcher cron.
  */
 export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return { prompted: 0, skippedAlreadyPrompted: 0, skippedNoCandidates: true, candidates: [] };
     }
 
@@ -174,7 +174,7 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
 
             // Log prompt to DB for cross-restart dedup
             try {
-                await supabase.from("ap_activity_log").insert({
+                await db.from("ap_activity_log").insert({
                     email_from: c.vendorName || "unknown",
                     email_subject: `Receipt prompt: PO ${c.poNumber}`,
                     intent: "RECEIPT_PROMPT",

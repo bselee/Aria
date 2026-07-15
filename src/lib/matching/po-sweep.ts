@@ -5,13 +5,13 @@
  *          the reconciliation engine on any new matches.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { FinaleClient } from "../finale/client";
 import { reconcileInvoiceToPO, applyReconciliation, buildReconciliationIdentityMetadata } from "../finale/reconciler";
 import Fuse from "fuse.js";
 
 export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false) {
-    const supabase = createClient();
+    const db = createClient();
     const finale = new FinaleClient();
 
     console.log(`🔍 [po-sweep] Scanning Finale for POs from the last ${daysBack} days...`);
@@ -151,7 +151,7 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
                             });
                             
                             // Log it so we don't repeat
-                            await supabase.from("ap_activity_log").insert({
+                            await db.from("ap_activity_log").insert({
                                 email_from: match.vendor_name,
                                 email_subject: `PO-Sweep: Invoice ${match.invoice_number} → PO ${po.orderId}`,
                                 intent: "RECONCILIATION",
@@ -165,7 +165,7 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
                                 vendorName: match.vendor_name,
                                 orderId: po.orderId,
                             });
-                            await supabase.from("ap_activity_log").insert({
+                            await db.from("ap_activity_log").insert({
                                 email_from: match.vendor_name,
                                 email_subject: `PO-Sweep: Invoice ${match.invoice_number} → PO ${po.orderId}`,
                                 intent: "RECONCILIATION",

@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import OpenAI from "openai";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import type { ArtifactSourceType, CopilotArtifact, CopilotChannel } from "./types";
 
 export interface NormalizeArtifactInput {

@@ -9,7 +9,7 @@
  * Pace: ~6 carrier calls/minute (10s sleep between) so we stay under any
  * rate ceiling even on a 200-shipment backlog.
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { getTrackingStatus } from "@/lib/carriers/tracking-service";
 import { upsertShipmentEvidence } from "@/lib/tracking/shipment-intelligence";
 

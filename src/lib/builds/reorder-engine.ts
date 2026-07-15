@@ -47,7 +47,7 @@ export interface ReorderPrescription {
  * AND meaningful consumption data (consumptionQuantity or demandQuantity > 0).
  *
  * Lead times are fetched from Finale in parallel (5x concurrency, ~10-15s for 20 SKUs).
- * If Finale has no lead time set for a component, we default to 14 days.
+ * If Finale has no lead time set for a component, we default to 21 days.
  */
 export async function generateReorderPrescriptions(
     components: Map<string, ComponentDemand>,
@@ -64,7 +64,7 @@ export async function generateReorderPrescriptions(
     // Warm vendor lead time cache once before the batch (no-op if already fresh)
     await leadTimeService.warmCache();
 
-    // Batch resolve lead times using vendor history → SKU product → 14d default
+    // Batch resolve lead times using vendor history → SKU product → 21d default
     const leadTimes = new Map<string, number | null>();
     const queue = atRisk.map(c => c.componentSku);
     const workers = Array.from({ length: Math.min(5, queue.length) }, async () => {

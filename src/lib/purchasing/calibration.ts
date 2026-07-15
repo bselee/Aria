@@ -10,7 +10,7 @@
  *          reservation discount) rather than blocking recommendations.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ──────────────────────────────────────────────────
 // CALIBRATION STATS — vendor -> safety multiplier

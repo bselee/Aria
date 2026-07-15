@@ -1,6 +1,6 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { buildFollowUpEmail } from "../carriers/tracking-service";
 
 /**
@@ -106,8 +106,8 @@ export class VendorCommsAgent {
         });
 
         // Mark as needing human review
-        const supabase = createClient();
-        await supabase.from("purchase_orders").update({
+        const db = createClient();
+        await db.from("purchase_orders").update({
             needs_human_review: true,
             updated_at: new Date().toISOString(),
         }).eq("po_number", context.poNumber);
@@ -184,10 +184,10 @@ export class VendorCommsAgent {
      * Mark vendor as non-communicative after failed follow-ups.
      */
     async markVendorNoncomm(context: VendorCommContext): Promise<void> {
-        const supabase = createClient();
+        const db = createClient();
         const now = new Date().toISOString();
 
-        await supabase.from("purchase_orders").update({
+        await db.from("purchase_orders").update({
             vendor_noncomm_at: now,
             tracking_unavailable_at: now,
             lifecycle_stage: 'tracking_unavailable',
@@ -196,7 +196,7 @@ export class VendorCommsAgent {
         }).eq("po_number", context.poNumber);
 
         // Update vendor profile
-        await supabase.from("vendor_profiles")
+        await db.from("vendor_profiles")
             .update({ is_noncomm: true })
             .ilike("vendor_name", context.vendorName);
 
@@ -207,10 +207,10 @@ export class VendorCommsAgent {
      * Mark PO as having human reply detected - deescalate follow-ups.
      */
     async markHumanReply(context: VendorCommContext): Promise<void> {
-        const supabase = createClient();
+        const db = createClient();
         const now = new Date().toISOString();
 
-        await supabase.from("purchase_orders").update({
+        await db.from("purchase_orders").update({
             human_reply_detected_at: now,
             needs_human_review: false,
             updated_at: now,

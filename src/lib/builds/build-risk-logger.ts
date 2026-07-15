@@ -1,4 +1,4 @@
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import type { BuildRiskReport, ComponentDemand } from './build-risk';
 
 /**

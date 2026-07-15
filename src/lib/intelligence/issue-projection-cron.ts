@@ -11,7 +11,7 @@
  *          age + terminal in last 14 days.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { listTasks, type AgentTask } from "./agent-task";
 import { createOrAdvance, linkTask } from "./agent-issue";
 import { groupTasksByFlow, deriveIssueState } from "./issue-projection";
@@ -35,8 +35,8 @@ export async function runIssueProjection(): Promise<ProjectionSummary> {
         skipped_no_key: 0,
     };
 
-    const supabase = createClient();
-    if (!supabase) return summary;
+    const db = createClient();
+    if (!db) return summary;
 
     // Pull all open tasks (any age) + recent terminal tasks (last 14 days).
     const open = await listTasks({ limit: 500, includeRecentFailed: true });

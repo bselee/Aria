@@ -15,7 +15,7 @@
  * If ALL layers return nothing, the brief sends nothing. Zero noise.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { notifyViaTask } from "./notify-via-task";
 
 interface BriefSection {

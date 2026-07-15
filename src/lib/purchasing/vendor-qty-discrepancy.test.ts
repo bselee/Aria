@@ -17,7 +17,7 @@ const mockGmailMessagesGet = vi.fn();
 const mockGmailMessagesList = vi.fn();
 const mockGmailThreadsGet = vi.fn();
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: vi.fn(),
 }));
 

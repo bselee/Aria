@@ -30,10 +30,9 @@ const HONCHO_OBSERVED_PEER = process.env.HONCHO_OBSERVED_PEER || "Bill";
 
 /**
  * Check if Honcho is reachable via direct fetch (Windows → WSL2 port forward).
- * If that fails, try via WSL curl fallback.
+ * Falls back to WSL curl if direct fetch fails.
  */
 async function honchoHealthCheck(): Promise<boolean> {
-    // Try direct fetch first
     try {
         const resp = await fetch(`${HONCHO_BASE_URL}/health`, {
             signal: AbortSignal.timeout(3000),
@@ -46,7 +45,6 @@ async function honchoHealthCheck(): Promise<boolean> {
         // Fall through to WSL fallback
     }
 
-    // Try WSL curl fallback
     try {
         const result = execSync(
             `wsl -e curl -s --max-time 5 http://127.0.0.1:8000/health`,
@@ -69,23 +67,19 @@ async function honchoHealthCheck(): Promise<boolean> {
  */
 function wslCurlPost(url: string, body: string): { ok: boolean; status: number; text: string } {
     try {
-        // Write body to a temp file to avoid shell escaping issues
-        const tmpFile = `/tmp/honcho-sync-${Date.now()}.json`;
-        const winTmpFile = execSync(`wsl -e mktemp`, { encoding: "utf-8" }).trim();
-        // Write body via wsl
-        execSync(`wsl -e bash -c 'cat > ${winTmpFile}'`, {
+        const tmpFile = execSync(`wsl -e mktemp`, { encoding: "utf-8" }).trim();
+        execSync(`wsl -e bash -c 'cat > ${tmpFile}'`, {
             input: body,
             encoding: "utf-8",
             timeout: 5000,
         });
 
         const result = execSync(
-            `wsl -e curl -s --max-time 10 -w "\\n%{http_code}" -X POST "http://127.0.0.1:8000${url}" -H "Content-Type: application/json" -d @${winTmpFile}`,
+            `wsl -e curl -s --max-time 10 -w "\\n%{http_code}" -X POST "http://127.0.0.1:8000${url}" -H "Content-Type: application/json" -d @${tmpFile}`,
             { timeout: 15000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
         );
 
-        // Clean up temp file
-        execSync(`wsl -e rm -f ${winTmpFile}`, { encoding: "utf-8" });
+        execSync(`wsl -e rm -f ${tmpFile}`, { encoding: "utf-8" });
 
         const lines = result.trim().split("\n");
         const status = parseInt(lines[lines.length - 1], 10);
@@ -131,7 +125,6 @@ async function pushConclusionToHoncho(
         ],
     });
 
-    // Try direct fetch first (if not already in fallback mode)
     if (!useWslFallback) {
         try {
             const resp = await fetch(`${HONCHO_BASE_URL}${url}`, {
@@ -144,7 +137,6 @@ async function pushConclusionToHoncho(
             if (resp.ok) return true;
 
             if (resp.status === 404 || resp.status === 0) {
-                // Switch to fallback mode
                 console.log("[obsidian-honcho-sync] Direct fetch failed, switching to WSL curl fallback.");
                 useWslFallback = true;
             } else {
@@ -158,7 +150,6 @@ async function pushConclusionToHoncho(
         }
     }
 
-    // WSL curl fallback
     const result = wslCurlPost(url, body);
     if (!result.ok) {
         console.error(`[obsidian-honcho-sync] WSL curl failed (status ${result.status}): ${result.text.substring(0, 200)}`);
@@ -181,7 +172,6 @@ async function getExistingConclusions(): Promise<string[]> {
         },
     });
 
-    // Try direct fetch first
     if (!useWslFallback) {
         try {
             const resp = await fetch(`${HONCHO_BASE_URL}${url}`, {
@@ -201,7 +191,6 @@ async function getExistingConclusions(): Promise<string[]> {
         }
     }
 
-    // WSL curl fallback
     const result = wslCurlPostJson(url, body);
     if (!result.ok || !result.data) return [];
     const items = result.data?.items ?? [];
@@ -211,16 +200,14 @@ async function getExistingConclusions(): Promise<string[]> {
 async function main() {
     console.log("[obsidian-honcho-sync] Starting vault to Honcho sync...");
 
-    // 1. Health check Honcho
     const healthy = await honchoHealthCheck();
     if (!healthy) {
         console.error(
             "[obsidian-honcho-sync] Honcho is not reachable. Skipping sync."
         );
-        process.exit(0); // Non-fatal — will retry next cron tick
+        process.exit(0);
     }
 
-    // 2. Read vault notes
     const notes = readVaultForSync(100);
     console.log(`[obsidian-honcho-sync] Read ${notes.length} notes from vault.`);
 
@@ -229,19 +216,16 @@ async function main() {
         process.exit(0);
     }
 
-    // 3. Get existing conclusions to avoid duplicates
     const existing = await getExistingConclusions();
     console.log(
         `[obsidian-honcho-sync] Found ${existing.length} existing conclusions in Honcho.`
     );
 
-    // 4. Build conclusion strings from vault notes
     let pushed = 0;
     let skipped = 0;
     let failed = 0;
 
     for (const note of notes) {
-        // Only push notes with substantive content (not just frontmatter)
         const contentLines = note.content
             .split("\n")
             .filter(
@@ -258,10 +242,8 @@ async function main() {
             continue;
         }
 
-        // Create a concise conclusion from the note
         const noteConclusion = `Obsidian note "${note.title}" (${note.path}): ${contentLines.slice(0, 5).join(" ").substring(0, 300)}`;
 
-        // Check dedup
         const noteDedupKey = noteConclusion.substring(0, 80);
         let isDup = false;
         for (const existingConclusion of existing) {
@@ -283,7 +265,6 @@ async function main() {
             failed++;
         }
 
-        // Rate limit: don't flood Honcho
         await new Promise((resolve) => setTimeout(resolve, 300));
     }
 

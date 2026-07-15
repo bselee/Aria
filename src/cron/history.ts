@@ -13,7 +13,7 @@
  *          (invoked_by, failure_reason, metadata_jsonb).
  */
 
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 
 export type CronRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "skipped";
 

@@ -8,6 +8,7 @@
 import { recommendQty } from "@/lib/purchasing/qty-recommender";
 import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
+import { DEFAULT_LEAD_TIME_DAYS } from "@/lib/constants";
 import {
     loadActiveReservations,
     loadAllVendorReorderPolicies,
@@ -2386,6 +2387,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         adjustedRunwayDays: Math.round(adjustedRunwayDays * 10) / 10,
                         leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance,
+                        /** Effective lead time used for ordering math (same as leadTimeDays for BOM path). */
+                        effectiveLeadTimeDays,
                         openPOs: compActivity.openPOs,
                         urgency,
                         explanation:
@@ -2717,12 +2720,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const unitPrice: number = mainSupplier.price ?? 0;
                     const reorderMethod = normalizeFinaleReorderMethod(prodData);
 
-                    // Lead time: REST product field → 14d default
+                    // Lead time: REST product field → default constant
                     const rawLeadTime = prodData.leadTime != null ? parseInt(String(prodData.leadTime), 10) : NaN;
-                    const leadTimeDays = !isNaN(rawLeadTime) && rawLeadTime > 0 ? rawLeadTime : 14;
+                    const leadTimeDays = !isNaN(rawLeadTime) && rawLeadTime > 0 ? rawLeadTime : DEFAULT_LEAD_TIME_DAYS;
                     const leadTimeProvenance = !isNaN(rawLeadTime) && rawLeadTime > 0
                         ? `${rawLeadTime}d (Finale)`
-                        : '14d default';
+                        : `${DEFAULT_LEAD_TIME_DAYS}d default`;
 
                     // DECISION(2026-03-16): Use GraphQL stock from getProductActivity().
                     const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
@@ -3044,6 +3047,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         adjustedRunwayDays,
                         leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance: effectiveLeadTimeProvenance,
+                        /** P90/vendor-override lead time the recommender actually used for qty math.
+                         *  Surfaces rec.leadTimeUsed so route handler urgency recomputation
+                         *  matches the ordering decision. */
+                        effectiveLeadTimeDays: rec.leadTimeUsed,
                         openPOs: activity.openPOs.map(po => ({
                             orderId: po.orderId,
                             quantity: po.quantity,

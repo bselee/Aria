@@ -7,7 +7,7 @@
  * lead time on SKUs that have stocked out before — they've already proven
  * the static defaults aren't enough buffer.
  */
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 export interface StockoutCount {
     productId: string;

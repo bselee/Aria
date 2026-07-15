@@ -13,7 +13,7 @@
  *   noncommRate        % of POs marked vendor_noncomm_at
  *   poCount            sample size in window
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export interface VendorReliability {
     vendorName: string;

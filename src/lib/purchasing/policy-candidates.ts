@@ -61,7 +61,9 @@ export function buildPurchasingCandidate(
         stockOnOrder,
         adjustedRunwayDays,
         finishedGoodsCoverageDays: context.finishedGoodsCoverageDays ?? null,
-        leadTimeDays: Number.isFinite(item.leadTimeDays) ? item.leadTimeDays : null,
+        leadTimeDays: Number.isFinite(item.effectiveLeadTimeDays ?? item.leadTimeDays)
+            ? (item.effectiveLeadTimeDays ?? item.leadTimeDays)
+            : null,
         suggestedQty: item.suggestedQty,
         orderIncrementQty: item.orderIncrementQty,
         minimumOrderQty: context.minimumOrderQty ?? item.orderIncrementQty ?? null,

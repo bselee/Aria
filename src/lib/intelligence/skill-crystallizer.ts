@@ -4,7 +4,7 @@
  *          shadow runs plus invocation confidence.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export interface SkillStep {
     order: number;

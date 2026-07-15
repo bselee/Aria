@@ -24,7 +24,7 @@
  */
 
 import { NextResponse } from 'next/server';
-import { createClient } from '../../../lib/supabase';
+import { createClient } from '../../../lib/db';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -33,11 +33,11 @@ export async function GET(): Promise<NextResponse> {
     const startTime = Date.now();
 
     try {
-        const supabase = createClient();
+        const db = createClient();
         let lastHeartbeat: string | null = null;
         let pid: number | null = null;
 
-        if (supabase) {
+        if (db) {
             // Read the latest heartbeat from agent_heartbeats
             const { data } = await supabase
                 .from('agent_heartbeats')

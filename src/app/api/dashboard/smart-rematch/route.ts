@@ -11,7 +11,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export async function POST(req: Request) {
     try {
@@ -21,8 +21,8 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "query parameter required" }, { status: 400 });
         }
 
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 

@@ -18,7 +18,7 @@ import os from 'os';
 import type { Telegraf } from 'telegraf';
 import { APAgent } from './ap-agent';
 import { unifiedTextGeneration } from './llm';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { businessHoursAlert } from "./alert-gate";
 
 // ── Directory layout ──────────────────────────────────────────────────────────
@@ -250,27 +250,25 @@ async function handleImage(filePath: string, bot: Telegraf) {
 
     try {
         const buffer = fs.readFileSync(filePath);
-        const supabase = createClient();
 
-        if (supabase) {
-            const storagePath = `sandbox/${Date.now()}-${filename}`;
-            const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+        // Local filesystem storage — upload as sandbox artifact
+        const { uploadPDF } = await import("../../lib/storage/supabase-storage");
+        const storagePath = `sandbox/${Date.now()}-${filename}`;
+        const localPath = await uploadPDF(buffer, {
+            type: "SANDBOX",
+            vendor: "sandbox",
+            date: new Date().toISOString().split("T")[0],
+            filename,
+        });
 
-            const { error } = await supabase.storage
-                .from('documents')
-                .upload(storagePath, buffer, { contentType: mimeType, upsert: false });
-
-            if (error) {
-                throw new Error(`Supabase upload failed: ${error.message}`);
-            }
-
+        if (localPath) {
             writeResponse(
                 `${basename}-uploaded.txt`,
                 `[sandbox] Image uploaded: ${filename}\n` +
-                `Storage path: documents/${storagePath}\n` +
+                `Storage path: ${localPath}\n` +
                 `Timestamp: ${new Date().toISOString()}\n`
             );
-            console.log(`[sandbox] Image uploaded to Supabase: ${storagePath}`);
+            console.log(`[sandbox] Image uploaded to local storage: ${localPath}`);
             await notifyTelegram(bot, `📂 <b>Sandbox</b> — uploaded image: <code>${filename}</code>`);
         } else {
             writeResponse(

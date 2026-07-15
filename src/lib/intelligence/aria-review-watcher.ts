@@ -13,7 +13,7 @@ import path from 'path';
 import os from 'os';
 import { APAgent } from './ap-agent';
 import { unifiedTextGeneration } from './llm';
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 
 // ── Directory layout ──────────────────────────────────────────────────────────
 function getReviewDir(): string {
@@ -77,7 +77,7 @@ async function handlePDF(filePath: string, apAgent: APAgent) {
         return;
     }
 
-    const supabase = createClient();
+    const db = createClient();
 
     try {
         // Use "aria-review" as the fake "from" address — no email context here.
@@ -116,8 +116,8 @@ async function handlePDF(filePath: string, apAgent: APAgent) {
 
 /** Pull relevant records from Supabase for identifiers found in the question. */
 async function fetchSupabaseContext(question: string): Promise<string> {
-    const supabase = createClient();
-    if (!supabase) return '';
+    const db = createClient();
+    if (!db) return '';
 
     // ── Extract identifiers ────────────────────────────────────────────────────
 

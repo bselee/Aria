@@ -6,9 +6,9 @@
  * @author  Hermia
  * @created 2026-06-01
  * @updated 2026-06-01 — 21-day window via lifecycle transitions, no Finale API
- * @deps    @/lib/supabase, @/lib/intelligence/alert-gate
+ * @deps    @/lib/db, @/lib/intelligence/alert-gate
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { businessHoursAlert } from "@/lib/intelligence/alert-gate";
 
 const MAX_POS_PER_RUN = 20;
@@ -34,8 +34,8 @@ export async function recheckReconciledInvoices(): Promise<ReceiptRecheckResult>
     const result: ReceiptRecheckResult = { checked: 0, shortShipments: 0, errors: 0, details: [] };
 
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             console.warn("[po-receipt-recheck] No Supabase client");
             return result;
         }
@@ -114,7 +114,7 @@ export async function recheckReconciledInvoices(): Promise<ReceiptRecheckResult>
                     { parse_mode: "Markdown" }
                 );
 
-                await supabase.from("ap_activity_log").insert({
+                await db.from("ap_activity_log").insert({
                     email_from: "po-receipt-recheck",
                     email_subject: `Receipt recheck: PO ${poNumber}`,
                     intent: "RECEIPT_RECHECK",

@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export function buildStatementFingerprint(args: {
     adapterKey: string;
@@ -53,15 +53,16 @@ export async function queueStatementEmailIntake(args: {
     }
 
     const artifactPath = `${args.gmailMessageId}/${Date.now()}_${args.filename}`;
-    const { error: uploadError } = await supabase.storage
-        .from("statement_artifacts")
-        .upload(artifactPath, args.buffer, {
-            contentType: args.contentType,
-            upsert: true,
-        });
+    const { uploadPDF } = await import("../storage/supabase-storage");
+    const localPath = await uploadPDF(args.buffer, {
+        type: "statement_artifacts",
+        vendor: args.vendorName || "unknown",
+        date: new Date().toISOString().split("T")[0],
+        filename: args.filename,
+    });
 
-    if (uploadError) {
-        throw new Error(`Statement artifact upload failed: ${uploadError.message}`);
+    if (!localPath) {
+        throw new Error(`Statement artifact upload failed for ${artifactPath}`);
     }
 
     const { data, error } = await supabase
@@ -70,7 +71,7 @@ export async function queueStatementEmailIntake(args: {
             vendor_name: args.vendorName,
             source_type: "email_statement",
             source_ref: args.gmailMessageId,
-            artifact_path: artifactPath,
+            artifact_path: localPath,
             artifact_kind: "pdf",
             statement_date: args.statementDate ?? null,
             period_start: args.periodStart ?? null,

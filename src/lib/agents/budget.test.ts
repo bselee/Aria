@@ -20,7 +20,7 @@ function resetChain() {
     supabaseMock.upsert.mockReturnValue(supabaseMock);
 }
 
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 import { checkBudget, chargeBudget, assertBudget, BudgetExceededError, estimateCostUsd } from "./budget";
 

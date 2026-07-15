@@ -24,7 +24,7 @@
  *   - Saves cookies after login for session reuse.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 import { BrowserManager } from "@/lib/scraping/browser-manager";
 import { fillUlineCart } from "./uline-cart";
@@ -46,8 +46,8 @@ function detectVendorPlatform(vendorName: string): VendorPlatform | null {
  * Called from Telegram /order command or dashboard.
  */
 export async function executeBrowserOrder(poNumber: string): Promise<CartFillResult | null> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.error("[browser-order] Supabase not available");
         return null;
     }
@@ -183,7 +183,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
 
     // 7. Log to ap_activity_log
     try {
-        await supabase.from("ap_activity_log").insert({
+        await db.from("ap_activity_log").insert({
             email_from: "browser-order",
             email_subject: `Browser order: PO ${poNumber} → ${vendorName}`,
             intent: "BROWSER_ORDER",

@@ -8,7 +8,7 @@ const {
     createOpsControlRequestMock: vi.fn(),
 }));
 
-vi.mock("@/lib/supabase", () => ({
+vi.mock("@/lib/db", () => ({
     createClient: createClientMock,
 }));
 

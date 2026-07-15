@@ -4,11 +4,11 @@
  * @author  Will
  * @created 2026-05-20
  * @updated 2026-05-20
- * @deps    @/lib/supabase, @/lib/axiom/lifecycle, next/server
+ * @deps    @/lib/db, @/lib/axiom/lifecycle, next/server
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { reassessActiveLifecyclesForSKU } from "@/lib/axiom/lifecycle";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
@@ -18,10 +18,10 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
  * Supports filtering by `sku` query parameter.
  */
 export async function GET(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -30,7 +30,7 @@ export async function GET(req: NextRequest) {
         const { searchParams } = new URL(req.url);
         const sku = searchParams.get("sku");
 
-        let query = supabase.from("axiom_order_templates").select("*");
+        let query = db.from("axiom_order_templates").select("*");
         if (sku) {
             query = query.eq("finale_sku", sku);
         } else {
@@ -58,10 +58,10 @@ export async function GET(req: NextRequest) {
  * Triggering a PO re-assessment for active POs using this SKU.
  */
 export async function POST(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -126,10 +126,10 @@ export async function POST(req: NextRequest) {
  * Deletes an Axiom order template.
  */
 export async function DELETE(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }

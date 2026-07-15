@@ -13,7 +13,7 @@
  *          See docs/plans/2026-04-28-agentic-issue-lifecycle-phase1.md.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Hub kill-switch (mirrors agent-task hubEnabled) ─────────────────────────
 function hubEnabled(): boolean {
@@ -33,15 +33,15 @@ async function appendIssueEvent(
     payload: Record<string, unknown> = {},
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const statusBucket =
         eventType === "issue_complete" ? "success"
             : eventType === "issue_blocked" ? "failure"
                 : "shadow";
 
-    const { error } = await supabase.from("task_history").insert({
+    const { error } = await db.from("task_history").insert({
         task_id: null,
         issue_id: issueId,
         agent_name: typeof payload.agent_name === "string" ? payload.agent_name : "agent-issue",
@@ -247,8 +247,8 @@ async function advanceExisting(
  */
 export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentIssue | null> {
     if (!hubEnabled()) return null;
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
 
     const existing = await findOpenIssue(supabase, args.businessFlowKey);
     if (existing) {
@@ -319,8 +319,8 @@ export async function recordHandoff(
     reason: string,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_issue")
@@ -345,8 +345,8 @@ export async function setBlocker(
     nextAction: string,
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const autonomy: IssueAutonomyState =
         reason === "human_approval_required" || reason === "policy_required"
@@ -380,8 +380,8 @@ export async function clearBlocker(
     resumeState: IssueLifecycleState = "working",
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_issue")
@@ -407,8 +407,8 @@ export async function complete(
     outputs: Record<string, unknown> = {},
 ): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { error } = await supabase
         .from("agent_issue")
@@ -435,8 +435,8 @@ export async function complete(
 
 export async function linkTask(taskId: string, issueId: string): Promise<void> {
     if (!hubEnabled()) return;
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
     const { error } = await supabase
         .from("agent_task")
         .update({ issue_id: issueId })
@@ -462,8 +462,8 @@ const OPEN_LIFECYCLE: IssueLifecycleState[] = [
 ];
 
 export async function listIssues(filters: ListIssuesFilters = {}): Promise<AgentIssue[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     const limit = Math.min(filters.limit ?? 200, 500);
     const since = new Date(Date.now() - (filters.terminalWindowMs ?? DEFAULT_TERMINAL_WINDOW_MS)).toISOString();
@@ -494,9 +494,9 @@ export async function listIssues(filters: ListIssuesFilters = {}): Promise<Agent
 }
 
 export async function getById(id: string): Promise<AgentIssue | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
-    const { data, error } = await supabase.from("agent_issue").select("*").eq("id", id).maybeSingle();
+    const db = createClient();
+    if (!db) return null;
+    const { data, error } = await db.from("agent_issue").select("*").eq("id", id).maybeSingle();
     if (error) {
         console.warn("[agent-issue] getById failed:", error.message);
         return null;
@@ -505,8 +505,8 @@ export async function getById(id: string): Promise<AgentIssue | null> {
 }
 
 export async function getBySource(sourceTable: string, sourceId: string): Promise<AgentIssue | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
     const { data, error } = await supabase
         .from("agent_issue")
         .select("*")
@@ -553,8 +553,8 @@ export type IssueHandlerCounts = {
 };
 
 export async function getCurrentlyHandlingCounts(): Promise<Record<string, IssueHandlerCounts>> {
-    const supabase = createClient();
-    if (!supabase) return {};
+    const db = createClient();
+    if (!db) return {};
 
     const OPEN: IssueLifecycleState[] = [
         "detected", "triaging", "working", "waiting_external", "blocked",
@@ -598,8 +598,8 @@ export async function getCurrentlyHandlingCounts(): Promise<Record<string, Issue
 export async function findLinkedOpenTask(
     issueId: string,
 ): Promise<{ id: string; status: string; source_table: string | null; source_id: string | null } | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
     const ACTIONABLE = ["NEEDS_APPROVAL", "PENDING", "CLAIMED", "RUNNING"];
     const { data, error } = await supabase
         .from("agent_task")
@@ -623,8 +623,8 @@ export async function getByBusinessFlowKey(
     businessFlowKey: string,
     onlyOpen = true,
 ): Promise<AgentIssue | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    const db = createClient();
+    if (!db) return null;
     let q = supabase
         .from("agent_issue")
         .select("*")

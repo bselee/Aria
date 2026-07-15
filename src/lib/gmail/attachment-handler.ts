@@ -8,7 +8,7 @@ import { parseVendorStatement } from "../../lib/pdf/statement-parser";
 import { matchInvoiceToPO } from "../../lib/matching/invoice-po-matcher";
 import { uploadPDF } from "../../lib/storage/supabase-storage";
 import { upsertVendorInvoice } from "../../lib/storage/vendor-invoices";
-import { createClient } from "../../lib/supabase";
+import { createClient } from "../../lib/db";
 import { ShipmentTracker } from "../../lib/carriers/aftership";
 import { parseBOL } from "../../lib/pdf/bol-parser";
 import { indexOperationalContext } from "../intelligence/pinecone";
@@ -83,7 +83,7 @@ export async function processDocument(
         emailDate?: string;
     }
 ) {
-    const supabase = createClient();
+    const db = createClient();
     const tracker = new ShipmentTracker();
 
     // 1. Extract text from PDF
@@ -132,7 +132,7 @@ export async function processDocument(
 
     // 4. Upload PDF to Supabase Storage (Optional)
     let storagePath = "";
-    if (supabase) {
+    if (db) {
         try {
             storagePath = await uploadPDF(buffer, {
                 type: classification.type,
@@ -157,7 +157,7 @@ export async function processDocument(
             );
 
             // Save processed document
-            const { data } = await supabase.from("documents").insert({
+            const { data } = await db.from("documents").insert({
                 type: classification.type,
                 status: matchResult?.autoApprove ? "MATCHED" : "EXTRACTED",
                 source: meta.source,
@@ -180,7 +180,7 @@ export async function processDocument(
 
             // Type-specific DB storage
             if (classification.type === "INVOICE") {
-                await supabase.from("invoices").upsert({
+                await db.from("invoices").upsert({
                     invoice_number: (extractedData as Record<string, unknown>).invoiceNumber,
                     vendor_id: vendorId,
                     vendor_name: (extractedData as Record<string, unknown>).vendorName,
@@ -239,7 +239,7 @@ export async function processDocument(
 }
 
 async function findOrCreateVendor(vendorName: string): Promise<string> {
-    const supabase = createClient();
+    const db = createClient();
 
     // Fuzzy search for existing vendor
     const { data: existing } = await supabase

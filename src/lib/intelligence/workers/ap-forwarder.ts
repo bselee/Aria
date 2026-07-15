@@ -1,7 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import type { Telegraf } from "telegraf";
 import { getAuthenticatedClient } from "../../gmail/auth";
-import { createClient } from "../../supabase";
+import { createClient } from "../../db";
 import { applyMessageLabelPolicy } from "../gmail-policy";
 import { APAgent } from "../ap-agent";
 import { writeInvoiceSummary } from "../../obsidian/bridge";
@@ -40,9 +40,9 @@ export class APForwarderAgent {
     }
 
     private async logActivity(supabase: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
-        if (!supabase) return;
+        if (!db) return;
         try {
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: from,
                 email_subject: subject,
                 intent,
@@ -195,10 +195,19 @@ export class APForwarderAgent {
     }
 
     async processPendingForwards() {
+        // Deprecated path — the local-first forwarder (ap-local-forwarder.ts)
+        // handles all forwarding via SQLite. This old path uses ap_inbox_queue
+        // and is kept only for backward compatibility during transition.
+        // Remove entirely once ap-local-forwarder is verified stable.
+        if ((process.env.DEPRECATED_FORWARDER_ENABLED ?? "false").toLowerCase() !== "true") {
+            console.log("📤 [AP-Forwarder] Skipped (DEPRECATED_FORWARDER_ENABLED != true). Use ap-local-forwarder.");
+            return;
+        }
+
         console.log("📤 [AP-Forwarder] Scanning queue for invoices to forward to Bill.com...");
         try {
-            const supabase = createClient();
-            if (!supabase) {
+            const db = createClient();
+            if (!db) {
                 console.error("   ❌ Supabase client not available.");
                 return;
             }
@@ -358,16 +367,15 @@ export class APForwarderAgent {
 
                                             console.log(`   -> Forwarding ${item.pdf_filename} from ${item.email_from} (single-forward gate)`);
 
-                    // Download PDF from Supabase Storage
-                    const { data: fileData, error: downloadError } = await supabase.storage
-                        .from('ap_invoices')
-                        .download(item.pdf_path);
+                    // Download PDF from local filesystem storage
+                    const { downloadPDF } = await import("../../storage/supabase-storage");
+                    const fileBuffer = await downloadPDF(item.pdf_path);
 
-                    if (downloadError || !fileData) {
-                        throw new Error(`Failed to download PDF from storage: ${downloadError?.message}`);
+                    if (!fileBuffer) {
+                        throw new Error(`Failed to download PDF from local storage: ${item.pdf_path}`);
                     }
 
-                    const buffer = Buffer.from(await fileData.arrayBuffer());
+                    const buffer = fileBuffer;
                     const once = await forwardInvoiceOnce({
                         gmailMessageId: sourceMessageId,
                         emailFrom: item.email_from || '',

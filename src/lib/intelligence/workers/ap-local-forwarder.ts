@@ -33,7 +33,7 @@
 import { getLocalDb } from "@/lib/storage/local-db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
 import { isDuplicate } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
@@ -356,10 +356,10 @@ async function syncToSupabase(
     billcomSentMessageId: string,
 ): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
         await Promise.race([
-            supabase.from("ap_activity_log").insert({
+            db.from("ap_activity_log").insert({
                 email_from: emailFrom,
                 email_subject: emailSubject,
                 intent: "INVOICE",

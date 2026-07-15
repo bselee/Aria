@@ -380,7 +380,7 @@ export async function createDraftPOFromLatestInvoice(): Promise<AxiomPOResult> {
 
         // 3. Check dedup — already have a PO for this invoice?
         const { createClient } = await import('../supabase');
-        const supabase = createClient();
+        const db = createClient();
         try {
             const { data: existing } = await supabase
                 .from('vendor_invoices')

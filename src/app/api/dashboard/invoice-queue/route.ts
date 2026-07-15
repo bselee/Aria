@@ -7,7 +7,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
 
@@ -147,8 +147,8 @@ export async function GET(req: NextRequest) {
         return NextResponse.json(cache, { headers: { 'Cache-Control': 'no-store' } });
     }
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
             { error: 'Supabase not configured' },
             { status: 503 }
@@ -321,8 +321,8 @@ export async function POST(req: NextRequest) {
 // Used by accounting for compliance audits.
 
 async function handleCsvExport(): Promise<NextResponse> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return new NextResponse('Supabase not configured', { status: 503 });
     }
 

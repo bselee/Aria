@@ -3,7 +3,7 @@
  */
 
 import { FinaleClient } from '@/lib/finale/client';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import { FuzzyMatcher, KnownProduct } from '@/lib/scraping/fuzzy-matcher';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -357,7 +357,7 @@ export async function assessSku(
     let prodData: any = null;
     let finaleFound = false;
     let doNotReorder = false;
-    let leadTimeDays = 14;
+    let leadTimeDays = 21;
 
     try {
         const res = await fetch(`${apiBase}/${accountPath}/api/product/${encodeURIComponent(sku)}`, {
@@ -524,7 +524,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
                         dailyRate: 0,
                         runwayDays: -1,
                         adjustedRunwayDays: -1,
-                        leadTimeDays: 14,
+                        leadTimeDays: 21,
                         openPOs: [],
                         explanation: `Error querying Finale: ${err.message}`,
                         finaleFound: false,
@@ -569,7 +569,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
                             dailyRate: 0,
                             runwayDays: -1,
                             adjustedRunwayDays: -1,
-                            leadTimeDays: 14,
+                            leadTimeDays: 21,
                             openPOs: [],
                             explanation: 'Could not fuzzy-match to a known SKU in Finale.',
                             finaleFound: false,
@@ -618,7 +618,7 @@ export async function assess(options: AssessmentOptions = {}): Promise<Assessmen
                             dailyRate: 0,
                             runwayDays: -1,
                             adjustedRunwayDays: -1,
-                            leadTimeDays: 14,
+                            leadTimeDays: 21,
                             openPOs: [],
                             explanation: `Error: ${err.message}`,
                             finaleFound: false,

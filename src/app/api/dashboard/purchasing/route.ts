@@ -8,6 +8,7 @@ import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { evaluateOpenPoDuplicateGuard } from '@/lib/purchasing/po-duplicate-guard';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
+import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -22,7 +23,7 @@ export async function GET(req: NextRequest) {
     // Throttled to reduce load on Unhealthy nano Supabase instance
     if (Date.now() - lastInvalidationCheck > INVALIDATION_CHECK_INTERVAL) {
         try {
-            const supabase = createClient();
+            const db = createClient();
             if (supabase && resaleSlot.at > 0) {
                 const cacheAt = resaleSlot.at;
                 const { data } = await supabase
@@ -282,8 +283,12 @@ export async function GET(req: NextRequest) {
                             ? 0
                             : (assessment.recommendedQty > 0 ? assessment.recommendedQty : line.item.suggestedQty);
                         // Recompute urgency from runway so CRIT = adj < lead (actionable, not historical floor noise).
+                        // Use effectiveLeadTimeDays (P90/vendor-override) when available — it's the value
+                        // the qty recommender actually used to decide whether to order. leadTimeDays alone
+                        // can understate urgency (Finale says 14d, but P90 says 55d → item should be CRIT).
                         const adj = Number.isFinite(line.item.adjustedRunwayDays) ? line.item.adjustedRunwayDays as number : null;
-                        const lead = Number.isFinite(line.item.leadTimeDays) ? (line.item.leadTimeDays as number) : 14;
+                        const rawLead = (line.item as any).effectiveLeadTimeDays ?? line.item.leadTimeDays;
+                        const lead = Number.isFinite(rawLead) ? (rawLead as number) : DEFAULT_LEAD_TIME_DAYS;
                         let displayUrgency: 'critical' | 'warning' | 'watch' | 'ok' = urgency;
                         if (isHold) {
                             if ((assessment.reasonCodes ?? []).includes('runway_healthy')

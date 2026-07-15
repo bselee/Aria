@@ -34,7 +34,7 @@ import { resolveFinalePo, correlatePo, type CorrelationStrategy } from "../../fi
 import { upsertVendorInvoice } from "../../storage/vendor-invoices";
 import { getAnthropicClient } from "../../anthropic";
 import { isBusinessHours } from "../alert-gate";
-import { createClient } from "../../supabase";
+import { createClient } from "../../db";
 import { findRelevantPatterns, storeVendorPattern } from "../vendor-memory";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";

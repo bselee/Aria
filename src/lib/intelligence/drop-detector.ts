@@ -5,7 +5,7 @@
  *          nobody acted on. Surfaces as a single summary report via the
  *          agent_task hub (drop_detect_report type, owner: will).
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { complete, listTasks } from "./agent-task";
 import { notifyViaTask } from "./notify-via-task";
 
@@ -26,8 +26,8 @@ export type DropDetectorResult = {
  * sending anything (caller decides whether to surface).
  */
 export async function detectDroppedTasks(): Promise<DropDetectorResult> {
-  const supabase = createClient();
-  if (!supabase) return { droppedCount: 0, dropped: [] };
+  const db = createClient();
+  if (!db) return { droppedCount: 0, dropped: [] };
 
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 

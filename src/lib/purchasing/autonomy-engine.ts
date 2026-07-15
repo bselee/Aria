@@ -7,7 +7,7 @@
  * @deps    supabase/client, finale/client, po-sender, telegraf
  */
 
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { FinaleClient } from '../finale/client';
 import {
     storePendingPOSend,

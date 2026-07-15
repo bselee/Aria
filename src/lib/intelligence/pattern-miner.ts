@@ -6,7 +6,7 @@
  *          can learn from is CLOSED LOOPS — so this waits until tasks
  *          have actually been resolved or expired before counting.
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { complete, listTasks } from "./agent-task";
 import { notifyViaTask } from "./notify-via-task";
 
@@ -38,13 +38,13 @@ function median(arr: number[]): number {
  * Aggregate closed-loop metrics for tasks completed/expired in the last 7 days.
  */
 export async function mineTaskPatterns(): Promise<PatternMinerResult> {
-  const supabase = createClient();
+  const db = createClient();
   const now = new Date();
   const weekAgo = new Date(now.getTime() - 7 * 86_400_000);
   const weekStart = weekAgo.toISOString();
   const weekEnd = now.toISOString();
 
-  if (!supabase) {
+  if (!db) {
     return { weekStart, weekEnd, metrics: [], totalTasks: 0, worstDropType: null };
   }
 

@@ -6,13 +6,13 @@
  * @route   GET /api/dashboard/po-lifecycle
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { NextResponse } from "next/server";
 
 export async function GET() {
     try {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             return NextResponse.json({ counts: {} });
         }
 

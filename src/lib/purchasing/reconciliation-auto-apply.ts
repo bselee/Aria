@@ -23,7 +23,7 @@
  *          When disabled, dry-runs (logs what it WOULD apply, writes nothing).
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { type ToolAuditContext } from "../agents/tool-registry";
 
 // ── Types ──────────────────────────────────────────────────────────────────

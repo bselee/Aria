@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createClientMock } = vi.hoisted(() => ({ createClientMock: vi.fn() }));
-vi.mock("@/lib/supabase", () => ({ createClient: createClientMock }));
+vi.mock("@/lib/db", () => ({ createClient: createClientMock }));
 
 import { evaluateClosure, closesWhenFor } from "./agent-task-closure";
 import type { AgentTask } from "./agent-task";

@@ -8,14 +8,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCommandBoardRuns } from "@/lib/command-board/service";
 import type { CommandBoardRunFilters } from "@/lib/command-board/types";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 export async function GET(req: NextRequest) {
     if (!createClient()) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }

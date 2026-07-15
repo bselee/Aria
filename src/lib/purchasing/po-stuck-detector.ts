@@ -14,7 +14,7 @@
  * Thresholds are conservative — tighten over time once we see the signal/noise
  * mix in production.
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export type StuckStage =
     | 'acked_no_tracking'

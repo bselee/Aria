@@ -35,7 +35,7 @@
  */
 
 import type { Tool } from "ai";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -202,11 +202,11 @@ async function emitAuditEvent(input: {
     succeeded: boolean;
     errorMessage?: string;
 }): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
     try {
         const argsSummary = summarizeArgs(input.args);
-        await supabase.from("task_history").insert({
+        await db.from("task_history").insert({
             task_id: input.ctx.taskId ?? null,
             issue_id: input.ctx.issueId ?? null,
             agent_name: input.ctx.agent,

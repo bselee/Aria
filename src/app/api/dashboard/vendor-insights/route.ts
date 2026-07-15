@@ -10,8 +10,8 @@
  */
 
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
-import { cachedQuery } from "@/lib/supabase/cache";
+import { createClient } from "@/lib/db";
+import { cachedQuery } from "@/lib/storage/query-cache";
 
 type LogEntry = {
     reviewed_action: string | null;
@@ -29,8 +29,8 @@ export async function GET(req: Request) {
             return NextResponse.json({ error: "vendor parameter required" }, { status: 400 });
         }
 
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 

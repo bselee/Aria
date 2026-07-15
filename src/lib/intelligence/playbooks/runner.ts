@@ -9,7 +9,7 @@
  *          same process.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import {
     setPlaybook,
     complete,
@@ -46,8 +46,8 @@ export async function runOnce(opts: { allow: PlaybookContext["allow"] }): Promis
 }
 
 async function runIteration(opts: { allow: PlaybookContext["allow"] }): Promise<RunSummary> {
-    const supabase = createClient();
-    if (!supabase) return { attempted: 0, succeeded: 0, failed: 0, escalated: 0, skipped: 1 };
+    const db = createClient();
+    if (!db) return { attempted: 0, succeeded: 0, failed: 0, escalated: 0, skipped: 1 };
 
     // Supabase doesn't support column-to-column comparison in chained filters,
     // so pull a window and apply retry_count < max_retries in JS. Cheaper than

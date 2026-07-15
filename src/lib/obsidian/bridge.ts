@@ -12,9 +12,6 @@
 import * as fs from "fs";
 import * as path from "path";
 
-// Node globals are typed via @types/node — the linter may not resolve
-// the project tsconfig but the code compiles correctly in the Next.js build.
-
 // ── Vault path resolution ────────────────────────────────────────────────────
 
 function resolveVaultPath(): string {
@@ -103,15 +100,12 @@ function formatCurrency(amount: number): string {
 function appendToFile(filePath: string, content: string): void {
     if (fs.existsSync(filePath)) {
         const existing = fs.readFileSync(filePath, "utf-8");
-        // Write back with appended content
         fs.writeFileSync(filePath, existing + "\n\n" + content);
     } else {
-        // Create with frontmatter
         const frontmatter = `---\ntags: [invoices, ap, auto-sync]\ncreated: ${new Date().toISOString().split("T")[0]}\nupdated: ${new Date().toISOString().split("T")[0]}\n---\n\n`;
         fs.writeFileSync(filePath, frontmatter + content);
     }
 
-    // Update the 'updated' frontmatter field
     updateFrontmatterDate(filePath);
 }
 
@@ -149,7 +143,6 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
         const invoiceSlug = slugify(invoice.invoiceNumber || "unknown");
         const dateStr = formatDateForFilename(invoice.invoiceDate);
 
-        // ── Individual invoice note ──
         const invoicesDir = ensureFolder("Invoices");
         const invoiceFile = path.join(
             invoicesDir,
@@ -164,8 +157,8 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
             `| Vendor | ${invoice.vendorName} |`,
             `| Invoice # | ${invoice.invoiceNumber} |`,
             `| Date | ${invoice.invoiceDate} |`,
-            `| Due Date | ${invoice.dueDate ?? "—" } |`,
-            `| PO Number | ${invoice.poNumber ?? "—" } |`,
+            `| Due Date | ${invoice.dueDate ?? "—"} |`,
+            `| PO Number | ${invoice.poNumber ?? "—"} |`,
             `| Subtotal | ${formatCurrency(invoice.subtotal ?? 0)} |`,
             `| Freight | ${formatCurrency(invoice.freight ?? 0)} |`,
             `| Tax | ${formatCurrency(invoice.tax ?? 0)} |`,
@@ -173,7 +166,7 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
             `| Status | ${invoice.status} |`,
             `| Line Items | ${invoice.lineItemCount} |`,
             `| Source | ${invoice.source} |`,
-            `| Reconciled | ${invoice.reconciledAt ?? "—" } |`,
+            `| Reconciled | ${invoice.reconciledAt ?? "—"} |`,
         ];
 
         if (invoice.notes) {
@@ -197,7 +190,7 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
         const frontmatter = `---\ntags: [invoice, ${vendorSlug}, ap, auto-sync]\ncreated: ${dateStr}\nupdated: ${new Date().toISOString().split("T")[0]}\n---\n\n`;
         fs.writeFileSync(invoiceFile, frontmatter + lines.join("\n") + "\n");
 
-        // ── Append to vendor note ──
+        // Append to vendor note
         const vendorsDir = ensureFolder("Vendors");
         const vendorFile = path.join(vendorsDir, `${invoice.vendorName}.md`);
         const summaryLine = `| ${invoice.invoiceDate} | #${invoice.invoiceNumber} | ${invoice.poNumber ?? "—"} | ${formatCurrency(invoice.total)} | ${invoice.status} | [[../Invoices/${dateStr}-${vendorSlug}-${invoiceSlug}|→]] |`;
@@ -205,15 +198,13 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
         if (fs.existsSync(vendorFile)) {
             const existing = fs.readFileSync(vendorFile, "utf-8");
             if (existing.includes("## Recent Invoices")) {
-                // Append row to existing table
                 const updated = existing.replace(
-                    /(\|\s*\*\*Total\*\*\s*\|[^|]*\|\s*\*\*Status\*\*\s*\|[^|]*\|\s*\*\*Link\*\*\s*\|\n)/,
-                    `$1${summaryLine}\n`
+                    /(\|\s*\*\*Total\*\*\s*\|\s*\*\*Status\*\*\s*\|\s*\*\*Link\*\*\s*\|)/,
+                    `$1\n${summaryLine}`
                 );
                 if (updated !== existing) {
                     fs.writeFileSync(vendorFile, updated);
                 } else {
-                    // Table header not found in expected format, append after heading
                     const withRow = existing.replace(
                         /(## Recent Invoices\n)/,
                         `$1\n| Date | Invoice # | PO | Total | Status | Link |\n|------|-----------|-----|-------|--------|------|\n${summaryLine}\n`
@@ -221,7 +212,6 @@ export function writeInvoiceSummary(invoice: InvoiceSummary): string | null {
                     fs.writeFileSync(vendorFile, withRow);
                 }
             } else {
-                // Add section
                 const section = `\n\n## Recent Invoices\n\n| Date | Invoice # | PO | Total | Status | Link |\n|------|-----------|-----|-------|--------|------|\n${summaryLine}\n`;
                 fs.writeFileSync(vendorFile, existing + section);
             }
@@ -264,12 +254,12 @@ export function writeScanNote(note: ScanNote): string | null {
             `## OCR Text`,
             ``,
             "```",
-            note.ocrText.substring(0, 10000), // Cap to prevent massive notes
+            note.ocrText.substring(0, 10000),
             "```",
         ];
 
         if (note.extractedData && Object.keys(note.extractedData).length > 0) {
-            lines.push("", `## Extracted Data`, "", "```json", JSON.stringify(note.extractedData, null, 2), "```");
+            lines.push("", "## Extracted Data", "", "```json", JSON.stringify(note.extractedData, null, 2), "```");
         }
 
         lines.push(
@@ -355,24 +345,21 @@ export function readVaultForSync(maxNotes: number = 100): Array<{
             const fullPath = path.join(dir, file);
             const content = fs.readFileSync(fullPath, "utf-8");
 
-            // Extract title from first H1 or filename
             const titleMatch = content.match(/^#\s+(.+)$/m);
             const title = titleMatch ? titleMatch[1] : file.replace(/\.md$/, "");
 
-            // Extract tags from frontmatter
             const tagsMatch = content.match(/^tags:\s*\[(.+?)\]/m);
             const tags = tagsMatch
                 ? tagsMatch[1].split(",").map((t: string) => t.trim())
                 : [];
 
-            // Extract updated date
             const updatedMatch = content.match(/^updated:\s*(.+)$/m);
             const updated = updatedMatch ? updatedMatch[1].trim() : "";
 
             notes.push({
                 path: `${folder}/${file}`,
                 title,
-                content: content.substring(0, 5000), // Cap for Honcho injection
+                content: content.substring(0, 5000),
                 tags,
                 updated,
             });

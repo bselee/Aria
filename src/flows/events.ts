@@ -9,7 +9,7 @@
  *          that produced the event. Failures log a warning and return null.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 export interface EmitOptions {
     /** Optional correlation_id for joining future events to in-flight runs. */

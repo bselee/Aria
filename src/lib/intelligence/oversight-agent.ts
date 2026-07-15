@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import type { OpsControlCommand } from "@/lib/ops/control-plane";
 import { createOpsControlRequest } from "@/lib/ops/control-plane-db";
 import * as agentTask from "./agent-task";
@@ -49,10 +49,10 @@ export class OversightAgent {
   }
 
   async registerHeartbeat(agentName: string, currentTask?: string, metrics?: Record<string, unknown>): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
-    await supabase.from("agent_heartbeats").upsert({
+    await db.from("agent_heartbeats").upsert({
       agent_name: agentName,
       heartbeat_at: new Date().toISOString(),
       status: "healthy",
@@ -67,10 +67,10 @@ export class OversightAgent {
   }
 
   async checkAllHeartbeats(): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
-    const { data: heartbeats } = await supabase.from("agent_heartbeats").select("*");
+    const { data: heartbeats } = await db.from("agent_heartbeats").select("*");
     if (!heartbeats) return;
 
     const now = Date.now();
@@ -88,8 +88,8 @@ export class OversightAgent {
   }
 
   private async updateStatus(agentName: string, status: AgentStatus): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     await supabase
       .from("agent_heartbeats")
@@ -117,8 +117,8 @@ export class OversightAgent {
   }
 
   private async buildContext(agentName: string): Promise<RecoveryContext> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
       return {
         agentName,
         currentTask: null,
@@ -181,8 +181,8 @@ export class OversightAgent {
         return { action: "restart_process", description: `No control-plane command registered for ${agentName}`, success: false };
       }
 
-      const supabase = createClient();
-      if (!supabase) {
+      const db = createClient();
+      if (!db) {
         return { action: "restart_process", description: "Supabase unavailable", success: false };
       }
 
@@ -223,8 +223,8 @@ export class OversightAgent {
   }
 
   private async escalate(agentName: string, actions: RecoveryAction[]): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
       console.error(`[Oversight] Escalation needed for ${agentName}`, actions);
       return;
     }
@@ -256,7 +256,7 @@ export class OversightAgent {
             actions,
           },
         });
-        await supabase.from("ops_control_requests")
+        await db.from("ops_control_requests")
           .update({ task_id: task.id })
           .eq("id", requestRow.id);
       } catch { /* hub write is best-effort */ }

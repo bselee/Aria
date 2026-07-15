@@ -10,7 +10,7 @@
  * @deps    supabase, zod, intelligence/llm, axios
  */
 
-import { createClient } from '../../supabase';
+import { createClient } from '../../db';
 import { unifiedObjectGeneration } from '../llm';
 import { z } from 'zod';
 import axios from 'axios';
@@ -60,8 +60,8 @@ export class AmazonOrderParser {
 
         console.log(`[AmazonOrderParser] Order #${orderData.orderId}: ${orderData.items.length} item(s)`);
 
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         // Step 2: Check if this order was already processed
         const { data: existing } = await supabase
@@ -110,7 +110,7 @@ export class AmazonOrderParser {
         } else {
             // No Slack request match — still record the order for spend tracking
             // Insert a new slack_request record with just the Amazon data
-            await supabase.from('slack_requests').insert({
+            await db.from('slack_requests').insert({
                 channel_id: 'unmatched',
                 channel_name: 'Amazon (no Slack request)',
                 message_ts: `amazon_${orderData.orderId}`,
@@ -220,7 +220,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         supabase: ReturnType<typeof createClient>,
         orderData: AmazonOrderData
     ): Promise<{ id: string; requester_name: string; channel_id: string; message_ts: string; thread_ts: string | null } | null> {
-        if (!supabase) return null;
+        if (!db) return null;
 
         // Get pending Slack requests from the last 7 days
         const sevenDaysAgo = new Date();
@@ -281,8 +281,8 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
      * Handle a shipping update for an already-matched order.
      */
     private async handleShippingUpdate(requestId: string, orderData: AmazonOrderData): Promise<void> {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         const updates: Record<string, any> = { status: 'shipped' };
         if (orderData.trackingNumber) updates.tracking_number = orderData.trackingNumber;
@@ -291,7 +291,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
             updates.estimated_delivery = this.parseDeliveryDate(orderData.estimatedDelivery);
         }
 
-        await supabase.from('slack_requests').update(updates).eq('id', requestId);
+        await db.from('slack_requests').update(updates).eq('id', requestId);
 
         // Get the request details for Telegram notification
         const { data: req } = await supabase

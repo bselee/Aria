@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createClientMock } = vi.hoisted(() => ({ createClientMock: vi.fn() }));
-vi.mock("@/lib/supabase", () => ({ createClient: createClientMock }));
+vi.mock("@/lib/db", () => ({ createClient: createClientMock }));
 
 import { indexOperationalContext } from "./pinecone";
 

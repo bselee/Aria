@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 const { createClientMock } = vi.hoisted(() => ({ createClientMock: vi.fn() }));
-vi.mock("@/lib/supabase", () => ({ createClient: createClientMock }));
+vi.mock("@/lib/db", () => ({ createClient: createClientMock }));
 
 import {
     deriveLane,

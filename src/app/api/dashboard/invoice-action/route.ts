@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { gmail as GmailApi } from '@googleapis/gmail';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import { APAgent } from '@/lib/intelligence/ap-agent';
 import { Telegraf } from 'telegraf';
 import { getAuthenticatedClient } from '@/lib/gmail/auth';
@@ -19,7 +19,7 @@ export async function POST(req: Request) {
         }
 
         const buffer = Buffer.from(bufferBase64, 'base64');
-        const supabase = createClient();
+        const db = createClient();
 
         const token = process.env.TELEGRAM_BOT_TOKEN;
         if (!token) return NextResponse.json({ error: 'TELEGRAM_BOT_TOKEN not configured' }, { status: 500 });
@@ -39,7 +39,7 @@ export async function POST(req: Request) {
         // Process invoice in background — OCR + Finale reconciliation can take 30-60s.
         // Results arrive via Telegram (approval buttons or auto-apply summary).
         console.log(`[Invoice Action] Kicking off background reconciliation for ${filename}...`);
-        apAgent.processInvoiceBuffer(buffer, filename, subjectString, fromString, supabase, false)
+        apAgent.processInvoiceBuffer(buffer, filename, subjectString, fromString, db, false)
             .catch((err: any) => console.error(`[Invoice Action] Background processing failed for ${filename}:`, err));
 
         return NextResponse.json({ success: true, status: 'processing', message: 'Invoice forwarded to Bill.com. Reconciliation running in background — results via Telegram.' });

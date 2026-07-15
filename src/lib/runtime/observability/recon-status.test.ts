@@ -12,7 +12,7 @@ import { describe, it, expect, vi } from "vitest";
 
 // Mock Supabase so the module-level import in recon-status.ts doesn't fail
 // when SUPABASE_URL / SUPABASE_ANON_KEY are absent (CI / local no-env runs).
-vi.mock("@/lib/supabase", () => ({ createClient: () => null }));
+vi.mock("@/lib/db", () => ({ createClient: () => null }));
 
 import { formatReconStatus, formatMorningApBlock } from "./recon-status";
 import type { ReconStatus } from "./recon-status";

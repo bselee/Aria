@@ -6,14 +6,14 @@
  *          (retail-impact) with clear build-level consequences.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/finale/purchasing
+ * @deps    @/lib/db, @/lib/finale/purchasing
  *
  * BILL'S RULE: "If I am chatting, it is a needed item and should be
  * deemed important." — natural language ordering via Telegram takes
  * priority over automated recommendations.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 

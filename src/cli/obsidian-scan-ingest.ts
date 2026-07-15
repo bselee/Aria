@@ -66,14 +66,13 @@ async function processFile(
             const result = await extractPDF(buffer);
             ocrText = result.rawText || "";
             extractedData = {
-                pageCount: result.metadata.pageCount,
+                pageCount: result.metadata?.pageCount,
                 ocrStrategy: result.ocrStrategy,
                 hasImages: result.hasImages,
             };
         } else if (ext === ".txt") {
             ocrText = fs.readFileSync(filePath, "utf-8");
         } else {
-            // For images, we'd need a vision model — log and skip for now
             ocrText = `[Image file: ${fileName}] — OCR for images requires vision model integration.`;
             extractedData = { fileType: "image", note: "Vision OCR not yet integrated" };
         }
@@ -132,9 +131,8 @@ async function main() {
 
             if (result) {
                 processedCount++;
-                // Move to processed dir to avoid reprocessing
                 const processedPath = path.join(processedDir, file);
-                fs.renameSync(filePath, processedPath);
+                try { fs.renameSync(filePath, processedPath); } catch { /* best effort */ }
                 console.log(`  → ${result}`);
                 console.log(`  → Moved to: ${processedPath}`);
             } else {

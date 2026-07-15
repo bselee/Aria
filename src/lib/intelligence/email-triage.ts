@@ -6,7 +6,7 @@
  *          actionable, concise when queried.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * DESIGN:
  *   This replaces the need to check Gmail manually. One command shows:
@@ -16,7 +16,7 @@
  *   4. Draft follow-ups waiting for Bill's review
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 

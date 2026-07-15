@@ -1,6 +1,7 @@
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { withAdvisoryLock } from "@/lib/purchasing/advisory-lock";
 import { FinaleClient } from "@/lib/finale/client";
+import { upsertTrackingLocal, syncTrackingToPostgREST, getTrackingLocal } from "@/lib/storage/tracking-cache";
 import {
     carrierUrl,
     detectCarrier,
@@ -615,8 +616,8 @@ export function getShipmentsDueForRefresh(
 }
 
 async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
-    const supabase = createClient();
-    if (!supabase || !poNumber) return;
+    const db = createClient();
+    if (!db || !poNumber) return;
 
     const { data: shipments } = await supabase
         .from("shipments")
@@ -673,8 +674,8 @@ async function appendLifecycleTransition(
     poNumber: string,
     entry: LifecycleTransitionEntry,
 ): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const { data: existing } = await supabase
         .from("purchase_orders")
@@ -704,8 +705,8 @@ async function syncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentR
 }
 
 async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
-    const supabase = createClient();
-    if (!supabase) return;
+    const db = createClient();
+    if (!db) return;
 
     const now = new Date().toISOString();
     const statusSummary = shipment.status_display || null;
@@ -799,7 +800,7 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
     }
     // If no meaningful change, still update tracking evidence timestamp without cluttering history
 
-    await supabase.from("purchase_orders").upsert(update, { onConflict: "po_number" });
+    await db.from("purchase_orders").upsert(update, { onConflict: "po_number" });
 
     // Also record transition via append-only column update when status changed
     if (statusChanged) {
@@ -814,8 +815,25 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
 }
 
 export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promise<ShipmentRecord | null> {
-    const supabase = createClient();
-    if (!supabase) return null;
+    // ── Phase 1: Write to local SQLite cache FIRST ──
+    // This ensures tracking data survives even if PostgREST is unavailable.
+    // The local cache is the primary store; PostgREST is best-effort sync.
+    try {
+        upsertTrackingLocal({
+            trackingNumber: input.trackingNumber,
+            poNumbers: input.poNumber ? [input.poNumber] : undefined,
+            statusCategory: input.statusCategory ?? null,
+            statusDisplay: input.statusDisplay ?? null,
+            estimatedDeliveryAt: input.estimatedDeliveryAt ?? null,
+            deliveredAt: input.deliveredAt ?? null,
+        });
+    } catch (localErr: any) {
+        console.warn(`[tracking] Local cache write failed (non-fatal): ${localErr.message}`);
+    }
+
+    // ── Phase 2: Write to PostgREST ──
+    const db = createClient();
+    if (!db) return null;
 
     const normalized = normalizeTrackingIdentity(input.trackingNumber);
     const { data: existing } = await supabase
@@ -893,8 +911,8 @@ function mergeTrackingStatus(record: ShipmentRecord, status: TrackingStatus | nu
 }
 
 export async function refreshShipmentStatus(record: ShipmentRecord): Promise<ShipmentRecord> {
-    const supabase = createClient();
-    if (!supabase) return record;
+    const db = createClient();
+    if (!db) return record;
 
     const status = await getTrackingStatus(record.tracking_number);
     const updated = mergeTrackingStatus(record, status);
@@ -914,8 +932,8 @@ export async function refreshShipmentStatus(record: ShipmentRecord): Promise<Shi
 }
 
 export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promise<ShipmentRecord[]> {
-    const supabase = createClient();
-    if (!supabase || poNumbers.length === 0) return [];
+    const db = createClient();
+    if (!db || poNumbers.length === 0) return [];
 
     const { data, error } = await supabase
         .from("shipments")
@@ -936,8 +954,8 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
 }
 
 async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
-    const supabase = createClient();
-    if (!supabase || poNumbers.length === 0) return new Set<string>();
+    const db = createClient();
+    if (!db || poNumbers.length === 0) return new Set<string>();
 
     const received = new Set<string>();
 
@@ -968,8 +986,8 @@ async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {
  * @modified 2026-06-15 — added thisWeekStart filter per Bill's request
  */
 async function listActiveShipmentsRaw(): Promise<ShipmentRecord[]> {
-    const supabase = createClient();
-    if (!supabase) return [];
+    const db = createClient();
+    if (!db) return [];
 
     // Limit to current week (Monday 00:00 UTC) to keep dashboard fast
     const now = new Date();

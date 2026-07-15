@@ -7,7 +7,7 @@
  * Phase 1a Task 4 — /recon-status Telegram command.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import type { ReconciliationOutcome } from "./reconciliation-outcomes";
 
 // ── Types ─────────────────────────────────────────────────────────────────────

@@ -113,10 +113,10 @@ function computeThirtyDayNeed(
 
 /**
  * Compute safety buffer = leadTimeDays * avgDailyConsumption.
- * If leadTimeDays is unknown, use 14-day default.
+ * If leadTimeDays is unknown, use 21-day default.
  */
 function computeSafetyBuffer(leadTimeDays: number | null, avgDailyConsumption: number): number {
-    const lt = leadTimeDays ?? 14;
+    const lt = leadTimeDays ?? 21;
     return Math.ceil(lt * avgDailyConsumption);
 }
 

@@ -6,7 +6,7 @@ const mockState = vi.hoisted(() => ({
     trackingStatusByNumber: new Map<string, any>(),
 }));
 
-vi.mock("@/lib/supabase", () => ({
+vi.mock("@/lib/db", () => ({
     createClient: vi.fn(() => ({
         from: (table: string) => {
             if (table === "shipments") {

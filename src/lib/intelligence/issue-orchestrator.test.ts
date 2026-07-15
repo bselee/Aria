@@ -20,7 +20,7 @@ function resetChain() {
     supabaseMock.update.mockReturnValue(supabaseMock);
     supabaseMock.insert.mockReturnValue(supabaseMock);
 }
-vi.mock("@/lib/supabase", () => ({ createClient: () => supabaseMock }));
+vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 // Mock listIssues so evaluateIssue tests stay isolated.
 const listIssuesMock = vi.hoisted(() => vi.fn());

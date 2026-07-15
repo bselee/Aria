@@ -35,7 +35,7 @@ vi.mock("../finale/client", () => ({
     }),
 }));
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: vi.fn(() => ({
         from: fromMock,
     })),

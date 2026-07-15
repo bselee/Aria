@@ -8,7 +8,7 @@
  *
  *          Spec: .agents/plans/2026-04-27-task-learning-loop.md §4.2
  */
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { appendEvent, type AgentTask } from "./agent-task";
 
 export type ClosurePredicate =
@@ -19,8 +19,8 @@ export type ClosurePredicate =
 const PREDICATES: Record<string, (task: AgentTask) => Promise<boolean>> = {
     agent_boot_after: async (task) => {
         const cw = task.closes_when as ClosurePredicate & { kind: "agent_boot_after" };
-        const supabase = createClient();
-        if (!supabase) return false;
+        const db = createClient();
+        if (!db) return false;
         const { data } = await supabase
             .from("agent_heartbeats")
             .select("heartbeat_at, status")
@@ -34,8 +34,8 @@ const PREDICATES: Record<string, (task: AgentTask) => Promise<boolean>> = {
     spoke_status: async (task) => {
         const cw = task.closes_when as ClosurePredicate & { kind: "spoke_status" };
         if (!task.source_id) return false;
-        const supabase = createClient();
-        if (!supabase) return false;
+        const db = createClient();
+        if (!db) return false;
         const { data } = await supabase
             .from(cw.table)
             .select("status")
@@ -101,8 +101,8 @@ export function closesWhenFor(args: {
  * Registered in OpsManager at 5-minute cadence.
  */
 export async function closeFinishedTasks(): Promise<number> {
-    const supabase = createClient();
-    if (!supabase) return 0;
+    const db = createClient();
+    if (!db) return 0;
     const { data, error } = await supabase
         .from("agent_task")
         .select("*")

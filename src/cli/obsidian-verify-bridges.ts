@@ -96,15 +96,7 @@ async function main() {
         console.log("  FAIL: Honcho unreachable: " + err.message);
     }
 
-    // ── Summary ──
     console.log("\n=== Verification Complete ===");
-    console.log("All three bridges are functional:");
-    console.log("  1. Aria to Obsidian (invoice summaries) - PASS");
-    console.log("  2. Scans/Downloads to Obsidian (document notes) - PASS");
-    console.log("  3. Obsidian to Honcho (vault read + Honcho API) - PASS");
-    console.log("\nTest notes created in vault — safe to delete from:");
-    console.log("  - Invoices/2026-06-26-test-vendor-co-test-001.md");
-    console.log("  - Scans/2026-06-26-test-document.md");
 }
 
 main().catch((err) => {

@@ -25,7 +25,7 @@ vi.mock("@/lib/copilot/tools", () => ({
     }),
 }));
 
-vi.mock("@/lib/supabase", () => ({ createClient: () => null }));
+vi.mock("@/lib/db", () => ({ createClient: () => null }));
 
 import { __resetRegistryForTests, listTools } from "./tool-registry";
 import { ensureCopilotToolsRegistered, __resetRegistrationLatchForTests } from "./register-copilot-tools";

@@ -20,7 +20,7 @@ const {
     assessGroupsMock: vi.fn(),
 }));
 
-vi.mock('../supabase', () => ({
+vi.mock('../db', () => ({
     createClient: createClientMock,
 }));
 

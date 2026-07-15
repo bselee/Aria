@@ -35,7 +35,7 @@ import { ensureFinaleToolsRegistered } from "../agents/register-finale-tools";
 
 import { FinaleClient, getShipmentReceiptItems } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
@@ -79,9 +79,9 @@ export async function storePendingApproval(result: ReconciliationResult, client:
     // Persist to Supabase â€” this is the durable source of truth.
     let dbId = id; // Fallback or placeholder until SB returns it
     try {
-        const supabase = createClient();
-        if (supabase) {
-            const { data, error } = await supabase.from("ap_pending_approvals").insert({
+        const db = createClient();
+        if (db) {
+            const { data, error } = await db.from("ap_pending_approvals").insert({
                 invoice_number: result.invoiceNumber,
                 vendor_name: result.vendorName,
                 order_id: result.orderId,
@@ -193,9 +193,9 @@ export async function storePendingApproval(result: ReconciliationResult, client:
  */
 export async function updatePendingApprovalMessageId(approvalId: string, telegramMessageId: number): Promise<void> {
     try {
-        const supabase = createClient();
-        if (supabase) {
-            await supabase.from("ap_pending_approvals")
+        const db = createClient();
+        if (db) {
+            await db.from("ap_pending_approvals")
                 .update({ telegram_message_id: telegramMessageId.toString() })
                 .eq("id", approvalId);
         }
@@ -217,8 +217,8 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
     expiresAt: Date;
 }>> {
     try {
-        const supabase = createClient();
-        if (!supabase) return [];
+        const db = createClient();
+        if (!db) return [];
 
         // Filter by status='pending' and expires_at > now()
         const { data, error } = await supabase
@@ -291,8 +291,8 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
  */
 export async function expireStaleApprovals(): Promise<number> {
     try {
-        const supabase = createClient();
-        if (!supabase) return 0;
+        const db = createClient();
+        if (!db) return 0;
 
         const { data, error } = await supabase
             .from("ap_pending_approvals")
@@ -329,10 +329,10 @@ export async function getPendingApproval(id: string): Promise<PendingApproval | 
 
     // Slow path: read from Supabase (survives restart)
     try {
-        const supabase = createClient();
-        if (!supabase) return undefined;
+        const db = createClient();
+        if (!db) return undefined;
 
-        const { data } = await supabase.from("ap_pending_approvals")
+        const { data } = await db.from("ap_pending_approvals")
             .select("*")
             .eq("id", id)
             .eq("status", "pending")
@@ -462,8 +462,8 @@ export async function approvePendingReconciliation(id: string): Promise<{
     // Write RECONCILIATION entry to ap_activity_log for duplicate detection.
     // Future re-processes of this invoice+PO combo will hit checkDuplicateReconciliation().
     try {
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             // Build a final report with approval updated to reflect Will's manual approval
             const approvedReport: ReconciliationReport | undefined = entry.result.report
                 ? {
@@ -476,7 +476,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
                 }
                 : undefined;
 
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} â†’ PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
@@ -492,7 +492,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             // future exact PO# matches (Strategy 1 in matcher) have vendor data.
             // Also helps watchdog product catalog builds that rely on this table.
             if (entry.result.vendorName && entry.result.orderId) {
-                await supabase.from("purchase_orders").upsert({
+                await db.from("purchase_orders").upsert({
                     po_number: entry.result.orderId,
                     vendor_name: entry.result.vendorName,
                     status: "open",
@@ -500,7 +500,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             }
 
             // Update structured invoice state
-            await supabase.from("invoices").update({
+            await db.from("invoices").update({
                 status: "reconciled"
             })
                 .eq("invoice_number", entry.result.invoiceNumber)
@@ -636,8 +636,8 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
     // Write to ap_activity_log so checkDuplicateReconciliation() catches future
     // re-processing of the same invoice â€” rejections must be "sticky".
     try {
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             // Build a final report reflecting Will's rejection decision
             const rejectedReport: ReconciliationReport | undefined = entry.result.report
                 ? {
@@ -650,7 +650,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
                 }
                 : undefined;
 
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: entry.result.vendorName,
                 email_subject: `Invoice ${entry.result.invoiceNumber} â†’ PO ${entry.result.orderId}`,
                 intent: "RECONCILIATION",
@@ -668,7 +668,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             });
 
             // Update structured invoice state
-            await supabase.from("invoices").update({
+            await db.from("invoices").update({
                 status: "matched_review"
             })
                 .eq("invoice_number", entry.result.invoiceNumber)
@@ -775,8 +775,8 @@ async function checkDuplicateReconciliation(
     orderId: string
 ): Promise<{ isDuplicate: boolean; processedAt?: string; actionTaken?: string }> {
     try {
-        const supabase = createClient();
-        if (!supabase) return { isDuplicate: false };
+        const db = createClient();
+        if (!db) return { isDuplicate: false };
 
         const identity = buildReconciliationIdentityMetadata({
             invoiceNumber: invoice.invoiceNumber,
@@ -2552,8 +2552,8 @@ async function deduplicateTrackingNumbers(
     if (trackingNumbers.length === 0) return [];
 
     try {
-        const supabase = createClient();
-        if (!supabase) return trackingNumbers; // No Supabase → skip dedup, write all
+        const db = createClient();
+        if (!db) return trackingNumbers; // No Supabase → skip dedup, write all
 
         // Check which tracking numbers already exist in any invoice record
         const { data: existingInvoices } = await supabase
@@ -2601,8 +2601,8 @@ async function saveTrackingNumbers(
     if (trackingNumbers.length === 0) return;
 
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         // Update the invoice record with tracking numbers (append, not overwrite)
         // Use RPC to merge arrays via array_append to avoid clobbering existing tracking data.
@@ -2801,8 +2801,8 @@ export async function enqueueForDashboardReview(
 ): Promise<string | null> {
     let activityLogId: string | null = null;
     try {
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             const shortShipmentDetected = result.overallVerdict === "short_shipment_hold";
             const shortShipmentLines = result.priceChanges
                 .filter(pc => pc.verdict === "short_shipment_hold")
@@ -2811,7 +2811,7 @@ export async function enqueueForDashboardReview(
                 .filter(pc => pc.verdict === "short_shipment_hold")
                 .reduce((sum, pc) => sum + (pc.receivingGap || 0), 0);
 
-            const { data } = await supabase.from("ap_activity_log").insert({
+            const { data } = await db.from("ap_activity_log").insert({
                 email_from: result.vendorName,
                 short_shipment_detected: shortShipmentDetected,
                 short_shipment_lines: shortShipmentLines.length > 0 ? shortShipmentLines : null,
@@ -2870,8 +2870,8 @@ export async function logPriceChangeAudit(
     source: string = "pdf_invoice"
 ): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         const rows: Array<Record<string, unknown>> = [];
 
@@ -2923,7 +2923,7 @@ export async function logPriceChangeAudit(
         }
 
         if (rows.length > 0) {
-            const { error } = await supabase.from("price_change_audit").insert(rows);
+            const { error } = await db.from("price_change_audit").insert(rows);
             if (error) {
                 console.warn(`âš ï¸ [reconciler] price_change_audit insert failed: ${error.message}`);
             } else {

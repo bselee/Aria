@@ -1,4 +1,4 @@
-import { createClient } from '../supabase';
+import { createClient } from '../db';
 import { FinaleClient } from '../finale/client';
 import { withToolAudit } from '../agents/tool-registry';
 import { assessPurchasingGroups } from './assessment-service';

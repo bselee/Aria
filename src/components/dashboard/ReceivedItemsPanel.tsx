@@ -45,6 +45,32 @@ type TrackingTodaySummary = {
     lines: string[];
 } | null;
 
+type MatchSuggestion = {
+    invoiceId: string;
+    invoiceNumber: string;
+    vendorName: string;
+    invoiceTotal: number;
+    candidates: Array<{
+        orderId: string;
+        vendorName: string;
+        orderDate: string;
+        total: number;
+        status: string;
+        score: number;
+        reasons: string[];
+        isOpen: boolean;
+    }>;
+    autoApplyReady: boolean;
+};
+
+type FreightClass = {
+    pattern: string;
+    confidence: string;
+    sampleCount: number;
+    source: string;
+    autonomousReady: boolean;
+};
+
 // Real AP status keyed by Finale orderId
 type ApStatusMap = Record<string, { label: string; cls: string }>;
 
@@ -160,7 +186,10 @@ function receiptItemsText(items: Array<{ productId: string; quantity: number }>)
 export default function ReceivedItemsPanel() {
     const lifecycle = usePurchasingLifecycle();
     const [pos, setPos] = useState<ReceivedPO[]>([]);
+    const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
+    const [freightClasses, setFreightClasses] = useState<Record<string, FreightClass>>({});
     const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
+    const [cachedAt, setCachedAt] = useState<string | null>(null);
     const [apMap, setApMap] = useState<ApStatusMap>({});
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -168,6 +197,37 @@ export default function ReceivedItemsPanel() {
     const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
     /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
     const knownReceiptIdsRef = useRef<Set<string>>(new Set());
+
+    async function handleMatchInvoice(invoiceId: string, poNumber: string) {
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber }),
+            });
+            if (res.ok) {
+                // Remove from suggestions
+                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
+            }
+        } catch (e: any) {
+            console.error("Match invoice error:", e.message);
+        }
+    }
+
+    async function handleCompletePO(orderId: string, vendorName: string) {
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
+            });
+            if (res.ok) {
+                fetchReceivings(true);
+            }
+        } catch (e: any) {
+            console.error("Complete PO error:", e.message);
+        }
+    }
 
     async function approveReconciliation(orderId: string, invoiceId?: string) {
         setApprovingReconcile(prev => new Set(prev).add(orderId));
@@ -321,6 +381,8 @@ export default function ReceivedItemsPanel() {
             }
             knownReceiptIdsRef.current = new Set(nextIds);
             setPos(sorted);
+            setMatchSuggestions(data.matchSuggestions || []);
+            setFreightClasses(data.freightClasses || {});
 
             if (trackingRes.ok) {
                 const trackingData = await trackingRes.json();
@@ -378,7 +440,7 @@ export default function ReceivedItemsPanel() {
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
                     ) : pos.length === 0 ? (
-                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings this week</span></div>
+                        <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-700">No receivings in 30d window</span></div>
                     ) : (
                         <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
                             {todaySummary && (
@@ -399,6 +461,57 @@ export default function ReceivedItemsPanel() {
                                             );
                                         })}
                                     </div>
+                                </div>
+                            )}
+
+                            {/* ── Match Suggestions: unmatched invoices with PO candidates ── */}
+                            {matchSuggestions.length > 0 && (
+                                <div className="border-b border-amber-500/20 bg-amber-500/5">
+                                    <div className="px-4 py-2 flex items-center gap-2">
+                                        <span className="text-[11px] font-mono uppercase tracking-[0.18em] text-amber-300/80">
+                                            Needs PO Match
+                                        </span>
+                                        <span className="text-[10px] font-mono text-amber-500/60">
+                                            {matchSuggestions.length} invoice{matchSuggestions.length > 1 ? "s" : ""}
+                                        </span>
+                                    </div>
+                                    {matchSuggestions.map(s => {
+                                        const best = s.candidates[0];
+                                        const scoreColor = best.score >= 80 ? "text-emerald-400" : best.score >= 60 ? "text-amber-400" : "text-zinc-400";
+                                        return (
+                                            <div key={s.invoiceId} className="px-4 py-2 border-t border-amber-500/10 hover:bg-amber-500/5 transition-colors">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs font-mono text-zinc-200 font-semibold">{s.invoiceNumber}</span>
+                                                    <span className="text-[10px] font-mono text-zinc-500">{s.vendorName}</span>
+                                                    <span className="text-[10px] font-mono text-zinc-400 ml-auto">
+                                                        ${Number(s.invoiceTotal).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                                    </span>
+                                                </div>
+                                                {best && (
+                                                    <div className="mt-1.5 flex items-center gap-2">
+                                                        <span className={`text-[10px] font-mono ${scoreColor}`}>
+                                                            {best.score}% → PO {best.orderId}
+                                                        </span>
+                                                        <span className="text-[9px] font-mono text-zinc-600">
+                                                            {best.reasons.slice(0, 2).join(" · ")}
+                                                        </span>
+                                                        <div className="flex-1" />
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); handleMatchInvoice(s.invoiceId, best.orderId); }}
+                                                            className="text-[10px] font-mono px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 transition-colors"
+                                                        >
+                                                            Match
+                                                        </button>
+                                                        {s.candidates.length > 1 && (
+                                                            <span className="text-[9px] font-mono text-zinc-600">
+                                                                +{s.candidates.length - 1} alt
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                             )}
 

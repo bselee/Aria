@@ -7,6 +7,7 @@
 
 import { FinalePurchasingClient } from "./purchasing";
 import { FinaleProductsClient } from "./products";
+import { DEFAULT_LEAD_TIME_DAYS } from "../constants";
 import {
     type ReceivedPO,
     parseFinaleNumber,
@@ -940,7 +941,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
         let expectedDelivery: import('../purchasing/po-verification').ExpectedDelivery;
         if (inTest) {
             expectedDelivery = computeExpectedDelivery({
-                leadTimeDays: 14, source: 'default', label: '14d default',
+                leadTimeDays: DEFAULT_LEAD_TIME_DAYS, source: 'default', label: `${DEFAULT_LEAD_TIME_DAYS}d default`,
             });
         } else {
             try {
@@ -951,7 +952,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 });
             } catch {
                 expectedDelivery = computeExpectedDelivery({
-                    leadTimeDays: 14, source: 'default', label: '14d default',
+                    leadTimeDays: DEFAULT_LEAD_TIME_DAYS, source: 'default', label: `${DEFAULT_LEAD_TIME_DAYS}d default`,
                 });
             }
         }

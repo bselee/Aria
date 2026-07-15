@@ -65,8 +65,8 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
     await ctx.answerCbQuery('Noted ✓');
 
     const { createClient } = await import('../../lib/supabase');
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         const originalText = ctx.callbackQuery && ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
         await ctx.editMessageText(originalText + '\n\n✅ Noted.');
@@ -75,7 +75,7 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
 
     try {
         // 1. Mark the activity log row as acknowledged
-        await supabase.from('ap_activity_log').update({
+        await db.from('ap_activity_log').update({
             metadata: { acknowledged: true, acknowledged_at: new Date().toISOString() },
         }).eq('id', logId);
 
@@ -103,7 +103,7 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
 
                 if (newCount >= NOTED_THRESHOLD && currentPhase === 1) {
                     // Graduate to Phase 2 — daily digest only
-                    await supabase.from('vendor_profiles').update({
+                    await db.from('vendor_profiles').update({
                         noted_count: newCount,
                         autonomy_phase: 2,
                         phase_upgraded_at: new Date().toISOString(),
@@ -118,7 +118,7 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
                         { parse_mode: 'Markdown' }
                     );
                 } else {
-                    await supabase.from('vendor_profiles').update({
+                    await db.from('vendor_profiles').update({
                         noted_count: newCount,
                         last_noted_at: new Date().toISOString(),
                     }).eq('vendor_name', vp.vendor_name);
@@ -144,8 +144,8 @@ export async function handleFlagReconciliation(ctx: Context, logId: string): Pro
     await ctx.answerCbQuery('Flagged ⚠️');
 
     const { createClient } = await import('../../lib/supabase');
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         const originalText = ctx.callbackQuery && ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
             ? ctx.callbackQuery.message.text : '';
         await ctx.editMessageText(originalText + '\n\n⚠️ Flagged for review.');
@@ -154,7 +154,7 @@ export async function handleFlagReconciliation(ctx: Context, logId: string): Pro
 
     try {
         // 1. Mark the activity log row as flagged
-        await supabase.from('ap_activity_log').update({
+        await db.from('ap_activity_log').update({
             metadata: { flagged: true, flagged_at: new Date().toISOString() },
         }).eq('id', logId);
 
@@ -178,7 +178,7 @@ export async function handleFlagReconciliation(ctx: Context, logId: string): Pro
 
             if (vp) {
                 const wasPhase2Plus = (vp.autonomy_phase ?? 1) >= 2;
-                await supabase.from('vendor_profiles').update({
+                await db.from('vendor_profiles').update({
                     noted_count: 0,           // reset the learning counter
                     flag_count: (vp.flag_count ?? 0) + 1,
                     autonomy_phase: 1,         // revert to Surface (always show diffs)

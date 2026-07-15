@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 export type AxiomQueueItem = {
     id: string;
@@ -43,8 +43,8 @@ export async function GET(req: NextRequest) {
         return NextResponse.json(cache, { headers: { 'Cache-Control': 'no-store' } });
     }
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
             { error: 'Supabase not configured' },
             { status: 503 }

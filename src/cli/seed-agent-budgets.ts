@@ -24,7 +24,7 @@
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { checkBudget, chargeBudget, estimateCostUsd } from "@/lib/agents/budget";
 
 interface AgentBudgetConfig {
@@ -51,8 +51,8 @@ const BUDGETS: AgentBudgetConfig[] = [
 async function main() {
     console.log("\n💰 Agent Budget Seeding\n");
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.error("❌ Supabase client unavailable — check env vars.");
         process.exit(1);
     }
@@ -74,7 +74,7 @@ async function main() {
 
         if (data) {
             // Update caps if changed
-            await supabase.from("agent_budget").update({
+            await db.from("agent_budget").update({
                 monthly_usd_cap: config.monthly_usd_cap,
                 notes: config.notes,
                 updated_at: new Date().toISOString(),
@@ -82,7 +82,7 @@ async function main() {
             existing++;
             console.log(`  ✅ ${config.agent_id.padEnd(22)} $${config.monthly_usd_cap.toFixed(2)}/mo (updated)`);
         } else {
-            await supabase.from("agent_budget").insert({
+            await db.from("agent_budget").insert({
                 agent_id: config.agent_id,
                 monthly_usd_cap: config.monthly_usd_cap,
                 current_period_start: new Date().toISOString(),

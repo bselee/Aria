@@ -5,7 +5,7 @@
  *          cron scheduling with adaptive, context-aware orchestration.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/storage/local-db
+ * @deps    @/lib/db, @/lib/storage/local-db
  *
  * ARCHITECTURE:
  *   Every 15 min, runCognitiveRound() gathers state from Supabase + SQLite,
@@ -15,7 +15,7 @@
  *   This is where Hermia's cognition lives inside Aria's runtime.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { getLocalDb } from "@/lib/storage/local-db";
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -67,8 +67,8 @@ async function gatherState(): Promise<CognitiveState> {
     };
 
     // Supabase queries (best-effort — failures degrade gracefully to empty state)
-    const supabase = createClient();
-    if (supabase) {
+    const db = createClient();
+    if (db) {
         try {
             // Agent heartbeats
             const { data: heartbeats } = await supabase

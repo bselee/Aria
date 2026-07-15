@@ -72,7 +72,7 @@ export interface VendorInvoiceRecord {
 export async function upsertVendorInvoice(
     record: VendorInvoiceRecord
 ): Promise<string | null> {
-    const supabase = createClient();
+    const db = createClient();
 
     // Normalise vendor name: trim, title-case first word at minimum
     const vendorName = record.vendor_name.trim();
@@ -153,7 +153,7 @@ export interface InvoiceLookupFilters {
  * Returns rows ordered by invoice_date DESC.
  */
 export async function lookupVendorInvoices(filters: InvoiceLookupFilters) {
-    const supabase = createClient();
+    const db = createClient();
 
     let query = supabase
         .from("vendor_invoices")
@@ -203,15 +203,15 @@ export async function lookupVendorInvoices(filters: InvoiceLookupFilters) {
  * Spend summary grouped by vendor for a date range.
  */
 export async function vendorSpendSummary(sinceDate: string) {
-    const supabase = createClient();
+    const db = createClient();
 
-    const { data, error } = await supabase.rpc("vendor_spend_summary", {
+    const { data, error } = await db.rpc("vendor_spend_summary", {
         since_date: sinceDate,
     });
 
     // Fallback if the RPC doesn't exist yet — query directly
     if (error) {
-        const { data: fallback } = await supabase
+        const { data: fallback } = await db
             .from("vendor_invoices")
             .select("vendor_name, total, freight, tax, invoice_date")
             .gte("invoice_date", sinceDate);
@@ -244,7 +244,7 @@ export async function markInvoicePaid(
     invoiceNumber: string,
     paidAt?: string
 ): Promise<boolean> {
-    const supabase = createClient();
+    const db = createClient();
 
     const { error } = await supabase
         .from("vendor_invoices")

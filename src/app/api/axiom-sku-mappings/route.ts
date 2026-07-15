@@ -4,11 +4,11 @@
  * @author  Will
  * @created 2026-05-20
  * @updated 2026-05-20
- * @deps    @/lib/supabase, next/server
+ * @deps    @/lib/db, next/server
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -16,10 +16,10 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
  * Fetches all Axiom-to-Finale SKU mappings ordered by Axiom Job Name.
  */
 export async function GET(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -48,10 +48,10 @@ export async function GET(req: NextRequest) {
  * Upserts (creates or updates) an Axiom-to-Finale SKU mapping.
  */
 export async function POST(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -112,10 +112,10 @@ export async function POST(req: NextRequest) {
  * Deletes an Axiom SKU mapping.
  */
 export async function DELETE(req: NextRequest) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }

@@ -9,10 +9,10 @@
  *
  * @author  Hermia
  * @created 2026-06-15
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 // ── Types ──────────────────────────────────────────────────────────────
 

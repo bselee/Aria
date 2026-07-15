@@ -15,7 +15,7 @@ vi.mock("@/lib/command-board/catalog", () => ({
 }));
 
 // Mock supabase so the registered-tools chain doesn't try a network call.
-vi.mock("@/lib/supabase", () => ({ createClient: () => null }));
+vi.mock("@/lib/db", () => ({ createClient: () => null }));
 
 import { __resetRegistryForTests, registerTool } from "./tool-registry";
 import { listIssueCapabilities } from "./issue-capabilities";

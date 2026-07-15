@@ -11,7 +11,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { FinaleClient } from "@/lib/finale/client";
 import {
     reconcileInvoiceToPO,
@@ -37,8 +37,8 @@ export async function POST(req: Request) {
         const body: ActionRequest = await req.json();
         const { action, activityLogId, dismissReason, rematchPoNumber } = body;
 
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 
@@ -139,7 +139,7 @@ export async function POST(req: Request) {
             );
 
             // Update the log entry with review status
-            await supabase.from("ap_activity_log").update({
+            await db.from("ap_activity_log").update({
                 reviewed_at: now,
                 reviewed_action: "approved",
                 action_taken: `Dashboard approved: ${applyResult.applied.length} applied, ${applyResult.skipped.length} skipped`,
@@ -172,7 +172,7 @@ export async function POST(req: Request) {
 
             // Write vendor_name to purchase_orders for future matching
             if (reconResult.vendorName && reconResult.orderId) {
-                await supabase.from("purchase_orders").upsert({
+                await db.from("purchase_orders").upsert({
                     po_number: reconResult.orderId,
                     vendor_name: reconResult.vendorName,
                     status: "open",
@@ -224,7 +224,7 @@ export async function POST(req: Request) {
 
         // ── PAUSE: Mark for research, no Finale changes ──
         if (action === "pause") {
-            await supabase.from("ap_activity_log").update({
+            await db.from("ap_activity_log").update({
                 reviewed_at: now,
                 reviewed_action: "paused",
             }).eq("id", activityLogId);
@@ -237,7 +237,7 @@ export async function POST(req: Request) {
 
         // ── DISMISS: Mark as dismissed with reason, no Finale changes ──
         if (action === "dismiss") {
-            await supabase.from("ap_activity_log").update({
+            await db.from("ap_activity_log").update({
                 reviewed_at: now,
                 reviewed_action: "dismissed",
                 dismiss_reason: dismissReason || null,
@@ -318,7 +318,7 @@ export async function POST(req: Request) {
             }
 
             // Update the log entry with new PO match — reset reviewed_at so user can act on it
-            await supabase.from("ap_activity_log").update({
+            await db.from("ap_activity_log").update({
                 reviewed_at: null,
                 reviewed_action: "re-matched",
                 email_subject: `Invoice ${metadata.invoiceNumber} → PO ${rematchPoNumber}`,
@@ -524,7 +524,7 @@ async function updateVendorProfile(
             }
         }
 
-        await supabase.from("vendor_profiles").upsert({
+        await db.from("vendor_profiles").upsert({
             vendor_name: vendorName,
             reconciliation_count: newReconCount,
             approval_count: newApprovalCount,

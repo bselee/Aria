@@ -7,7 +7,7 @@
 
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { extractPDF } from "../pdf/extractor";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
@@ -135,9 +135,9 @@ export class TrackingAgent {
     async processUnreadEmails(maxResults: number = 20): Promise<TrackingFoundResult[]> {
         console.log(`🕵️‍♂️ [TrackingAgent] Scanning queue for tracking numbers...`);
         try {
-            const supabase = createClient();
+            const db = createClient();
 
-            if (!supabase) {
+            if (!db) {
                 console.error("❌ [TrackingAgent] Supabase client unavailable — check env vars.");
                 return [];
             }
@@ -177,7 +177,7 @@ export class TrackingAgent {
             const foundTracking: TrackingFoundResult[] = [];
 
             for (const m of messages) {
-                await supabase.from('email_inbox_queue')
+                await db.from('email_inbox_queue')
                     .update({ processed_by_tracking: true })
                     .eq('id', m.id);
 

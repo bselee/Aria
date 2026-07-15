@@ -12,7 +12,7 @@
 
 import { getAuthenticatedClient } from "../gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { unifiedTextGeneration } from "./llm";
 
 type CommState =

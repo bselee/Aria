@@ -5,7 +5,7 @@ const { createClientMock, upsertMock } = vi.hoisted(() => ({
     upsertMock: vi.fn(),
 }));
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: createClientMock,
 }));
 

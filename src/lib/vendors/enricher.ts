@@ -1,6 +1,6 @@
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { getAnthropicClient } from "@/lib/anthropic";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { z } from "zod";
 
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! });
@@ -31,7 +31,7 @@ export interface VendorProfile {
 }
 
 export async function enrichVendorFromWeb(vendorId: string, vendorName: string) {
-    const supabase = createClient();
+    const db = createClient();
 
     // Search for vendor info
     const searchResults = await firecrawl.search(
@@ -81,7 +81,7 @@ Search results: ${(searchResults as any).data?.slice(0, 3).map((r: any) => r.des
     }
 
     // Update vendor in DB
-    await supabase.from("vendors").update({
+    await db.from("vendors").update({
         ...enrichedData,
         last_enriched_at: new Date().toISOString(),
     }).eq("id", vendorId);
@@ -91,7 +91,7 @@ Search results: ${(searchResults as any).data?.slice(0, 3).map((r: any) => r.des
 
 // Aggregate vendor stats from documents
 export async function computeVendorStats(vendorId: string) {
-    const supabase = createClient();
+    const db = createClient();
 
     const { data: invoices } = await supabase
         .from("invoices")
@@ -114,7 +114,7 @@ export async function computeVendorStats(vendorId: string) {
         new Date(b.invoice_date).getTime() - new Date(a.invoice_date).getTime()
     )[0]?.invoice_date;
 
-    await supabase.from("vendors").update({
+    await db.from("vendors").update({
         total_spend: totalSpend,
         document_count: invoices.length,
         average_payment_days: Math.round(avgPaymentDays),

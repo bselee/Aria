@@ -41,7 +41,7 @@ function buildQueryChain(returns: any) {
     return chain;
 }
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: vi.fn(() => ({
         from: vi.fn((table: string) => {
             if (table === "ap_activity_log") {

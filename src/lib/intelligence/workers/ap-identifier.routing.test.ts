@@ -86,7 +86,7 @@ vi.mock("@googleapis/gmail", () => ({
     })),
 }));
 
-vi.mock("../../supabase", () => ({
+vi.mock("../../db", () => ({
     createClient: vi.fn(() => ({
         from: mockSupabaseFrom,
         storage: { from: () => ({ upload: mockStorageUpload }) },

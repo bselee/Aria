@@ -6,7 +6,7 @@
  *          agent ownership with a clear command chain.
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase
+ * @deps    @/lib/db
  *
  * ARCHITECTURE:
  *
@@ -61,7 +61,7 @@
  *     5. report() — log decisions + telemetry
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Agent Registry ──────────────────────────────────────────────────────────
 
@@ -201,10 +201,10 @@ export class HermesOrchestrator {
         agent.lastHeartbeat = new Date().toISOString();
 
         // Persist to Supabase for cross-session tracking
-        const supabase = createClient();
-        if (supabase) {
+        const db = createClient();
+        if (db) {
             try {
-                await supabase.from("agent_heartbeats").upsert({
+                await db.from("agent_heartbeats").upsert({
                     agent_name: agentName,
                     heartbeat_at: agent.lastHeartbeat,
                     status,
@@ -252,8 +252,8 @@ export class HermesOrchestrator {
      * real-world agent health without waiting for a /hermia command.
      */
     async syncFromSupabase(): Promise<void> {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         try {
             const { data } = await supabase

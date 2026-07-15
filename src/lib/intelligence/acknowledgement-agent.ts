@@ -1,7 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { unifiedObjectGeneration } from "./llm";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { z } from "zod";
 import { recall } from "./memory";
 import { applyMessageLabelPolicy } from "./gmail-policy";
@@ -294,9 +294,9 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
         try {
             const auth = await getAuthenticatedClient(this.tokenIdentifier);
             const gmail = GmailApi({ version: "v1", auth });
-            const supabase = createClient();
+            const db = createClient();
 
-            if (!supabase) {
+            if (!db) {
                 console.error("❌ [Acknowledgement-Agent] Supabase client unavailable — check env vars.");
                 return;
             }
@@ -337,7 +337,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
 
             for (const m of messages) {
                 // Lock row for ACK agent so we don't process it twice if the script restarts mid-loop
-                await supabase.from('email_inbox_queue')
+                await db.from('email_inbox_queue')
                     .update({ processed_by_ack: true })
                     .eq('id', m.id);
 

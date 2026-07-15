@@ -10,7 +10,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  *
  * INBOX CONTEXT:
  *   ap@buildasoil.com → AP pipeline (classify → forward → Bill.com → reconcile)
@@ -29,7 +29,7 @@
  *     Alert if stuck >24h with no retry success.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { sendTelegramNotify } from "./telegram-notify";
 
 export interface StuckForwardAlert {

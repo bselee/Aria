@@ -15,7 +15,7 @@
  * POs ≥ 30 days overdue without tracking are logged as exceptions.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { VendorCommsAgent } from "@/lib/intelligence/vendor-comms-agent";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";

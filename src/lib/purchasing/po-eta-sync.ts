@@ -8,11 +8,11 @@
  *
  * @author  Hermia
  * @created 2026-06-18
- * @deps    @/lib/finale/client, @/lib/supabase, @/lib/purchasing/vendor-eta-profile
+ * @deps    @/lib/finale/client, @/lib/db, @/lib/purchasing/vendor-eta-profile
  * @env     None (uses existing Finale + Supabase clients)
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { finaleClient } from "@/lib/finale/client";
 
 /**
@@ -43,8 +43,8 @@ export async function syncPOETA(
         let bestEta: string | null = explicitDate ?? null;
 
         if (!bestEta) {
-            const supabase = createClient();
-            if (supabase) {
+            const db = createClient();
+            if (db) {
                 const { data: po } = await supabase
                     .from("purchase_orders")
                     .select("vendor_stated_eta, vendor_stated_eta_confidence, last_eta_update")
@@ -82,9 +82,9 @@ export async function syncPOETA(
 
             // Log to ap_activity_log for audit trail
             try {
-                const supabase = createClient();
-                if (supabase) {
-                    await supabase.from("ap_activity_log").insert({
+                const db = createClient();
+                if (db) {
+                    await db.from("ap_activity_log").insert({
                         intent: "ETA_SYNC",
                         action_taken: `Pushed dueDate ${bestEta} to Finale`,
                         metadata: {

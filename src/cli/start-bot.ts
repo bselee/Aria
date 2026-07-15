@@ -650,12 +650,12 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     setInterval(async () => {
         try {
             const { createClient } = await import('../lib/supabase');
-            const supabase = createClient();
-            if (!supabase) return;
+            const db = createClient();
+            if (!db) return;
 
             const maxCutoffMin = Math.max(...CRITICAL_CRONS.map(c => c.maxStaleMin));
             const cutoff = new Date(Date.now() - maxCutoffMin * 60 * 1000).toISOString();
-            const { data } = await supabase.from('cron_runs')
+            const { data } = await db.from('cron_runs')
                 .select('task_name, started_at')
                 .in('task_name', CRITICAL_CRONS.map(c => c.name))
                 .gte('started_at', cutoff)

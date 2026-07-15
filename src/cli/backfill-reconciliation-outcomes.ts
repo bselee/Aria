@@ -16,7 +16,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
 import { createHash } from "crypto";
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 
 // ─── CLI flags ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -116,8 +116,8 @@ async function main() {
   console.log(`Mode: ${DRY_RUN ? "DRY-RUN (no writes)" : "LIVE"}`);
   console.log(`Window: last ${DAYS_BACK} days\n`);
 
-  const supabase = createClient();
-  if (!supabase) {
+  const db = createClient();
+  if (!db) {
     console.error("ERROR: Supabase client unavailable — check env vars");
     process.exit(1);
   }

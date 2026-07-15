@@ -18,7 +18,7 @@ const mockGmailList = vi.fn();
 const mockGmailGet = vi.fn();
 
 // Mock dependencies
-vi.mock('../supabase', () => ({
+vi.mock('../db', () => ({
     createClient: vi.fn(() => ({
         from: vi.fn(() => ({
             select: vi.fn(() => ({

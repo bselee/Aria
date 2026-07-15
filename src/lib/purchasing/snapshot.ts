@@ -5,7 +5,7 @@
  * @created 2026-04-07
  */
 
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 import type { AssessedItem } from '@/cli/assess-purchases';
 
 export interface SnapshotRecord {

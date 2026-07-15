@@ -1,6 +1,6 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import * as agentTask from "./agent-task";
 import { Telegraf, Markup } from "telegraf";
 import { z } from "zod";
@@ -246,7 +246,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 auth = await getAuthenticatedClient("default");
             }
             const gmail = GmailApi({ version: "v1", auth });
-            const supabase = createClient();
+            const db = createClient();
 
             // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent.
             // Exclude bill.selee@buildasoil.com at the query level — ap@ is now the active inbox.
@@ -754,7 +754,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     if (part.body?.attachmentId) {
                         // Idempotency check — skip if this Gmail message was already processed
                         // Prevents double-forwarding to Bill.com on crash + re-poll scenarios
-                        if (supabase) {
+                        if (db) {
                             const { data: existing } = await supabase
                                 .from("documents")
                                 .select("id")
@@ -780,26 +780,27 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         if (base64Data) {
                             processedAnyPDF = true;
 
-                            // 1. Upload PDF to Supabase Storage BEFORE forwarding
+                            // 1. Upload PDF to local storage BEFORE forwarding
                             // Gmail API returns base64url encoding (URL-safe), not standard base64
                             const buffer = Buffer.from(base64Data, "base64url");
                             let pdfStoragePath: string | null = null;
-                            if (supabase) {
-                                try {
-                                    const safeFilename = m.id + "-" + part.filename!.replace(/[^a-zA-Z0-9.-]/g, "_");
-                                    const { data: uploadData, error: uploadErr } = await supabase.storage.from("vendor_invoices").upload(safeFilename, buffer, {
-                                        contentType: "application/pdf",
-                                        upsert: true
-                                    });
-                                    if (!uploadErr && uploadData) {
-                                        pdfStoragePath = uploadData.path;
-                                        console.log(`     ✅ PDF safely archived prior to Bill.com forward (${pdfStoragePath})`);
-                                    } else {
-                                        console.warn(`     ⚠️ PDF Storage upload failed:`, uploadErr?.message || 'Unknown error');
-                                    }
-                                } catch (e: any) {
-                                    console.warn(`     ⚠️ PDF Storage archival error:`, e.message);
+                            try {
+                                // Use local filesystem storage — no cloud Supabase dependency
+                                const { uploadPDF } = await import("../../storage/supabase-storage");
+                                const path = await uploadPDF(buffer, {
+                                    type: "INVOICE",
+                                    vendor: from,
+                                    date: new Date().toISOString().split("T")[0],
+                                    filename: part.filename || `invoice-${m.id}.pdf`,
+                                });
+                                if (path) {
+                                    pdfStoragePath = path;
+                                    console.log(`     ✅ PDF safely archived prior to Bill.com forward (${pdfStoragePath})`);
+                                } else {
+                                    console.warn(`     ⚠️ PDF Storage upload failed (local write returned empty path)`);
                                 }
+                            } catch (e: any) {
+                                console.warn(`     ⚠️ PDF Storage archival error:`, e.message);
                             }
 
                             // ── BOL/shipping document detection ───────────────────────────
@@ -823,7 +824,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             // ap-autonomous-poll for some vendors. Sender-based 48h dedup was removed
                             // 2026-06-18 (Hermia) — it suppressed legitimate same-vendor invoices
                             // (FedEx, Uline, Ferticell send multiple invoices in 48h) and no-ops when
-                            // Supabase is unavailable (the `if (supabase)` guard skips it entirely).
+                            // Supabase is unavailable (the `if (db)` guard skips it entirely).
                             const forwarded = await this.forwardToBillCom(gmail, subject, part.filename!, buffer);
                             if (!forwarded) {
                                 // Critical: Bill.com never received the invoice — alert Will immediately (bypasses business-hours gate)
@@ -1086,7 +1087,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // C2 FIX: Persist the document even on OCR failure so it's never silently lost.
                 // Without this, the email sits unread with zero audit trail in `documents`.
                 try {
-                    await supabase.from("documents").insert({
+                    await db.from("documents").insert({
                         type: "invoice",
                         status: "ocr_failed",
                         source: "email",
@@ -1118,7 +1119,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             if (!invoiceData.lineItems || invoiceData.lineItems.length === 0) {
                 // C2 FIX: Persist the document so zero-line-item failures have an audit trail.
                 try {
-                    await supabase.from("documents").insert({
+                    await db.from("documents").insert({
                         type: "invoice",
                         status: "ocr_failed",
                         source: "email",
@@ -1343,7 +1344,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             }
 
             // 3. Save to DB — audit trail and daily recap source
-            const { data: docData } = await supabase.from("documents").insert({
+            const { data: docData } = await db.from("documents").insert({
                 type: "invoice",
                 status: "PROCESSED",
                 source: "email",
@@ -1356,7 +1357,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 gmail_message_id: messageId || null,
             }).select("id").single();
 
-            await supabase.from("invoices").upsert({
+            await db.from("invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber,
@@ -1542,7 +1543,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     private async resolveVendorAlias(supabase: any, vendorName: string): Promise<string> {
-        if (!vendorName || !supabase) return vendorName;
+        if (!vendorName || !db) return vendorName;
         try {
             // 1. ILIKE case-handling fallback + trim
             const { data, error } = await supabase
@@ -1806,7 +1807,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             vendorName: result.vendorName,
                             orderId: result.orderId,
                         });
-                        const { data: pendingLog } = await supabase.from("ap_activity_log").insert({
+                        const { data: pendingLog } = await db.from("ap_activity_log").insert({
                             email_from: result.vendorName,
                             email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                             intent: "RECONCILIATION",
@@ -1843,7 +1844,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     // or fall back to a new row if the update fails.
                     if (pendingLogId) {
                         try {
-                            await supabase.from("ap_activity_log").update({
+                            await db.from("ap_activity_log").update({
                                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                                 // Both activity log and Telegram say the same plain English thing.
                                 action_taken: result.summary,
@@ -1866,7 +1867,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                     actual: fc.amount, verdict: fc.verdict, reason: fc.reason
                                 }))
                             ];
-                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
+                            await db.from("invoices").update({ status: newStatus, discrepancies })
                                 .eq("invoice_number", result.invoiceNumber)
                                 .ilike("vendor_name", `%${result.vendorName}%`);
                         } catch {
@@ -2143,7 +2144,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // otherwise generate it on the spot (no extra API calls needed).
             const reconciliationReport = result.report ?? null;
 
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: result.vendorName,
                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                 intent: "RECONCILIATION",
@@ -2179,7 +2180,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }))
             ];
 
-            await supabase.from("invoices").update({
+            await db.from("invoices").update({
                 status: newStatus,
                 discrepancies: discrepancies
             })
@@ -2210,7 +2211,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     ): Promise<void> {
         if (result.overallVerdict === "no_change") return;
 
-        const supabase = createClient();
+        const db = createClient();
         const hasDifferences = result.totalDollarImpact !== 0
             || result.priceChanges.some(pc => pc.verdict !== "no_change" && pc.verdict !== "no_match")
             || result.feeChanges.length > 0;
@@ -2229,7 +2230,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                         .eq("id", logId)
                         .single();
                     const existingMetadata = logRow?.metadata || {};
-                    await supabase.from("ap_activity_log").update({
+                    await db.from("ap_activity_log").update({
                         metadata: {
                             ...existingMetadata,
                             routine: true,
@@ -2332,9 +2333,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         metadata?: Record<string, any>,
         notifiedSlack: boolean = false
     ) {
-        if (!supabase) return;
+        if (!db) return;
         try {
-            await supabase.from("ap_activity_log").insert({
+            await db.from("ap_activity_log").insert({
                 email_from: emailFrom,
                 email_subject: emailSubject,
                 intent,
@@ -2356,8 +2357,8 @@ INVOICE - Standard vendor bill (may or may not have a PO).
      * rollout period. Trust but verify.
      */
     async sendDailyRecap() {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
         // Get today's activity from midnight Denver time (America/Denver, UTC-6/7).
         // Using UTC midnight would miss emails processed in the early Denver morning hours.

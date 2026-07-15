@@ -13,7 +13,7 @@
  *   ap_activity_log     reconciliation events (best-effort)
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 export type TimelineEvent = {
     at: string;                  // ISO timestamp
@@ -37,8 +37,8 @@ export type TimelineEvent = {
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ orderId: string }> }) {
     const { orderId } = await ctx.params;
-    const supabase = createClient();
-    if (!supabase) return NextResponse.json({ events: [], error: 'no supabase' }, { status: 500 });
+    const db = createClient();
+    if (!db) return NextResponse.json({ events: [], error: 'no supabase' }, { status: 500 });
 
     const events: TimelineEvent[] = [];
 

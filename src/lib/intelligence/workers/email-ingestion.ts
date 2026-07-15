@@ -1,6 +1,6 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
-import { createClient } from "../../supabase";
+import { createClient } from "../../db";
 
 /**
  * @file email-ingestion.ts
@@ -50,7 +50,7 @@ export class EmailIngestionWorker {
         try {
             const auth = await getAuthenticatedClient(this.tokenIdentifier);
             const gmail = GmailApi({ version: "v1", auth });
-            const supabase = createClient();
+            const db = createClient();
 
             const { data } = await gmail.users.messages.list({
                 userId: "me",
@@ -120,7 +120,7 @@ export class EmailIngestionWorker {
                 const bodyText = extractFullBodyText(payload);
 
                 // Insert into Supabase Queue
-                const { error } = await supabase.from('email_inbox_queue').insert({
+                const { error } = await db.from('email_inbox_queue').insert({
                     gmail_message_id: m.id!,
                     rfc_message_id: rfcMessageId,
                     thread_id: threadId,

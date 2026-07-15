@@ -1,5 +1,5 @@
 import { Octokit } from "@octokit/rest";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { getAnthropicClient } from "@/lib/anthropic";
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
@@ -40,7 +40,7 @@ export class GitHubClient {
 
     // Sync open issues related to documents
     async syncDocumentIssues() {
-        const supabase = createClient();
+        const db = createClient();
 
         const issues = await octokit.issues.listForRepo({
             owner: GITHUB_OWNER,
@@ -54,7 +54,7 @@ export class GitHubClient {
             const docIdMatch = issue.body?.match(/Document ID: `([^`]+)`/);
             if (!docIdMatch) return;
 
-            await supabase.from("documents").update({
+            await db.from("documents").update({
                 github_issue_state: issue.state,
                 github_last_synced: new Date().toISOString(),
             }).eq("id", docIdMatch[1]);

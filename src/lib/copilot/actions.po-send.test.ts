@@ -108,7 +108,7 @@ const {
     };
 });
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: createClientMock,
 }));
 

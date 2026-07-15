@@ -31,7 +31,7 @@ vi.mock("./memory", () => ({
     recall: recallMock,
 }));
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: () => ({
         from: (table: string) => {
             if (table !== "nightshift_queue") {

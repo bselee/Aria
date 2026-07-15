@@ -5,7 +5,7 @@
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  *
  * DESIGN:
  *   L1 (2 days): polite Gmail draft — handled by po-followup-watcher.ts
@@ -31,7 +31,7 @@
  *   6. Update followup_level = 'l3'
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { sendTelegramNotify, sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 
 /** Escalation windows (days since PO sent) */
@@ -71,8 +71,8 @@ function daysSince(iso: string | null | undefined): number | null {
  * Run L2/L3 escalation check. Called from cron.
  */
 export async function runVendorEscalation(): Promise<EscalationResult> {
-    const supabase = createClient();
-    if (!supabase) return { outcomes: [], l2Count: 0, l3Count: 0 };
+    const db = createClient();
+    if (!db) return { outcomes: [], l2Count: 0, l3Count: 0 };
 
     const outcomes: EscalationOutcome[] = [];
     const now = Date.now();
@@ -155,7 +155,7 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
             // We don't import VendorCommsAgent here to avoid circular deps
             // Instead, log the escalation and let the existing followup run pick it up
             // with the followup_level context
-            await supabase.from("purchase_orders").update({
+            await db.from("purchase_orders").update({
                 lifecycle_stage: "l2_escalated",
                 updated_at: new Date().toISOString(),
             }).eq("po_number", po.po_number);
@@ -185,7 +185,7 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
             alertLines.push(`\n*PO ${po.po_number}* — ${vendor} (${po.daysSinceDays}d)`);
             alertLines.push(`💰 ${amount} | No tracking, no ack`);
 
-            await supabase.from("purchase_orders").update({
+            await db.from("purchase_orders").update({
                 lifecycle_stage: "l3_escalated",
                 needs_human_review: true,
                 updated_at: new Date().toISOString(),

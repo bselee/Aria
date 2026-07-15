@@ -20,7 +20,7 @@
  *          deliberately surface to Will.
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { flowsForEvent, getFlow } from "./registry";
 import * as agentTask from "@/lib/intelligence/agent-task";
 import type {

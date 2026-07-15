@@ -20,7 +20,7 @@ import { ensureFinaleToolsRegistered } from "../lib/agents/register-finale-tools
 import { ensureGmailToolsRegistered } from "../lib/agents/register-gmail-tools";
 import { ensureMemoryToolsRegistered } from "../lib/agents/register-memory-tools";
 import { checkBudget } from "../lib/agents/budget";
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 
 async function main() {
     console.log("─── Aria stabilization smoke ───\n");

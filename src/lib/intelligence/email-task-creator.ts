@@ -5,10 +5,10 @@
  *          this creates a structured task visible in the dashboard TasksPanel.
  * @author  Hermia
  * @created 2026-05-29
- * @deps    @/lib/supabase, @/lib/intelligence/agent-task
+ * @deps    @/lib/db, @/lib/intelligence/agent-task
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import * as agentTask from "./agent-task";
 
 export interface EmailTaskInput {
@@ -36,8 +36,8 @@ export interface EmailTaskResult {
  * Searches email queues for matching emails to link the task to.
  */
 export async function createEmailTask(input: EmailTaskInput): Promise<EmailTaskResult> {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return { success: false, message: "Supabase unavailable" };
     }
 

@@ -1,7 +1,7 @@
 /**
- * @file    cache.ts
- * @purpose Shared Supabase query caching wrapper for dashboard API routes.
- *          Uses Next.js `unstable_cache` to prevent redundant Supabase reads
+ * @file    src/lib/storage/query-cache.ts
+ * @purpose Shared query caching wrapper for dashboard API routes.
+ *          Uses Next.js `unstable_cache` to prevent redundant reads
  *          on repeated page loads. Short TTL (30s default) keeps data fresh
  *          while eliminating the bulk of free-tier request volume from UI polls.
  *
@@ -29,7 +29,7 @@ const DEFAULT_TTL_S = 30;
  *
  * @example
  *   const data = await cachedQuery("vendor-insights", () =>
- *     supabase.from("vendor_profiles").select("*").eq("vendor_name", vendor).single()
+ *     db.from("vendor_profiles").select("*").eq("vendor_name", vendor).single()
  *   );
  */
 export async function cachedQuery<T>(

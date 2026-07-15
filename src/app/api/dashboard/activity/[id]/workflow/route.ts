@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 const VALID_PROCESS_STATES = new Set([
     "new",
@@ -18,8 +18,8 @@ async function getParams(context: RouteContext): Promise<{ id: string }> {
 }
 
 export async function PATCH(req: Request, context: RouteContext) {
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         return NextResponse.json({ error: "Supabase not configured" }, { status: 503 });
     }
 

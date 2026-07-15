@@ -45,7 +45,7 @@ vi.mock("../pdf/extractor", () => ({
     extractPDF: vi.fn().mockResolvedValue({ rawText: "" }),
 }));
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: vi.fn(() => ({
         from: (table: string) => {
             if (table === "email_inbox_queue") {

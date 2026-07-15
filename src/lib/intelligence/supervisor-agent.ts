@@ -6,7 +6,7 @@
  * @author Aria (Antigravity)
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { Telegraf } from "telegraf";
 import * as agentTask from "./agent-task";
 import { unifiedObjectGeneration } from "./llm";
@@ -35,8 +35,8 @@ export class SupervisorAgent {
      * the return value).
      */
     async reportAgentException(taskName: string, error: any): Promise<void> {
-        const supabase = createClient();
-        if (!supabase) {
+        const db = createClient();
+        if (!db) {
             console.warn(`[Supervisor-Agent] reportAgentException(${taskName}): supabase unavailable — exception dropped.`);
             return;
         }
@@ -156,9 +156,9 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
      */
     async supervise() {
         console.log(`🛡️ [Supervisor-Agent] Checking for recent agent exceptions...`);
-        const supabase = createClient();
+        const db = createClient();
 
-        if (!supabase) {
+        if (!db) {
             console.error("❌ [Supervisor-Agent] Supabase client unavailable — check env vars.");
             return;
         }
@@ -198,7 +198,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                         },
                     });
                     if (!rootCause.task_id) {
-                        await supabase.from('ops_agent_exceptions')
+                        await db.from('ops_agent_exceptions')
                             .update({ task_id: task.id })
                             .eq('id', rootCause.id);
                     }
@@ -214,7 +214,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                 if (remedy === "ESCALATE") {
                     await this.escalateToHuman(rootCause.agent_name, rootCause.error_message, rootCause.error_stack || "");
 
-                    await supabase.from('ops_agent_exceptions')
+                    await db.from('ops_agent_exceptions')
                         .update({ status: 'escalated', resolution_notes: 'Pushed to Telegram' })
                         .eq('id', rootCause.id);
 
@@ -238,7 +238,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                     // assuming the original agent didn't successfully lock the queue row or API state
                     // and will organically try again automatically on next tick.
                     // If we need explicit requeuing, we read `rootCause.context_data` here.
-                    await supabase.from('ops_agent_exceptions')
+                    await db.from('ops_agent_exceptions')
                         .update({ status: 'resolved', resolution_notes: 'Transient error, ignoring to allow organic retry.' })
                         .eq('id', rootCause.id);
 
@@ -258,7 +258,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
                     });
 
                 } else if (remedy === "IGNORE") {
-                    await supabase.from('ops_agent_exceptions')
+                    await db.from('ops_agent_exceptions')
                         .update({ status: 'ignored', resolution_notes: 'Noise pattern identified.' })
                         .eq('id', rootCause.id);
 

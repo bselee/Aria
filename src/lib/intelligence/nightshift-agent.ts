@@ -12,7 +12,7 @@
  * @created 2026-03-24
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { recall } from "./memory";
 import { getAnthropicClient } from "../anthropic";
 
@@ -137,10 +137,10 @@ export async function enqueueDefaultInboxInvoice(
     bodyText: string,
 ): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
-        await supabase.from("nightshift_queue").upsert(
+        await db.from("nightshift_queue").upsert(
             {
                 gmail_message_id: gmailMessageId,
                 task_type: "default_inbox_invoice",
@@ -167,10 +167,10 @@ export async function enqueueEmailClassification(
     sourceInbox = "ap",
 ): Promise<void> {
     try {
-        const supabase = createClient();
-        if (!supabase) return;
+        const db = createClient();
+        if (!db) return;
 
-        await supabase.from("nightshift_queue").upsert(
+        await db.from("nightshift_queue").upsert(
             {
                 gmail_message_id: gmailMessageId,
                 task_type: "email_classification",
@@ -195,8 +195,8 @@ export async function getPreClassification(
     gmailMessageId: string,
 ): Promise<NightshiftResult | null> {
     try {
-        const supabase = createClient();
-        if (!supabase) return null;
+        const db = createClient();
+        if (!db) return null;
 
         const { data, error } = await supabase
             .from("nightshift_queue")
@@ -233,8 +233,8 @@ export interface NightshiftLoopOpts {
 export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<void> {
     const { dryRun = false } = opts;
 
-    const supabase = createClient();
-    if (!supabase) {
+    const db = createClient();
+    if (!db) {
         console.warn("[nightshift] Supabase unavailable — skipping cycle");
         return;
     }
@@ -466,8 +466,8 @@ export interface NightshiftHandoff {
  */
 export async function generateMorningHandoff(): Promise<NightshiftHandoff | null> {
     try {
-        const supabase = createClient();
-        if (!supabase) return null;
+        const db = createClient();
+        if (!db) return null;
 
         const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
 
@@ -646,7 +646,7 @@ export async function generateMorningHandoff(): Promise<NightshiftHandoff | null
 
         // 4. Store handoff in Supabase for dashboard access
         try {
-            await supabase.from("nightshift_queue").upsert(
+            await db.from("nightshift_queue").upsert(
                 {
                     gmail_message_id: `handoff-${new Date().toISOString().slice(0, 10)}`,
                     task_type: "morning_handoff",

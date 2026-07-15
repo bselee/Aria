@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig({ path: '.env.local' });
-import { createClient } from '@/lib/supabase';
+import { createClient } from '@/lib/db';
 
 (async () => {
     const sb = createClient();

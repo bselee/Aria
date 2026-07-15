@@ -29,7 +29,7 @@ import {
 } from "./reconciler";
 import type { InvoiceData } from "../pdf/invoice-parser";
 
-vi.mock("../supabase", () => ({
+vi.mock("../db", () => ({
     createClient: createClientMock,
 }));
 

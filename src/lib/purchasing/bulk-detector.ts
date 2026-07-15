@@ -23,7 +23,7 @@
  * @env     FINALE_API_BASE, FINALE_ACCOUNT_PATH, FINALE_AUTH_HEADER
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Finale GraphQL shapes ────────────────────────────────────────────────────
 

@@ -10,10 +10,10 @@
  *
  * @author  Hermia
  * @created 2026-06-04
- * @deps    @/lib/supabase, @/lib/intelligence/telegram-notify
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 import { sendTelegramNotify } from "../intelligence/telegram-notify";
 import { isBusinessHours } from "../intelligence/alert-gate";
 

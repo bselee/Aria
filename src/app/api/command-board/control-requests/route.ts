@@ -11,7 +11,7 @@ import {
     createCommandBoardControlRequest,
     getCommandBoardControlRequests,
 } from "@/lib/command-board/service";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -27,7 +27,7 @@ const ALLOWED_TARGETS = new Set(["aria-bot", "watchdog", "all"]);
 export async function GET(req: NextRequest) {
     if (!createClient()) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -50,7 +50,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
     if (!createClient()) {
         return NextResponse.json(
-            { error: "supabase unavailable" },
+            { error: "database unavailable" },
             { status: 503, headers: NO_STORE },
         );
     }
@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
         });
         if (!created) {
             return NextResponse.json(
-                { error: "supabase unavailable" },
+                { error: "database unavailable" },
                 { status: 503, headers: NO_STORE },
             );
         }

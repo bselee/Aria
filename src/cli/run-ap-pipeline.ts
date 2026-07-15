@@ -9,7 +9,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { Telegraf, Markup } from "telegraf";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
-import { createClient } from "../lib/supabase";
+import { createClient } from "../lib/db";
 import { extractPDF } from "../lib/pdf/extractor";
 import { parseInvoice, InvoiceData } from "../lib/pdf/invoice-parser";
 import { FinaleClient } from "../lib/finale/client";
@@ -347,14 +347,14 @@ async function main() {
 
     // ── Step 4: Save to Supabase ──────────────────────────────────────────────
     console.log("5️⃣  Saving to Supabase...");
-    const supabase = createClient();
+    const db = createClient();
     let documentId: string | null = null;
 
-    if (!supabase) {
+    if (!db) {
         console.warn("   ⚠️ Supabase unavailable — skipping DB save");
     } else {
         try {
-            const { data: docData, error: docError } = await supabase.from("documents").insert({
+            const { data: docData, error: docError } = await db.from("documents").insert({
                 type: "invoice",
                 status: "PROCESSED",
                 source: "email",
@@ -372,7 +372,7 @@ async function main() {
                 console.error("   ❌ Document insert failed:", docError.message);
             }
 
-            const { error: invError } = await supabase.from("invoices").upsert({
+            const { error: invError } = await db.from("invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber || null,
@@ -506,8 +506,8 @@ async function main() {
                 if (applyResult.errors.length > 0) console.error(`      Errors: ${applyResult.errors.join(", ")}`);
 
                 // Full audit log to Supabase
-                if (supabase) {
-                    await supabase.from("ap_activity_log").insert({
+                if (db) {
+                    await db.from("ap_activity_log").insert({
                         email_from: invoiceData.vendorName,
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",
@@ -543,8 +543,8 @@ async function main() {
                 if (applyResult.errors.length > 0) console.error(`      Errors: ${applyResult.errors.join(", ")}`);
 
                 // Full audit log to Supabase
-                if (supabase) {
-                    await supabase.from("ap_activity_log").insert({
+                if (db) {
+                    await db.from("ap_activity_log").insert({
                         email_from: invoiceData.vendorName,
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",

@@ -16,11 +16,11 @@
  *
  * @author  Hermia
  * @created 2026-06-11
- * @deps    @/lib/supabase (purchase_orders, shipments tables)
+ * @deps    @/lib/db (purchase_orders, shipments tables)
  * @env     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 

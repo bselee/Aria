@@ -36,7 +36,7 @@ vi.mock("../../gmail/auth", () => ({
     getAuthenticatedClient: getAuthenticatedClientMock,
 }));
 
-vi.mock("../../supabase", () => ({
+vi.mock("../../db", () => ({
     createClient: createClientMock,
 }));
 

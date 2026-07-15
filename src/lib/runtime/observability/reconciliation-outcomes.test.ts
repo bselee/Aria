@@ -8,11 +8,11 @@ import { writeReconciliationOutcome } from "./reconciliation-outcomes";
 
 // ── Mock createClient ──────────────────────────────────────────────────────────
 
-vi.mock("@/lib/supabase", () => ({
+vi.mock("@/lib/db", () => ({
     createClient: vi.fn(),
 }));
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 const mockCreateClient = vi.mocked(createClient);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

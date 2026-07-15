@@ -15,7 +15,7 @@
  *          key — no pool management needed.
  */
 
-import { createClient } from "../supabase";
+import { createClient } from "../db";
 
 export interface PackSizeRecord {
     sku: string;

@@ -17,7 +17,7 @@
  * @created 2026-06-11
  */
 
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/db";
 import { FinaleClient } from "@/lib/finale/client";
 import { notifyViaTask } from "@/lib/intelligence/notify-via-task";
 import { runDrafterAgent, type DrafterAgentResult } from "@/lib/purchasing/drafter-agent";
@@ -57,7 +57,7 @@ async function computeStockoutCandidates(finale: FinaleClient): Promise<Stockout
 
         const runwayDays = item.runwayDays ?? (item.stockOnHand > 0 ? item.stockOnHand / dailyRate : 0);
         const adjustedRunway = item.adjustedRunwayDays ?? runwayDays;
-        const leadTime = item.leadTimeDays ?? 14;
+        const leadTime = item.leadTimeDays ?? 21;
         const margin = adjustedRunway - leadTime;
 
         if (margin > 14) continue;
