@@ -65,7 +65,7 @@ export async function PATCH(req: Request, context: RouteContext) {
         return NextResponse.json({ error: "no supported workflow fields" }, { status: 400 });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("ap_activity_log")
         .update(patch)
         .eq("id", id)
