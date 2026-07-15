@@ -132,16 +132,17 @@ export async function GET(req: NextRequest) {
                                 total: Number(inv.total || 0),
                                 lineItems: inv.raw_data?.lineItems || [],
                             });
-                            if (result.candidates.length > 0) {
-                                matchSuggestions.push({
-                                    invoiceId: inv.id,
-                                    invoiceNumber: inv.invoice_number,
-                                    vendorName: inv.vendor_name,
-                                    invoiceTotal: inv.total,
-                                    candidates: result.candidates.slice(0, 5),
-                                    autoApplyReady: result.autoApplyReady,
-                                });
-                            }
+                            // Always include the invoice, even with no auto-match candidates
+                            // so the operator can manually assign.
+                            matchSuggestions.push({
+                                invoiceId: inv.id,
+                                invoiceNumber: inv.invoice_number,
+                                vendorName: inv.vendor_name,
+                                invoiceDate: inv.invoice_date,
+                                invoiceTotal: inv.total,
+                                candidates: result.candidates.slice(0, 5),
+                                autoApplyReady: result.autoApplyReady ?? false,
+                            });
                         } catch { /* skip individual match failures */ }
                     }
                 }
