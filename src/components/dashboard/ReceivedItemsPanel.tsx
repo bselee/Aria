@@ -5,6 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
+import POFlowStepper from "./POFlowStepper";
+import type { POFlowStep } from "./POFlowStepper";
 
 type ReceivedPO = {
     orderId: string;
@@ -925,8 +927,8 @@ export default function ReceivedItemsPanel() {
                                                 ))}
                                             </div>
                                         )}
-                                        {/* ── PO Lifecycle State: next-action guidance ── */}
-                                        <div className="mt-2.5 pt-2 border-t border-zinc-800/50 flex flex-wrap items-center gap-2 bg-zinc-900/10 px-2.5 py-2 rounded">
+                                        {/* ── PO Lifecycle State: 3-step flow + action ── */}
+                                        <div className="mt-2.5 pt-2 border-t border-zinc-800/50 bg-zinc-900/10 px-2.5 py-2 rounded">
                                             {(() => {
                                                 const receiptStatus = getDynamicReceiptStatus(po);
                                                 const apLabel = apStatus?.label || "";
@@ -939,50 +941,114 @@ export default function ReceivedItemsPanel() {
                                                 const hasDiscrepancy = apLabel === "RECONCILED ±";
                                                 const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
 
-                                                // ── State classification ──
-                                                // Checks _reconciliation first (direct from API), falls back to apStatus
-                                                let state: { emoji: string; label: string; tone: string; action: string } | null = null;
+                                                // ── Build 3-step flow ──
+                                                // Step 1: Received (always done if we're in Receivings)
+                                                // Step 2: Invoice Matched
+                                                // Step 3: Complete PO
 
+                                                const steps: POFlowStep[] = [
+                                                    { label: "Received", emoji: "📦", state: "done" },
+                                                ];
+
+                                                // Determine Step 2 and Step 3 states
                                                 if (rec?.hasAutoApplied && rec?.matchedInvoice) {
-                                                    state = { emoji: "✅", label: "APPLIED", tone: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number} — $${rec.matchedInvoice.total?.toFixed(2)} applied to PO` };
+                                                    // Fully applied — all done
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done" });
+                                                    steps.push({ label: "Complete", emoji: "🔒", state: "done" });
                                                 } else if (rec?.hasPendingApproval && rec?.matchedInvoice) {
-                                                    state = { emoji: "🔍", label: "PENDING APPROVAL", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number}: $${rec.matchedInvoice.total?.toFixed(2)} vs PO $${po.total?.toLocaleString()} — review` };
+                                                    // Invoice matched, pending approval → need to complete
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done" });
+                                                    steps.push({
+                                                        label: "Complete", emoji: "🔒", state: "active",
+                                                        action: `Invoice ${rec.matchedInvoice.invoice_number}: $${rec.matchedInvoice.total?.toFixed(2)} vs PO $${po.total?.toLocaleString()}`,
+                                                        actionButton: {
+                                                            text: "Approve & Complete",
+                                                            onClick: () => approveReconciliation(po.orderId, rec!.matchedInvoice!.invoice_number),
+                                                            loading: approvingReconcile.has(po.orderId),
+                                                            tone: "warning",
+                                                        },
+                                                    });
                                                 } else if (rec?.matchedInvoice) {
-                                                    state = { emoji: "📋", label: "MATCHED", tone: "text-cyan-300 border-cyan-500/40 bg-cyan-500/10", action: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)} matched` };
-                                                } else if (rec) {
-                                                    state = { emoji: "📋", label: "AWAITING MATCH", tone: "text-zinc-400 border-zinc-600/40 bg-zinc-800/40", action: "No invoice matched yet" };
+                                                    // Invoice matched, no pending action → ready to complete
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done",
+                                                        action: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)}` });
+                                                    steps.push({
+                                                        label: "Complete", emoji: "🔒", state: "active",
+                                                        action: "Verify invoice matches PO qty & price, then complete",
+                                                        actionButton: {
+                                                            text: "Complete PO",
+                                                            onClick: () => toggleModifier(po.orderId, rec!.matchedInvoice!.invoice_number),
+                                                            tone: "success",
+                                                        },
+                                                    });
                                                 } else if (isComplete) {
-                                                    state = { emoji: "✅", label: "COMPLETE", tone: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", action: "PO closed — no action needed" };
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done" });
+                                                    steps.push({ label: "Complete", emoji: "🔒", state: "done" });
                                                 } else if (hasDiscrepancy && isReconciled) {
-                                                    state = { emoji: "⚠️", label: "RECONCILED ±", tone: "text-blue-400 border-blue-500/30 bg-blue-500/10", action: "Reconciled with pricing differences — verify final amounts" };
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done" });
+                                                    steps.push({
+                                                        label: "Complete", emoji: "🔒", state: "issue",
+                                                        action: "Reconciled with pricing differences — verify final amounts",
+                                                        actionButton: {
+                                                            text: "Review Diff",
+                                                            onClick: () => toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number),
+                                                            tone: "warning",
+                                                        },
+                                                    });
                                                 } else if (hasDiscrepancy) {
-                                                    state = { emoji: "⚠️", label: "PRICE DISCREPANCY", tone: "text-rose-300 border-rose-500/40 bg-rose-500/10", action: "Invoice $ differs from PO $ — resolve with vendor before closing" };
-                                                } else if (isPendingReview) {
-                                                    state = { emoji: "🔍", label: "MATCH INVOICE", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: "Invoice matched — review line items and approve reconciliation" };
-                                                } else if (isPartial && hasOpenQty) {
-                                                    state = { emoji: "🔄", label: "PARTIAL", tone: "text-amber-300 border-amber-500/40 bg-amber-500/10", action: "Partial receipt — backorder remains. No action until remaining arrives" };
+                                                    steps.push({
+                                                        label: "Invoice", emoji: "📄", state: "issue",
+                                                        action: "Invoice $ differs from PO $ — resolve with vendor",
+                                                        actionButton: {
+                                                            text: "Modify PO",
+                                                            onClick: () => toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number),
+                                                            tone: "danger",
+                                                        },
+                                                    });
+                                                    steps.push({ label: "Complete", emoji: "🔒", state: "pending" });
+                                                } else if (isPendingReview || isPartial) {
+                                                    // Invoice matched but needs review, OR partial receipt awaiting rest
+                                                    steps.push({
+                                                        label: "Invoice", emoji: "📄", state: isPendingReview ? "active" : "done",
+                                                        action: isPendingReview
+                                                            ? "Invoice matched — review line items and approve"
+                                                            : "Partial receipt — backorder remains",
+                                                        actionButton: isPendingReview ? {
+                                                            text: "Approve",
+                                                            onClick: () => approveReconciliation(po.orderId),
+                                                            loading: approvingReconcile.has(po.orderId),
+                                                            tone: "warning",
+                                                        } : undefined,
+                                                    });
+                                                    steps.push({ label: "Complete", emoji: "🔒", state: isPendingReview ? "active" : "pending" });
                                                 } else if (hasInvoice) {
-                                                    state = { emoji: "📋", label: "VERIFY RECEIPT", tone: "text-cyan-300 border-cyan-500/40 bg-cyan-500/10", action: "Received in full — verify invoice matches PO qty & price" };
+                                                    // Invoice exists but not in a known state → verify
+                                                    steps.push({ label: "Invoice", emoji: "📄", state: "done" });
+                                                    steps.push({
+                                                        label: "Complete", emoji: "🔒", state: "active",
+                                                        action: "Received in full — verify invoice matches PO qty & price",
+                                                        actionButton: {
+                                                            text: "Verify & Complete",
+                                                            onClick: () => toggleModifier(po.orderId),
+                                                            tone: "success",
+                                                        },
+                                                    });
                                                 } else {
-                                                    state = { emoji: "📋", label: "RECEIVED", tone: "text-zinc-400 border-zinc-600/40 bg-zinc-800/40", action: "Receipt recorded — awaiting invoice match" };
+                                                    // No invoice yet
+                                                    steps.push({
+                                                        label: "Invoice", emoji: "📄", state: "active",
+                                                        action: "Receipt recorded — awaiting invoice match",
+                                                    });
+                                                    steps.push({ label: "Complete", emoji: "🔒", state: "pending" });
                                                 }
 
                                                 return (
                                                     <>
-                                                        {/* Left: State badge only (action text below) */}
-                                                                                                                <div className="flex items-center gap-2 shrink-0">
-                                                                                                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${state.tone}`} title={state.action}>
-                                                                                                                        {state.emoji} {state.label}
-                                                                                                                    </span>
-                                                                                                                </div>
-                                                                                                                {/* Prominent next-action text line */}
-                                                                                                                <div className="w-full mt-1.5">
-                                                                                                                    <span className="text-[11px] font-mono px-2 py-1 rounded block bg-zinc-800/50 border border-zinc-700/40 text-zinc-300 leading-relaxed">
-                                                                                                                        {state.action}
-                                                                                                                    </span>
-                                                                                                                </div>
+                                                        <div className="w-full">
+                                                            <POFlowStepper steps={steps} compact />
+                                                        </div>
 
-                                                                                                                {/* Expanded approval card — shows exactly what is being approved */}
+                                                        {/* Expanded approval card — shows exactly what's being approved */}
                                                         {rec?.hasPendingApproval && rec?.matchedInvoice && (
                                                             <div className="mt-2 w-full bg-amber-500/5 border border-amber-500/20 rounded px-2.5 py-2">
                                                                 <div className="text-[10px] font-mono text-amber-300/80 mb-1">Invoice {rec.matchedInvoice.invoice_number} from {po.supplier}</div>
@@ -1001,84 +1067,12 @@ export default function ReceivedItemsPanel() {
                                                                         {rec.matchedInvoice.total > po.total ? '+' : ''}{Math.abs(rec.matchedInvoice.total - po.total).toFixed(2)} vs PO total {po.total}
                                                                     </div>
                                                                 )}
-                                                                <button
-                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId, rec!.matchedInvoice!.invoice_number); }}
-                                                                    disabled={approvingReconcile.has(po.orderId)}
-                                                                    className={`mt-2 w-full text-center text-[11px] font-mono font-semibold px-2 py-1 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait bg-amber-500/10 border-amber-500/30 text-amber-400/50' : 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'}`}
-                                                                >
-                                                                    {approvingReconcile.has(po.orderId) ? 'Applying...' : 'Approve & Apply to Finale'}
-                                                                </button>
                                                             </div>
                                                         )}
-
-                                                        {/* Right: Verification badges + Modify PO */}
-                                                                <div className="flex-1" />
-                                                                <div className="flex flex-wrap items-center gap-1.5 text-[9px] font-mono shrink-0">
-                                                                    {po.items.some(i => (i.receivedQuantity ?? 0) > 0) && (
-                                                                        <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-                                                                            <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
-                                                                            {po.items.reduce((s, i) => s + (i.receivedQuantity ?? 0), 0)} units rcvd
-                                                                        </span>
-                                                                    )}
-                                                                    {isPartial && hasOpenQty && (
-                                                                        <span className="text-amber-300/80 px-1 py-0.5 rounded border border-amber-500/20 bg-amber-500/5">
-                                                                            {po.items.reduce((s, i) => s + (i.openQuantity ?? 0), 0)} open
-                                                                        </span>
-                                                                    )}
-                                                                    {hasInvoice && !isPendingReview && !hasDiscrepancy && (
-                                                                        <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-                                                                            <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
-                                                                            Invoice Matched
-                                                                        </span>
-                                                                    )}
-                                                                    {isPendingReview && apStatus && (
-                                                                        <button
-                                                                            onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
-                                                                            disabled={approvingReconcile.has(po.orderId)}
-                                                                            className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
-                                                                            title="Approve reconciliation"
-                                                                        >
-                                                                            {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
-                                                                        </button>
-                                                                    )}
-                                                                    {rec?.hasPendingApproval && !apStatus && (
-                                                                        <button
-                                                                            onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
-                                                                            disabled={approvingReconcile.has(po.orderId)}
-                                                                            className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors text-amber-300 border-amber-500/40 bg-amber-500/10 ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'}`}
-                                                                            title="Approve reconciliation"
-                                                                        >
-                                                                            {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
-                                                                        </button>
-                                                                    )}
-                                                                    {hasDiscrepancy && (
-                                                                        <>
-                                                                            <span className="flex items-center gap-1 text-rose-300/80 px-1 py-0.5 rounded border border-rose-500/20 bg-rose-500/5">
-                                                                                ⚠️ Price mismatch
-                                                                            </span>
-                                                                            <button
-                                                                                onClick={e => { e.stopPropagation(); toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number); }}
-                                                                                className="px-1.5 py-0.5 rounded border border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 transition-colors cursor-pointer text-[10px] font-mono"
-                                                                                title="Adjust PO line items and freight to match invoice"
-                                                                            >
-                                                                                Modify PO
-                                                                            </button>
-                                                                        </>
-                                                                    )}
-                                                                    {isReconciled && !hasDiscrepancy && rec?.matchedInvoice && (
-                                                                        <button
-                                                                            onClick={e => { e.stopPropagation(); toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number); }}
-                                                                            className="px-1.5 py-0.5 rounded border border-zinc-600/40 bg-zinc-800/40 text-zinc-400 hover:bg-zinc-700/40 transition-colors cursor-pointer text-[10px] font-mono"
-                                                                            title="Review PO-invoice details"
-                                                                        >
-                                                                            Review
-                                                                        </button>
-                                                                    )}
-                                                                </div>
-                                                            </>
-                                                        );
-                                                        })()}
-                                                        </div>
+                                                    </>
+                                                );
+                                            })()}
+                                        </div>
 
                                                         {/* ── PO Modifier Inline Expansion ── */}
                                                         {modifyingPO.has(po.orderId) && (() => {
