@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import { MessageSquare, Radio, Bot, Send, Loader2, Plus, Paperclip, FolderPlus, X, Zap, ChevronDown } from "lucide-react";
 
 type ChatLog = {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import { TrendingDown, ChevronDown } from "lucide-react";
 
 type ComponentRisk = {

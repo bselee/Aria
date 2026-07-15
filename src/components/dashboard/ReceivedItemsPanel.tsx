@@ -3,7 +3,7 @@
 import React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 
 type ReceivedPO = {

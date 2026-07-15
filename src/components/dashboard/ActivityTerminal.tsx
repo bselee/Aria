@@ -9,7 +9,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import {
     getActivityIntentLabel,

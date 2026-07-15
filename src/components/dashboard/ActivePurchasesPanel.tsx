@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ListChecks, RefreshCw, ChevronDown, ExternalLink, X, AlertCircle, Truck } from "lucide-react";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import { POStepper } from "./POStepper";
 
 type AtRiskInfo = { severity: "at_risk" | "soon_at_risk"; worstDaysShort: number };

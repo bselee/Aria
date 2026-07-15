@@ -12,7 +12,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { createBrowserClient } from "@/lib/supabase";
+import { createClient as createBrowserClient } from "@/lib/db";
 import {
     ExternalLink, FileText, CheckCircle2, AlertCircle, Trash2,
     Webhook, BotMessageSquare, ChevronDown, ChevronRight,
