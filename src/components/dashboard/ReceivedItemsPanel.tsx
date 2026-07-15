@@ -38,7 +38,7 @@ type ReceivedPO = {
         outcomes: Array<{ outcome: string; created_at: string; resolved_at: string | null }>;
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string } | null;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null } | null;
     };
 };
 
@@ -811,8 +811,6 @@ export default function ReceivedItemsPanel() {
                                 return (
                                     <div
                                         key={po.orderId}
-                                        onMouseEnter={() => lifecycle.setFocus({ source: "rcv", vendorName: po.supplier, orderId: po.orderId, productIds: poProductIds })}
-                                        onMouseLeave={lifecycle.clearFocus}
                                         onClick={(e) => {
                                             const target = e.target as HTMLElement;
                                             if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
@@ -1067,6 +1065,45 @@ export default function ReceivedItemsPanel() {
                                                                         {rec.matchedInvoice.total > po.total ? '+' : ''}{Math.abs(rec.matchedInvoice.total - po.total).toFixed(2)} vs PO total {po.total}
                                                                     </div>
                                                                 )}
+                                                            </div>
+                                                        )}
+
+                                                        {/* ── Document Reference Links ── */}
+                                                        {rec?.matchedInvoice && (
+                                                            <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] font-mono">
+                                                                <span className="text-zinc-600">📎</span>
+                                                                <span className="text-zinc-500">{rec.matchedInvoice.invoice_number}</span>
+                                                                {rec.matchedInvoice.pdf_storage_path && (
+                                                                    <a
+                                                                        href={`/api/storage/invoice-pdf?id=${encodeURIComponent(rec.matchedInvoice.invoice_number)}`}
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                        onClick={e => e.stopPropagation()}
+                                                                        className="text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30"
+                                                                    >
+                                                                        View Invoice PDF
+                                                                    </a>
+                                                                )}
+                                                                {rec.matchedInvoice.source_ref && (
+                                                                    <a
+                                                                        href={`https://mail.google.com/mail/u/0/#inbox/${rec.matchedInvoice.source_ref}`}
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                        onClick={e => e.stopPropagation()}
+                                                                        className="text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30"
+                                                                    >
+                                                                        View in Gmail
+                                                                    </a>
+                                                                )}
+                                                                <a
+                                                                    href={po.finaleUrl}
+                                                                    target="_blank"
+                                                                    rel="noopener noreferrer"
+                                                                    onClick={e => e.stopPropagation()}
+                                                                    className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-500/30"
+                                                                >
+                                                                    View PO in Finale
+                                                                </a>
                                                             </div>
                                                         )}
                                                     </>
