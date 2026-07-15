@@ -417,7 +417,7 @@ defineJob({
 // Invoice→PO matching depends on a complete PO mirror.
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
-    name: "po-sync",
+    name: "po-purchase-sync",
     schedule: "0 */2 * * *",
     onFail: "telegram-will",
     description: "Sync purchase_orders from Finale (every 2h) — foundation for invoice→PO matching.",

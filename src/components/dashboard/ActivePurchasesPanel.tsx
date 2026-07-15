@@ -641,7 +641,7 @@ export default function ActivePurchasesPanel() {
                             </button>
                         </div>
                     )}
-                                        {/* ── Aggregate Status Banner ── */}
+                    {/* ── Aggregate Status Banner ── */}
                                         {!loading && !error && purchases.length > 0 && (
                                             <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-900/30 flex flex-wrap items-center gap-x-2 gap-y-1">
                                                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
