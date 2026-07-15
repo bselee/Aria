@@ -14,6 +14,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 
 export function getDenverWeekStart(date: Date): string {
@@ -187,6 +188,60 @@ export async function POST(req: NextRequest) {
         const body = await req.json();
         const { action } = body;
 
+        if (action === 'approve_reconciliation') {
+            const { orderId, invoiceId } = body;
+            if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+
+            const sb = createClient();
+            if (!sb) return NextResponse.json({ error: 'DB unavailable' }, { status: 500 });
+
+            const now = new Date().toISOString();
+
+            // Update ap_pending_approvals
+            if (invoiceId) {
+                await sb
+                    .from('ap_pending_approvals')
+                    .update({ status: 'approved', resolved_at: now })
+                    .eq('order_id', orderId)
+                    .eq('invoice_number', invoiceId);
+            } else {
+                await sb
+                    .from('ap_pending_approvals')
+                    .update({ status: 'approved', resolved_at: now })
+                    .eq('order_id', orderId);
+            }
+
+            // Update reconciliation_outcomes
+            await sb
+                .from('reconciliation_outcomes')
+                .update({ outcome: 'approved', resolved_at: now })
+                .eq('po_id', orderId)
+                .is('resolved_at', null);
+
+            // Update invoices status
+            await sb
+                .from('invoices')
+                .update({ status: 'reconciled', updated_at: now })
+                .eq('po_number', orderId);
+
+            // Update vendor_invoices status
+            await sb
+                .from('vendor_invoices')
+                .update({ status: 'reconciled', updated_at: now })
+                .eq('po_number', orderId);
+
+            // Transition lifecycle state
+            const { transitionLifecycleState } = await import('@/lib/purchasing/po-lifecycle');
+            await transitionLifecycleState(
+                orderId,
+                'RECONCILED',
+                'dashboard-receivings',
+                { invoiceId: invoiceId || null, approvedAt: now },
+            );
+
+            return NextResponse.json({ ok: true, orderId, reconciled: true });
+        }
+
         if (action === 'complete_po') {
             const { orderId, vendorName, hadFreightOnPO, invoiceFreight, freightMatched } = body;
             if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
@@ -225,6 +280,8 @@ export async function POST(req: NextRequest) {
                 .from('vendor_invoices')
                 .update({ po_number: poNumber })
                 .eq('id', invoiceId);
+
+            await transitionLifecycleState(poNumber, 'INVOICED', 'dashboard-receivings', { invoiceId });
 
             return NextResponse.json({ matched: true, invoiceId, poNumber });
         }

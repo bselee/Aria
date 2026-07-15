@@ -90,6 +90,17 @@ export async function POST(req: Request) {
 
             if (error) throw error;
 
+            // Transition lifecycle state machine
+            try {
+                const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                await transitionLifecycleState(orderId, "SENT", "dashboard-active-purchases", {
+                    source: "manual",
+                    verifiedAt: now,
+                });
+            } catch (tlErr: any) {
+                console.warn(`[active-purchases] Lifecycle transition failed for ${orderId}:`, tlErr.message);
+            }
+
             return NextResponse.json({
                 ok: true,
                 orderId,
@@ -443,6 +454,119 @@ export async function POST(req: Request) {
             if (poErr) throw poErr;
 
             return NextResponse.json({ ok: true, orderId, applied: !!approval?.reconciliation_result });
+        }
+
+        // Action 7b: Resend PO Email — re-sends the PO to the vendor via Gmail
+        if (action === "resend_po_email") {
+            // Fetch PO details from Finale to get vendor email
+            const finale = new FinaleClient();
+            let vendorEmail = "";
+
+            // Try to get vendor email from purchase_orders or vendor_profiles
+            try {
+                const { data: poData } = await db
+                    .from("purchase_orders")
+                    .select("vendor_email, vendor_name, po_sent_to_email")
+                    .eq("po_number", orderId)
+                    .maybeSingle();
+
+                vendorEmail = poData?.po_sent_to_email || poData?.vendor_email || "";
+
+                // If no email on the PO, look up from vendor_profiles
+                if (!vendorEmail && poData?.vendor_name) {
+                    const { data: vp } = await db
+                        .from("vendor_profiles")
+                        .select("orders_email")
+                        .ilike("vendor_name", `%${poData.vendor_name.split(/\s+/).find((w: string) => w.length > 3) || poData.vendor_name}%`)
+                        .maybeSingle();
+                    vendorEmail = vp?.orders_email || "";
+                }
+            } catch (e) {
+                console.warn("[resend_po_email] Could not look up vendor email:", e);
+            }
+
+            if (!vendorEmail) {
+                return NextResponse.json({ error: "No vendor email found for this PO" }, { status: 400 });
+            }
+
+            let gmailResult: any = null;
+            try {
+                const { sendGmailPdfEmail } = await import("@/lib/gmail/send-email");
+                const { renderPurchaseOrderPdf } = await import("@/lib/purchasing/po-email-pdf");
+
+                // Fetch PO details to build the email
+                const poDetails = await finale.getOrderDetails(orderId);
+                const review = {
+                    orderId,
+                    vendorName: poDetails?.supplierName || poDetails?.vendorName || "",
+                    orderDate: poDetails?.orderDate || "",
+                    total: poDetails?.totalAmount || 0,
+                    items: (poDetails?.orderItemList || []).map((item: any) => ({
+                        productId: item.productId,
+                        productName: item.internalName || item.description || "",
+                        quantity: item.quantity,
+                        unitPrice: item.unitPrice,
+                    })),
+                    finaleUrl: poDetails?.orderUrl || "",
+                    vendorPartyId: "",
+                };
+
+                const pdfBuffer = await renderPurchaseOrderPdf(review);
+
+                const { subject, body } = await (async () => {
+                    const { generatePOEmailBody } = await import("@/lib/purchasing/po-sender");
+                    return generatePOEmailBody(review);
+                })();
+
+                gmailResult = await sendGmailPdfEmail({
+                    to: vendorEmail,
+                    cc: "bill.selee@buildasoil.com",
+                    subject,
+                    body,
+                    pdfBuffer,
+                    pdfFilename: `BuildASoil-PO-${orderId}.pdf`,
+                });
+
+                // Log the send
+                await db.from("po_sends").insert({
+                    po_number: orderId,
+                    sent_at: now,
+                    sent_to_email: vendorEmail,
+                    triggered_by: "dashboard-resend",
+                    gmail_message_id: gmailResult.messageId,
+                    gmail_thread_id: gmailResult.threadId,
+                    created_at: now,
+                });
+
+                // Update purchase_orders tracking
+                await db.from("purchase_orders").upsert({
+                    po_number: orderId,
+                    po_sent_verified_at: now,
+                    po_sent_verified_source: "dashboard-resend",
+                    updated_at: now,
+                }, { onConflict: "po_number" });
+
+                // Transition lifecycle state
+                try {
+                    const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                    await transitionLifecycleState(orderId, "SENT", "dashboard-resend", {
+                        source: "resend_po_email",
+                        resentAt: now,
+                    });
+                } catch (tlErr: any) {
+                    console.warn(`[resend_po_email] Lifecycle transition failed:`, tlErr.message);
+                }
+            } catch (sendErr: any) {
+                console.error("[resend_po_email] Failed to resend:", sendErr);
+                return NextResponse.json({ error: `Failed to resend: ${sendErr.message}` }, { status: 500 });
+            }
+
+            return NextResponse.json({
+                ok: true,
+                orderId,
+                sentTo: vendorEmail,
+                gmailMessageId: gmailResult?.messageId || null,
+            });
         }
 
         // Action 7: Close stale PO — mark lifecycle as closed_stale without cancelling in Finale

@@ -20,6 +20,7 @@
  */
 
 import { createClient } from "@/lib/db";
+import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -251,6 +252,18 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                 .from("vendor_invoices")
                 .update({ po_number: result.bestMatch.orderId })
                 .eq("id", inv.id);
+
+            await transitionLifecycleState(
+                result.bestMatch.orderId,
+                'INVOICED',
+                'invoice-po-matcher',
+                {
+                    invoiceId: inv.id,
+                    invoiceNumber: inv.invoice_number,
+                    score: result.bestMatch.score,
+                    reasons: result.bestMatch.reasons,
+                }
+            );
 
             autoMatched.push({
                 invoiceId: inv.id,

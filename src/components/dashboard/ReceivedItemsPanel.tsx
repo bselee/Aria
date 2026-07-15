@@ -197,6 +197,20 @@ export default function ReceivedItemsPanel() {
     const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
     /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
     const knownReceiptIdsRef = useRef<Set<string>>(new Set());
+    /** PO modification state: orderId → expanded & diff data */
+    const [modifyingPO, setModifyingPO] = useState<Map<string, {
+        loading: boolean;
+        diff?: any;
+        error?: string;
+        saving?: boolean;
+    }>>(new Map());
+    const [modifySuccess, setModifySuccess] = useState<string | null>(null);
+    /** Unmatched POs check state */
+    const [unmatchedData, setUnmatchedData] = useState<{
+        unmatchedPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string }>;
+        unreconciledPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string; lifecycleState: string }>;
+    } | null>(null);
+    const [unmatchedLoading, setUnmatchedLoading] = useState(false);
 
     async function handleMatchInvoice(invoiceId: string, poNumber: string) {
         try {
@@ -256,6 +270,149 @@ export default function ReceivedItemsPanel() {
                 next.delete(orderId);
                 return next;
             });
+        }
+    }
+
+    /** Load PO-invoice diff from the po-modify API and expand the modifier UI. */
+    async function loadPOInvoiceDiff(orderId: string, invoiceId?: string) {
+        setModifyingPO(prev => {
+            const next = new Map(prev);
+            next.set(orderId, { loading: true });
+            return next;
+        });
+
+        try {
+            const params = new URLSearchParams({ orderId });
+            if (invoiceId) params.set("invoiceId", invoiceId);
+            const res = await fetch(`/api/dashboard/po-modify?${params}`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+            const data = await res.json();
+
+            setModifyingPO(prev => {
+                const next = new Map(prev);
+                next.set(orderId, { loading: false, diff: data.diff, error: undefined });
+                return next;
+            });
+        } catch (e: any) {
+            setModifyingPO(prev => {
+                const next = new Map(prev);
+                next.set(orderId, { loading: false, error: e.message });
+                return next;
+            });
+        }
+    }
+
+    /** Apply PO modifications from the modifier UI. */
+    async function applyPOInvoiceModification(orderId: string, adjustments: any[], freightAdjustment?: number | null) {
+        setModifyingPO(prev => {
+            const next = new Map(prev);
+            const existing = next.get(orderId) || { loading: false };
+            next.set(orderId, { ...existing, saving: true });
+            return next;
+        });
+        setModifySuccess(null);
+
+        try {
+            // Find invoiceId from the invoice number in diff data
+            const state = modifyingPO.get(orderId);
+            let invoiceId: string | undefined;
+            if (state?.diff?.invoiceNumber) {
+                // Look up the first matching invoice from PO's reconciliation data
+                const po = pos.find(p => p.orderId === orderId);
+                const inv = po?._reconciliation?.invoices?.find(
+                    i => i.invoice_number === state.diff.invoiceNumber,
+                );
+                if (inv) invoiceId = inv.invoice_number;
+            }
+
+            const payload: any = {
+                orderId,
+                invoiceId,
+                adjustments,
+                freightAdjustment: freightAdjustment ?? null,
+                notes: "Manual adjustment from Receivings panel",
+            };
+
+            const res = await fetch("/api/dashboard/po-modify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+
+            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+            const result = await res.json();
+
+            if (result.success) {
+                setModifySuccess(`PO ${orderId} modified: ${result.adjustmentsApplied} line(s) adjusted${result.freightApplied ? ", freight updated" : ""}`);
+                // Close the modifier
+                setModifyingPO(prev => {
+                    const next = new Map(prev);
+                    next.delete(orderId);
+                    return next;
+                });
+                // Refresh after a moment
+                setTimeout(() => fetchReceivings(true), 1500);
+            } else {
+                throw new Error(result.errors?.join("; ") || "Modification failed");
+            }
+        } catch (e: any) {
+            setModifyingPO(prev => {
+                const next = new Map(prev);
+                const existing = next.get(orderId) || { loading: false };
+                next.set(orderId, { ...existing, saving: false, error: e.message });
+                return next;
+            });
+        }
+    }
+
+    // ── Resend PO email ─────────────────────────────────────────────────────
+    async function resendPOEmail(orderId: string) {
+        try {
+            const res = await fetch("/api/dashboard/active-purchases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "resend_po_email", orderId }),
+            });
+            if (!res.ok) throw new Error(await res.text());
+            setModifySuccess(`PO ${orderId} email re-sent`);
+        } catch (e: any) {
+            setError(`Resend failed: ${e.message}`);
+        }
+    }
+
+    /** Toggle the PO modifier UI open/closed for a given orderId. */
+    function toggleModifier(orderId: string, invoiceId?: string) {
+        if (modifyingPO.has(orderId)) {
+            setModifyingPO(prev => {
+                const next = new Map(prev);
+                next.delete(orderId);
+                return next;
+            });
+        } else {
+            loadPOInvoiceDiff(orderId, invoiceId);
+        }
+    }
+
+    /** Check for POs without matched invoices. */
+    async function checkUnmatchedPOs() {
+        setUnmatchedLoading(true);
+        try {
+            const res = await fetch("/api/dashboard/po-modify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "check_unmatched" }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            setUnmatchedData(data);
+        } catch (e: any) {
+            console.error("Failed to check unmatched POs:", e);
+            setUnmatchedData({
+                unmatchedPos: [],
+                unreconciledPos: [],
+            });
+        } finally {
+            setUnmatchedLoading(false);
         }
     }
 
@@ -428,6 +585,13 @@ export default function ReceivedItemsPanel() {
 
             {!isCollapsed && (
                 <>
+                    {modifySuccess && (
+                        <div className="px-4 py-2 border-b border-emerald-500/30 bg-emerald-500/10 text-[11px] font-mono text-emerald-400 flex items-center gap-2">
+                            <span>✅</span>
+                            <span className="flex-1">{modifySuccess}</span>
+                            <button onClick={() => setModifySuccess(null)} className="text-emerald-400/50 hover:text-emerald-300">✕</button>
+                        </div>
+                    )}
                     {loading ? (
                         <div className="px-4 py-2 space-y-2.5">
                             {[1, 2, 3].map(i => (
@@ -514,6 +678,57 @@ export default function ReceivedItemsPanel() {
                                     })}
                                 </div>
                             )}
+
+                            {/* ── Unmatched POs Check ── */}
+                            <div className="border-b border-zinc-800/40">
+                                <div className="px-4 py-2 flex items-center gap-2">
+                                    <span className="text-[10px] font-mono text-zinc-500">
+                                        {unmatchedData
+                                            ? `${unmatchedData.unmatchedPos.length + unmatchedData.unreconciledPos.length} POs need review`
+                                            : `PO-invoice match status unknown`}
+                                    </span>
+                                    <div className="flex-1" />
+                                    <button
+                                        onClick={e => { e.stopPropagation(); checkUnmatchedPOs(); }}
+                                        disabled={unmatchedLoading}
+                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700/40 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors disabled:opacity-40"
+                                    >
+                                        {unmatchedLoading ? "checking..." : "Check Match Status"}
+                                    </button>
+                                </div>
+                                {unmatchedData && (unmatchedData.unmatchedPos.length > 0 || unmatchedData.unreconciledPos.length > 0) && (
+                                    <div className="px-4 py-1.5 space-y-1 pb-2">
+                                        {unmatchedData.unmatchedPos.map(po => (
+                                            <div key={`u-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-rose-300">
+                                                <span className="w-1 h-1 rounded-full bg-rose-500 shrink-0" />
+                                                <span className="font-semibold">{po.orderId}</span>
+                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
+                                                <span className="text-zinc-600">· no invoice</span>
+                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
+                                            </div>
+                                        ))}
+                                        {unmatchedData.unreconciledPos.slice(0, 10).map(po => (
+                                            <div key={`r-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-amber-300">
+                                                <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
+                                                <span className="font-semibold">{po.orderId}</span>
+                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
+                                                <span className="text-zinc-600">· {po.lifecycleState || 'unknown'}</span>
+                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
+                                            </div>
+                                        ))}
+                                        {(unmatchedData.unreconciledPos.length > 10) && (
+                                            <div className="text-[10px] font-mono text-zinc-600 pl-3">
+                                                +{unmatchedData.unreconciledPos.length - 10} more
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                                {unmatchedData && unmatchedData.unmatchedPos.length === 0 && unmatchedData.unreconciledPos.length === 0 && (
+                                    <div className="px-4 py-1.5 text-[10px] font-mono text-emerald-400/70 pb-2">
+                                        ✅ All POs have matched invoices or are reconciled
+                                    </div>
+                                )}
+                            </div>
 
                             {pos.map(po => {
                                 const apStatus = apMap[po.orderId];
@@ -728,56 +943,248 @@ export default function ReceivedItemsPanel() {
                                                             </div>
                                                         )}
 
-                                                        {/* Right: Verification badges */}
-                                                        <div className="flex-1" />
-                                                        <div className="flex flex-wrap items-center gap-1.5 text-[9px] font-mono shrink-0">
-                                                            {po.items.some(i => (i.receivedQuantity ?? 0) > 0) && (
-                                                                <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-                                                                    <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
-                                                                    {po.items.reduce((s, i) => s + (i.receivedQuantity ?? 0), 0)} units rcvd
-                                                                </span>
-                                                            )}
-                                                            {isPartial && hasOpenQty && (
-                                                                <span className="text-amber-300/80 px-1 py-0.5 rounded border border-amber-500/20 bg-amber-500/5">
-                                                                    {po.items.reduce((s, i) => s + (i.openQuantity ?? 0), 0)} open
-                                                                </span>
-                                                            )}
-                                                            {hasInvoice && !isPendingReview && !hasDiscrepancy && (
-                                                                <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-                                                                    <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
-                                                                    Invoice Matched
-                                                                </span>
-                                                            )}
-                                                            {isPendingReview && apStatus && (
-                                                                <button
-                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
-                                                                    disabled={approvingReconcile.has(po.orderId)}
-                                                                    className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
-                                                                    title="Approve reconciliation"
-                                                                >
-                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
-                                                                </button>
-                                                            )}
-                                                            {rec?.hasPendingApproval && !apStatus && (
-                                                                <button
-                                                                    onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
-                                                                    disabled={approvingReconcile.has(po.orderId)}
-                                                                    className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors text-amber-300 border-amber-500/40 bg-amber-500/10 ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'}`}
-                                                                    title="Approve reconciliation"
-                                                                >
-                                                                    {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
-                                                                </button>
-                                                            )}
-                                                            {hasDiscrepancy && (
-                                                                <span className="flex items-center gap-1 text-rose-300/80 px-1 py-0.5 rounded border border-rose-500/20 bg-rose-500/5">
-                                                                    ⚠️ Price mismatch
-                                                                </span>
-                                                            )}
+                                                        {/* Right: Verification badges + Modify PO */}
+                                                                <div className="flex-1" />
+                                                                <div className="flex flex-wrap items-center gap-1.5 text-[9px] font-mono shrink-0">
+                                                                    {po.items.some(i => (i.receivedQuantity ?? 0) > 0) && (
+                                                                        <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+                                                                            <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
+                                                                            {po.items.reduce((s, i) => s + (i.receivedQuantity ?? 0), 0)} units rcvd
+                                                                        </span>
+                                                                    )}
+                                                                    {isPartial && hasOpenQty && (
+                                                                        <span className="text-amber-300/80 px-1 py-0.5 rounded border border-amber-500/20 bg-amber-500/5">
+                                                                            {po.items.reduce((s, i) => s + (i.openQuantity ?? 0), 0)} open
+                                                                        </span>
+                                                                    )}
+                                                                    {hasInvoice && !isPendingReview && !hasDiscrepancy && (
+                                                                        <span className="flex items-center gap-1 text-emerald-400/80 px-1 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+                                                                            <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
+                                                                            Invoice Matched
+                                                                        </span>
+                                                                    )}
+                                                                    {isPendingReview && apStatus && (
+                                                                        <button
+                                                                            onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
+                                                                            disabled={approvingReconcile.has(po.orderId)}
+                                                                            className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'} ${apStatus.cls}`}
+                                                                            title="Approve reconciliation"
+                                                                        >
+                                                                            {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
+                                                                        </button>
+                                                                    )}
+                                                                    {rec?.hasPendingApproval && !apStatus && (
+                                                                        <button
+                                                                            onClick={e => { e.stopPropagation(); approveReconciliation(po.orderId); }}
+                                                                            disabled={approvingReconcile.has(po.orderId)}
+                                                                            className={`px-1.5 py-0.5 rounded border cursor-pointer transition-colors text-amber-300 border-amber-500/40 bg-amber-500/10 ${approvingReconcile.has(po.orderId) ? 'opacity-50 cursor-wait' : 'hover:bg-amber-500/20'}`}
+                                                                            title="Approve reconciliation"
+                                                                        >
+                                                                            {approvingReconcile.has(po.orderId) ? "saving…" : "✓ Approve"}
+                                                                        </button>
+                                                                    )}
+                                                                    {hasDiscrepancy && (
+                                                                        <>
+                                                                            <span className="flex items-center gap-1 text-rose-300/80 px-1 py-0.5 rounded border border-rose-500/20 bg-rose-500/5">
+                                                                                ⚠️ Price mismatch
+                                                                            </span>
+                                                                            <button
+                                                                                onClick={e => { e.stopPropagation(); toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number); }}
+                                                                                className="px-1.5 py-0.5 rounded border border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 transition-colors cursor-pointer text-[10px] font-mono"
+                                                                                title="Adjust PO line items and freight to match invoice"
+                                                                            >
+                                                                                Modify PO
+                                                                            </button>
+                                                                        </>
+                                                                    )}
+                                                                    {isReconciled && !hasDiscrepancy && rec?.matchedInvoice && (
+                                                                        <button
+                                                                            onClick={e => { e.stopPropagation(); toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number); }}
+                                                                            className="px-1.5 py-0.5 rounded border border-zinc-600/40 bg-zinc-800/40 text-zinc-400 hover:bg-zinc-700/40 transition-colors cursor-pointer text-[10px] font-mono"
+                                                                            title="Review PO-invoice details"
+                                                                        >
+                                                                            Review
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            </>
+                                                        );
+                                                        })()}
                                                         </div>
-                                                    </>
-                                                );
-                                            })()}
-                                        </div>
+
+                                                        {/* ── PO Modifier Inline Expansion ── */}
+                                                        {modifyingPO.has(po.orderId) && (() => {
+                                                        const m = modifyingPO.get(po.orderId)!;
+                                                        if (m.loading) {
+                                                        return (
+                                                            <div className="mt-2 px-3 py-3 border border-cyan-500/20 bg-cyan-950/10 rounded">
+                                                                <span className="text-[11px] font-mono text-cyan-300/70 animate-pulse">Loading invoice-PO diff...</span>
+                                                            </div>
+                                                        );
+                                                        }
+                                                        if (m.error) {
+                                                        return (
+                                                            <div className="mt-2 px-3 py-3 border border-rose-500/30 bg-rose-950/10 rounded">
+                                                                <span className="text-[11px] font-mono text-rose-400">⚠ {m.error}</span>
+                                                                <button onClick={() => toggleModifier(po.orderId)} className="ml-2 text-[10px] font-mono text-zinc-500 hover:text-zinc-300">Close</button>
+                                                            </div>
+                                                        );
+                                                        }
+                                                        const diff = m.diff;
+                                                        if (!diff || !diff.hasChanges) {
+                                                        return (
+                                                            <div className="mt-2 px-3 py-3 border border-emerald-500/20 bg-emerald-950/10 rounded">
+                                                                <div className="flex items-center justify-between">
+                                                                    <span className="text-[11px] font-mono text-emerald-400">✅ PO matches invoice — no adjustments needed</span>
+                                                                    <div className="flex items-center gap-2">
+                                                                        <button
+                                                                            onClick={e => {
+                                                                                e.stopPropagation();
+                                                                                fetch('/api/dashboard/po-modify', {
+                                                                                    method: 'POST',
+                                                                                    headers: { 'Content-Type': 'application/json' },
+                                                                                    body: JSON.stringify({
+                                                                                        action: 'verify_and_complete',
+                                                                                        orderId: po.orderId,
+                                                                                        invoiceId: rec?.matchedInvoice?.invoice_number,
+                                                                                    }),
+                                                                                })
+                                                                                .then(r => r.json())
+                                                                                .then(result => {
+                                                                                    if (result.success) {
+                                                                                        setModifySuccess(`PO ${po.orderId} completed ✅`);
+                                                                                        toggleModifier(po.orderId);
+                                                                                        setTimeout(() => fetchReceivings(true), 1500);
+                                                                                    }
+                                                                                })
+                                                                                .catch(() => {});
+                                                                            }}
+                                                                            className="px-2 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
+                                                                        >
+                                                                            Complete PO
+                                                                        </button>
+                                                                        <button onClick={() => toggleModifier(po.orderId)} className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300">Close</button>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                        }
+                                                        // Has changes: show diff table + apply button
+                                                        const hasVerifiedStep = diff.totalDiff != null && Math.abs(diff.totalDiff) < 0.01;
+                                                        return (
+                                                        <div className="mt-2 border border-amber-500/30 bg-amber-950/10 rounded overflow-hidden">
+                                                            <div className="px-3 py-2 border-b border-amber-500/20 flex items-center justify-between">
+                                                                <span className="text-[10px] font-mono uppercase tracking-wider text-amber-300/80">PO-Invoice Variance</span>
+                                                                <span className="text-[10px] font-mono text-zinc-500">
+                                                                    Total: PO ${diff.poTotal.toFixed(2)} → Invoice ${(diff.invoiceTotal ?? diff.poTotal).toFixed(2)}
+                                                                    {diff.totalDiff != null && (
+                                                                        <span className={`ml-1 ${diff.totalDiff > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                                                                            ({diff.totalDiff > 0 ? '+' : ''}{diff.totalDiff.toFixed(2)})
+                                                                        </span>
+                                                                    )}
+                                                                </span>
+                                                            </div>
+                                                            {/* Per-line-item diff table */}
+                                                            <div className="px-3 py-2 space-y-1.5">
+                                                                {diff.lineItems.filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null).map((li: any) => (
+                                                                    <div key={li.productId} className="flex items-center gap-2 text-[10px] font-mono">
+                                                                        <span className="w-16 truncate text-zinc-200 font-semibold">{li.productId}</span>
+                                                                        {li.quantityDiff !== null && (
+                                                                            <span className={li.quantityDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
+                                                                                qty: {li.poQuantity} → {li.invoiceQuantity}
+                                                                                <span className="text-zinc-600 ml-0.5">({li.quantityDiff > 0 ? '+' : ''}{li.quantityDiff})</span>
+                                                                            </span>
+                                                                        )}
+                                                                        {li.priceDiff !== null && (
+                                                                            <span className={li.priceDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
+                                                                                ${li.poUnitPrice.toFixed(2)} → ${li.invoiceUnitPrice?.toFixed(2)}
+                                                                                <span className="text-zinc-600 ml-0.5">({li.priceDiff > 0 ? '+' : ''}${li.priceDiff.toFixed(2)})</span>
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                ))}
+                                                                {diff.freightDiff != null && (
+                                                                    <div className="flex items-center gap-2 text-[10px] font-mono pt-1 border-t border-zinc-700/40">
+                                                                        <span className="text-zinc-400">Freight</span>
+                                                                        <span className={diff.freightDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
+                                                                            ${diff.poFreight.toFixed(2)} → ${(diff.invoiceFreight ?? 0).toFixed(2)}
+                                                                            <span className="text-zinc-600 ml-0.5">({diff.freightDiff > 0 ? '+' : ''}${diff.freightDiff.toFixed(2)})</span>
+                                                                        </span>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                            {/* Apply / Cancel buttons */}
+                                                            <div className="px-3 py-2 border-t border-amber-500/20 flex items-center gap-2 justify-end">
+                                                                <button
+                                                                    onClick={() => toggleModifier(po.orderId)}
+                                                                    className="px-2 py-1 rounded text-[10px] font-mono text-zinc-400 hover:text-zinc-200 border border-zinc-700/40 hover:border-zinc-600 transition-colors"
+                                                                >
+                                                                    Cancel
+                                                                </button>
+                                                                <button
+                                                                    onClick={e => {
+                                                                        e.stopPropagation();
+                                                                        const adjustments = diff.lineItems
+                                                                            .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
+                                                                            .map((li: any) => ({
+                                                                                productId: li.productId,
+                                                                                newQuantity: li.invoiceQuantity ?? undefined,
+                                                                                newUnitPrice: li.invoiceUnitPrice ?? undefined,
+                                                                            }));
+                                                                        applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null);
+                                                                        }}
+                                                                        disabled={m.saving}
+                                                                        className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${m.saving
+                                                                            ? 'bg-amber-500/10 text-amber-400/50 border border-amber-500/30 cursor-wait'
+                                                                            : 'bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer'
+                                                                        }`}
+                                                                        >
+                                                                        {m.saving ? 'Applying...' : 'Apply Changes to PO'}
+                                                                        </button>
+                                                                        {/* Verify & Complete — PO totals match invoice, ready to close */}
+                                                                        <button
+                                                                        onClick={e => {
+                                                                            e.stopPropagation();
+                                                                            // First apply modifications, then verify & complete
+                                                                            const adjustments = diff.lineItems
+                                                                                .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
+                                                                                .map((li: any) => ({
+                                                                                    productId: li.productId,
+                                                                                    newQuantity: li.invoiceQuantity ?? undefined,
+                                                                                    newUnitPrice: li.invoiceUnitPrice ?? undefined,
+                                                                                }));
+                                                                            // Apply modifications first
+                                                                            applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null)
+                                                                                .then(() => {
+                                                                                    // Then verify & complete
+                                                                                    fetch('/api/dashboard/po-modify', {
+                                                                                        method: 'POST',
+                                                                                        headers: { 'Content-Type': 'application/json' },
+                                                                                        body: JSON.stringify({
+                                                                                            action: 'verify_and_complete',
+                                                                                            orderId: po.orderId,
+                                                                                            invoiceId: rec?.matchedInvoice?.invoice_number,
+                                                                                        }),
+                                                                                    })
+                                                                                    .then(r => r.json())
+                                                                                    .then(result => {
+                                                                                        if (result.success) {
+                                                                                            setModifySuccess(`PO ${po.orderId} modified and completed ✅`);
+                                                                                            setTimeout(() => fetchReceivings(true), 1500);
+                                                                                        }
+                                                                                    })
+                                                                                    .catch(() => {});
+                                                                                });
+                                                                        }}
+                                                                        disabled={m.saving}
+                                                                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer"
+                                                                        >
+                                                                        Apply & Complete PO
+                                                                        </button>
+                                                            </div>
+                                                        </div>
+                                                        );
+                                                        })()}
                                     </div>
                                 );
                             })}

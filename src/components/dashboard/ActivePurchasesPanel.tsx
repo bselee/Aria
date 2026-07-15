@@ -1103,11 +1103,35 @@ export default function ActivePurchasesPanel() {
                                                                  : "bg-zinc-800/40 border-zinc-700/40 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
                                                          }`}
                                                      >
-                                                         ✉ Poke Vendor
-                                                         </button>
-                                                         )}
+                                                          ✉ Poke Vendor
+                                                          </button>
+                                                          )}
 
-                                                         {/* Close stale PO — for l3_escalated or sent POs overdue >14d */}
+                                                          {/* Resend PO Email — available when sentVerification is verified */}
+                                                          {po.sentVerification?.verified && !po.isReceived && (
+                                                          <button
+                                                          onClick={async (e) => {
+                                                              e.stopPropagation();
+                                                              try {
+                                                                  const res = await fetch('/api/dashboard/active-purchases', {
+                                                                      method: 'POST',
+                                                                      headers: { 'Content-Type': 'application/json' },
+                                                                      body: JSON.stringify({ action: 'resend_po_email', orderId: po.orderId }),
+                                                                  });
+                                                                  if (res.ok) {
+                                                                      setError(null);
+                                                                      fetchPurchases(true);
+                                                                  }
+                                                              } catch { /* ignore */ }
+                                                          }}
+                                                          className="px-1.5 py-0.5 rounded border transition-colors bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20"
+                                                          title="Re-send the PO email to the vendor via Gmail"
+                                                          >
+                                                          ↻ Resend Email
+                                                          </button>
+                                                          )}
+
+                                                          {/* Close stale PO — for l3_escalated or sent POs overdue >14d */}
                                                          {!po.isReceived && (po.lifecycleStage === 'l3_escalated' || (overdue && daysLate > 14 && po.lifecycleStage === 'sent')) && (
                                                          <button
                                                          onClick={async (e) => {

@@ -39,6 +39,7 @@ export type StepperPO = {
         source: string | null;
         evidence?: Array<{ type: string; at: string | null; detail: string }>;
     };
+    invoiceStatus?: string;
 };
 
 interface POStepperProps {
@@ -80,11 +81,15 @@ export const POStepper: React.FC<POStepperProps> = ({ po }) => {
     const isShippedWarning = po.lifecycleStage === "tracking_unavailable" || po.lifecycleStage === "ap_follow_up";
     const trackingDetail = po.lastMovementSummary || (po.trackingNumbers && po.trackingNumbers.length > 0 ? `${po.trackingNumbers.length} tracking capture(s)` : null);
 
-    // 4. Received Step
+    // 4. Invoiced Step — invoice matched to PO (real signal: invoiceStatus set on ActivePurchase)
+    const hasInvoiceMatched = !!po.invoiceStatus;
+    const isInvoiceCompleted = hasInvoiceMatched;
+
+    // 5. Received Step
     const rcvDate = po.receiveDate;
     const isRcvCompleted = po.isReceived;
 
-    // 5. Reconciled Step
+    // 6. Reconciled Step
     const isReconciledCompleted = po.completionState === "complete";
     const reconciledDate = isReconciledCompleted ? po.receiveDate : null;
 
@@ -144,6 +149,21 @@ export const POStepper: React.FC<POStepperProps> = ({ po }) => {
             extra: trackingDetail ?? undefined,
         },
         {
+            title: "Invoiced",
+            description: isInvoiceCompleted
+                ? "Invoice received and matched to PO"
+                : "Awaiting vendor invoice",
+            date: null, // date not tracked at stepper level yet
+            status: isCancelled
+                ? "pending"
+                : isInvoiceCompleted
+                ? "completed"
+                : isShippedCompleted
+                ? "active"
+                : "pending",
+            extra: po.invoiceStatus ? `Status: ${po.invoiceStatus}` : undefined,
+        },
+        {
             title: "Received",
             description: isRcvCompleted ? "Warehouse logged receipt" : "Awaiting physical arrival",
             date: rcvDate ? new Date(rcvDate).toLocaleDateString() : null,
@@ -151,13 +171,13 @@ export const POStepper: React.FC<POStepperProps> = ({ po }) => {
                 ? "pending" 
                 : isRcvCompleted 
                 ? "completed" 
-                : isShippedCompleted 
+                : isInvoiceCompleted || isShippedCompleted
                 ? "active" 
                 : "pending",
         },
         {
             title: "Reconciled",
-            description: isReconciledCompleted ? "Invoice completely matched" : "Awaiting vendor invoice match",
+            description: isReconciledCompleted ? "Invoice completely matched" : "Awaiting final reconciliation",
             date: reconciledDate ? new Date(reconciledDate).toLocaleDateString() : null,
             status: isCancelled 
                 ? "pending" 
