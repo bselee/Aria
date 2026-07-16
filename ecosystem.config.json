@@ -20,17 +20,6 @@
       "min_uptime": "10s"
     },
     {
-      "name": "aria-healthcheck",
-      "script": "scripts/aria-healthcheck.ts",
-      "interpreter": "npx",
-      "interpreter_args": "tsx",
-      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
-      "windowsHide": true,
-      "max_restarts": 10,
-      "restart_delay": 10000,
-      "min_uptime": "5s"
-    },
-    {
       "name": "aria-bot",
       "script": "src/cli/start-bot.ts",
       "interpreter": "npx",

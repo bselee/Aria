@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import "./globals.css";
-// BUILD-SENTINEL:2
+// BUILD-SENTINEL:4
 
 export const metadata = {
     title: "Aria Intelligence",

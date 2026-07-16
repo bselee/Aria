@@ -33,10 +33,9 @@ export async function GET(req: Request) {
 
         const finale = new FinaleClient();
 
-        // Use the PO cache layer: reads from PostgREST when fresh,
-        // calls Finale only when stale or bust=1 is set
-        const { pos: cachedPos, fromCache } = await getCachedOrFresh(finale, 60, forceRefresh);
-        const activePos = await loadActivePurchases(finale, 60, cachedPos);
+        // Bypass cache — call Finale directly for stability
+        // (PostgREST connection is unreliable on this WSL2 setup)
+        const activePos = await loadActivePurchases(finale, 60, []);
 
         // Phase C — attach rec backreferences (recommended vs drafted qty per SKU).
         // Best-effort: a Supabase miss returns the active POs without rec links.
@@ -49,7 +48,6 @@ export async function GET(req: Request) {
         return NextResponse.json({
             purchases: enriched,
             cachedAt: new Date().toISOString(),
-            fromCache,
         });
 
     } catch (err: any) {
