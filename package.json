@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build && node scripts/patch-base64url.js",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "node --max-old-space-size=12288 ./node_modules/typescript/bin/tsc --noEmit",
