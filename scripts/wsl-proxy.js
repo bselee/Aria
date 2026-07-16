@@ -1,17 +1,12 @@
 /**
  * @file    wsl-proxy.js
- * @purpose TCP port forwarder from Windows localhost → WSL2 Docker containers.
- *          Forwards all configured ports automatically. When the primary port
- *          is already bound by wslrelay (Docker's built-in forwarder), checks
- *          if it's working. If not, falls back to port + 10000.
- *
- *          For PostgREST (5434), the check is more patient: retries once
- *          after 5s because PostgREST can take ~10s to start responding
- *          after a container restart.
- *
- * @author  BuildASoil
- * @created 2026-??-??
- * @updated 2026-07-16 — Hermia: retry logic for PostgREST startup delay
+ * @purpose TCP port forwarder Windows localhost → WSL2 Docker.
+ *          PostgREST (5434): prefer healthy wslrelay (Docker publish). Only kill
+ *          wslrelay and own the port when WSL eth0 is reachable from Windows.
+ *          Never restart Docker containers. Never treat 503 schema-load as dead.
+ * @author  BuildASoil / Hermia
+ * @updated 2026-07-16 — wslrelay-first for Docker ports; no hostile kill when eth0 unreachable
+ * @deps    net, child_process, fs
  */
 
 const net = require("net");
@@ -19,33 +14,22 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-// ── CONFIG ──────────────────────────────────────────
 const FALLBACK_OFFSET = 10000;
 const PROXY_PORT_FILE = path.join(__dirname, "..", ".env.proxy");
 
-// Map { WSL listen port → Docker target port (same by default) }
 const PORT_MAP = [
-  { listen: 5434, target: 5434, name: "PostgREST" },  // Aria DB REST API
-  { listen: 5433, target: 5433, name: "Postgres" },   // Aria DB direct
-  { listen: 5435, target: 5435, name: "MinIO-API" },  // S3-compatible storage
-  { listen: 5436, target: 5436, name: "MinIO-Console" },
-  { listen: 8000, target: 8000, name: "Honcho" },
+  { listen: 5434, target: 5434, name: "PostgREST", http: true },
+  { listen: 5433, target: 5433, name: "Postgres", http: false },
+  { listen: 5435, target: 5435, name: "MinIO-API", http: false },
+  { listen: 5436, target: 5436, name: "MinIO-Console", http: false },
+  { listen: 8000, target: 8000, name: "Honcho", http: false },
 ];
 
-// Global bound ports map: name → port (or null if fallback failed)
 const boundPorts = {};
 
-// ── HELPERS ──────────────────────────────────────────
-
-/**
- * Resolve the WSL2 VM's IP address by repeatedly querying `wsl hostname -I`.
- * Retries up to 30 times (60 seconds) because WSL2 may still be booting.
- */
 function resolveWslIp() {
   let attempts = 0;
-  const interval = 2000;
   const maxAttempts = 30;
-
   return new Promise((resolve, reject) => {
     const poll = setInterval(() => {
       attempts++;
@@ -55,92 +39,61 @@ function resolveWslIp() {
           encoding: "utf-8",
           shell: "powershell.exe",
         });
-        const lines = raw.trim().split(/\s+/);
-        const wslIp = lines[0];
-
+        const wslIp = raw.trim().split(/\s+/)[0];
         if (wslIp && /^\d+\.\d+\.\d+\.\d+$/.test(wslIp)) {
           clearInterval(poll);
           console.log(`[wsl-proxy] WSL2 IP: ${wslIp}`);
           resolve(wslIp);
         } else if (attempts >= maxAttempts) {
           clearInterval(poll);
-          reject(new Error("Could not resolve WSL2 IP after max attempts"));
-        } else {
-          console.log(`[wsl-proxy] WSL2 not reachable, retrying... (${attempts}/${maxAttempts})`);
+          reject(new Error("Could not resolve WSL2 IP"));
         }
-      } catch (e) {
+      } catch {
         if (attempts >= maxAttempts) {
           clearInterval(poll);
-          reject(new Error("WSL2 not reachable after max attempts"));
+          reject(new Error("WSL2 not reachable"));
         } else {
           console.log(`[wsl-proxy] WSL2 not reachable, retrying... (${attempts}/${maxAttempts})`);
         }
       }
-    }, interval);
+    }, 2000);
   });
 }
 
-/**
- * Check if a port is actually reachable on localhost.
- * wslrelay.exe sometimes binds a port but doesn't forward connections.
- *
- * For PostgREST (5434): after a container restart, PostgREST can take ~10s
- * to start responding (schema cache reload). We retry once after 5s and
- * wait up to 8s total before giving up.
- */
-function checkPortReachable(port) {
+/** HTTP probe on localhost — 200 or 503 (schema loading) = pipe alive. */
+function checkLocalHttp(port, timeoutMs = 3000) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
-    socket.setTimeout(2000);
+    let data = "";
+    socket.setTimeout(timeoutMs);
     socket.on("connect", () => {
-      if (port === 5434) {
-        // PostgREST: probe HTTP GET / with retry on timeout
-        socket.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
-        let gotData = false;
-        let retried = false;
-        socket.on("data", () => {
-          gotData = true;
-          socket.destroy();
-          resolve(true);
-        });
-        const timer = () => {
-          socket.destroy();
-          if (!gotData && !retried) {
-            retried = true;
-            // Wait 5s, then retry with a fresh socket
-            setTimeout(() => {
-              const s2 = new net.Socket();
-              s2.setTimeout(2000);
-              s2.on("connect", () => {
-                s2.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
-                s2.on("data", () => {
-                  s2.destroy();
-                  resolve(true);
-                });
-                setTimeout(() => {
-                  s2.destroy();
-                  resolve(false);
-                }, 5000);
-              });
-              s2.on("error", () => {
-                s2.destroy();
-                resolve(false);
-              });
-              s2.on("timeout", () => {
-                s2.destroy();
-                resolve(false);
-              });
-              s2.connect(port, "127.0.0.1");
-            }, 5000);
-          } else {
-            resolve(gotData);
-          }
-        };
-        setTimeout(timer, 3000);
-        return;
+      socket.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    });
+    socket.on("data", (buf) => {
+      data += buf.toString("utf8");
+      if (data.includes("\r\n\r\n") || data.length > 32) {
+        socket.destroy();
+        // Any HTTP response means forwarder works (incl. 503 schema cache)
+        resolve(/HTTP\/\d\.\d\s+\d{3}/.test(data) || data.length > 0);
       }
+    });
+    socket.on("error", () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.on("timeout", () => {
+      socket.destroy();
+      resolve(data.length > 0);
+    });
+    socket.connect(port, "127.0.0.1");
+  });
+}
 
-      // For all other ports: just check TCP connectivity
+function checkTcp(ip, port, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.on("connect", () => {
       socket.destroy();
       resolve(true);
     });
@@ -152,109 +105,170 @@ function checkPortReachable(port) {
       socket.destroy();
       resolve(false);
     });
-    socket.connect(port, "127.0.0.1");
+    socket.connect(port, ip);
   });
 }
 
-/**
- * Create a TCP proxy server that forwards connections to the WSL2 IP.
- * If the primary port is in use (by wslrelay), check if it works.
- * If not, try a fallback port.
- */
-function createProxy(listenPort, targetPort, ip, name) {
-  const tryBind = (port, isFallback) => {
-    return new Promise((resolve) => {
-      const server = net.createServer((clientSocket) => {
-        const upstream = net.connect(targetPort, ip, () => {
-          upstream.pipe(clientSocket);
-          clientSocket.pipe(upstream);
-        });
+/** Probe PostgREST inside WSL (bypasses Windows↔eth0 flakiness). */
+function checkInsideWslPostgrest() {
+  try {
+    const out = execSync(
+      'wsl -d Ubuntu -u root bash -c "curl -s -o /dev/null -w %{http_code} --max-time 4 http://127.0.0.1:5434/"',
+      { timeout: 8000, encoding: "utf-8", shell: "powershell.exe" }
+    ).trim();
+    const code = parseInt(out, 10);
+    return code === 200 || code === 503;
+  } catch {
+    return false;
+  }
+}
 
-        upstream.on("error", () => clientSocket.destroy());
-        clientSocket.on("error", () => upstream.destroy());
+function killWslRelay() {
+  try {
+    execSync("taskkill /F /IM wslrelay.exe", {
+      timeout: 5000,
+      stdio: "ignore",
+      shell: "cmd.exe",
+    });
+    console.log("[wsl-proxy] Killed wslrelay.exe");
+  } catch {
+    /* not running */
+  }
+}
 
-        let timeout = setTimeout(() => {
-          clientSocket.destroy();
-          upstream.destroy();
-        }, 30000);
-
-        clientSocket.on("close", () => {
-          clearTimeout(timeout);
-          upstream.destroy();
-        });
-        upstream.on("close", () => {
-          clearTimeout(timeout);
-          clientSocket.destroy();
-        });
+function tryBind(port, targetPort, ip, name, isFallback) {
+  return new Promise((resolve) => {
+    const server = net.createServer((clientSocket) => {
+      const upstream = net.connect(targetPort, ip, () => {
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
       });
-
-      server.on("error", (err) => {
-        if (err.code === "EADDRINUSE") {
-          resolve(null);
-        } else {
-          console.error(`[wsl-proxy] Server error on ${port} (${name}):`, err.message);
-          resolve(null);
-        }
+      upstream.on("error", () => clientSocket.destroy());
+      clientSocket.on("error", () => upstream.destroy());
+      const timeout = setTimeout(() => {
+        clientSocket.destroy();
+        upstream.destroy();
+      }, 60000);
+      clientSocket.on("close", () => {
+        clearTimeout(timeout);
+        upstream.destroy();
       });
-
-      server.listen(port, "127.0.0.1", () => {
-        const tag = isFallback ? " (fallback)" : "";
-        console.log(`[wsl-proxy] 127.0.0.1:${port} → ${ip}:${targetPort} (${name}${tag})`);
-        resolve(server);
+      upstream.on("close", () => {
+        clearTimeout(timeout);
+        clientSocket.destroy();
       });
     });
-  };
 
-  return (async () => {
-    // Try primary port first
-    let server = await tryBind(listenPort, false);
-    if (server) {
-      boundPorts[name] = listenPort;
-      return server;
-    }
+    server.on("error", (err) => {
+      if (err.code === "EADDRINUSE") resolve(null);
+      else {
+        console.error(`[wsl-proxy] Server error on ${port} (${name}):`, err.message);
+        resolve(null);
+      }
+    });
 
-    // Primary port is taken (likely wslrelay). Check if it's actually working.
-    const reachable = await checkPortReachable(listenPort);
-    if (reachable) {
-      console.log(`[wsl-proxy] Port ${listenPort} (${name}) already bound and working — skipping`);
-      boundPorts[name] = listenPort;
-      return null; // Don't create a server, wslrelay handles it
-    }
+    server.listen(port, "127.0.0.1", () => {
+      const tag = isFallback ? " (fallback)" : "";
+      console.log(`[wsl-proxy] 127.0.0.1:${port} → ${ip}:${targetPort} (${name}${tag})`);
+      resolve(server);
+    });
+  });
+}
 
-    // PostgREST (5434) is served by Docker's native port forwarding (wslrelay).
-    // Even if our health check got a timeout, Docker will forward correctly once
-    // PostgREST finishes loading its schema cache. Never fallback for this port.
-    if (listenPort === 5434) {
-      console.log(`[wsl-proxy] Port ${listenPort} (${name}) bound by Docker proxy — trusting wslrelay`);
-      boundPorts[name] = listenPort;
+async function waitForLocalHttp(port, attempts = 12, delayMs = 2500) {
+  for (let i = 0; i < attempts; i++) {
+    const ok = await checkLocalHttp(port, 2500);
+    if (ok) return true;
+    console.log(`[wsl-proxy] localhost:${port} not ready (${i + 1}/${attempts})`);
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false;
+}
+
+async function createProxy(listenPort, targetPort, ip, name, http) {
+  if (listenPort === 5434) {
+    // 1) Prefer Docker's wslrelay path — wait for real HTTP on localhost
+    const localOk = await waitForLocalHttp(5434, 10, 2000);
+    if (localOk) {
+      console.log("[wsl-proxy] Port 5434 working via Docker/wslrelay — leaving it");
+      boundPorts[name] = 5434;
       return null;
     }
 
-    // wslrelay bound the port but it's not forwarding. Use fallback port.
-    const fallbackPort = listenPort + FALLBACK_OFFSET;
-    console.log(`[wsl-proxy] Port ${listenPort} (${name}) bound but dead — using fallback ${fallbackPort}`);
-    server = await tryBind(fallbackPort, true);
-    if (server) {
-      boundPorts[name] = fallbackPort;
-    } else {
-      console.error(`[wsl-proxy] Could not bind ${listenPort} or ${fallbackPort} for ${name}`);
-      boundPorts[name] = null;
+    // 2) Is PostgREST alive inside WSL but Windows path broken?
+    const insideOk = checkInsideWslPostgrest();
+    const ethOk = await checkTcp(ip, 5434, 3000);
+
+    if (insideOk && ethOk) {
+      // eth0 reachable — safe to kill wslrelay and own the port
+      console.log("[wsl-proxy] PostgREST up in WSL + eth0 reachable — taking over 5434");
+      killWslRelay();
+      await new Promise((r) => setTimeout(r, 800));
+      const server = await tryBind(5434, targetPort, ip, name, false);
+      if (server) {
+        boundPorts[name] = 5434;
+        return server;
+      }
     }
+
+    if (insideOk && !ethOk) {
+      // Critical: WSL has PostgREST but Windows cannot route to eth0.
+      // Do NOT kill wslrelay — it may still recover; wait longer.
+      console.warn(
+        "[wsl-proxy] PostgREST alive in WSL but Windows→eth0 broken — waiting on wslrelay (not killing)"
+      );
+      const recovered = await waitForLocalHttp(5434, 15, 3000);
+      if (recovered) {
+        console.log("[wsl-proxy] wslrelay recovered for 5434");
+        boundPorts[name] = 5434;
+        return null;
+      }
+      console.error(
+        "[wsl-proxy] 5434 unreachable from Windows. Run scripts\\aria-startup.bat after WSL network settles."
+      );
+      boundPorts[name] = null;
+      return null;
+    }
+
+    // 3) Fallback port if we can reach eth0
+    if (ethOk) {
+      const fallback = listenPort + FALLBACK_OFFSET;
+      const server = await tryBind(fallback, targetPort, ip, name, true);
+      boundPorts[name] = server ? fallback : null;
+      return server;
+    }
+
+    boundPorts[name] = null;
+    return null;
+  }
+
+  // Non-PostgREST ports
+  let server = await tryBind(listenPort, targetPort, ip, name, false);
+  if (server) {
+    boundPorts[name] = listenPort;
     return server;
-  })();
+  }
+
+  const ethOk = await checkTcp(ip, targetPort, 1500);
+  if (ethOk || !http) {
+    // Assume docker publish works on primary
+    boundPorts[name] = listenPort;
+    console.log(`[wsl-proxy] Port ${listenPort} (${name}) already bound — skipping`);
+    return null;
+  }
+
+  const fallback = listenPort + FALLBACK_OFFSET;
+  server = await tryBind(fallback, targetPort, ip, name, true);
+  boundPorts[name] = server ? fallback : null;
+  return server;
 }
 
-/**
- * Write a .env.proxy file with the actual bound ports.
- * The app reads this to know which port to connect to.
- */
-function writeProxyEnv(boundPorts) {
-  const lines = Object.entries(boundPorts)
-    .filter(([_, port]) => port !== null)
+function writeProxyEnv(ports) {
+  const lines = Object.entries(ports)
+    .filter(([, port]) => port !== null)
     .map(([name, port]) => `${name.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}=${port}`);
 
-  // Also write a var for PostgREST_url
-  const pgrPort = boundPorts["PostgREST"];
+  const pgrPort = ports["PostgREST"];
   if (pgrPort) {
     lines.push(`PGREST_PORT=${pgrPort}`);
     lines.push(`PGREST_URL=http://localhost:${pgrPort}`);
@@ -264,28 +278,22 @@ function writeProxyEnv(boundPorts) {
   console.log(`[wsl-proxy] Proxy env written to ${PROXY_PORT_FILE}`);
 }
 
-// ── MAIN ─────────────────────────────────────────────
-
 (async () => {
   try {
     const ip = await resolveWslIp();
-
-    // Start all proxies in parallel
     const results = await Promise.allSettled(
-      PORT_MAP.map(({ listen, target, name }) => createProxy(listen, target, ip, name))
+      PORT_MAP.map(({ listen, target, name, http }) =>
+        createProxy(listen, target, ip, name, http)
+      )
     );
-
     const failures = results.filter((r) => r.status === "rejected");
-    if (failures.length > 0) {
-      console.error(`[wsl-proxy] ${failures.length} proxy(s) failed to start`);
-    }
-
+    if (failures.length) console.error(`[wsl-proxy] ${failures.length} proxy start failure(s)`);
     writeProxyEnv(boundPorts);
-
-    // Keep alive — PM2 handles restart on crash
-    console.log(`[wsl-proxy] ${PORT_MAP.length} proxies configured, ${Object.values(boundPorts).filter(Boolean).length} active`);
+    console.log(
+      `[wsl-proxy] configured=${PORT_MAP.length} active=${Object.values(boundPorts).filter(Boolean).length}`
+    );
   } catch (err) {
-    console.error("[wsl-proxy] Fatal error:", err.message);
+    console.error("[wsl-proxy] Fatal:", err.message);
     process.exit(1);
   }
 })();

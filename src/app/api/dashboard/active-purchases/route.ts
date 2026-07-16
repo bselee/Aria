@@ -33,21 +33,32 @@ export async function GET(req: Request) {
 
         const finale = new FinaleClient();
 
-        // Bypass cache — call Finale directly for stability
-        // (PostgREST connection is unreliable on this WSL2 setup)
-        const activePos = await loadActivePurchases(finale, 60, []);
+        // Cache when PostgREST healthy+fresh; always Finale fallback
+        const { pos: finalePos, fromCache } = await getCachedOrFresh(finale, 60, forceRefresh);
+        const activePos = await loadActivePurchases(finale, 60, finalePos);
+        console.log(
+            `[active-purchases] ${activePos.length} active of ${finalePos.length} Finale POs (fromCache=${fromCache})`
+        );
 
-        // Phase C — attach rec backreferences (recommended vs drafted qty per SKU).
-        // Best-effort: a Supabase miss returns the active POs without rec links.
-        const recsByPO = await loadDraftedPORecSummaries(activePos.map(p => p.orderId));
-        const enriched = activePos.map(po => ({
+        // Phase C — attach rec backreferences (best-effort)
+        let enriched: Array<ActivePurchase & { recLinks: any[] }> = activePos.map(po => ({
             ...po,
-            recLinks: recsByPO.get(po.orderId) ?? [],
+            recLinks: [],
         }));
+        try {
+            const recsByPO = await loadDraftedPORecSummaries(activePos.map(p => p.orderId));
+            enriched = activePos.map(po => ({
+                ...po,
+                recLinks: recsByPO.get(po.orderId) ?? [],
+            }));
+        } catch (e: any) {
+            console.warn("[active-purchases] rec links skipped:", e?.message || e);
+        }
 
         return NextResponse.json({
             purchases: enriched,
             cachedAt: new Date().toISOString(),
+            fromCache,
         });
 
     } catch (err: any) {

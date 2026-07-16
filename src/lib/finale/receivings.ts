@@ -1506,6 +1506,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
             const data = await this.graphql(query, 'Recent POs');
             const edges = data?.orderViewConnection?.edges || [];
+            console.log(`[finale] getRecentPurchaseOrders: ${edges.length} POs (${beginStr}..${endStr})`);
             return edges.map((edge: any) => {
                 const po = edge.node;
                 const items = (po.itemList?.edges || [])

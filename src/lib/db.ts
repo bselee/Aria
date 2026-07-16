@@ -26,10 +26,34 @@ import * as crypto from "crypto";
 function getPgrstUrl(): string {
   return (
     process.env.PGRST_URL ||
+    process.env.PGREST_URL ||
     process.env.NEXT_PUBLIC_SUPABASE_URL?.replace(".supabase.co", "") ||
     process.env.SUPABASE_URL ||
-    ""
+    "http://localhost:5434"
   );
+}
+
+/**
+ * Quick health probe for PostgREST. Use before optional enrichment paths
+ * so Finale-first UI never blocks on a dead local DB.
+ *
+ * @param timeoutMs Max wait (default 2s)
+ * @returns true if PostgREST returns a body (200 or 503 schema loading)
+ */
+export async function probePostgrest(timeoutMs = 2000): Promise<boolean> {
+  const base = getPgrstUrl().replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
+  if (!base) return false;
+  try {
+    const res = await fetch(base + "/", {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    // 200 = ready; 503 = schema cache loading but pipe is alive
+    return res.status === 200 || res.status === 503;
+  } catch {
+    return false;
+  }
 }
 
 const PGRST_SECRET =
@@ -308,7 +332,7 @@ class QueryBuilder {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeout = setTimeout(() => controller.abort(), 5000);
 
     try {
       const res = await fetch(url.toString(), {
@@ -419,7 +443,7 @@ class RpcBuilder {
     };
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeout = setTimeout(() => controller.abort(), 5_000);
 
     try {
       const res = await fetch(url, {

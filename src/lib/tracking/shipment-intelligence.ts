@@ -935,22 +935,28 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
     const db = createClient();
     if (!db || poNumbers.length === 0) return [];
 
-    const { data, error } = await db
-        .from("shipments")
-        .select("*")
-        .overlaps("po_numbers", poNumbers)
-        .eq("active", true)
-        .order("updated_at", { ascending: false });
+    try {
+        const { data, error } = await db
+            .from("shipments")
+            .select("*")
+            .overlaps("po_numbers", poNumbers)
+            .eq("active", true)
+            .order("updated_at", { ascending: false });
 
-    if (error) {
-        if (isMissingShipmentsTableError(error.message)) {
+        if (error) {
+            if (isMissingShipmentsTableError(error.message)) {
+                return [];
+            }
+            console.warn(`[shipments] load failed: ${error.message}`);
             return [];
         }
-        throw new Error(`Shipment load failed: ${error.message}`);
-    }
 
-    // Return raw data — no carrier refresh during reads (cron handles it).
-    return (data || []) as ShipmentRecord[];
+        // Return raw data — no carrier refresh during reads (cron handles it).
+        return (data || []) as ShipmentRecord[];
+    } catch (e: any) {
+        console.warn(`[shipments] load failed: ${e?.message || e}`);
+        return [];
+    }
 }
 
 async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {

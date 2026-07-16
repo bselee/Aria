@@ -74,16 +74,26 @@ export async function loadPOCompletionSignalIndex(
 ): Promise<Map<string, POCompletionSignal>> {
     if (!client || poNumbers.length === 0) return new Map();
 
-    const cutoff = new Date();
-    cutoff.setUTCDate(cutoff.getUTCDate() - lookbackDays);
+    try {
+        const cutoff = new Date();
+        cutoff.setUTCDate(cutoff.getUTCDate() - lookbackDays);
 
-    const { data } = await client
-        .from("ap_activity_log")
-        .select("intent, created_at, metadata")
-        .in("intent", ["RECONCILIATION", "RECONCILIATION_ERROR"])
-        .gte("created_at", cutoff.toISOString())
-        .order("created_at", { ascending: false })
-        .limit(1000);
+        const { data, error } = await client
+            .from("ap_activity_log")
+            .select("intent, created_at, metadata")
+            .in("intent", ["RECONCILIATION", "RECONCILIATION_ERROR"])
+            .gte("created_at", cutoff.toISOString())
+            .order("created_at", { ascending: false })
+            .limit(1000);
 
-    return buildPOCompletionSignalIndex((data || []) as APActivityRow[], poNumbers);
+        if (error) {
+            console.warn("[po-completion] load failed:", error.message || error);
+            return new Map();
+        }
+
+        return buildPOCompletionSignalIndex((data || []) as APActivityRow[], poNumbers);
+    } catch (e: any) {
+        console.warn("[po-completion] load failed:", e?.message || e);
+        return new Map();
+    }
 }

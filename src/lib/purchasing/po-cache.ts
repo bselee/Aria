@@ -1,48 +1,37 @@
 /**
  * @file    po-cache.ts
- * @purpose Cache layer for Finale PO data. Stores PO summaries in the local
- *          purchase_orders table so the dashboard reads from PostgREST instead
- *          of live-querying Finale's GraphQL API (which is slow and rate-limited).
- *
- *          Flow:
- *          getCachedOrFresh(forceRefresh=false)
- *            ├─ Check purchase_orders: if any PO has updated_at < 15 min ago → RETURN CACHE
- *            ├─ Otherwise → call Finale → upsert ALL POs → RETURN FRESH
- *
+ * @purpose Cache layer for Finale PO data. Reads from PostgREST when healthy + fresh;
+ *          always falls back to Finale. Never blocks the dashboard on a dead DB.
  * @author  Hermia
  * @created 2026-07-16
+ * @updated 2026-07-16 — probe + timeout; fire-and-forget cache write
  * @deps    @/lib/db, @/lib/finale/client
  */
 
 import type { FinaleClient, FullPO } from "../finale/client";
-import { createClient } from "../db";
+import { createClient, probePostgrest } from "../db";
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const SYNC_TAG_KEY = "po_cache_last_sync";
 
-/**
- * Check if the PO cache is fresh enough to skip a Finale call.
- * Returns the ISO timestamp of the last sync, or null if never synced.
- */
 async function getCacheAge(): Promise<Date | null> {
+    const healthy = await probePostgrest(1500);
+    if (!healthy) return null;
+
     const db = createClient();
     if (!db) return null;
     try {
-        const { data } = await db
+        const { data, error } = await db
             .from("purchase_orders")
             .select("updated_at")
             .order("updated_at", { ascending: false })
             .limit(1);
-        if (data && data.length > 0 && data[0].updated_at) {
-            return new Date(data[0].updated_at);
-        }
-    } catch { /* no cache yet */ }
-    return null;
+        if (error || !data || data.length === 0 || !data[0].updated_at) return null;
+        return new Date(data[0].updated_at);
+    } catch {
+        return null;
+    }
 }
 
-/**
- * Whether the cache is fresh enough to skip Finale.
- */
 function isCacheFresh(lastSync: Date | null): boolean {
     if (!lastSync) return false;
     return (Date.now() - lastSync.getTime()) < CACHE_TTL_MS;
@@ -50,9 +39,12 @@ function isCacheFresh(lastSync: Date | null): boolean {
 
 /**
  * Upsert Finale PO data into the purchase_orders cache table.
- * Returns the list of POs that were cached.
+ * Best-effort — failures are logged, never thrown.
  */
 export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
+    const healthy = await probePostgrest(1500);
+    if (!healthy) return;
+
     const db = createClient();
     if (!db || pos.length === 0) return;
 
@@ -73,7 +65,6 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
         });
     }
 
-    // Upsert in batches of 100
     for (let i = 0; i < chunks.length; i += 100) {
         const batch = chunks.slice(i, i + 100);
         try {
@@ -84,22 +75,18 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
     }
 }
 
-/**
- * Read cached PO data from purchase_orders table.
- * Returns FullPO-like objects reconstructed from cache.
- */
 async function readCachedPos(): Promise<FullPO[]> {
     const db = createClient();
     if (!db) return [];
 
     try {
-        const { data } = await db
+        const { data, error } = await db
             .from("purchase_orders")
             .select("*")
-            .order("created_at", { ascending: false })
+            .order("updated_at", { ascending: false })
             .limit(500);
 
-        if (!data || data.length === 0) return [];
+        if (error || !data || data.length === 0) return [];
 
         return data.map((row: any) => {
             let items: Array<{ productId: string; quantity: number }> = [];
@@ -129,35 +116,37 @@ async function readCachedPos(): Promise<FullPO[]> {
 }
 
 /**
- * Get active POs, using cache when fresh.
- *
- * @param finale       FinaleClient instance
- * @param daysBack     Days of history to fetch from Finale on cache miss
- * @param forceRefresh If true, skip cache and call Finale directly
- * @returns FullPO array + whether it came from cache
+ * Get POs using cache when PostgREST is healthy and fresh; otherwise Finale.
+ * Cache write is best-effort after a Finale fetch.
  */
 export async function getCachedOrFresh(
     finale: FinaleClient,
     daysBack = 60,
     forceRefresh = false
 ): Promise<{ pos: FullPO[]; fromCache: boolean }> {
-    // Check cache freshness
-    const lastSync = forceRefresh ? null : await getCacheAge();
-    if (lastSync && isCacheFresh(lastSync)) {
-        const cached = await readCachedPos();
-        if (cached.length > 0) {
-            console.log(`[po-cache] HIT — ${cached.length} POs from cache (synced ${timeAgo(lastSync)})`);
-            return { pos: cached, fromCache: true };
+    if (!forceRefresh) {
+        try {
+            const lastSync = await getCacheAge();
+            if (lastSync && isCacheFresh(lastSync)) {
+                const cached = await readCachedPos();
+                if (cached.length > 0) {
+                    console.log(`[po-cache] HIT — ${cached.length} POs (synced ${timeAgo(lastSync)})`);
+                    return { pos: cached, fromCache: true };
+                }
+            }
+        } catch (e: any) {
+            console.warn("[po-cache] cache read failed, using Finale:", e?.message || e);
         }
     }
 
-    // Cache miss or stale — fetch from Finale
-    console.log(`[po-cache] MISS — fetching from Finale (last sync: ${lastSync?.toISOString() || "never"})`);
+    console.log(`[po-cache] MISS — fetching from Finale`);
     const pos = await finale.getRecentPurchaseOrders(daysBack);
 
-    // Cache the result
-    await cacheFinalePos(pos);
-    console.log(`[po-cache] CACHED — ${pos.length} POs`);
+    // Fire-and-forget cache write — never delay response
+    void cacheFinalePos(pos).catch((e) =>
+        console.warn("[po-cache] background cache write failed:", (e as Error).message)
+    );
+    console.log(`[po-cache] FRESH — ${pos.length} POs from Finale`);
 
     return { pos, fromCache: false };
 }
