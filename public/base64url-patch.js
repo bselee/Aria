@@ -1,11 +1,31 @@
 /**
  * Patch the buffer polyfill to support base64url encoding.
- * Runs immediately AND re-applies after Buffer becomes available
- * (webpack loads the buffer polyfill asynchronously).
+ * The @supabase framework uses base64url encoding for JWT/Auth operations.
+ * Webpack's buffer polyfill v6.x doesn't support this encoding.
+ *
+ * Strategy: patch Buffer.isEncoding to accept base64url, and patch
+ * Buffer.from and toString to convert base64url to base64.
+ * Runs eagerly at script load and re-applies via MutationObserver
+ * to catch webpack's deferred module evaluation.
  */
-(function patchBase64Url() {
-  function apply() {
+(function () {
+  'use strict';
+
+  function patch() {
+    // Patch Buffer if available
     if (typeof Buffer !== 'undefined') {
+      // Patch isEncoding to accept base64url
+      if (Buffer.isEncoding) {
+        const origIsEncoding = Buffer.isEncoding;
+        Buffer.isEncoding = function (enc) {
+          if (enc && typeof enc === 'string') {
+            const lower = enc.toLowerCase().replace(/-/g, '');
+            if (lower === 'base64url') return true;
+          }
+          return origIsEncoding.call(this, enc);
+        };
+      }
+
       // Patch Buffer.from
       const origFrom = Buffer.from;
       Buffer.from = function (value, encodingOrOffset, length) {
@@ -27,34 +47,43 @@
       };
     }
 
-    // Also patch Uint8Array.toString for direct calls
+    // Patch Uint8Array.prototype.toString (called by buffer polyfill)
     if (typeof Uint8Array !== 'undefined') {
-      const origU8 = Uint8Array.prototype.toString;
+      const origU8toString = Uint8Array.prototype.toString;
       Uint8Array.prototype.toString = function (encoding) {
         if (encoding && typeof encoding === 'string') {
           const lower = encoding.toLowerCase().replace(/-/g, '');
-          if (lower === 'base64url') return origU8.call(this, 'base64');
+          if (lower === 'base64url') return origU8toString.call(this, 'base64');
         }
-        return origU8.apply(this, arguments);
+        return origU8toString.apply(this, arguments);
       };
     }
   }
 
-  // Apply immediately
-  apply();
+  // Apply synchronously (catches eagerly evaluated modules)
+  patch();
 
-  // Re-apply periodically until Buffer is patched
-  // (webpack chunks load asynchronously and may overwrite our patch)
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      apply();
-      // Some webpack chunks load even after DOMContentLoaded
-      setTimeout(apply, 1000);
-      setTimeout(apply, 3000);
-    });
-  } else {
-    apply();
-    setTimeout(apply, 1000);
-    setTimeout(apply, 3000);
+  // Watch for Buffer to be defined (webpack evaluates modules lazily)
+  var target = typeof Buffer !== 'undefined' ? Buffer : null;
+  Object.defineProperty(window, 'Buffer', {
+    get: function () { return target; },
+    set: function (v) {
+      target = v;
+      patch(); // Re-patch when Buffer is set by webpack
+    },
+    configurable: true,
+    enumerable: true,
+  });
+
+  // Also re-patch on DOMContentLoaded and at intervals
+  function reapply() {
+    patch();
   }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', reapply);
+  }
+  setTimeout(reapply, 500);
+  setTimeout(reapply, 2000);
+  setTimeout(reapply, 5000);
 })();
