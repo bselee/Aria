@@ -221,6 +221,15 @@ function createProxy(listenPort, targetPort, ip, name) {
       return null; // Don't create a server, wslrelay handles it
     }
 
+    // PostgREST (5434) is served by Docker's native port forwarding (wslrelay).
+    // Even if our health check got a timeout, Docker will forward correctly once
+    // PostgREST finishes loading its schema cache. Never fallback for this port.
+    if (listenPort === 5434) {
+      console.log(`[wsl-proxy] Port ${listenPort} (${name}) bound by Docker proxy — trusting wslrelay`);
+      boundPorts[name] = listenPort;
+      return null;
+    }
+
     // wslrelay bound the port but it's not forwarding. Use fallback port.
     const fallbackPort = listenPort + FALLBACK_OFFSET;
     console.log(`[wsl-proxy] Port ${listenPort} (${name}) bound but dead — using fallback ${fallbackPort}`);
