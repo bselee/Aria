@@ -1,0 +1,228 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" font-family="'SF Mono','Menlo','Consolas',monospace">
+  <defs>
+    <filter id="glow"><feGaussianBlur stdDeviation="2" result="coloredBlur"/><feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a1a1aa"/></marker>
+    <marker id="arrow-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/></marker>
+    <marker id="arrow-miss" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444"/></marker>
+    <linearGradient id="base-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#18181b"/><stop offset="100%" stop-color="#09090b"/></linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="900" fill="url(#base-bg)" rx="8"/>
+
+  <!-- Title -->
+  <text x="600" y="32" text-anchor="middle" fill="#f4f4f5" font-size="16" font-weight="bold">PO Lifecycle Flow — Current Architecture</text>
+  <text x="600" y="50" text-anchor="middle" fill="#71717a" font-size="10">Ordering Panel → Active Purchases Panel → Receivings Panel</text>
+
+  <!-- ──────────────────── LANE LABELS ──────────────────── -->
+  <text x="20" y="85" fill="#a1a1aa" font-size="11" font-weight="bold" text-transform="uppercase">┃ Dashboard Panels</text>
+  <text x="20" y="98" fill="#52525b" font-size="9">Three separate React components, connected via PurchasingLifecycleContext</text>
+
+  <!-- ──────────────────── PANEL 1: ORDERING ──────────────────── -->
+  <rect x="20" y="110" width="370" height="350" rx="6" fill="#27272a" stroke="#3f3f46" stroke-width="1"/>
+  <rect x="20" y="110" width="370" height="28" rx="6" fill="#1e3a5f" stroke="#2563eb" stroke-width="1"/>
+  <text x="205" y="129" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="bold">📦 ORDERING (PurchasingPanel.tsx)</text>
+
+  <!-- Data source -->
+  <rect x="35" y="148" width="340" height="22" rx="3" fill="#18181b" stroke="#3f3f46" stroke-width="1"/>
+  <text x="38" y="163" fill="#71717a" font-size="9">Data: GET /api/dashboard/purchasing → Finale Intelligence + BOM demand</text>
+
+  <!-- Items list -->
+  <rect x="35" y="178" width="340" height="40" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="38" y="193" fill="#a1a1aa" font-size="9">Items grouped by vendor · urgency: critical/warning/watch/ok</text>
+  <text x="38" y="208" fill="#71717a" font-size="9">Shows: stock on hand, daily rate, runway, lead time, suggested qty</text>
+
+  <!-- Key actions -->
+  <rect x="35" y="226" width="160" height="50" rx="3" fill="#0f3b1e" stroke="#22c55e" stroke-width="0.5"/>
+  <text x="42" y="241" fill="#86efac" font-size="10" font-weight="bold">✅ Create Draft PO</text>
+  <text x="42" y="255" fill="#a1a1aa" font-size="8">POST /api/dashboard/purchasing</text>
+  <text x="42" y="267" fill="#71717a" font-size="8">→ Finale.createDraftPurchaseOrder()</text>
+
+  <rect x="210" y="226" width="165" height="50" rx="3" fill="#1e1b0e" stroke="#f59e0b" stroke-width="0.5"/>
+  <text x="217" y="241" fill="#fbbf24" font-size="10" font-weight="bold">⚠ Commit & Send</text>
+  <text x="217" y="255" fill="#a1a1aa" font-size="8">Opens VendorDecisionFlyout</text>
+  <text x="217" y="267" fill="#71717a" font-size="8">→ po-sender.ts (commit + email)</text>
+
+  <!-- Lifecycle ribbon chips -->
+  <rect x="35" y="284" width="340" height="30" rx="3" fill="#13131a" stroke="#3f3f46" stroke-width="0.5"/>
+  <text x="38" y="299" fill="#71717a" font-size="9">Inline open-PO lifecycle ribbon (click → Active Purchases)</text>
+  <text x="38" y="311" fill="#52525b" font-size="8">Already ordered / Draft submitted / Commit ready / Blocked badges</text>
+
+  <!-- Guard clause -->
+  <rect x="35" y="320" width="340" height="20" rx="3" fill="#1f1b0a" stroke="#a16207" stroke-width="0.5"/>
+  <text x="38" y="334" fill="#facc15" font-size="8">∩ commitGuard: leadTime +30d, vendorCycle, duplicate-draft guard</text>
+
+  <!-- Naming the POST action -->
+  <rect x="35" y="347" width="340" height="20" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="38" y="361" fill="#71717a" font-size="8">Snooze (localStorage) · Why-{qty} math trace · Focus-lock linkage</text>
+
+  <!-- Panel connector -->
+  <line x1="390" y1="220" x2="430" y2="220" stroke="#a1a1aa" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="400" y="212" fill="#71717a" font-size="8">Draft Event →</text>
+
+  <!-- ──────────────────── PANEL 2: ACTIVE PURCHASES ──────────────────── -->
+  <rect x="440" y="110" width="370" height="350" rx="6" fill="#27272a" stroke="#3f3f46" stroke-width="1"/>
+  <rect x="440" y="110" width="370" height="28" rx="6" fill="#1e1b0e" stroke="#f59e0b" stroke-width="1"/>
+  <text x="625" y="129" text-anchor="middle" fill="#fde68a" font-size="12" font-weight="bold">🔄 ACTIVE PURCHASES (ActivePurchasesPanel.tsx)</text>
+
+  <rect x="455" y="148" width="340" height="22" rx="3" fill="#18181b" stroke="#3f3f46" stroke-width="1"/>
+  <text x="458" y="163" fill="#71717a" font-size="9">Data: GET /api/dashboard/active-purchases → Finale + local lifecycle</text>
+
+  <!-- PO rows -->
+  <rect x="455" y="178" width="340" height="55" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="458" y="193" fill="#a1a1aa" font-size="9">Each PO shows: status, vendor, order date, expected date, ETA</text>
+  <text x="458" y="208" fill="#71717a" font-size="9">sentVerification · trackingNumbers · shipments · lifecycleStage</text>
+  <text x="458" y="225" fill="#52525b" font-size="8">POStepper visual: Sent → Recognized → Shipped → Received → Reconciled</text>
+
+  <!-- Actions -->
+  <rect x="455" y="240" width="100" height="65" rx="3" fill="#0f3b1e" stroke="#22c55e" stroke-width="0.5"/>
+  <text x="462" y="255" fill="#86efac" font-size="9">mark_sent_</text>
+  <text x="462" y="267" fill="#86efac" font-size="9">verified</text>
+  <text x="462" y="281" fill="#71717a" font-size="8">Manual confirm</text>
+  <text x="462" y="293" fill="#71717a" font-size="8">PO was sent</text>
+
+  <rect x="565" y="240" width="110" height="65" rx="3" fill="#1e1b0e" stroke="#f59e0b" stroke-width="0.5"/>
+  <text x="572" y="255" fill="#fbbf24" font-size="9">add_tracking</text>
+  <text x="572" y="267" fill="#fbbf24" font-size="9">_number</text>
+  <text x="572" y="281" fill="#71717a" font-size="8">Manual entry +</text>
+  <text x="572" y="293" fill="#71717a" font-size="8">learns source</text>
+
+  <rect x="685" y="240" width="110" height="65" rx="3" fill="#1f1b0a" stroke="#a16207" stroke-width="0.5"/>
+  <text x="692" y="255" fill="#facc15" font-size="9">send_follow_</text>
+  <text x="692" y="267" fill="#facc15" font-size="9">up_email</text>
+  <text x="692" y="281" fill="#71717a" font-size="8">Poke vendor via</text>
+  <text x="692" y="293" fill="#71717a" font-size="8">Gmail API</text>
+
+  <rect x="455" y="312" width="340" height="20" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="458" y="326" fill="#71717a" font-size="8">ETA override · Toggle tracking pause · approve_reconciliation · Dismiss</text>
+
+  <!-- Panel connector -->
+  <line x1="810" y1="180" x2="850" y2="180" stroke="#a1a1aa" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="818" y="172" fill="#71717a" font-size="8">Receipt →</text>
+
+  <!-- ──────────────────── PANEL 3: RECEIVINGS ──────────────────── -->
+  <rect x="860" y="110" width="320" height="350" rx="6" fill="#27272a" stroke="#3f3f46" stroke-width="1"/>
+  <rect x="860" y="110" width="320" height="28" rx="6" fill="#0f3b1e" stroke="#22c55e" stroke-width="1"/>
+  <text x="1020" y="129" text-anchor="middle" fill="#86efac" font-size="12" font-weight="bold">📋 RECEIVINGS (ReceivedItemsPanel.tsx)</text>
+
+  <rect x="875" y="148" width="290" height="22" rx="3" fill="#18181b" stroke="#3f3f46" stroke-width="1"/>
+  <text x="878" y="163" fill="#71717a" font-size="9">Data: GET /api/dashboard/receivings → Finale + local</text>
+
+  <rect x="875" y="178" width="290" height="40" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="878" y="193" fill="#a1a1aa" font-size="9">Received POs from last 30 days</text>
+  <text x="878" y="208" fill="#71717a" font-size="9">Receipt status: FULL / PARTIAL · Reconciliation status</text>
+
+  <rect x="875" y="226" width="290" height="55" rx="3" fill="#13131a" stroke="#3f3f46" stroke-width="0.5"/>
+  <text x="878" y="241" fill="#fbbf24" font-size="9">Invoice-PO Match Suggestions (scored ≥50)</text>
+  <text x="878" y="256" fill="#71717a" font-size="9">Auto-apply when single candidate ≥80 score</text>
+  <text x="878" y="273" fill="#52525b" font-size="8">Invoice status: UNMATCHED / PENDING / RECONCILED / RECONCILED ±</text>
+
+  <!-- Actions -->
+  <rect x="875" y="289" width="140" height="50" rx="3" fill="#0f3b1e" stroke="#22c55e" stroke-width="0.5"/>
+  <text x="882" y="304" fill="#86efac" font-size="9">match_invoice</text>
+  <text x="882" y="318" fill="#71717a" font-size="8">Links invoice to PO</text>
+  <text x="882" y="330" fill="#52525b" font-size="8">on vendor_invoices</text>
+
+  <rect x="1025" y="289" width="140" height="50" rx="3" fill="#1e1b0e" stroke="#f59e0b" stroke-width="0.5"/>
+  <text x="1032" y="304" fill="#fbbf24" font-size="9">complete_po</text>
+  <text x="1032" y="318" fill="#71717a" font-size="8">Finale API complete,</text>
+  <text x="1032" y="330" fill="#52525b" font-size="8">records freight evidence</text>
+
+  <rect x="875" y="347" width="290" height="18" rx="3" fill="#1f1b0a" stroke="#a16207" stroke-width="0.5"/>
+  <text x="878" y="360" fill="#facc15" font-size="8">mark_freight_pattern · approve_reconciliation</text>
+
+  <!-- ──────────────────── BOTTOM ROW: BACKGROUND CRONS & DATA FLOWS ──────────────────── -->
+  <text x="20" y="490" fill="#a1a1aa" font-size="11" font-weight="bold" text-transform="uppercase">┃ Background Data Flows (Cron Jobs)</text>
+  <text x="20" y="503" fill="#52525b" font-size="9">All auto-matching and state-transition crons run independently of panel actions</text>
+
+  <!-- Lifecycle state machine -->
+  <rect x="20" y="515" width="1160" height="140" rx="6" fill="#13131a" stroke="#3f3f46" stroke-width="1"/>
+
+  <text x="40" y="535" fill="#a1a1aa" font-size="10" font-weight="bold">PO Lifecycle State Machine (po-lifecycle.ts)</text>
+
+  <!-- State boxes -->
+  <rect x="40" y="548" width="80" height="30" rx="4" fill="#3b0764" stroke="#a855f7" stroke-width="1"/>
+  <text x="80" y="567" text-anchor="middle" fill="#d8b4fe" font-size="9">REVIEW</text>
+
+  <rect x="150" y="548" width="80" height="30" rx="4" fill="#1e3a5f" stroke="#3b82f6" stroke-width="1"/>
+  <text x="190" y="567" text-anchor="middle" fill="#93c5fd" font-size="9">SENT</text>
+
+  <rect x="260" y="548" width="95" height="30" rx="4" fill="#1e3a5f" stroke="#3b82f6" stroke-width="1"/>
+  <text x="307" y="567" text-anchor="middle" fill="#93c5fd" font-size="9">ACKNOWLEDGED</text>
+
+  <rect x="385" y="548" width="80" height="30" rx="4" fill="#1e1b0e" stroke="#f59e0b" stroke-width="1"/>
+  <text x="425" y="567" text-anchor="middle" fill="#fde68a" font-size="9">INVOICED</text>
+
+  <rect x="495" y="548" width="95" height="30" rx="4" fill="#0f3b1e" stroke="#22c55e" stroke-width="1"/>
+  <text x="542" y="567" text-anchor="middle" fill="#86efac" font-size="9">RECONCILED</text>
+
+  <rect x="620" y="548" width="80" height="30" rx="4" fill="#0f3b1e" stroke="#22c55e" stroke-width="1"/>
+  <text x="660" y="567" text-anchor="middle" fill="#86efac" font-size="9">RECEIVED</text>
+
+  <rect x="730" y="548" width="90" height="30" rx="4" fill="#27272a" stroke="#52525b" stroke-width="1"/>
+  <text x="775" y="567" text-anchor="middle" fill="#a1a1aa" font-size="9">COMPLETED</text>
+
+  <rect x="850" y="548" width="80" height="30" rx="4" fill="#3b0a0a" stroke="#ef4444" stroke-width="1"/>
+  <text x="890" y="567" text-anchor="middle" fill="#fca5a5" font-size="9">CANCELLED</text>
+
+  <!-- Arrows between states -->
+  <line x1="120" y1="563" x2="146" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="230" y1="563" x2="256" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="355" y1="563" x2="381" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="465" y1="563" x2="491" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="590" y1="563" x2="616" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="700" y1="563" x2="726" y2="563" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Missing INVOICED trigger note -->
+  <text x="385" y="600" text-anchor="middle" fill="#f87171" font-size="9">⚠ NO automated trigger to reach INVOICED</text>
+  <text x="385" y="614" text-anchor="middle" fill="#f87171" font-size="8">invoice-po-matcher assigns po_number but never calls transitionLifecycleState</text>
+
+  <!-- Auto-matcher cron -->
+  <rect x="40" y="630" width="540" height="20" rx="3" fill="#1a1a2e" stroke="#52525b" stroke-width="0.5"/>
+  <text x="44" y="644" fill="#71717a" font-size="8">Crons: invoice-po-auto-match (30m) · po-sync (2h) · po-receipt-recheck (30m) · po-arrival-risk-check (2h)</text>
+
+  <!-- Gap section -->
+  <rect x="600" y="593" width="280" height="60" rx="4" fill="#1f1b0a" stroke="#f59e0b" stroke-width="1"/>
+  <text x="740" y="610" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="bold">⚠ Key Gap</text>
+  <text x="608" y="626" fill="#a1a1aa" font-size="9">POStepper shows: Sent → Recognized → Shipped → Received → Reconciled</text>
+  <text x="608" y="640" fill="#a1a1aa" font-size="9">State machine defines: SENT → ACKNOWLEDGED → INVOICED → RECONCILED → RECEIVED</text>
+  <text x="608" y="650" fill="#f87171" font-size="8">Two different models · INVOICED stage not rendered · INVOICED has no trigger</text>
+
+  <!-- Cross-panel bridge context -->
+  <rect x="20" y="665" width="1160" height="40" rx="4" fill="#13131a" stroke="#3f3f46" stroke-width="1"/>
+  <text x="40" y="683" fill="#a1a1aa" font-size="9" font-weight="bold">PurchasingLifecycleContext — Cross-Panel Bridges</text>
+  <text x="40" y="697" fill="#71717a" font-size="9">Focus/Hover linking · Draft Event (Ordering → Purchases) · Receipt Event (RCV → Ordering) · Scroll-to-PO navigation</text>
+
+  <!-- ──────────────────── GAPS & RECOMMENDATIONS ──────────────────── -->
+  <text x="20" y="740" fill="#a1a1aa" font-size="11" font-weight="bold" text-transform="uppercase">┃ Critical Gaps (see analysis)</text>
+
+  <rect x="20" y="752" width="270" height="60" rx="4" fill="#3b0a0a" stroke="#ef4444" stroke-width="1"/>
+  <text x="30" y="769" fill="#fca5a5" font-size="9" font-weight="bold">Gap: PO-to-Invoice Modified Match</text>
+  <text x="30" y="783" fill="#a1a1aa" font-size="8">No action exists to adjust PO line items /</text>
+  <text x="30" y="795" fill="#a1a1aa" font-size="8">prices to match invoice data</text>
+
+  <rect x="310" y="752" width="270" height="60" rx="4" fill="#3b0a0a" stroke="#ef4444" stroke-width="1"/>
+  <text x="320" y="769" fill="#fca5a5" font-size="9" font-weight="bold">Gap: INVOICED State Orphaned</text>
+  <text x="320" y="783" fill="#a1a1aa" font-size="8">invoice-po-matcher doesn't trigger</text>
+  <text x="320" y="795" fill="#a1a1aa" font-size="8">lifecycle_state transition to INVOICED</text>
+
+  <rect x="600" y="752" width="270" height="60" rx="4" fill="#3b0a0a" stroke="#ef4444" stroke-width="1"/>
+  <text x="610" y="769" fill="#fca5a5" font-size="9" font-weight="bold">Gap: Direct Send Still Risky</text>
+  <text x="610" y="783" fill="#a1a1aa" font-size="8">Commit & Send goes through approval flow.</text>
+  <text x="610" y="795" fill="#a1a1aa" font-size="8">No dashboard surface to send from Active.</text>
+
+  <rect x="890" y="752" width="280" height="60" rx="4" fill="#1e1b0e" stroke="#f59e0b" stroke-width="1"/>
+  <text x="1030" y="769" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="bold">Gap: Freight Pattern Learning</text>
+  <text x="898" y="783" fill="#a1a1aa" font-size="8">Freight tracked but not tied to PO lifecycle.</text>
+  <text x="898" y="795" fill="#a1a1aa" font-size="8">No automated price/variance check</text>
+
+  <text x="20" y="835" fill="#52525b" font-size="9">Source: full code trace of PurchasingPanel.tsx · ActivePurchasesPanel.tsx · ReceivedItemsPanel.tsx · po-lifecycle.ts · po-sender.ts · invoice-po-matcher.ts</text>
+
+  <!-- Legend -->
+  <circle cx="220" cy="870" r="4" fill="#22c55e"/>
+  <text x="228" y="874" fill="#71717a" font-size="8">Works well</text>
+  <circle cx="320" cy="870" r="4" fill="#f59e0b"/>
+  <text x="328" y="874" fill="#71717a" font-size="8">Partial / Has gaps</text>
+  <circle cx="430" cy="870" r="4" fill="#ef4444"/>
+  <text x="438" y="874" fill="#71717a" font-size="8">Missing / Broken</text>
+</svg>

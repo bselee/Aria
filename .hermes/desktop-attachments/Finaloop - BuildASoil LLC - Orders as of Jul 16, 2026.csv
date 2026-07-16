@@ -1,0 +1,131 @@
+Placed At,Source,Sales Channel,Order,Customer,Net Sales,Net Order,"Balance as of Jul 16, 2026",Current Balance,Status,Payment
+07/16/2026,buildasoil-retail,Draft Orders,#2611,Russell Edgar,$437,$457.32,$457.32,$457.32,"Unfulfilled, Unpaid",
+07/15/2026,buildasoil-wholesale,Online Store,#4688,Mark Kunshek,$2412,$2412,$2412,$2412,"Fulfilled, Unpaid",
+07/15/2026,buildasoil-wholesale,Online Store,#4687,Justin Simmons,$2486,$2486,$2486,$2486,"Unfulfilled, Unpaid",
+07/14/2026,buildasoil-wholesale,Online Store,#4686,Thomas Quintana,$1878,$1878,$1878,$1878,"Fulfilled, Unpaid",
+07/14/2026,buildasoil-wholesale,Online Store,#4685,Peter Hilleary,$3945.35,$3945.35,$3945.35,$3945.35,"Fulfilled, Unpaid",
+07/13/2026,buildasoil-retail,Draft Orders,#2609,Teddy Lopez,$42,$43.96,$43.96,$43.96,"Fulfilled, Unpaid",Manual
+07/11/2026,buildasoil-wholesale,Online Store,#4684,Sandra Bower,$169.71,$169.71,$169.71,$169.71,"Fulfilled, Unpaid",Unknown
+07/11/2026,buildasoil-wholesale,Online Store,#4683,Ian DeShon,$11189.23,$11189.23,$11189.23,$11189.23,"Fulfilled, Unpaid",
+07/10/2026,buildasoil-wholesale,Online Store,#4682,Travis Chapman,$3201.01,$3201.01,$3201.01,$3201.01,"Fulfilled, Unpaid",Unknown
+07/10/2026,buildasoil-retail,Draft Orders,#2607,Austin Baere,$179,$187.33,$187.33,$187.33,"Fulfilled, Unpaid",Manual
+07/10/2026,buildasoil,Online Store,#23484097,Tammy Triche,$56.65,$61.95,$61.95,$61.95,"Unfulfilled, Unpaid",
+07/10/2026,buildasoil,Online Store,#23484077,Tammy Triche,$29.75,$32.65,$32.65,$32.65,"Unfulfilled, Unpaid",
+07/09/2026,buildasoil-retail,Draft Orders,#2604,Dale Lyneis,$23,$24.07,$24.07,$24.07,"Fulfilled, Unpaid",Manual
+07/09/2026,buildasoil-wholesale,Online Store,#4680,Bailey Damast,$411.17,$411.17,$411.17,$411.17,"Fulfilled, Unpaid",
+07/09/2026,buildasoil-retail,Draft Orders,#2601,Gerren Anderson,$270,$270,$270,$270,"Fulfilled, Unpaid",Manual
+07/08/2026,buildasoil-wholesale,Online Store,#4678,Ryan Clout,$4472.6,$4472.6,$4472.6,$4472.6,"Fulfilled, Unpaid",
+07/08/2026,buildasoil-retail,Online Store,#2594,Micah Ross,$500,$523.25,$350,$350,"Fulfilled, Partially paid","Manual, Shopify Payments"
+07/08/2026,buildasoil-wholesale,Online Store,#4677,Michael Davidson,$1666,$1666,$1666,$1666,"Fulfilled, Unpaid",
+07/08/2026,buildasoil-retail,Draft Orders,#2593,James Joseph,$330,$345.35,$345.35,$345.35,"Fulfilled, Unpaid",Manual
+07/07/2026,buildasoil-retail,Online Store,#2589,Micah Ross,$500,$523.25,$523.25,$523.25,"Fulfilled, Unpaid",Manual
+07/06/2026,buildasoil-wholesale,Online Store,#4674,Isaiah Tyler,$184.75,$184.75,$184.75,$184.75,"Fulfilled, Unpaid",
+07/06/2026,buildasoil-wholesale,Online Store,#4673,Tony Cochran,$2198.8,$2198.8,$2198.8,$2198.8,"Fulfilled, Unpaid",
+07/05/2026,buildasoil,Online Store,#23480267,Pueblo of Pojuaque Cannabis,$375.15,$375.15,$375.15,$375.15,"Fulfilled, Unpaid",Unknown
+07/03/2026,buildasoil-wholesale,Online Store,#4672,Gary Underwood,$2683.18,$2683.18,$2683.18,$2683.18,"Fulfilled, Unpaid",Unknown
+07/02/2026,buildasoil-wholesale,Online Store,#4671,Beau Bradley,$216.34,$216.34,$216.34,$216.34,"Fulfilled, Unpaid",
+07/02/2026,buildasoil-wholesale,Online Store,#4670,Kyle Blessing,$2331,$2331,$2331,$2331,"Fulfilled, Unpaid",
+07/02/2026,buildasoil-wholesale,Online Store,#4668,Mason Hernandez,$7577,$7577,$7577,$7577,"Fulfilled, Unpaid",
+07/01/2026,buildasoil-wholesale,Online Store,#4666,Jessica Cortez,$5332,$5332,$5332,$5332,"Fulfilled, Unpaid",
+06/29/2026,buildasoil-wholesale,Online Store,#4662,Cheryl Dobbins,$3897.95,$3897.95,$3897.95,$3897.95,"Fulfilled, Unpaid",
+06/25/2026,buildasoil-wholesale,Online Store,#4660,Jacob Kerekes,$2100,$2100,$2100,$2100,"Unfulfilled, Unpaid",
+06/24/2026,buildasoil-retail,Online Store,#2571,Jo Allen,$96,$100.47,$100.47,$100.47,"Fulfilled, Unpaid",Manual
+06/23/2026,buildasoil-wholesale,Online Store,#4655,Zobec Ness,$2764.48,$2764.48,$2764.48,$2764.48,"Fulfilled, Unpaid",
+06/21/2026,buildasoil-wholesale,Online Store,#4653,Bryson Clark,$2351,$2351,$2351,$2351,"Fulfilled, Partially restocked, Unpaid",
+06/19/2026,buildasoil-wholesale,Online Store,#4651,Emily Williams,$3051.88,$3051.88,$3051.88,$3051.88,"Partially fulfilled, Unpaid",
+06/19/2026,buildasoil-wholesale,Online Store,#4650,Alex Jones,$1700,$1700,$1700,$1700,"Fulfilled, Unpaid",
+06/18/2026,buildasoil-wholesale,Online Store,#4649,Michael Jernigan,$1366.59,$1366.59,$1366.59,$1366.59,"Fulfilled, Unpaid",
+06/18/2026,buildasoil-wholesale,Online Store,#4648,Forrest A,$126.32,$126.32,$126.32,$126.32,"Fulfilled, Unpaid",
+06/17/2026,buildasoil-wholesale,Online Store,#4646,Richard Aylard,$2742,$2742,$2742,$2742,"Fulfilled, Unpaid",
+06/15/2026,buildasoil-wholesale,Online Store,#4643,Robb Turpyn,$3128,$3362.62,$3362.62,$3362.62,"Fulfilled, Unpaid",
+06/15/2026,buildasoil-wholesale,Online Store,#4642,Michael Davidson,$155.47,$155.47,$155.47,$155.47,"Fulfilled, Unpaid",
+06/12/2026,buildasoil-retail,Draft Orders,#2544,Josh Sisneros,$55,$57.56,$57.56,$57.56,"Fulfilled, Unpaid",Manual
+06/12/2026,buildasoil-retail,Draft Orders,#2543,Josh Sisneros,$72,$75.35,$75.35,$75.35,"Fulfilled, Unpaid",Manual
+06/11/2026,buildasoil,Draft Orders,#23451447,Gilbert Burke,$1086.63,$1086.63,$1086.63,$1086.63,"Fulfilled, Unpaid",Unknown
+06/10/2026,buildasoil-wholesale,Online Store,#4636,Forrest A,$3314.55,$3314.55,$3314.55,$3314.55,"Fulfilled, Unpaid",
+06/09/2026,buildasoil-wholesale,Online Store,#4631,Isaiah Tyler,$239.39,$239.39,$239.39,$239.39,"Fulfilled, Unpaid",
+06/05/2026,buildasoil-wholesale,Online Store,#4628,Justin Stevenson,$118.77,$118.77,$118.77,$118.77,"Partially fulfilled, Unpaid",
+06/05/2026,buildasoil-wholesale,Online Store,#4627,Jessica Cortez,$5320,$5745.62,$5745.62,$5745.62,"Fulfilled, Unpaid",
+06/05/2026,buildasoil-retail,Draft Orders,#2526,Robert Foulk,$18,$18.84,$0.1,$0.1,"Fulfilled, Partially paid","Manual, Link"
+06/03/2026,buildasoil-wholesale,Online Store,#4623,Leonard Song,$2529,$2529,$2529,$2529,"Fulfilled, Unpaid",
+06/02/2026,buildasoil-wholesale,Online Store,#4622,Juan Quezada,$1600,$1600,$1600,$1600,"Fulfilled, Unpaid",
+05/29/2026,buildasoil-wholesale,Online Store,#4616,Brendan Woltan,$586.66,$586.66,$586.66,$586.66,"Fulfilled, Unpaid",
+05/29/2026,buildasoil-wholesale,Online Store,#4615,Jacob Kerekes,$2166,$2166,$2166,$2166,"Fulfilled, Unpaid",
+05/28/2026,buildasoil-wholesale,Online Store,#4614,Thomas Simpson,$14539.5,$14539.5,$14539.5,$14539.5,"Fulfilled, Unpaid",
+05/22/2026,buildasoil-retail,Draft Orders,#2476,Ron Stern,$330,$345.35,$200,$200,"Fulfilled, Partially paid","Manual, Shopify Payments"
+05/22/2026,buildasoil-retail,Draft Orders,#2474,Ron Stern,$660,$690.69,$690.69,$690.69,"Fulfilled, Unpaid",Manual
+05/22/2026,buildasoil-retail,Draft Orders,#2473,Ron Stern,$114,$119.31,$119.31,$119.31,"Fulfilled, Unpaid",Manual
+05/21/2026,buildasoil-retail,Draft Orders,#2469,Jesse Maslen,$660,$690.69,$690.69,$690.69,"Fulfilled, Unpaid",Manual
+05/19/2026,buildasoil-wholesale,Draft Orders,#4601,Devin Williams,$1082.51,$1082.51,$1082.51,$1082.51,"Fulfilled, Unpaid",
+05/11/2026,buildasoil-wholesale,Online Store,#4591,Isaiah Tyler,$139.32,$139.32,$139.32,$139.32,"Fulfilled, Unpaid",Unknown
+05/07/2026,buildasoil-retail,Draft Orders,#2421,Ken Altmann,$12,$12.56,$12.56,$12.56,"Fulfilled, Unpaid",Manual
+05/07/2026,buildasoil,Online Store,#23419287,Connie Gholson,$110,$121.29,$121.29,$121.29,"Fulfilled, Unpaid",
+05/01/2026,buildasoil-wholesale,Online Store,#4574,James Harper,$2032,$2032,$2032,$2032,"Fulfilled, Unpaid",
+04/30/2026,buildasoil-retail,Draft Orders,#2407,Tara Gray,$163,$170.59,$170.59,$170.59,"Fulfilled, Unpaid",Manual
+04/29/2026,buildasoil-retail,Draft Orders,#2398,Ken Altmann,$102,$106.75,$106.75,$106.75,"Fulfilled, Unpaid",Manual
+04/29/2026,buildasoil-wholesale,Online Store,#4567,Matt's Hydroponics,$9208.5,$9208.5,$3208.5,$3208.5,"Fulfilled, Partially paid",Link
+04/23/2026,buildasoil-retail,Online Store,#2378,Jo Allen,$131,$137.1,$137.1,$137.1,"Fulfilled, Unpaid",Manual
+04/14/2026,buildasoil-wholesale,Online Store,#4546,Toledo Indoor Garden Supply,$4408.89,$4408.89,$2408.89,$2408.89,"Fulfilled, Partially paid",Link
+04/10/2026,buildasoil-retail,Draft Orders,#2343,Alex Jensen,$73,$76.4,$76.4,$76.4,"Fulfilled, Unpaid",Manual
+04/09/2026,buildasoil,Online Store,#23382367,Samuel Krull,$96.04,$101.04,$32.86,$32.86,"Unfulfilled, Partially paid",Shopify Payments
+04/08/2026,buildasoil-retail,Draft Orders,#2336,Teddy Lopez,$43,$45,$45,$45,"Fulfilled, Unpaid",Manual
+04/08/2026,buildasoil-retail,Draft Orders,#2333,Brady Selvage,$72,$75.35,$75.35,$75.35,"Fulfilled, Unpaid",Manual
+04/07/2026,buildasoil-retail,Draft Orders,#2329,Pat Gauthreaux,$33,$34.54,$34.54,$34.54,"Fulfilled, Unpaid",Manual
+04/03/2026,buildasoil-retail,Draft Orders,#2320,David Kurronen,$183,$191.52,$191.52,$191.52,"Fulfilled, Unpaid",Manual
+03/31/2026,buildasoil-retail,Draft Orders,#2312,David Parry,$169,$176.87,$176.87,$176.87,"Fulfilled, Unpaid",Manual
+03/26/2026,buildasoil-wholesale,Online Store,#4506,Sandra Bower,$1952.69,$2030.21,$-282.48,$-282.48,"Fulfilled, Partially restocked, Paid","Unknown, Link"
+03/25/2026,buildasoil-retail,Draft Orders,#2296,Phillip Orloff,$330,$345.35,$345.35,$345.35,"Fulfilled, Unpaid",Manual
+03/25/2026,buildasoil,Online Store,#23368387,Adam Pratt,$170.5,$180.37,$-37.1,$-37.1,"Fulfilled, Paid",Shopify Payments
+03/20/2026,buildasoil-retail,Draft Orders,#2285,David Parry,$298,$311.86,$311.86,$311.86,"Fulfilled, Unpaid",Manual
+03/20/2026,buildasoil-retail,Draft Orders,#2284,David Kurronen,$480,$502.32,$502.32,$502.32,"Fulfilled, Unpaid",Manual
+03/20/2026,buildasoil-retail,Draft Orders,#2282,John Atwood,$33,$34.54,$34.54,$34.54,"Fulfilled, Unpaid",Manual
+03/19/2026,buildasoil-retail,Draft Orders,#2280,Dayvid Duran,$18,$18.84,$18.84,$18.84,"Fulfilled, Unpaid",Manual
+03/19/2026,buildasoil-retail,Draft Orders,#2279,Joshua Lopez,$37,$38.72,$38.72,$38.72,"Fulfilled, Unpaid",Manual
+03/18/2026,buildasoil-retail,Draft Orders,#2276,John Atwood,$27,$28.25,$28.25,$28.25,"Fulfilled, Unpaid",Manual
+03/16/2026,buildasoil-retail,Online Store,#2270,Jo Allen,$48,$50.23,$50.23,$50.23,"Fulfilled, Unpaid",Manual
+03/16/2026,buildasoil-retail,Draft Orders,#2267,McKinley Scott,$3243.48,$3310.44,$3310.44,$3310.44,"Fulfilled, Partially restocked, Unpaid",Manual
+03/12/2026,buildasoil-wholesale,Draft Orders,#4472,Daniel Rodriguez,$269,$269,$269,$269,"Fulfilled, Unpaid",
+03/09/2026,buildasoil-retail,Draft Orders,#2239,Gerren Anderson,$131,$137.09,$137.09,$137.09,"Fulfilled, Unpaid",Manual
+02/27/2026,buildasoil-retail,Online Store,#2220,Micah Ross,$288,$301.4,$301.4,$301.4,"Fulfilled, Unpaid",Manual
+02/26/2026,buildasoil-retail,Draft Orders,#2215,James Joseph,$785,$821.5,$821.5,$821.5,"Fulfilled, Unpaid",Manual
+02/25/2026,buildasoil-retail,Draft Orders,#2211,Micah Ross,$946,$989.99,$989.99,$989.99,"Fulfilled, Unpaid",Manual
+02/24/2026,buildasoil,Online Store,#23338717,Pueblo of Pojuaque Cannabis,$190.99,$190.99,$190.99,$190.99,"Fulfilled, Unpaid",Unknown
+02/23/2026,buildasoil-retail,Draft Orders,#2208,Tara Gray,$29,$30.35,$30.35,$30.35,"Fulfilled, Unpaid",Manual
+02/23/2026,buildasoil-wholesale,Online Store,#4438,Lila Waier,$228.05,$228.05,$2.28,$2.28,"Fulfilled, Partially paid","Manual, Link"
+02/19/2026,buildasoil-wholesale,Online Store,#4432,Chrissie Brown,$2107.35,$2107.35,$163.36,$163.36,"Fulfilled, Partially paid","Manual, Link"
+02/17/2026,buildasoil,Gorgias ‑ Live Chat & Helpdesk,#23332367,Shawn Roehrich,$49.99,$54.24,$54.24,$54.24,"Fulfilled, Unpaid",Manual
+02/17/2026,buildasoil-wholesale,Online Store,#4430,Josh Martin,$4000,$4000,$20,$20,"Fulfilled, Partially paid","Manual, Link"
+02/09/2026,buildasoil,Online Store,#23325377,Andrew Chase,$214,$226.84,$15.26,$15.26,"Unfulfilled, Partially restocked, Partially paid",Shopify Payments
+02/06/2026,buildasoil-retail,Draft Orders,#2179,Dayvid Duran,$70,$73.26,$73.26,$73.26,"Fulfilled, Unpaid",Manual
+02/05/2026,buildasoil,Online Store,#23322807,Derek Reniker,$2774.41,$3021.34,$-15.89,$-15.89,"Fulfilled, Partially restocked, Paid",Shopify Payments
+01/30/2026,buildasoil-retail,Draft Orders,#2173,Zach Branson,$40.03,$41.89,$20,$20,"Fulfilled, Partially paid","Manual, Shopify Payments"
+01/27/2026,buildasoil-wholesale,Online Store,#4398,Jacob Kerekes,$3581.62,$3581.62,$1817.9,$1817.9,"Fulfilled, Partially paid","Unknown, Link"
+01/26/2026,buildasoil-retail,Online Store,#2166,Jo Allen,$48,$50.23,$50.23,$50.23,"Fulfilled, Unpaid",Manual
+01/08/2026,buildasoil-retail,Draft Orders,#2138,Aaron Faulkner,$22,$23.03,$23.03,$23.03,"Fulfilled, Unpaid",Manual
+01/05/2026,buildasoil,Online Store,#23299627,Pueblo of Pojuaque Cannabis,$1694.7,$1694.7,$1694.7,$1694.7,"Fulfilled, Unpaid",Unknown
+12/31/2025,buildasoil-wholesale,Online Store,#4353,Toledo Indoor Garden Supply,$2894.33,$2894.33,$2894.33,$2894.33,"Fulfilled, Unpaid",Manual
+12/29/2025,buildasoil-wholesale,Online Store,#4351,Eli Fuller,$1700,$1700,$1700,$1700,"Fulfilled, Unpaid",Manual
+12/29/2025,buildasoil-wholesale,Online Store,#4349,Mike Towle,$3515,$3515,$3515,$3515,"Fulfilled, Unpaid",Manual
+12/19/2025,buildasoil-wholesale,Online Store,#4343,Troy Smith,$170.14,$170.14,$170.14,$170.14,"Fulfilled, Unpaid",Manual
+12/15/2025,buildasoil-wholesale,Online Store,#4337,Troy Smith,$483.3,$483.3,$483.3,$483.3,"Fulfilled, Unpaid",Manual
+12/12/2025,buildasoil-wholesale,Online Store,#4334,James Harper,$2244,$2244,$2244,$2244,"Fulfilled, Unpaid",Manual
+12/09/2025,buildasoil-wholesale,Online Store,#4329,Kyle Blessing,$4147,$4147,$4147,$4147,"Fulfilled, Unpaid",Manual
+12/07/2025,buildasoil-wholesale,Online Store,#4327,Brendan Woltan,$130.79,$130.79,$130.79,$130.79,"Fulfilled, Unpaid",Manual
+11/20/2025,buildasoil-wholesale,Online Store,#4318,Leonard Song,$2236,$2236,$2236,$2236,"Fulfilled, Unpaid",Manual
+11/17/2025,buildasoil-wholesale,Online Store,#4311,Brad Bullock,$4979.68,$4979.68,$4979.68,$4979.68,"Fulfilled, Unpaid",Manual
+11/13/2025,buildasoil-wholesale,Draft Orders,#4307,Brynnen Beierle,$17473.27,$17473.27,$17473.27,$17473.27,"Fulfilled, Unpaid",Manual
+11/10/2025,buildasoil-wholesale,Online Store,#4300,Jacob Kerekes,$679.25,$679.25,$679.25,$679.25,"Fulfilled, Unpaid",Manual
+11/07/2025,buildasoil-wholesale,Online Store,#4296,Kyle Blessing,$3230,$3230,$3230,$3230,"Fulfilled, Unpaid",Manual
+11/04/2025,buildasoil-wholesale,Online Store,#4288,Tony Cochran,$2681.38,$2681.38,$2681.38,$2681.38,"Fulfilled, Unpaid",Manual
+10/22/2025,buildasoil-wholesale,Online Store,#4259,Jacob Kerekes,$6000.2,$6000.2,$6000.2,$6000.2,"Fulfilled, Unpaid",Manual
+10/16/2025,buildasoil-wholesale,Online Store,#4254,Kyle Blessing,$3230,$3230,$3230,$3230,"Fulfilled, Unpaid",Manual
+10/08/2025,buildasoil-wholesale,Online Store,#4236,Kyle Blessing,$3833.36,$3833.36,$3833.36,$3833.36,"Fulfilled, Unpaid",Manual
+09/29/2025,buildasoil-wholesale,Online Store,#4220,Isaiah Tyler,$341.91,$341.91,$341.91,$341.91,"Fulfilled, Unpaid",Manual
+09/28/2025,buildasoil-wholesale,Online Store,#4219,Isaiah Tyler,$1255.67,$1255.67,$1255.67,$1255.67,"Fulfilled, Unpaid",Manual
+09/25/2025,buildasoil-wholesale,Online Store,#4214,Jacob Kerekes,$3358.46,$3358.46,$3358.46,$3358.46,"Fulfilled, Unpaid",Manual
+09/06/2025,buildasoil,Online Store,#23192657,John Paul Domingo,$79.98,$87.08,$-85.36,$-85.36,"Fulfilled, Partially restocked, Paid",Shopify Payments
+07/01/2025,buildasoil-wholesale,Draft Orders,#4049,Gabriel Zamorano,$2509.5,$2509.5,$2509.5,$2509.5,"Fulfilled, Unpaid",Manual
+06/12/2025,buildasoil-wholesale,Draft Orders,#3985,Mason Vasquez,$2501,$2501,$2501,$2501,"Fulfilled, Unpaid","Manual, Unknown"
+03/30/2025,buildasoil,Online Store,#23038907,WILLIAM LEBLANC,$770.16,$770.16,$-34.4,$-34.4,"Fulfilled, Partially restocked, Paid",Shopify Payments
+03/28/2016,buildasoil,Draft Orders,#2115547,Travis Oshman,$7065.17,$7065.17,$7065.17,$7065.17,"Fulfilled, Unpaid",Unknown
+2026-07-16T15:34:37.542Z

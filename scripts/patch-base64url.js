@@ -2,7 +2,9 @@
  * Post-build script: patches the buffer polyfill in webpack chunks to
  * support base64url encoding. Run after `next build`.
  *
- * Usage: automatically via `npm run build`
+ * The buffer polyfill v6.x doesn't support Node's 'base64url' encoding.
+ * Strategy: Add 'case"base64url":' after EVERY occurrence of 'case"base64":'
+ * and '"base64url"' after EVERY '"base64"' in encoding lists.
  */
 const fs = require('fs');
 const path = require('path');
@@ -20,40 +22,35 @@ function patchChunks() {
 
   for (const file of files) {
     const filePath = path.join(CHUNKS_DIR, file);
-    let content = fs.readFileSync(filePath, 'utf8');
-    let modified = false;
+    let c = fs.readFileSync(filePath, 'utf8');
+    const orig = c;
+    let mods = 0;
 
-    // Pattern: isEncoding switch that lists base64 without base64url
-    // Matches: case"base64":case"ucs2" or case"base64":case"base64url": (already patched)
-    const p1 = /case"base64":case"ucs2"/g;
-    if (p1.test(content)) {
-      content = content.replace(p1, 'case"base64":case"base64url":case"ucs2"');
-      modified = true;
-    }
+    // Pattern 1: case"base64": (anywhere in the file) — add case"base64url": after it
+    // Only if base64url doesn't already follow
+    c = c.replace(/case"base64":(?!case"base64url")/g, 'case"base64":case"base64url":');
+    mods += (c.match(/case"base64url":/g) || []).length - (orig.match(/case"base64url":/g) || []).length;
 
-    // Pattern 2: encoding check with "base64","ucs2"
-    const p2 = /"base64","ucs2","ucs-2","utf16le","utf-16le":return!0/g;
-    if (p2.test(content)) {
-      content = content.replace(p2, '"base64","base64url","ucs2","ucs-2","utf16le","utf-16le":return!0');
-      modified = true;
-    }
+    // Pattern 2: "base64" in encoding list strings — add "base64url" after it
+    // Matches "base64","ucs2" etc.
+    c = c.replace(/"base64","ucs2"/g, '"base64","base64url","ucs2"');
+    c = c.replace(/"base64","ascii"/g, '"base64","base64url","ascii"');
+    c = c.replace(/"base64","hex"/g, '"base64","base64url","hex"');
 
-    // Pattern 3: raw isEncoding in fromString
-    // Matches: case"base64":case"base64url": (already good) or case"base64":case"utf8": (rare)
-    const p3 = /case"base64":(?=case"utf8"|case"ascii"|case"latin1"|case"binary"|case"hex")/g;
-    if (p3.test(content)) {
-      content = content.replace(p3, 'case"base64":case"base64url":');
-      modified = true;
-    }
+    // Pattern 3: "base64" as part of array-like encoding checks
+    c = c.replace(/"base64","ucs2","ucs-2","utf16le","utf-16le"/g, '"base64","base64url","ucs2","ucs-2","utf16le","utf-16le"');
+    c = c.replace(/"base64","ucs2","ucs-2","utf16le","utf-16le","raw"/g, '"base64","base64url","ucs2","ucs-2","utf16le","utf-16le","raw"');
 
-    if (modified) {
-      fs.writeFileSync(filePath, content, 'utf8');
+    if (c !== orig) {
+      fs.writeFileSync(filePath, c, 'utf8');
       patched++;
-      console.log(`  [patch-base64url] Patched ${file}`);
+      const added = (c.match(/base64url/g) || []).length - (orig.match(/base64url/g) || []).length;
+      const total = (c.match(/base64url/g) || []).length;
+      console.log(`  [patch-base64url] ${file}: +${added} base64url, total ${total}`);
     }
   }
 
-  console.log(`  [patch-base64url] ${patched} chunk(s) patched for base64url support`);
+  console.log(`  [patch-base64url] Patched ${patched} chunk(s)`);
 }
 
 patchChunks();

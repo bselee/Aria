@@ -29,6 +29,7 @@ import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
 import BasautoPanel from "@/components/dashboard/BasautoPanel";
 import DedupActivityPanel from "@/components/dashboard/DedupActivityPanel";
 import ReconciliationPanel from "@/components/dashboard/ReconciliationPanel";
+import DepositMatchPanel from "@/components/dashboard/DepositMatchPanel";
 
 import type { PanelId } from "./useDashboardLayout";
 
@@ -152,6 +153,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
             label: "Reconciliation",
             short: "Recon",
             render: () => <ReconciliationPanel />,
+        },
+        {
+            id: "deposit-match",
+            label: "Deposit Match",
+            short: "Deposit Match",
+            render: () => <DepositMatchPanel />,
         },
     ];
 

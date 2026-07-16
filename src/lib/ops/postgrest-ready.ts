@@ -11,6 +11,8 @@
  */
 
 import * as crypto from "crypto";
+import * as http from "http";
+import * as https from "https";
 
 export type PostgrestReadyState = "ACTIVE" | "COMING_UP" | "UNKNOWN" | "MISSING_URL";
 
@@ -53,39 +55,52 @@ function getAuthToken(): string {
     return `${header}.${payload}.${sig}`;
 }
 
+
+/**
+ * HTTP GET helper using Node's native http/https modules.
+ * Avoids undici/fetch incompatibility with PostgREST's Haskell/Warp
+ * server (observed as "SocketError: other side closed" on Windows).
+ */
+function nodeHttpGet(url: string, headers: Record<string, string>, timeoutMs: number): Promise<{ status: number; ok: boolean }> {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const mod = parsed.protocol === "https:" ? https : http;
+        const req = mod.get(
+            url,
+            { headers, timeout: timeoutMs },
+            (res) => {
+                // Consume body so connection can be reused
+                res.resume();
+                resolve({ status: res.statusCode ?? 0, ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 400 });
+            },
+        );
+        req.on("error", reject);
+        req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    });
+}
+
 /**
  * Single readiness probe: OpenAPI root + authenticated 1-row table query.
  * ACTIVE only when table query returns 2xx (not just TCP open / OpenAPI).
  */
 export async function probePostgrestReady(
-    fetchImpl: typeof fetch = fetch,
+    _fetchImpl?: typeof fetch,
     probeTable = "agent_heartbeats",
 ): Promise<PostgrestReadyState> {
     const base = getBaseUrl();
     if (!base) return "MISSING_URL";
 
     try {
-        const root = await fetchImpl(`${base}/`, {
-            method: "GET",
-            headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(4000),
-        } as RequestInit);
+        const root = await nodeHttpGet(`${base}/`, { Accept: "application/json" }, 4000);
 
         if (root.status === 503) return "COMING_UP";
         if (!(root.ok || root.status === 401)) return "UNKNOWN";
 
         const token = getAuthToken();
-        const q = await fetchImpl(
+        const q = await nodeHttpGet(
             `${base}/${probeTable}?select=agent_name&limit=1`,
-            {
-                method: "GET",
-                headers: {
-                    Accept: "application/json",
-                    apikey: token,
-                    Authorization: `Bearer ${token}`,
-                },
-                signal: AbortSignal.timeout(5000),
-            } as RequestInit,
+            { Accept: "application/json", apikey: token, Authorization: `Bearer ${token}` },
+            5000,
         );
 
         if (q.status === 503) return "COMING_UP";

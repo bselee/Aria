@@ -894,24 +894,218 @@ const apRetryCommand: BotCommand = {
     },
 };
 
-        export const hermiaCommands: BotCommand[] = [
-                            cognitionCommand,
-                            priorityCommand,
-                            orderNowCommand,
-                            ballCommand,
-                            orderGuardCommand,
-                            emailCommand,
-                            emailSearchCommand,
+                /**
+                 * /match — Cross-reference a bank deposit against the Daily Cash Report and
+                 * Finaloop Draft Orders to find which unpaid orders the deposit covers.
+                 *
+                 * Usage: /match <deposit_amount>
+                 * Requires the sheet CSV and Finaloop CSV in configured paths.
+                 */
+                const matchCommand: BotCommand = {
+                    name: "match",
+                    description: "Match a deposit to unpaid Draft Orders using Daily Cash Report + Finaloop export + Transactions",
+                    handler: async (ctx, deps) => {
+                        const text = getCmdText(ctx);
+                        const parts = text.split(/\s+/);
+                        const depositArg = parts[1];
+
+                        await ctx.sendChatAction("typing");
+
+                        try {
+                            const { reconcileDeposit, reconcileMultipleDeposits } = await import("../../lib/intelligence/finaloop-reconciler");
+                            const fs = await import("fs");
+                            const path = await import("path");
+
+                            // Known locations to look for CSVs
+                            const searchDirs = [
+                                process.cwd(),
+                                path.join(process.cwd(), ".hermes", "desktop-attachments"),
+                                path.join(process.cwd(), "data"),
+                                path.join(process.cwd(), "tmp"),
+                            ];
+
+                            let finaloopPath = "";
+                            let sheetPath = "";
+                            let transactionsPath = "";
+
+                            for (const dir of searchDirs) {
+                                if (fs.existsSync(dir)) {
+                                    const files = fs.readdirSync(dir);
+                                    if (!finaloopPath) {
+                                        const f = files.find(
+                                            (f: string) => f.includes("Finaloop") && f.endsWith(".csv")
+                                        );
+                                        if (f) finaloopPath = path.join(dir, f);
+                                    }
+                                    if (!sheetPath) {
+                                        const f = files.find(
+                                            (f: string) =>
+                                                (f.includes("Daily Cash Report") ||
+                                                 f.includes("daily-cash") ||
+                                                 f.includes("test-sheet")) &&
+                                                f.endsWith(".csv")
+                                        );
+                                        if (f) sheetPath = path.join(dir, f);
+                                    }
+                                    if (!transactionsPath) {
+                                        const f = files.find(
+                                            (f: string) =>
+                                                f.includes("Transactions") && f.endsWith(".csv") &&
+                                                !f.includes("Finaloop")
+                                        );
+                                        if (f) transactionsPath = path.join(dir, f);
+                                    }
+                                }
+                            }
+
+                            if (!finaloopPath || !sheetPath) {
+                                await ctx.reply(
+                                    "❌ CSVs not found.\n\n" +
+                                    "Place these files in .hermes/desktop-attachments/:\n" +
+                                    "1. Finaloop Draft Orders CSV (export from Finaloop)\n" +
+                                    "2. Daily Cash Report CSV (download from Google Drive)\n" +
+                                    "3. (Optional) Transactions CSV for auto-detect deposits\n\n" +
+                                    "Then: /match <deposit_amount>"
+                                );
+                                return;
+                            }
+
+                            const finaloopCsv = fs.readFileSync(finaloopPath, "utf-8");
+                            const sheetCsv = fs.readFileSync(sheetPath, "utf-8");
+                            const sheetLabel = path.basename(sheetPath, path.extname(sheetPath));
+
+                            // ── Transactions auto-detect mode ──
+                            if (!depositArg && transactionsPath) {
+                                const txCsv = fs.readFileSync(transactionsPath, "utf-8");
+                                const multiResult = reconcileMultipleDeposits(sheetCsv, finaloopCsv, txCsv, sheetLabel);
+
+                                if (multiResult.deposits.length === 0) {
+                                    await ctx.reply(
+                                        "📋 *Deposit Check*\n\n" +
+                                        "No pending Bank of Colorado deposits found in the Transactions export.\n" +
+                                        "Export a fresh Transactions CSV from Finaloop and try again.",
+                                        { parse_mode: "Markdown" }
+                                    );
+                                    return;
+                                }
+
+                                const lines: string[] = [
+                                    `📋 *Deposit Check — ${multiResult.deposits.length} pending*`,
+                                    `Sheet: ${sheetLabel} · ${multiResult.unpaidOrders.length} unpaid`,
+                                    "",
+                                ];
+
+                                for (let i = 0; i < multiResult.matches.length; i++) {
+                                    const m = multiResult.matches[i];
+                                    const icon = m.confidence === "high" ? "✅" : m.confidence === "medium" ? "🟡" : "⚪";
+                                    lines.push(
+                                        `${icon} *$${m.deposit.amount.toFixed(2)}*  ${m.deposit.date}`
+                                    );
+                                    lines.push(`   Window: ${m.dateWindow} · ${m.windowOrders.length} orders / $${m.windowTotal.toFixed(2)}`);
+
+                                    if (m.matchedOrders.length > 0) {
+                                        lines.push(
+                                            `   → ${m.matchedOrders.length} orders / $${m.matchedTotal.toFixed(2)}`
+                                        );
+                                        for (const o of m.matchedOrders.slice(0, 5)) {
+                                            lines.push(
+                                                `     ${o.orderName} $${o.unpaidBalance.toFixed(2)} ${o.customer} [${o.placedDate}]`
+                                            );
+                                        }
+                                        if (m.matchedOrders.length > 5) {
+                                            lines.push(`     …and ${m.matchedOrders.length - 5} more`);
+                                        }
+                                    } else {
+                                        lines.push(`   No orders in this date window (likely different period)`);
+                                    }
+                                    lines.push("");
+                                }
+
+                                lines.push(multiResult.summary);
+                                await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+                                return;
+                            }
+
+                            // ── Standard match mode ──
+                            if (!depositArg || isNaN(parseFloat(depositArg))) {
+                                await ctx.reply(
+                                    "Usage:\n" +
+                                    "  /match <amount>    — Match a specific deposit\n" +
+                                    "  /match             — Auto-detect deposits (requires Transactions CSV)"
+                                );
+                                return;
+                            }
+
+                            const depositAmount = parseFloat(depositArg);
+                            const result = reconcileDeposit(sheetCsv, finaloopCsv, depositAmount, sheetLabel);
+
+                            const lines: string[] = [];
+                            lines.push(`📋 *Deposit Match — $${depositAmount.toFixed(2)}*`);
+                            lines.push(`Sheet: ${result.sheetLabel} · ${result.totalSheetOrders} orders`);
+
+                            if (result.unpaidOrders.length > 0) {
+                                lines.push("");
+                                lines.push(`⬜ *${result.unpaidOrders.length} unpaid* — $${result.unpaidTotal.toFixed(2)}`);
+                                for (const o of result.unpaidOrders) {
+                                    const date = o.placedDate.split("/").slice(0, 2).join("/");
+                                    lines.push(`☐ ${o.orderName}  $${o.unpaidBalance.toFixed(2)}  ${o.customer}  [${date}]`);
+                                }
+                            }
+
+                            if (result.depositMatchesUnpaid) {
+                                lines.push("");
+                                lines.push(`✅ *Deposit exactly matches ${result.unpaidOrders.length} unpaid order(s)*`);
+                                lines.push("→ Match these in Finaloop: Bulk Actions → Link payment");
+                            } else {
+                                lines.push("");
+                                lines.push(`Variance: *$${result.depositVariance.toFixed(2)}*`);
+                                const { computeDepositCoverage } = await import("../../lib/intelligence/finaloop-reconciler");
+                                const coverage = computeDepositCoverage(depositAmount, result.unpaidOrders);
+                                if (coverage.matchedOrders.length > 0) {
+                                    lines.push(`Best match: ${coverage.matchedOrders.length} / *$${coverage.matchedTotal.toFixed(2)}*`);
+                                    for (const o of coverage.matchedOrders.slice(0, 10)) {
+                                        lines.push(`→ ${o.orderName}  $${o.unpaidBalance.toFixed(2)}  ${o.customer}`);
+                                    }
+                                }
+                            }
+
+                            if (result.paidOrders.length > 0) {
+                                lines.push("");
+                                lines.push(`✅ ${result.paidOrders.length} already paid — $${result.paidTotal.toFixed(2)}`);
+                            }
+                            if (result.notFoundInFinaloop.length > 0) {
+                                lines.push("");
+                                lines.push(`ℹ️ ${result.notFoundInFinaloop.length} not in Draft Orders — $${result.notFoundTotal.toFixed(2)}`);
+                            }
+                            lines.push("");
+                            lines.push(result.recommendation);
+
+                            await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+                        } catch (err: any) {
+                            await ctx.reply(`❌ Match failed: ${err.message}`);
+                        }
+                    },
+                };
+
+                export const hermiaCommands: BotCommand[] = [
+                    cognitionCommand,
+                    priorityCommand,
+                    orderNowCommand,
+                    ballCommand,
+                    orderGuardCommand,
+                    emailCommand,
+                    emailSearchCommand,
                     orderCommand,
-                            apSummaryCommand,
-                            taskCommand,
-                            budgetCommand,
-                            memoriesCommand,
-                            agentsCommand,
-                            hermiaCommand,
-                            shipCommand,
-                            costCommand,
-                            apHealthCommand,
+                    apSummaryCommand,
+                    taskCommand,
+                    budgetCommand,
+                    memoriesCommand,
+                    agentsCommand,
+                    hermiaCommand,
+                    shipCommand,
+                    costCommand,
+                    apHealthCommand,
                     reclassifyCommand,
                     apRetryCommand,
-                        ];
+                    matchCommand,
+                ];

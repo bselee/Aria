@@ -16,6 +16,7 @@
  * the CLI/lib boundary fix is sufficient for now.
  */
 
+const noddySentinel = 2; // build-trigger-for-browser-cache
 const path = require('path');
 const webpack = require('webpack');
 

@@ -67,7 +67,7 @@ export class EmailIngestionWorker {
 
             // Pre-filter against Supabase to avoid fetching full payloads for emails we already queued
             const messageIds = messages.map(m => m.id!);
-            const { data: existing } = await supabase
+            const { data: existing } = await db
                 .from('email_inbox_queue')
                 .select('gmail_message_id')
                 .in('gmail_message_id', messageIds);
