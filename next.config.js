@@ -17,6 +17,7 @@
  */
 
 const path = require('path');
+const webpack = require('webpack');
 
 /**
  * Regex for packages that require Node built-ins
@@ -94,7 +95,19 @@ const nextConfig = {
         'pdfkit',
     ],
     webpack: (config, { isServer }) => {
-      config.resolve.alias['@'] = isServer ? path.join(__dirname, 'src') : path.join(__dirname, '..', 'src');
+        // Use the 'buffer' polyfill package in the browser bundle
+        // (Node's base64url encoding isn't supported by webpack's built-in polyfill)
+        if (!isServer) {
+            config.resolve.fallback = config.resolve.fallback || {};
+            config.resolve.fallback.buffer = require.resolve('buffer/');
+            config.plugins = config.plugins || [];
+            config.plugins.push(
+                new (webpack.ProvidePlugin)({
+                    Buffer: ['buffer', 'Buffer'],
+                })
+            );
+        }
+        config.resolve.alias['@'] = isServer ? path.join(__dirname, 'src') : path.join(__dirname, '..', 'src');
         if (isServer) {
             // HERMIA(2026-06-11): Externalize the googleapis runtime stack
             // from the server webpack bundle. These packages require Node
