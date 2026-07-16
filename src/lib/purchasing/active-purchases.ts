@@ -43,9 +43,10 @@ function addDays(dateStr: string, days: number): string {
 
 export async function loadActivePurchases(
     finale: FinaleClient,
-    daysBack = 60
+    daysBack = 60,
+    preloadedPos?: FullPO[]
 ): Promise<ActivePurchase[]> {
-    const pos = await finale.getRecentPurchaseOrders(daysBack);
+    const pos = preloadedPos ?? await finale.getRecentPurchaseOrders(daysBack);
     await leadTimeService.warmCache();
 
     // KAIZEN #2: pre-warm per-vendor lead-time cache so the per-PO loop reads

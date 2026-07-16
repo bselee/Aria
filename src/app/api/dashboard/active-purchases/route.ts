@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { FinaleClient } from "@/lib/finale/client";
-import { loadActivePurchases } from "@/lib/purchasing/active-purchases";
+import { loadActivePurchases, type ActivePurchase } from "@/lib/purchasing/active-purchases";
+import { getCachedOrFresh } from "@/lib/purchasing/po-cache";
 import { loadDraftedPORecSummaries } from "@/lib/purchasing/calibration";
 import { createClient } from "@/lib/db";
 import { gmail as GmailApi } from "@googleapis/gmail";
@@ -27,8 +28,15 @@ function replySubject(orderId: string, originalSubject?: string, hasThread = fal
 
 export async function GET(req: Request) {
     try {
+        const url = new URL(req.url);
+        const forceRefresh = url.searchParams.get("bust") === "1";
+
         const finale = new FinaleClient();
-        const activePos = await loadActivePurchases(finale, 60);
+
+        // Use the PO cache layer: reads from PostgREST when fresh,
+        // calls Finale only when stale or bust=1 is set
+        const { pos: cachedPos, fromCache } = await getCachedOrFresh(finale, 60, forceRefresh);
+        const activePos = await loadActivePurchases(finale, 60, cachedPos);
 
         // Phase C — attach rec backreferences (recommended vs drafted qty per SKU).
         // Best-effort: a Supabase miss returns the active POs without rec links.
@@ -41,6 +49,7 @@ export async function GET(req: Request) {
         return NextResponse.json({
             purchases: enriched,
             cachedAt: new Date().toISOString(),
+            fromCache,
         });
 
     } catch (err: any) {
