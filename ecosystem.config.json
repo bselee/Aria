@@ -1,6 +1,36 @@
 {
   "apps": [
     {
+      "name": "aria-wsl-proxy",
+      "script": "scripts/wsl-proxy.js",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 5000,
+      "min_uptime": "5s"
+    },
+    {
+      "name": "aria-dashboard",
+      "script": "node_modules/next/dist/bin/next",
+      "args": "start -p 3001",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 5,
+      "restart_delay": 15000,
+      "min_uptime": "10s"
+    },
+    {
+      "name": "aria-healthcheck",
+      "script": "scripts/aria-healthcheck.ts",
+      "interpreter": "npx",
+      "interpreter_args": "tsx",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 10000,
+      "min_uptime": "5s"
+    },
+    {
       "name": "aria-bot",
       "script": "src/cli/start-bot.ts",
       "interpreter": "npx",
@@ -10,24 +40,6 @@
       "max_restarts": 5,
       "restart_delay": 30000,
       "min_uptime": "10s"
-    },
-    {
-      "name": "aria-dashboard",
-      "script": "node_modules/next/dist/bin/next",
-      "args": "start -p 3001",
-      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
-      "windowsHide": true,
-      "max_restarts": 3,
-      "restart_delay": 30000,
-      "min_uptime": "30s"
-    },
-    {
-      "name": "wsl-proxy",
-      "script": "scripts/wsl-proxy.js",
-      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
-      "windowsHide": true,
-      "max_restarts": 10,
-      "restart_delay": 5000
     }
   ]
 }
