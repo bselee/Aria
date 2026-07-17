@@ -145,6 +145,18 @@ export async function GET(req: NextRequest) {
                                         .update({ po_number: best.orderId, status: 'matched', updated_at: new Date().toISOString() })
                                         .eq('id', inv.id);
 
+                                    await transitionLifecycleState(
+                                        best.orderId,
+                                        'INVOICED',
+                                        'receivings-auto-match',
+                                        {
+                                            invoiceId: inv.id,
+                                            invoiceNumber: inv.invoice_number,
+                                            score: best.score,
+                                            reasons: best.reasons,
+                                        }
+                                    );
+
                                     // Log the auto-match event — human still needs to complete
                                     await sb
                                         .from('ap_activity_log')
