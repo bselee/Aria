@@ -6,21 +6,20 @@
  *
  *          Bridge 3 of 3: Obsidian Vault → Honcho Peer Memory
  *
- *          Honcho runs in WSL2 Docker. When direct fetch() fails from Windows
- *          (IPv6/WSL2 port-forward issue), the script falls back to calling
- *          curl through WSL to reach the API at 127.0.0.1:8000 inside WSL.
+ *          KAIZEN(2026-07-22): Removed WSL curl fallback. The TCP proxy
+ *          (wsl-proxy.js) forwards port 8000 via plain TCP — same reliable
+ *          path as PostgreSQL. Retry with backoff instead of spawning wsl.exe.
  *
  * @author  Hermia
  * @created 2026-06-26
- * @deps    obsidian/bridge, child_process
- * @env     OBSIDIAN_VAULT_PATH
- *          HONCHO_BASE_URL (default: http://127.0.0.1:8000)
+ * @updated 2026-07-22 — removed wsl.exe fallback, added retry
+ * @deps    obsidian/bridge
+ * @env     HONCHO_BASE_URL (default: http://127.0.0.1:8000)
  *          HONCHO_WORKSPACE (default: aria)
  *          HONCHO_OBSERVER_PEER (default: hermia)
  *          HONCHO_OBSERVED_PEER (default: Bill)
  */
 
-import { execSync } from "child_process";
 import { readVaultForSync } from "../lib/obsidian/bridge";
 
 const HONCHO_BASE_URL = process.env.HONCHO_BASE_URL || "http://127.0.0.1:8000";
@@ -28,143 +27,95 @@ const HONCHO_WORKSPACE = process.env.HONCHO_WORKSPACE || "aria";
 const HONCHO_OBSERVER_PEER = process.env.HONCHO_OBSERVER_PEER || "hermia";
 const HONCHO_OBSERVED_PEER = process.env.HONCHO_OBSERVED_PEER || "Bill";
 
+/** Retry a fetch with exponential backoff (1s → 2s → 4s), up to 3 attempts. */
+async function fetchWithRetry(
+    url: string,
+    options: RequestInit & { timeoutMs?: number },
+    retries = 3
+): Promise<Response> {
+    const timeoutMs = options.timeoutMs ?? 5000;
+    let lastError: any;
+
+    for (let attempt = 0; attempt < retries; attempt++) {
+        if (attempt > 0) {
+            const delay = Math.pow(2, attempt - 1) * 1000;
+            await new Promise(r => setTimeout(r, delay));
+        }
+        try {
+            const { timeoutMs: _, ...fetchOpts } = options;
+            const resp = await fetch(url, {
+                ...fetchOpts,
+                signal: AbortSignal.timeout(timeoutMs + attempt * 3000),
+            });
+            if (resp.ok || resp.status === 404) return resp;
+            // 502/503 — transient, retry
+            if (resp.status === 502 || resp.status === 503) {
+                lastError = new Error(`Honcho ${resp.status}`);
+                continue;
+            }
+            return resp; // Other status codes — return as-is
+        } catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError || new Error("Honcho unreachable after retries");
+}
+
 /**
- * Check if Honcho is reachable via direct fetch (Windows → WSL2 port forward).
- * Falls back to WSL curl if direct fetch fails.
+ * Check if Honcho is reachable via the TCP proxy.
  */
 async function honchoHealthCheck(): Promise<boolean> {
     try {
-        const resp = await fetch(`${HONCHO_BASE_URL}/health`, {
-            signal: AbortSignal.timeout(3000),
-        });
+        const resp = await fetchWithRetry(`${HONCHO_BASE_URL}/health`, { timeoutMs: 3000 }, 2);
         if (resp.ok) {
-            console.log("[obsidian-honcho-sync] Honcho reachable via direct fetch.");
+            console.log("[obsidian-honcho-sync] Honcho reachable.");
             return true;
         }
     } catch {
-        // Fall through to WSL fallback
+        // Will return false below
     }
-
-    try {
-        const result = execSync(
-            `wsl -e curl -s --max-time 5 http://127.0.0.1:8000/health`,
-            { timeout: 10000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
-        );
-        if (result.includes('"ok"')) {
-            console.log("[obsidian-honcho-sync] Honcho reachable via WSL curl fallback.");
-            return true;
-        }
-    } catch {
-        // Both failed
-    }
-
     return false;
 }
-
-/**
- * HTTP POST via WSL curl fallback.
- * Used when Node.js fetch() can't reach WSL2's port-forwarded service.
- */
-function wslCurlPost(url: string, body: string): { ok: boolean; status: number; text: string } {
-    try {
-        const tmpFile = execSync(`wsl -e mktemp`, { encoding: "utf-8" }).trim();
-        execSync(`wsl -e bash -c 'cat > ${tmpFile}'`, {
-            input: body,
-            encoding: "utf-8",
-            timeout: 5000,
-        });
-
-        const result = execSync(
-            `wsl -e curl -s --max-time 10 -w "\\n%{http_code}" -X POST "http://127.0.0.1:8000${url}" -H "Content-Type: application/json" -d @${tmpFile}`,
-            { timeout: 15000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
-        );
-
-        execSync(`wsl -e rm -f ${tmpFile}`, { encoding: "utf-8" });
-
-        const lines = result.trim().split("\n");
-        const status = parseInt(lines[lines.length - 1], 10);
-        const text = lines.slice(0, -1).join("\n");
-        return { ok: status >= 200 && status < 300, status, text };
-    } catch (err: any) {
-        return { ok: false, status: 0, text: err.message };
-    }
-}
-
-/**
- * HTTP POST via WSL curl fallback (for listing conclusions).
- */
-function wslCurlPostJson(url: string, body: string): { ok: boolean; data: any } {
-    const result = wslCurlPost(url, body);
-    if (!result.ok) return { ok: false, data: null };
-    try {
-        return { ok: true, data: JSON.parse(result.text) };
-    } catch {
-        return { ok: false, data: null };
-    }
-}
-
-let useWslFallback = false;
 
 /**
  * Create a Honcho conclusion for the user peer.
  *
  * API: POST /v3/workspaces/{workspace_id}/conclusions
- * Body: { "conclusions": [{ "content": "...", "observer_id": "...", "observed_id": "..." }] }
  */
 async function pushConclusionToHoncho(
     conclusion: string
 ): Promise<boolean> {
-    const url = `/v3/workspaces/${HONCHO_WORKSPACE}/conclusions`;
+    const url = `${HONCHO_BASE_URL}/v3/workspaces/${HONCHO_WORKSPACE}/conclusions`;
     const body = JSON.stringify({
-        conclusions: [
-            {
-                content: conclusion,
-                observer_id: HONCHO_OBSERVER_PEER,
-                observed_id: HONCHO_OBSERVED_PEER,
-            },
-        ],
+        conclusions: [{
+            content: conclusion,
+            observer_id: HONCHO_OBSERVER_PEER,
+            observed_id: HONCHO_OBSERVED_PEER,
+        }],
     });
 
-    if (!useWslFallback) {
-        try {
-            const resp = await fetch(`${HONCHO_BASE_URL}${url}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body,
-                signal: AbortSignal.timeout(10000),
-            });
-
-            if (resp.ok) return true;
-
-            if (resp.status === 404 || resp.status === 0) {
-                console.log("[obsidian-honcho-sync] Direct fetch failed, switching to WSL curl fallback.");
-                useWslFallback = true;
-            } else {
-                const text = await resp.text().catch(() => "");
-                console.error(`[obsidian-honcho-sync] Honcho API returned ${resp.status}: ${text}`);
-                return false;
-            }
-        } catch {
-            useWslFallback = true;
-            console.log("[obsidian-honcho-sync] Direct fetch failed, switching to WSL curl fallback.");
-        }
-    }
-
-    const result = wslCurlPost(url, body);
-    if (!result.ok) {
-        console.error(`[obsidian-honcho-sync] WSL curl failed (status ${result.status}): ${result.text.substring(0, 200)}`);
+    try {
+        const resp = await fetchWithRetry(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            timeoutMs: 10000,
+        });
+        if (resp.ok) return true;
+        const text = await resp.text().catch(() => "");
+        console.error(`[obsidian-honcho-sync] Honcho API returned ${resp.status}: ${text.slice(0, 200)}`);
+        return false;
+    } catch (err: any) {
+        console.error(`[obsidian-honcho-sync] Honcho push failed: ${err.message}`);
         return false;
     }
-    return true;
 }
 
 /**
  * Get existing conclusions to avoid duplicates.
- *
- * API: POST /v3/workspaces/{workspace_id}/conclusions/list
  */
 async function getExistingConclusions(): Promise<string[]> {
-    const url = `/v3/workspaces/${HONCHO_WORKSPACE}/conclusions/list`;
+    const url = `${HONCHO_BASE_URL}/v3/workspaces/${HONCHO_WORKSPACE}/conclusions/list`;
     const body = JSON.stringify({
         filters: {
             observer_id: HONCHO_OBSERVER_PEER,
@@ -172,29 +123,22 @@ async function getExistingConclusions(): Promise<string[]> {
         },
     });
 
-    if (!useWslFallback) {
-        try {
-            const resp = await fetch(`${HONCHO_BASE_URL}${url}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body,
-                signal: AbortSignal.timeout(5000),
-            });
-
-            if (resp.ok) {
-                const data = await resp.json();
-                const items = data?.items ?? [];
-                return items.map((c: any) => c?.content ?? "");
-            }
-        } catch {
-            useWslFallback = true;
+    try {
+        const resp = await fetchWithRetry(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            timeoutMs: 5000,
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            const items = data?.items ?? [];
+            return items.map((c: any) => c?.content ?? "");
         }
+    } catch (err: any) {
+        console.error(`[obsidian-honcho-sync] Failed to list conclusions: ${err.message}`);
     }
-
-    const result = wslCurlPostJson(url, body);
-    if (!result.ok || !result.data) return [];
-    const items = result.data?.items ?? [];
-    return items.map((c: any) => c?.content ?? "");
+    return [];
 }
 
 async function main() {

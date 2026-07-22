@@ -138,3 +138,5 @@ __pycache__/
 .env.proxy
 data/downloads-archive/
 .git-rewrite/
+.wsl-ip-cache
+retry_at=*

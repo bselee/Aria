@@ -331,70 +331,98 @@ class QueryBuilder {
       if (this._offset !== null) url.searchParams.set("offset", String(this._offset));
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    // KAIZEN(2026-07-22): Retry transient failures (502=proxy rebind, 503=schema
+    // cache reload, fetch failed=connection refused). Up to 3 attempts with
+    // exponential backoff (1s → 2s → 4s). No retry on 4xx (client errors).
+    const MAX_RETRIES = 3;
+    let lastError: any = null;
 
-    try {
-      const res = await fetch(url.toString(), {
-        method: this._method,
-        headers,
-        body: this._method !== "GET" && this._body !== null
-          ? JSON.stringify(this._body)
-          : undefined,
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return {
-          data: null,
-          error: new Error(
-            `PostgREST ${res.status}: ${res.statusText} — ${text.slice(0, 200)}`
-          ),
-        };
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+        await new Promise(r => setTimeout(r, delay));
       }
 
-      // Check for 204 No Content
-      if (res.status === 204) {
-        return { data: null as T | null, error: null };
-      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000 + attempt * 3000);
 
-      const text = await res.text();
-      if (!text || text.trim() === "") {
-        return { data: null as T | null, error: null };
-      }
-
-      let parsed: any;
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        return { data: text as unknown as T, error: null };
-      }
+        const res = await fetch(url.toString(), {
+          method: this._method,
+          headers,
+          body: this._method !== "GET" && this._body !== null
+            ? JSON.stringify(this._body)
+            : undefined,
+          signal: controller.signal,
+        });
 
-      if (this._single || this._maybeSingle) {
-        if (Array.isArray(parsed)) {
-          if (parsed.length === 0) {
-            return {
-              data: (this._single ? null : null) as T | null,
-              error: this._single
-                ? new Error("Row not found")
-                : null,
-            };
-          }
-          return { data: parsed[0], error: null };
+        if (res.status === 502 || res.status === 503) {
+          // Transient — retry
+          lastError = new Error(`PostgREST ${res.status}: ${res.statusText}`);
+          clearTimeout(timeout);
+          continue;
         }
-        return { data: parsed, error: null };
-      }
 
-      return { data: parsed, error: null };
-    } catch (err: any) {
-      if (err.name === "AbortError") {
-        return { data: null, error: new Error("PostgREST request timed out") };
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          clearTimeout(timeout);
+          return {
+            data: null,
+            error: new Error(
+              `PostgREST ${res.status}: ${res.statusText} — ${text.slice(0, 200)}`
+            ),
+          };
+        }
+
+        // Check for 204 No Content
+        if (res.status === 204) {
+          clearTimeout(timeout);
+          return { data: null as T | null, error: null };
+        }
+
+        const text = await res.text();
+        clearTimeout(timeout);
+        if (!text || text.trim() === "") {
+          return { data: null as T | null, error: null };
+        }
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return { data: text as unknown as T, error: null };
+        }
+
+        if (this._single || this._maybeSingle) {
+          if (Array.isArray(parsed)) {
+            if (parsed.length === 0) {
+              return {
+                data: (this._single ? null : null) as T | null,
+                error: this._single
+                  ? new Error("Row not found")
+                  : null,
+              };
+            }
+            return { data: parsed[0], error: null };
+          }
+          return { data: parsed, error: null };
+        }
+
+        return { data: parsed, error: null };
+      } catch (err: any) {
+        clearTimeout(timeout);
+        if (err.name === "AbortError") {
+          lastError = new Error("PostgREST request timed out");
+        } else {
+          // fetch failed / connection refused — retry
+          lastError = err;
+        }
+        // continue to next retry attempt
       }
-      return { data: null, error: err };
-    } finally {
-      clearTimeout(timeout);
     }
+
+    // All retries exhausted
+    return { data: null, error: lastError || new Error("PostgREST request failed after retries") };
   }
 }
 
@@ -438,53 +466,75 @@ class RpcBuilder {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "application/json",
-      apikey: getAuthToken(),
+      apikey: process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "",
       Authorization: `Bearer ${getAuthToken()}`,
     };
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5_000);
+    // Retry transient failures (502/503/fetch errors) up to 3x with backoff
+    const MAX_RETRIES = 3;
+    let lastError: any = null;
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(this.params),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return {
-          data: null,
-          error: new Error(
-            `PostgREST RPC ${res.status}: ${res.statusText} — ${text.slice(0, 200)}`
-          ),
-        };
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = Math.pow(2, attempt - 1) * 1000;
+        await new Promise(r => setTimeout(r, delay));
       }
 
-      if (res.status === 204) {
-        return { data: null as T | null, error: null };
-      }
-
-      const text = await res.text();
-      if (!text || text.trim() === "") {
-        return { data: null as T | null, error: null };
-      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000 + attempt * 3000);
 
       try {
-        return { data: JSON.parse(text), error: null };
-      } catch {
-        return { data: text as unknown as T, error: null };
+        const res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(this.params),
+          signal: controller.signal,
+        });
+
+        if (res.status === 502 || res.status === 503) {
+          lastError = new Error(`PostgREST RPC ${res.status}: ${res.statusText}`);
+          clearTimeout(timeout);
+          continue;
+        }
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          clearTimeout(timeout);
+          return {
+            data: null,
+            error: new Error(
+              `PostgREST RPC ${res.status}: ${res.statusText} — ${text.slice(0, 200)}`
+            ),
+          };
+        }
+
+        if (res.status === 204) {
+          clearTimeout(timeout);
+          return { data: null as T | null, error: null };
+        }
+
+        const text = await res.text();
+        clearTimeout(timeout);
+        if (!text || text.trim() === "") {
+          return { data: null as T | null, error: null };
+        }
+
+        try {
+          return { data: JSON.parse(text), error: null };
+        } catch {
+          return { data: text as unknown as T, error: null };
+        }
+      } catch (err: any) {
+        clearTimeout(timeout);
+        if (err.name === "AbortError") {
+          lastError = new Error("PostgREST RPC timed out");
+        } else {
+          lastError = err;
+        }
       }
-    } catch (err: any) {
-      if (err.name === "AbortError") {
-        return { data: null, error: new Error("PostgREST RPC timed out") };
-      }
-      return { data: null, error: err };
-    } finally {
-      clearTimeout(timeout);
     }
+
+    return { data: null, error: lastError || new Error("PostgREST RPC failed after retries") };
   }
 }
 

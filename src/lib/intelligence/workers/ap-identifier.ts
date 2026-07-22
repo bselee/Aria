@@ -400,7 +400,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
             // Read from central queue instead of making a direct Gmail API search
             // Include emails that failed in ap_inbox_queue (ERROR_PROCESSING) — reset them for retry
-            const { data: messages, error } = await supabase
+            const { data: messages, error } = await db
                 .from('email_inbox_queue')
                 .select('*')
                 .eq('processed_by_ap', false)
@@ -410,7 +410,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
             if (!messages || messages.length === 0) {
                 // No unprocessed emails — check if any need retry via ap_inbox_queue ERROR_PROCESSING
-                const { data: retryMessages } = await supabase
+                const { data: retryMessages } = await db
                     .from('email_inbox_queue')
                     .select('id, gmail_message_id, from_email, source_inbox')
                     .eq('processed_by_ap', true)
@@ -418,7 +418,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 if (retryMessages && retryMessages.length > 0) {
                     const msgIds = retryMessages.map((r: any) => r.gmail_message_id);
-                    const { data: errorItems } = await supabase
+                    const { data: errorItems } = await db
                         .from('ap_inbox_queue')
                         .select('message_id, extracted_json, updated_at')
                         .in('message_id', msgIds)
@@ -443,7 +443,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             .map((r: any) => r.id);
 
                         if (retryIds.length > 0) {
-                            await supabase
+                            await db
                                 .from('email_inbox_queue')
                                 .update({ processed_by_ap: false })
                                 .in('id', retryIds);
@@ -508,7 +508,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                         });
                     } catch (e) { /* ignore */ }
-                    await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                    await this.logActivity(db, from, subject, "BLOCKED_SENDER",
                         `Blocked: ${blockedSender.label} — archived without forwarding`);
                     continue;
                 }
@@ -534,7 +534,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                                     requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                                                 });
                                             } catch (e) { /* ignore */ }
-                                            await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                                            await this.logActivity(db, from, subject, "BLOCKED_SENDER",
                                                 `Skipped: ${routingRule.label} — archived without forwarding`);
                                             console.log(`     ⏭️ Skipped (${routingRule.label})`);
                                             continue;
@@ -549,7 +549,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                             });
                         } catch (e) { /* ignore */ }
-                        await this.logActivity(supabase, from, subject, "BLOCKED_SENDER",
+                        await this.logActivity(db, from, subject, "BLOCKED_SENDER",
                             `${routingRule.label} — marked read, no Bill.com forward`);
                         console.log(`     ✅ Autopay: ${routingRule.label} — marked read, no forward`);
                         continue;
@@ -573,7 +573,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 },
                             });
                             console.log(`     🚚 Dropship: ${routingRule.label} — queued for forward`);
-                            await this.logActivity(supabase, from, subject, "DROPSHIP",
+                            await this.logActivity(db, from, subject, "DROPSHIP",
                                 `${routingRule.label} — queued for Bill.com forward (dropship, no PO matching)`, {
                                     vendor_routing_action: "dropship",
                                     vendor_name: routingRule.label,
@@ -610,7 +610,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 
                 if (isTaxRelated) {
                     console.log(`   ⚠️ TAX DOCUMENT: "${subject}". Leaving unread for human review.`);
-                    await this.logActivity(supabase, from, subject, "TAX_DOCUMENT", 
+                    await this.logActivity(db, from, subject, "TAX_DOCUMENT", 
                         "Tax document detected — leaving unread in inbox");
                     continue; // Skip all further processing; remains UNREAD and in INBOX
                 }
@@ -626,7 +626,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                         });
                     } catch (e) { /* ignore */ }
-                    await this.logActivity(supabase, from, subject, "BLOCKED_SUBJECT",
+                    await this.logActivity(db, from, subject, "BLOCKED_SUBJECT",
                         `Blocked: subject matches skip pattern — archived without forwarding`);
                     continue;
                 }
@@ -675,7 +675,6 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 const isReadyNotification = /\*\*READY\*\*/i.test(subject);
                 const isOrderAck = /acknowledgement|order\s*confirm/i.test(subject);
                 const isFedExInvoice = this.isFedExInvoiceEmail(from, subject, snippet, pdfFilenames);
-                const isAAACooper = /aaa\s*cooper/i.test(from);
 
                 let intent: string;
                 if (hasInvoicePdf && !isNonInvoicePdf) {
@@ -718,7 +717,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             id: m.gmail_message_id,
                             requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
                         });
-                        await this.logActivity(supabase, from, subject, "ADVERTISEMENT", "Archived and marked read");
+                        await this.logActivity(db, from, subject, "ADVERTISEMENT", "Archived and marked read");
                     } catch (e) { /* ignore */ }
                     continue;
                 }
@@ -737,7 +736,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             }
                         });
                         await this.logActivity(
-                            supabase,
+                            db,
                             from,
                             subject,
                             "STATEMENT",
@@ -764,7 +763,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
-                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                    await this.logActivity(db, from, subject, intent, policy.activityNote, {
                         reasonCode: policy.reasonCode,
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
@@ -778,10 +777,10 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 // and create a draft PO when no match is found.
                 if (intent === "PAID_INVOICE") {
                     try {
-                        await this.handlePaidInvoice(m, gmail, supabase, sourceInbox, getLabels);
+                        await this.handlePaidInvoice(m, gmail, db, sourceInbox, getLabels);
                     } catch (err: any) {
                         console.error(`     ❌ PAID_INVOICE handler failed:`, err.message);
-                        await this.logActivity(supabase, from, subject, "PAID_INVOICE", `Handler error: ${err.message}`);
+                        await this.logActivity(db, from, subject, "PAID_INVOICE", `Handler error: ${err.message}`);
                     }
                     continue;
                 }
@@ -803,7 +802,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             removeLabels: policy.removeLabels,
                         });
                     } catch (e) { /* ignore */ }
-                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                    await this.logActivity(db, from, subject, intent, policy.activityNote, {
                         reasonCode: policy.reasonCode,
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
@@ -838,7 +837,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                             if (result.success) {
                                 console.log(`     ✅ Inline invoice handled — forwarded as ${result.invoiceNumber} (PO ${result.poNumber || "N/A"})`);
-                                await this.logActivity(supabase, from, subject, "INLINE_INVOICE",
+                                await this.logActivity(db, from, subject, "INLINE_INVOICE",
                                     `Auto-generated PDF invoice ${result.invoiceNumber} from inline text. PO ${result.poNumber || "not found"}. Forwarded to Bill.com: ${result.forwardedMessageId}`,
                                     {
                                         reasonCode: "inline_invoice_handled",
@@ -860,14 +859,14 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 } catch (e) { /* ignore */ }
                             } else {
                                 console.warn(`     ⚠️ Inline invoice handler failed: ${result.error}`);
-                                await this.logActivity(supabase, from, subject, "INLINE_INVOICE_FAILED",
+                                await this.logActivity(db, from, subject, "INLINE_INVOICE_FAILED",
                                     `Handler error: ${result.error} — leaving unread for human review`,
                                     { reasonCode: "inline_invoice_failed", sourceInbox, gmailMessageId: m.gmail_message_id }
                                 );
                             }
                         } catch (err: any) {
                             console.error(`     ❌ Inline invoice handler exception: ${err.message}`);
-                            await this.logActivity(supabase, from, subject, "INLINE_INVOICE_ERROR",
+                            await this.logActivity(db, from, subject, "INLINE_INVOICE_ERROR",
                                 `Unhandled error: ${err.message}`,
                                 { reasonCode: "inline_invoice_exception", sourceInbox, gmailMessageId: m.gmail_message_id }
                             );
@@ -902,7 +901,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             const uniqueMsgId = pdfParts.length > 1 ? `${m.gmail_message_id}_${attachmentIndex}` : m.gmail_message_id;
 
                             // ── Dedup Check 1: same message_id (same inbox re-scan) ──
-                            const { data: existing } = await supabase
+                            const { data: existing } = await db
                                 .from("ap_inbox_queue")
                                 .select("id")
                                 .eq("message_id", uniqueMsgId)
@@ -921,7 +920,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             // (email_from, pdf_filename, email_subject) within 24h to
                             // prevent duplicate Bill.com forwards.
                             const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-                            const { data: crossInboxDup } = await supabase
+                            const { data: crossInboxDup } = await db
                                 .from("ap_inbox_queue")
                                 .select("id, source_inbox")
                                 .eq("email_from", from)
@@ -955,7 +954,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             // regardless of filename or subject line.
                             const pdfHash = createHash("sha256").update(buffer).digest("hex");
                             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-                            const { data: hashDup } = await supabase
+                            const { data: hashDup } = await db
                                 .from("ap_inbox_queue")
                                 .select("id, email_subject")
                                 .eq("email_from", from)
@@ -964,7 +963,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 .maybeSingle();
                             if (hashDup) {
                                 console.log(`     ⚠️ PDF content duplicate: ${capturedFilename} (hash match with "${hashDup.email_subject}") — skipping`);
-                                await this.logActivity(supabase, from, subject, "DUPLICATE_PDF_CONTENT",
+                                await this.logActivity(db, from, subject, "DUPLICATE_PDF_CONTENT",
                                     `PDF content hash duplicate: ${capturedFilename} matches prior entry "${hashDup.email_subject}" — not forwarded`, {
                                         reasonCode: "duplicate_pdf_content",
                                         sourceInbox,
@@ -998,7 +997,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 const blockedContent = PDF_BLOCK_PATTERNS.find(p => p.pattern.test(pdfTextPreview));
                                 if (blockedContent) {
                                     console.log(`     🚫 PDF BLOCKED: ${capturedFilename} — ${blockedContent.reason}`);
-                                    await this.logActivity(supabase, from, subject, "BLOCKED_PDF_CONTENT",
+                                    await this.logActivity(db, from, subject, "BLOCKED_PDF_CONTENT",
                                         `PDF blocked from Bill.com: ${blockedContent.reason} (${capturedFilename})`, {
                                             reasonCode: "blocked_pdf_content",
                                             sourceInbox,
@@ -1022,20 +1021,18 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             let queueBuffer = buffer;
                             const queueMetadata: Record<string, unknown> = {};
                             if (extractedPdf) {
-                                let pageSelection;
-                                if (isAAACooper) {
-                                    pageSelection = {
-                                        pageNumber: 1,
-                                        confidence: "strong" as const,
-                                        reason: "AAA Cooper outbound invoice - forced first page only",
-                                    };
-                                } else {
-                                    pageSelection = await this.selectPrimaryInvoicePageNumber(
-                                        buffer,
-                                        extractedPdf.pages,
-                                        extractedPdf.metadata?.pageCount,
-                                    );
-                                }
+                                // KAIZEN(2026-07-22): Removed AAA Cooper forced-page-1 override.
+                                // AAA Cooper page 1 is always a STATEMENT SUMMARY cover sheet
+                                // (hits "statement" negative rule, scores ~-2). Page 2 is the
+                                // actual invoice (hits "invoice_heading" + "amount_due", scores
+                                // ~9). Forcing page 1 sent the cover sheet to Bill.com, which
+                                // picked up the customer number instead of the PRO/BOL number.
+                                // The page selector correctly identifies page 2 as the invoice.
+                                const pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                    buffer,
+                                    extractedPdf.pages,
+                                    extractedPdf.metadata?.pageCount,
+                                );
 
                                 const multiPagePacket = (extractedPdf.metadata?.pageCount ?? 1) > 1;
                                 const needsFedExOcrRetry = isFedExInvoice
@@ -1065,7 +1062,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 if (isFedExInvoice && multiPagePacket && pageSelection.confidence !== "strong") {
                                     manualReviewReason = `Ambiguous FedEx invoice packet (${capturedFilename}) - unable to isolate a single invoice page`;
                                     console.log(`     ⚠️ ${manualReviewReason}`);
-                                    await this.logActivity(supabase, from, subject, "AMBIGUOUS_INVOICE_PACKET", manualReviewReason, {
+                                    await this.logActivity(db, from, subject, "AMBIGUOUS_INVOICE_PACKET", manualReviewReason, {
                                         reasonCode: "ambiguous_invoice_packet",
                                         sourceInbox,
                                         gmailMessageId: m.gmail_message_id,
@@ -1145,7 +1142,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                         } catch (err: any) {
                             console.error(`     ❌ Failed to queue attachment:`, err.message);
-                            await this.logActivity(supabase, from, subject, "PROCESSING_ERROR", `Queue failed: ${err.message}`, {
+                            await this.logActivity(db, from, subject, "PROCESSING_ERROR", `Queue failed: ${err.message}`, {
                                 reasonCode: "queue_insert_failed",
                                 sourceInbox,
                                 gmailMessageId: m.gmail_message_id,
@@ -1157,7 +1154,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 if (processedAnyPDF) {
                     const pdfNames = pdfParts.map((p: any) => p.filename).join(", ");
                     const logNote = `Queued for Bill.com forward (${pdfNames}); source email archived`;
-                    await this.logActivity(supabase, from, subject, intent, logNote, {
+                    await this.logActivity(db, from, subject, intent, logNote, {
                         reasonCode: "queued_for_billcom",
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
@@ -1187,7 +1184,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 } else if (pdfParts.length === 0) {
                     console.log(`     ⚠️ No PDF found on ${intent}. Leaving unread for human check.`);
                     const policy = getAPMissingPdfPolicy(sourceInbox, intent);
-                    await this.logActivity(supabase, from, subject, intent, policy.activityNote, {
+                    await this.logActivity(db, from, subject, intent, policy.activityNote, {
                         reasonCode: policy.reasonCode,
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
@@ -1205,7 +1202,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                         ? `${manualReviewReason}; leaving unread in inbox`
                         : "Invoice PDFs detected but queueing was incomplete; leaving unread in inbox";
                     console.log(`     ⚠️ ${incompleteReason}`);
-                    await this.logActivity(supabase, from, subject, intent, incompleteReason, {
+                    await this.logActivity(db, from, subject, intent, incompleteReason, {
                         reasonCode: manualReviewReason ? "manual_review_required" : "incomplete_queue",
                         sourceInbox,
                         gmailMessageId: m.gmail_message_id,
@@ -1322,7 +1319,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         if (!matchedPO) {
             // Check paid_invoices table for existing record with same vendor + invoice
             try {
-                const { data: existingPaid } = await supabase
+                const { data: existingPaid } = await db
                     .from('paid_invoices')
                     .select('id, po_number, po_matched')
                     .eq('vendor_name', extracted.vendorName)
@@ -1343,7 +1340,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             if (!skipDraftCreation) {
                 try {
                     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-                    const { data: recentDraft } = await supabase
+                    const { data: recentDraft } = await db
                         .from('paid_invoices')
                         .select('id, po_number')
                         .eq('vendor_name', extracted.vendorName)
@@ -1484,7 +1481,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                 ? `Draft PO #${draftInfo.orderId} created`
                 : `No PO match, vendor not found in Finale`;
 
-        await this.logActivity(supabase, from, subject, 'PAID_INVOICE', action, {
+        await this.logActivity(db, from, subject, 'PAID_INVOICE', action, {
             invoiceNumber: extracted.invoiceNumber,
             amountPaid: extracted.amountPaid,
             vendorName: extracted.vendorName,

@@ -21,6 +21,7 @@
 
 import { createClient } from "@/lib/db";
 import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
+import { FinaleClient } from "@/lib/finale/client";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -264,6 +265,28 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                     reasons: result.bestMatch.reasons,
                 }
             );
+
+            // Push freight to Finale PO — the database has the correlation,
+            // so use it. Freight on the invoice IS the PO's freight.
+            const invFreight = Number(inv.freight || 0);
+            if (invFreight > 0) {
+                try {
+                    const finale = new FinaleClient();
+                    await finale.updateOrderAdjustmentAmount(
+                        result.bestMatch.orderId,
+                        'FREIGHT',
+                        invFreight,
+                        `Freight from invoice ${inv.invoice_number}`,
+                    );
+                    console.log(
+                        `[invoice-matcher] Freight $${invFreight.toFixed(2)} applied to PO ${result.bestMatch.orderId}`,
+                    );
+                } catch (freightErr: any) {
+                    console.warn(
+                        `[invoice-matcher] Freight push failed for PO ${result.bestMatch.orderId}: ${freightErr.message}`,
+                    );
+                }
+            }
 
             autoMatched.push({
                 invoiceId: inv.id,

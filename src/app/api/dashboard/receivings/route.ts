@@ -53,7 +53,19 @@ export async function GET(req: NextRequest) {
         const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 
         const finale = new FinaleClient();
-        const received = await finale.getTodaysReceivedPOs(startStr, tomorrowStr);
+        // Finale receivings can hang 60s+ under load — fail open so the panel paints
+        let received: any[] = [];
+        try {
+            received = await Promise.race([
+                finale.getTodaysReceivedPOs(startStr, tomorrowStr),
+                new Promise<any[]>((_, reject) =>
+                    setTimeout(() => reject(new Error('Finale receivings timeout (35s)')), 35_000),
+                ),
+            ]);
+        } catch (finaleErr: any) {
+            console.warn('[receivings] Finale getTodaysReceivedPOs failed/timeout:', finaleErr?.message || finaleErr);
+            received = [];
+        }
 
         // Enrich with reconciliation data from local Postgres
         const sb = createClient();
@@ -110,18 +122,126 @@ export async function GET(req: NextRequest) {
             let matchSuggestions: any[] = [];
 
             if (vendorNames.length > 0) {
-                const { data: unmatchedInvoices } = await sb
-                    .from('vendor_invoices')
-                    .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
-                    .is('po_number', null)
-                    .in('vendor_name', vendorNames)
-                    .order('created_at', { ascending: false })
-                    .limit(20);
+                let unmatchedInvoices: any[] = [];
+                try {
+                    const { data } = await sb
+                        .from('vendor_invoices')
+                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
+                        .is('po_number', null)
+                        .in('vendor_name', vendorNames)
+                        .order('created_at', { ascending: false })
+                        .limit(20);
+                    unmatchedInvoices = data || [];
+                } catch {
+                    unmatchedInvoices = [];
+                }
+
+                // Local invoice_cache fallback when PostgREST is empty/down (photo invoices etc.)
+                try {
+                    const { getUnmatchedInvoices, getInvoiceCacheByVendor } = await import(
+                        '@/lib/storage/purchasing-cache'
+                    );
+                    const localUnmatched = getUnmatchedInvoices();
+                    const seen = new Set(
+                        unmatchedInvoices.map(
+                            (i) =>
+                                `${(i.vendor_name || '').toLowerCase()}|${i.invoice_number || ''}|${i.total || 0}`,
+                        ),
+                    );
+                    for (const v of vendorNames) {
+                        const rows = [
+                            ...localUnmatched.filter((r) =>
+                                (r.vendor_name || '').toLowerCase().includes(String(v).toLowerCase().slice(0, 12)),
+                            ),
+                            ...getInvoiceCacheByVendor(v).filter((r) => !r.matched_po && !r.po_number),
+                        ];
+                        for (const row of rows) {
+                            const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
+                            if (seen.has(key)) continue;
+                            // Only skip confirmed matches — OCR may set po_number as candidate
+                            if (row.matched_po) continue;
+                            seen.add(key);
+                            unmatchedInvoices.push({
+                                id: row.vendor_invoice_id || key,
+                                invoice_number: row.invoice_number,
+                                vendor_name: row.vendor_name,
+                                invoice_date: row.invoice_date,
+                                subtotal: row.total || 0,
+                                freight: row.freight || 0,
+                                tax: row.tax || 0,
+                                total: row.total || 0,
+                                raw_data: {
+                                    lineItems: (() => {
+                                        try {
+                                            return JSON.parse(row.line_items || '[]');
+                                        } catch {
+                                            return [];
+                                        }
+                                    })(),
+                                    source: 'invoice_cache',
+                                    ocrPoCandidate: row.po_number || null,
+                                },
+                                _fromCache: true,
+                            });
+                        }
+                    }
+                    // Also surface DTE / recent AP photo invoices even if vendor name on PO differs slightly
+                    for (const row of localUnmatched.slice(0, 30)) {
+                        const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
+                        if (seen.has(key)) continue;
+                        if (row.matched_po) continue;
+                        seen.add(key);
+                        unmatchedInvoices.push({
+                            id: row.vendor_invoice_id || key,
+                            invoice_number: row.invoice_number,
+                            vendor_name: row.vendor_name,
+                            invoice_date: row.invoice_date,
+                            subtotal: row.total || 0,
+                            freight: row.freight || 0,
+                            tax: row.tax || 0,
+                            total: row.total || 0,
+                            raw_data: {
+                                source: 'invoice_cache',
+                                ocrPoCandidate: row.po_number || null,
+                            },
+                            _fromCache: true,
+                        });
+                    }
+                } catch (cacheErr: any) {
+                    console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
+                }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                    for (const inv of unmatchedInvoices) {
+                    // Hard cap — findPOCandidates hits PostgREST; unbounded loops hang the panel
+                    const toScore = unmatchedInvoices.slice(0, 12);
+                    for (const inv of toScore) {
                         try {
-                            const result = await findPOCandidates({
+                            // Prefer OCR PO candidate without DB scoring when present
+                            const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
+                            if (inv._fromCache && ocrPo) {
+                                matchSuggestions.push({
+                                    invoiceId: inv.id,
+                                    invoiceNumber: inv.invoice_number,
+                                    vendorName: inv.vendor_name,
+                                    invoiceDate: inv.invoice_date,
+                                    invoiceTotal: inv.total,
+                                    candidates: [{
+                                        orderId: String(ocrPo),
+                                        vendorName: inv.vendor_name,
+                                        orderDate: inv.invoice_date || '',
+                                        total: Number(inv.total || 0),
+                                        status: 'ocr_candidate',
+                                        score: 70,
+                                        reasons: ['OCR PO# candidate'],
+                                        isOpen: true,
+                                    }],
+                                    autoApplyReady: false,
+                                    fromCache: true,
+                                });
+                                continue;
+                            }
+
+                            const scorePromise = findPOCandidates({
                                 id: inv.id,
                                 invoiceNumber: inv.invoice_number,
                                 vendorName: inv.vendor_name,
@@ -132,9 +252,29 @@ export async function GET(req: NextRequest) {
                                 total: Number(inv.total || 0),
                                 lineItems: inv.raw_data?.lineItems || [],
                             });
+                            const result = await Promise.race([
+                                scorePromise,
+                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+                            ]);
+                            if (!result) {
+                                matchSuggestions.push({
+                                    invoiceId: inv.id,
+                                    invoiceNumber: inv.invoice_number,
+                                    vendorName: inv.vendor_name,
+                                    invoiceDate: inv.invoice_date,
+                                    invoiceTotal: inv.total,
+                                    candidates: [],
+                                    autoApplyReady: false,
+                                    fromCache: !!inv._fromCache,
+                                    timedOut: true,
+                                });
+                                continue;
+                            }
                             // Auto-apply high-confidence matches: score ≥80 and autoApplyReady
+                            // Never auto-apply cache-only rows against PostgREST (id may be local)
                             const best = result.candidates[0];
-                            const shouldAutoApply = best && best.score >= 80 && result.autoApplyReady;
+                            const shouldAutoApply =
+                                best && best.score >= 80 && result.autoApplyReady && !inv._fromCache;
 
                             if (shouldAutoApply) {
                                 // Auto-match: link invoice to PO, but DON'T complete PO in Finale
@@ -156,6 +296,23 @@ export async function GET(req: NextRequest) {
                                             reasons: best.reasons,
                                         }
                                     );
+
+                                    // Push freight to Finale — the database correlation exists, use it
+                                    const invFreight = Number(inv.freight || 0);
+                                    if (invFreight > 0) {
+                                        try {
+                                            await finale.updateOrderAdjustmentAmount(
+                                                best.orderId,
+                                                'FREIGHT',
+                                                invFreight,
+                                                `Freight from invoice ${inv.invoice_number}`,
+                                            );
+                                        } catch (freightErr: any) {
+                                            console.warn(
+                                                `[receivings] Freight push failed for PO ${best.orderId}: ${freightErr.message}`,
+                                            );
+                                        }
+                                    }
 
                                     // Log the auto-match event — human still needs to complete
                                     await sb
@@ -197,6 +354,7 @@ export async function GET(req: NextRequest) {
                                     invoiceTotal: inv.total,
                                     candidates: result.candidates.slice(0, 5),
                                     autoApplyReady: result.autoApplyReady ?? false,
+                                    fromCache: !!inv._fromCache,
                                 });
                             }
                         } catch { /* skip individual match failures */ }

@@ -4,24 +4,28 @@
  *          invoice PDFs to Bill.com, tracks dedup in local SQLite.
  *          Zero Supabase dependency for the critical path.
  * @created 2026-06-18
- * @updated 2026-06-18 (Bill Selee: simplified — forward all PDFs, skip no-PDF emails,
- *          removed autopay concept. All vendors with PDF invoices forwarded identically.)
- * @deps    better-sqlite3 (via local-db), @googleapis/gmail, gmail/auth
+ * @updated 2026-07-17 (Hermia: phone-photo invoices → PDF, e.g. Down to Earth Worms /
+ *          Gary Ambriole garyambriole@icloud.com. Bill.com OCR handles images fine;
+ *          we wrap JPEG/PNG as PDF so single-forward + OCR + vendor_invoices/PO match
+ *          all stay on the existing PDF contract.)
+ * @deps    better-sqlite3 (via local-db), @googleapis/gmail, gmail/auth, pdf-lib, sharp
  * @env     GMAIL_AP_TOKEN (ap-token.json), BILL_COM_FORWARD_EMAIL (default: buildasoilap@bill.com)
  *
- * DESIGN DECISION (2026-06-18, Bill Selee):
- *   SIMPLE RULE: has PDF → forward to Bill.com. No PDF → skip.
- *   The only exceptions are: internal emails, Bill.com self-notifications,
- *   FedEx past-due notices, and Amazon tracking — all of which lack invoice PDFs.
- *   "Autopay" was a mistaken inference — we forward ALL vendor PDF invoices.
+ * DESIGN DECISION (2026-06-18, Bill Selee; extended 2026-07-17):
+ *   SIMPLE RULE: has invoice attachment (PDF OR large JPEG/PNG photo) → forward to Bill.com.
+ *   No invoice attachment → skip.
+ *   Phone photos are converted to single-page PDF before send so:
+ *     (a) ap-single-forward / Bill.com MIME stay PDF,
+ *     (b) pdf-parse + reconciliation handoff can populate vendor_invoices for PO match.
+ *   Exceptions: internal emails, Bill.com self-notifications, FedEx past-due, Amazon tracking.
  *   Dropship vendors still forward but skip PO reconciliation (no Finale PO exists).
  *
  * FLOW:
  *   1. Scan Gmail for unread emails in the ap@ inbox (max 20 per cycle)
- *   2. For each email with a PDF attachment: forward to Bill.com
- *   3. No PDF → skip (mark read, archive — not an invoice)
+ *   2. For each email with PDF or invoice-image attachment: forward to Bill.com
+ *   3. No invoice attachment → skip (mark read, archive)
  *   4. Dedup by message_id + filename + SHA-256 content hash
- *   5. Record in local SQLite (ap_local_forwards table)
+ *   5. Record in local SQLite (ap_local_forwards table) + reconciliation handoff → DB/PO match
  *   6. Mark source email as read + archive
  *
  * DEDUP LAYERS:
@@ -35,9 +39,14 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
-import { isDuplicate } from "@/lib/intelligence/ap-dedup";
+import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
+import {
+    imageBufferToPdf,
+    imageFilenameToPdf,
+    isInvoiceImagePart,
+} from "@/lib/pdf/image-to-pdf";
 import * as crypto from "crypto";
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
@@ -65,9 +74,9 @@ function parseFromHeader(from: string): { email: string; name: string } {
  * - 'amazon_order'  → skip (handled by Amazon parser elsewhere)
  * - null            → default: forward to Bill.com + attempt PO matching
  */
-function checkVendorRouting(from: string, subject: string): VendorRoutingRule | null {
+function checkVendorRouting(from: string, subject: string, filename: string = ""): VendorRoutingRule | null {
     const { email, name } = parseFromHeader(from);
-    return matchVendorRouting(email, name, subject);
+    return matchVendorRouting(email, name, subject, filename);
 }
 
 /**
@@ -91,16 +100,44 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
         "order acknowledgement",
         "order acknowledgment",
         "monthly statement",
+        "account statement",
+        "statement of account",
+        "your statement",
         "reminder on overdue",
         "packing list",
+        "immediate attention required",
     ];
     if (nonInvoiceSubjects.some((s) => subjectLower.includes(s))) {
         return true;
     }
-    // Belt Power no-reply is shipment-only (invoices come from remitto@)
+    // Belt Power no-reply / AR = ship notices + statements/collections (invoices = remitto@)
     if (fromLower.includes("no-reply@beltpower.com")) {
         return true;
     }
+    if (fromLower.includes("beltpowerar@")) {
+        return true;
+    }
+    // Toyota Industries Commercial Finance — paid online
+    if (
+        fromLower.includes("toyota commercial finance") ||
+        fromLower.includes("ticf") ||
+        (fromLower.includes("billtrust.com") && (fromLower.includes("toyota") || subjectLower.includes("ticf")))
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/** Statement / collections attachments that must never hit Bill.com. */
+function isStatementAttachment(filename: string, from: string, subject: string): boolean {
+    const f = (filename || "").toLowerCase();
+    const fromLower = (from || "").toLowerCase();
+    const subjectLower = (subject || "").toLowerCase();
+    if (!f) return false;
+    if (f.includes("statement") || f.includes("aging") || f.includes("account_summary")) return true;
+    // Belt Power remitto invoices are Inv######.pdf — statements are BuildASoil_LLC_Statement.pdf
+    if (fromLower.includes("beltpower") && f.includes("statement")) return true;
+    if (fromLower.includes("beltpower") && subjectLower.includes("reminder") && !f.startsWith("inv")) return true;
     return false;
 }
 
@@ -163,52 +200,273 @@ async function checkPaidInvoiceBlock(pdfBuffer: Buffer): Promise<{ blocked: bool
 }
 
 /**
- * Extract all PDF attachments from a Gmail message.
- * Returns array of { filename, buffer } for each application/pdf attachment.
- * Handles nested multipart structures.
+ * Invoice attachment extracted from Gmail (PDF or image-as-invoice).
+ * Images (JPEG/PNG phone photos) are converted to PDF before Bill.com forward.
+ * HERMIA(2026-07-17): Down to Earth Worms / Gary Ambriole sends only photos.
  */
-function extractPdfAttachments(payload: any): Array<{ filename: string; buffer: Buffer; attachmentId: string }> {
-    const pdfs: Array<{ filename: string; buffer: Buffer; attachmentId: string }> = [];
+type InvoiceAttachment = {
+    filename: string;
+    buffer: Buffer;
+    attachmentId: string;
+    /** Original Gmail mime — used when converting images → PDF */
+    mimeType: string;
+    kind: "pdf" | "image";
+};
+
+/**
+ * Extract invoice-capable attachments from a Gmail message:
+ *  - application/pdf (primary path)
+ *  - image/jpeg|png phone photos used as invoices (Down to Earth Worms etc.)
+ *
+ * If the email already has real PDFs, images are ignored (logos/signatures).
+ * If there is no PDF, large named image attachments are treated as invoices.
+ */
+function extractInvoiceAttachments(payload: any): InvoiceAttachment[] {
+    const pdfs: InvoiceAttachment[] = [];
+    const images: InvoiceAttachment[] = [];
 
     function walk(part: any) {
         if (!part) return;
 
-        // Check if this part is a PDF attachment
         const mimeType = part.mimeType || "";
         const filename = part.filename || "";
+        const sizeHint = part.body?.size || 0;
         const isPdf = mimeType === "application/pdf" || filename.toLowerCase().endsWith(".pdf");
+        const isImage = isInvoiceImagePart(mimeType, filename, sizeHint);
 
-        if (isPdf && filename && part.body?.attachmentId) {
-            // Attachment content needs to be fetched separately
-            pdfs.push({
-                filename,
-                buffer: Buffer.alloc(0), // placeholder — will be fetched by caller
-                attachmentId: part.body.attachmentId,
-            });
-        } else if (isPdf && filename && part.body?.data) {
-            // Inline PDF (data embedded in the part)
-            pdfs.push({
-                filename,
-                buffer: Buffer.from(part.body.data, "base64url"),
-                attachmentId: "",
-            });
-        }
-
-        // Recurse into nested parts
-        if (part.parts) {
-            for (const subPart of part.parts) {
-                walk(subPart);
+        const push = (list: InvoiceAttachment[], kind: "pdf" | "image") => {
+            if (filename && part.body?.attachmentId) {
+                list.push({
+                    filename,
+                    buffer: Buffer.alloc(0),
+                    attachmentId: part.body.attachmentId,
+                    mimeType,
+                    kind,
+                });
+            } else if (filename && part.body?.data) {
+                list.push({
+                    filename,
+                    buffer: Buffer.from(part.body.data, "base64url"),
+                    attachmentId: "",
+                    mimeType,
+                    kind,
+                });
             }
+        };
+
+        if (isPdf) push(pdfs, "pdf");
+        else if (isImage) push(images, "image");
+
+        if (part.parts) {
+            for (const subPart of part.parts) walk(subPart);
         }
     }
 
     walk(payload);
-    return pdfs;
+    // Prefer real PDFs; only fall back to photos when no PDF is present.
+    return pdfs.length > 0 ? pdfs : images;
+}
+
+/** @deprecated name kept for call-site clarity — delegates to extractInvoiceAttachments */
+function extractPdfAttachments(payload: any): InvoiceAttachment[] {
+    return extractInvoiceAttachments(payload);
 }
 
 // ── Dedup delegate → src/lib/intelligence/ap-dedup.ts ──
 // isAlreadyForwarded() replaced by canonical isDuplicate() from ap-dedup.
 // Layer 1: gmail_message_id + pdf_filename, Layer 2: pdf_content_hash.
+
+/**
+ * After a successful Bill.com forward: OCR the PDF (vision for photo invoices)
+ * and carefully log to SQLite (ap_local_forwards + invoice_cache) AND
+ * PostgREST vendor_invoices so Receivings can PO-match. Never store "UNKNOWN".
+ */
+async function enrichInvoiceForPoMatch(args: {
+    gmailMessageId: string;
+    emailFrom: string;
+    emailSubject: string;
+    pdfFilename: string;
+    pdfBuffer: Buffer;
+    ocrHint?: string;
+    vendorHint?: string;
+}): Promise<void> {
+    const { extractPDF } = await import("@/lib/pdf/extractor");
+    const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
+    const { normalizeInvoiceForDb } = await import("@/lib/pdf/invoice-field-normalize");
+    const { upsertVendorInvoice } = await import("@/lib/storage/vendor-invoices");
+    const { uploadPDF } = await import("@/lib/storage/supabase-storage");
+    const { upsertInvoiceCache } = await import("@/lib/storage/purchasing-cache");
+
+    let rawText = (args.ocrHint || "").trim();
+    // Photo/scanned invoices need vision OCR — pdf-parse alone is near-empty
+    if (rawText.length < 40) {
+        try {
+            const extraction = await extractPDF(args.pdfBuffer);
+            rawText = (extraction.rawText || "").trim();
+            console.log(
+                `   [AP-Local] OCR for PO-match: ${rawText.length} chars (strategy=${extraction.ocrStrategy || "?"})`,
+            );
+        } catch (e: any) {
+            console.warn(`   [AP-Local] extractPDF failed: ${e?.message || e}`);
+        }
+    }
+
+    let vendorHint =
+        args.vendorHint ||
+        (/ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(args.emailFrom)
+            ? "Down to Earth Worms"
+            : undefined);
+
+    let parsed: any = null;
+    if (rawText.length >= 20) {
+        try {
+            parsed = await parseInvoice(rawText);
+        } catch (e: any) {
+            console.warn(`   [AP-Local] parseInvoice failed: ${e?.message || e}`);
+        }
+    }
+
+    const norm = normalizeInvoiceForDb(parsed, rawText, { vendorHint });
+    // Subject-line PO fallback
+    if (!norm.poNumber) {
+        const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
+        if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // ── SQLite permanent log on ap_local_forwards (always, even if PostgREST down) ──
+    try {
+        const db = getLocalDb();
+        db.prepare(
+            `UPDATE ap_local_forwards
+             SET ocr_raw_text = COALESCE(?, ocr_raw_text),
+                 ocr_processed_at = datetime('now'),
+                 ocr_vendor_name = ?,
+                 ocr_invoice_number = ?,
+                 ocr_total = ?,
+                 ocr_freight = ?,
+                 ocr_tax = ?,
+                 ocr_line_items = ?,
+                 matched_po_number = COALESCE(?, matched_po_number),
+                 reconciliation_status = CASE
+                   WHEN ? IS NOT NULL AND (reconciliation_status IS NULL OR reconciliation_status = '' OR reconciliation_status = 'PO_UNMATCHED')
+                   THEN 'PO_CANDIDATE'
+                   ELSE reconciliation_status
+                 END,
+                 reconciliation_notes = COALESCE(reconciliation_notes, ?)
+             WHERE gmail_message_id = ?`,
+        ).run(
+            rawText || null,
+            norm.vendorName,
+            norm.invoiceNumber,
+            norm.total ? String(norm.total) : null,
+            norm.freight ? String(norm.freight) : null,
+            norm.tax ? String(norm.tax) : null,
+            norm.lineItems.length ? JSON.stringify(norm.lineItems) : null,
+            norm.poNumber,
+            norm.poNumber,
+            norm.poNumber
+                ? `OCR logged; PO candidate ${norm.poNumber}`
+                : "OCR logged; no PO# found — needs match",
+            args.gmailMessageId,
+        );
+    } catch (e: any) {
+        console.warn(`   [AP-Local] SQLite OCR field update failed: ${e?.message || e}`);
+    }
+
+    // Local invoice_cache (durable enough for matching; long TTL for AP path)
+    const localId = `apfwd:${args.gmailMessageId}:${args.pdfFilename}`.slice(0, 180);
+    try {
+        upsertInvoiceCache({
+            vendor_invoice_id: localId,
+            vendor_name: norm.vendorName,
+            invoice_number: norm.invoiceNumber,
+            invoice_date: norm.invoiceDate,
+            due_date: null,
+            po_number: norm.poNumber, // OCR candidate only — not a confirmed match
+            total: norm.total,
+            freight: norm.freight,
+            tax: norm.tax,
+            status: "received",
+            line_items: JSON.stringify(norm.lineItems),
+            source: "email_attachment",
+            // Leave matched_po null so Receivings still surfaces "needs match"
+            matched_po: null,
+            match_confidence: norm.poNumber ? "ocr_po_candidate" : null,
+        });
+        // Extend TTL beyond default 24h so photo invoices aren't lost while waiting for match
+        try {
+            getLocalDb()
+                .prepare(
+                    `UPDATE invoice_cache SET expire_at = datetime('now', '+365 days') WHERE vendor_invoice_id = ?`,
+                )
+                .run(localId);
+        } catch { /* non-fatal */ }
+    } catch (e: any) {
+        console.warn(`   [AP-Local] invoice_cache write failed: ${e?.message || e}`);
+    }
+
+    let storagePath: string | null = null;
+    try {
+        storagePath = await uploadPDF(args.pdfBuffer, {
+            type: "INVOICE",
+            vendor: norm.vendorName || "unknown",
+            date: (norm.invoiceDate || new Date().toISOString()).slice(0, 10),
+            filename: args.pdfFilename,
+        });
+    } catch (e: any) {
+        console.warn(`   [AP-Local] local PDF store failed: ${e?.message || e}`);
+    }
+
+    // PostgREST vendor_invoices — retry once; never write UNKNOWN invoice#
+    let id: string | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            id = await upsertVendorInvoice({
+                vendor_name: norm.vendorName,
+                invoice_number: norm.invoiceNumber, // null OK, never "UNKNOWN"
+                invoice_date: norm.invoiceDate,
+                po_number: norm.poNumber,
+                subtotal: norm.subtotal,
+                freight: norm.freight,
+                tax: norm.tax,
+                total: norm.total,
+                status: "received",
+                source: "email_attachment",
+                source_ref: args.gmailMessageId,
+                pdf_storage_path: storagePath,
+                line_items: norm.lineItems,
+                raw_data: {
+                    email_from: args.emailFrom,
+                    email_subject: args.emailSubject,
+                    pdf_filename: args.pdfFilename,
+                    ocr_chars: rawText.length,
+                    photo_invoice: true,
+                    local_cache_id: localId,
+                },
+                notes:
+                    rawText.length < 40
+                        ? "Photo invoice — OCR thin; match may need manual total/PO"
+                        : null,
+            });
+            if (id) break;
+        } catch (e: any) {
+            console.warn(
+                `   [AP-Local] vendor_invoices attempt ${attempt} failed: ${e?.message || e}`,
+            );
+            if (attempt === 1) await new Promise((r) => setTimeout(r, 1500));
+        }
+    }
+
+    if (id) {
+        console.log(
+            `   [AP-Local] DB logged vendor_invoices id=${id} vendor=${norm.vendorName} inv#=${norm.invoiceNumber || "—"} PO=${norm.poNumber || "—"} total=${norm.total || "—"}`,
+        );
+    } else {
+        console.warn(
+            `   [AP-Local] vendor_invoices not written (PostgREST?) — SQLite ap_local_forwards + invoice_cache hold the record for ${args.pdfFilename}`,
+        );
+    }
+}
 
 /**
  * Record a successful forward in local SQLite.
@@ -816,23 +1074,50 @@ export async function runLocalApForward(): Promise<{
             // Skip known non-invoice senders (tracking notifications, etc.)
             if (isNonInvoiceSender(from, subject)) {
                 console.log(`   [AP-Local] Skipping non-invoice: ${subject.slice(0, 50)} (${from.slice(0, 25)})`);
+                recordSkippedForward({
+                    gmailMessageId,
+                    emailFrom: from,
+                    emailSubject: subject,
+                    pdfFilename: "(no-attachment)",
+                    reason: `non-invoice sender/subject: ${subject.slice(0, 80)}`,
+                    vendorRoutingAction: "skip",
+                });
                 await markEmailProcessed(gmail, gmailMessageId);
                 summary.skipped++;
                 continue;
             }
 
-            // ── Vendor routing check ────────────────────────────────────
+            // Extract PDF or invoice-image attachments first (filename needed for routing)
+            const invoiceAttachments = extractInvoiceAttachments(msgRes.data.payload);
+
+            // ── Vendor routing check (subject + each attachment filename) ──
             // Only three outcomes that matter for forwarding:
             //   'skip'         → mark read, archive (not an invoice)
             //   'amazon_order' → route to Amazon parser
             //   'dropship'     → forward, but skip PO reconciliation later
             //   null (no rule) → forward + PO matching (default)
-            const routingRule = checkVendorRouting(from, subject);
+            let routingRule = checkVendorRouting(from, subject);
+            for (const att of invoiceAttachments) {
+                const byFile = checkVendorRouting(from, subject, att.filename);
+                if (byFile?.action === "skip") {
+                    routingRule = byFile;
+                    break;
+                }
+                if (!routingRule && byFile) routingRule = byFile;
+            }
             let skipReconciliation = false;
 
             if (routingRule) {
                 if (routingRule.action === "skip" || routingRule.action === "amazon_order") {
                     console.log(`   [AP-Local] Skipping: ${routingRule.label} — ${subject.slice(0, 50)}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: invoiceAttachments[0]?.filename || "(none)",
+                        reason: routingRule.label,
+                        vendorRoutingAction: routingRule.action,
+                    });
                     await markEmailProcessed(gmail, gmailMessageId);
                     summary.skipped++;
                     continue;
@@ -843,43 +1128,80 @@ export async function runLocalApForward(): Promise<{
                 }
             }
 
-            // Extract PDF attachments
-            const pdfAttachments = extractPdfAttachments(msgRes.data.payload);
-
-            if (pdfAttachments.length === 0) {
-                // No PDF attached — not an invoice. Mark read, archive, skip.
-                console.log(`   [AP-Local] No PDF — skipping: ${subject.slice(0, 50)}`);
+            if (invoiceAttachments.length === 0) {
+                // No invoice attachment — not an invoice. Mark read, archive, skip.
+                console.log(`   [AP-Local] No PDF/image invoice — skipping: ${subject.slice(0, 50)}`);
+                recordSkippedForward({
+                    gmailMessageId,
+                    emailFrom: from,
+                    emailSubject: subject,
+                    pdfFilename: "(no-attachment)",
+                    reason: "no PDF/image invoice attachment",
+                });
                 await markEmailProcessed(gmail, gmailMessageId);
                 summary.skipped++;
                 continue;
             }
 
-            // Process each PDF attachment
+            // Process each invoice attachment (PDF as-is; images converted → PDF)
             let allPdfsForwarded = true;
-            for (const pdf of pdfAttachments) {
-                let pdfBuffer = pdf.buffer;
+            for (const att of invoiceAttachments) {
+                // Statement / collections PDFs — log, never Bill.com
+                if (isStatementAttachment(att.filename, from, subject)) {
+                    console.log(`   [AP-Local] Statement attachment — log only: ${att.filename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: att.filename,
+                        reason: `statement/non-invoice attachment: ${att.filename}`,
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
+                }
+
+                let pdfBuffer = att.buffer;
+                let pdfFilename = att.filename;
 
                 // Fetch attachment content if not inline
-                if (pdf.attachmentId && pdfBuffer.length === 0) {
+                if (att.attachmentId && pdfBuffer.length === 0) {
                     const attRes = await gmail.users.messages.attachments.get({
                         userId: "me",
                         messageId: gmailMessageId,
-                        id: pdf.attachmentId,
+                        id: att.attachmentId,
                     });
                     pdfBuffer = Buffer.from(attRes.data.data || "", "base64url");
                 }
 
                 if (pdfBuffer.length === 0) {
-                    console.warn(`   [AP-Local] Empty PDF: ${pdf.filename}`);
+                    console.warn(`   [AP-Local] Empty attachment: ${att.filename}`);
                     allPdfsForwarded = false;
                     continue;
                 }
 
+                // Phone-photo invoices → single-page PDF (Bill.com OCR is fine with
+                // images on manual upload; we wrap so single-forward + DB OCR path work).
+                if (att.kind === "image") {
+                    try {
+                        console.log(`   [AP-Local] Converting image invoice → PDF: ${att.filename}`);
+                        pdfBuffer = await imageBufferToPdf(pdfBuffer, att.mimeType);
+                        pdfFilename = imageFilenameToPdf(att.filename);
+                    } catch (convErr: any) {
+                        console.error(
+                            `   [AP-Local] Image→PDF failed for ${att.filename}: ${convErr?.message || convErr}`,
+                        );
+                        allPdfsForwarded = false;
+                        summary.errors++;
+                        continue;
+                    }
+                }
+
                 const pdfHash = crypto.createHash("sha256").update(pdfBuffer).digest("hex");
 
-                // Dedup check
-                if (isDuplicate(gmailMessageId, pdf.filename, pdfHash)) {
-                    console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdf.filename} (msg ${gmailMessageId})`);
+                // Dedup: hash / message+file / vendor+inv — log, never re-send
+                if (isDuplicate(gmailMessageId, pdfFilename, pdfHash) || isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash)) {
+                    console.log(`   [AP-Local] ⏭️ Already logged/forwarded (dedup): ${pdfFilename} (msg ${gmailMessageId})`);
                     summary.skipped++;
                     continue;
                 }
@@ -888,9 +1210,10 @@ export async function runLocalApForward(): Promise<{
                 // OCR the PDF to check if this is an already-paid invoice.
                 // Paid invoices (receipts, $0.00 balance, "Do Not Pay") should
                 // never reach Bill.com. Safe default: forward if OCR fails.
+                // Scanned/photo PDFs often yield little text — do not block those.
                 const paidCheck = await checkPaidInvoiceBlock(pdfBuffer);
                 if (paidCheck.blocked) {
-                    recordError(gmailMessageId, from, subject, pdf.filename, pdfHash,
+                    recordError(gmailMessageId, from, subject, pdfFilename, pdfHash,
                         `BLOCKED: ${paidCheck.reason}`);
                     summary.skipped++;
                     continue;
@@ -904,36 +1227,60 @@ export async function runLocalApForward(): Promise<{
                         gmailMessageId,
                         emailFrom: from,
                         emailSubject: subject,
-                        pdfFilename: pdf.filename,
+                        pdfFilename,
                         pdfBuffer,
                         source: "local-forwarder",
                         gmail,
                         ocrRawText: paidCheck.rawText,
                         vendorRoutingAction: skipReconciliation ? "dropship" : undefined,
+                        vendorName: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                            ? "Down to Earth Worms"
+                            : undefined,
                     });
                     if (once.status === "already_forwarded") {
-                        console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdf.filename} (${once.reason})`);
+                        console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);
                         summary.skipped++;
                         continue;
                     }
                     if (once.status === "blocked") {
-                        console.log(`   [AP-Local] 🚫 Blocked: ${pdf.filename} (${once.reason})`);
+                        console.log(`   [AP-Local] 🚫 Blocked: ${pdfFilename} (${once.reason})`);
                         summary.skipped++;
                         continue;
                     }
                     if (once.status !== "forwarded") {
                         summary.errors++;
                         allPdfsForwarded = false;
-                        console.error(`   [AP-Local] ❌ Failed to forward ${pdf.filename}: ${once.reason}`);
+                        console.error(`   [AP-Local] ❌ Failed to forward ${pdfFilename}: ${once.reason}`);
                         continue;
                     }
-                    await syncToSupabase(from, subject, pdf.filename, once.billcomSentMessageId);
+                    await syncToSupabase(from, subject, pdfFilename, once.billcomSentMessageId);
                     summary.forwarded++;
-                    console.log(`   [AP-Local] ✅ Forwarded ${pdf.filename} from ${from.slice(0, 25)} (single-gate)`);
+                    console.log(`   [AP-Local] ✅ Forwarded ${pdfFilename} from ${from.slice(0, 25)} (single-gate)`);
+
+                    // Vision/OCR + vendor_invoices so Receivings can PO-match.
+                    // Photo invoices need LLM OCR (pdf-parse returns ~0 text).
+                    // Non-fatal: Bill.com already has the bill.
+                    try {
+                        await enrichInvoiceForPoMatch({
+                            gmailMessageId,
+                            emailFrom: from,
+                            emailSubject: subject,
+                            pdfFilename,
+                            pdfBuffer,
+                            ocrHint: paidCheck.rawText,
+                            vendorHint: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                                ? "Down to Earth Worms"
+                                : undefined,
+                        });
+                    } catch (enrichErr: any) {
+                        console.warn(
+                            `   [AP-Local] PO-match enrich failed for ${pdfFilename}: ${enrichErr?.message || enrichErr}`,
+                        );
+                    }
                 } catch (e: any) {
                     summary.errors++;
                     allPdfsForwarded = false;
-                    console.error(`   [AP-Local] ❌ Failed to forward ${pdf.filename}: ${e.message}`);
+                    console.error(`   [AP-Local] ❌ Failed to forward ${pdfFilename}: ${e.message}`);
                 }
             }
 

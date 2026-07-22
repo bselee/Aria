@@ -181,6 +181,58 @@ try {
             Write-Log "OK: aria-bot is online. Heartbeat check passed."
         }
     }
+
+    # --- Local data plane: WSL + PostgREST Windows path ---
+    try {
+        $pgCode = 0
+        try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:5434/" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $pgCode = [int]$resp.StatusCode
+        } catch {
+            if ($_.Exception.Response) {
+                $pgCode = [int]$_.Exception.Response.StatusCode
+            } else {
+                $pgCode = 0
+            }
+        }
+
+        # 200/401/503 are healthy (503 = schema cache reload — never docker-restart)
+        if ($pgCode -eq 200 -or $pgCode -eq 401 -or $pgCode -eq 503) {
+            # ok
+        } else {
+            Write-Log "WARN: PostgREST Windows path down (HTTP $pgCode) — waking WSL/Docker + proxy"
+            & wsl.exe -d Ubuntu -u root -- bash -lc "service docker start >/dev/null 2>&1; docker start aria-db >/dev/null 2>&1; sleep 6; docker exec aria-db pg_isready -U postgres >/dev/null 2>&1; docker start aria-postgrest aria-minio >/dev/null 2>&1; true" 2>$null | Out-Null
+            Start-Sleep -Seconds 8
+            Set-Location $ProjectDir
+            & pm2 restart aria-wsl-proxy 2>&1 | Out-Null
+            Start-Sleep -Seconds 6
+            $pgCode2 = 0
+            try {
+                $resp2 = Invoke-WebRequest -Uri "http://127.0.0.1:5434/" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+                $pgCode2 = [int]$resp2.StatusCode
+            } catch {
+                if ($_.Exception.Response) { $pgCode2 = [int]$_.Exception.Response.StatusCode } else { $pgCode2 = 0 }
+            }
+            if ($pgCode2 -eq 200 -or $pgCode2 -eq 401 -or $pgCode2 -eq 503) {
+                Write-Log "OK: PostgREST recovered (HTTP $pgCode2)"
+            } else {
+                Write-Log "ERROR: PostgREST still down after recovery (HTTP $pgCode2)"
+            }
+        }
+
+        # Ensure local-stack + proxy processes exist in PM2
+        foreach ($app in @("aria-wsl-proxy", "aria-local-stack", "aria-dashboard")) {
+            $pidOut = & pm2 pid $app 2>$null | Out-String
+            $pidOut = $pidOut.Trim()
+            if (-not $pidOut -or $pidOut -eq "" -or $pidOut -eq "0") {
+                Write-Log "WARN: $app missing — starting from ecosystem.config.json"
+                $ecoJson = Join-Path $ProjectDir "ecosystem.config.json"
+                & pm2 start $ecoJson --only $app 2>&1 | Out-Null
+            }
+        }
+    } catch {
+        Write-Log "WARN: Data-plane check failed: $($_.Exception.Message)"
+    }
 } catch {
     Write-Log "ERROR: Watchdog failed: $($_.Exception.Message)"
 

@@ -77,9 +77,21 @@ export async function upsertVendorInvoice(
     // Normalise vendor name: trim, title-case first word at minimum
     const vendorName = record.vendor_name.trim();
 
+    // Never persist schema sentinels as invoice numbers — they poison unique keys
+    // (e.g. multiple photo invoices collapsing to "UNKNOWN").
+    let invoiceNumber = record.invoice_number ?? null;
+    if (invoiceNumber != null) {
+        const t = String(invoiceNumber).trim();
+        if (!t || /^(unknown|n\/a|na|none|null|-|—)$/i.test(t)) {
+            invoiceNumber = null;
+        } else {
+            invoiceNumber = t;
+        }
+    }
+
     const payload = {
         vendor_name: vendorName,
-        invoice_number: record.invoice_number ?? null,
+        invoice_number: invoiceNumber,
         invoice_date: record.invoice_date ?? null,
         due_date: record.due_date ?? null,
         po_number: record.po_number ?? null,
@@ -101,8 +113,8 @@ export async function upsertVendorInvoice(
 
     // If we have an invoice_number, UPSERT (dedup by vendor+inv).
     // If no invoice_number, just INSERT (can't dedup without a number).
-    if (record.invoice_number) {
-        const { data, error } = await supabase
+    if (invoiceNumber) {
+        const { data, error } = await db
             .from("vendor_invoices")
             .upsert(payload, { onConflict: "vendor_name,invoice_number" })
             .select("id")
@@ -110,7 +122,7 @@ export async function upsertVendorInvoice(
 
         if (error) {
             console.error(
-                `[vendor-invoices] Upsert failed for ${vendorName} #${record.invoice_number}:`,
+                `[vendor-invoices] Upsert failed for ${vendorName} #${invoiceNumber}:`,
                 error.message
             );
             return null;
@@ -119,7 +131,7 @@ export async function upsertVendorInvoice(
     }
 
     // No invoice number — plain insert
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("vendor_invoices")
         .insert(payload)
         .select("id")
@@ -155,7 +167,7 @@ export interface InvoiceLookupFilters {
 export async function lookupVendorInvoices(filters: InvoiceLookupFilters) {
     const db = createClient();
 
-    let query = supabase
+    let query = db
         .from("vendor_invoices")
         .select("*")
         .order("invoice_date", { ascending: false });
@@ -246,7 +258,7 @@ export async function markInvoicePaid(
 ): Promise<boolean> {
     const db = createClient();
 
-    const { error } = await supabase
+    const { error } = await db
         .from("vendor_invoices")
         .update({
             status: "paid",

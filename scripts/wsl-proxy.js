@@ -1,92 +1,69 @@
 /**
  * @file    wsl-proxy.js
- * @purpose Port forwarder Windows → WSL2 Docker + WSL-HTTP bridge for PostgREST.
- *          When wslrelay/eth0 fail, PostgREST is still served via `wsl curl`
- *          against localhost:5434 *inside* WSL (always works when container is up).
+ * @purpose Simple TCP port forwarder Windows → WSL2 Docker.
+ *          Binds localhost ports and proxies to WSL2 IP on matching ports.
+ *          Health loop detects WSL IP changes and rebinds.
+ *          NO wsl.exe spawn per request — plain TCP only.
  * @author  BuildASoil / Hermia
- * @updated 2026-07-16 — WSL HTTP bridge fallback for 5434
- * @deps    net, http, child_process, fs
+ * @updated 2026-07-22 — removed WSL-HTTP bridge (was crashing WSL via wsl.exe flood)
+ * @deps    net, child_process, fs
  */
 
 const net = require("net");
-const http = require("http");
-const { execSync, spawn } = require("child_process");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const FALLBACK_OFFSET = 10000;
 const PROXY_PORT_FILE = path.join(__dirname, "..", ".env.proxy");
+const WSL_IP_CACHE_FILE = path.join(__dirname, "..", ".wsl-ip-cache");
+const HEALTH_INTERVAL_MS = 30_000;
+const IP_REFRESH_MS = 120_000;
+
+const SILENT = { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] };
+
+function wslArgs(args, timeout = 10000) {
+  return execFileSync("wsl.exe", args, { encoding: "utf-8", timeout, ...SILENT });
+}
 
 const PORT_MAP = [
-  { listen: 5434, target: 5434, name: "PostgREST", http: true },
-  { listen: 5433, target: 5433, name: "Postgres", http: false },
-  { listen: 5435, target: 5435, name: "MinIO-API", http: false },
-  { listen: 5436, target: 5436, name: "MinIO-Console", http: false },
-  { listen: 8000, target: 8000, name: "Honcho", http: false },
+  { listen: 5433, target: 5433, name: "Postgres" },
+  { listen: 5435, target: 5435, name: "MinIO-API" },
+  { listen: 5436, target: 5436, name: "MinIO-Console" },
+  { listen: 8000, target: 8000, name: "Honcho" },
 ];
 
+/** @type {Map<string, net.Server>} */
+const servers = new Map();
 const boundPorts = {};
+let wslIp = null;
+let healthTimer = null;
 
 function resolveWslIp() {
   let attempts = 0;
   const maxAttempts = 15;
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const poll = setInterval(() => {
       attempts++;
       try {
-        const raw = execSync("wsl -d Ubuntu hostname -I", {
-          timeout: 5000,
-          encoding: "utf-8",
-          shell: "powershell.exe",
-        });
-        const wslIp = raw.trim().split(/\s+/)[0];
-        if (wslIp && /^\d+\.\d+\.\d+\.\d+$/.test(wslIp)) {
+        const raw = wslArgs(["-d", "Ubuntu", "hostname", "-I"], 5000);
+        const ip = raw.trim().split(/\s+/)[0];
+        if (ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
           clearInterval(poll);
-          console.log(`[wsl-proxy] WSL2 IP: ${wslIp}`);
-          resolve(wslIp);
+          console.log(`[wsl-proxy] WSL2 IP: ${ip}`);
+          resolve(ip);
         } else if (attempts >= maxAttempts) {
           clearInterval(poll);
-          // Still continue — bridge doesn't need eth0
-          console.warn("[wsl-proxy] Could not resolve WSL IP — bridge-only mode for PostgREST");
+          console.warn("[wsl-proxy] Could not resolve WSL IP");
           resolve(null);
         }
       } catch {
         if (attempts >= maxAttempts) {
           clearInterval(poll);
-          console.warn("[wsl-proxy] WSL hostname failed — bridge-only mode");
+          console.warn("[wsl-proxy] WSL hostname failed");
           resolve(null);
-        } else if (attempts === 1 || attempts % 5 === 0) {
-          console.log(`[wsl-proxy] WSL2 not reachable, retrying... (${attempts}/${maxAttempts})`);
         }
       }
     }, 2000);
-  });
-}
-
-function checkLocalHttp(port, timeoutMs = 2500) {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let data = "";
-    socket.setTimeout(timeoutMs);
-    socket.on("connect", () => {
-      socket.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
-    });
-    socket.on("data", (buf) => {
-      data += buf.toString("utf8");
-      if (data.includes("\r\n\r\n") || data.length > 32) {
-        socket.destroy();
-        resolve(/HTTP\/\d\.\d\s+\d{3}/.test(data) || data.length > 0);
-      }
-    });
-    socket.on("error", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve(data.length > 0);
-    });
-    socket.connect(port, "127.0.0.1");
   });
 }
 
@@ -95,287 +72,157 @@ function checkTcp(ip, port, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(timeoutMs);
-    socket.on("connect", () => {
-      socket.destroy();
-      resolve(true);
-    });
-    socket.on("error", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve(false);
-    });
+    socket.on("connect", () => { socket.destroy(); resolve(true); });
+    socket.on("error", () => { socket.destroy(); resolve(false); });
+    socket.on("timeout", () => { socket.destroy(); resolve(false); });
     socket.connect(port, ip);
   });
 }
 
-function checkInsideWslPostgrest() {
-  try {
-    const out = execSync(
-      'wsl -d Ubuntu -u root bash -c "curl -s -o /dev/null -w %{http_code} --max-time 4 http://127.0.0.1:5434/"',
-      { timeout: 10000, encoding: "utf-8", shell: "powershell.exe" }
-    ).trim();
-    const code = parseInt(out, 10);
-    return code === 200 || code === 503;
-  } catch {
-    return false;
-  }
-}
-
-function tryBindTcp(port, targetPort, ip, name, isFallback) {
+function createTcpProxy(listenPort, targetPort, ip, name) {
   return new Promise((resolve) => {
-    if (!ip) {
-      resolve(null);
-      return;
-    }
+    if (!ip) { resolve(null); return; }
     const server = net.createServer((clientSocket) => {
       const upstream = net.connect(targetPort, ip, () => {
-        upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
+        upstream.pipe(clientSocket);
       });
       upstream.on("error", () => clientSocket.destroy());
       clientSocket.on("error", () => upstream.destroy());
       const timeout = setTimeout(() => {
         clientSocket.destroy();
         upstream.destroy();
-      }, 60000);
-      clientSocket.on("close", () => {
-        clearTimeout(timeout);
-        upstream.destroy();
-      });
-      upstream.on("close", () => {
-        clearTimeout(timeout);
-        clientSocket.destroy();
-      });
+      }, 120_000);
+      clientSocket.on("close", () => { clearTimeout(timeout); upstream.destroy(); });
+      upstream.on("close", () => { clearTimeout(timeout); clientSocket.destroy(); });
     });
     server.on("error", (err) => {
-      if (err.code !== "EADDRINUSE") {
-        console.error(`[wsl-proxy] Server error on ${port} (${name}):`, err.message);
+      if (err.code === "EADDRINUSE") {
+        console.warn(`[wsl-proxy] Port ${listenPort} (${name}) already in use — skipping`);
+      } else {
+        console.error(`[wsl-proxy] Server error on ${listenPort} (${name}):`, err.message);
       }
       resolve(null);
     });
-    server.listen(port, "127.0.0.1", () => {
-      const tag = isFallback ? " (fallback)" : "";
-      console.log(`[wsl-proxy] 127.0.0.1:${port} → ${ip}:${targetPort} (${name}${tag})`);
-      resolve(server);
-    });
-  });
-}
-
-/**
- * HTTP reverse proxy via `wsl curl` to PostgREST inside the VM.
- * Works when Docker port publish / eth0 NAT is broken.
- */
-function startWslHttpBridge(listenPort = 5434) {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const chunks = [];
-      req.on("data", (c) => chunks.push(c));
-      req.on("end", () => {
-        const body = Buffer.concat(chunks);
-        const url = `http://127.0.0.1:5434${req.url || "/"}`;
-        const curlArgs = [
-          "-d",
-          "Ubuntu",
-          "-u",
-          "root",
-          "--",
-          "curl",
-          "-sS",
-          "-i",
-          "--max-time",
-          "25",
-          "-X",
-          req.method || "GET",
-        ];
-        for (const [k, v] of Object.entries(req.headers || {})) {
-          const key = k.toLowerCase();
-          if (
-            key === "host" ||
-            key === "connection" ||
-            key === "content-length" ||
-            key === "transfer-encoding" ||
-            key === "accept-encoding"
-          ) {
-            continue;
-          }
-          if (Array.isArray(v)) curlArgs.push("-H", `${k}: ${v.join(",")}`);
-          else if (v != null) curlArgs.push("-H", `${k}: ${v}`);
-        }
-        if (body.length > 0) {
-          curlArgs.push("--data-binary", "@-");
-        }
-        curlArgs.push(url);
-
-        const child = spawn("wsl", curlArgs, { windowsHide: true });
-        if (body.length > 0) child.stdin.write(body);
-        child.stdin.end();
-
-        let out = Buffer.alloc(0);
-        let errBuf = Buffer.alloc(0);
-        child.stdout.on("data", (d) => {
-          out = Buffer.concat([out, d]);
-        });
-        child.stderr.on("data", (d) => {
-          errBuf = Buffer.concat([errBuf, d]);
-        });
-        child.on("error", (e) => {
-          res.statusCode = 502;
-          res.end(`WSL bridge spawn error: ${e.message}`);
-        });
-        child.on("close", (code) => {
-          if (!out.length) {
-            res.statusCode = 502;
-            res.end(
-              `WSL bridge empty (exit ${code}): ${errBuf.toString("utf8").slice(0, 200)}`
-            );
-            return;
-          }
-          // curl -i may emit multiple headers on redirect; take last block
-          const str = out.toString("latin1");
-          let splitAt = str.lastIndexOf("\r\n\r\n");
-          if (splitAt < 0) splitAt = str.indexOf("\n\n");
-          if (splitAt < 0) {
-            res.statusCode = 502;
-            res.end("WSL bridge: unparseable response");
-            return;
-          }
-          const head = str.slice(0, splitAt);
-          const bodyPart = str.slice(splitAt + (str.includes("\r\n\r\n") ? 4 : 2));
-          const lines = head.split(/\r?\n/);
-          const statusLine = lines[0] || "";
-          const m = statusLine.match(/HTTP\/[\d.]+\s+(\d+)/);
-          res.statusCode = m ? parseInt(m[1], 10) : 502;
-          for (let i = 1; i < lines.length; i++) {
-            const colon = lines[i].indexOf(":");
-            if (colon <= 0) continue;
-            const hk = lines[i].slice(0, colon).trim();
-            const hv = lines[i].slice(colon + 1).trim();
-            if (/^(transfer-encoding|connection|content-length)$/i.test(hk)) continue;
-            try {
-              res.setHeader(hk, hv);
-            } catch {
-              /* ignore invalid headers */
-            }
-          }
-          res.end(Buffer.from(bodyPart, "latin1"));
-        });
-      });
-    });
-
-    server.on("error", (err) => {
-      if (err.code === "EADDRINUSE") resolve(null);
-      else reject(err);
-    });
     server.listen(listenPort, "127.0.0.1", () => {
-      console.log(
-        `[wsl-proxy] WSL-HTTP bridge 127.0.0.1:${listenPort} → wsl curl http://127.0.0.1:5434 (PostgREST)`
-      );
+      console.log(`[wsl-proxy] 127.0.0.1:${listenPort} → ${ip}:${targetPort} (${name})`);
       resolve(server);
     });
   });
 }
 
-async function waitForLocalHttp(port, attempts = 4, delayMs = 1500) {
-  for (let i = 0; i < attempts; i++) {
-    if (await checkLocalHttp(port, 2000)) return true;
-    await new Promise((r) => setTimeout(r, delayMs));
-  }
-  return false;
-}
-
-async function createProxy(listenPort, targetPort, ip, name, http) {
-  if (listenPort === 5434) {
-    // 1) Already working via wslrelay?
-    if (await waitForLocalHttp(5434, 3, 1000)) {
-      console.log("[wsl-proxy] Port 5434 already working — leaving it");
-      boundPorts[name] = 5434;
-      return null;
+async function bindAll(ip) {
+  for (const { listen, target, name } of PORT_MAP) {
+    // Close old server if exists
+    const old = servers.get(name);
+    if (old) {
+      try { old.close(); } catch {}
+      servers.delete(name);
     }
-
-    const insideOk = checkInsideWslPostgrest();
-
-    // Prefer WSL-HTTP bridge — durable when eth0 NAT flaps (common on this host)
-    if (insideOk || checkInsideWslPostgrest()) {
-      const bridge = await startWslHttpBridge(5434);
-      if (bridge) {
-        await new Promise((r) => setTimeout(r, 200));
-        if (await checkLocalHttp(5434, 8000)) {
-          boundPorts[name] = 5434;
-          return bridge;
-        }
-        bridge.close();
-        console.warn("[wsl-proxy] WSL bridge bound but probe failed");
-      }
+    const server = await createTcpProxy(listen, target, ip, name);
+    if (server) {
+      servers.set(name, server);
+      boundPorts[name] = listen;
+    } else {
+      boundPorts[name] = null;
     }
-
-    // eth0 TCP as secondary
-    const ethOk = ip ? await checkTcp(ip, 5434, 2000) : false;
-    if (ethOk) {
-      const server = await tryBindTcp(5434, targetPort, ip, name, false);
-      if (server) {
-        await new Promise((r) => setTimeout(r, 300));
-        if (await checkLocalHttp(5434, 2500)) {
-          boundPorts[name] = 5434;
-          return server;
-        }
-        server.close();
-      }
-    }
-
-    console.error("[wsl-proxy] PostgREST unavailable on Windows and inside WSL");
-    boundPorts[name] = null;
-    return null;
   }
-
-  // Other ports — TCP only
-  let server = await tryBindTcp(listenPort, targetPort, ip, name, false);
-  if (server) {
-    boundPorts[name] = listenPort;
-    return server;
-  }
-  if (ip && (await checkTcp(ip, targetPort, 1000))) {
-    boundPorts[name] = listenPort;
-    console.log(`[wsl-proxy] Port ${listenPort} (${name}) already bound — skipping`);
-    return null;
-  }
-  const fallback = listenPort + FALLBACK_OFFSET;
-  server = await tryBindTcp(fallback, targetPort, ip, name, true);
-  boundPorts[name] = server ? fallback : null;
-  return server;
 }
 
 function writeProxyEnv(ports) {
   const lines = Object.entries(ports)
     .filter(([, port]) => port !== null)
     .map(([name, port]) => `${name.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}=${port}`);
-  const pgrPort = ports["PostgREST"];
-  if (pgrPort) {
-    lines.push(`PGREST_PORT=${pgrPort}`);
-    lines.push(`PGREST_URL=http://localhost:${pgrPort}`);
-  }
   fs.writeFileSync(PROXY_PORT_FILE, lines.join("\n") + "\n");
   console.log(`[wsl-proxy] Proxy env written to ${PROXY_PORT_FILE}`);
 }
 
+async function healthCheck() {
+  let allHealthy = true;
+  for (const { listen, target, name } of PORT_MAP) {
+    // Check if our server is still listening
+    const srv = servers.get(name);
+    if (!srv || !srv.listening) {
+      allHealthy = false;
+      continue;
+    }
+    // Also verify target is reachable
+    if (!(await checkTcp(wslIp, target, 2000))) {
+      console.warn(`[wsl-proxy] Health: ${name} target ${wslIp}:${target} unreachable`);
+      allHealthy = false;
+    }
+  }
+  if (!allHealthy) {
+    console.warn("[wsl-proxy] Health check failed — rebinding all ports...");
+    await bindAll(wslIp);
+    writeProxyEnv(boundPorts);
+  }
+}
+
+function startHealthLoop() {
+  if (healthTimer) clearInterval(healthTimer);
+  healthTimer = setInterval(async () => {
+    try { await healthCheck(); } catch (err) {
+      console.warn("[wsl-proxy] Health loop error:", err.message || err);
+    }
+  }, HEALTH_INTERVAL_MS);
+}
+
 (async () => {
   try {
-    const ip = await resolveWslIp();
-    const results = await Promise.allSettled(
-      PORT_MAP.map(({ listen, target, name, http }) =>
-        createProxy(listen, target, ip, name, http)
-      )
-    );
-    const failures = results.filter((r) => r.status === "rejected");
-    if (failures.length) {
-      console.error(`[wsl-proxy] ${failures.length} proxy failure(s)`, failures[0].reason);
+    // Fast path: use cached IP from last successful run, verify in background
+    let cachedIp = null;
+    try {
+      cachedIp = fs.readFileSync(WSL_IP_CACHE_FILE, "utf8").trim();
+      if (cachedIp && /^\d+\.\d+\.\d+\.\d+$/.test(cachedIp)) {
+        console.log(`[wsl-proxy] Using cached WSL IP: ${cachedIp}`);
+        wslIp = cachedIp;
+        // Bind immediately with cached IP so ports are available
+        await bindAll(wslIp);
+        writeProxyEnv(boundPorts);
+        const active = Object.values(boundPorts).filter(Boolean).length;
+        console.log(`[wsl-proxy] configured=${PORT_MAP.length} active=${active} (cached IP)`);
+      }
+    } catch { /* no cache file */ }
+
+    // Always resolve fresh IP (may update if changed)
+    const freshIp = await resolveWslIp();
+    if (freshIp) {
+      if (freshIp !== wslIp) {
+        console.log(`[wsl-proxy] Fresh IP differs from cached — rebinding`);
+        wslIp = freshIp;
+        await bindAll(wslIp);
+        writeProxyEnv(boundPorts);
+      }
+      // Persist for next startup
+      try { fs.writeFileSync(WSL_IP_CACHE_FILE, freshIp); } catch {}
     }
-    writeProxyEnv(boundPorts);
-    console.log(
-      `[wsl-proxy] configured=${PORT_MAP.length} active=${Object.values(boundPorts).filter(Boolean).length}`
-    );
+
+    if (!wslIp) {
+      console.error("[wsl-proxy] Cannot resolve WSL IP — exiting");
+      process.exit(1);
+    }
+
+    const active = Object.values(boundPorts).filter(Boolean).length;
+    console.log(`[wsl-proxy] configured=${PORT_MAP.length} active=${active}`);
+
+    startHealthLoop();
+
+    // Refresh WSL IP periodically (changes after WSL restart)
+    setInterval(async () => {
+      try {
+        const raw = wslArgs(["-d", "Ubuntu", "hostname", "-I"], 5000);
+        const next = raw.trim().split(/\s+/)[0];
+        if (next && /^\d+\.\d+\.\d+\.\d+$/.test(next) && next !== wslIp) {
+          console.log(`[wsl-proxy] WSL IP changed ${wslIp} → ${next}`);
+          wslIp = next;
+          await bindAll(wslIp);
+          writeProxyEnv(boundPorts);
+          try { fs.writeFileSync(WSL_IP_CACHE_FILE, next); } catch {}
+        }
+      } catch { /* WSL down — health loop handles */ }
+    }, IP_REFRESH_MS);
+
   } catch (err) {
     console.error("[wsl-proxy] Fatal:", err.message);
     process.exit(1);

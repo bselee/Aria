@@ -1,6 +1,16 @@
 {
   "apps": [
     {
+      "name": "aria-postgrest",
+      "script": "bin/postgrest.exe",
+      "args": "postgrest.conf",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 5,
+      "restart_delay": 5000,
+      "min_uptime": "5s"
+    },
+    {
       "name": "aria-wsl-proxy",
       "script": "scripts/wsl-proxy.js",
       "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
@@ -8,6 +18,16 @@
       "max_restarts": 10,
       "restart_delay": 5000,
       "min_uptime": "5s"
+    },
+    {
+      "name": "aria-local-stack",
+      "script": "scripts/local-stack-watchdog.js",
+      "args": "--loop",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 10000,
+      "min_uptime": "10s"
     },
     {
       "name": "aria-dashboard",
@@ -22,8 +42,8 @@
     {
       "name": "aria-bot",
       "script": "src/cli/start-bot.ts",
-      "interpreter": "npx",
-      "interpreter_args": "tsx",
+      "interpreter": "node",
+      "node_args": "--import tsx",
       "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
       "windowsHide": true,
       "max_restarts": 5,

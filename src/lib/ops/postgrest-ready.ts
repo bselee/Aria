@@ -98,7 +98,7 @@ export async function probePostgrestReady(
 
         const token = getAuthToken();
         const q = await nodeHttpGet(
-            `${base}/${probeTable}?select=agent_name&limit=1`,
+            `${base}/${probeTable}?limit=1`,
             { Accept: "application/json", apikey: token, Authorization: `Bearer ${token}` },
             5000,
         );

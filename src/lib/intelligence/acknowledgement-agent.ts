@@ -314,7 +314,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
             const repliedThreadIds = new Set<string>();
 
             // Fetch unprocessed rows
-            const { data: messages, error } = await supabase
+            const { data: messages, error } = await db
                 .from('email_inbox_queue')
                 .select('*')
                 .eq('processed_by_ack', false)
@@ -642,9 +642,7 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
                         lines.push(`\n🌙 _Off-hours: holding notification for morning digest._`);
                         // Queue for morning digest instead of sending now
                         try {
-                            const { createClient } = await import("@/lib/supabase");
                             const { sendTelegramNotify: sendNow } = await import("@/lib/intelligence/telegram-notify");
-                            const db = createClient();
                             if (db) {
                                 // Write to agent_task for morning pickup
                                 const { upsertTask } = await import("@/lib/command-board/task-actions");
