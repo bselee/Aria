@@ -138,3 +138,7 @@ __pycache__/
 data/downloads-archive/
 .git-rewrite/
 retry_at=*
+# Daily DB backups
+backup/
+# PG health watchdog log
+data/pg-health.log

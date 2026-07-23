@@ -2,13 +2,21 @@
   "apps": [
     {
       "name": "aria-postgrest",
-      "script": "bin/postgrest.exe",
-      "args": "postgrest.conf",
+      "script": "scripts/start-postgrest.js",
       "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
       "windowsHide": true,
       "max_restarts": 5,
       "restart_delay": 5000,
       "min_uptime": "5s"
+    },
+    {
+      "name": "aria-pg-health",
+      "script": "scripts/pg-health-watchdog.js",
+      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
+      "windowsHide": true,
+      "max_restarts": 10,
+      "restart_delay": 10000,
+      "min_uptime": "10s"
     },
     {
       "name": "aria-dashboard",
