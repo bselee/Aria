@@ -16,7 +16,6 @@ import { createClient } from "@/lib/db";
 import { inputHash } from "./agent-task-hash";
 import { closesWhenFor, type ClosurePredicate } from "./agent-task-closure";
 
-const supabase = createClient();
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -188,7 +187,7 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
     let previousStatus: AgentTaskStatus | null = null;
     let existingId: string | null = null;
     try {
-        const { data: existing } = await supabase
+        const { data: existing } = await db
             .from("agent_task")
             .select("id, status")
             .eq("source_table", args.sourceTable)
@@ -284,7 +283,7 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
     const inputs = args.inputs ?? {};
     const hash = inputHash(inputs);
 
-    const { data: existing } = await supabase
+    const { data: existing } = await db
         .from("agent_task")
         .select("id, dedup_count, created_at")
         .eq("source_table", args.sourceTable)
@@ -295,7 +294,7 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
 
     if (existing) {
         const newDedupCount = (existing.dedup_count ?? 1) + 1;
-        const { data: updated, error: updErr } = await supabase
+        const { data: updated, error: updErr } = await db
             .from("agent_task")
             .update({
                 dedup_count: newDedupCount,
@@ -326,7 +325,7 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
         inputs,
     });
 
-    const { data: created, error: insErr } = await supabase
+    const { data: created, error: insErr } = await db
         .from("agent_task")
         .insert({
             type: args.type,
@@ -444,7 +443,7 @@ export async function decideApproval(
 
     const status: AgentTaskStatus = decision === "approve" ? "APPROVED" : "REJECTED";
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update({
             approval_decision: decision,
@@ -474,7 +473,7 @@ export async function complete(
     const db = createClient();
     if (!db) return;
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update({
             status: "SUCCEEDED",
@@ -504,7 +503,7 @@ export async function fail(taskId: string, errorMessage: string): Promise<void> 
     const db = createClient();
     if (!db) return;
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update({
             status: "FAILED",
@@ -583,7 +582,7 @@ export async function getById(taskId: string): Promise<AgentTask | null> {
     const db = createClient();
     if (!db) return null;
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("agent_task")
         .select("*")
         .eq("id", taskId)
@@ -604,7 +603,7 @@ export async function getBySource(
     const db = createClient();
     if (!db) return null;
 
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("agent_task")
         .select("*")
         .eq("source_table", sourceTable)
@@ -678,7 +677,7 @@ export async function updateBySource(
     const db = createClient();
     if (!db) return;
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update(patch)
         .eq("source_table", sourceTable)
@@ -725,7 +724,7 @@ export async function decideApprovalBySource(
 
     const status: AgentTaskStatus = decision === "approve" ? "APPROVED" : "REJECTED";
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update({
             approval_decision: decision,
@@ -770,7 +769,7 @@ export async function setPlaybook(
     const db = createClient();
     if (!db) return;
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_task")
         .update({
             playbook_kind: kind,

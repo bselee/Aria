@@ -15,7 +15,6 @@ import { remember, recall, Memory } from "./memory";
 import { recordFeedback } from "./feedback-loop";
 import { criticalAlert } from "./alert-gate";
 
-const supabase = createClient();
 
 export class SupervisorAgent {
     private bot: Telegraf;
@@ -45,7 +44,7 @@ export class SupervisorAgent {
         try {
             const errorMessage = String(error?.message ?? error ?? "(no message)");
             const errorStack = String(error?.stack ?? "");
-            const { error: insertError } = await supabase
+            const { error: insertError } = await db
                 .from("ops_agent_exceptions")
                 .insert({
                     agent_name: taskName,
@@ -166,7 +165,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
         }
 
         try {
-            const { data: exceptions, error } = await supabase
+            const { data: exceptions, error } = await db
                 .from('ops_agent_exceptions')
                 .select('*')
                 .eq('status', 'pending');
