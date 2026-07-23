@@ -376,3 +376,210 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
 
     return { autoMatched, needsReview };
 }
+
+// ── Batch freight reconciliation (for cron) ─────────────────────────────────
+
+/**
+ * Find already-matched invoices (po_number set, freight > 0) whose freight
+ * has never been pushed to Finale, and push it via the reconciliation engine.
+ *
+ * The 30-min matching cron (batchMatchUnmatchedInvoices) handles NEW matches.
+ * This function catches the backlog: invoices matched before the lifecycle
+ * engine existed, or where reconciliation was deferred.
+ *
+ * Only processes invoices whose PO has NOT reached RECONCILED/RECEIVED/COMPLETED.
+ * Processes at most `limit` per call to keep cron bounded.
+ */
+export async function batchReconcileExistingFreight(limit: number = 10): Promise<{
+    pushed: Array<{ invoiceId: string; poNumber: string; freight: number }>;
+    skipped: number;
+    errors: number;
+}> {
+    const db = createClient();
+    const pushed: Array<{ invoiceId: string; poNumber: string; freight: number }> = [];
+    let skipped = 0;
+    let errors = 0;
+
+    if (!db) return { pushed, skipped, errors };
+
+    // Find matched invoices with freight that haven't been reconciled yet.
+    // Join against purchase_orders to exclude POs that are already
+    // RECONCILED, RECEIVED, or COMPLETED (freight was already pushed).
+    // Also exclude CANCELLED POs.
+    const { data: candidates } = await db
+        .from("vendor_invoices")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, po_number, raw_data, line_items")
+        .gt("freight", 0)
+        .not("po_number", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(limit * 3); // overfetch — we filter post-query
+
+    if (!candidates || candidates.length === 0) {
+        return { pushed, skipped, errors };
+    }
+
+    // Pre-load PO lifecycle states in one batch to avoid N+1 queries
+    const poNumbers = [...new Set((candidates as any[]).map(c => c.po_number))];
+    const { data: pos } = await db
+        .from("purchase_orders")
+        .select("po_number, lifecycle_state")
+        .in("po_number", poNumbers);
+
+    const poStateMap = new Map<string, string>();
+    for (const po of (pos || []) as any[]) {
+        poStateMap.set(po.po_number, po.lifecycle_state || "");
+    }
+
+    // Pre-check: find invoices that already have a RECONCILIATION log entry
+    // for this invoice+PO combo (dedup — don't double-reconcile)
+    const { data: existingLogs } = await db
+        .from("ap_activity_log")
+        .select("metadata")
+        .eq("intent", "RECONCILIATION")
+        .in("metadata->>invoiceNumber", (candidates as any[]).map(c => c.invoice_number))
+        .not("metadata->>poNumber", "is", null);
+
+    const reconciledSet = new Set<string>();
+    for (const log of (existingLogs || []) as any[]) {
+        const m = log.metadata;
+        if (m?.invoiceNumber && m?.poNumber) {
+            reconciledSet.add(`${m.invoiceNumber}::${m.poNumber}`);
+        }
+    }
+
+    // Process candidates
+    let processed = 0;
+    for (const inv of (candidates as any[])) {
+        if (processed >= limit) break;
+
+        const state = poStateMap.get(inv.po_number) || "";
+        const terminalStates = ["RECONCILED", "RECEIVED", "COMPLETED", "CANCELLED"];
+
+        // Skip if PO is already in a terminal reconciliation state
+        if (terminalStates.includes(state)) {
+            skipped++;
+            continue;
+        }
+
+        // Skip if PO doesn't exist in our local mirror (stale data — PO was likely
+        // deleted or never synced from Finale)
+        if (!poStateMap.has(inv.po_number)) {
+            skipped++;
+            continue;
+        }
+
+        // Skip if already reconciled (dedup via ap_activity_log)
+        const dedupKey = `${inv.invoice_number}::${inv.po_number}`;
+        if (reconciledSet.has(dedupKey)) {
+            skipped++;
+            continue;
+        }
+
+        processed++;
+
+        try {
+            const finale = new FinaleClient();
+
+            const rawData = inv.raw_data as Record<string, unknown> | undefined;
+            const hasValidRawData =
+                rawData &&
+                typeof rawData.vendorName === 'string' &&
+                typeof rawData.invoiceNumber === 'string' &&
+                typeof rawData.total === 'number';
+
+            const invoiceData = hasValidRawData ? rawData : {
+                vendorName: inv.vendor_name,
+                invoiceNumber: inv.invoice_number,
+                invoiceDate: inv.invoice_date,
+                dueDate: null,
+                total: Number(inv.total || 0),
+                amountDue: Number(inv.total || 0),
+                subtotal: Number(inv.subtotal || 0),
+                freight: Number(inv.freight || 0),
+                tax: Number(inv.tax || 0),
+                poNumber: inv.po_number,
+                lineItems: inv.line_items || [],
+                confidence: "medium" as const,
+            };
+
+            const reconResult = await reconcileInvoiceToPO(
+                invoiceData as any,
+                inv.po_number,
+                finale,
+                'freight-backfill',
+            );
+
+            // Only auto-apply if the reconciler is confident (auto_approve or line_level_ok)
+            const autoVerdicts = new Set(['auto_approve', 'line_level_ok']);
+            if (autoVerdicts.has(reconResult.overallVerdict)) {
+                const applyResult = await applyReconciliation(reconResult, finale);
+                pushed.push({
+                    invoiceId: inv.id,
+                    poNumber: inv.po_number,
+                    freight: Number(inv.freight || 0),
+                });
+
+                // Transition PO to RECONCILED
+                await transitionLifecycleState(
+                    inv.po_number,
+                    'RECONCILED',
+                    'freight-backfill',
+                    {
+                        invoiceId: inv.id,
+                        invoiceNumber: inv.invoice_number,
+                        freight: Number(inv.freight || 0),
+                        applied: applyResult.applied.length,
+                    }
+                );
+
+                // Write activity log for dedup
+                await db.from('ap_activity_log').insert({
+                    intent: 'RECONCILIATION',
+                    action_taken: `Freight backfill: push $${Number(inv.freight || 0).toFixed(2)} freight for invoice ${inv.invoice_number} → PO ${inv.po_number}`,
+                    metadata: {
+                        invoiceNumber: inv.invoice_number,
+                        poNumber: inv.po_number,
+                        vendorName: inv.vendor_name,
+                        freight: Number(inv.freight || 0),
+                        verdict: reconResult.overallVerdict,
+                    },
+                    email_from: inv.vendor_name || '',
+                    email_subject: `Freight backfill — ${inv.invoice_number}`,
+                });
+
+                // Also mark in reconciledSet to prevent double-processing in this batch
+                reconciledSet.add(dedupKey);
+
+                console.log(
+                    `[freight-backfill] Pushed $${Number(inv.freight || 0).toFixed(2)} freight: ` +
+                    `${inv.invoice_number} → PO ${inv.po_number} (${applyResult.applied.length} changes)`
+                );
+            } else {
+                console.log(
+                    `[freight-backfill] PO ${inv.po_number} needs approval for freight push ` +
+                    `(${reconResult.overallVerdict}) — skipping`
+                );
+                skipped++;
+            }
+        } catch (err: any) {
+            errors++;
+            console.error(
+                `[freight-backfill] Error processing ${inv.invoice_number} → PO ${inv.po_number}: ${err.message}`
+            );
+        }
+    }
+
+    // Don't leave stuck APPROVAL rows from batch-run (they need human review via Telegram)
+    // Best-effort — expire any stale approvals older than their expiration
+    try {
+        await db
+            .from("ap_pending_approvals")
+            .update({ status: "expired" })
+            .eq("status", "pending")
+            .lt("expires_at", new Date().toISOString());
+    } catch {
+        // Non-critical cleanup
+    }
+
+    return { pushed, skipped, errors };
+}

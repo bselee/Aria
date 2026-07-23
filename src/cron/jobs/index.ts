@@ -1298,15 +1298,31 @@ defineJob({
     onFail: "telegram-will",
     description: "Auto-match unmatched vendor invoices to purchase orders (every 30m).",
     handler: async () => {
-        const { batchMatchUnmatchedInvoices } = await import(
+        const { batchMatchUnmatchedInvoices, batchReconcileExistingFreight } = await import(
             "@/lib/purchasing/invoice-po-matcher"
         );
         const result = await batchMatchUnmatchedInvoices();
-        if (result.autoMatched.length > 0 || result.needsReview.length > 0) {
+        if (result.autoMatched.length > 0 || result.needsReview > 0) {
             console.log(
                 `[invoice-po-auto-match] auto-matched=${result.autoMatched.length}, ` +
-                `needs-review=${result.needsReview.length}`
+                `needs-review=${result.needsReview}`
             );
+        }
+
+        // KAIZEN: Push freight for already-matched invoices that were never
+        // reconciled (backlog from before the lifecycle engine existed).
+        // Runs as a post-pass on every invocation — bounded to 10 invoices
+        // per tick to avoid overwhelming Finale.
+        try {
+            const freightResult = await batchReconcileExistingFreight(10);
+            if (freightResult.pushed.length > 0 || freightResult.skipped > 0 || freightResult.errors > 0) {
+                console.log(
+                    `[freight-backfill] pushed=${freightResult.pushed.length}, ` +
+                    `skipped=${freightResult.skipped}, errors=${freightResult.errors}`
+                );
+            }
+        } catch (err: any) {
+            console.warn(`[invoice-po-auto-match] freight backfill failed: ${err?.message ?? err}`);
         }
     },
     budget: { durationMs: 120_000 },
