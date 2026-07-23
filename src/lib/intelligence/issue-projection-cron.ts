@@ -43,7 +43,7 @@ export async function runIssueProjection(): Promise<ProjectionSummary> {
     // Pull all open tasks (any age) + recent terminal tasks (last 14 days).
     const open = await listTasks({ limit: 500, includeRecentFailed: true });
     const since = new Date(Date.now() - TERMINAL_WINDOW_MS).toISOString();
-    const { data: closed } = await supabase
+    const { data: closed } = await db
         .from("agent_task")
         .select("*")
         .in("status", ["SUCCEEDED", "APPROVED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED"])

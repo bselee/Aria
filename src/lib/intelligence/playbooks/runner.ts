@@ -54,7 +54,7 @@ async function runIteration(opts: { allow: PlaybookContext["allow"] }): Promise<
     // Supabase doesn't support column-to-column comparison in chained filters,
     // so pull a window and apply retry_count < max_retries in JS. Cheaper than
     // a stored proc for cap-of-5 workload.
-    const { data: rows } = await supabase
+    const { data: rows } = await db
         .from("agent_task")
         .select("*")
         .in("playbook_state", ["queued", "failed"])
@@ -107,12 +107,12 @@ async function runIteration(opts: { allow: PlaybookContext["allow"] }): Promise<
             } else {
                 await setPlaybook(task.id, task.playbook_kind!, "failed");
                 const newRetry = (task.retry_count ?? 0) + 1;
-                await supabase
+                await db
                     .from("agent_task")
                     .update({ retry_count: newRetry })
                     .eq("id", task.id);
                 if (!result.retryable || newRetry >= (task.max_retries ?? 3)) {
-                    await supabase
+                    await db
                         .from("agent_task")
                         .update({ status: "NEEDS_APPROVAL", owner: "will" })
                         .eq("id", task.id);

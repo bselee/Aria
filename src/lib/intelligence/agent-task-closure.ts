@@ -23,7 +23,7 @@ const PREDICATES: Record<string, (task: AgentTask) => Promise<boolean>> = {
         const cw = task.closes_when as ClosurePredicate & { kind: "agent_boot_after" };
         const db = createClient();
         if (!db) return false;
-        const { data } = await supabase
+        const { data } = await db
             .from("agent_heartbeats")
             .select("heartbeat_at, status")
             .eq("agent_name", cw.agent)
@@ -38,7 +38,7 @@ const PREDICATES: Record<string, (task: AgentTask) => Promise<boolean>> = {
         if (!task.source_id) return false;
         const db = createClient();
         if (!db) return false;
-        const { data } = await supabase
+        const { data } = await db
             .from(cw.table)
             .select("status")
             .eq("id", task.source_id)
@@ -105,7 +105,7 @@ export function closesWhenFor(args: {
 export async function closeFinishedTasks(): Promise<number> {
     const db = createClient();
     if (!db) return 0;
-    const { data, error } = await supabase
+    const { data, error } = await db
         .from("agent_task")
         .select("*")
         .in("status", ["PENDING", "NEEDS_APPROVAL", "RUNNING", "CLAIMED"])
@@ -117,7 +117,7 @@ export async function closeFinishedTasks(): Promise<number> {
         if (await evaluateClosure(task)) {
             const resolvedStatus = task.closes_when?.kind === "deadline" ? "EXPIRED" : "SUCCEEDED";
             const autoHandledBy = `closure_cron:${task.closes_when?.kind ?? "unknown"}`;
-            const { error: upErr } = await supabase
+            const { error: upErr } = await db
                 .from("agent_task")
                 .update({
                     status: resolvedStatus,
