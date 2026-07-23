@@ -13,6 +13,8 @@
     "test:watch": "vitest",
     "reconcile:axiom": "node --import tsx src/cli/reconcile-axiom.ts",
     "typecheck:all": "npm run typecheck && npm run typecheck:cli",
+    "typecheck:check": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit --project tsconfig.check.json",
+    "check:refs": "bash scripts/check-refs.sh",
     "ship:bot": "pm2 restart aria-bot && npm run smoke:bot",
     "ship:dashboard": "npm run build && pm2 reload aria-dashboard && npm run smoke:dashboard",
     "smoke:bot": "node scripts/smoke.js aria-bot",
