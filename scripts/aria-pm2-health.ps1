@@ -29,6 +29,28 @@ try {
     if (-not $anyRestarted) {
         Write-Host "All aria-* processes are online."
     }
+
+    # Backup freshness check — ensure daily backups are still happening
+    $backupLog = "C:\Users\BuildASoil\Documents\Projects\aria\backup\daily\backup.log"
+    if (Test-Path $backupLog) {
+        $lines = Get-Content $backupLog | Select-String 'OK:'
+        if ($lines) {
+            $last = $lines[-1]
+            if ($last -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') {
+                $lastDate = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null)
+                $age = (Get-Date) - $lastDate
+                if ($age.TotalHours -gt 30) {
+                    Write-Warning ("Backup STALE: last OK was " + [math]::Round($age.TotalHours) + "h ago")
+                } else {
+                    Write-Host ("Backup OK: last dump " + [math]::Round($age.TotalHours) + "h ago")
+                }
+            }
+        } else {
+            Write-Warning "Backup WARNING: no successful backup found in log"
+        }
+    } else {
+        Write-Warning "Backup WARNING: backup.log not found at $backupLog"
+    }
 } catch {
     Write-Error "Health check failed: $_"
     exit 1

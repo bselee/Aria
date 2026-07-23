@@ -18,7 +18,9 @@ const PG_PORT = 5432;
 const LOG_FILE = path.join(__dirname, '..', 'data', 'pg-health.log');
 
 let failureCount = 0;
+let probeCount = 0;
 const MAX_FAILURES_BEFORE_WARN = 3;
+const HEARTBEAT_INTERVAL = 15; // log a healthy heartbeat every N successful probes
 
 function log(level, message) {
   const ts = new Date().toISOString();
@@ -61,10 +63,16 @@ async function checkHealth() {
   const alive = await probePostgres();
 
   if (alive) {
+    probeCount++;
     if (failureCount >= MAX_FAILURES_BEFORE_WARN) {
       log('INFO', `PostgreSQL recovered after ${failureCount} failures`);
     }
     failureCount = 0;
+    if (probeCount % HEARTBEAT_INTERVAL === 0) {
+      const msg = `PG heartbeat OK — ${probeCount} probes, 0 failures`;
+      log('INFO', msg);
+      console.log(msg);
+    }
   } else {
     failureCount++;
     if (failureCount >= MAX_FAILURES_BEFORE_WARN) {

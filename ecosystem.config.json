@@ -16,7 +16,8 @@
       "windowsHide": true,
       "max_restarts": 10,
       "restart_delay": 10000,
-      "min_uptime": "10s"
+      "min_uptime": "10s",
+      "max_memory_restart": "64M"
     },
     {
       "name": "aria-dashboard",

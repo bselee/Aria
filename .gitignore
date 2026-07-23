@@ -142,3 +142,5 @@ retry_at=*
 backup/
 # PG health watchdog log
 data/pg-health.log
+# Live bot state, changes every watch tick
+data/scans-watcher-state.json
