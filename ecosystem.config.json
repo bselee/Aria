@@ -11,25 +11,6 @@
       "min_uptime": "5s"
     },
     {
-      "name": "aria-wsl-proxy",
-      "script": "scripts/wsl-proxy.js",
-      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
-      "windowsHide": true,
-      "max_restarts": 10,
-      "restart_delay": 5000,
-      "min_uptime": "5s"
-    },
-    {
-      "name": "aria-local-stack",
-      "script": "scripts/local-stack-watchdog.js",
-      "args": "--loop",
-      "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
-      "windowsHide": true,
-      "max_restarts": 10,
-      "restart_delay": 10000,
-      "min_uptime": "10s"
-    },
-    {
       "name": "aria-dashboard",
       "script": "node_modules/next/dist/bin/next",
       "args": "start -p 3001",
