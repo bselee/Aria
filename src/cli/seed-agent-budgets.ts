@@ -61,7 +61,7 @@ async function main() {
     let existing = 0;
 
     for (const config of BUDGETS) {
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("agent_budget")
             .select("agent_id")
             .eq("agent_id", config.agent_id)

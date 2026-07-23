@@ -8,6 +8,8 @@ import { z } from "zod";
 import { createClient } from "@/lib/db";
 import { unifiedObjectGeneration } from "../intelligence/llm";
 
+const supabase = createClient();
+
 export const StatementLineSchema = z.object({
     date: z.string(),
     referenceNumber: z.string(),         // Invoice # or payment ref

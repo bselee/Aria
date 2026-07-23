@@ -15,6 +15,8 @@ import { APAgent } from './ap-agent';
 import { unifiedTextGeneration } from './llm';
 import { createClient } from '../db';
 
+const supabase = createClient();
+
 // ── Directory layout ──────────────────────────────────────────────────────────
 function getReviewDir(): string {
     return path.join(os.homedir(), 'aria-review');

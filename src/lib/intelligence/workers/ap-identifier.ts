@@ -45,6 +45,9 @@ import { pickPrimaryInvoicePage } from "./invoice-page-selector";
 import { businessHoursAlert } from "../alert-gate";
 import { matchVendorRouting } from "../ap/vendor-router";
 
+const supabase = createClient();
+const db = supabase;
+
 // ── SENDER BLOCKLIST ──────────────────────────────────────────────
 // DECISION(2026-03-20): Emails from these senders/domains must NEVER
 // be forwarded to Bill.com. They are either internal, autopay leases,

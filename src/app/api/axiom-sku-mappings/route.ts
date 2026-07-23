@@ -25,7 +25,7 @@ export async function GET(req: NextRequest) {
     }
 
     try {
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("axiom_sku_mappings")
             .select("*")
             .order("axiom_job_name", { ascending: true });
@@ -83,7 +83,7 @@ export async function POST(req: NextRequest) {
             );
         }
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("axiom_sku_mappings")
             .upsert({
                 axiom_job_name: axiom_job_name.trim(),
@@ -131,7 +131,7 @@ export async function DELETE(req: NextRequest) {
             );
         }
 
-        const { error } = await supabase
+        const { error } = await db
             .from("axiom_sku_mappings")
             .delete()
             .eq("axiom_job_name", axiom_job_name);

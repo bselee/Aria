@@ -124,7 +124,7 @@ const budgetCommand: BotCommand = {
                 return;
             }
 
-            const { data } = await supabase
+            const { data } = await db
                 .from("agent_budget")
                 .select("agent_id, monthly_usd_cap, current_period_usd_spent, current_period_tokens_spent")
                 .order("current_period_usd_spent", { ascending: false });
@@ -223,7 +223,7 @@ const agentsCommand: BotCommand = {
                 return;
             }
 
-            const { data } = await supabase
+            const { data } = await db
                 .from("agent_heartbeats")
                 .select("agent_name, status, heartbeat_at")
                 .order("heartbeat_at", { ascending: false });
@@ -501,7 +501,7 @@ const hermiaCommand: BotCommand = {
             const { createClient } = await import("@/lib/supabase");
             const db = createClient();
             if (db) {
-                const { data: heartbeats } = await supabase
+                const { data: heartbeats } = await db
                     .from("agent_heartbeats")
                     .select("agent_name, status, heartbeat_at")
                     .order("heartbeat_at", { ascending: false });
@@ -753,7 +753,7 @@ const apRetryCommand: BotCommand = {
             }
 
             // Query error-state records
-            const { data: stuckItems, error: queryError } = await supabase
+            const { data: stuckItems, error: queryError } = await db
                 .from("ap_inbox_queue")
                 .select("*")
                 .in("status", ["ERROR_FORWARDING", "ERROR_PROCESSING"])
@@ -829,7 +829,7 @@ const apRetryCommand: BotCommand = {
 
             for (const item of matchedItems) {
                 // Update the record
-                const { error: updateError } = await supabase
+                const { error: updateError } = await db
                     .from("ap_inbox_queue")
                     .update({
                         status: "PENDING_FORWARD",

@@ -18,7 +18,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "activityId required" }, { status: 400 });
     }
 
-    const { error } = await supabase
+    const { error } = await db
         .from("ap_activity_log")
         .update({
             reviewed_at: new Date().toISOString(),

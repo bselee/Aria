@@ -129,7 +129,7 @@ async function main() {
   let pageOffset = 0;
 
   while (true) {
-    const { data: rows, error: fetchErr } = await supabase
+    const { data: rows, error: fetchErr } = await db
       .from("ap_activity_log")
       .select(
         "id, created_at, email_from, intent, action_taken, metadata, reconciliation_report"
@@ -253,7 +253,7 @@ async function main() {
   const runIds = mapped.map((r) => r.run_id);
 
   // Fetch already-existing run_ids in one query
-  const { data: existing, error: existErr } = await supabase
+  const { data: existing, error: existErr } = await db
     .from("reconciliation_outcomes")
     .select("run_id")
     .in("run_id", runIds);
@@ -282,7 +282,7 @@ async function main() {
   let insertedTotal = 0;
   for (let i = 0; i < insertPayload.length; i += BATCH) {
     const batch = insertPayload.slice(i, i + BATCH);
-    const { error: insErr } = await supabase
+    const { error: insErr } = await db
       .from("reconciliation_outcomes")
       .insert(batch);
 
@@ -298,7 +298,7 @@ async function main() {
 
   // ── 5. Sanity query ───────────────────────────────────────────────────────
   // .limit(5000) — CLI sanity check ceiling; avoids full scan at scale
-  const { data: summary, error: sumErr } = await supabase
+  const { data: summary, error: sumErr } = await db
     .from("reconciliation_outcomes")
     .select("outcome")
     .order("outcome")

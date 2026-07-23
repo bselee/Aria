@@ -36,7 +36,7 @@ export async function GET(req: Request) {
 
         // Query all reconciliation entries for this vendor (cached 30s)
         const { data } = await cachedQuery(`vendor-insights:${vendor}`, () =>
-            supabase
+            db
                 .from("ap_activity_log")
                 .select("reviewed_action, dismiss_reason, metadata, created_at")
                 .eq("intent", "RECONCILIATION")
@@ -50,7 +50,7 @@ export async function GET(req: Request) {
 
         // Also fetch vendor profile for Phase 3 threshold data (cached 30s)
         const { data: vendorProfile } = await cachedQuery(`vendor-profile:${vendor}`, () =>
-            supabase
+            db
                 .from("vendor_profiles")
                 .select("auto_approve_threshold, default_dismiss_action, reconciliation_count, approval_count")
                 .ilike("vendor_name", `%${vendor}%`)

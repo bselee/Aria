@@ -22,6 +22,8 @@
 import { createClient } from "@/lib/db";
 import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
 
+const supabase = createClient();
+
 const MAX_PER_RUN = 5;
 const alertedThisSession = new Set<string>();
 

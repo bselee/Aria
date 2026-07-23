@@ -11,6 +11,8 @@
 import { createClient } from "@/lib/db";
 import type { AriaPurchaseHistory } from "./purchasing-candidate";
 
+const supabase = createClient();
+
 /**
  * Batch-query our Supabase purchase_orders table for the specified product IDs.
  * Returns a map of product_id → AriaPurchaseHistory.

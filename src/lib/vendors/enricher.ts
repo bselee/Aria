@@ -3,6 +3,8 @@ import { getAnthropicClient } from "@/lib/anthropic";
 import { createClient } from "@/lib/db";
 import { z } from "zod";
 
+const supabase = createClient();
+
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! });
 
 export interface VendorProfile {

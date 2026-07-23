@@ -10,6 +10,8 @@ import { createClient } from "@/lib/db";
 import { complete, listTasks } from "./agent-task";
 import { notifyViaTask } from "./notify-via-task";
 
+const supabase = createClient();
+
 export type TypeMetrics = {
   type: string;
   total: number;

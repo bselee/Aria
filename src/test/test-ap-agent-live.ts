@@ -18,6 +18,8 @@ import {
 } from "../lib/finale/reconciler";
 
 import dotenv from "dotenv";
+
+const supabase = createClient();
 dotenv.config({ path: ".env.local" });
 
 async function main() {

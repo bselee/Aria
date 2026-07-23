@@ -216,7 +216,7 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
     const cutoffMax = new Date(Date.now() - WINDOW_MIN_DAYS * 86_400_000).toISOString();
     const cutoffMin = new Date(Date.now() - WINDOW_MAX_DAYS * 86_400_000).toISOString();
 
-    const { data: pos, error } = await supabase
+    const { data: pos, error } = await db
         .from('purchase_orders')
         .select(
             'po_number, vendor_name, vendor_party_id, po_sent_verified_at, ' +
@@ -367,7 +367,7 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
         try {
             if (!dryRun) {
                 await agent.draftFollowUp(ctx, 1);
-                await supabase
+                await db
                     .from('purchase_orders')
                     .update({ tracking_requested_at: new Date().toISOString(), updated_at: new Date().toISOString() })
                     .eq('po_number', po.po_number);

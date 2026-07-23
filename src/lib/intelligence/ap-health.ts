@@ -16,6 +16,8 @@
 
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 // ── Stuck Email Detection ───────────────────────────────────────────────────
 
 const STUCK_THRESHOLD_HOURS = 6;

@@ -1,6 +1,8 @@
 import { upsertFromSource } from "@/lib/intelligence/agent-task";
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 export type AxiomLifecycleStatus =
     | "needs_spec"
     | "blocked_duplicate"

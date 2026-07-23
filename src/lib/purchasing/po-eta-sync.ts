@@ -45,7 +45,7 @@ export async function syncPOETA(
         if (!bestEta) {
             const db = createClient();
             if (db) {
-                const { data: po } = await supabase
+                const { data: po } = await db
                     .from("purchase_orders")
                     .select("vendor_stated_eta, vendor_stated_eta_confidence, last_eta_update")
                     .eq("po_number", numericId)

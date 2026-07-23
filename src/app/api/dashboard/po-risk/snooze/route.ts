@@ -24,7 +24,7 @@ export async function POST(req: Request) {
     if (!isFinite(hours) || hours <= 0) hours = DEFAULT_HOURS;
     if (hours > MAX_HOURS) hours = MAX_HOURS;
 
-    const { data: row, error: readErr } = await supabase
+    const { data: row, error: readErr } = await db
         .from("ap_activity_log")
         .select("id, intent, metadata")
         .eq("id", activityId)
@@ -39,7 +39,7 @@ export async function POST(req: Request) {
     const snoozedUntil = new Date(Date.now() + hours * 3600 * 1000).toISOString();
     const nextMetadata = { ...(row.metadata ?? {}), snoozed_until: snoozedUntil, snooze_hours: hours };
 
-    const { error: writeErr } = await supabase
+    const { error: writeErr } = await db
         .from("ap_activity_log")
         .update({
             metadata: nextMetadata,

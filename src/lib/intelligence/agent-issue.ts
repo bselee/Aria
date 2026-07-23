@@ -15,6 +15,8 @@
 
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 // ── Hub kill-switch (mirrors agent-task hubEnabled) ─────────────────────────
 function hubEnabled(): boolean {
     const v = (process.env.HUB_TASKS_ENABLED ?? "true").toLowerCase();
@@ -250,9 +252,9 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
     const db = createClient();
     if (!db) return null;
 
-    const existing = await findOpenIssue(supabase, args.businessFlowKey);
+    const existing = await findOpenIssue(db, args.businessFlowKey);
     if (existing) {
-        return advanceExisting(supabase, existing, args);
+        return advanceExisting(db, existing, args);
     }
 
     // No existing — create new. Title required.
@@ -261,7 +263,7 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
         return null;
     }
     const initialLifecycle = args.lifecycleState ?? "detected";
-    const { data: created, error: insErr } = await supabase
+    const { data: created, error: insErr } = await db
         .from("agent_issue")
         .insert({
             title: args.title,
@@ -284,12 +286,12 @@ export async function createOrAdvance(args: CreateOrAdvanceArgs): Promise<AgentI
     if (insErr) {
         // Concurrent projection: another worker won the insert. Advance that row.
         if (isUniqueConflict(insErr)) {
-            const raced = await findOpenIssue(supabase, args.businessFlowKey);
+            const raced = await findOpenIssue(db, args.businessFlowKey);
             if (raced) {
-                return advanceExisting(supabase, raced, args);
+                return advanceExisting(db, raced, args);
             }
             // Insert may have completed into a terminal state under race — fetch any row
-            const { data: anyRow } = await supabase
+            const { data: anyRow } = await db
                 .from("agent_issue")
                 .select("*")
                 .eq("business_flow_key", args.businessFlowKey)
@@ -322,7 +324,7 @@ export async function recordHandoff(
     const db = createClient();
     if (!db) return;
 
-    const { error } = await supabase
+    const { error } = await db
         .from("agent_issue")
         .update({ current_handler: toHandler, updated_at: new Date().toISOString() })
         .eq("id", issueId);

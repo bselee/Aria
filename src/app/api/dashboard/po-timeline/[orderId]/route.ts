@@ -43,7 +43,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ orderId: s
     const events: TimelineEvent[] = [];
 
     // ── PO row ──
-    const { data: po, error: poErr } = await supabase
+    const { data: po, error: poErr } = await db
         .from('purchase_orders')
         .select(
             'po_number, vendor_name, po_sent_at, po_sent_verified_at, ' +
@@ -109,7 +109,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ orderId: s
     // event is emitted by the Active Purchases data layer from shipments[].delivered_at.
 
     // ── Shipments ──
-    const { data: ships } = await supabase
+    const { data: ships } = await db
         .from('shipments')
         .select('tracking_number, status_category, status_display, estimated_delivery_at, delivered_at, last_checked_at, updated_at, created_at')
         .overlaps('po_numbers', [orderId])
@@ -142,7 +142,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ orderId: s
     }
 
     // ── Invoices ──
-    const { data: invs } = await supabase
+    const { data: invs } = await db
         .from('invoices')
         .select('invoice_number, created_at, reconciled_at, total')
         .eq('po_number', orderId);

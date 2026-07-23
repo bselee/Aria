@@ -45,7 +45,7 @@ export async function handleReceiptConfirm(ctx: Context, poNumber: string): Prom
 
         // Update the purchase_orders table to flag for receiving
         // (actual Finale receive is done by the receiving watcher cron)
-        await supabase
+        await db
             .from("purchase_orders")
             .update({ receipt_confirmed_at: new Date().toISOString() })
             .eq("po_number", poNumber);

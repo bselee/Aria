@@ -43,7 +43,7 @@ export async function recheckReconciledInvoices(): Promise<ReceiptRecheckResult>
         const cutoff = new Date(Date.now() - LOOKBACK_DAYS * 86400000).toISOString();
 
         // Find POs where RECEIVED transition happened after invoicing
-        const { data: transitions, error } = await supabase
+        const { data: transitions, error } = await db
             .from("po_lifecycle_transitions")
             .select("po_number, from_state, to_state, transitioned_at, triggered_by")
             .eq("to_state", "RECEIVED")
@@ -68,7 +68,7 @@ export async function recheckReconciledInvoices(): Promise<ReceiptRecheckResult>
 
                 // Cooldown check — don't re-alert within 72h
                 const cooldownCutoff = new Date(Date.now() - RE_ALERT_COOLDOWN_HOURS * 3600000).toISOString();
-                const { data: recentAlerts } = await supabase
+                const { data: recentAlerts } = await db
                     .from("ap_activity_log")
                     .select("id")
                     .eq("intent", "RECEIPT_RECHECK")
@@ -82,7 +82,7 @@ export async function recheckReconciledInvoices(): Promise<ReceiptRecheckResult>
                 }
 
                 // Get invoice details from activity log
-                const { data: activity } = await supabase
+                const { data: activity } = await db
                     .from("ap_activity_log")
                     .select("created_at, metadata")
                     .in("intent", ["BILL_FORWARD", "RECONCILIATION"])

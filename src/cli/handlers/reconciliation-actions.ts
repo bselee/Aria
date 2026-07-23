@@ -80,7 +80,7 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
         }).eq('id', logId);
 
         // 2. Get vendor name from the log row so we can update vendor_profiles
-        const { data: logRow } = await supabase
+        const { data: logRow } = await db
             .from('ap_activity_log')
             .select('email_from')
             .eq('id', logId)
@@ -90,7 +90,7 @@ export async function handleNotedReconciliation(ctx: Context, logId: string): Pr
 
         if (vendorName) {
             // 3. Upsert vendor_profiles — increment noted_count, update last_noted_at
-            const { data: vp } = await supabase
+            const { data: vp } = await db
                 .from('vendor_profiles')
                 .select('noted_count, autonomy_phase, vendor_name')
                 .ilike('vendor_name', `%${vendorName.split(' ')[0]}%`)
@@ -159,7 +159,7 @@ export async function handleFlagReconciliation(ctx: Context, logId: string): Pro
         }).eq('id', logId);
 
         // 2. Get vendor name from the log row
-        const { data: logRow } = await supabase
+        const { data: logRow } = await db
             .from('ap_activity_log')
             .select('email_from, email_subject')
             .eq('id', logId)
@@ -169,7 +169,7 @@ export async function handleFlagReconciliation(ctx: Context, logId: string): Pro
 
         if (vendorName) {
             // 3. Reset noted_count, increment flag_count, revert to Phase 1
-            const { data: vp } = await supabase
+            const { data: vp } = await db
                 .from('vendor_profiles')
                 .select('flag_count, autonomy_phase, vendor_name')
                 .ilike('vendor_name', `%${vendorName.split(' ')[0]}%`)

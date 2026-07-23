@@ -27,7 +27,7 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
         console.log(`   Found ${actionablePOs.length} Committed/Received POs in the window.`);
 
         // Fetch all recent invoices that aren't matched yet or are matched to something else
-        const { data: recentInvoices, error: invErr } = await supabase
+        const { data: recentInvoices, error: invErr } = await db
             .from("vendor_invoices")
             .select("*")
             .gte("invoice_date", new Date(Date.now() - (daysBack + 30) * 86400000).toISOString())
@@ -45,7 +45,7 @@ export async function runPOSweep(daysBack: number = 60, dryRun: boolean = false)
 
         for (const po of actionablePOs) {
             // Check if this PO already has a reconciliation entry
-            const { data: existingLog } = await supabase
+            const { data: existingLog } = await db
                 .from("ap_activity_log")
                 .select("id")
                 .eq("metadata->>orderId", po.orderId)

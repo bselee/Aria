@@ -16,6 +16,8 @@ import { createClient } from "@/lib/db";
 import { inputHash } from "./agent-task-hash";
 import { closesWhenFor, type ClosurePredicate } from "./agent-task-closure";
 
+const supabase = createClient();
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export type AgentTaskType =
@@ -400,7 +402,7 @@ async function emitStuckSourceMetaTask(
         return;
     }
 
-    const { data: createdMeta, error: metaErr } = await db.from("agent_task").insert({
+    const { data: createdMeta, error: metaErr } = await supabase.from("agent_task").insert({
         type: "stuck_source",
         source_table: null,
         source_id: null,

@@ -16,6 +16,8 @@ import { createClient } from "../db";
 import { recall } from "./memory";
 import { getAnthropicClient } from "../anthropic";
 
+const supabase = createClient();
+
 // ── Constants (overridable via env) ──────────────────────────────────────────
 
 const CONFIDENCE_THRESHOLD   = 0.7;

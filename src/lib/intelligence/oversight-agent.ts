@@ -3,6 +3,8 @@ import type { OpsControlCommand } from "@/lib/ops/control-plane";
 import { createOpsControlRequest } from "@/lib/ops/control-plane-db";
 import * as agentTask from "./agent-task";
 
+const supabase = createClient();
+
 export type AgentStatus = "healthy" | "degraded" | "starting" | "stopped";
 
 export interface AgentHeartbeat {

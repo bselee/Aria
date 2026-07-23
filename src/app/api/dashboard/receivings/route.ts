@@ -16,6 +16,7 @@ import { createClient } from '@/lib/db';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
+import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 
 export function getDenverWeekStart(date: Date): string {
     const denverNow = new Date(date.toLocaleString('en-US', { timeZone: 'America/Denver' }));
@@ -132,7 +133,8 @@ export async function GET(req: NextRequest) {
                         .order('created_at', { ascending: false })
                         .limit(20);
                     unmatchedInvoices = data || [];
-                } catch {
+                } catch (fetchErr: any) {
+                    console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
                     unmatchedInvoices = [];
                 }
 
@@ -297,29 +299,39 @@ export async function GET(req: NextRequest) {
                                         }
                                     );
 
-                                    // Push freight to Finale — the database correlation exists, use it
-                                    const invFreight = Number(inv.freight || 0);
-                                    if (invFreight > 0) {
-                                        try {
-                                            await finale.updateOrderAdjustmentAmount(
-                                                best.orderId,
-                                                'FREIGHT',
-                                                invFreight,
-                                                `Freight from invoice ${inv.invoice_number}`,
-                                            );
-                                        } catch (freightErr: any) {
-                                            console.warn(
-                                                `[receivings] Freight push failed for PO ${best.orderId}: ${freightErr.message}`,
-                                            );
-                                        }
-                                    }
+                                    // Route through reconciler — single source of truth for freight/fees.
+                                    // Uses delta-based freight, duplicate detection, disproportion guards.
+                                    try {
+                                        const invoiceData = inv.raw_data || {
+                                            vendorName: inv.vendor_name,
+                                            invoiceNumber: inv.invoice_number,
+                                            invoiceDate: inv.invoice_date,
+                                            dueDate: null,
+                                            total: Number(inv.total || 0),
+                                            amountDue: Number(inv.total || 0),
+                                            subtotal: Number(inv.subtotal || 0),
+                                            freight: Number(inv.freight || 0),
+                                            tax: Number(inv.tax || 0),
+                                            poNumber: best.orderId,
+                                            lineItems: inv.raw_data?.lineItems || [],
+                                            confidence: "medium" as const,
+                                        };
 
-                                    // Log the auto-match event — human still needs to complete
-                                    await sb
-                                        .from('ap_activity_log')
-                                        .insert({
+                                        const reconResult = await reconcileInvoiceToPO(
+                                            invoiceData as any,
+                                            best.orderId,
+                                            finale,
+                                            'receivings-auto-match',
+                                        );
+
+                                        if (reconResult.overallVerdict === 'auto_approve') {
+                                            await applyReconciliation(reconResult, finale);
+                                        }
+
+                                        // Log the auto-match event
+                                        await sb.from('ap_activity_log').insert({
                                             intent: 'RECONCILIATION_AUTO_APPLIED',
-                                            action_taken: `Auto-matched to PO ${best.orderId} — awaiting human review`,
+                                            action_taken: `Auto-matched to PO ${best.orderId} — recon verdict=${reconResult.overallVerdict}`,
                                             metadata: {
                                                 invoiceNumber: inv.invoice_number,
                                                 poNumber: best.orderId,
@@ -327,11 +339,57 @@ export async function GET(req: NextRequest) {
                                                 score: best.score,
                                                 reasons: best.reasons,
                                                 status: 'needs_review',
+                                                reconVerdict: reconResult.overallVerdict,
                                             },
                                             email_from: inv.vendor_name || '',
                                             email_subject: `Invoice ${inv.invoice_number} auto-matched`,
                                         });
-                                } catch { /* auto-apply failed silently */ }
+                                    } catch (reconErr: any) {
+                                        console.warn(
+                                            `[receivings] Reconciliation failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${reconErr?.message || reconErr}`,
+                                        );
+                                        // Log the failure
+                                        try {
+                                            await sb.from('ap_activity_log').insert({
+                                                intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
+                                                action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
+                                                metadata: {
+                                                    invoiceNumber: inv.invoice_number,
+                                                    poNumber: best.orderId,
+                                                    vendorName: inv.vendor_name,
+                                                    score: best.score,
+                                                    error: reconErr?.message || String(reconErr),
+                                                },
+                                                email_from: inv.vendor_name || '',
+                                                email_subject: `Auto-apply failed — ${inv.invoice_number}`,
+                                            });
+                                        } catch {
+                                            // Non-critical
+                                        }
+                                    }
+                                } catch (autoApplyErr: any) {
+                                    console.warn(
+                                        `[receivings] Auto-apply failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${autoApplyErr?.message || autoApplyErr}`,
+                                    );
+                                    // Log the failure so it shows on the dashboard
+                                    try {
+                                        await sb.from('ap_activity_log').insert({
+                                            intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
+                                            action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
+                                            metadata: {
+                                                invoiceNumber: inv.invoice_number,
+                                                poNumber: best.orderId,
+                                                vendorName: inv.vendor_name,
+                                                score: best.score,
+                                                error: autoApplyErr?.message || String(autoApplyErr),
+                                            },
+                                            email_from: inv.vendor_name || '',
+                                            email_subject: `Auto-apply failed — ${inv.invoice_number}`,
+                                        });
+                                    } catch {
+                                        // Non-critical — logging failure shouldn't cascade
+                                    }
+                                }
 
                                 // Show in suggestions as auto-matched, not hidden
                                 matchSuggestions.push({
@@ -357,7 +415,9 @@ export async function GET(req: NextRequest) {
                                     fromCache: !!inv._fromCache,
                                 });
                             }
-                        } catch { /* skip individual match failures */ }
+                        } catch (matchErr: any) {
+                            console.warn(`[receivings] Match scoring failed for invoice: ${matchErr?.message || matchErr}`);
+                        }
                     }
                 }
             }
@@ -390,14 +450,18 @@ export async function GET(req: NextRequest) {
                         metadata: row.metadata,
                     }));
                 }
-            } catch { /* skip recent completions */ }
+            } catch (completionsErr: any) {
+                console.warn(`[receivings] Failed to fetch recent auto-completions: ${completionsErr?.message || completionsErr}`);
+            }
 
             // ── Freight classifications for received PO vendors ──
             const freightClasses: Record<string, any> = {};
             for (const v of vendorNames) {
                 try {
                     freightClasses[v] = await getVendorFreightClassification(v);
-                } catch { /* skip */ }
+                } catch (fcErr: any) {
+                    console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
+                }
             }
 
             return NextResponse.json({

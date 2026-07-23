@@ -30,7 +30,7 @@ export async function detectAndAlertCrashLoop(bot: Telegraf): Promise<void> {
         const windowStart = new Date(Date.now() - CRASH_LOOP_WINDOW_MS).toISOString();
 
         // Count recent 'starting' heartbeats (proxy for restarts)
-        const { data: heartbeats, error } = await supabase
+        const { data: heartbeats, error } = await db
             .from("agent_heartbeats")
             .select("heartbeat_at, status, metadata")
             .eq("agent_name", "ops-manager")

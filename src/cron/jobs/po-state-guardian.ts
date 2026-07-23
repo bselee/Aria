@@ -40,7 +40,7 @@ defineJob({
     await notifyViaTask({
       sourceId: "po-guardian",
       type: "po_correction",
-      goal: `Recent PO cancellation(s): ${problematic.map(p => p.docNum).join(", ")}\n(uncANCELED after 1h to avoid working bad invoice state)\nApprove correction or let run out`
+      goal: `Recent PO cancellation(s): ${problematic.map(p => p.docNum).join(", ")}\n(uncANCELED after 1h to avoid working bad invoice state)\nApprove correction or let run out`,
       inputs: { pofix: problematic },
       priority: 0
     });

@@ -149,7 +149,7 @@ export async function processDocument(
     let savedDoc = null;
     let vendorId = "";
 
-    if (supabase && extractedData) {
+    if (db && extractedData) {
         try {
             // Identify/create vendor
             vendorId = await findOrCreateVendor(
@@ -242,7 +242,7 @@ async function findOrCreateVendor(vendorName: string): Promise<string> {
     const db = createClient();
 
     // Fuzzy search for existing vendor
-    const { data: existing } = await supabase
+    const { data: existing } = await db
         .from("vendors")
         .select("id, name")
         .textSearch("name", vendorName.split(" ").join(" | "));
@@ -250,7 +250,7 @@ async function findOrCreateVendor(vendorName: string): Promise<string> {
     if (existing?.length) return existing[0].id;
 
     // Create new vendor record
-    const { data: newVendor } = await supabase
+    const { data: newVendor } = await db
         .from("vendors")
         .insert({ name: vendorName, status: "active" })
         .select("id")

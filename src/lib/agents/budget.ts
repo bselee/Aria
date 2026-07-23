@@ -16,6 +16,8 @@
 
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 export class BudgetExceededError extends Error {
     constructor(public agentId: string, public capUsd: number, public spentUsd: number) {
         super(`Agent '${agentId}' exceeded monthly budget: $${spentUsd.toFixed(2)} / $${capUsd.toFixed(2)} cap`);

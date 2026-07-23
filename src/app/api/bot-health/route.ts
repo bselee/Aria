@@ -39,7 +39,7 @@ export async function GET(): Promise<NextResponse> {
 
         if (db) {
             // Read the latest heartbeat from agent_heartbeats
-            const { data } = await supabase
+            const { data } = await db
                 .from('agent_heartbeats')
                 .select('last_seen, metadata')
                 .eq('agent_name', 'aria-bot')

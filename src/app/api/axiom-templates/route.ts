@@ -88,7 +88,7 @@ export async function POST(req: NextRequest) {
         const cleanSku = finale_sku.trim();
         const now = new Date().toISOString();
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("axiom_order_templates")
             .upsert({
                 finale_sku: cleanSku,
@@ -145,7 +145,7 @@ export async function DELETE(req: NextRequest) {
             );
         }
 
-        const { error } = await supabase
+        const { error } = await db
             .from("axiom_order_templates")
             .delete()
             .eq("finale_sku", sku);

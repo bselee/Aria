@@ -27,6 +27,8 @@
 
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 export interface DropshipEntry {
     vendorName: string;
     invoiceNumber: string;

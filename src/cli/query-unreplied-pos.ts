@@ -155,7 +155,7 @@ async function searchPOThread(gmail: any, poNumber: string): Promise<VendorInfo>
 
   // Step 1: Query unreplied POs (sent but not acknowledged, not noncommittal)
   console.log('🔍 Querying Supabase for unreplied POs...\n');
-  const { data: pos, error } = await supabase
+  const { data: pos, error } = await db
     .from('purchase_orders')
     .select(
       'po_number, vendor_name, po_sent_verified_at, vendor_acknowledged_at, ' +

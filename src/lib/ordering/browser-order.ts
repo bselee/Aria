@@ -53,7 +53,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
     }
 
     // 1. Load PO
-    const { data: po, error: poError } = await supabase
+    const { data: po, error: poError } = await db
         .from("purchase_orders")
         .select("po_number, vendor_name, vendor_party_id, line_items, completion_state, total_amount, status")
         .eq("po_number", poNumber)

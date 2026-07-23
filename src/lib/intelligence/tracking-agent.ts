@@ -17,6 +17,8 @@ import {
     extractTrackingNumbers as extractTrackingNumbersCentral
 } from "../carriers/tracking-service";
 
+const supabase = createClient();
+
 /**
  * Return type for TrackingAgent.processUnreadEmails().
  * Includes PO, tracking numbers, and whether the status warrants immediate calendar refresh.

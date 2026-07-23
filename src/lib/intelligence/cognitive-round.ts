@@ -18,6 +18,8 @@
 import { createClient } from "@/lib/db";
 import { getLocalDb } from "@/lib/storage/local-db";
 
+const supabase = createClient();
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 export interface CognitiveState {

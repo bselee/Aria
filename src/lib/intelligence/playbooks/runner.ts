@@ -20,6 +20,8 @@ import {
 import { PLAYBOOK_BY_KIND } from "./registry";
 import type { PlaybookContext } from "./types";
 
+const supabase = createClient();
+
 const PER_CYCLE_CAP = 5;
 const QUEUE_FETCH_MULTIPLIER = 4; // pull oversized window for JS-side filter
 

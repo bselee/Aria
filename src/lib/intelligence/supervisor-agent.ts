@@ -15,6 +15,8 @@ import { remember, recall, Memory } from "./memory";
 import { recordFeedback } from "./feedback-loop";
 import { criticalAlert } from "./alert-gate";
 
+const supabase = createClient();
+
 export class SupervisorAgent {
     private bot: Telegraf;
 

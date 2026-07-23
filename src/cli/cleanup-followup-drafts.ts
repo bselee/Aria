@@ -52,7 +52,7 @@ import { createClient } from '@/lib/db';
     if (affectedPOs.size > 0) {
         const list = Array.from(affectedPOs);
         const orPattern = list.map(n => `po_number.eq.${n},po_number.eq.PO-${n}`).join(',');
-        const { error } = await supabase
+        const { error } = await db
             .from('purchase_orders')
             .update({ tracking_requested_at: null, updated_at: new Date().toISOString() })
             .or(orPattern);

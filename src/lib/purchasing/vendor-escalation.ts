@@ -81,7 +81,7 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
     const cutoffMax = new Date(now - L2_MIN_DAYS * 86_400_000).toISOString();
     const cutoffMin = new Date(now - L3_MAX_DAYS * 86_400_000).toISOString();
 
-    const { data: pos, error } = await supabase
+    const { data: pos, error } = await db
         .from("purchase_orders")
         .select(
             "po_number, vendor_name, po_sent_verified_at, vendor_acknowledged_at, " +

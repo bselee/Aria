@@ -246,7 +246,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 auth = await getAuthenticatedClient("default");
             }
             const gmail = GmailApi({ version: "v1", auth });
-            const db = createClient();
+            const supabase = createClient();
 
             // Find *ALL* unread emails in the inbox that haven't been marked as seen by the AP Agent.
             // Exclude bill.selee@buildasoil.com at the query level — ap@ is now the active inbox.
@@ -754,7 +754,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     if (part.body?.attachmentId) {
                         // Idempotency check — skip if this Gmail message was already processed
                         // Prevents double-forwarding to Bill.com on crash + re-poll scenarios
-                        if (db) {
+                        if (supabase) {
                             const { data: existing } = await supabase
                                 .from("documents")
                                 .select("id")
@@ -1087,7 +1087,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // C2 FIX: Persist the document even on OCR failure so it's never silently lost.
                 // Without this, the email sits unread with zero audit trail in `documents`.
                 try {
-                    await db.from("documents").insert({
+                    await supabase.from("documents").insert({
                         type: "invoice",
                         status: "ocr_failed",
                         source: "email",
@@ -1119,7 +1119,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             if (!invoiceData.lineItems || invoiceData.lineItems.length === 0) {
                 // C2 FIX: Persist the document so zero-line-item failures have an audit trail.
                 try {
-                    await db.from("documents").insert({
+                    await supabase.from("documents").insert({
                         type: "invoice",
                         status: "ocr_failed",
                         source: "email",
@@ -1344,7 +1344,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             }
 
             // 3. Save to DB — audit trail and daily recap source
-            const { data: docData } = await db.from("documents").insert({
+            const { data: docData } = await supabase.from("documents").insert({
                 type: "invoice",
                 status: "PROCESSED",
                 source: "email",
@@ -1357,7 +1357,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 gmail_message_id: messageId || null,
             }).select("id").single();
 
-            await db.from("invoices").upsert({
+            await supabase.from("invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber,
@@ -1543,7 +1543,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     private async resolveVendorAlias(supabase: any, vendorName: string): Promise<string> {
-        if (!vendorName || !db) return vendorName;
+        if (!vendorName || !supabase) return vendorName;
         try {
             // 1. ILIKE case-handling fallback + trim
             const { data, error } = await supabase
@@ -1807,7 +1807,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                             vendorName: result.vendorName,
                             orderId: result.orderId,
                         });
-                        const { data: pendingLog } = await db.from("ap_activity_log").insert({
+                        const { data: pendingLog } = await supabase.from("ap_activity_log").insert({
                             email_from: result.vendorName,
                             email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                             intent: "RECONCILIATION",
@@ -1844,7 +1844,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     // or fall back to a new row if the update fails.
                     if (pendingLogId) {
                         try {
-                            await db.from("ap_activity_log").update({
+                            await supabase.from("ap_activity_log").update({
                                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                                 // Both activity log and Telegram say the same plain English thing.
                                 action_taken: result.summary,
@@ -1867,7 +1867,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                     actual: fc.amount, verdict: fc.verdict, reason: fc.reason
                                 }))
                             ];
-                            await db.from("invoices").update({ status: newStatus, discrepancies })
+                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
                                 .eq("invoice_number", result.invoiceNumber)
                                 .ilike("vendor_name", `%${result.vendorName}%`);
                         } catch {
@@ -2144,7 +2144,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             // otherwise generate it on the spot (no extra API calls needed).
             const reconciliationReport = result.report ?? null;
 
-            await db.from("ap_activity_log").insert({
+            await supabase.from("ap_activity_log").insert({
                 email_from: result.vendorName,
                 email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                 intent: "RECONCILIATION",
@@ -2180,7 +2180,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }))
             ];
 
-            await db.from("invoices").update({
+            await supabase.from("invoices").update({
                 status: newStatus,
                 discrepancies: discrepancies
             })
@@ -2224,7 +2224,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
             if (logId && hasDifferences) {
                 // Mark row so daily digest cron can GROUP BY vendor and surface it
                 try {
-                    const { data: logRow } = await supabase
+                    const { data: logRow } = await db
                         .from("ap_activity_log")
                         .select("metadata")
                         .eq("id", logId)
@@ -2333,9 +2333,9 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         metadata?: Record<string, any>,
         notifiedSlack: boolean = false
     ) {
-        if (!db) return;
+        if (!supabase) return;
         try {
-            await db.from("ap_activity_log").insert({
+            await supabase.from("ap_activity_log").insert({
                 email_from: emailFrom,
                 email_subject: emailSubject,
                 intent,
@@ -2370,7 +2370,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         const _offset = _tzName === "MDT" ? "-06:00" : "-07:00";
         const todayStart = new Date(`${_denverDate}T00:00:00${_offset}`);
 
-        const { data: logs, error } = await supabase
+        const { data: logs, error } = await db
             .from("ap_activity_log")
             .select("*")
             .gte("created_at", todayStart.toISOString())

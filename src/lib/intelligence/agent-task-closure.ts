@@ -11,6 +11,8 @@
 import { createClient } from "@/lib/db";
 import { appendEvent, type AgentTask } from "./agent-task";
 
+const supabase = createClient();
+
 export type ClosurePredicate =
     | { kind: "agent_boot_after"; agent: string }
     | { kind: "spoke_status"; table: string; value_in: string[] }

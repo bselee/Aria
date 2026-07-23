@@ -25,6 +25,8 @@ import {
     writeReconciliationOutcome,
 } from "@/lib/runtime/observability/reconciliation-outcomes";
 
+const supabase = createClient();
+
 type ActionRequest = {
     action: "approve" | "pause" | "dismiss" | "rematch";
     activityLogId: string;
@@ -524,7 +526,7 @@ async function updateVendorProfile(
             }
         }
 
-        await db.from("vendor_profiles").upsert({
+        await supabase.from("vendor_profiles").upsert({
             vendor_name: vendorName,
             reconciliation_count: newReconCount,
             approval_count: newApprovalCount,

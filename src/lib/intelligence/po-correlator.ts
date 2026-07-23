@@ -25,6 +25,8 @@ import { createClient } from "../db";
 import { unifiedObjectGeneration } from "./llm";
 import { z } from "zod";
 
+const supabase = createClient();
+
 // ──────────────────────────────────────────────────
 // TYPES
 // ──────────────────────────────────────────────────

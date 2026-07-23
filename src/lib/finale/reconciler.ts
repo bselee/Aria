@@ -221,7 +221,7 @@ export async function loadPendingApprovalsFromSupabase(): Promise<Array<{
         if (!db) return [];
 
         // Filter by status='pending' and expires_at > now()
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("ap_pending_approvals")
             .select("id, reconciliation_result, telegram_chat_id, expires_at")
             .eq("status", "pending")
@@ -294,7 +294,7 @@ export async function expireStaleApprovals(): Promise<number> {
         const db = createClient();
         if (!db) return 0;
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("ap_pending_approvals")
             .update({ status: "expired" })
             .eq("status", "pending")
@@ -793,7 +793,7 @@ async function checkDuplicateReconciliation(
             return { isDuplicate: true, processedAt, actionTaken: entry.action_taken };
         };
 
-        const { data: canonicalMatch, error: canonicalErr } = await supabase
+        const { data: canonicalMatch, error: canonicalErr } = await db
             .from("ap_activity_log")
             .select("created_at, action_taken, metadata")
             .eq("intent", "RECONCILIATION")
@@ -817,7 +817,7 @@ async function checkDuplicateReconciliation(
 
         // 1. Fuzzy Vendor Name, Exact Invoice Number
         const vendorPattern = `%${String(invoice.vendorName || "").trim()}%`;
-        const { data: exactMatch, error: exactErr } = await supabase
+        const { data: exactMatch, error: exactErr } = await db
             .from("ap_activity_log")
             .select("created_at, action_taken, metadata")
             .eq("intent", "RECONCILIATION")
@@ -2556,7 +2556,7 @@ async function deduplicateTrackingNumbers(
         if (!db) return trackingNumbers; // No Supabase → skip dedup, write all
 
         // Check which tracking numbers already exist in any invoice record
-        const { data: existingInvoices } = await supabase
+        const { data: existingInvoices } = await db
             .from("invoices")
             .select("tracking_numbers")
             .overlaps("tracking_numbers", trackingNumbers);
@@ -2607,14 +2607,14 @@ async function saveTrackingNumbers(
         // Update the invoice record with tracking numbers (append, not overwrite)
         // Use RPC to merge arrays via array_append to avoid clobbering existing tracking data.
         // Fallback: read existing, merge, write back.
-        const { data: existing } = await supabase
+        const { data: existing } = await db
             .from("invoices")
             .select("tracking_numbers")
             .eq("invoice_number", invoiceNumber)
             .maybeSingle();
         const existingTracking = (existing as any)?.tracking_numbers as string[] || [];
         const merged = [...new Set([...existingTracking, ...trackingNumbers])];
-        await supabase
+        await db
             .from("invoices")
             .update({ tracking_numbers: merged })
             .eq("invoice_number", invoiceNumber);

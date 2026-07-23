@@ -382,7 +382,7 @@ export async function createDraftPOFromLatestInvoice(): Promise<AxiomPOResult> {
         const { createClient } = await import('../supabase');
         const db = createClient();
         try {
-            const { data: existing } = await supabase
+            const { data: existing } = await db
                 .from('vendor_invoices')
                 .select('id, po_number')
                 .eq('vendor_name', 'Axiom Print')

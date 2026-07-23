@@ -18,7 +18,7 @@ export interface OpsControlRequestRow {
 }
 
 export async function upsertAgentHeartbeat(supabase: any, heartbeat: AgentHeartbeatRecord): Promise<void> {
-    await db.from("agent_heartbeats").upsert({
+    await supabase.from("agent_heartbeats").upsert({
         agent_name: heartbeat.agentName,
         status: heartbeat.status,
         heartbeat_at: heartbeat.heartbeatAt,

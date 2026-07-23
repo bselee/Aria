@@ -157,7 +157,7 @@ export async function GET(req: NextRequest) {
 
     try {
         // ── Fetch invoices ordered newest-first ───────────────────────────────
-        const { data: invoicesRaw, error: invErr } = await supabase
+        const { data: invoicesRaw, error: invErr } = await db
             .from('invoices')
             .select(
                 'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, discrepancies'
@@ -174,7 +174,7 @@ export async function GET(req: NextRequest) {
         // include the invoice number in the subject or metadata). Since there is no
         // FK between the tables, we fetch the last 200 log rows and index them by
         // invoice number extracted from metadata.invoiceNumber.
-        const { data: logRaw } = await supabase
+        const { data: logRaw } = await db
             .from('ap_activity_log')
             .select('id, created_at, email_subject, action_taken, reviewed_at, reviewed_action, metadata, intent')
             .in('intent', ['INVOICE', 'RECONCILIATION', 'HUMAN_INTERACTION', 'HUMAN_INTERACT', 'EYES_NEEDED'])
@@ -330,7 +330,7 @@ async function handleCsvExport(): Promise<NextResponse> {
         const since = new Date();
         since.setDate(since.getDate() - 90);
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from('ap_activity_log')
             .select('created_at, reconciliation_report')
             .not('reconciliation_report', 'is', null)

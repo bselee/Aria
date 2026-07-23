@@ -16,6 +16,8 @@ import { listTasks, type AgentTask } from "./agent-task";
 import { createOrAdvance, linkTask } from "./agent-issue";
 import { groupTasksByFlow, deriveIssueState } from "./issue-projection";
 
+const supabase = createClient();
+
 const TERMINAL_WINDOW_MS = 14 * 24 * 3600 * 1000;
 
 export type ProjectionSummary = {

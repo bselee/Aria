@@ -30,7 +30,7 @@ export async function POST(req: Request) {
         const directPoMatch = query.match(/\b(\d{5,7})\b/);
         if (directPoMatch) {
             const poNumber = directPoMatch[1];
-            const { data: directPo } = await supabase
+            const { data: directPo } = await db
                 .from("purchase_orders")
                 .select("po_number, vendor_name, issue_date, total_amount, status")
                 .eq("po_number", poNumber)
@@ -45,7 +45,7 @@ export async function POST(req: Request) {
         }
 
         // Step 2: Fetch all recent POs for the vendor from Supabase
-        let poQuery = supabase
+        let poQuery = db
             .from("purchase_orders")
             .select("po_number, vendor_name, issue_date, total_amount, status")
             .order("issue_date", { ascending: false })

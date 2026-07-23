@@ -19,7 +19,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "activityId required" }, { status: 400 });
     }
 
-    const { data: row, error } = await supabase
+    const { data: row, error } = await db
         .from("ap_activity_log")
         .select("id, intent, metadata")
         .eq("id", activityId)

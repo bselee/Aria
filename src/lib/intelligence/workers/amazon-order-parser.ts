@@ -64,7 +64,7 @@ export class AmazonOrderParser {
         if (!db) return;
 
         // Step 2: Check if this order was already processed
-        const { data: existing } = await supabase
+        const { data: existing } = await db
             .from('slack_requests')
             .select('id, status, amazon_order_id')
             .eq('amazon_order_id', orderData.orderId)
@@ -86,11 +86,11 @@ export class AmazonOrderParser {
         }
 
         // Step 3: Try to match to a pending Slack request
-        const match = await this.matchToSlackRequest(supabase, orderData);
+        const match = await this.matchToSlackRequest(db, orderData);
 
         // Step 4: Update the slack_request record
         if (match) {
-            await supabase
+            await db
                 .from('slack_requests')
                 .update({
                     status: isShippingUpdate ? 'shipped' : 'ordered',
@@ -217,7 +217,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
      * Match an Amazon order to a pending Slack request by item name similarity and timing.
      */
     private async matchToSlackRequest(
-        supabase: ReturnType<typeof createClient>,
+        db: ReturnType<typeof createClient>,
         orderData: AmazonOrderData
     ): Promise<{ id: string; requester_name: string; channel_id: string; message_ts: string; thread_ts: string | null } | null> {
         if (!db) return null;
@@ -226,7 +226,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-        const { data: pending } = await supabase
+        const { data: pending } = await db
             .from('slack_requests')
             .select('id, requester_name, channel_id, message_ts, thread_ts, items_requested, created_at')
             .eq('status', 'pending')
@@ -294,7 +294,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         await db.from('slack_requests').update(updates).eq('id', requestId);
 
         // Get the request details for Telegram notification
-        const { data: req } = await supabase
+        const { data: req } = await db
             .from('slack_requests')
             .select('*')
             .eq('id', requestId)

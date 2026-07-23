@@ -27,7 +27,7 @@ export async function GET(req: Request) {
         }
 
         // Search purchase_orders by vendor name (case-insensitive partial match)
-        const { data: pos, error } = await supabase
+        const { data: pos, error } = await db
             .from("purchase_orders")
             .select("po_number, vendor_name, issue_date, total_amount, status")
             .ilike("vendor_name", `%${vendor}%`)

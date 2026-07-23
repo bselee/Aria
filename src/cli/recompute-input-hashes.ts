@@ -60,7 +60,7 @@ async function main() {
 
     let offset = 0;
     while (true) {
-        const { data: rows, error } = await supabase
+        const { data: rows, error } = await db
             .from("agent_task")
             .select("id, inputs, input_hash")
             .order("created_at", { ascending: true })
@@ -87,7 +87,7 @@ async function main() {
             }
 
             if (apply) {
-                const { error: updErr } = await supabase
+                const { error: updErr } = await db
                     .from("agent_task")
                     .update({ input_hash: newHash })
                     .eq("id", row.id);

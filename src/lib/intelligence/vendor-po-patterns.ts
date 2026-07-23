@@ -10,6 +10,8 @@
 
 import { createClient } from "@/lib/db";
 
+const supabase = createClient();
+
 /** How many failures before we generate an LLM hint */
 const HINT_THRESHOLD = 3;
 

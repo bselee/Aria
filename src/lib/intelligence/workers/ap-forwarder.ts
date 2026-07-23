@@ -8,6 +8,8 @@ import { writeInvoiceSummary } from "../../obsidian/bridge";
 import { getLocalDb } from "../../storage/local-db";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 
+const supabase = createClient();
+
 /**
  * @file ap-forwarder.ts
  * @purpose Agent 2 of the decoupled AP pipeline (The "Hands").
@@ -39,7 +41,7 @@ export class APForwarderAgent {
         this.invoiceProcessor = new APAgent(fallbackBot);
     }
 
-    private async logActivity(supabase: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
+    private async logActivity(db: any, from: string, subject: string, intent: string, action: string, metadata: any = {}) {
         if (!db) return;
         try {
             await db.from("ap_activity_log").insert({
@@ -160,7 +162,7 @@ export class APForwarderAgent {
     }
 
     private async finalizeSourceEmailIfReady(
-        supabase: any,
+        db: any,
         gmail: any,
         item: any,
     ): Promise<void> {

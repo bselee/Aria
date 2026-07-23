@@ -38,6 +38,9 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { businessHoursAlert } from "../alert-gate";
 
+const supabase = createClient();
+const db = supabase;
+
 const execAsync = promisify(exec);
 const RECONCILE_TIMEOUT_MS = 5 * 60 * 1000;
 const RECONCILE_MAX_BUFFER = 10 * 1024 * 1024;

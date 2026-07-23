@@ -696,6 +696,8 @@ import type {
     CommandBoardIssueFilters,
 } from "./types";
 
+const supabase = createClient();
+
 function issueRowToCard(row: AgentIssue, taskCount: number): CommandBoardIssue {
     return {
         id: row.id,

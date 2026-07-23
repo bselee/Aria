@@ -82,7 +82,7 @@ async function main() {
             console.warn('  ⚠️ No Supabase — skipping storage');
         } else {
             try {
-                const { data: runRow, error: runErr } = await supabase
+                const { data: runRow, error: runErr } = await db
                     .from('purchase_assessment_runs')
                     .insert({
                         scrape_success: scrapeSuccess,
@@ -120,7 +120,7 @@ async function main() {
                         do_not_reorder: item.doNotReorder,
                     }));
 
-                    const { error: insertErr } = await supabase
+                    const { error: insertErr } = await db
                         .from('purchase_assessments')
                         .insert(itemsToInsert);
                     if (insertErr) {
@@ -143,7 +143,7 @@ async function main() {
         const db = createClient();
         if (db) {
             try {
-                const { data: prevRuns, error: prevErr } = await supabase
+                const { data: prevRuns, error: prevErr } = await db
                     .from('purchase_assessment_runs')
                     .select('id')
                     .lt('run_at', new Date().toISOString())
@@ -153,7 +153,7 @@ async function main() {
 
                 if (prevRuns && prevRuns.length > 0) {
                     const prevRunId = prevRuns[0].id;
-                    const { data: prevItems, error: prevItemsErr } = await supabase
+                    const { data: prevItems, error: prevItemsErr } = await db
                         .from('purchase_assessments')
                         .select('*')
                         .eq('run_id', prevRunId);

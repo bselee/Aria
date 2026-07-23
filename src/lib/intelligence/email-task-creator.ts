@@ -11,6 +11,8 @@
 import { createClient } from "@/lib/db";
 import * as agentTask from "./agent-task";
 
+const supabase = createClient();
+
 export interface EmailTaskInput {
     /** Free-text description from Bill */
     description: string;

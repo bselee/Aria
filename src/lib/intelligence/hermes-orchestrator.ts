@@ -256,7 +256,7 @@ export class HermesOrchestrator {
         if (!db) return;
 
         try {
-            const { data } = await supabase
+            const { data } = await db
                 .from("agent_heartbeats")
                 .select("agent_name, status, heartbeat_at")
                 .order("heartbeat_at", { ascending: false })

@@ -22,6 +22,7 @@
 import { createClient } from "@/lib/db";
 import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
 import { FinaleClient } from "@/lib/finale/client";
+import { reconcileInvoiceToPO, applyReconciliation, buildReconciliationIdentityMetadata } from "@/lib/finale/reconciler";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ export interface InvoiceToMatch {
     freight: number;
     tax: number;
     total: number;
+    /** Optional line items from OCR or invoice cache. Used for line-level matching. */
+    lineItems?: Array<{ sku?: string; qty?: number; unitPrice?: number; description?: string }>;
 }
 
 export interface POCandidate {
@@ -229,7 +232,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
     // Find invoices with no PO assigned, ordered by most recent
     const { data: unmatched } = await db
         .from("vendor_invoices")
-        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, raw_data, line_items")
         .is("po_number", null)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -266,26 +269,65 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                 }
             );
 
-            // Push freight to Finale PO — the database has the correlation,
-            // so use it. Freight on the invoice IS the PO's freight.
-            const invFreight = Number(inv.freight || 0);
-            if (invFreight > 0) {
-                try {
-                    const finale = new FinaleClient();
-                    await finale.updateOrderAdjustmentAmount(
-                        result.bestMatch.orderId,
-                        'FREIGHT',
-                        invFreight,
-                        `Freight from invoice ${inv.invoice_number}`,
-                    );
+            // Route through the mature reconciliation engine — single source of truth
+            // for freight, line-item prices, and fee adjustments. Handles delta-based
+            // freight application, duplicate detection, and disproportion guards.
+            try {
+                const finale = new FinaleClient();
+                const invoiceData = inv.raw_data || {
+                    vendorName: inv.vendor_name,
+                    invoiceNumber: inv.invoice_number,
+                    invoiceDate: inv.invoice_date,
+                    dueDate: null,
+                    total: Number(inv.total || 0),
+                    amountDue: Number(inv.total || 0),
+                    subtotal: Number(inv.subtotal || 0),
+                    freight: Number(inv.freight || 0),
+                    tax: Number(inv.tax || 0),
+                    poNumber: result.bestMatch.orderId,
+                    lineItems: inv.line_items || [],
+                    confidence: "medium" as const,
+                };
+
+                const reconResult = await reconcileInvoiceToPO(
+                    invoiceData as any,
+                    result.bestMatch.orderId,
+                    finale,
+                    'invoice-po-matcher',
+                );
+
+                console.log(
+                    `[invoice-matcher] Reconciliation ${result.bestMatch.orderId}: ` +
+                    `verdict=${reconResult.overallVerdict} impact=$${reconResult.totalDollarImpact.toFixed(2)}`,
+                );
+
+                if (reconResult.overallVerdict === 'auto_approve') {
+                    const applyResult = await applyReconciliation(reconResult, finale);
                     console.log(
-                        `[invoice-matcher] Freight $${invFreight.toFixed(2)} applied to PO ${result.bestMatch.orderId}`,
+                        `[invoice-matcher] Applied ${applyResult.applied.length} change(s) to PO ${result.bestMatch.orderId}`,
                     );
-                } catch (freightErr: any) {
-                    console.warn(
-                        `[invoice-matcher] Freight push failed for PO ${result.bestMatch.orderId}: ${freightErr.message}`,
+                    const identity = buildReconciliationIdentityMetadata({
+                        invoiceNumber: inv.invoice_number,
+                        vendorName: inv.vendor_name,
+                        orderId: result.bestMatch.orderId,
+                    });
+                    await db.from('ap_activity_log').insert({
+                        email_from: inv.vendor_name,
+                        email_subject: `Auto-match: Invoice ${inv.invoice_number} → PO ${result.bestMatch.orderId}`,
+                        intent: 'RECONCILIATION',
+                        action_taken: `Auto-applied: ${applyResult.applied.length} changes`,
+                        metadata: identity,
+                    });
+                } else {
+                    // Needs human approval — the reconciler already handles logging
+                    console.log(
+                        `[invoice-matcher] PO ${result.bestMatch.orderId} needs approval (${reconResult.overallVerdict})`,
                     );
                 }
+            } catch (reconErr: any) {
+                console.error(
+                    `[invoice-matcher] Reconciliation failed for PO ${result.bestMatch.orderId}: ${reconErr.message}`,
+                );
             }
 
             autoMatched.push({

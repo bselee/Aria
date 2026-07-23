@@ -22,6 +22,8 @@
 import { createClient } from "@/lib/db";
 import type { AgentIssue } from "./agent-issue";
 
+const supabase = createClient();
+
 export type IssueControlMode =
     | "observe_only"
     | "suggest"

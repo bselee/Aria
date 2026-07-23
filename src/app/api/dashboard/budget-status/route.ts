@@ -20,7 +20,7 @@ export async function GET() {
             return NextResponse.json({ agents: [], error: "Database unavailable" });
         }
 
-        const { data, error } = await supabase
+        const { data, error } = await db
             .from("agent_budget")
             .select("agent_id, monthly_usd_cap, current_period_usd_spent, current_period_tokens_spent, current_period_start, paused_until, notes, last_charged_at")
             .order("current_period_usd_spent", { ascending: false });

@@ -1269,7 +1269,7 @@ defineJob({
             const db = createClient();
             if (db) {
                 const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-                const { data, error } = await supabase
+                const { data, error } = await db
                     .from("ap_activity_log")
                     .delete()
                     .lt("created_at", cutoff);

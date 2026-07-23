@@ -19,6 +19,8 @@ import {
     findLatestFedexCsvCandidate,
 } from "./fedex-acquisition";
 
+const supabase = createClient();
+
 const execAsync = promisify(exec);
 
 function emptySummary(): StatementReconciliationRunSummary {
