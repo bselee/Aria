@@ -274,7 +274,18 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
             // freight application, duplicate detection, and disproportion guards.
             try {
                 const finale = new FinaleClient();
-                const invoiceData = inv.raw_data || {
+
+                // Only trust raw_data if it has the InvoiceData shape we need.
+                // Modules / raw email payloads stored as raw_data lack the required
+                // fields and would pass nulls/undefineds into the reconciler.
+                const rawData = inv.raw_data as Record<string, unknown> | undefined;
+                const hasValidRawData =
+                    rawData &&
+                    typeof rawData.vendorName === 'string' &&
+                    typeof rawData.invoiceNumber === 'string' &&
+                    typeof rawData.total === 'number';
+
+                const invoiceData = hasValidRawData ? rawData : {
                     vendorName: inv.vendor_name,
                     invoiceNumber: inv.invoice_number,
                     invoiceDate: inv.invoice_date,
@@ -328,6 +339,24 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                 console.error(
                     `[invoice-matcher] Reconciliation failed for PO ${result.bestMatch.orderId}: ${reconErr.message}`,
                 );
+                // Log the failure so it shows on the dashboard
+                try {
+                    await db.from('ap_activity_log').insert({
+                        intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
+                        action_taken: `Reconciliation failed for ${inv.invoice_number} → PO ${result.bestMatch.orderId}`,
+                        metadata: {
+                            invoiceNumber: inv.invoice_number,
+                            poNumber: result.bestMatch.orderId,
+                            vendorName: inv.vendor_name,
+                            score: result.bestMatch.score,
+                            error: reconErr?.message || String(reconErr),
+                        },
+                        email_from: inv.vendor_name || '',
+                        email_subject: `Recon failed — ${inv.invoice_number}`,
+                    });
+                } catch {
+                    // Non-critical
+                }
             }
 
             autoMatched.push({

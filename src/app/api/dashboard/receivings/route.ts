@@ -18,6 +18,13 @@ import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 
+// ── In-flight PO reconciliation guard ─────────────────────────────────────
+// Prevents concurrent Finale writes when two browser tabs / bust=1 calls
+// attempt to auto-reconcile the same PO simultaneously.
+// The Set is module-scoped so it resets on server restart / HMR.
+const _reconcilingPOs = new Set<string>();
+// ────────────────────────────────────────────────────────────────────────────
+
 export function getDenverWeekStart(date: Date): string {
     const denverNow = new Date(date.toLocaleString('en-US', { timeZone: 'America/Denver' }));
     const day = denverNow.getDay();
@@ -301,8 +308,23 @@ export async function GET(req: NextRequest) {
 
                                     // Route through reconciler — single source of truth for freight/fees.
                                     // Uses delta-based freight, duplicate detection, disproportion guards.
-                                    try {
-                                        const invoiceData = inv.raw_data || {
+                                    // Skip if this PO is already being reconciled by another request.
+                                    if (_reconcilingPOs.has(best.orderId)) {
+                                        console.log(
+                                            `[receivings] Skipping PO ${best.orderId} — reconciliation already in-flight`,
+                                        );
+                                    } else {
+                                        // Only trust raw_data if it has the InvoiceData shape.
+                                        // Modules / raw email payloads stored as raw_data lack the
+                                        // required fields and would pass nulls into the reconciler.
+                                        const rawData = inv.raw_data as Record<string, unknown> | undefined;
+                                        const hasValidRawData =
+                                            rawData &&
+                                            typeof rawData.vendorName === 'string' &&
+                                            typeof rawData.invoiceNumber === 'string' &&
+                                            typeof rawData.total === 'number';
+
+                                        const invoiceData = hasValidRawData ? rawData : {
                                             vendorName: inv.vendor_name,
                                             invoiceNumber: inv.invoice_number,
                                             invoiceDate: inv.invoice_date,
@@ -317,57 +339,62 @@ export async function GET(req: NextRequest) {
                                             confidence: "medium" as const,
                                         };
 
-                                        const reconResult = await reconcileInvoiceToPO(
-                                            invoiceData as any,
-                                            best.orderId,
-                                            finale,
-                                            'receivings-auto-match',
-                                        );
-
-                                        if (reconResult.overallVerdict === 'auto_approve') {
-                                            await applyReconciliation(reconResult, finale);
-                                        }
-
-                                        // Log the auto-match event
-                                        await sb.from('ap_activity_log').insert({
-                                            intent: 'RECONCILIATION_AUTO_APPLIED',
-                                            action_taken: `Auto-matched to PO ${best.orderId} — recon verdict=${reconResult.overallVerdict}`,
-                                            metadata: {
-                                                invoiceNumber: inv.invoice_number,
-                                                poNumber: best.orderId,
-                                                vendorName: inv.vendor_name,
-                                                score: best.score,
-                                                reasons: best.reasons,
-                                                status: 'needs_review',
-                                                reconVerdict: reconResult.overallVerdict,
-                                            },
-                                            email_from: inv.vendor_name || '',
-                                            email_subject: `Invoice ${inv.invoice_number} auto-matched`,
-                                        });
-                                    } catch (reconErr: any) {
-                                        console.warn(
-                                            `[receivings] Reconciliation failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${reconErr?.message || reconErr}`,
-                                        );
-                                        // Log the failure
+                                        _reconcilingPOs.add(best.orderId);
                                         try {
+                                            const reconResult = await reconcileInvoiceToPO(
+                                                invoiceData as any,
+                                                best.orderId,
+                                                finale,
+                                                'receivings-auto-match',
+                                            );
+
+                                            if (reconResult.overallVerdict === 'auto_approve') {
+                                                await applyReconciliation(reconResult, finale);
+                                            }
+
+                                            // Log the auto-match event
                                             await sb.from('ap_activity_log').insert({
-                                                intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
-                                                action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
+                                                intent: 'RECONCILIATION_AUTO_APPLIED',
+                                                action_taken: `Auto-matched to PO ${best.orderId} — recon verdict=${reconResult.overallVerdict}`,
                                                 metadata: {
                                                     invoiceNumber: inv.invoice_number,
                                                     poNumber: best.orderId,
                                                     vendorName: inv.vendor_name,
                                                     score: best.score,
-                                                    error: reconErr?.message || String(reconErr),
+                                                    reasons: best.reasons,
+                                                    status: 'needs_review',
+                                                    reconVerdict: reconResult.overallVerdict,
                                                 },
                                                 email_from: inv.vendor_name || '',
-                                                email_subject: `Auto-apply failed — ${inv.invoice_number}`,
+                                                email_subject: `Invoice ${inv.invoice_number} auto-matched`,
                                             });
-                                        } catch {
-                                            // Non-critical
+                                        } catch (reconErr: any) {
+                                            console.warn(
+                                                `[receivings] Reconciliation failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${reconErr?.message || reconErr}`,
+                                            );
+                                            // Log the failure
+                                            try {
+                                                await sb.from('ap_activity_log').insert({
+                                                    intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
+                                                    action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
+                                                    metadata: {
+                                                        invoiceNumber: inv.invoice_number,
+                                                        poNumber: best.orderId,
+                                                        vendorName: inv.vendor_name,
+                                                        score: best.score,
+                                                        error: reconErr?.message || String(reconErr),
+                                                    },
+                                                    email_from: inv.vendor_name || '',
+                                                    email_subject: `Auto-apply failed — ${inv.invoice_number}`,
+                                                });
+                                            } catch {
+                                                // Non-critical
+                                            }
+                                        } finally {
+                                            _reconcilingPOs.delete(best.orderId);
                                         }
                                     }
-                                } catch (autoApplyErr: any) {
+                            } catch (autoApplyErr: any) {
                                     console.warn(
                                         `[receivings] Auto-apply failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${autoApplyErr?.message || autoApplyErr}`,
                                     );
