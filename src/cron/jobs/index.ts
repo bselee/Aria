@@ -29,7 +29,7 @@ const ops = () => OpsManager.singleton;
 defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
-    onFail: "telegram-will",
+    onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
     description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
     handler: async () => {
         // HERMIA(2026-06-18): Local-first forwarding — scans Gmail directly, forwards
@@ -57,14 +57,33 @@ defineJob({
             console.warn(`[ap-polling] post-pass po-sweep failed: ${err?.message ?? err}`);
             throw err;
         }
+
+        // KAIZEN (2026-07-23): Freight backfill for already-matched invoices.
+        // Runs as a post-pass on every ap-polling tick (3x/day) — the matching
+        // cron handles NEW matches; this catches the backlog for matched invoices
+        // whose freight was never pushed to Finale. Bounded to 20 per tick.
+        try {
+            const { batchReconcileExistingFreight } = await import(
+                "@/lib/purchasing/invoice-po-matcher"
+            );
+            const freightResult = await batchReconcileExistingFreight(20);
+            if (freightResult.pushed.length > 0 || freightResult.errors > 0) {
+                console.log(
+                    `[freight-backfill] pushed=${freightResult.pushed.length}, ` +
+                    `skipped=${freightResult.skipped}, errors=${freightResult.errors}`
+                );
+            }
+        } catch (err: any) {
+            console.warn(`[ap-polling] freight backfill failed: ${err?.message ?? err}`);
+        }
     },
     budget: { durationMs: 180_000 },  // bumped from default to cover the post-pass
 });
 
 defineJob({
     name: "build-risk",
-    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7:30 → 8:00 (business hours start)
-    onFail: "telegram-will",
+    schedule: "0 8 * * 1-5",
+    onFail: "telegram-will",  // Bill orders based on this data
     description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.runDailyBuildRisk(); },
 });
@@ -72,7 +91,7 @@ defineJob({
 defineJob({
     name: "jit-forward-projection",
         schedule: "0 8 * * 1-5",
-        onFail: "telegram-will",
+        onFail: "telegram-will",  // Bill orders based on this data
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
@@ -166,7 +185,7 @@ defineJob({
 defineJob({
     name: "ap-health-report",
     schedule: "30 8 * * 1-5",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
             const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
@@ -270,7 +289,7 @@ defineJob({
 defineJob({
     name: "daily-summary",
     schedule: "0 8 * * 1-5",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Daily PO/invoice/email summary (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.sendDailySummary(); },
 });
@@ -333,7 +352,7 @@ defineJob({
 defineJob({
     name: "po-followup-watcher",
         schedule: "15 8 * * 1-5",  // KAIZEN #7: 7:45 → 8:15 (after business hours start)
-        onFail: "telegram-will",
+        onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "8:15 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
     handler: async () => {
         const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
@@ -353,7 +372,7 @@ defineJob({
 defineJob({
     name: "po-stuck-detector",
         schedule: "20 8 * * 1-5",  // KAIZEN #7: 7:50 → 8:20 (after business hours start)
-        onFail: "telegram-will",
+        onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "8:20 AM Mon-Fri: find POs stalled at any stage (acked-no-tracking, delivered-no-receipt, etc). Also drafts vendor follow-up emails for overdue POs (po-overdue-followup).",
     handler: async () => {
         const { detectStuckPOs, summariseStuck } = await import("@/lib/purchasing/po-stuck-detector");
@@ -384,7 +403,7 @@ defineJob({
 defineJob({
     name: "email-tracking-ingest",
         schedule: "15 */2 * * *",
-        onFail: "telegram-will",
+        onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments.",
     handler: async () => {
         const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
@@ -396,7 +415,7 @@ defineJob({
 defineJob({
     name: "carrier-poll",
     schedule: "0 6,14 * * *", // 6am + 2pm daily — catches afternoon deliveries
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Refresh live carrier status for active shipments (2x/day).",
     handler: async () => {
         const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
@@ -419,7 +438,7 @@ defineJob({
 defineJob({
     name: "po-purchase-sync",
     schedule: "0 */2 * * *",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Sync purchase_orders from Finale (every 2h) — foundation for invoice→PO matching.",
     handler: async () => {
         const { syncPurchaseOrders } = await import("@/lib/purchasing/po-sync");
@@ -448,7 +467,7 @@ defineJob({
 defineJob({
     name: "po-receiving-watcher",
     schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — warehouse hours only
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Poll Finale for received POs (every 30m during business hours).",
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
@@ -457,8 +476,8 @@ defineJob({
 // after an invoice was reconciled, re-checks quantities and alerts if short.
 defineJob({
     name: "po-receipt-recheck",
-    schedule: "*/30 * * * *",
-    onFail: "telegram-will",
+    schedule: "*/30 8-17 * * 1-5",  // KAIZEN (2026-07-23): weekdays only. No goods arrive off-hours.
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Re-check reconciled invoices against newly received goods (every 30m).",
     handler: async () => {
         const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
@@ -471,7 +490,7 @@ defineJob({
 defineJob({
     name: "vendor-escalation",
         schedule: "40 8 * * 1-5",
-        onFail: "telegram-will",
+        onFail: "telegram-will",  // unresponsive vendors → late orders
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -487,7 +506,7 @@ defineJob({
 defineJob({
     name: "delivery-exception-escalator",
     schedule: "0 */4 * * 1-5",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-escalate delivery exceptions — draft vendor email + Telegram alert (every 4h weekdays).",
     handler: async () => {
         const { escalateDeliveryExceptions } = await import("@/lib/tracking/delivery-exception-escalator");
@@ -527,7 +546,7 @@ defineJob({
 defineJob({
     name: "missing-reconciliation-watchdog",
     schedule: "0 9 * * 1-5",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "9 AM Mon-Fri: alert if any vendor missed a 24h reconciliation.",
     handler: async () => { await ops()?.checkMissingReconciliationRuns(); },
 });
@@ -579,7 +598,7 @@ defineJob({
 defineJob({
     name: "po-auto-complete-watcher",
     schedule: "0 */4 * * *",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
     handler: async () => { await ops()?.runPOAutoCompleteWatcher(); },
     budget: { durationMs: 300_000 }, // 5min — fetches getOrderDetails per candidate
@@ -593,7 +612,7 @@ defineJob({
 defineJob({
     name: "po-arrival-risk-check",
     schedule: "0 */2 * * *",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Detect PO arrivals that will land after stockout (every 2h).",
     handler: async () => { await ops()?.runPOArrivalRiskCheck(); },
     budget: { durationMs: 180_000 },
@@ -682,7 +701,7 @@ defineJob({
 // Every 30min for active shipments; stale check at 60min.
 defineJob({
     name: "tracking-refresh",
-    schedule: "*/30 * * * *",
+    schedule: "0 * * * *",  // KAIZEN (2026-07-23): */30 → hourly. Packages move 2-3x/day.
     onFail: "log",
     description: "Refresh stale tracking numbers from carrier APIs into local cache.",
     handler: async () => {
@@ -968,7 +987,7 @@ defineJob({
 defineJob({
     name: "proactive-brief",
     schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
     handler: async () => {
         const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
@@ -1008,8 +1027,8 @@ defineJob({
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
     name: "stockout-driver",
-    schedule: "0 8,11,15 * * 1-5",  // KAIZEN #7: 7am → 8am, 11am, 3pm weekdays
-    onFail: "telegram-will",
+    schedule: "0 8,11,15 * * 1-5",
+    onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
@@ -1057,8 +1076,8 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "monday-briefing",
-    schedule: "0 8 * * 1",  // Monday 8:00 AM
-    onFail: "telegram-will",
+    schedule: "0 8 * * 1",
+    onFail: "telegram-will",  // weekly overview — Bill reads these
     description: "Monday morning status overview: last-week purchases, upcoming needs, Slack SKU status, industry pulse. Emails bill.selee@buildasoil.com.",
     handler: async () => {
         const { generateAndSendMondayBriefing } = await import(
@@ -1109,7 +1128,7 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "po-reply-watcher",
-    schedule: "*/30 7-18 * * 1-5",
+    schedule: "0 7-18 * * 1-5",  // KAIZEN (2026-07-23): */30 → hourly. Gmail threads don't update faster.
     onFail: "log",
     description: "Watch Gmail threads for vendor replies to sent POs (30min, M-F 7AM-6PM MT).",
     handler: async () => {
@@ -1154,7 +1173,7 @@ defineJob({
     defineJob({
         name: "reconciliation-auto-apply",
         schedule: "15 * * * *",
-        onFail: "telegram-will",
+        onFail: "log",  // was telegram-will — demoted in frequency+alert audit
         description: "Auto-apply auto_approve/no_change reconciliation results to Finale POs (hourly at :15).",
         handler: async () => {
             const { runReconciliationAutoApply } = await import(
@@ -1179,7 +1198,7 @@ defineJob({
             defineJob({
                 name: "vendor-qty-discrepancy",
                 schedule: "*/30 8-17 * * 1-5",  // every 30 min during business hours
-                onFail: "telegram-will",
+                onFail: "log",  // was telegram-will — demoted in frequency+alert audit
                 description:
                     "Handle qty discrepancies between invoice and received qty — email vendor, detect replies, escalate after 7d.",
                 handler: async () => {
@@ -1209,7 +1228,7 @@ defineJob({
             defineJob({
                 name: "vendor-lead-time-tracker",
                 schedule: "0 22 * * *",
-                onFail: "telegram-will",
+                onFail: "log",  // was telegram-will — demoted in frequency+alert audit
                 description: "Nightly vendor lead-time tracking (4 layers): persist stats, drift alerts, auto-update overrides, BAS cross-validation. 10 PM.",
                 handler: async () => {
                     const { runLeadTimeTracker } = await import("@/lib/purchasing/lead-time-tracker");
@@ -1295,10 +1314,10 @@ defineJob({
 defineJob({
     name: "invoice-po-auto-match",
     schedule: "*/30 * * * *",
-    onFail: "telegram-will",
+    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-match unmatched vendor invoices to purchase orders (every 30m).",
     handler: async () => {
-        const { batchMatchUnmatchedInvoices, batchReconcileExistingFreight } = await import(
+        const { batchMatchUnmatchedInvoices } = await import(
             "@/lib/purchasing/invoice-po-matcher"
         );
         const result = await batchMatchUnmatchedInvoices();
@@ -1307,22 +1326,6 @@ defineJob({
                 `[invoice-po-auto-match] auto-matched=${result.autoMatched.length}, ` +
                 `needs-review=${result.needsReview}`
             );
-        }
-
-        // KAIZEN: Push freight for already-matched invoices that were never
-        // reconciled (backlog from before the lifecycle engine existed).
-        // Runs as a post-pass on every invocation — bounded to 10 invoices
-        // per tick to avoid overwhelming Finale.
-        try {
-            const freightResult = await batchReconcileExistingFreight(10);
-            if (freightResult.pushed.length > 0 || freightResult.skipped > 0 || freightResult.errors > 0) {
-                console.log(
-                    `[freight-backfill] pushed=${freightResult.pushed.length}, ` +
-                    `skipped=${freightResult.skipped}, errors=${freightResult.errors}`
-                );
-            }
-        } catch (err: any) {
-            console.warn(`[invoice-po-auto-match] freight backfill failed: ${err?.message ?? err}`);
         }
     },
     budget: { durationMs: 120_000 },
