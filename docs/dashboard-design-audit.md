@@ -555,6 +555,35 @@ from day one rather than retrofitting:
 Sequencing: build this page AFTER backlog items 1-4 and 7 land (see table
 below) so it inherits the fixes instead of needing a follow-up patch.
 
+**Status (2026-07-24): DONE.** Built `src/app/dashboard/invoice-review/page.tsx`
+after verifying all 3 dependencies live on disk (not just trusting the
+in-flight subagent reports — `PanelErrorBoundary.tsx` had timed out once
+before landing on a retry). All 3 tie-ins applied as specified.
+
+**Correction to the data-source list above:** `GET /api/dashboard/pending-approvals`
+is NOT the live source — the one row in `ap_pending_approvals` in the local
+DB has `status: "expired"` and the table isn't written to by the current
+reconciliation flow. `InvoiceQueuePanel` (the panel this page supersedes for
+the decision moment) actually reads `GET /api/dashboard/invoice-queue`
+(sourced from `invoices` + `ap_activity_log`, keyed by `activityLogId`) and
+posts to `reconciliation-action` with that same id. The new page uses
+`invoice-queue` + `activityLogId`, matching `InvoiceQueuePanel`'s real
+wiring — `pending-approvals` looks like dead/superseded code from an earlier
+iteration and is worth a follow-up prune (not done here — out of scope).
+
+**Known data gap surfaced during testing:** the one live `needs_approval`
+row today (Marion Ag Service, Invoice #85974 → PO #124977, auto-matched via
+the PO-sweep path) has `metadata` with no `priceChanges`/`feeChanges` array
+— that auto-match path doesn't attach line-item diff detail the way the
+dashboard-approval path does (`reconciliation-action.ts` L79). The page
+correctly falls back to an honest "no line-item differences recorded"
+message rather than fabricating a diff. If diff detail should always be
+attached, that's a gap in the PO-sweep reconciliation write, not in this
+page — flagging as a candidate follow-up, not fixing here (out of scope).
+
+Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
+(shown only when there's a pending queue).
+
 ---
 
 ## Prioritized backlog (do in this order)
@@ -572,7 +601,7 @@ below) so it inherits the fixes instead of needing a follow-up patch.
 | 8 | Build shared `<Panel>` primitive; migrate 1-2 panels as proof | new: `src/components/dashboard/Panel.tsx` | M |
 | 9 | Write the "when is it a tab vs panel vs grid column" contributor rule into this doc | this file | XS |
 | 10 | Decide fate of `LegacyDashboard()` — delete or document why it stays | `page.tsx` | XS |
-| 11 | Build `/dashboard/invoice-review` page (design approved, see above) — AFTER items 1-4 + 7 land | new: `src/app/dashboard/invoice-review/page.tsx` + focused-review component | M |
+| 11 | ✅ DONE — Build `/dashboard/invoice-review` page (design approved, see above) — AFTER items 1-4 + 7 land | new: `src/app/dashboard/invoice-review/page.tsx` + focused-review component | M |
 | 12 | Clutter fix: visually separate the 3 stacked filter rows in Ordering panel (window/lifecycle/action) | `PurchasingPanel.tsx` L1678-1822 | S |
 | 13 | Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
 | 14 | Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | new: `src/components/dashboard/chips/` | M |

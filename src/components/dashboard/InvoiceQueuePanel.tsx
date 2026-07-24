@@ -357,6 +357,16 @@ export default function InvoiceQueuePanel() {
         </span>
         <div className="flex-1" />
 
+        {/* Focused review page — full-width side-by-side invoice/PO comparison */}
+        {!isCollapsed && pending.length > 0 && (
+          <a
+            href="/dashboard/invoice-review"
+            className="text-[10px] font-mono text-amber-400 hover:text-amber-300 transition-colors mr-1 underline"
+          >
+            review →
+          </a>
+        )}
+
         {/* CSV export — only when expanded */}
         {!isCollapsed && (
           <button
