@@ -504,7 +504,102 @@ they're the worst offenders; other panels benefit as they're touched.
 
 ---
 
-## ⚪ P3-1: Dead legacy dashboard code
+## P1-3: Lifecycle flow doesn't match real-world AP/purchasing workflow
+
+Bill's live assessment (2026-07-24, after items 1-14 landed and real data
+started flowing): "this should be almost a complete lifecycle/kanban flow.
+Does not transfer IRL. Tracking week after ordering, receivings broken, no
+obvious match indicator." Traced each claim against code + live behavior —
+all three are real, distinct findings, not one bug wearing three
+descriptions.
+
+### 1. Tracking has no place in the actual flow — it's a phantom step
+
+The Lifecycle tab's 3-pane grid (`PurchasingLifecyclePanel()` in
+`CommandBoardShell.tsx`) hard-codes exactly 3 panes: Ordering
+(`PurchasingPanel`) → Purchases (`ActivePurchasesPanel`) → RCV
+(`ReceivedItemsPanel`). `TrackingBoardPanel` — the panel that would show
+"where is this shipment right now" between placing an order and receiving
+it — **is registered in `panelRegistry.tsx` and `useDashboardLayout.ts`'s
+panel-id list, but is never rendered in the Lifecycle tab's grid.** It only
+exists reachable via the *legacy* 4-column drag-and-drop dashboard
+(`LegacyDashboard()` in `page.tsx`), which is dead code nobody sees
+(`NEXT_PUBLIC_COMMAND_BOARD_ENABLED` defaults to enabling Command Board —
+see P3-1). So in the real, live UI: an order goes from Ordering straight
+to a Purchases pane showing "In Transit" badges with no shipment detail,
+then jumps straight to RCV. There's no dedicated tracking surface in
+between — which matches Bill's complaint exactly: the workflow *implies*
+Order → Track → Receive but the built UI only has Order → (badge) →
+Receive, with the actual tracking detail (`TrackingBoardPanel`'s
+per-shipment ETA/carrier/exception buckets) orphaned in unreachable code.
+
+**Fix options (needs a product decision, not just a code fix):**
+- (a) Add `TrackingBoardPanel` as a 4th pane in the Lifecycle grid between
+  Purchases and RCV, OR
+- (b) Fold tracking detail directly into the Active Purchases pane's
+  per-row expansion (it already renders `In Transit`/`shipments[]` data —
+  see `ActivePurchasesPanel.tsx` around line 27-37 — so the raw data is
+  already there, just not surfaced with the depth `TrackingBoardPanel`
+  gives it).
+Recommend (b) — a 4th pane makes the grid narrower per-column on an
+already-tight 3-column layout (`minmax(560px,1.4fr)_minmax(480px,1fr)_minmax(400px,0.9fr)`
+gap-2), and the shipment data central to tracking already flows through
+Active Purchases. Needs Bill's call before building either way.
+
+### 2. Receivings panel is not "slow," it's actually timing out — confirmed live
+
+`curl http://localhost:3001/api/dashboard/receivings` returned **zero
+bytes after a full 20-second timeout** — not a slow response, a hung one.
+PM2 error log confirms the exact mechanism:
+`[receivings] Finale getTodaysReceivedPOs failed/timeout: Finale
+receivings timeout (35s)`. This is the same `getTodaysReceivedPOs`
+function fixed for its internal fan-out in backlog item 5 (commit
+`d266043`'s predecessor work) — the concurrency cap on shipment lookups is
+correct and verified, but it's still timing out because a *separate*,
+still-open traffic source (product-lookup 429s from
+`getPurchasingIntelligence`, same one flagged in commit `2a8073b` and
+tracked as the still-open half of item 5) is saturating Finale's global
+rate limit budget during the same cold-start window, starving the
+receivings call entirely. **This is not a new bug — it's item 5's known
+residual issue, now confirmed to have a second, concrete, user-visible
+symptom** (empty RCV pane, not just slow Ordering panel).
+
+Additionally found a real UI copy bug independent of the timeout: the RCV
+pane header says **"WTD"** (week-to-date — `ReceivedItemsPanel.tsx` line
+633) but its empty-state message says **"No receipts in the last 30
+days"** (line 719) — the displayed time window label doesn't match the
+window described in the fallback copy. Even once the timeout is fixed,
+this mismatch will keep undermining trust in what the panel is actually
+showing. Cheap, independent fix — do it regardless of the timeout fix's
+timeline.
+
+### 3. Match indicators exist and are reasonably sophisticated — but only in ONE of two places, and inconsistently
+
+Two separate match-status signals exist in the live UI today:
+- **Active Purchases pane** (middle column): per-row `Invoice ✓` (green,
+  auto-applied) / `Invoice ±` (amber, pending approval/discrepancy) badges
+  — confirmed present and legible in a live screenshot. This one is
+  actually a good, glanceable indicator.
+- **RCV pane** (`ReceivedItemsPanel.tsx` ~line 1096-1165): a full
+  `POFlowStepper` with 3 steps (Received → Invoice → Complete) and 8+
+  branching states (auto-applied, pending-approval, matched-no-action,
+  discrepancy, partial-receipt, etc.) — genuinely thorough logic, but
+  rendered as small emoji-icon steps (`📦 📄 🔒`) buried inside each PO's
+  expanded row, not a glanceable badge like Active Purchases' `Invoice ✓`.
+  A user has to expand a row and parse a 3-step mini-stepper to learn
+  what Active Purchases tells them in one 2-character badge.
+
+**The inconsistency, not the absence, is the real problem.** Two different
+match-indicator visual languages for what is conceptually the same
+question ("does the invoice match this PO?") at two different points in
+the same lifecycle. Recommend: give RCV's stepper a summary-level badge
+(visible without expanding, same `✓`/`±`/`✗` visual language as Active
+Purchases) that reflects the stepper's overall state, and keep the
+detailed stepper as the expanded-row drill-in rather than the only signal.
+
+---
+
+
 
 `src/app/dashboard/page.tsx` still ships `LegacyDashboard()` — the old
 4-column drag-and-drop panel wall with its own resize handlers, its own
@@ -606,6 +701,10 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 13 | ✅ DONE — Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
 | 14 | ✅ DONE — Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | `src/components/dashboard/chips/` | M |
 | 15 | Fix 6 pre-existing failing tests in `PurchasingPanel.test.tsx` (vendor-cycle-lock, rounding-chevron, watch-item rendering) — blocks pre-commit hook on unrelated changes | `src/components/dashboard/PurchasingPanel.test.tsx` | M |
+| 16 | Decide + implement where Tracking Board fits in the Lifecycle flow (4th pane vs. fold into Active Purchases) — needs Bill's product call first | `CommandBoardShell.tsx` `PurchasingLifecyclePanel()`, `TrackingBoardPanel.tsx`, `ActivePurchasesPanel.tsx` | M (+ decision) |
+| 17 | Fix `/api/dashboard/receivings` hard timeout (confirmed live: 20s+ hang, zero bytes) — second concrete symptom of item 5's still-open residual 429 source | `src/app/api/dashboard/receivings/route.ts`, `src/lib/finale/receivings.ts` `getTodaysReceivedPOs` | M (shares root cause w/ item 5) |
+| 18 | Fix RCV panel header/copy mismatch: says "WTD" but empty-state says "last 30 days" | `ReceivedItemsPanel.tsx` L633 vs L719 | XS |
+| 19 | Give RCV's per-row match stepper a glanceable summary badge (like Active Purchases' `Invoice ✓`/`±`) instead of requiring row-expand to see match status | `ReceivedItemsPanel.tsx` L1096-1165 | S |
 
 **Status (2026-07-24) — item 14:** landed at commit `443450d`. Components,
 JSDoc, and README were correct as delivered. Oversight review caught one
