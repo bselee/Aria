@@ -2082,10 +2082,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // surface based on their own receipt velocity (primary signal),
                     // so build-ahead/contract FGs that never show retail sales still
                     // contribute via their components' historical purchasing.
-                    const prodData = await this.get(
-                        `/${this.accountPath}/api/product/${encodeURIComponent(sku)}`
-                    );
-                    const name: string = prodData.internalName || prodData.productId || sku;
+                    //
+                    // DECISION(2026-07-24): Reuse lookupProduct() (cache-first) for
+                    // the FG name instead of a second raw /api/product/<sku> call.
+                    // getBillOfMaterials() already fetched+cached this SKU's full
+                    // detail above, so this is now a cache hit, not a second
+                    // network round-trip — was doubling Finale traffic per FG SKU.
+                    const fgDetail = await this.lookupProduct(sku);
+                    const name: string = fgDetail?.name || sku;
                     fgVelocities.push({ sku, name, dailySalesRate, bom });
                 } catch (err: any) {
                     console.error(`[bom-demand] FG ${sku} failed:`, err.message);

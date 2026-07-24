@@ -18,6 +18,7 @@ import {
     isDoNotReorderHelper,
     normalizeFinaleReorderMethod,
 } from "./core-client";
+import { getFreshCachedSkus, upsertSkuCache, cachedRowToProductDetail } from "./finale-sku-cache";
 
 // Facility URL cache — module-level so it persists across FinaleClient instances.
 export interface FacilityInfo {
@@ -191,14 +192,38 @@ export class FinaleProductsClient extends FinaleCoreClient {
     /**
      * Look up a product by exact SKU and resolve all enrichment data.
      * Total API calls: 1 (product) + 1 per supplier to resolve names (cached).
+     *
+     * DECISION(2026-07-24): Checks the persistent `finale_sku_cache` (24h TTL)
+     * before hitting Finale. BOM/vendor/lead-time data is stale-safe for a
+     * day — recipes change roughly monthly — so this collapses ~700 calls/
+     * cycle down to only the SKUs that are missing or stale. Prevents the
+     * 429 storms observed on every cold PM2 restart. Pass `skipCache: true`
+     * for callers that need a guaranteed-live read (e.g. PO commit guards).
      */
-    async lookupProduct(sku: string): Promise<FinaleProductDetail | null> {
+    async lookupProduct(sku: string, opts?: { skipCache?: boolean }): Promise<FinaleProductDetail | null> {
+        const trimmedSku = sku.trim();
+
+        if (!opts?.skipCache) {
+            try {
+                const cached = await getFreshCachedSkus([trimmedSku]);
+                const row = cached.get(trimmedSku);
+                if (row) {
+                    const detail = cachedRowToProductDetail(row);
+                    if (detail) return detail;
+                }
+            } catch (cacheErr: any) {
+                console.warn(`[finale] lookupProduct: cache read failed for ${trimmedSku}, falling through to live fetch:`, cacheErr?.message || cacheErr);
+            }
+        }
+
         try {
-            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku.trim())}`);
+            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(trimmedSku)}`);
             const product = await this.parseProductDetail(data);
 
             // Check for committed POs containing this product (GraphQL)
-            product.openPOs = await (this as any).findCommittedPOsForProduct(sku.trim());
+            product.openPOs = await (this as any).findCommittedPOsForProduct(trimmedSku);
+
+            void upsertSkuCache(trimmedSku, product);
 
             return product;
         } catch (err: any) {
@@ -214,6 +239,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
                     if (synthetic) {
                         const product = await this.parseProductDetail(synthetic);
                         product.openPOs = await (this as any).findCommittedPOsForProduct(sku.trim());
+                        void upsertSkuCache(trimmedSku, product);
                         return product;
                     }
                 } catch (cacheErr: any) {
@@ -232,6 +258,12 @@ export class FinaleProductsClient extends FinaleCoreClient {
      * Skips already-cached SKUs. Fetches missing/expired SKUs in parallel via lookupProduct().
      * Extracts MAIN supplier's partyUrl → partyId + groupName.
      * Unresolvable SKUs produce { vendorName: 'Unknown Vendor', vendorPartyId: null }.
+     *
+     * DECISION(2026-07-24): Added a batched pre-check against the persistent
+     * `finale_sku_cache` (one query for all uncached SKUs) before falling
+     * through to per-SKU `lookupProduct()` calls. Collapses steady-state
+     * Finale traffic from ~700 calls/cycle to just the SKUs that are
+     * genuinely missing or >24h stale — the cause of the 2026-07-24 429 storm.
      */
     async lookupComponentVendorBatch(
         skus: string[],
@@ -239,7 +271,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
         const results = new Map<string, { vendorName: string; vendorPartyId: string | null }>();
         const now = Date.now();
 
-        // Separate cached (fresh) vs uncached/expired SKUs
+        // Separate cached (fresh) vs uncached/expired SKUs (in-memory 4h cache first)
         const uncachedSkus: string[] = [];
         for (const sku of skus) {
             const cached = _vendorCache.get(sku);
@@ -250,9 +282,35 @@ export class FinaleProductsClient extends FinaleCoreClient {
             }
         }
 
-        if (uncachedSkus.length > 0) {
+        if (uncachedSkus.length === 0) return results;
+
+        // Batched persistent-cache pre-check — one query instead of N.
+        let stillUncached = uncachedSkus;
+        try {
+            const persisted = await getFreshCachedSkus(uncachedSkus);
+            if (persisted.size > 0) {
+                stillUncached = [];
+                for (const sku of uncachedSkus) {
+                    const row = persisted.get(sku);
+                    const detail = row ? cachedRowToProductDetail(row) : null;
+                    if (detail) {
+                        const main = detail.suppliers.find(s => s.role === 'MAIN') ?? detail.suppliers[0];
+                        const vendorName = main?.name || 'Unknown Vendor';
+                        const partyId = main?.partyUrl ? main.partyUrl.split('/').pop() ?? null : null;
+                        _vendorCache.set(sku, { vendorName, vendorPartyId: partyId, ts: now });
+                        results.set(sku, { vendorName, vendorPartyId: partyId });
+                    } else {
+                        stillUncached.push(sku);
+                    }
+                }
+            }
+        } catch (err: any) {
+            console.warn('[finale] lookupComponentVendorBatch: persistent cache batch-read failed, falling through to live fetch:', err?.message || err);
+        }
+
+        if (stillUncached.length > 0) {
             await Promise.allSettled(
-                uncachedSkus.map(async (sku) => {
+                stillUncached.map(async (sku) => {
                     try {
                         const product = await this.lookupProduct(sku);
                         if (!product || product.suppliers.length === 0) {
@@ -275,6 +333,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
 
         return results;
     }
+
 
     async validateProductExists(sku: string): Promise<boolean> {
         const trimmed = sku.trim();
@@ -848,24 +907,51 @@ export class FinaleProductsClient extends FinaleCoreClient {
     /**
      * Retrieve the Bill of Materials (BOM) for a given product.
      * Returns a list of required component SKUs and the quantity needed per 1 unit of the finished product.
+     *
+     * DECISION(2026-07-24): Checks the persistent `finale_sku_cache` (24h TTL)
+     * before hitting Finale. BOM recipes change roughly monthly, not per
+     * scan — this was the single largest source of the 2026-07-24 429 storm
+     * (getBOMDemand calls this once per active SKU on every cold scan, with
+     * a second raw /api/product/<sku> call right after for the FG name).
      */
     async getBillOfMaterials(productId: string): Promise<Array<{ componentSku: string; quantity: number }>> {
+        const trimmedSku = productId.trim();
+
         try {
-            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(productId)}`);
+            const cached = await getFreshCachedSkus([trimmedSku]);
+            const row = cached.get(trimmedSku);
+            if (row) {
+                // bom_components is null for confirmed-no-BOM SKUs (cached as
+                // such) vs. undefined/missing row = never checked.
+                return row.bom_components ?? [];
+            }
+        } catch (cacheErr: any) {
+            console.warn(`[finale] getBillOfMaterials: cache read failed for ${trimmedSku}, falling through to live fetch:`, cacheErr?.message || cacheErr);
+        }
 
-            if (!data.productAssocList || !Array.isArray(data.productAssocList)) {
-                return [];
+        try {
+            const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(trimmedSku)}`);
+
+            let bom: Array<{ componentSku: string; quantity: number }> = [];
+            if (data.productAssocList && Array.isArray(data.productAssocList)) {
+                const manufAssoc = data.productAssocList.find((a: any) => a.productAssocTypeId === "MANUF_COMPONENT");
+                if (manufAssoc && manufAssoc.productAssocItemList) {
+                    bom = manufAssoc.productAssocItemList.map((item: any) => ({
+                        componentSku: item.productId || "",
+                        quantity: item.quantity || 0
+                    })).filter((c: any) => c.componentSku && c.quantity > 0);
+                }
             }
 
-            const manufAssoc = data.productAssocList.find((a: any) => a.productAssocTypeId === "MANUF_COMPONENT");
-            if (!manufAssoc || !manufAssoc.productAssocItemList) {
-                return [];
-            }
+            // Cache the full product detail + BOM together so getBOMDemand's
+            // follow-up name lookup can hit the cache instead of firing a
+            // second raw request for the same SKU.
+            try {
+                const detail = await this.parseProductDetail(data);
+                void upsertSkuCache(trimmedSku, detail, bom.length > 0 ? bom : null);
+            } catch { /* caching is best-effort; never block BOM callers on it */ }
 
-            return manufAssoc.productAssocItemList.map((item: any) => ({
-                componentSku: item.productId || "",
-                quantity: item.quantity || 0
-            })).filter((c: any) => c.componentSku && c.quantity > 0);
+            return bom;
 
         } catch (err: any) {
             // 404 is the expected outcome for any product without a BOM (most

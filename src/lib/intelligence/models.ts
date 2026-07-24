@@ -95,18 +95,17 @@ export const OPENROUTER_CHAT_CHAIN = [
  * Free tiers are rate-limited; the cascade falls through to paid Haiku if
  * 429s exhaust the free quota. Models proven viable for JSON via Zod
  * schemas in early 2026 — adjust this list when OpenRouter rotates them.
+ *
+ * DECISION(2026-07-24): Removed 'openrouter/free' (the Free Models Router).
+ * It only succeeded ~30-50% of the time ("No object generated: could not
+ * parse the response"), and every failure still burned a full request
+ * before falling through to DeepSeek. During the 2026-07-23 heavy-use day
+ * the free tier's own daily quota was exhausted, so nearly every call paid
+ * for two round-trips (failed free attempt + DeepSeek) instead of one.
+ * DeepSeek V4 Flash ($0.14/M) alone is cheaper than that failure tax and
+ * has proven reliable — lead with it directly.
  */
 export const OPENROUTER_FREE_CHAIN = [
-    // DECISION(2026-04-28): `openrouter/free` is OpenRouter's "Free Models
-    // Router" that auto-picks an available free model per call. Resilient to
-    // upstream rotations (no slug rot to chase). Often rate-limited but
-    // succeeds ~30-50% of the time — worth trying before paying.
-    { name: 'OpenRouter Free Router', slug: 'openrouter/free' },
-    // KAIZEN(2026-06-04): Removed 5 dead free models (Qwen3 80B, MiniMax M2.5,
-    // Gemma 4 31B, Llama 3.3 70B, Nemotron — all "Provider returned error")
-    // and a failed Phi-4 free slug ("No endpoints found"). Free-tier models
-    // are too volatile to pin. Jump directly to DeepSeek V4 Flash ($0.14/M)
-    // when the meta-router fails — cheaper than 2+ failed attempts.
     { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },
 ] as const;
 
