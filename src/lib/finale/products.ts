@@ -1138,6 +1138,7 @@ export class FinaleProductsClient extends FinaleCoreClient {
             hasBOM,
             doNotReorder: FinaleProductsClient.isDoNotReorder(data),
             reorderMethod: normalizeFinaleReorderMethod(data),
+            orderIncrementQuantity: data.orderIncrementQuantity != null ? Number(data.orderIncrementQuantity) : null,
             finaleUrl: data.productUrl || "",
             openPOs: [],  // Populated later by lookupProduct()
         };

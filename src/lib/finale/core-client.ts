@@ -44,6 +44,7 @@ export interface FinaleProductDetail {
     hasBOM: boolean;
     doNotReorder: boolean;         // Finale ROM = "Do not reorder" or category = "Deprecating"
     reorderMethod?: FinaleReorderMethod;
+    orderIncrementQuantity: number | null;  // "Std reorder in qty of" — snap suggested qty to this multiple
     finaleUrl: string;
     openPOs: POInfo[];             // Committed POs containing this product
 }

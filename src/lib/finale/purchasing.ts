@@ -41,6 +41,7 @@ import {
     _skuHasNoBomCache,
     _bomComponent404Cache,
 } from "./products";
+import { getFreshCachedSkus, upsertSkuCache, cachedRowToProductDetail } from "./finale-sku-cache";
 import {
     type FinaleReorderMethod,
     parseFinaleNumber,
@@ -2701,9 +2702,50 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 const candidate = queue.shift()!;
                 const sku = candidate.productId;
                 try {
-                    // Step A: REST product data first — need supplier URL to check exclusions
-                    // before spending any GraphQL calls on manufactured/dropship vendors.
-                    const prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                    // Step A: REST product data — cached via finale_sku_cache (24h TTL)
+                    // DECISION(2026-07-24): The persistent cache prevents ~700 per-SKU
+                    // /api/product/<sku> GETs on cold start from saturating Finale's rate
+                    // limiter and starving the receivings path. Same cache table used by
+                    // BOM/lookupProduct() — shared, not a new parallel cache.
+                    // Fields that change hourly (stockLevel, quantityOnHand) are NOT cached
+                    // — they fall through to GraphQL in Step C.
+                    let prodData: any;
+                    let _cachedCtx: FinaleProductDetail | null = null;
+                    try {
+                        const cached = await getFreshCachedSkus([sku]);
+                        const row = cached.get(sku);
+                        if (row) {
+                            const detail = cachedRowToProductDetail(row);
+                            if (detail) {
+                                // Reconstruct a prodData-shaped object from cached detail
+                                const suppliers = (detail.suppliers || []).map((s: SupplierInfo) => ({
+                                    supplierPartyUrl: s.partyUrl,
+                                    supplierPrefOrderId: s.role === 'MAIN' ? 'MAIN' : s.role,
+                                    price: s.cost,
+                                }));
+                                prodData = {
+                                    supplierList: suppliers,
+                                    internalName: detail.name,
+                                    productId: detail.productId,
+                                    leadTime: detail.leadTimeDays,
+                                    orderIncrementQuantity: detail.orderIncrementQuantity,
+                                    doNotReorder: detail.doNotReorder,
+                                };
+                                _cachedCtx = detail;
+                            }
+                        }
+                    } catch (cacheErr: any) {
+                        console.warn(`[finale] getPurchasingIntelligence: cache read failed for ${sku}, falling through to live API:`, cacheErr?.message || cacheErr);
+                    }
+
+                    if (!prodData) {
+                        // Live fallback — also warms the cache for next cycle
+                        prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                        // Fire-and-forget cache write (typed columns + raw_detail)
+                        const detail = await this.parseProductDetail(prodData).catch(() => null);
+                        if (detail) void upsertSkuCache(sku, detail);
+                    }
+
                     const suppliers: any[] = prodData.supplierList || [];
                     const mainSupplier = suppliers.find(s => s.supplierPrefOrderId?.includes('MAIN')) || suppliers[0];
                     if (!mainSupplier?.supplierPartyUrl) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: no supplierPartyUrl`); continue; }
@@ -2714,7 +2756,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     if (party.isManufactured || party.isDropship) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: mfg/dropship`); continue; }
 
                     // Skip products flagged "Do not reorder" in Finale
-                    if (FinaleProductsClient.isDoNotReorder(prodData)) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: DNR`); continue; }
+                    if (_cachedCtx ? _cachedCtx.doNotReorder : FinaleProductsClient.isDoNotReorder(prodData)) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: DNR`); continue; }
 
                     // Step C: Single combined GraphQL request — purchase history + sales history + open POs
                     const activity = await this.getProductActivity(sku, daysBack);

@@ -34,6 +34,36 @@ export function getDenverWeekStart(date: Date): string {
 }
 
 export async function GET(req: NextRequest) {
+    // ── Outer guard: the route MUST NEVER hang the socket ──
+    // If the handler doesn't resolve within 25s (including Finale timeout),
+    // return a graceful error payload instead of a hung connection.
+    const ROUTE_TIMEOUT_MS = 25_000;
+    try {
+        const payload = await Promise.race([
+            handleGET(req),
+            new Promise<NextResponse>((_, reject) =>
+                setTimeout(() => reject(new Error('Receivings route timed out (25s)')), ROUTE_TIMEOUT_MS),
+            ),
+        ]);
+        return payload;
+    } catch (outerErr: any) {
+        console.warn('[receivings] Route guard caught hang — returning graceful error:', outerErr?.message || outerErr);
+        return NextResponse.json({
+            error: 'finale_timeout',
+            message: 'Receivings data temporarily unavailable — Finale rate-limited',
+            received: [],
+            days: 30,
+            range: 'error',
+            startDate: '',
+            asOf: new Date().toLocaleDateString('en-CA', { timeZone: 'America/Denver' }),
+            matchSuggestions: [],
+            freightClasses: {},
+            recentAutoCompletions: [],
+        });
+    }
+}
+
+async function handleGET(req: NextRequest): Promise<NextResponse> {
     try {
         const { searchParams } = new URL(req.url);
         const daysParam = searchParams.get('days');
@@ -61,13 +91,20 @@ export async function GET(req: NextRequest) {
         const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 
         const finale = new FinaleClient();
-        // Finale receivings can hang 60s+ under load — fail open so the panel paints
+        // Finale receivings can hang 60s+ under load — fail open so the panel paints.
+        // NOTE(2026-07-24): dropped from 20s -> 8s. Under a cold-start rate-limit
+        // storm, 20s is a guaranteed near-certain failure — the user was waiting
+        // out a foregone conclusion before the graceful empty-array fallback (and
+        // the outer route guard's 25s socket-safety net) ever kicked in. 8s is
+        // still generous for a healthy Finale response but stops making every
+        // page load eat a 20-second tax during the known-flaky cold-start window
+        // (see docs/dashboard-design-audit.md P0-3 / P1-3 — item 5 residual).
         let received: any[] = [];
         try {
             received = await Promise.race([
                 finale.getTodaysReceivedPOs(startStr, tomorrowStr),
                 new Promise<any[]>((_, reject) =>
-                    setTimeout(() => reject(new Error('Finale receivings timeout (35s)')), 35_000),
+                    setTimeout(() => reject(new Error('Finale receivings timeout (8s)')), 8_000),
                 ),
             ]);
         } catch (finaleErr: any) {
