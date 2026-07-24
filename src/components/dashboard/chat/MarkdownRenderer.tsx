@@ -36,12 +36,12 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
     <div className="relative group my-2 rounded-lg overflow-hidden border border-gray-700 bg-gray-950">
       <div className="flex items-center justify-between px-3 py-1.5 bg-gray-900 border-b border-gray-700">
-        <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-mono">
+        <span className="text-[10px] text-dash-l3 uppercase tracking-wider font-mono">
           {language || "code"}
         </span>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] text-zinc-400 hover:text-zinc-200 transition-colors"
+          className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] text-dash-l2 hover:text-zinc-200 transition-colors"
           title="Copy code"
         >
           {copied ? <Check size={10} className="text-green-400" /> : <Copy size={10} />}

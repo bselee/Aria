@@ -31,6 +31,39 @@ import {
     type POInfo,
 } from "./core-client";
 
+// ── Concurrency-limited async map ────────────────────────────────────────
+/**
+ * Maps an array with a bounded number of concurrent async operations.
+ * Preserves input order. Replaces unbounded Promise.all(arr.map(fn))
+ * which fans out N requests at once.
+ */
+async function mapConcurrent<T, R>(
+    items: T[],
+    concurrency: number,
+    fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+
+    async function worker(): Promise<void> {
+        while (nextIndex < items.length) {
+            const i = nextIndex++;
+            results[i] = await fn(items[i]);
+        }
+    }
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+    await Promise.all(workers);
+    return results;
+}
+
+// ── Shipment detail cache (module-level, survives across invocations) ────
+// Keyed by raw shipmentId, TTL ~5 minutes — prevents re-fetching the same
+// shipment detail on every 30s dashboard poll. The cache is module-scoped
+// so it persists across calls within the same Node process (PM2 / Next.js).
+const _shipmentDetailCache = new Map<string, { data: any; fetchedAt: number }>();
+const SHIPMENT_CACHE_TTL_MS = 5 * 60 * 1_000; // 5 minutes
+
 export class FinaleReceivingsClient extends FinalePurchasingClient {
     constructor() {
         super();
@@ -112,27 +145,55 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
             const receivedOrderIds = new Set(received.map((po) => po.orderId));
             const shipmentDetailsByOrderId: Record<string, any[]> = {};
-            await Promise.all(edges.map(async (edge: any) => {
-                const po = edge.node;
-                if (!receivedOrderIds.has(po?.orderId)) return;
 
+            // Build a flat list of (orderId, shipmentId, url) tuples.
+            // Flattening means we can apply a single concurrency cap across ALL
+            // shipment fetches instead of per-PO caps, which is the actual fix for
+            // the N-per-PO × M-POs = N*M simultaneous request storm (P0-3).
+            const shipmentTasks: Array<{ orderId: string; shipmentId: string; url: string }> = [];
+            for (const edge of edges) {
+                const po = edge.node;
+                if (!receivedOrderIds.has(po?.orderId)) continue;
                 const allShipmentIds = (po.shipmentList || [])
                     .map((shipment: any) => String(shipment?.shipmentId || ""))
                     .filter(Boolean);
                 // shipmentUrlList was removed from Finale GraphQL schema (2026-06-22).
                 // Always construct URLs from shipmentList[].shipmentId.
-                const urls: string[] = allShipmentIds.map((shipmentId) => `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`);
+                for (const shipmentId of allShipmentIds) {
+                    shipmentTasks.push({
+                        orderId: po.orderId,
+                        shipmentId,
+                        url: `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`,
+                    });
+                }
+            }
 
-                const details = await Promise.all(urls.map(async (url) => {
-                    try {
-                        return await this.getShipmentDetails(url);
-                    } catch {
-                        return null;
-                    }
-                }));
+            // Fetch with concurrency cap (8 in-flight) + short-TTL cache (5 min).
+            // Before: unbounded Promise.all fired N simultaneous GET /api/shipment/{id}
+            // requests, triggering a 429 rate-limit storm on every dashboard poll.
+            const CONCURRENCY = 8;
+            const fetchedShipments = await mapConcurrent(shipmentTasks, CONCURRENCY, async (task) => {
+                const cached = _shipmentDetailCache.get(task.shipmentId);
+                if (cached && Date.now() - cached.fetchedAt < SHIPMENT_CACHE_TTL_MS) {
+                    return { orderId: task.orderId, data: cached.data };
+                }
+                try {
+                    const data = await this.getShipmentDetails(task.url);
+                    _shipmentDetailCache.set(task.shipmentId, { data, fetchedAt: Date.now() });
+                    return { orderId: task.orderId, data };
+                } catch {
+                    return { orderId: task.orderId, data: null };
+                }
+            });
 
-                shipmentDetailsByOrderId[po.orderId] = details.filter(Boolean);
-            }));
+            // Group by orderId — preserves the exact shape downstream code expects
+            for (const result of fetchedShipments) {
+                if (!result.data) continue;
+                if (!shipmentDetailsByOrderId[result.orderId]) {
+                    shipmentDetailsByOrderId[result.orderId] = [];
+                }
+                shipmentDetailsByOrderId[result.orderId].push(result.data);
+            }
 
             return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId, today, tomorrowStr);
         } catch (err: any) {

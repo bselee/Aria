@@ -23,6 +23,7 @@ import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
 import AxiomSkuMappingPanel from "./AxiomSkuMappingPanel";
 import KanbanBoard from "@/components/dashboard/KanbanBoard";
 import { PANEL_BY_ID } from "./panelRegistry";
+import { PanelErrorBoundary } from "./PanelErrorBoundary";
 import type { PanelId } from "./useDashboardLayout";
 import type {
     CommandBoardAgent,
@@ -76,17 +77,23 @@ function PurchasingLifecyclePanel() {
                 >
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
                 <div className="h-full min-h-0 overflow-hidden">
-                    <PurchasingPanel />
+                    <PanelErrorBoundary label="PurchasingPanel">
+                        <PurchasingPanel />
+                    </PanelErrorBoundary>
                 </div>
             </section>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-purchases">
                 <div className="h-full min-h-0 overflow-hidden">
-                    <ActivePurchasesPanel />
+                    <PanelErrorBoundary label="ActivePurchasesPanel">
+                        <ActivePurchasesPanel />
+                    </PanelErrorBoundary>
                 </div>
             </section>
             <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-rcv">
                 <div className="h-full min-h-0 overflow-hidden">
-                    <ReceivedItemsPanel />
+                    <PanelErrorBoundary label="ReceivedItemsPanel">
+                        <ReceivedItemsPanel />
+                    </PanelErrorBoundary>
                 </div>
             </section>
                 </div>
@@ -127,14 +134,17 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
 
     const aborterRef = useRef<AbortController | null>(null);
 
-    // Restore last tab from localStorage
+    // Restore last tab from localStorage — validated against known tab ids
+    // to prevent re-landing on a tab that previously crashed.
     useEffect(() => {
         if (typeof window === "undefined") return;
         try {
             const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
             const RETIRED = new Set(["ops", "ordering", "purchases", "rcv", "build-schedule", "tasks", "oversight", "blocking"]);
+            const VALID_TABS: TabId[] = ["lifecycle", "builds", "axiom-skus", "kanban", "activity"];
             if (saved && RETIRED.has(saved)) setActiveTab("lifecycle");
-            else if (saved) setActiveTab(saved as TabId);
+            else if (saved && VALID_TABS.includes(saved as TabId)) setActiveTab(saved as TabId);
+            else setActiveTab("lifecycle");
         } catch { /* ignore */ }
     }, []);
 
@@ -188,7 +198,11 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
 
     // Map tabs → render functions. Reuses existing panels by id.
     const panelById = useCallback(
-        (id: PanelId) => PANEL_BY_ID[id]?.render() ?? <div className="p-4 text-zinc-500">panel missing: {id}</div>,
+        (id: PanelId) => (
+            <PanelErrorBoundary label={PANEL_BY_ID[id]?.label ?? id}>
+                {PANEL_BY_ID[id]?.render() ?? <div className="p-4 text-zinc-500">panel missing: {id}</div>}
+            </PanelErrorBoundary>
+        ),
         [],
     );
 
@@ -334,7 +348,9 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                                 className={`h-full overflow-hidden ${isActive ? "block" : "hidden"}`}
                                 aria-hidden={!isActive}
                             >
-                                {tab.render()}
+                                <PanelErrorBoundary label={tab.label}>
+                                    {tab.render()}
+                                </PanelErrorBoundary>
                             </div>
                         );
                     })}
