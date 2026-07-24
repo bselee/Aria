@@ -782,8 +782,27 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 21 | ✅ DONE — Fold Tracking Board depth into Active Purchases (stages + exception visibility + per-row shipment detail) | `ActivePurchasesPanel.tsx` | M |
 | 22 | 3-way match UI (PO × Receipt × Invoice side-by-side) built ON TOP of the po-ledger endpoint — do this next, now that the spine (item 20) exists | new component, likely inside `ActivePurchasesPanel.tsx`'s RECEIVED-stage row expansion | M |
 | 23 | Delete orphaned `TrackingBoardPanel.tsx` + legacy dashboard (`LegacyDashboard()` in `page.tsx`) now that item 16/21 supersedes it — deliberately deferred, not done in items 20/21's commits | `TrackingBoardPanel.tsx`, `page.tsx` | S |
-| 24 | Port `inferPONumberFromRecentPOs()` from dead `tracking-agent.ts` into live `email-tracking-ingest.ts` as a fallback when in-text PO regex finds nothing — fixes the 55%-orphaned shipment-linkage gap (P0-4) | `src/lib/tracking/email-tracking-ingest.ts`, reference: `src/lib/intelligence/tracking-agent.ts` `inferPONumberFromRecentPOs` | M |
+| 24 | ✅ DONE — Port `inferPONumberFromRecentPOs()` from dead `tracking-agent.ts` into live `email-tracking-ingest.ts` as a fallback when in-text PO regex finds nothing — fixes the 55%-orphaned shipment-linkage gap (P0-4) | `src/lib/tracking/email-tracking-ingest.ts`, reference: `src/lib/intelligence/tracking-agent.ts` `inferPONumberFromRecentPOs` | M |
 | 25 | Decide fate of dead `TrackingAgent` class (`tracking-agent.ts`) — delete entirely, or extract its still-useful pieces (PDF attachment parsing, LLM LTL extraction) into the live `email-tracking-ingest.ts` path and then delete | `src/lib/intelligence/tracking-agent.ts`, `ops-manager.ts` | S (+ decision) |
+
+**Status (2026-07-24) — item 24:** landed at commit `28a1de7`. The
+vendor-inference fallback is wired correctly (only fires when in-text
+regex finds nothing, never overrides a real match) with tiered confidence
+(0.90 direct / 0.60 inferred / 0.80 no-PO) and traceable via the existing
+`source`/`source_confidence` columns — no new schema needed. Oversight
+caught and fixed two real issues before commit: (1) the subagent's
+tsconfig-deletion workaround for a pre-existing (unrelated) vitest bug
+was left in a dangerous half-finished state — restored immediately,
+verified byte-identical, documented the safe workaround pattern as a
+skill reference so it doesn't recur; (2) a fabricated GitHub issue URL in
+an attribution comment was removed. Completed the live-data verification
+step the subagent's own report flagged as still pending: ran the ported
+inference against the actual real orphaned FedEx email (tracking
+874718364184) with real `purchase_orders` data — it correctly returned
+`null` (that email has zero vendor identity in its text, so no confident
+match should exist), confirming the fallback is both functional and
+appropriately conservative rather than over-eager. 11/11 unit tests
+verified passing independently, not just from the subagent's self-report.
 
 **Status (2026-07-24) — items 17/18/20/21:** all landed and independently
 verified live (not just subagent self-report):
