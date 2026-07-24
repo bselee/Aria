@@ -599,7 +599,79 @@ detailed stepper as the expanded-row drill-in rather than the only signal.
 
 ---
 
+## P0-4: Tracking/invoice ACQUISITION gap — the real bottleneck (Bill: "acquisition is the most difficult part")
 
+Bill's framing (2026-07-24): "We need to grab or access the tracking...
+acquisition is the most difficult part. Getting real data from invoices
+and email strings, WELL documented." Traced end-to-end with live Gmail
+queries and direct Postgres inspection — not assumed. Two acquisition
+pipelines exist; one (invoices) is healthy, the other (tracking) has a
+precise, fixable correlation gap.
+
+### Invoice acquisition: healthy, not the bottleneck
+
+`ap-polling` and `invoice-po-auto-match` cron jobs are both live and
+firing on schedule. `vendor_invoices` (994 rows) and the ledger VIEW
+(item 20) both show fresh same-day data. This side is NOT where the
+problem is — confirmed, not assumed, via the item-20 audit's own table
+row counts and date ranges.
+
+### Tracking acquisition: TWO pipelines exist, only one is live, and the live one has a real correlation gap
+
+**Dead code found:** `src/lib/intelligence/tracking-agent.ts`
+(`TrackingAgent.processUnreadEmails()`) — a genuinely sophisticated
+extractor (PDF attachment parsing, LLM-based LTL/freight extraction,
+`inferPONumberFromRecentPOs()` vendor-name-token + numeric-hint fallback
+correlation) — is instantiated in `ops-manager.ts`
+(`this.trackingAgent = new TrackingAgent()`) but **no method on it is
+ever called anywhere in the codebase** (confirmed via
+`grep -rn "this.trackingAgent\."` — zero results). It has never run.
+
+**Live pipeline:** `src/lib/tracking/email-tracking-ingest.ts`
+(`runEmailTrackingIngest`), cron `email-tracking-ingest` (`15 */2 * * *`,
+confirmed firing via PM2 logs every 2h). This is the actual acquisition
+path. Ran a live diagnostic against real Gmail (not assumed):
+- The Gmail search (`newer_than:2d` + shipping/tracking keyword OR-clause)
+  genuinely works — 25 matches on `default`, 4 on `ap`, including a real
+  live FedEx tracking-update email (`874718364184`) sitting right in the
+  result set.
+- That FedEx tracking number IS correctly extracted and upserted into
+  `shipments` (confirmed via direct Postgres query, `created_at` today) —
+  extraction and carrier detection are NOT broken.
+- **But `po_numbers: []` for that row.** Queried the full `shipments`
+  table: **36 of 65 rows (55%) have zero PO linkage** — the majority
+  failure mode, not an edge case. Overwhelmingly carrier auto-notification
+  emails (FedEx/UPS/USPS "your package shipped/delivered" system emails)
+  — these emails, by nature, never contain a BuildASoil PO number in their
+  text (the carrier only knows its own tracking ID, not the customer's PO
+  reference). `extractPONumbersFromText()` in `email-tracking-ingest.ts`
+  is pure in-text regex with **zero fallback correlation** — confirmed via
+  `grep` for `inferPONumberFromRecentPOs`/vendor-correlation logic in that
+  file: zero hits. `po_shipment_legs` (a plausible secondary correlation
+  source) is empty (0 rows) — not being used by anything currently.
+- The 29 rows that DID get linked correctly are (by inspection) vendor
+  reply emails that happened to quote the PO number in text — i.e. the
+  regex path works when a human vendor writes "shipped your PO #124605",
+  it just can't work on a bare system-generated carrier notification.
+
+**The fix is a port, not new logic.** The dead `tracking-agent.ts` already
+contains `inferPONumberFromRecentPOs()` — a working scored-match algorithm
+(vendor-name tokens + numeric hints against `purchase_orders` created in
+the last 7 days) that was built for exactly this problem and never wired
+up. Recommend: port that function (or an equivalent, tightened to only
+fire for the *no-PO-found-in-text* case, never overriding a real in-text
+match) into `email-tracking-ingest.ts`'s `processMessage()` as a fallback
+step when `extractPONumbersFromText()` returns empty. Needs a confidence
+floor + a "linked via vendor-inference, needs confirmation" flag in the
+UI (the existing `source_confidence` column on `shipments` already
+supports this) rather than silently asserting a PO link that could be
+wrong — carrier emails carry a "ship-to name" or return address in some
+formats that could raise confidence further, worth checking case-by-case
+during implementation.
+
+---
+
+## ⚪ P3-1: Dead legacy dashboard code
 
 `src/app/dashboard/page.tsx` still ships `LegacyDashboard()` — the old
 4-column drag-and-drop panel wall with its own resize handlers, its own
@@ -610,6 +682,7 @@ detailed stepper as the expanded-row drill-in rather than the only signal.
 This is ~280 lines of parallel dead-but-compiled code that every future
 dashboard change has to visually scan past and reason about ("is this the
 file that's live?").
+
 
 **Recommendation:** if there's no near-term rollback scenario planned,
 delete `LegacyDashboard()` and its dedicated bits
@@ -709,6 +782,8 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 21 | ✅ DONE — Fold Tracking Board depth into Active Purchases (stages + exception visibility + per-row shipment detail) | `ActivePurchasesPanel.tsx` | M |
 | 22 | 3-way match UI (PO × Receipt × Invoice side-by-side) built ON TOP of the po-ledger endpoint — do this next, now that the spine (item 20) exists | new component, likely inside `ActivePurchasesPanel.tsx`'s RECEIVED-stage row expansion | M |
 | 23 | Delete orphaned `TrackingBoardPanel.tsx` + legacy dashboard (`LegacyDashboard()` in `page.tsx`) now that item 16/21 supersedes it — deliberately deferred, not done in items 20/21's commits | `TrackingBoardPanel.tsx`, `page.tsx` | S |
+| 24 | Port `inferPONumberFromRecentPOs()` from dead `tracking-agent.ts` into live `email-tracking-ingest.ts` as a fallback when in-text PO regex finds nothing — fixes the 55%-orphaned shipment-linkage gap (P0-4) | `src/lib/tracking/email-tracking-ingest.ts`, reference: `src/lib/intelligence/tracking-agent.ts` `inferPONumberFromRecentPOs` | M |
+| 25 | Decide fate of dead `TrackingAgent` class (`tracking-agent.ts`) — delete entirely, or extract its still-useful pieces (PDF attachment parsing, LLM LTL extraction) into the live `email-tracking-ingest.ts` path and then delete | `src/lib/intelligence/tracking-agent.ts`, `ops-manager.ts` | S (+ decision) |
 
 **Status (2026-07-24) — items 17/18/20/21:** all landed and independently
 verified live (not just subagent self-report):
