@@ -130,6 +130,81 @@ function timeAgo(iso: string) {
     return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
 }
 
+type LifecycleStage = "SENT" | "IN_TRANSIT" | "DELIVERED" | "RECEIVED";
+
+/**
+ * Derive a unified lifecycle stage for a PO purely from data already on
+ * the ActivePurchase payload. No extra API calls.
+ *
+ * Stages — monotonic:
+ *   SENT       → sentVerification.verified, no shipments yet
+ *   IN_TRANSIT → shipments exist (confirmed), none fully delivered
+ *   DELIVERED  → all confirmed shipments delivered, but isReceived=false
+ *   RECEIVED   → isReceived=true
+ *
+ * Edge cases handled:
+ *   - PO with zero shipments + unverified send → null (no stage)
+ *   - PO with candidate-only shipments (no confirmed evidence) → falls
+ *     through to SENT (or null if send unverified)
+ *   - PO with mixed delivered + in-transit → IN_TRANSIT (not all delivered)
+ */
+function deriveStage(po: ActivePurchase): LifecycleStage | null {
+    if (po.isReceived) return "RECEIVED";
+    const confirmed = (po.shipments || []).filter((s) => s.evidenceLevel === "confirmed");
+    if (confirmed.length > 0) {
+        const allDelivered = confirmed.every((s) =>
+            s.status_display?.toLowerCase().includes("delivered")
+        );
+        if (allDelivered) return "DELIVERED";
+        return "IN_TRANSIT";
+    }
+    // Candidate-only shipments count as in-transit for visibility
+    if ((po.shipments || []).length > 0) return "IN_TRANSIT";
+    if ((po.trackingNumbers?.length || 0) > 0) return "IN_TRANSIT";
+    if (po.sentVerification?.verified) return "SENT";
+    return null;
+}
+
+/**
+ * Check if a PO has any shipment-level exception that should flash at the
+ * collapsed row level. Exception statuses: exception, failed, return,
+ * held, delay.
+ */
+function hasShipmentException(po: ActivePurchase): boolean {
+    return (po.shipments || []).some((s) => {
+        const st = (s.status_display || "").toLowerCase();
+        return /exception|failed|return|held|delay/.test(st);
+    });
+}
+
+/**
+ * Check if ALL of a PO's non-delivered shipments are stale (last_checked_at
+ * > 24 hours ago). Delivered shipments are excluded from staleness check
+ * since they're already terminal.
+ */
+function allShipmentsStale(po: ActivePurchase): boolean {
+    const shipments = po.shipments || [];
+    if (shipments.length === 0) return false;
+    const now = Date.now();
+    const nonDelivered = shipments.filter(
+        (s) => !s.status_display?.toLowerCase().includes("delivered")
+    );
+    if (nonDelivered.length === 0) return false;
+    return nonDelivered.every((s) => {
+        if (!s.last_checked_at) return true; // never checked = stale
+        const checked = new Date(s.last_checked_at).getTime();
+        if (isNaN(checked)) return true;
+        return now - checked > 24 * 3600 * 1000;
+    });
+}
+
+function freshnessLabel(minutes: number | null | undefined): string {
+    if (minutes == null) return "freshness unknown";
+    if (minutes < 60) return `fresh ${minutes}m ago`;
+    if (minutes < 24 * 60) return `fresh ${Math.round(minutes / 60)}h ago`;
+    return `fresh ${Math.round(minutes / (24 * 60))}d ago`;
+}
+
 export default function ActivePurchasesPanel() {
     const lifecycle = usePurchasingLifecycle();
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
@@ -151,6 +226,7 @@ export default function ActivePurchasesPanel() {
     const [pokeBody, setPokeBody] = useState("");
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [filterOverdue, setFilterOverdue] = useState(false);
+    const [filterStage, setFilterStage] = useState<LifecycleStage | null>(null);
     const [editingEta, setEditingEta] = useState<string | null>(null);
     const [etaSaving, setEtaSaving] = useState<string | null>(null);
     const [expandedPOs, setExpandedPOs] = useState<Set<string>>(new Set());
@@ -534,6 +610,7 @@ export default function ActivePurchasesPanel() {
     const visiblePurchases = purchases
         .filter((po) => !dismissed.has(po.orderId))
         .filter((po) => !filterOverdue || isOverdue(po))
+        .filter((po) => !filterStage || deriveStage(po) === filterStage)
         .sort((a, b) => {
             // Received → bottom (most recent at top of the received pile)
             if (a.isReceived !== b.isReceived) return a.isReceived ? 1 : -1;
@@ -656,6 +733,39 @@ export default function ActivePurchasesPanel() {
                                                 )}
                                                 {purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length > 0 && (
                                                     <StatusBadge label={`${purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length} In Transit`} tone="cyan" />
+                                                )}
+                                            </div>
+                                        )}
+                                        {/* ── Stage FilterChips Row ── */}
+                                        {!loading && !error && purchases.length > 0 && (
+                                            <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
+                                                <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 mr-1">Stage:</span>
+                                                {(["SENT", "IN_TRANSIT", "DELIVERED", "RECEIVED"] as const).map((stage) => {
+                                                    const count = purchases.filter((p) => deriveStage(p) === stage).length;
+                                                    if (count === 0) return null;
+                                                    const tone = stage === "RECEIVED" ? "emerald"
+                                                        : stage === "DELIVERED" ? "cyan"
+                                                        : stage === "IN_TRANSIT" ? "default"
+                                                        : "default";
+                                                    return (
+                                                        <FilterChip
+                                                            key={stage}
+                                                            label={stage}
+                                                            count={count}
+                                                            active={filterStage === stage}
+                                                            onClick={() => setFilterStage(filterStage === stage ? null : stage)}
+                                                            tone={tone as any}
+                                                            title={filterStage === stage ? "Show all stages" : `Filter to ${stage}`}
+                                                        />
+                                                    );
+                                                })}
+                                                {filterStage && (
+                                                    <button
+                                                        onClick={() => setFilterStage(null)}
+                                                        className="text-[9px] font-mono text-zinc-600 hover:text-zinc-300 transition-colors ml-1"
+                                                    >
+                                                        clear
+                                                    </button>
                                                 )}
                                             </div>
                                         )}
@@ -820,6 +930,18 @@ export default function ActivePurchasesPanel() {
                                             {overdue && (
                                                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0">
                                                     ⚠ OVERDUE {daysLate}d
+                                                </span>
+                                            )}
+                                            {/* Shipment exception flag — visible without expanding */}
+                                            {!po.isReceived && hasShipmentException(po) && (
+                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/20 text-rose-300 border-rose-500/40 shrink-0">
+                                                    ⚠ Shipment Exception
+                                                </span>
+                                            )}
+                                            {/* Stale shipment flag — all non-delivered shipments unchecked >24h */}
+                                            {!po.isReceived && allShipmentsStale(po) && !hasShipmentException(po) && (
+                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-300 border-amber-500/40 shrink-0">
+                                                    Stale tracking
                                                 </span>
                                             )}
                                             {po.vendorAcknowledgedAt && !po.isReceived && (
@@ -1038,6 +1160,96 @@ export default function ActivePurchasesPanel() {
                                                 </>
                                             )}
                                         </div>
+
+                                        {/* ── Expanded Shipments Detail Block ── */}
+                                        {((po.shipments?.length || 0) > 0 || (po.trackingNumbers?.length || 0) > 0) && (
+                                            <div className="mt-2 space-y-1.5">
+                                                <div className="flex items-center gap-2">
+                                                    <Truck className="w-3 h-3 text-zinc-500 shrink-0" />
+                                                    <span className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500">Shipments</span>
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-400">
+                                                        {po.shipments?.length || po.trackingNumbers?.length || 0}
+                                                    </span>
+                                                </div>
+                                                {(po.shipments || []).map((shipment, idx) => {
+                                                    const statusLower = (shipment.status_display || "").toLowerCase();
+                                                    const isException = /exception|failed|return|held|delay/.test(statusLower);
+                                                    const isDelivered = statusLower.includes("delivered");
+                                                    const isStale = shipment.last_checked_at
+                                                        ? Date.now() - new Date(shipment.last_checked_at).getTime() > 24 * 3600 * 1000
+                                                        : false;
+                                                    const badgeTone = isDelivered ? "emerald" as const
+                                                        : isException ? "rose" as const
+                                                        : isStale ? "amber" as const
+                                                        : "cyan" as const;
+                                                    const trackingUrl = shipment.public_tracking_url || carrierUrl(shipment.tracking_number);
+                                                    const carrierName = shipment.tracking_number?.includes(":::")
+                                                        ? shipment.tracking_number.split(":::")[0].trim()
+                                                        : null;
+                                                    const freshness = shipment.last_checked_at
+                                                        ? freshnessLabel(Math.floor((Date.now() - new Date(shipment.last_checked_at).getTime()) / 60000))
+                                                        : null;
+                                                    return (
+                                                        <div key={idx} className="border border-zinc-800 rounded bg-zinc-900/40 px-2.5 py-2 space-y-1">
+                                                            <div className="flex items-center gap-2">
+                                                                <StatusBadge label={shipment.status_display || "In transit"} tone={badgeTone} />
+                                                                {carrierName && (
+                                                                    <span className="text-[10px] font-mono text-zinc-500">{carrierName}</span>
+                                                                )}
+                                                                <span className="ml-auto text-[10px] font-mono text-zinc-600">
+                                                                    {freshness || (shipment.last_checked_at ? timeAgo(shipment.last_checked_at) + "" : "")}
+                                                                </span>
+                                                            </div>
+                                                            <div className="flex items-center gap-2 text-[11px] font-mono">
+                                                                <a
+                                                                    href={trackingUrl}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                    onClick={(e) => e.stopPropagation()}
+                                                                    className="text-cyan-400 hover:text-cyan-300 hover:underline inline-flex items-center gap-1 shrink-0"
+                                                                >
+                                                                    {shipment.tracking_number.replace(/:::/, " ")}
+                                                                    <ExternalLink className="w-2.5 h-2.5" />
+                                                                </a>
+                                                                {shipment.estimated_delivery_at && (
+                                                                    <span className="text-zinc-500">
+                                                                        ETA {fmtDateTime(shipment.estimated_delivery_at)}
+                                                                    </span>
+                                                                )}
+                                                                {shipment.evidenceLevel === "candidate" && (
+                                                                    <span className="text-[9px] uppercase tracking-wide px-1 py-px rounded border border-amber-500/30 text-amber-300 bg-amber-500/10">
+                                                                        candidate
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                                {/* Legacy tracking numbers (no shipment evidence) */}
+                                                {(po.trackingNumbers || []).filter((tn) => !(po.shipments || []).some((s) => s.tracking_number === tn)).length > 0 && (
+                                                    <div className="border border-dashed border-zinc-800 rounded bg-zinc-900/20 px-2.5 py-1.5">
+                                                        <span className="text-[9px] font-mono uppercase tracking-wide text-zinc-600">Legacy tracking</span>
+                                                        <div className="mt-1 flex flex-wrap gap-1.5">
+                                                            {(po.trackingNumbers || [])
+                                                                .filter((tn) => !(po.shipments || []).some((s) => s.tracking_number === tn))
+                                                                .map((tn, idx) => (
+                                                                    <a
+                                                                        key={idx}
+                                                                        href={carrierUrl(tn)}
+                                                                        target="_blank"
+                                                                        rel="noreferrer"
+                                                                        onClick={(e) => e.stopPropagation()}
+                                                                        className="text-[10px] font-mono text-amber-300 hover:text-amber-200 hover:underline inline-flex items-center gap-0.5"
+                                                                    >
+                                                                        {tn.includes(":::") ? tn.replace(":::", " ") : tn}
+                                                                        <ExternalLink className="w-2 h-2" />
+                                                                    </a>
+                                                                ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
 
                                         {/* Line 3: Line Items */}
                                         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
