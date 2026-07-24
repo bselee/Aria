@@ -602,9 +602,10 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 9 | Write the "when is it a tab vs panel vs grid column" contributor rule into this doc | this file | XS |
 | 10 | Decide fate of `LegacyDashboard()` — delete or document why it stays | `page.tsx` | XS |
 | 11 | ✅ DONE — Build `/dashboard/invoice-review` page (design approved, see above) — AFTER items 1-4 + 7 land | new: `src/app/dashboard/invoice-review/page.tsx` + focused-review component | M |
-| 12 | Clutter fix: visually separate the 3 stacked filter rows in Ordering panel (window/lifecycle/action) | `PurchasingPanel.tsx` L1678-1822 | S |
-| 13 | Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
+| 12 | ✅ DONE — Clutter fix: visually separate the 3 stacked filter rows in Ordering panel (window/lifecycle/action) | `PurchasingPanel.tsx` L1678-1822 | S |
+| 13 | ✅ DONE — Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
 | 14 | ✅ DONE — Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | `src/components/dashboard/chips/` | M |
+| 15 | Fix 6 pre-existing failing tests in `PurchasingPanel.test.tsx` (vendor-cycle-lock, rounding-chevron, watch-item rendering) — blocks pre-commit hook on unrelated changes | `src/components/dashboard/PurchasingPanel.test.tsx` | M |
 
 **Status (2026-07-24) — item 14:** landed at commit `443450d`. Components,
 JSDoc, and README were correct as delivered. Oversight review caught one
