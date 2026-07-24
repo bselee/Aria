@@ -702,9 +702,44 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 14 | ✅ DONE — Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | `src/components/dashboard/chips/` | M |
 | 15 | Fix 6 pre-existing failing tests in `PurchasingPanel.test.tsx` (vendor-cycle-lock, rounding-chevron, watch-item rendering) — blocks pre-commit hook on unrelated changes | `src/components/dashboard/PurchasingPanel.test.tsx` | M |
 | 16 | Decide + implement where Tracking Board fits in the Lifecycle flow (4th pane vs. fold into Active Purchases) — needs Bill's product call first | `CommandBoardShell.tsx` `PurchasingLifecyclePanel()`, `TrackingBoardPanel.tsx`, `ActivePurchasesPanel.tsx` | M (+ decision) |
-| 17 | Fix `/api/dashboard/receivings` hard timeout (confirmed live: 20s+ hang, zero bytes) — second concrete symptom of item 5's still-open residual 429 source | `src/app/api/dashboard/receivings/route.ts`, `src/lib/finale/receivings.ts` `getTodaysReceivedPOs` | M (shares root cause w/ item 5) |
-| 18 | Fix RCV panel header/copy mismatch: says "WTD" but empty-state says "last 30 days" | `ReceivedItemsPanel.tsx` L633 vs L719 | XS |
+| 17 | ✅ DONE — Fix `/api/dashboard/receivings` hard timeout (confirmed live: 20s+ hang, zero bytes) — second concrete symptom of item 5's still-open residual 429 source | `src/app/api/dashboard/receivings/route.ts`, `src/lib/finale/receivings.ts` `getTodaysReceivedPOs` | M (shares root cause w/ item 5) |
+| 18 | ✅ DONE — Fix RCV panel header/copy mismatch: says "WTD" but empty-state says "last 30 days" | `ReceivedItemsPanel.tsx` L633 vs L719 | XS |
 | 19 | Give RCV's per-row match stepper a glanceable summary badge (like Active Purchases' `Invoice ✓`/`±`) instead of requiring row-expand to see match status | `ReceivedItemsPanel.tsx` L1096-1165 | S |
+| 20 | ✅ DONE — Build `po_document_ledger` unified VIEW + `/api/dashboard/po-ledger` endpoint — the relational spine for all AP documents | `supabase/migrations/20260724_po_document_ledger.sql`, `src/app/api/dashboard/po-ledger/route.ts` | L |
+| 21 | ✅ DONE — Fold Tracking Board depth into Active Purchases (stages + exception visibility + per-row shipment detail) | `ActivePurchasesPanel.tsx` | M |
+| 22 | 3-way match UI (PO × Receipt × Invoice side-by-side) built ON TOP of the po-ledger endpoint — do this next, now that the spine (item 20) exists | new component, likely inside `ActivePurchasesPanel.tsx`'s RECEIVED-stage row expansion | M |
+| 23 | Delete orphaned `TrackingBoardPanel.tsx` + legacy dashboard (`LegacyDashboard()` in `page.tsx`) now that item 16/21 supersedes it — deliberately deferred, not done in items 20/21's commits | `TrackingBoardPanel.tsx`, `page.tsx` | S |
+
+**Status (2026-07-24) — items 17/18/20/21:** all landed and independently
+verified live (not just subagent self-report):
+- **Item 17/18:** oversight caught that the shipped 20s internal Finale
+  timeout meant every page load ate a guaranteed ~20s wait before the
+  graceful fallback engaged — dropped to 8s, live-verified 3x consecutive
+  ~8s responses, HTTP 200, real JSON payload every time (previously
+  20s+ and occasionally a dead 0-byte socket). Also extended the item-5
+  `finale_sku_cache` pattern to the resale-scan path (`getPurchasingIntelligence`)
+  — reduces but does not eliminate the residual 429 volume; item 5
+  remains open as an ongoing/monitoring item, not fully closed.
+- **Item 20:** live-queried the installed view directly against local
+  PG16 (`SELECT count(*) FROM po_document_ledger` = 1797, matches
+  subagent's figure exactly) and curl'd the new endpoint for a real PO
+  with a 6-document, 5-type trail. Oversight caught and fixed two bugs
+  before commit: (a) the test file's DB mock had a broken thenable —
+  `then()` returned a Promise instead of invoking the `resolve`/`reject`
+  callbacks handed to it, causing 4/6 tests to hang until timeout despite
+  being reached correctly; (b) `totalInvoiced` naively summed amounts
+  across `invoice`/`paid_invoice`/`vendor_invoice` doc types, but those
+  three tables are different lifecycle eras of the SAME underlying
+  invoice — a fully-processed invoice was being counted 2-3x. Fixed via
+  dedup on (docRef, amount); verified the fix doesn't regress a real PO
+  that didn't hit the bug while fixing the constructed test case that did.
+- **Item 21:** live screenshot confirms the RCV panel header now correctly
+  reads "30d" (was "WTD"), and the stage-chip/exception-flagging code
+  path was read in full and confirmed sound — no crash on the current
+  genuine zero-active-purchases state (chips correctly hide when count=0,
+  by design per the subagent's report, verified against actual rendered
+  code). Full visual confirmation with real in-flight POs pending next
+  time there's live order volume to render against.
 
 **Status (2026-07-24) — item 14:** landed at commit `443450d`. Components,
 JSDoc, and README were correct as delivered. Oversight review caught one
