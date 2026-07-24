@@ -417,6 +417,93 @@ each panel author has to remember to add.
 
 ---
 
+## P2-3: Clutter audit — two panels have redundant, stacked filter/status UI
+
+Screenshot review (2026-07-24, post-429-fix, panels finally loading real
+data) surfaced a distinct problem from anything above: it's not broken, it's
+**noisy**. Once real data renders, both the Ordering panel and Active
+Purchases panel show 3+ layers of overlapping chips/filters before a single
+actual line item appears. This is a genuine UX regression risk as data
+volume grows — traced to specific code, not just a vibe.
+
+### Ordering panel (`PurchasingPanel.tsx`) — THREE stacked filter rows
+
+1. **Time-window pills** (line ~1678-1680): `TODAY / 30 / 60 / 90 / ALL` —
+   cumulative day-window filter, each showing a count.
+2. **Lifecycle-bucket pills** (line ~1780-1783): `Need Order / Topping Up /
+   On Order / Other Holds / All` — a *second*, independent filter axis,
+   rendered as its own row directly below #1, visually identical pill
+   style (colored border + count badge) so the eye can't tell these are
+   two different filter systems, not one continuous row.
+3. **"Order Now (2)" chip** (below both): a third summary/action control
+   in the same visual language (pill, count badge).
+
+All three are legitimate, useful filters individually. The problem is
+purely presentation: identical visual weight (same pill shape, same badge
+style, same color-coded borders) makes 3 unrelated control groups read as
+one confusing wall of 12+ chips. A user has to consciously segment them by
+reading label text, not by any visual grouping cue (spacing, section
+label, iconography).
+
+**Fix — visual hierarchy, not fewer features:**
+- Give each filter *row* a small uppercase micro-label to its left (e.g.
+  "WINDOW", "STATUS") so the two axes are visually distinct groups, not
+  one long chip soup. ~4px of `text-dash-l3` label solves most of this.
+- Demote the "Order Now (N)" chip to a different visual treatment (e.g.
+  a solid button, not a pill matching the filter chips) since it's an
+  action/shortcut, not a filter — currently it's visually indistinguishable
+  from the filter pills next to it, which is the single biggest
+  "what am I looking at" confusion point in the screenshot.
+- Consider collapsing the time-window row by default (behind the existing
+  chevron affordance at line ~1678's container) since the lifecycle-bucket
+  row is the one Bill actually uses day-to-day per his stated workflow —
+  the audit `dashboard-design-audit.md` conversation confirms priority is
+  "reorder? given demand" not "what's due in the next N days" as the
+  primary lens.
+
+### Active Purchases panel — summary chips duplicate per-row badges
+
+`59 Active / 7 Overdue / 44 No Tracking` chips (~line 590-664) sit directly
+above a list where **every row already carries its own status badge**
+(`In Transit`, `⚠ OVERDUE 35d`, etc. — visible per-row in the screenshot).
+The header chips are aggregate counts of the exact same signal each row
+already displays individually. They're not wrong, just redundant real
+estate — in a dense list this reads as "the same information, said twice."
+
+**Fix:**
+- Keep the header chips as **filter toggles** (they already partially are
+  — `filterOverdue` state exists at line 152) but make that affordance
+  visually obvious (e.g. underline-on-hover, pressed state) so they read
+  as "click to filter" controls, not passive repeated counters.
+- Do NOT remove the per-row badges — those are the actually useful signal
+  when scanning a list. The header chips should feel like a *lens*, not
+  a second data source.
+
+### Underlying structural note (ties to P1-2)
+
+Both `PurchasingPanel.tsx` (3,018 lines) and `ActivePurchasesPanel.tsx`
+(1,430 lines) contain enormous type surfaces (`UrgencyTier`,
+`LifecycleBucket`, `FocusFilter`, ETA confidence, tracking-source
+provenance, sent-verification evidence chains, etc.) and — predictably —
+most of those internal concepts have grown their own visible badge over
+time with no shared "badge/chip" component enforcing consistent visual
+weight between "this is a filter," "this is a status," and "this is an
+action." This is the same root cause as P1-2 (no shared `<Panel>`
+primitive) manifesting one level deeper: no shared `<FilterChip>` /
+`<StatusBadge>` / `<ActionChip>` primitives either, so every new state a
+developer adds gets rendered in whatever pill style was copy-pasted from
+the nearest existing one — regardless of whether it's semantically a
+filter, a status, or an action.
+
+**Fix (do this once, benefits every future badge):** build 3 small
+primitives — `<FilterChip active count onClick>`, `<StatusBadge tone
+label>`, `<ActionChip label onClick>` — with deliberately distinct visual
+languages (chips = outlined pill, status = solid/tinted badge, action =
+filled button). Migrate the Ordering + Active Purchases panels first since
+they're the worst offenders; other panels benefit as they're touched.
+
+---
+
 ## ⚪ P3-1: Dead legacy dashboard code
 
 `src/app/dashboard/page.tsx` still ships `LegacyDashboard()` — the old
@@ -486,6 +573,9 @@ below) so it inherits the fixes instead of needing a follow-up patch.
 | 9 | Write the "when is it a tab vs panel vs grid column" contributor rule into this doc | this file | XS |
 | 10 | Decide fate of `LegacyDashboard()` — delete or document why it stays | `page.tsx` | XS |
 | 11 | Build `/dashboard/invoice-review` page (design approved, see above) — AFTER items 1-4 + 7 land | new: `src/app/dashboard/invoice-review/page.tsx` + focused-review component | M |
+| 12 | Clutter fix: visually separate the 3 stacked filter rows in Ordering panel (window/lifecycle/action) | `PurchasingPanel.tsx` L1678-1822 | S |
+| 13 | Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
+| 14 | Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | new: `src/components/dashboard/chips/` | M |
 
 Items 1-4 are the ones that actively hurt you today — they're the reason
 this audit exists. Do those first, independent of everything else.
