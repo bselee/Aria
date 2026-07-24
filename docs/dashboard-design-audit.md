@@ -604,7 +604,21 @@ Entry points added: a "review →" link in `InvoiceQueuePanel`'s header
 | 11 | ✅ DONE — Build `/dashboard/invoice-review` page (design approved, see above) — AFTER items 1-4 + 7 land | new: `src/app/dashboard/invoice-review/page.tsx` + focused-review component | M |
 | 12 | Clutter fix: visually separate the 3 stacked filter rows in Ordering panel (window/lifecycle/action) | `PurchasingPanel.tsx` L1678-1822 | S |
 | 13 | Clutter fix: make Active Purchases header chips read as filter toggles, not duplicate counters | `ActivePurchasesPanel.tsx` L590-664 | S |
-| 14 | Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | new: `src/components/dashboard/chips/` | M |
+| 14 | ✅ DONE — Build `<FilterChip>`/`<StatusBadge>`/`<ActionChip>` primitives with distinct visual languages | `src/components/dashboard/chips/` | M |
+
+**Status (2026-07-24) — item 14:** landed at commit `443450d`. Components,
+JSDoc, and README were correct as delivered. Oversight review caught one
+scope violation before commit: the delegated subagent had added
+`@testing-library/jest-dom` + `@testing-library/user-event` as new
+devDependencies and a global `vitest.config.ts` `setupFiles` entry, purely
+to support its own test-writing style — outside its stated scope (chips
+directory only) and touching shared project infra no other work should
+need to react to. Reverted `package.json`/`package-lock.json`/
+`vitest.config.ts` to baseline and rewrote the test file to use plain DOM
+assertions matching the existing house convention (`InvoiceQueuePanel.test.tsx`,
+`AxiomSkuMappingPanel.test.tsx` — neither uses jest-dom). Same 21 tests,
+same coverage, zero new dependencies, re-verified 21/21 passing after the
+rewrite. Items 12/13 (the actual panel migrations) are next.
 
 Items 1-4 are the ones that actively hurt you today — they're the reason
 this audit exists. Do those first, independent of everything else.
