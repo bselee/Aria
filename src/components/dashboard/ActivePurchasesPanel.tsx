@@ -7,6 +7,7 @@ import { createClient as createBrowserClient } from "@/lib/db";
 import POFlowStepper from "./POFlowStepper";
 import type { POFlowStep } from "./POFlowStepper";
 import { POStepper } from "./POStepper";
+import { FilterChip, StatusBadge } from "@/components/dashboard/chips";
 
 type AtRiskInfo = { severity: "at_risk" | "soon_at_risk"; worstDaysShort: number };
 
@@ -588,17 +589,14 @@ export default function ActivePurchasesPanel() {
                 )}
 
                 {!loading && purchases.filter(isOverdue).length > 0 && (
-                    <button
+                    <FilterChip
+                        label="Overdue"
+                        count={purchases.filter(isOverdue).length}
+                        active={filterOverdue}
                         onClick={() => setFilterOverdue(!filterOverdue)}
-                        className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors cursor-pointer ${
-                            filterOverdue
-                                ? "bg-red-500/20 text-red-300 border-red-500/40"
-                                : "bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20"
-                        }`}
+                        tone="red"
                         title={filterOverdue ? "Showing overdue only — click to show all" : "Past expected delivery date — click to filter"}
-                    >
-                        {purchases.filter(isOverdue).length} overdue
-                    </button>
+                    />
                 )}
 
                 {dismissed.size > 0 && (
@@ -646,28 +644,18 @@ export default function ActivePurchasesPanel() {
                     {/* ── Aggregate Status Banner ── */}
                                         {!loading && !error && purchases.length > 0 && (
                                             <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-900/30 flex flex-wrap items-center gap-x-2 gap-y-1">
-                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
-                                                    <span className="font-bold text-blue-400">{purchases.length}</span> Active
-                                                </span>
+                                                <StatusBadge label={`${purchases.length} Active`} tone="cyan" />
                                                 {purchases.filter(isOverdue).length > 0 && (
-                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
-                                                        <span className="font-bold text-rose-400">{purchases.filter(isOverdue).length}</span> Overdue
-                                                    </span>
+                                                    <StatusBadge label={`${purchases.filter(isOverdue).length} Overdue`} tone="rose" />
                                                 )}
                                                 {purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length > 0 && (
-                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
-                                                        <span className="font-bold text-amber-400">{purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length}</span> Unacknowledged
-                                                    </span>
+                                                    <StatusBadge label={`${purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length} Unacknowledged`} tone="amber" />
                                                 )}
                                                 {purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length > 0 && (
-                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
-                                                        <span className="font-bold text-orange-400">{purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length}</span> No Tracking
-                                                    </span>
+                                                    <StatusBadge label={`${purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length} No Tracking`} tone="orange" />
                                                 )}
                                                 {purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length > 0 && (
-                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-300 border border-zinc-700/50">
-                                                        <span className="font-bold text-cyan-400">{purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length}</span> In Transit
-                                                    </span>
+                                                    <StatusBadge label={`${purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length} In Transit`} tone="cyan" />
                                                 )}
                                             </div>
                                         )}

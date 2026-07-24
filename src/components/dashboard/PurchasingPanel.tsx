@@ -20,6 +20,7 @@ import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
 import type { ExpectedDelivery, DraftVerification, CommitVerification } from "@/lib/purchasing/po-verification";
 import { CrystalBallDetail, type CrystalBallItem } from "./CrystalBallDetail";
 import { CrystalBallSearch } from "./CrystalBallSearch";
+import { FilterChip, ActionChip } from "@/components/dashboard/chips";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -1676,24 +1677,23 @@ export default function PurchasingPanel() {
                 <div className="flex-1" />
 
                 {/* v2 ordering filter — Order Now / 30 / 60 / 90 / All. Cumulative. Item-counted. */}
+                <span className="text-[10px] font-mono text-dash-l3 tracking-wider shrink-0 mr-1">WINDOW</span>
                 {([
-                    { k: "order_now" as const, label: "TODAY", count: orderNowCount, active: "bg-red-500/20 text-red-300 border-red-500/40", title: "Items short within lead time (or already short with no PO coverage)" },
-                    { k: "30" as const, label: "30", count: thirtyCount, active: "bg-amber-500/20 text-amber-300 border-amber-500/40", title: "Show items projected short within 30 days" },
-                    { k: "60" as const, label: "60", count: sixtyCount, active: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40", title: "Show items projected short within 60 days" },
-                    { k: "90" as const, label: "90", count: ninetyCount, active: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40", title: "Show items projected short within 90 days" },
-                    { k: "all" as const, label: "ALL", count: allCount, active: "bg-zinc-700 text-zinc-200 border-zinc-600", title: "Every actionable item" },
+                    { k: "order_now" as const, label: "TODAY", count: orderNowCount, tone: "red" as const, title: "Items short within lead time (or already short with no PO coverage)" },
+                    { k: "30" as const, label: "30", count: thirtyCount, tone: "amber" as const, title: "Show items projected short within 30 days" },
+                    { k: "60" as const, label: "60", count: sixtyCount, tone: "default" as const, title: "Show items projected short within 60 days" },
+                    { k: "90" as const, label: "90", count: ninetyCount, tone: "emerald" as const, title: "Show items projected short within 90 days" },
+                    { k: "all" as const, label: "ALL", count: allCount, tone: "default" as const, title: "Every actionable item" },
                 ]).map(b => (
-                    <button
+                    <FilterChip
                         key={b.k}
+                        label={b.label}
+                        count={b.count}
+                        active={focusFilter === b.k}
                         onClick={() => setFocusFilter(b.k)}
+                        tone={b.tone}
                         title={b.title}
-                        className={`text-xs font-mono ${b.k === "order_now" ? "font-bold" : ""} px-1.5 py-0.5 rounded border transition-colors ${focusFilter === b.k
-                            ? b.active
-                            : "text-zinc-500 border-zinc-700 hover:text-zinc-300"
-                            }`}
-                    >
-                        {b.count} {b.label}
-                    </button>
+                    />
                 ))}
 
                 {/* Snoozed badge — toggles reveal */}
@@ -1729,10 +1729,13 @@ export default function PurchasingPanel() {
                     }
                     if (vendorCount === 0) return null;
                     return (
-                        <button onClick={() => handleCreateAllDrafts(filtered)} disabled={anyCreating}
-                            className="text-xs font-mono font-bold px-3 py-1.5 rounded border border-emerald-500 bg-emerald-600/30 hover:bg-emerald-500/40 text-emerald-200 hover:text-emerald-100 transition-colors disabled:opacity-40">
-                            ORDER ALL ({vendorCount})
-                        </button>
+                        <ActionChip
+                            label="ORDER ALL"
+                            count={vendorCount}
+                            onClick={() => handleCreateAllDrafts(filtered)}
+                            disabled={anyCreating}
+                            variant="primary"
+                        />
                     );
                 })()}
                 {anyCreating && (
@@ -1775,30 +1778,24 @@ export default function PurchasingPanel() {
                         <>
                             {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
                             <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                        <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider mr-1 shrink-0">show</span>
+                        <span className="text-[10px] font-mono text-dash-l3 tracking-wider shrink-0 mr-1">STATUS</span>
                         {([
-                            { k: "need" as const, label: "Need Order", tone: "bg-red-500/15 text-red-300 border-red-500/40", inactive: "text-zinc-400 border-zinc-700 hover:text-zinc-200" },
-                            { k: "topping" as const, label: "Topping Up", tone: "bg-amber-500/15 text-amber-300 border-amber-500/40", inactive: "text-zinc-500 border-zinc-700 hover:text-zinc-300" },
-                            { k: "on_order" as const, label: "On Order", tone: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40", inactive: "text-zinc-500 border-zinc-800 hover:text-zinc-300" },
-                            { k: "other" as const, label: "Other Holds", tone: "bg-zinc-700 text-zinc-200 border-zinc-500", inactive: "text-zinc-500 border-zinc-800 hover:text-zinc-300" },
+                            { k: "need" as const, label: "Need Order", tone: "red" as const, title: "Need a fresh PO — nothing already on order" },
+                            { k: "topping" as const, label: "Topping Up", tone: "amber" as const, title: "Open PO exists but Aria sees additional need" },
+                            { k: "on_order" as const, label: "On Order", tone: "emerald" as const, title: "Open PO already covers near-term need — no action" },
+                            { k: "other" as const, label: "Other Holds", tone: "default" as const, title: "Other holds (FG covered, uneconomic, manual review)" },
+                            { k: "all" as const, label: "All", count: lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other, tone: "default" as const, title: "All buckets at once" },
                         ]).map(t => (
-                            <button key={t.k}
+                            <FilterChip
+                                key={t.k}
+                                label={t.label}
+                                count={t.k === "all" ? t.count : lifecycleCounts[t.k]}
+                                active={lifecycleFilter === t.k}
                                 onClick={() => setLifecycleFilter(t.k)}
-                                className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${lifecycleFilter === t.k ? t.tone : t.inactive}`}
-                                title={t.k === "need" ? "Need a fresh PO — nothing already on order"
-                                    : t.k === "topping" ? "Open PO exists but Aria sees additional need"
-                                    : t.k === "on_order" ? "Open PO already covers near-term need — no action"
-                                    : "Other holds (FG covered, uneconomic, manual review)"}
-                            >
-                                {t.label} <span className="opacity-60">{lifecycleCounts[t.k]}</span>
-                            </button>
+                                tone={t.tone}
+                                title={t.title}
+                            />
                         ))}
-                        <button onClick={() => setLifecycleFilter("all")}
-                            className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors shrink-0 ${lifecycleFilter === "all" ? "bg-zinc-700 text-zinc-200 border-zinc-500" : "text-zinc-500 border-zinc-800 hover:text-zinc-300"}`}
-                            title="All buckets at once"
-                        >
-                            All <span className="opacity-60">{lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other}</span>
-                        </button>
                     </div>
 
                     {/* ── Vendor dropdown combobox ── replaces horizontal tab strip */}
