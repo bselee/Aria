@@ -107,9 +107,9 @@ describe('resolveStatus', () => {
         expect(resolveStatus('duplicate', null, null, 'PO123')).toBe('duplicate');
     });
 
-    it('still returns unmatched via action_taken even with po_number', () => {
-        // Action-based explicit unmatched should still win
-        expect(resolveStatus('received', 'no match found', null, 'PO123')).toBe('unmatched');
+    it('po_number wins over action_taken "no match" — PO is authoritative', () => {
+        // Even if an old log said "no match", a set po_number means the invoice is matched
+        expect(resolveStatus('received', 'no match found', null, 'PO123')).toBe('matched_unreconciled');
     });
 
     it('still defers to metadata verdict even with po_number', () => {

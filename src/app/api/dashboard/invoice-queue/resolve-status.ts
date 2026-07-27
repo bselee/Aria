@@ -47,6 +47,13 @@ export function resolveStatus(
     if (verdict === 'short_shipment_hold') {
         return 'short_shipment_hold';
     }
+
+    // ── PO-number guard FIRST ───────────────────────────────────────────────
+    // An invoice with a po_number is authoritatively matched. Never "unmatched"
+    // / "NO PO". Activity-log verdicts below can still upgrade to needs_approval
+    // / auto_approved / rejected when present.
+    const hasPo = !!(poNumber && poNumber.trim().length > 0);
+
     if (verdict === 'needs_approval') {
         return 'needs_approval';
     }
@@ -68,7 +75,9 @@ export function resolveStatus(
         return 'auto_approved';
     }
     if (s === 'matched_review' || a.includes('pending') || a.includes('flagged') || a.includes('approval')) {
-        return 'needs_approval';
+        // Has PO but no human approval yet → matched_unreconciled is more accurate
+        // than needs_approval when there is no activity-log review payload.
+        return hasPo ? 'matched_unreconciled' : 'needs_approval';
     }
     if (a.includes('rejected') || a.includes('reject')) {
         return 'rejected';
@@ -76,18 +85,17 @@ export function resolveStatus(
     if (s === 'duplicate' || a.includes('duplicate') || a.includes('already processed')) {
         return 'duplicate';
     }
-    // Default: unmatched if no PO was found
+    // Explicit unmatched ONLY when there is no PO
     if (s === 'unmatched' || a.includes('no match') || a.includes('unmatched') || a.includes('dropship')) {
-        return 'unmatched';
+        return hasPo ? 'matched_unreconciled' : 'unmatched';
     }
 
-    // ── PO-number guard (the core fix) ───────────────────────────────────────
-    // An invoice with a po_number is authoritatively matched to a PO. Even when
-    // the reconciler hasn't processed it yet (status='received', reconciled_at=NULL),
-    // it must NEVER be labelled "NO PO". Map it as matched-but-unreconciled so
-    // the dashboard accurately reflects PO-assignment status without over-reporting
-    // the unmatched count.
-    if (poNumber && poNumber.trim().length > 0) {
+    // Auto-match path writes status matched_unreconciled
+    if (s === 'matched_unreconciled' || s === 'matched') {
+        return 'matched_unreconciled';
+    }
+
+    if (hasPo) {
         return 'matched_unreconciled';
     }
 

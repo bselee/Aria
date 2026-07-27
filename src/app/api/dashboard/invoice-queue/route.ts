@@ -290,9 +290,19 @@ export async function GET(req: NextRequest) {
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
             const balanceWarning = extractBalanceWarning(matchedLog?.metadata ?? null);
 
+            // Activity-log-less pending items: demote to unmatched ONLY when there is
+            // no PO. If a PO is already assigned, keep matched_unreconciled so Approve
+            // / Dismiss show — never "NO PO" for a matched invoice.
             const hasActivityLog = !!matchedLog?.id;
-            // Items with no activity log can't be acted on — demote needs_approval/short_shipment to unmatched
-            const resolvedStatus = hasActivityLog ? status : (isPendingStatus(status) ? 'unmatched' : status);
+            const hasPo = !!(row.po_number && String(row.po_number).trim().length > 0);
+            let resolvedStatus = status;
+            if (!hasActivityLog && isPendingStatus(status)) {
+                resolvedStatus = hasPo ? 'matched_unreconciled' : 'unmatched';
+            }
+            // Final belt: never report unmatched when po_number is set
+            if (hasPo && resolvedStatus === 'unmatched') {
+                resolvedStatus = 'matched_unreconciled';
+            }
 
             // Filter items that can't be acted on (no activityLogId for needs_approval or short_shipment_hold)
             if (isPendingStatus(resolvedStatus) && !hasActivityLog) {
