@@ -378,6 +378,12 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         && bestMatch!.score >= AUTO_APPLY_THRESHOLD
         && invoice.total > 0;
 
+    // Never auto-apply dropship POs — out of AP purview (Bill 2026-07-27).
+    const isDropshipPo = (po: string) => /DropshipPO$/i.test(po || "");
+    if (bestMatch && isDropshipPo(bestMatch.orderId)) {
+        autoApplyReady = false;
+    }
+
     // ── Tier A: Exact OCR PO match ────────────────────────────────────────
     // If the invoice carries a raw OCR PO candidate (from raw_data.poNumber,
     // orderRef, etc.), sanitize it and check if it exactly matches a PO in
@@ -385,9 +391,9 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // the PO, so score = 100, autoApplyReady = true.
     const sanitizedOcrPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
         || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
-    if (sanitizedOcrPo) {
+    if (sanitizedOcrPo && !isDropshipPo(sanitizedOcrPo)) {
         const exactMatch = candidates.find(
-            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase()
+            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase() && !isDropshipPo(c.orderId)
         );
         if (exactMatch) {
             exactMatch.score = 100;
@@ -403,6 +409,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // confidence even if the base score is below threshold.
     if (!autoApplyReady && candidates.length > 0 && invoice.total > 0) {
         const tightCandidates = candidates.filter(c => {
+            if (isDropshipPo(c.orderId)) return false;
             // Vendor score >= 30 (exact, substring, or alias match)
             const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
             if (vScore.score < 30) return false;
@@ -429,8 +436,13 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                 "unique vendor+amount±2%+date±14d"
             );
             candidates.sort((a, b) => b.score - a.score);
-            autoApplyReady = true;
+            autoApplyReady = !isDropshipPo(tightCandidates[0].orderId);
         }
+    }
+
+    // Final guard: never auto-apply a dropship PO
+    if (autoApplyReady && candidates[0] && isDropshipPo(candidates[0].orderId)) {
+        autoApplyReady = false;
     }
 
     return { invoice, candidates, bestMatch: candidates[0] || null, autoApplyReady };
@@ -458,13 +470,14 @@ export function tryHighConfidenceAutoMatch(
     candidates: POCandidate[],
 ): HighConfidenceDecision | null {
     if (candidates.length === 0 || invoice.total <= 0) return null;
+    const isDropshipPo = (po: string) => /DropshipPO$/i.test(po || "");
 
-    // Tier A-1: Exact OCR PO match
+    // Tier A-1: Exact OCR PO match (never dropship)
     const sanitizedOcrPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
         || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
-    if (sanitizedOcrPo) {
+    if (sanitizedOcrPo && !isDropshipPo(sanitizedOcrPo)) {
         const exactMatch = candidates.find(
-            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase()
+            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase() && !isDropshipPo(c.orderId)
         );
         if (exactMatch) {
             return {
@@ -476,8 +489,9 @@ export function tryHighConfidenceAutoMatch(
         }
     }
 
-    // Tier A-2: Unique vendor + amount ±2% + date ±14d
+    // Tier A-2: Unique vendor + amount ±2% + date ±14d (exclude dropship)
     const tightCandidates = candidates.filter(c => {
+        if (isDropshipPo(c.orderId)) return false;
         const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
         if (vScore.score < 30) return false;
         if (c.total <= 0) return false;

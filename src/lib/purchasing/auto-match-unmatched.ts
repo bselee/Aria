@@ -239,6 +239,17 @@ export async function runAutoMatchUnmatched(
                 continue;
             }
 
+            // Belt-and-suspenders: never write a dropship PO (out of AP purview)
+            if (poToAssign && /DropshipPO$/i.test(poToAssign)) {
+                result.skipped.push({
+                    invoiceId: invoice.id,
+                    poNumber: poToAssign,
+                    score: matchResult.bestMatch?.score || 0,
+                    reason: "blocked: dropship PO out of AP purview",
+                });
+                continue;
+            }
+
             // ── Apply the match ───────────────────────────────────────────
             // Always assign po_number to invoices table
             await db
