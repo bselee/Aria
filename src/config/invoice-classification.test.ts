@@ -155,7 +155,7 @@ describe("classifyInvoice — Fallback to real_invoice", () => {
             fromEmail: "billing@unknownco.com",
         });
         expect(result.classification).toBe(real);
-        expect(result.reason).toContain("No dropship rules matched");
+        expect(result.reason).toBe("");
     });
 
     it("Vendor present but not dropship → real_invoice", () => {
@@ -369,7 +369,7 @@ describe("classifyInvoice — Full resolution order", () => {
             poNumber: "99999999-DropshipPO",
         });
         expect(r.classification).toBe(dropship);
-        expect(r.matchedRule).toContain("DropshipPO suffix");
+        expect(r.matchedRule).toContain("DropshipPO");
     });
 
     it("Step 3: DropshipRules match — AutoPot", () => {
@@ -381,7 +381,7 @@ describe("classifyInvoice — Full resolution order", () => {
     it("Step 4: Fallback with vendor/email → real_invoice", () => {
         const r = classifyInvoice({ vendorName: "Some Vendor" });
         expect(r.classification).toBe(real);
-        expect(r.reason).toContain("No dropship rules matched");
+        expect(r.reason).toBe("");
     });
 
     it("Step 5: No data → unknown", () => {
@@ -401,7 +401,7 @@ describe("classifyInvoice — PO-number dropship pattern", () => {
         });
         expect(r.classification).toBe(dropship);
         expect(r.reason).toContain("23496707-DropshipPO");
-        expect(r.matchedRule).toContain("DropshipPO suffix");
+        expect(r.matchedRule).toContain("DropshipPO");
     });
 
     it("PO ending with '-S-DropshipPO' (sales order variant) classifies as dropship", () => {
@@ -421,7 +421,7 @@ describe("classifyInvoice — PO-number dropship pattern", () => {
         });
         expect(r.classification).toBe(dropship);
         // Should be PO-based reason, not vendor-keyword reason
-        expect(r.matchedRule).toContain("DropshipPO suffix");
+        expect(r.matchedRule).toContain("DropshipPO");
     });
 
     it("PO without dropship suffix does NOT match — falls through to vendor keyword", () => {
@@ -440,7 +440,7 @@ describe("classifyInvoice — PO-number dropship pattern", () => {
             poNumber: "124161",
         });
         expect(r.classification).toBe(real);
-        expect(r.reason).toContain("No dropship rules matched");
+        expect(r.reason).toBe("");
     });
 
     it("Null/undefined poNumber does not crash", () => {
@@ -479,6 +479,6 @@ describe("classifyInvoice — PO-number dropship pattern", () => {
             poNumber: "55555555-S-DropshipPO",
         });
         expect(r.classification).toBe(dropship);
-        expect(r.matchedRule).toContain("DropshipPO suffix");
+        expect(r.matchedRule).toContain("DropshipPO");
     });
 });

@@ -269,6 +269,10 @@ export async function GET(req: NextRequest) {
             if (classResult.classification === 'dropship_flow_through') {
                 return [];
             }
+            // Belt-and-suspenders: DropshipPO in po_number is never our purview
+            if (row.po_number && /DropshipPO/i.test(String(row.po_number))) {
+                return [];
+            }
             // Disregarded invoices (marked "not a PO purchase" by a human) are excluded
             if (row.no_po_required === true) {
                 return [];
@@ -278,6 +282,15 @@ export async function GET(req: NextRequest) {
             if (!row.po_number && isNoPoVendor(vendorName, noPoVendorNames)) {
                 return [];
             }
+
+            // Garbage / non-Finale PO tokens (BUILMOCO, "NEED PO…") are NOT matches
+            const rawPo = row.po_number ? String(row.po_number).trim() : "";
+            const plausiblePo = rawPo && (
+                /^\d{4,8}$/.test(rawPo) ||
+                /^\d{4,8}-(?:[SD]-)?DropshipPO$/i.test(rawPo) ||
+                /^PO-?\d+/i.test(rawPo)
+            );
+            const effectivePo = plausiblePo ? rawPo : null;
             const invNum: string = row.invoice_number ?? '';
             const matchedLog = logByInvoiceNum.get(invNum) ?? null;
             const reviewedAction = (matchedLog?.reviewed_action ?? "").toLowerCase();
@@ -286,7 +299,7 @@ export async function GET(req: NextRequest) {
                 return [];
             }
 
-            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null, matchedLog?.metadata, row.po_number);
+            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null, matchedLog?.metadata, effectivePo);
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
             const balanceWarning = extractBalanceWarning(matchedLog?.metadata ?? null);
 
@@ -294,12 +307,12 @@ export async function GET(req: NextRequest) {
             // no PO. If a PO is already assigned, keep matched_unreconciled so Approve
             // / Dismiss show — never "NO PO" for a matched invoice.
             const hasActivityLog = !!matchedLog?.id;
-            const hasPo = !!(row.po_number && String(row.po_number).trim().length > 0);
+            const hasPo = !!effectivePo;
             let resolvedStatus = status;
             if (!hasActivityLog && isPendingStatus(status)) {
                 resolvedStatus = hasPo ? 'matched_unreconciled' : 'unmatched';
             }
-            // Final belt: never report unmatched when po_number is set
+            // Final belt: never report unmatched when a plausible PO is set
             if (hasPo && resolvedStatus === 'unmatched') {
                 resolvedStatus = 'matched_unreconciled';
             }
@@ -338,7 +351,7 @@ export async function GET(req: NextRequest) {
                             tariff: row.tariff !== null ? Number(row.tariff) : null,
                             labor: row.labor !== null ? Number(row.labor) : null,
                             status: resolvedStatus,
-                            poNumber: row.po_number ?? null,
+                            poNumber: effectivePo,
                             invoiceDate: row.invoice_date ?? null,
                             dueDate: row.due_date ?? null,
                             ocrPoCandidate,

@@ -63,28 +63,26 @@ interface DropshipRule {
 }
 
 const DROPSHIP_RULES: DropshipRule[] = [
-    // ── Confirmed dropship vendors (ship directly to customers) ────────────
-    { vendorKeyword: 'autopot',          label: 'AutoPot (Dropship)' },
-    { vendorKeyword: 'logan labs',       label: 'Logan Labs (Dropship)' },
-    { vendorKeyword: 'loganlab',         label: 'Logan Labs (Dropship)' },
+    // ── Confirmed dropship-only vendors (Bill 2026-07-27) ──────────────────
+    // These never place standard warehouse POs Aria manages.
+    { vendorKeyword: 'autopot',           label: 'AutoPot (Dropship)' },
+    { vendorKeyword: 'logan labs',        label: 'Logan Labs (Dropship)' },
+    { vendorKeyword: 'loganlab',          label: 'Logan Labs (Dropship)' },
     { vendorKeyword: 'evergreen growers', label: 'Evergreen Growers (Dropship)' },
-    { vendorKeyword: 'evergreengrow',    label: 'Evergreen Growers (Dropship)' },
-    { vendorKeyword: 'abel',             label: 'Abel\'s Aces (Dropship)' },
-    { vendorKeyword: 'abelsace',         label: 'Abel\'s Aces (Dropship)' },
+    { vendorKeyword: 'evergreengrow',     label: 'Evergreen Growers (Dropship)' },
+    { vendorKeyword: 'evergreen',         label: 'Evergreen (Dropship)' }, // lighting variants
+    { vendorKeyword: 'grandmaster',       label: 'Grandmaster (Dropship)' },
+    { vendorKeyword: 'mammoth',           label: 'Mammoth (Dropship)' },
+    { vendorKeyword: 'abel',              label: "Abel's Aces (Dropship)" },
+    { vendorKeyword: 'abelsace',          label: "Abel's Aces (Dropship)" },
 
     // ── QuickBooks routed dropship (vendor name only in subject) ───────────
     { senderKeyword: 'quickbooks', subjectRequired: 'logan labs',  label: 'Logan Labs (Dropship via QuickBooks)' },
     { senderKeyword: 'quickbooks', subjectRequired: 'autopot',     label: 'AutoPot (Dropship via QuickBooks)' },
     { senderKeyword: 'quickbooks', subjectRequired: 'fert',        label: 'Ferticell (Dropship via QuickBooks)' },
 
-    // ── Add new dropship vendors here ──────────────────────────────────────
-    // Format: { senderKeyword: 'domain.com', label: 'Vendor Name (Dropship)' }
-    //   OR    { vendorKeyword: 'vendor name', label: 'Vendor Name (Dropship)' }
+    // Ferticell is dropship-only in Aria's purview
     { vendorKeyword: 'ferticell', label: 'Ferticell (Dropship)' },
-    // KAIZEN(2026-06-04): 'fert' alone removed — too short, latent false-positive
-    // risk with "Fertilizer Co" or "Fertility Plus" vendors. The QuickBooks rule
-    // with subjectRequired:'fert' remains — it's guarded by sender:quickbooks.
-    // Vendor keyword 'ferticell' catches all Ferticell OCR name variants.
 ];
 
 // ─── Real Invoice Overrides ───────────────────────────────────────────────────
@@ -179,11 +177,11 @@ export function classifyInvoice(input: ClassificationInput): ClassificationResul
     // "-DropshipPO" or "-S-DropshipPO", the transaction IS a dropship regardless
     // of vendor name, OCR accuracy, or keyword registry completeness.
     const po = (input.poNumber || '').trim();
-    if (po && /^\d+(-S)?-DropshipPO$/i.test(po)) {
+    if (po && /DropshipPO/i.test(po)) {
         return {
             classification: 'dropship_flow_through',
             reason: `Dropship PO number: ${po}`,
-            matchedRule: 'PO Pattern: DropshipPO suffix',
+            matchedRule: 'PO Pattern: DropshipPO',
         };
     }
 
@@ -227,17 +225,19 @@ export function classifyInvoice(input: ClassificationInput): ClassificationResul
     }
 
     // ── Step 4: Unknown — can't determine from available data ──────────────
-    // If we have enough data to make a real invoice guess, assume real
+    // If we have enough data to make a real invoice guess, assume real.
+    // Reason is intentionally EMPTY for the common case — the dashboard
+    // must not spam "No dropship rules matched" on every real invoice row.
     if (vendor || email) {
         return {
             classification: 'real_invoice',
-            reason: 'No dropship rules matched — treating as real invoice',
+            reason: '',
         };
     }
 
     return {
         classification: 'unknown',
-        reason: 'Insufficient data to classify (no vendor name, sender, or subject)',
+        reason: 'Insufficient data to classify',
     };
 }
 

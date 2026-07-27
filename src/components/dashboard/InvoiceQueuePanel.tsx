@@ -759,7 +759,7 @@ export default function InvoiceQueuePanel() {
                         {timeAgo(inv.processedAt)}
                       </span>
                     </div>
-                    {inv.classificationReason && (
+                    {inv.classificationReason && inv.classificationReason.trim().length > 0 && !inv.classificationReason.includes("No dropship rules") && (
                       <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
                         {inv.classificationReason}
                       </div>
@@ -956,7 +956,7 @@ export default function InvoiceQueuePanel() {
                                 {timeAgo(inv.processedAt)}
                               </span>
                             </div>
-                            {inv.classificationReason && (
+                            {inv.classificationReason && inv.classificationReason.trim().length > 0 && !inv.classificationReason.includes("No dropship rules") && (
                               <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
                                 {inv.classificationReason}
                               </div>
@@ -1063,114 +1063,143 @@ export default function InvoiceQueuePanel() {
             </div>
           )}
 
-          {/* Matched but unreconciled — has PO but no activity log; offer approve + disregard */}
+          {/* Matched but unreconciled — scannable match table */}
           {rest.filter(i => i.status === "matched_unreconciled").length > 0 && (
             <div className="border-t border-cyan-500/10">
-              <div className="px-4 py-1.5 flex items-center gap-2 bg-cyan-500/5">
-                <span className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider font-semibold">
-                  Matched — Awaiting Confirmation
-                </span>
-                <span className="ml-auto text-[10px] font-mono text-cyan-400/60">
-                  {rest.filter(i => i.status === "matched_unreconciled").length} invoice{rest.filter(i => i.status === "matched_unreconciled").length !== 1 ? "s" : ""}
-                </span>
-              </div>
-              {/* Bulk bar: Confirm all amount-matched */}
               {(() => {
                 const matched = rest.filter(i => i.status === "matched_unreconciled");
                 const amountMatched = matched.filter(i => (i as any).amountMatchesPo === true);
-                if (amountMatched.length < 2) return null;
-                return (
-                  <div className="px-4 py-1 flex items-center gap-2 bg-emerald-500/[0.03] border-b border-emerald-500/10">
-                    <span className="text-[9px] font-mono text-emerald-400/70">
-                      {amountMatched.length} amount-matched — totals match the PO
-                    </span>
-                    <div className="flex-1" />
-                    <button
-                      onClick={() => handleBulkConfirmMatched(matched)}
-                      disabled={actingOn === "bulk_confirm"}
-                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                const needsReview = matched.filter(i => (i as any).amountMatchesPo !== true);
+                // Sort each pack: $ high → low
+                const byTotal = (a: typeof matched[0], b: typeof matched[0]) =>
+                  Number(b.total ?? 0) - Number(a.total ?? 0);
+                amountMatched.sort(byTotal);
+                needsReview.sort(byTotal);
+
+                const renderMatchRow = (inv: typeof matched[0], pack: "confirm" | "review") => {
+                  const isActing = actingOn === inv.id;
+                  const amtMatch = pack === "confirm";
+                  return (
+                    <div
+                      key={inv.id}
+                      className={`grid grid-cols-[minmax(0,1.4fr)_72px_88px_100px_1fr_auto] items-center gap-2 px-4 py-1.5 border-b border-cyan-500/5 hover:bg-cyan-500/[0.03] transition-colors ${
+                        amtMatch ? "bg-emerald-500/[0.03]" : ""
+                      }`}
                     >
-                      {actingOn === "bulk_confirm" ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                      {actingOn === "bulk_confirm" ? "Confirming..." : `Confirm all amount-matched (${amountMatched.length})`}
-                    </button>
-                  </div>
-                );
-              })()}
-              {rest.filter(i => i.status === "matched_unreconciled").map(inv => {
-                const isActing = actingOn === inv.id;
-                const amtMatch = (inv as any).amountMatchesPo === true;
-                return (
-                  <div key={inv.id} className={`flex items-start gap-2.5 px-4 py-2 border-b border-cyan-500/5 hover:bg-cyan-500/[0.02] transition-colors ${amtMatch ? 'border-l-2 border-emerald-500/30' : ''}`}>
-                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-cyan-500" />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
+                      <div className="min-w-0">
+                        <div className="text-[12px] font-mono font-semibold text-zinc-100 truncate">
                           {inv.vendorName}
-                        </span>
+                        </div>
                         {inv.invoiceNumber && (
-                          <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                          <div className="text-[9px] font-mono text-zinc-500 truncate">
                             #{inv.invoiceNumber}
-                          </span>
+                          </div>
                         )}
-                        {inv.poNumber && (
-                          <span className="text-xs font-mono text-blue-400 shrink-0">
-                            → PO {inv.poNumber}
-                          </span>
-                        )}
-                        {amtMatch && (
-                          <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0">
-                            ✓ Amount Match
-                          </span>
-                        )}
-                        {inv.total !== 0 && (
-                          <span className="text-[10px] font-mono text-zinc-400 shrink-0">
-                            ${Number(inv.total).toFixed(2)}
-                          </span>
-                        )}
-                        {inv.invoiceDate && (
-                          <span className="text-[10px] font-mono text-zinc-500 shrink-0">
-                            {fmtShortDate(inv.invoiceDate)}
-                          </span>
-                        )}
-                        <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
-                          {timeAgo(inv.processedAt)}
-                        </span>
                       </div>
-                      <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                        <span className="text-[10px] font-mono text-cyan-400/60 leading-tight">
-                          {amtMatch
-                            ? "Invoice total matches PO amount — safe to confirm."
-                            : "PO matched but awaiting confirmation. Approve to confirm and learn, or disregard as not a PO purchase."
-                          }
-                        </span>
-                        <div className="flex-1" />
+                      <span className="text-[11px] font-mono text-zinc-400 tabular-nums">
+                        {inv.invoiceDate ? fmtShortDate(inv.invoiceDate) : "—"}
+                      </span>
+                      <span className="text-[12px] font-mono text-zinc-200 tabular-nums text-right">
+                        ${Number(inv.total ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      </span>
+                      <span className="text-[12px] font-mono text-blue-400 tabular-nums">
+                        PO {inv.poNumber}
+                      </span>
+                      <span className={`text-[10px] font-mono ${amtMatch ? "text-emerald-400" : "text-amber-400/80"}`}>
+                        {amtMatch ? "✓ $ matches PO" : "review $ vs PO"}
+                      </span>
+                      <div className="flex items-center gap-1 justify-end">
                         <button
                           onClick={() => handleApproveUnreconciled(inv.id, inv.poNumber || "")}
                           disabled={isActing || !inv.poNumber}
                           className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold disabled:opacity-40 transition-colors ${
                             amtMatch
                               ? "bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/50"
-                              : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30"
+                              : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/25 hover:bg-emerald-500/25"
                           }`}
-                          title={`Confirm PO ${inv.poNumber} match — removes from queue and learns for future`}
+                          title={`Confirm PO ${inv.poNumber}`}
                         >
                           {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                          {isActing ? "..." : amtMatch ? "Confirm match" : "Approve"}
+                          {amtMatch ? "Confirm" : "Approve"}
                         </button>
                         <button
                           onClick={() => handleDisregardUnreconciled(inv.id, inv.poNumber || "")}
                           disabled={isActing || !inv.poNumber}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
-                          title="Mark as not a PO purchase — removes from queue"
+                          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono text-zinc-500 border border-zinc-700/40 hover:text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+                          title="Not a PO purchase"
                         >
-                          {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
-                          {isActing ? "..." : "Dismiss"}
+                          <X className="w-3 h-3" />
                         </button>
                       </div>
                     </div>
-                  </div>
+                  );
+                };
+
+                return (
+                  <>
+                    {amountMatched.length > 0 && (
+                      <div>
+                        <div className="px-4 py-1.5 flex items-center gap-2 bg-emerald-500/10 border-b border-emerald-500/15">
+                          <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider font-semibold">
+                            Confirm — $ matches PO
+                          </span>
+                          <span className="text-[10px] font-mono text-emerald-400/60">
+                            {amountMatched.length}
+                          </span>
+                          <div className="flex-1" />
+                          {amountMatched.length >= 2 && (
+                            <button
+                              onClick={() => handleBulkConfirmMatched(amountMatched)}
+                              disabled={actingOn === "bulk_confirm"}
+                              className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/40 disabled:opacity-40"
+                            >
+                              {actingOn === "bulk_confirm" ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Check className="w-3 h-3" />
+                              )}
+                              Confirm all ({amountMatched.length})
+                            </button>
+                          )}
+                        </div>
+                        {/* Column headers */}
+                        <div className="grid grid-cols-[minmax(0,1.4fr)_72px_88px_100px_1fr_auto] gap-2 px-4 py-1 text-[9px] font-mono text-zinc-600 uppercase tracking-wider border-b border-zinc-800/80">
+                          <span>Vendor / Inv#</span>
+                          <span>Date</span>
+                          <span className="text-right">Inv $</span>
+                          <span>PO</span>
+                          <span>Status</span>
+                          <span className="text-right">Action</span>
+                        </div>
+                        {amountMatched.map((inv) => renderMatchRow(inv, "confirm"))}
+                      </div>
+                    )}
+                    {needsReview.length > 0 && (
+                      <div>
+                        <div className="px-4 py-1.5 flex items-center gap-2 bg-amber-500/5 border-b border-amber-500/10">
+                          <span className="text-[10px] font-mono text-amber-300 uppercase tracking-wider font-semibold">
+                            Review — $ differs or unknown
+                          </span>
+                          <span className="text-[10px] font-mono text-amber-400/60">
+                            {needsReview.length}
+                          </span>
+                        </div>
+                        {amountMatched.length === 0 && (
+                          <div className="grid grid-cols-[minmax(0,1.4fr)_72px_88px_100px_1fr_auto] gap-2 px-4 py-1 text-[9px] font-mono text-zinc-600 uppercase tracking-wider border-b border-zinc-800/80">
+                            <span>Vendor / Inv#</span>
+                            <span>Date</span>
+                            <span className="text-right">Inv $</span>
+                            <span>PO</span>
+                            <span>Status</span>
+                            <span className="text-right">Action</span>
+                          </div>
+                        )}
+                        {needsReview.map((inv) => renderMatchRow(inv, "review"))}
+                      </div>
+                    )}
+                  </>
                 );
-              })}
+              })()}
             </div>
           )}
 
