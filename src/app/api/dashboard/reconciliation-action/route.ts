@@ -28,10 +28,16 @@ import {
 const supabase = createClient();
 
 type ActionRequest = {
-    action: "approve" | "pause" | "dismiss" | "rematch";
+    action: "approve" | "pause" | "dismiss" | "rematch" | "disregard";
     activityLogId: string;
     dismissReason?: "already_handled" | "duplicate" | "credit_memo" | "statement" | "not_ours";
     rematchPoNumber?: string;
+    /** Keyed on vendor_invoices.id (UUID), NOT activityLogId, because unmatched
+     *  invoices have no activity log row. The existing dismiss path is unusable
+     *  for these — disregard is a separate action for the same reason. */
+    invoiceId?: string;
+    reason?: string;
+    markedBy?: string;
 };
 
 export async function POST(req: Request) {
@@ -44,23 +50,30 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 
-        // 1. Fetch the original activity log entry
-        const { data: logEntry, error: fetchError } = await supabase
-            .from("ap_activity_log")
-            .select("*")
-            .eq("id", activityLogId)
-            .single();
+        // 1. Fetch the original activity log entry (skipped for disregard — unmatched invoices have no activity log)
+        let logEntry: any = null;
+        let fetchError: any = null;
 
-        if (fetchError || !logEntry) {
-            return NextResponse.json({ error: "Activity log entry not found" }, { status: 404 });
+        if (action !== "disregard") {
+            const result = await supabase
+                .from("ap_activity_log")
+                .select("*")
+                .eq("id", activityLogId)
+                .single();
+            logEntry = result.data;
+            fetchError = result.error;
+
+            if (fetchError || !logEntry) {
+                return NextResponse.json({ error: "Activity log entry not found" }, { status: 404 });
+            }
+
+            // Allow re-action on paused items (they haven't been finalized)
+            if (logEntry.reviewed_at && logEntry.reviewed_action !== "paused") {
+                return NextResponse.json({ error: `Already ${logEntry.reviewed_action}` }, { status: 409 });
+            }
         }
 
-        // Allow re-action on paused items (they haven't been finalized)
-        if (logEntry.reviewed_at && logEntry.reviewed_action !== "paused") {
-            return NextResponse.json({ error: `Already ${logEntry.reviewed_action}` }, { status: 409 });
-        }
-
-        const metadata = logEntry.metadata || {};
+        const metadata = logEntry?.metadata || {};
         const now = new Date().toISOString();
 
         // ── APPROVE: Re-derive reconciliation from stored data, apply to Finale ──
@@ -378,6 +391,70 @@ export async function POST(req: Request) {
                 message: `🔄 Re-matched to PO ${rematchPoNumber}. Verdict: ${reconResult.overallVerdict}.`,
                 verdict: reconResult.overallVerdict,
                 summary: reconResult.summary,
+            });
+        }
+
+        // ── DISREGARD: Mark an unmatched invoice as "not a PO purchase" — no activity log needed ──
+        // Unlike dismiss (which records on ap_activity_log), disregard writes directly to
+        // vendor_invoices because unmatched invoices have no activity log entry. The action
+        // is keyed on invoiceId (vendor_invoices.id UUID), not activityLogId.
+        // DECISION(2026-08-02): Keeping disregard separate from dismiss prevents the subtle
+        // bug of trying to write reviewed_action on a non-existent activity log row, and
+        // makes it explicit in the codebase that these are different lifecycle paths.
+        if (action === "disregard") {
+            if (!body.invoiceId || typeof body.invoiceId !== "string" || body.invoiceId.trim() === "") {
+                return NextResponse.json(
+                    { error: "invoiceId is required" },
+                    { status: 400 }
+                );
+            }
+
+            // Verify the invoice exists
+            const { data: invoice, error: fetchError } = await db
+                .from("vendor_invoices")
+                .select("id, invoice_number, vendor_name")
+                .eq("id", body.invoiceId)
+                .single();
+
+            if (fetchError || !invoice) {
+                return NextResponse.json(
+                    { error: "Invoice not found" },
+                    { status: 404 }
+                );
+            }
+
+            // Set disregard columns — idempotent (setting again is not an error)
+            await db
+                .from("vendor_invoices")
+                .update({
+                    no_po_required: true,
+                    no_po_reason: body.reason || null,
+                    no_po_marked_by: body.markedBy || null,
+                    no_po_marked_at: new Date().toISOString(),
+                })
+                .eq("id", body.invoiceId);
+
+            // Phase 2 issue ledger: if this invoice has an open issue, close it
+            try {
+                const issueId = await apIssue.findApIssue({
+                    vendorName: invoice.vendor_name || "Unknown",
+                    invoiceNumber: invoice.invoice_number || "",
+                    poNumber: "",
+                    orderId: "",
+                });
+                if (issueId) {
+                    await apIssue.unblockApIssue(issueId, "working");
+                    await apIssue.completeApIssue(issueId, {
+                        resolution: "disregarded",
+                        dismissed_by: body.markedBy || "dashboard",
+                        dismiss_reason: body.reason || "not_a_po_purchase",
+                    });
+                }
+            } catch { /* non-blocking — issue ledger is best-effort */ }
+
+            return NextResponse.json({
+                success: true,
+                message: `🚫 Invoice ${invoice.invoice_number || ''} marked as not a PO purchase.`,
             });
         }
 

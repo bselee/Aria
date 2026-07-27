@@ -112,7 +112,7 @@ export async function GET(req: NextRequest) {
         const { data: invoicesRaw, error: invErr } = await db
             .from('invoices')
             .select(
-                'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, discrepancies'
+                'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, discrepancies, no_po_required'
             )
             .order('created_at', { ascending: false })
             .limit(100);
@@ -170,6 +170,10 @@ export async function GET(req: NextRequest) {
 
             // Dropship flow-through invoices never appear in the queue
             if (classResult.classification === 'dropship_flow_through') {
+                return [];
+            }
+            // Disregarded invoices (marked "not a PO purchase" by a human) are excluded
+            if (row.no_po_required === true) {
                 return [];
             }
             const invNum: string = row.invoice_number ?? '';
