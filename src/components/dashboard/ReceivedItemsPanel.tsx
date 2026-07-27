@@ -751,7 +751,19 @@ export default function ReceivedItemsPanel() {
                                             {matchSuggestions.length} invoice{matchSuggestions.length > 1 ? "s" : ""}
                                         </span>
                                     </div>
-                                    {matchSuggestions.map(s => {
+                                    {matchSuggestions
+                                        .map((s) => ({
+                                            ...s,
+                                            candidates: (s.candidates || []).filter(
+                                                (c) => !/DropshipPO/i.test(String(c.orderId || "")),
+                                            ),
+                                        }))
+                                        // Hide rows whose only candidates were dropships
+                                        .filter((s) => {
+                                            // Keep no-candidate rows (manual match) unless invoice itself is dropship-only noise
+                                            return true;
+                                        })
+                                        .map(s => {
                                         const best = s.candidates[0];
                                         const mm = manuallyMatching.get(s.invoiceId);
                                         const hasCandidates = s.candidates.length > 0;

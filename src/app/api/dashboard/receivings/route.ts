@@ -25,6 +25,33 @@ import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconcil
 const _reconcilingPOs = new Set<string>();
 // ────────────────────────────────────────────────────────────────────────────
 
+// ── Concurrency-limited async map ────────────────────────────────────────
+/**
+ * Maps an array with a bounded number of concurrent async operations.
+ * Preserves input order. Replaces unbounded Promise.all(arr.map(fn))
+ * which fans out N requests at once. Used for PostgREST loops that are
+ * NOT subject to the Finale 500ms global queue (local DB calls only).
+ */
+async function mapConcurrent<T, R>(
+    items: T[],
+    concurrency: number,
+    fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+
+    async function worker(): Promise<void> {
+        while (nextIndex < items.length) {
+            const i = nextIndex++;
+            results[i] = await fn(items[i]);
+        }
+    }
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+    await Promise.all(workers);
+    return results;
+}
+
 export function getDenverWeekStart(date: Date): string {
     const denverNow = new Date(date.toLocaleString('en-US', { timeZone: 'America/Denver' }));
     const day = denverNow.getDay();
@@ -35,14 +62,14 @@ export function getDenverWeekStart(date: Date): string {
 
 export async function GET(req: NextRequest) {
     // ── Outer guard: the route MUST NEVER hang the socket ──
-    // If the handler doesn't resolve within 25s (including Finale timeout),
+    // If the handler doesn't resolve within 45s (including Finale timeout),
     // return a graceful error payload instead of a hung connection.
-    const ROUTE_TIMEOUT_MS = 25_000;
+    const ROUTE_TIMEOUT_MS = 45_000;
     try {
         const payload = await Promise.race([
             handleGET(req),
             new Promise<NextResponse>((_, reject) =>
-                setTimeout(() => reject(new Error('Receivings route timed out (25s)')), ROUTE_TIMEOUT_MS),
+                setTimeout(() => reject(new Error(`Receivings route timed out (${ROUTE_TIMEOUT_MS / 1000}s)`)), ROUTE_TIMEOUT_MS),
             ),
         ]);
         return payload;
@@ -92,21 +119,19 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
         const finale = new FinaleClient();
         // Finale receivings can hang 60s+ under load — fail open so the panel paints.
-        // NOTE(2026-07-24): dropped from 20s -> 8s. Under a cold-start rate-limit
-        // storm, 20s is a guaranteed near-certain failure — the user was waiting
-        // out a foregone conclusion before the graceful empty-array fallback (and
-        // the outer route guard's 25s socket-safety net) ever kicked in. 8s is
-        // still generous for a healthy Finale response but stops making every
-        // page load eat a 20-second tax during the known-flaky cold-start window
-        // (see docs/dashboard-design-audit.md P0-3 / P1-3 — item 5 residual).
+        // NOTE(2026-07-27): getTodaysReceivedPOs no longer uses a soft timeout at all.
+        // Shipment enrichment on the request path is CACHE-ONLY (synchronous Map
+        // lookups, zero network I/O), with cold shipment detail fetched by a bounded
+        // single-flight background warm-up. See the DECISION block in receivings.ts.
+        // Consequence: base GraphQL POs always return promptly even when Finale is
+        // rate-limited, and there is no enrichment race left to tune here.
         let received: any[] = [];
         try {
-            received = await Promise.race([
-                finale.getTodaysReceivedPOs(startStr, tomorrowStr),
-                new Promise<any[]>((_, reject) =>
-                    setTimeout(() => reject(new Error('Finale receivings timeout (8s)')), 8_000),
-                ),
-            ]);
+            // NOTE(2026-07-27): No inner timeout here — the request path in
+            // getTodaysReceivedPOs performs no shipment network I/O, so it cannot
+            // stall on Finale rate limiting. The outer route guard (45s) remains the
+            // sole backstop for a genuinely hung connection.
+            received = await finale.getTodaysReceivedPOs(startStr, tomorrowStr);
         } catch (finaleErr: any) {
             console.warn('[receivings] Finale getTodaysReceivedPOs failed/timeout:', finaleErr?.message || finaleErr);
             received = [];
@@ -260,12 +285,34 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
                     // Hard cap — findPOCandidates hits PostgREST; unbounded loops hang the panel
                     const toScore = unmatchedInvoices.slice(0, 12);
-                    for (const inv of toScore) {
-                        try {
-                            // Prefer OCR PO candidate without DB scoring when present
-                            const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
-                            if (inv._fromCache && ocrPo) {
-                                matchSuggestions.push({
+                    // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
+                    const { classifyInvoice } = await import('@/config/invoice-classification');
+                    const filteredToScore = toScore.filter((inv: any) => {
+                        const cls = classifyInvoice({
+                            vendorName: inv.vendor_name,
+                            poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
+                        });
+                        return cls.classification !== 'dropship_flow_through';
+                    });
+                    // Prefer filtered list
+                    const scoreList = filteredToScore; // always use filtered (may be empty)
+
+                    // ── Phase A: score all invoices in parallel (read-only, concurrency 4) ──
+                    // DECISION(2026-07-27): Previously this loop scored up to 12 invoices
+                    // sequentially against 4s findPOCandidates timeouts (~48s worst case).
+                    // Now scoring runs in parallel at concurrency 4. The write/auto-apply
+                    // phase (Phase B) remains strictly sequential — financial writes must
+                    // never overlap. These are local PostgREST calls, NOT subject to the
+                    // Finale 500ms global queue.
+                    // Dropship POs/invoices are excluded before scoring (scoreList).
+                    const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
+                        // OCR short-circuit: no DB call needed — still never offer dropship POs
+                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
+                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
+                            return {
+                                inv,
+                                status: 'ocr' as const,
+                                ocrSuggestion: {
                                     invoiceId: inv.id,
                                     invoiceNumber: inv.invoice_number,
                                     vendorName: inv.vendor_name,
@@ -283,10 +330,10 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     }],
                                     autoApplyReady: false,
                                     fromCache: true,
-                                });
-                                continue;
-                            }
-
+                                },
+                            };
+                        }
+                        try {
                             const scorePromise = findPOCandidates({
                                 id: inv.id,
                                 invoiceNumber: inv.invoice_number,
@@ -297,30 +344,88 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 tax: Number(inv.tax || 0),
                                 total: Number(inv.total || 0),
                                 lineItems: inv.raw_data?.lineItems || [],
+                                ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
+                                ocrOrderCandidate: inv.raw_data?.orderNumber || null,
                             });
                             const result = await Promise.race([
                                 scorePromise,
                                 new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
                             ]);
                             if (!result) {
-                                matchSuggestions.push({
-                                    invoiceId: inv.id,
-                                    invoiceNumber: inv.invoice_number,
-                                    vendorName: inv.vendor_name,
-                                    invoiceDate: inv.invoice_date,
-                                    invoiceTotal: inv.total,
-                                    candidates: [],
-                                    autoApplyReady: false,
-                                    fromCache: !!inv._fromCache,
-                                    timedOut: true,
-                                });
-                                continue;
+                                return { inv, status: 'timed_out' as const };
                             }
+                            return { inv, status: 'scored' as const, result };
+                        } catch (err: any) {
+                            return { inv, status: 'error' as const, err };
+                        }
+                    });
+
+                    // ── Phase B: process scored results sequentially (side-effect-safe) ──
+                    for (const sr of scoredResults) {
+                        const { inv } = sr;
+                        if (sr.status === 'ocr' && sr.ocrSuggestion) {
+                            // Never offer dropship POs as OCR match targets
+                            const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
+                                (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                            );
+                            if (ocrCands.length === 0) continue;
+                            matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
+                            continue;
+                        }
+                        if (sr.status === 'timed_out') {
+                            matchSuggestions.push({
+                                invoiceId: inv.id,
+                                invoiceNumber: inv.invoice_number,
+                                vendorName: inv.vendor_name,
+                                invoiceDate: inv.invoice_date,
+                                invoiceTotal: inv.total,
+                                candidates: [],
+                                autoApplyReady: false,
+                                fromCache: !!inv._fromCache,
+                                timedOut: true,
+                            });
+                            continue;
+                        }
+                        if (sr.status === 'error') {
+                            console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
+                            continue;
+                        }
+
+                        // Scored successfully — execute side effects
+                        const result = sr.result!;
+                        // Strip dropship POs from candidates — never match those
+                        result.candidates = (result.candidates || []).filter(
+                            (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                        );
+                        if (result.candidates.length === 0) {
+                            matchSuggestions.push({
+                                invoiceId: inv.id,
+                                invoiceNumber: inv.invoice_number,
+                                vendorName: inv.vendor_name,
+                                invoiceDate: inv.invoice_date,
+                                invoiceTotal: inv.total,
+                                candidates: [],
+                                autoApplyReady: false,
+                                fromCache: !!inv._fromCache,
+                            });
+                            continue;
+                        }
+                        // Recompute best after filter
+                        result.bestMatch = result.candidates[0] || null;
+                        if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
+                            result.autoApplyReady = false;
+                        }
+                        try {
                             // Auto-apply high-confidence matches: score ≥80 and autoApplyReady
                             // Never auto-apply cache-only rows against PostgREST (id may be local)
+                            // Never auto-apply dropship POs
                             const best = result.candidates[0];
                             const shouldAutoApply =
-                                best && best.score >= 80 && result.autoApplyReady && !inv._fromCache;
+                                best &&
+                                best.score >= 80 &&
+                                result.autoApplyReady &&
+                                !inv._fromCache &&
+                                !/DropshipPO/i.test(String(best.orderId || ''));
 
                             if (shouldAutoApply) {
                                 // Auto-match: link invoice to PO, but DON'T complete PO in Finale
@@ -431,7 +536,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                             _reconcilingPOs.delete(best.orderId);
                                         }
                                     }
-                            } catch (autoApplyErr: any) {
+                                } catch (autoApplyErr: any) {
                                     console.warn(
                                         `[receivings] Auto-apply failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${autoApplyErr?.message || autoApplyErr}`,
                                     );
@@ -519,12 +624,23 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             }
 
             // ── Freight classifications for received PO vendors ──
+            // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
+            // round-trips and is now bounded-parallel at 8. These are local-DB
+            // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
+            // global queue, so real parallelism is achieved here.
             const freightClasses: Record<string, any> = {};
-            for (const v of vendorNames) {
+            const fcResults = await mapConcurrent(vendorNames, 8, async (v) => {
                 try {
-                    freightClasses[v] = await getVendorFreightClassification(v);
+                    const result = await getVendorFreightClassification(v);
+                    return { vendor: v, result };
                 } catch (fcErr: any) {
                     console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
+                    return { vendor: v, result: undefined };
+                }
+            });
+            for (const fr of fcResults) {
+                if (fr.result !== undefined) {
+                    freightClasses[fr.vendor] = fr.result;
                 }
             }
 

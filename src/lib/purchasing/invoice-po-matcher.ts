@@ -360,6 +360,11 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             reasons.push("amount unknown (OCR may have missed total)");
         }
 
+        // Never surface dropship POs as match candidates — out of AP purview
+        if (po.po_number && /DropshipPO/i.test(String(po.po_number))) {
+            continue;
+        }
+
         candidates.push({
             orderId: po.po_number,
             vendorName: po.vendor_name,
@@ -370,6 +375,13 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             reasons,
             isOpen: ["open", "partial"].includes((po.status || "").toLowerCase()),
         });
+    }
+
+    // Belt: strip any dropship that slipped through (OCR direct lookup path etc.)
+    for (let i = candidates.length - 1; i >= 0; i--) {
+        if (/DropshipPO/i.test(candidates[i].orderId || "")) {
+            candidates.splice(i, 1);
+        }
     }
 
     candidates.sort((a, b) => b.score - a.score);
