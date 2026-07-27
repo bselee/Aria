@@ -437,6 +437,52 @@ export default function InvoiceQueuePanel() {
     }
   }, []);
 
+  // Handle "Apply PO candidate" on unmatched invoice rows
+  // Assigns a PO from the candidate chips to the invoice, moving it to matched_unreconciled.
+  const handleApplyPOCandidate = useCallback(async (invoiceId: string, poNumber: string) => {
+    setActingOn(`apply:${invoiceId}:${poNumber}`);
+    setToast(null);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "apply_po_candidate", invoiceId, poNumber, markedBy: "dashboard" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error || "Apply failed", type: "error" });
+      } else {
+        setToast({ message: data.message || "PO applied", type: "success" });
+        setExpandedId(null);
+      }
+    } catch (err) {
+      setToast({ message: "Network error", type: "error" });
+    } finally {
+      setActingOn(null);
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }, []);
+
+  // Handle bulk-confirm all amount-matched unreconciled invoices
+  const handleBulkConfirmMatched = useCallback(async (items: InvoiceQueueItem[]) => {
+    setActingOn("bulk_confirm");
+    const amountMatched = items.filter(i => (i as any).amountMatchesPo === true);
+    for (const inv of amountMatched) {
+      try {
+        await fetch("/api/dashboard/reconciliation-action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "approve_unreconciled", invoiceId: inv.id, poNumber: inv.poNumber, markedBy: "dashboard" }),
+        });
+      } catch { /* continue with rest */ }
+    }
+    setActingOn(null);
+    fetchData(true);
+    setToast({ message: `Confirmed ${amountMatched.length} amount-matched invoice(s)`, type: "success" });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
   // Collapse state — persisted to localStorage
   const [isCollapsed, setIsCollapsed] = useState(false);
   useEffect(() => {
@@ -929,6 +975,45 @@ export default function InvoiceQueuePanel() {
                                 )}
                               </div>
                             )}
+                            {/* PO Candidate chips — top 3, one-click Apply (unmatched only) */}
+                            {(inv as any).poCandidates?.length > 0 && (
+                              <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                                {(inv as any).poCandidates.slice(0, 3).map((pc: any) => {
+                                  const applyKey = `apply:${inv.id}:${pc.poNumber}`;
+                                  const isApplying = actingOn === applyKey;
+                                  return (
+                                    <span
+                                      key={pc.poNumber}
+                                      className="inline-flex items-center gap-1.5 text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/25"
+                                    >
+                                      PO {pc.poNumber}
+                                      {pc.total != null && (
+                                        <span className="text-cyan-400/60">· ${Number(pc.total).toFixed(0)}</span>
+                                      )}
+                                      {pc.invoiceDate && (
+                                        <span className="text-cyan-400/50">· {fmtShortDate(pc.invoiceDate)}</span>
+                                      )}
+                                      {pc.score != null && (
+                                        <span className="text-cyan-400/50">· {pc.score}%</span>
+                                      )}
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); handleApplyPOCandidate(inv.id, pc.poNumber); }}
+                                        disabled={isApplying}
+                                        className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded text-[8px] font-mono font-semibold bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/50 disabled:opacity-40 transition-colors"
+                                        title={`Apply PO ${pc.poNumber} — ${pc.score}% confidence`}
+                                      >
+                                        {isApplying ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : "Apply"}
+                                      </button>
+                                    </span>
+                                  );
+                                })}
+                                {(inv as any).poCandidates.length > 3 && (
+                                  <span className="text-[8px] font-mono text-zinc-600">
+                                    +{(inv as any).poCandidates.length - 3} more
+                                  </span>
+                                )}
+                              </div>
+                            )}
                             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                               {/* Reason selector — compact inline buttons */}
                               {(["credit_card", "service_no_po", "not_ours", "other"] as const).map(r => (
@@ -989,10 +1074,33 @@ export default function InvoiceQueuePanel() {
                   {rest.filter(i => i.status === "matched_unreconciled").length} invoice{rest.filter(i => i.status === "matched_unreconciled").length !== 1 ? "s" : ""}
                 </span>
               </div>
+              {/* Bulk bar: Confirm all amount-matched */}
+              {(() => {
+                const matched = rest.filter(i => i.status === "matched_unreconciled");
+                const amountMatched = matched.filter(i => (i as any).amountMatchesPo === true);
+                if (amountMatched.length < 2) return null;
+                return (
+                  <div className="px-4 py-1 flex items-center gap-2 bg-emerald-500/[0.03] border-b border-emerald-500/10">
+                    <span className="text-[9px] font-mono text-emerald-400/70">
+                      {amountMatched.length} amount-matched — totals match the PO
+                    </span>
+                    <div className="flex-1" />
+                    <button
+                      onClick={() => handleBulkConfirmMatched(matched)}
+                      disabled={actingOn === "bulk_confirm"}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                    >
+                      {actingOn === "bulk_confirm" ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                      {actingOn === "bulk_confirm" ? "Confirming..." : `Confirm all amount-matched (${amountMatched.length})`}
+                    </button>
+                  </div>
+                );
+              })()}
               {rest.filter(i => i.status === "matched_unreconciled").map(inv => {
                 const isActing = actingOn === inv.id;
+                const amtMatch = (inv as any).amountMatchesPo === true;
                 return (
-                  <div key={inv.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-cyan-500/5 hover:bg-cyan-500/[0.02] transition-colors">
+                  <div key={inv.id} className={`flex items-start gap-2.5 px-4 py-2 border-b border-cyan-500/5 hover:bg-cyan-500/[0.02] transition-colors ${amtMatch ? 'border-l-2 border-emerald-500/30' : ''}`}>
                     <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-cyan-500" />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 min-w-0">
@@ -1007,6 +1115,11 @@ export default function InvoiceQueuePanel() {
                         {inv.poNumber && (
                           <span className="text-xs font-mono text-blue-400 shrink-0">
                             → PO {inv.poNumber}
+                          </span>
+                        )}
+                        {amtMatch && (
+                          <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0">
+                            ✓ Amount Match
                           </span>
                         )}
                         {inv.total !== 0 && (
@@ -1025,17 +1138,24 @@ export default function InvoiceQueuePanel() {
                       </div>
                       <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                         <span className="text-[10px] font-mono text-cyan-400/60 leading-tight">
-                          PO matched but awaiting confirmation. Approve to confirm and learn, or disregard as not a PO purchase.
+                          {amtMatch
+                            ? "Invoice total matches PO amount — safe to confirm."
+                            : "PO matched but awaiting confirmation. Approve to confirm and learn, or disregard as not a PO purchase."
+                          }
                         </span>
                         <div className="flex-1" />
                         <button
                           onClick={() => handleApproveUnreconciled(inv.id, inv.poNumber || "")}
                           disabled={isActing || !inv.poNumber}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold disabled:opacity-40 transition-colors ${
+                            amtMatch
+                              ? "bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/50"
+                              : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30"
+                          }`}
                           title={`Confirm PO ${inv.poNumber} match — removes from queue and learns for future`}
                         >
                           {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                          {isActing ? "..." : "Approve"}
+                          {isActing ? "..." : amtMatch ? "Confirm match" : "Approve"}
                         </button>
                         <button
                           onClick={() => handleDisregardUnreconciled(inv.id, inv.poNumber || "")}

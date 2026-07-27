@@ -11,8 +11,18 @@ import { createClient } from '@/lib/db';
 import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
 import { resolveStatus, isPendingStatus, type ResolvedStatus } from './resolve-status';
+import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface POCandidate {
+  poNumber: string;
+  vendorName: string;
+  total: number;
+  invoiceDate: string | null;
+  score: number;
+  remainingBalance: number;
+}
 
 export type InvoiceQueueItem = {
     id: string;
@@ -39,6 +49,13 @@ export type InvoiceQueueItem = {
     classification: InvoiceClassification;
     classificationReason: string | null;
     sourceInbox: string | null;
+    /** Top PO candidates for manual matching — populated by sibling route
+     *  (invoice-po-matcher) via multi-delivery-match.ts or primary scorer.
+     *  Optional — UI will gracefully degrade when absent. */
+    poCandidates?: POCandidate[];
+    /** Whether the invoice total matches the matched PO total within tolerance.
+     *  Used by UI to style Approve as primary "Confirm match" in matched_unreconciled. */
+    amountMatchesPo?: boolean;
 };
 
 export type InvoiceQueueStats = {
@@ -326,6 +343,76 @@ export async function GET(req: NextRequest) {
                             sourceInbox,
                         }];
         });
+
+        // ── Attach PO candidates (top 3) for unmatched rows — human chips ──
+        // Cap at 15 unmatched to keep latency bounded. Concurrency 3.
+        const unmatchedForCands = invoices
+            .filter((i) => i.status === "unmatched")
+            .slice(0, 15);
+        async function mapPool<T, R>(items: T[], concurrency: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+            const out: R[] = new Array(items.length);
+            let idx = 0;
+            async function worker() {
+                while (idx < items.length) {
+                    const i = idx++;
+                    out[i] = await fn(items[i]);
+                }
+            }
+            await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+            return out;
+        }
+        if (unmatchedForCands.length > 0) {
+            await mapPool(unmatchedForCands, 3, async (inv) => {
+                try {
+                    const mr = await findPOCandidates({
+                        id: inv.id,
+                        invoiceNumber: inv.invoiceNumber,
+                        vendorName: inv.vendorName,
+                        invoiceDate: inv.invoiceDate || "",
+                        subtotal: inv.subtotal,
+                        freight: inv.freight || 0,
+                        tax: inv.tax || 0,
+                        total: inv.total,
+                        ocrPoCandidate: inv.ocrPoCandidate,
+                        ocrOrderCandidate: inv.ocrOrderCandidate,
+                    });
+                    inv.poCandidates = (mr.candidates || []).slice(0, 3).map((c) => ({
+                        poNumber: c.orderId,
+                        vendorName: c.vendorName,
+                        total: c.total,
+                        invoiceDate: c.orderDate || null,
+                        score: c.score,
+                        remainingBalance: c.total, // full PO total as upper bound; multi-delivery refines later
+                    }));
+                } catch (e: any) {
+                    console.warn(`[invoice-queue] findPOCandidates failed for ${inv.invoiceNumber}: ${e?.message || e}`);
+                    inv.poCandidates = [];
+                }
+                return inv;
+            });
+        }
+
+        // amountMatchesPo for matched_unreconciled (within 2% of PO total)
+        const mur = invoices.filter((i) => i.status === "matched_unreconciled" && i.poNumber);
+        if (mur.length > 0) {
+            try {
+                const poNums = [...new Set(mur.map((i) => i.poNumber!).filter(Boolean))];
+                const { data: poRows } = await db
+                    .from("purchase_orders")
+                    .select("po_number, total, total_amount")
+                    .in("po_number", poNums);
+                const poTot = new Map<string, number>();
+                for (const p of poRows || []) {
+                    poTot.set(String((p as any).po_number), Number((p as any).total_amount || (p as any).total || 0));
+                }
+                for (const inv of mur) {
+                    const pt = poTot.get(String(inv.poNumber)) || 0;
+                    inv.amountMatchesPo = pt > 0 && Math.abs(inv.total - pt) / pt <= 0.02;
+                }
+            } catch (e: any) {
+                console.warn(`[invoice-queue] amountMatchesPo lookup failed: ${e?.message || e}`);
+            }
+        }
 
         // ── Sort: ap@ unmatched first (real exceptions), then high-dollar first ──
         invoices.sort((a, b) => {

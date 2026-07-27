@@ -38,6 +38,16 @@ vi.mock("./resolve-status", () => ({
     isPendingStatus: vi.fn().mockReturnValue(false),
 }));
 
+// findPOCandidates pulls Finale via invoice-po-matcher — mock entirely
+vi.mock("@/lib/purchasing/invoice-po-matcher", () => ({
+    findPOCandidates: vi.fn().mockResolvedValue({
+        candidates: [],
+        bestMatch: null,
+        autoApplyReady: false,
+        invoice: {},
+    }),
+}));
+
 const { GET } = await import("./route");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

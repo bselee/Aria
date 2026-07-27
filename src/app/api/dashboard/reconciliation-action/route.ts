@@ -24,12 +24,17 @@ import {
     resolvePendingReconciliationOutcomeBySource,
     writeReconciliationOutcome,
 } from "@/lib/runtime/observability/reconciliation-outcomes";
+import {
+    runAutoMatchUnmatched,
+    applyPOCandidate as libApplyPOCandidate,
+    approveCloseMatchUnreconciled,
+} from "@/lib/purchasing/auto-match-unmatched";
 
 const supabase = createClient();
 
 type ActionRequest = {
-    action: "approve" | "pause" | "dismiss" | "rematch" | "disregard" | "approve_unreconciled" | "disregard_unreconciled";
-    activityLogId: string;
+    action: "approve" | "pause" | "dismiss" | "rematch" | "disregard" | "approve_unreconciled" | "disregard_unreconciled" | "run_auto_match" | "apply_po_candidate" | "approve_matched_unreconciled_bulk";
+    activityLogId?: string;
     dismissReason?: "already_handled" | "duplicate" | "credit_memo" | "statement" | "not_ours";
     rematchPoNumber?: string;
     /** Keyed on vendor_invoices.id (UUID), NOT activityLogId, because unmatched
@@ -57,7 +62,7 @@ export async function POST(req: Request) {
         let logEntry: any = null;
         let fetchError: any = null;
 
-        if (action !== "disregard" && action !== "approve_unreconciled" && action !== "disregard_unreconciled" && action !== "disregard_vendor") {
+        if (action !== "disregard" && action !== "approve_unreconciled" && action !== "disregard_unreconciled" && action !== "disregard_vendor" && action !== "apply_po_candidate" && action !== "run_auto_match" && action !== "approve_matched_unreconciled_bulk") {
             const result = await supabase
                 .from("ap_activity_log")
                 .select("*")
@@ -737,6 +742,123 @@ export async function POST(req: Request) {
             return NextResponse.json({
                 success: true,
                 message: `🚫 Invoice ${invoice.invoice_number || ''} (${invoice.vendor_name || 'vendor'}) marked as not a PO purchase. Vendor disregard count updated.`,
+            });
+        }
+
+        // ── APPLY PO CANDIDATE: Assign a PO to an unmatched invoice via chip click ──
+        // Unmatched invoices have no activity log entry. This action assigns the selected
+        // PO to the invoice, making it matched_unreconciled so the user can confirm or
+        // dismiss it from the matched section.
+        if (action === "apply_po_candidate") {
+            if (!body.invoiceId || typeof body.invoiceId !== "string" || body.invoiceId.trim() === "") {
+                return NextResponse.json(
+                    { error: "invoiceId is required" },
+                    { status: 400 }
+                );
+            }
+            if (!body.poNumber || typeof body.poNumber !== "string" || body.poNumber.trim() === "") {
+                return NextResponse.json(
+                    { error: "poNumber is required" },
+                    { status: 400 }
+                );
+            }
+
+            // Verify the invoice exists
+            const { data: invoice, error: fetchError } = await db
+                .from("vendor_invoices")
+                .select("id, invoice_number, vendor_name, po_number")
+                .eq("id", body.invoiceId)
+                .single();
+
+            if (fetchError || !invoice) {
+                return NextResponse.json(
+                    { error: "Invoice not found" },
+                    { status: 404 }
+                );
+            }
+
+            // Skip if already has a PO
+            if (invoice.po_number) {
+                return NextResponse.json({
+                    success: true,
+                    message: `Invoice ${invoice.invoice_number || ''} already has PO ${invoice.po_number}.`,
+                });
+            }
+
+            const poNumber = body.poNumber.trim();
+            const now = new Date().toISOString();
+
+            // Update vendor_invoices with the selected PO
+            await db
+                .from("vendor_invoices")
+                .update({
+                    po_number: poNumber,
+                    reconciled_at: now,
+                    updated_at: now,
+                })
+                .eq("id", body.invoiceId);
+
+            // Also update the invoices table so the queue picks up the change
+            if (invoice.invoice_number) {
+                await db
+                    .from("invoices")
+                    .update({
+                        po_number: poNumber,
+                        updated_at: now,
+                    })
+                    .eq("invoice_number", invoice.invoice_number)
+                    .eq("vendor_name", invoice.vendor_name);
+            }
+
+            // Insert an ap_activity_log stub so the queue re-classifies this
+            // invoice as matched_unreconciled (no review yet — user will confirm
+            // or dismiss from the matched section)
+            await db.from("ap_activity_log").insert({
+                email_from: invoice.vendor_name || "Unknown",
+                email_subject: `PO candidate applied: Invoice ${invoice.invoice_number || ''} → PO ${poNumber}`,
+                intent: "RECONCILIATION",
+                action_taken: "PO candidate applied from dashboard — awaiting confirmation",
+                reviewed_at: null,
+                reviewed_action: null,
+                metadata: {
+                    invoiceNumber: invoice.invoice_number || "",
+                    vendorName: invoice.vendor_name || "",
+                    orderId: poNumber,
+                    source: "dashboard_apply_po_candidate",
+                },
+            });
+
+            return NextResponse.json({
+                success: true,
+                message: `✅ PO ${poNumber} applied to invoice ${invoice.invoice_number || ''} (${invoice.vendor_name || 'vendor'}). Confirm match in the Matched section.`,
+            });
+        }
+
+        // ── RUN AUTO MATCH: Batch auto-match unmatched invoices ──────────────
+        // Admin/dashboard trigger: runs the batch auto-match runner and returns
+        // a summary. Does not require activityLogId.
+        if (action === "run_auto_match") {
+            const result = await runAutoMatchUnmatched(100);
+
+            return NextResponse.json({
+                success: true,
+                message: `🤖 Auto-match complete: examined ${result.examined}, auto-matched ${result.autoApplied.length}, skipped ${result.skipped.length}, errors ${result.errors}.`,
+                result,
+            });
+        }
+
+        // ── APPROVE CLOSE-MATCH UNRECONCILED: Auto-approve matched_unreconciled
+        //    invoices within 2% of PO total ────────────────────────────────────
+        // Scans all matched_unreconciled invoices, checks amount proximity to
+        // PO total, and auto-approves those within 2% variance.
+        if (action === "approve_matched_unreconciled_bulk") {
+            const { approved, errors } = await approveCloseMatchUnreconciled();
+
+            return NextResponse.json({
+                success: true,
+                message: `✅ Auto-approved ${approved} matched_unreconciled invoice(s) within 2% of PO total. ${errors} error(s).`,
+                approved,
+                errors,
             });
         }
 

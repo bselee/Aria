@@ -28,6 +28,9 @@ import {
     resolveCanonicalVendor,
     loadVendorAliases,
 } from "@/lib/purchasing/vendor-name-normalize";
+import { sanitizeOcrPoCandidate } from "@/lib/purchasing/ocr-po-sanitize";
+
+export { sanitizeOcrPoCandidate };
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +45,11 @@ export interface InvoiceToMatch {
     total: number;
     /** Optional line items from OCR or invoice cache. Used for line-level matching. */
     lineItems?: Array<{ sku?: string; qty?: number; unitPrice?: number; description?: string }>;
+    /** Raw OCR-extracted PO number candidate from invoice PDF/email data.
+     *  Sanitized by sanitizeOcrPoCandidate for exact-match lookup. */
+    ocrPoCandidate?: string | null;
+    /** Raw OCR-extracted order reference (alternative PO source, e.g. "orderRef" or "orderNumber"). */
+    ocrOrderCandidate?: string | null;
 }
 
 export interface POCandidate {
@@ -366,13 +374,133 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
     candidates.sort((a, b) => b.score - a.score);
     const bestMatch = candidates.length > 0 ? candidates[0] : null;
-    // Auto-apply requires: single candidate, score ≥80, AND non-zero invoice amount.
-    // $0 invoices (bad OCR) always need human review.
-    const autoApplyReady = candidates.length === 1
+    let autoApplyReady = candidates.length === 1
         && bestMatch!.score >= AUTO_APPLY_THRESHOLD
         && invoice.total > 0;
 
-    return { invoice, candidates, bestMatch, autoApplyReady };
+    // ── Tier A: Exact OCR PO match ────────────────────────────────────────
+    // If the invoice carries a raw OCR PO candidate (from raw_data.poNumber,
+    // orderRef, etc.), sanitize it and check if it exactly matches a PO in
+    // our candidate list. This beats all scoring — the OCR directly named
+    // the PO, so score = 100, autoApplyReady = true.
+    const sanitizedOcrPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
+        || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
+    if (sanitizedOcrPo) {
+        const exactMatch = candidates.find(
+            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase()
+        );
+        if (exactMatch) {
+            exactMatch.score = 100;
+            exactMatch.reasons.push(`exact OCR PO match: ${sanitizedOcrPo}`);
+            // Promote to top of sorted list
+            candidates.sort((a, b) => b.score - a.score);
+            autoApplyReady = candidates[0] === exactMatch && invoice.total > 0;
+        }
+    }
+
+    // ── Tier A: Unique vendor + amount ±2% + date ±14d ────────────────────
+    // When only one candidate meets all three tight criteria, it's high-
+    // confidence even if the base score is below threshold.
+    if (!autoApplyReady && candidates.length > 0 && invoice.total > 0) {
+        const tightCandidates = candidates.filter(c => {
+            // Vendor score >= 30 (exact, substring, or alias match)
+            const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
+            if (vScore.score < 30) return false;
+
+            // Amount variance <= 2%
+            if (c.total <= 0) return false;
+            const amtPct = Math.abs(invoice.total - c.total) / c.total;
+            if (amtPct > 0.02) return false;
+
+            // Date within 14 days
+            const normDate = (s: string) => (s || "").slice(0, 10);
+            const invTs = new Date(normDate(invoice.invoiceDate) + "T12:00:00Z").getTime();
+            const poTs = new Date(normDate(c.orderDate) + "T12:00:00Z").getTime();
+            if (isNaN(invTs) || isNaN(poTs)) return false;
+            const days = Math.abs((invTs - poTs) / 86_400_000);
+            if (days > 14) return false;
+
+            return true;
+        });
+
+        if (tightCandidates.length === 1) {
+            tightCandidates[0].score = Math.max(tightCandidates[0].score, 90);
+            tightCandidates[0].reasons.push(
+                "unique vendor+amount±2%+date±14d"
+            );
+            candidates.sort((a, b) => b.score - a.score);
+            autoApplyReady = true;
+        }
+    }
+
+    return { invoice, candidates, bestMatch: candidates[0] || null, autoApplyReady };
+}
+
+// ── Tier A: High-confidence auto-match (pure function) ──────────────────────
+
+/**
+ * Post-process a set of scored candidates and determine if a high-confidence
+ * auto-match is available. This is the pure-function counterpart to the
+ * Tier A logic embedded in findPOCandidates — useful for batch runners that
+ * want to separate candidate search from match decision.
+ *
+ * Returns a simplified match decision (or null) without mutating inputs.
+ */
+export interface HighConfidenceDecision {
+    poNumber: string;
+    score: number;
+    reason: string;
+    tier: "exact_ocr" | "unique_vendor_amount_date";
+}
+
+export function tryHighConfidenceAutoMatch(
+    invoice: InvoiceToMatch,
+    candidates: POCandidate[],
+): HighConfidenceDecision | null {
+    if (candidates.length === 0 || invoice.total <= 0) return null;
+
+    // Tier A-1: Exact OCR PO match
+    const sanitizedOcrPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
+        || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
+    if (sanitizedOcrPo) {
+        const exactMatch = candidates.find(
+            c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase()
+        );
+        if (exactMatch) {
+            return {
+                poNumber: exactMatch.orderId,
+                score: 100,
+                reason: `exact OCR PO match: ${sanitizedOcrPo}`,
+                tier: "exact_ocr",
+            };
+        }
+    }
+
+    // Tier A-2: Unique vendor + amount ±2% + date ±14d
+    const tightCandidates = candidates.filter(c => {
+        const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
+        if (vScore.score < 30) return false;
+        if (c.total <= 0) return false;
+        const amtPct = Math.abs(invoice.total - c.total) / c.total;
+        if (amtPct > 0.02) return false;
+        const normDate = (s: string) => (s || "").slice(0, 10);
+        const invTs = new Date(normDate(invoice.invoiceDate) + "T12:00:00Z").getTime();
+        const poTs = new Date(normDate(c.orderDate) + "T12:00:00Z").getTime();
+        if (isNaN(invTs) || isNaN(poTs)) return false;
+        const days = Math.abs((invTs - poTs) / 86_400_000);
+        return days <= 14;
+    });
+
+    if (tightCandidates.length === 1) {
+        return {
+            poNumber: tightCandidates[0].orderId,
+            score: Math.max(tightCandidates[0].score, 90),
+            reason: "unique vendor+amount±2%+date±14d",
+            tier: "unique_vendor_amount_date",
+        };
+    }
+
+    return null;
 }
 
 // ── Batch auto-match (for cron) ────────────────────────────────────────────
@@ -405,6 +533,8 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
             freight: Number(inv.freight || 0),
             tax: Number(inv.tax || 0),
             total: Number(inv.total || 0),
+            ocrPoCandidate: inv.raw_data?.poNumber || null,
+            ocrOrderCandidate: inv.raw_data?.orderRef || inv.raw_data?.orderNumber || null,
         };
 
         const result = await findPOCandidates(invoice);
