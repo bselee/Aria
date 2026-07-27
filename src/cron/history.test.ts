@@ -2,7 +2,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const fromMock = vi.fn();
 
-vi.mock("../lib/supabase", () => ({
+// CRITICAL(2026-07-27): mock the module `history.ts` ACTUALLY imports — `../lib/db`.
+// This file previously mocked `../lib/supabase` (a thin re-export of ../lib/db). Vitest
+// mocked that re-export, but history.ts imports ../lib/db directly, so the mock NEVER
+// applied and every test in this file executed against the LIVE production database.
+//
+// Consequences observed before the fix:
+//   * 32 junk rows with task_name='x' inserted into the real cron_runs table.
+//   * The recordEnd test below (duration_ms=1234, failureMessage='boom') combined with
+//     the unfiltered-PATCH bug in db.ts to stamp that fixture payload onto 125,202
+//     production rows — the fabricated "99.96% cron failure rate".
+//
+// Rule: always mock the module path the code under test imports, not an alias/re-export
+// of it. If a test asserts a mocked return value but receives realistic-looking data
+// (a real autoincrement id instead of the stubbed 99), the mock is not engaged.
+vi.mock("../lib/db", () => ({
     createClient: () => ({ from: fromMock }),
 }));
 
