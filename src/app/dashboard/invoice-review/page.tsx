@@ -115,6 +115,43 @@ function timeAgo(iso: string): string {
     return `${Math.floor(hrs / 24)}d ago`;
 }
 
+/** Parse messy invoice dates: 2026-05-20, 2026/05/29, 05/28/26, 5/6/26, ISO */
+function parseInvoiceDate(raw: string | null | undefined): Date | null {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+        const d = new Date(s.includes("T") ? s : s.slice(0, 10) + "T12:00:00");
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const ymd = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+    if (ymd) {
+        const d = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]), 12);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (mdy) {
+        let y = Number(mdy[3]);
+        if (y < 100) y += 2000;
+        const d = new Date(y, Number(mdy[1]) - 1, Number(mdy[2]), 12);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+function fmtInvDate(raw: string | null | undefined): string {
+    const d = parseInvoiceDate(raw);
+    if (!d) return "—";
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function fmtInvDateLong(raw: string | null | undefined): string {
+    const d = parseInvoiceDate(raw);
+    if (!d) return "—";
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
 function verdictBadgeClasses(verdict: string): string {
     switch (verdict) {
         case "auto_approve":
@@ -234,8 +271,31 @@ function QueueRow({
     active: boolean;
     onClick: () => void;
 }) {
-    const isShortShip = item.status === "short_shipment_hold";
-    const dotClass = isShortShip ? "bg-orange-500 animate-pulse" : "bg-amber-400 animate-pulse";
+    const status = item.status;
+    const isShortShip = status === "short_shipment_hold";
+    const isUnmatched = status === "unmatched";
+    const isMatched = status === "matched_unreconciled";
+    const amtOk = (item as any).amountMatchesPo === true;
+
+    const dotClass = isShortShip
+        ? "bg-orange-500 animate-pulse"
+        : isUnmatched
+          ? "bg-rose-500"
+          : isMatched && amtOk
+            ? "bg-emerald-500"
+            : isMatched
+              ? "bg-cyan-500"
+              : "bg-amber-400 animate-pulse";
+
+    const statusLabel = isUnmatched
+        ? "NO PO"
+        : isMatched
+          ? amtOk
+            ? "CONFIRM"
+            : "MATCHED"
+          : isShortShip
+            ? "SHORT"
+            : "PENDING";
 
     return (
         <button
@@ -248,18 +308,33 @@ function QueueRow({
             <div className="flex items-center gap-1.5">
                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotClass}`} />
                 <span className="text-dash-l1 text-sm font-medium truncate">{item.vendorName}</span>
+                <span
+                    className={`ml-auto text-[9px] font-mono uppercase shrink-0 ${
+                        isUnmatched
+                            ? "text-rose-400"
+                            : isMatched && amtOk
+                              ? "text-emerald-400"
+                              : isMatched
+                                ? "text-cyan-400"
+                                : "text-amber-400"
+                    }`}
+                >
+                    {statusLabel}
+                </span>
             </div>
             <div className="flex items-center justify-between mt-0.5 pl-3">
                 <span className="text-dash-l2 text-xs font-mono">
-                    #{item.invoiceNumber} · {fmtDollars(item.total)}
+                    {item.invoiceNumber ? `#${item.invoiceNumber} · ` : ""}
+                    {fmtDollars(item.total)}
+                    {item.poNumber ? ` · PO ${item.poNumber}` : ""}
                 </span>
-                <span className="text-dash-l3 text-[10px] font-mono uppercase">{timeAgo(item.processedAt)}</span>
+                <span className="text-dash-l3 text-[10px] font-mono">
+                    {item.invoiceDate ? fmtInvDate(item.invoiceDate) : timeAgo(item.processedAt)}
+                </span>
             </div>
             {item.dollarImpact !== null && item.dollarImpact !== 0 && (
                 <div className="pl-3 mt-0.5">
-                    <span className="text-[10px] font-mono text-amber-400">
-                        Δ {fmtDollars(item.dollarImpact)}
-                    </span>
+                    <span className="text-[10px] font-mono text-amber-400">Δ {fmtDollars(item.dollarImpact)}</span>
                 </div>
             )}
         </button>
@@ -274,11 +349,32 @@ function FocusedReview({
     actingOn,
 }: {
     item: InvoiceQueueItem;
-    onAction: (action: "approve" | "pause" | "dismiss" | "rematch", rematchPo?: string) => void;
+    onAction: (
+        action:
+            | "approve"
+            | "pause"
+            | "dismiss"
+            | "rematch"
+            | "approve_unreconciled"
+            | "disregard_unreconciled"
+            | "disregard"
+            | "apply_po_candidate",
+        rematchPo?: string,
+    ) => void;
     actingOn: boolean;
 }) {
     const [rematchInput, setRematchInput] = useState("");
     const [showRematch, setShowRematch] = useState(false);
+
+    const isUnmatched = item.status === "unmatched";
+    const isMatched = item.status === "matched_unreconciled";
+    const amtOk = (item as any).amountMatchesPo === true;
+    const chips = ((item as any).poCandidates || []) as Array<{
+        poNumber: string;
+        total?: number;
+        invoiceDate?: string | null;
+        score?: number;
+    }>;
 
     const metadata = (item.metadata ?? {}) as Record<string, any>;
     const priceChanges = ((metadata.priceChanges ?? []) as PriceChangeRow[]).map(normalizePriceChange);
@@ -327,12 +423,214 @@ function FocusedReview({
                 </div>
             </div>
 
+            {/* Action bar — status-aware */}
+            <div className="px-6 py-4 border-t border-zinc-800 shrink-0 space-y-3">
+                {/* Match context for humans */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] font-mono">
+                    <div className="bg-zinc-900/60 border border-zinc-800 rounded px-2 py-1.5">
+                        <div className="text-zinc-500 uppercase text-[9px]">Invoice $</div>
+                        <div className="text-zinc-100">{fmtDollars(item.total)}</div>
+                    </div>
+                    <div className="bg-zinc-900/60 border border-zinc-800 rounded px-2 py-1.5">
+                        <div className="text-zinc-500 uppercase text-[9px]">Inv date</div>
+                        <div className="text-zinc-100">
+                            {fmtInvDateLong(item.invoiceDate)}
+                        </div>
+                    </div>
+                    <div className="bg-zinc-900/60 border border-zinc-800 rounded px-2 py-1.5">
+                        <div className="text-zinc-500 uppercase text-[9px]">PO</div>
+                        <div className={item.poNumber ? "text-blue-400" : "text-rose-400"}>
+                            {item.poNumber || "none"}
+                        </div>
+                    </div>
+                    <div className="bg-zinc-900/60 border border-zinc-800 rounded px-2 py-1.5">
+                        <div className="text-zinc-500 uppercase text-[9px]">Status</div>
+                        <div
+                            className={
+                                isUnmatched
+                                    ? "text-rose-400"
+                                    : isMatched && amtOk
+                                      ? "text-emerald-400"
+                                      : isMatched
+                                        ? "text-cyan-400"
+                                        : "text-amber-400"
+                            }
+                        >
+                            {isUnmatched
+                                ? "Need PO"
+                                : isMatched && amtOk
+                                  ? "$ matches — confirm"
+                                  : isMatched
+                                    ? "Matched — review $"
+                                    : String(verdict).replace(/_/g, " ")}
+                        </div>
+                    </div>
+                </div>
+
+                {isUnmatched && chips.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                        <span className="text-[10px] font-mono text-zinc-500 self-center mr-1">Apply PO:</span>
+                        {chips.slice(0, 4).map((pc) => (
+                            <button
+                                key={pc.poNumber}
+                                type="button"
+                                disabled={actingOn}
+                                onClick={() => onAction("apply_po_candidate", pc.poNumber)}
+                                className="inline-flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/20 disabled:opacity-40"
+                            >
+                                PO {pc.poNumber}
+                                {pc.total != null && <span className="text-cyan-400/60">· ${Number(pc.total).toFixed(0)}</span>}
+                                {pc.score != null && <span className="text-cyan-400/50">· {pc.score}</span>}
+                            </button>
+                        ))}
+                    </div>
+                )}
+
+                {isUnmatched && (item.ocrPoCandidate || item.ocrOrderCandidate) && (
+                    <div className="text-[11px] font-mono text-zinc-500">
+                        OCR found:{" "}
+                        {item.ocrPoCandidate && <span className="text-zinc-300">PO {item.ocrPoCandidate}</span>}
+                        {item.ocrPoCandidate && item.ocrOrderCandidate && " · "}
+                        {item.ocrOrderCandidate && <span className="text-zinc-300">order {item.ocrOrderCandidate}</span>}
+                    </div>
+                )}
+
+                {showRematch ? (
+                    <div className="flex items-center gap-2">
+                        <input
+                            type="text"
+                            value={rematchInput}
+                            onChange={(e) => setRematchInput(e.target.value)}
+                            placeholder="PO number to apply…"
+                            className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-dash-l1 text-sm font-mono focus:outline-none focus:border-amber-500/50"
+                            autoFocus
+                        />
+                        <button
+                            type="button"
+                            disabled={!rematchInput.trim() || actingOn}
+                            onClick={() => {
+                                if (isUnmatched || isMatched) {
+                                    onAction("apply_po_candidate", rematchInput.trim());
+                                } else {
+                                    onAction("rematch", rematchInput.trim());
+                                }
+                                setShowRematch(false);
+                                setRematchInput("");
+                            }}
+                            className="px-3 py-1.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-xs font-medium disabled:opacity-40"
+                        >
+                            Confirm
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setShowRematch(false)}
+                            className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-dash-l2 border border-zinc-700 text-xs"
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                ) : isMatched ? (
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                            type="button"
+                            disabled={actingOn || !item.poNumber}
+                            onClick={() => onAction("approve_unreconciled")}
+                            className={`flex-1 min-w-[140px] px-4 py-2.5 rounded border text-sm font-semibold inline-flex items-center justify-center gap-1.5 disabled:opacity-40 ${
+                                amtOk
+                                    ? "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border-emerald-500/40"
+                                    : "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
+                            }`}
+                        >
+                            <CheckCircle2 className="w-4 h-4" />
+                            {amtOk ? "Confirm match" : "Approve match"}
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => setShowRematch(true)}
+                            className="px-4 py-2.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <Shuffle className="w-4 h-4" />
+                            Change PO
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => onAction("disregard_unreconciled")}
+                            className="px-4 py-2.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <XCircle className="w-4 h-4" />
+                            Not a PO
+                        </button>
+                    </div>
+                ) : isUnmatched ? (
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => setShowRematch(true)}
+                            className="flex-1 min-w-[140px] px-4 py-2.5 rounded bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-sm font-semibold inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <Shuffle className="w-4 h-4" />
+                            Enter PO #
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => onAction("disregard")}
+                            className="flex-1 min-w-[140px] px-4 py-2.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <XCircle className="w-4 h-4" />
+                            Not a PO purchase
+                        </button>
+                    </div>
+                ) : (
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => onAction("approve")}
+                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-sm font-semibold inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <CheckCircle2 className="w-4 h-4" />
+                            Approve
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => onAction("pause")}
+                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-zinc-800 hover:bg-zinc-700 text-dash-l2 border border-zinc-700 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <PauseCircle className="w-4 h-4" />
+                            Pause
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => setShowRematch(true)}
+                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <Shuffle className="w-4 h-4" />
+                            Rematch
+                        </button>
+                        <button
+                            type="button"
+                            disabled={actingOn}
+                            onClick={() => onAction("dismiss")}
+                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                        >
+                            <XCircle className="w-4 h-4" />
+                            Dismiss
+                        </button>
+                    </div>
+                )}
+            </div>
+
             {/* Two-column diff */}
             <div className="flex-1 overflow-y-auto px-6 py-4">
                 {meaningfulPrices.length === 0 && feeChanges.length === 0 && shortShipLines.length === 0 && (
-                    <div className="text-dash-l2 text-sm italic py-8 text-center">
-                        No line-item differences recorded for this invoice — reasoning may be summarized in the
-                        activity log only.
+                    <div className="text-dash-l3 text-xs py-4 text-center border border-zinc-800/80 rounded-lg bg-zinc-900/40">
+                        No line-item diffs stored — decide from the match summary above (Inv $ · Date · PO).
                     </div>
                 )}
 
@@ -463,79 +761,6 @@ function FocusedReview({
                 )}
             </div>
 
-            {/* Action bar */}
-            <div className="px-6 py-4 border-t border-zinc-800 shrink-0">
-                {showRematch ? (
-                    <div className="flex items-center gap-2">
-                        <input
-                            type="text"
-                            value={rematchInput}
-                            onChange={(e) => setRematchInput(e.target.value)}
-                            placeholder="PO number to rematch to…"
-                            className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-dash-l1 text-sm font-mono focus:outline-none focus:border-amber-500/50"
-                            autoFocus
-                        />
-                        <button
-                            type="button"
-                            disabled={!rematchInput.trim() || actingOn}
-                            onClick={() => {
-                                onAction("rematch", rematchInput.trim());
-                                setShowRematch(false);
-                                setRematchInput("");
-                            }}
-                            className="px-3 py-1.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-xs font-medium disabled:opacity-40"
-                        >
-                            Confirm
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => setShowRematch(false)}
-                            className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-dash-l2 border border-zinc-700 text-xs"
-                        >
-                            Cancel
-                        </button>
-                    </div>
-                ) : (
-                    <div className="flex items-center gap-2 flex-wrap">
-                        <button
-                            type="button"
-                            disabled={actingOn}
-                            onClick={() => onAction("approve")}
-                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-sm font-semibold inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
-                        >
-                            <CheckCircle2 className="w-4 h-4" />
-                            Approve
-                        </button>
-                        <button
-                            type="button"
-                            disabled={actingOn}
-                            onClick={() => onAction("pause")}
-                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-zinc-800 hover:bg-zinc-700 text-dash-l2 border border-zinc-700 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
-                        >
-                            <PauseCircle className="w-4 h-4" />
-                            Pause
-                        </button>
-                        <button
-                            type="button"
-                            disabled={actingOn}
-                            onClick={() => setShowRematch(true)}
-                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
-                        >
-                            <Shuffle className="w-4 h-4" />
-                            Rematch
-                        </button>
-                        <button
-                            type="button"
-                            disabled={actingOn}
-                            onClick={() => onAction("dismiss")}
-                            className="flex-1 min-w-[120px] px-4 py-2.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-sm font-medium inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
-                        >
-                            <XCircle className="w-4 h-4" />
-                            Dismiss
-                        </button>
-                    </div>
-                )}
-            </div>
         </div>
     );
 }
@@ -548,36 +773,108 @@ export default function InvoiceReviewPage() {
     const [actingOn, setActingOn] = useState(false);
     const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
-    const pending = useMemo(
-        () => invoices.filter((i) => i.status === "needs_approval" || i.status === "short_shipment_hold"),
-        [invoices],
-    );
+    // Full work queue — not just activity-log needs_approval
+    const pending = useMemo(() => {
+        const actionable = invoices.filter(
+            (i) =>
+                i.status === "needs_approval" ||
+                i.status === "short_shipment_hold" ||
+                i.status === "matched_unreconciled" ||
+                i.status === "unmatched",
+        );
+        // Sort: confirm-ready matches first, then other matched, then unmatched by $, then pending
+        const rank = (i: InvoiceQueueItem) => {
+            if (i.status === "matched_unreconciled" && (i as any).amountMatchesPo) return 0;
+            if (i.status === "matched_unreconciled") return 1;
+            if (i.status === "needs_approval" || i.status === "short_shipment_hold") return 2;
+            return 3; // unmatched
+        };
+        return [...actionable].sort((a, b) => {
+            const ra = rank(a);
+            const rb = rank(b);
+            if (ra !== rb) return ra - rb;
+            return Number(b.total ?? 0) - Number(a.total ?? 0);
+        });
+    }, [invoices]);
 
     const selected = useMemo(
-        () => pending.find((i) => i.activityLogId === selectedId) ?? pending[0] ?? null,
+        () => pending.find((i) => i.id === selectedId) ?? pending[0] ?? null,
         [pending, selectedId],
     );
 
     useEffect(() => {
         if (!selectedId && pending.length > 0) {
-            setSelectedId(pending[0].activityLogId);
+            setSelectedId(pending[0].id);
+        }
+        // If current selection left the queue, jump to next
+        if (selectedId && pending.length > 0 && !pending.some((i) => i.id === selectedId)) {
+            setSelectedId(pending[0].id);
         }
     }, [pending, selectedId]);
 
     const handleAction = useCallback(
-        async (action: "approve" | "pause" | "dismiss" | "rematch", rematchPo?: string) => {
-            if (!selected?.activityLogId) return;
+        async (
+            action:
+                | "approve"
+                | "pause"
+                | "dismiss"
+                | "rematch"
+                | "approve_unreconciled"
+                | "disregard_unreconciled"
+                | "disregard"
+                | "apply_po_candidate",
+            rematchPo?: string,
+        ) => {
+            if (!selected) return;
             setActingOn(true);
             setToast(null);
             try {
-                const res = await fetch("/api/dashboard/reconciliation-action", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
+                let body: Record<string, unknown>;
+                if (action === "approve_unreconciled") {
+                    body = {
+                        action: "approve_unreconciled",
+                        invoiceId: selected.id,
+                        poNumber: selected.poNumber,
+                        markedBy: "invoice-review",
+                    };
+                } else if (action === "disregard_unreconciled") {
+                    body = {
+                        action: "disregard_unreconciled",
+                        invoiceId: selected.id,
+                        poNumber: selected.poNumber,
+                        markedBy: "invoice-review",
+                    };
+                } else if (action === "disregard") {
+                    body = {
+                        action: "disregard",
+                        invoiceId: selected.id,
+                        reason: "not_ours",
+                        markedBy: "invoice-review",
+                    };
+                } else if (action === "apply_po_candidate") {
+                    body = {
+                        action: "apply_po_candidate",
+                        invoiceId: selected.id,
+                        poNumber: rematchPo,
+                        markedBy: "invoice-review",
+                    };
+                } else {
+                    if (!selected.activityLogId) {
+                        setToast({ message: "No activity log for this action", type: "error" });
+                        setActingOn(false);
+                        return;
+                    }
+                    body = {
                         activityLogId: selected.activityLogId,
                         action,
                         ...(action === "rematch" ? { rematchPoNumber: rematchPo } : {}),
-                    }),
+                    };
+                }
+
+                const res = await fetch("/api/dashboard/reconciliation-action", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
                 });
                 const data = await res.json();
                 if (!res.ok || data.success === false) {
@@ -597,6 +894,10 @@ export default function InvoiceReviewPage() {
         [selected, reload],
     );
 
+    const confirmCount = pending.filter((i) => i.status === "matched_unreconciled" && (i as any).amountMatchesPo).length;
+    const matchedCount = pending.filter((i) => i.status === "matched_unreconciled").length;
+    const unmatchedCount = pending.filter((i) => i.status === "unmatched").length;
+
     return (
         <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col">
             {/* Page header */}
@@ -611,7 +912,12 @@ export default function InvoiceReviewPage() {
                     </Link>
                     <h1 className="text-2xl font-semibold text-dash-l1 mt-2">Invoice Review</h1>
                     <p className="text-xs font-mono text-dash-l3 mt-1">
-                        {pending.length} pending approval{pending.length === 1 ? "" : "s"}
+                        {pending.length} to work
+                        {confirmCount > 0 && <span className="text-emerald-400"> · {confirmCount} confirm</span>}
+                        {matchedCount > confirmCount && (
+                            <span className="text-cyan-400"> · {matchedCount - confirmCount} review $</span>
+                        )}
+                        {unmatchedCount > 0 && <span className="text-rose-400"> · {unmatchedCount} no PO</span>}
                     </p>
                 </div>
                 <button
@@ -640,7 +946,11 @@ export default function InvoiceReviewPage() {
 
             {/* Body */}
             <div className="flex-1 flex overflow-hidden">
-                {state === "loading" && <div className="flex-1"><LoadingSkeleton /></div>}
+                {state === "loading" && (
+                    <div className="flex-1">
+                        <LoadingSkeleton />
+                    </div>
+                )}
                 {(state === "timeout" || state === "error") && (
                     <div className="flex-1">
                         <LoadErrorState
@@ -658,25 +968,25 @@ export default function InvoiceReviewPage() {
                         <div className="text-center">
                             <CheckCircle2 className="w-8 h-8 text-emerald-400 mx-auto mb-2" />
                             <div className="text-dash-l1 text-sm">Queue is clear</div>
-                            <div className="text-dash-l3 text-xs mt-1">No invoices need approval right now.</div>
+                            <div className="text-dash-l3 text-xs mt-1">No invoices need attention right now.</div>
                         </div>
                     </div>
                 )}
                 {state === "ready" && pending.length > 0 && (
                     <>
                         {/* Left rail — queue list */}
-                        <div className="w-[300px] border-r border-zinc-800 overflow-y-auto shrink-0">
+                        <div className="w-[320px] border-r border-zinc-800 overflow-y-auto shrink-0">
                             {pending.map((item) => (
                                 <QueueRow
-                                    key={item.activityLogId ?? item.id}
+                                    key={item.id}
                                     item={item}
-                                    active={item.activityLogId === selected?.activityLogId}
-                                    onClick={() => setSelectedId(item.activityLogId)}
+                                    active={item.id === selected?.id}
+                                    onClick={() => setSelectedId(item.id)}
                                 />
                             ))}
                         </div>
 
-                        {/* Focused review — wrapped per audit P0-1 spec */}
+                        {/* Focused review */}
                         <div className="flex-1 overflow-hidden">
                             <PanelErrorBoundary label="Invoice Review">
                                 {selected ? (
