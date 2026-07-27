@@ -2,6 +2,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FinaleClient } from "./client";
 
+// Mock calibration module to prevent live DB calls during tests.
+// src/lib/finale/purchasing.ts and src/lib/finale/receivings.ts dynamically
+// import("@/lib/purchasing/calibration") after draft-PO creation/reuse to
+// stamp recommendations and record reservations.  The calibration module
+// calls createClient() from @/lib/db, which makes real PostgREST HTTP
+// requests to localhost:5434 with a 5s AbortController timeout and up to
+// 3 retries.  Those unmocked calls either consume mockResolvedValueOnce
+// entries meant for Finale API responses (corrupting later assertions) or
+// exhaust the mock queue and stall until the timeout fires, causing 4-5
+// flaky test failures whose membership rotates between runs.
+vi.mock("@/lib/purchasing/calibration", () => ({
+    loadActiveReservations: vi.fn().mockResolvedValue(new Map()),
+    loadAllVendorReorderPolicies: vi.fn().mockResolvedValue(new Map()),
+    loadCalibrationStats: vi.fn().mockResolvedValue(new Map()),
+    loadVendorMOQs: vi.fn().mockResolvedValue(new Map()),
+    loadVendorReorderPolicies: vi.fn().mockResolvedValue(new Map()),
+    loadVendorRecentLineQtys: vi.fn().mockResolvedValue(new Map()),
+    loadShipmentLegs: vi.fn().mockResolvedValue(new Map()),
+    recordRecommendationSnapshots: vi.fn().mockResolvedValue(undefined),
+    recordReservations: vi.fn().mockResolvedValue(0),
+    releaseReservations: vi.fn().mockResolvedValue(0),
+    stampRecommendationsWithDraftPO: vi.fn().mockResolvedValue(0),
+}));
+
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
     return new Response(JSON.stringify(body), {
         status: init.status ?? 200,
