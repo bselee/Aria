@@ -126,18 +126,62 @@ Add a `vendor_profiles.requires_po BOOLEAN` (or reuse existing profile flags). F
 utility vendors get `false` and never appear as exceptions. Removes 255 permanent
 false positives.
 
-### 5.4 Add an invoice-driven worklist (the flow gap)
-The receiving panel is the right place to *confirm* a match — keep the existing scoring +
-auto-apply. But add a small **"Unmatched Invoices"** surface that is NOT gated on receipts:
+### 5.4 Do NOT build a new panel — the surface already exists (corrected 2026-07-27)
 
-- Query: `po_number` NULL/empty AND `requires_po` AND age > 2 days.
-- Columns: vendor, invoice #, date, total, inbox badge (ap/bill), top-3 PO candidates with
-  score + reasons, and **Apply / Not a PO purchase / Snooze** actions.
-- "Not a PO purchase" writes a terminal state so the row leaves the list permanently —
-  today there is no way to say that, which is why the list would otherwise grow forever.
+My original recommendation was to add a new "Unmatched Invoices" panel. **That was wrong.**
+Inspecting the dashboard first showed the surface already exists and is already wired
+end-to-end:
 
-Per Bill's dashboard conventions: red = needs action, amber = attention, cyan = in
-progress, emerald = matched, orange = missing data.
+- `src/components/dashboard/InvoiceQueuePanel.tsx` (599 lines) already has an `unmatched`
+  status in `StatusKey` / `STATUS_CFG`, rendered as a rose **"NO PO"** badge — matching
+  Bill's convention of rose = exception.
+- `src/app/api/dashboard/invoice-queue/route.ts` already emits those rows and a
+  `stats.unmatched` counter.
+- Live check: `curl /api/dashboard/invoice-queue` → `stats.unmatched = 64`, 65 invoices
+  returned. It is already working and visible today.
+
+So step 4 is not "build a panel". It is three much smaller changes.
+
+#### 5.4a Fix the false-positive bug first (highest priority of the whole plan)
+
+`resolveStatus()` in `invoice-queue/route.ts:88-110` never inspects `po_number`. Its final
+line is an unconditional `return 'unmatched'`, so any unrecognised `status` value is
+labelled "NO PO".
+
+Every invoice in the last 60 days has `status='received'`, which matches none of the
+branches. Measured:
+
+```
+SELECT status, COUNT(*) n, COUNT(*) FILTER (WHERE COALESCE(po_number,'')<>'') has_po
+  FROM vendor_invoices WHERE created_at >= now() - interval '60 days' GROUP BY 1;
+-> received | 69 | 35
+```
+
+**35 of the 64 rows shown as "NO PO" actually have a `po_number`.** Concrete example:
+Marion Ag Service invoice `85974` has `po_number='124977'` and is still displayed as
+unmatched.
+
+The dashboard therefore over-reports the problem by roughly 2×, which buries the real
+exceptions in noise. Fixing this costs a few lines and immediately halves the list —
+worth doing before any matching improvement, because otherwise the improvement is
+invisible under the false positives.
+
+Note the distinct status: `po_number` set but `reconciled_at IS NULL` means *matched to a
+PO but not yet reconciled*. That is neither "done" nor "NO PO" and deserves its own
+treatment (either `needs_approval` or a new badge).
+
+#### 5.4b Add the terminal "not a PO purchase" action
+
+Still genuinely missing. Without it the list can only grow — there is no way to record
+"this was a credit-card purchase, it will never have a PO". Combined with §5.2's
+`source_inbox`, a one-click "Not a PO purchase" on a `bill.selee@` invoice is the exact
+flow Bill described.
+
+#### 5.4c Filter by `requires_po`
+
+Once §5.3 lands, the queue should exclude vendors flagged `requires_po = false` so the 255
+freight/utility invoices stop appearing at all.
+
 
 ### 5.5 Normalize at write time, not just read time
 OCR-extracted `vendor_name` should be normalized before insert (the `\r\n` and `™` cases
