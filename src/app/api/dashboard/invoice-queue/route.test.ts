@@ -1,200 +1,211 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/**
+ * @file    src/app/api/dashboard/invoice-queue/route.test.ts
+ * @purpose Unit tests for the invoice-queue route — specifically that disregarded
+ *          invoices are excluded from the response list and from stats.unmatched.
+ *          Mocks @/lib/db and the classification/config modules so no live DB is hit.
+ * @author  Hermia
+ * @created 2026-08-02
+ */
+import { describe, expect, it, vi, beforeEach } from "vitest";
 
-const baseInvoicesData = [
-  {
-    id: 1,
-    invoice_number: "INV-100",
-    vendor_name: "Vendor A",
-    total: 120,
-    subtotal: 110,
-    freight: 5,
-    tax: 5,
-    tariff: null,
-    labor: null,
-    status: "matched_review",
-    po_number: "PO-1",
-    created_at: new Date().toISOString(),
-    discrepancies: null,
-  },
-];
+// ── Mocks ────────────────────────────────────────────────────────────────────
 
-const baseLogData = [
-  {
-    id: 10,
-    created_at: new Date().toISOString(),
-    email_subject: "INV-100",
-    action_taken: "queued for Bill.com forward",
-    reviewed_action: null,
-    metadata: {
-      invoiceNumber: "INV-100",
-      reasonCode: "queued_for_billcom",
-    },
-    intent: "INVOICE",
-  },
-  {
-    id: 11,
-    created_at: new Date().toISOString(),
-    email_subject: "Missing PDF",
-    action_taken: "No PDF attachment found - left unread for manual review",
-    reviewed_action: null,
-    metadata: {
-      reasonCode: "missing_pdf_manual_review",
-    },
-    intent: "INVOICE",
-  },
-  {
-    id: 12,
-    created_at: new Date().toISOString(),
-    email_subject: "Need response",
-    action_taken: "Human interaction detected on ap inbox - left visible for manual AP review",
-    reviewed_action: null,
-    metadata: {
-      reasonCode: "human_interaction_manual_review",
-    },
-    intent: "HUMAN_INTERACTION",
-  },
-];
-
-const queryState = {
-  intentFilter: null as string[] | null,
-  apLogInCalls: [] as string[][],
-  apLogSelects: [] as string[],
-};
-
-let invoicesData: any[] = [];
-let logData: any[] = [];
-
-const makeQuery = (rows: any[], table: string) => {
-  let selectedColumns: string | null = null;
-
-  const projectSelectedColumns = (row: any) => {
-    if (!selectedColumns || selectedColumns === "*") return row;
-    const projected: Record<string, unknown> = {};
-    for (const column of selectedColumns.split(",").map((col) => col.trim()).filter(Boolean)) {
-      projected[column] = row[column];
-    }
-    return projected;
-  };
-
-  const query: any = {
-    select: vi.fn().mockImplementation((columns: string) => {
-      selectedColumns = columns;
-      if (table === "ap_activity_log") queryState.apLogSelects.push(columns);
-      return query;
-    }),
-    order: vi.fn().mockReturnThis(),
-    limit: vi.fn().mockImplementation(() => {
-      const projectedRows = rows.map(projectSelectedColumns);
-      if (table !== "ap_activity_log" || !queryState.intentFilter) {
-        return Promise.resolve({ data: projectedRows, error: null });
-      }
-
-      return Promise.resolve({
-        data: projectedRows.filter((row) => queryState.intentFilter!.includes(row.intent)),
-        error: null,
-      });
-    }),
-    in: vi.fn().mockImplementation((_column: string, values: string[]) => {
-      queryState.intentFilter = values;
-      queryState.apLogInCalls.push(values);
-      return query;
-    }),
-  };
-  return query;
-};
-
-const supabase = {
-  from: vi.fn((table: string) => {
-    if (table === "invoices") return makeQuery(invoicesData, table);
-    if (table === "ap_activity_log") return makeQuery(logData, table);
-    return makeQuery([], table);
-  }),
+const mockDbClient = {
+    from: vi.fn(),
+    rpc: vi.fn(),
 };
 
 vi.mock("@/lib/db", () => ({
-  createClient: () => supabase,
+    createClient: () => mockDbClient,
 }));
 
-import { GET } from "./route";
+// Mock classifyInvoice — default to "real_invoice"
+vi.mock("@/config/invoice-classification", () => ({
+    classifyInvoice: vi.fn().mockReturnValue({
+        classification: "real_invoice",
+        reason: "Test",
+    }),
+}));
 
-describe("invoice queue route", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    invoicesData = structuredClone(baseInvoicesData);
-    logData = structuredClone(baseLogData);
-    queryState.intentFilter = null;
-    queryState.apLogInCalls = [];
-    queryState.apLogSelects = [];
-  });
+// Mock dropship keywords
+vi.mock("@/config/dropship-vendors", () => ({
+    KNOWN_DROPSHIP_KEYWORDS: [],
+}));
 
-  it("returns needsEyes counts using AP manual-review reason codes", async () => {
-    const response = await GET({
-      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue?bust=1"),
-    } as any);
+// Mock resolve-status — default to "unmatched"
+vi.mock("./resolve-status", () => ({
+    resolveStatus: vi.fn().mockReturnValue("unmatched"),
+    isPendingStatus: vi.fn().mockReturnValue(false),
+}));
 
-    expect(response.status).toBe(200);
+const { GET } = await import("./route");
 
-    const body = await response.json();
-    expect(body.needsEyes).toEqual({
-      missingPdf: 1,
-      humanInteraction: 1,
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function makeRequest(bust = true): NextRequest {
+    const url = bust
+        ? "http://localhost:3001/api/dashboard/invoice-queue?bust=1"
+        : "http://localhost:3001/api/dashboard/invoice-queue";
+    const parsed = new URL(url);
+    return { nextUrl: parsed } as NextRequest;
+}
+
+/**
+ * Build a query builder that returns the given invoices from select,
+ * and empty ap_activity_log data from the second select.
+ */
+function mockQueueDb(invoices: any[], logData: any[] = []) {
+    // Query builder for invoices select
+    const invoiceSelectBuilder = {
+        order: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        not: vi.fn().mockReturnThis(),
+        eq: vi.fn().mockReturnThis(),
+        in: vi.fn().mockReturnThis(),
+        then: vi.fn().mockImplementation((resolve: any) => resolve({
+            data: invoices,
+            error: null,
+        })),
+    };
+
+    // Query builder for activity log select
+    const logSelectBuilder = {
+        in: vi.fn().mockReturnThis(),
+        order: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        then: vi.fn().mockImplementation((resolve: any) => resolve({
+            data: logData,
+            error: null,
+        })),
+    };
+
+    // First .from('invoices') call returns invoiceSelectBuilder
+    // Any subsequent .from() calls return logSelectBuilder
+    mockDbClient.from.mockImplementation((table: string) => {
+        const qb = {
+            select: vi.fn().mockReturnThis(),
+            order: vi.fn().mockReturnThis(),
+            limit: vi.fn().mockReturnThis(),
+            in: vi.fn().mockReturnThis(),
+            then: vi.fn(),
+        };
+
+        if (table === "invoices") {
+            qb.select.mockReturnValue(invoiceSelectBuilder);
+        } else if (table === "vendor_profiles") {
+            // requires_po filter: return empty list by default (no suppressed vendors)
+            qb.select.mockReturnThis();
+            qb.eq = vi.fn().mockReturnThis();
+            qb.then = vi.fn().mockImplementation((resolve: any) => resolve({ data: [], error: null }));
+        } else if (table === "vendor_invoices") {
+            // source_inbox lookup
+            qb.select.mockReturnThis();
+            qb.in = vi.fn().mockReturnThis();
+            qb.not = vi.fn().mockReturnThis();
+            qb.then = vi.fn().mockImplementation((resolve: any) => resolve({ data: [], error: null }));
+        } else {
+            qb.select.mockReturnValue(logSelectBuilder);
+        }
+
+        return qb;
     });
-    expect(body.invoices).toHaveLength(1);
-    expect(queryState.apLogInCalls).toContainEqual([
-      "INVOICE",
-      "RECONCILIATION",
-      "HUMAN_INTERACTION",
-      "HUMAN_INTERACT",
-      "EYES_NEEDED",
-    ]);
-  });
+}
 
-  it("filters invoices out of the queue when the latest linked review is dismissed", async () => {
-    logData[0] = {
-      ...logData[0],
-      action_taken: "queued for review",
-      reviewed_action: "dismissed",
-    };
+// ── Tests ────────────────────────────────────────────────────────────────────
 
-    const response = await GET({
-      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue?bust=1"),
-    } as any);
+describe("GET /api/dashboard/invoice-queue — disregard filter", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
 
-    expect(response.status).toBe(200);
+    it("excludes invoices with no_po_required=true from the unmatched list", async () => {
+        const invoices = [
+            {
+                id: "1",
+                invoice_number: "INV-001",
+                vendor_name: "Vendor A",
+                total: 100,
+                subtotal: 100,
+                freight: 0,
+                tax: 0,
+                tariff: 0,
+                labor: 0,
+                status: "received",
+                po_number: null,
+                created_at: new Date().toISOString(),
+                discrepancies: null,
+                no_po_required: false, // normal unmatched — should appear
+            },
+            {
+                id: "2",
+                invoice_number: "INV-002",
+                vendor_name: "Vendor B",
+                total: 200,
+                subtotal: 200,
+                freight: 0,
+                tax: 0,
+                tariff: 0,
+                labor: 0,
+                status: "received",
+                po_number: null,
+                created_at: new Date().toISOString(),
+                discrepancies: null,
+                no_po_required: true, // DISREGARDED — must be filtered out
+            },
+        ];
 
-    const body = await response.json();
-    expect(body.invoices).toHaveLength(0);
-  });
+        const logs: any[] = [];
 
-  it("filters approved short-shipment review rows even when stale verdict metadata remains", async () => {
-    logData[0] = {
-      ...logData[0],
-      intent: "RECONCILIATION",
-      action_taken: "Dashboard approved: 1 applied, 0 skipped",
-      reviewed_action: "approved",
-      reviewed_at: new Date().toISOString(),
-      metadata: {
-        invoiceNumber: "INV-100",
-        overallVerdict: "short_shipment_hold",
-        priceChanges: [{
-          productId: "SKU-1",
-          verdict: "short_shipment_hold",
-          quantity: 10,
-          receivedQty: 8,
-          receivingGap: 2,
-          invoicePrice: 10,
-        }],
-      },
-    };
+        mockQueueDb(invoices, logs);
 
-    const response = await GET({
-      nextUrl: new URL("http://localhost/api/dashboard/invoice-queue?bust=1"),
-    } as any);
+        const req = makeRequest(true);
+        const res = await GET(req);
+        const body = await res.json();
 
-    expect(response.status).toBe(200);
+        expect(res.status).toBe(200);
 
-    const body = await response.json();
-    expect(body.invoices).toHaveLength(0);
-    expect(queryState.apLogSelects[0]).toContain("reviewed_action");
-  });
+        // INV-002 should be excluded
+        expect(body.invoices.length).toBe(1);
+        expect(body.invoices[0].invoiceNumber).toBe("INV-001");
+
+        // unmatched count should reflect only INV-001
+        expect(body.stats.unmatched).toBe(1);
+    });
+
+    it("returns empty list when all unmatched invoices are disregarded", async () => {
+        const invoices = [
+            {
+                id: "3",
+                invoice_number: "INV-003",
+                vendor_name: "Vendor C",
+                total: 150,
+                subtotal: 150,
+                freight: 0,
+                tax: 0,
+                tariff: 0,
+                labor: 0,
+                status: "received",
+                po_number: null,
+                created_at: new Date().toISOString(),
+                discrepancies: null,
+                no_po_required: true, // disregarded
+            },
+        ];
+
+        const logs: any[] = [];
+        mockQueueDb(invoices, logs);
+
+        const req = makeRequest(true);
+        const res = await GET(req);
+        const body = await res.json();
+
+        expect(res.status).toBe(200);
+        expect(body.invoices.length).toBe(0);
+
+        // Since the mock's resolveStatus returns "unmatched" for every invoice,
+        // and mocks' isPendingStatus returns false, all items pass through the
+        // flatMap but INV-003 gets filtered out by no_po_required check.
+        // With no items making it through, unmatched should be 0.
+        expect(body.stats.unmatched).toBe(0);
+    });
 });

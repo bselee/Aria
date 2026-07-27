@@ -150,6 +150,31 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     const aliases = await loadVendorAliases();
     const canonicalName = resolveCanonicalVendor(invoice.vendorName, aliases);
 
+    // ── Load confirmed PO matches ──────────────────────────────────────────
+    // Read the full confirmed_po_matches table and index by vendor_name →
+    // Set<po_number>. A human-approved vendor+po pair gets a 95-point boost
+    // (enough to auto-apply) with a descriptive reason.
+    // This is the "fine-tuning" mechanism: when Bill approves a match, the
+    // matcher learns and future invoices from the same vendor matching the
+    // same PO auto-resolve.
+    const confirmedMatchMap = new Map<string, Set<string>>();
+    try {
+        const { data: confirmedMatches } = await db
+            .from("confirmed_po_matches")
+            .select("vendor_name, po_number");
+        for (const cm of (confirmedMatches || []) as any[]) {
+            const vn = (cm.vendor_name || "").toLowerCase().trim();
+            if (!vn) continue;
+            if (!confirmedMatchMap.has(vn)) {
+                confirmedMatchMap.set(vn, new Set());
+            }
+            confirmedMatchMap.get(vn)!.add((cm.po_number || "").trim());
+        }
+    } catch {
+        // Non-blocking — confirmed matches are an optimization
+        console.warn("[invoice-po-matcher] Failed to load confirmed_po_matches");
+    }
+
     // Collect all alias values that map to this canonical vendor. These can be
     // used as ilike search targets — the alias text (e.g. "AutoPot Watering
     // Systems USA") may be a superset of the PO vendor name ("Autopot Watering
@@ -283,7 +308,27 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             vendorScore = { score: 40, reason: aliasReason };
         }
 
+        // ── Confirmed-match boost ──────────────────────────────────────────
+        // When this vendor_name + po_number pair was previously confirmed by a
+        // human (via the approve_unreconciled action), boost the total score to
+        // 95. This is the fine-tuning mechanism: once Bill confirms a match,
+        // future invoices from the same vendor matching the same PO auto-resolve.
+        const poNumberKey = (po.po_number || "").trim();
+        const vendorKey = (invoice.vendorName || "").toLowerCase().trim();
+        const isConfirmedMatch = !!(
+            poNumberKey &&
+            vendorKey &&
+            confirmedMatchMap.get(vendorKey)?.has(poNumberKey)
+        );
+        let confirmedMatchReason: string | null = null;
+        if (isConfirmedMatch) {
+            confirmedMatchReason = `previously confirmed by user (vendor=${invoice.vendorName}, PO=${poNumberKey})`;
+        }
+
         let total = vendorScore.score + dateScore.score + amountScore.score;
+        if (confirmedMatchReason) {
+            total = 95;
+        }
 
         // When invoice total is $0 (bad OCR), still surface the match on
         // vendor + date alone if those are strong. Don't auto-apply though.
@@ -300,6 +345,9 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         const reasons = [vendorScore, dateScore, amountScore]
             .filter(r => r.score > 0)
             .map(r => r.reason);
+        if (confirmedMatchReason) {
+            reasons.push(confirmedMatchReason);
+        }
         if (isZeroAmount && amountScore.score === 0) {
             reasons.push("amount unknown (OCR may have missed total)");
         }

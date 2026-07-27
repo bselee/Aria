@@ -33,6 +33,7 @@ export type InvoiceQueueItem = {
     metadata: Record<string, unknown> | null;
     classification: InvoiceClassification;
     classificationReason: string | null;
+    sourceInbox: string | null;
 };
 
 export type InvoiceQueueStats = {
@@ -88,6 +89,7 @@ function extractBalanceWarning(metadata: any): string | null {
 export async function GET(req: NextRequest) {
     const bust = req.nextUrl.searchParams.has('bust');
     const wantCsv = req.nextUrl.searchParams.get('export') === '1';
+    const sortByDollar = req.nextUrl.searchParams.get('sort') === 'dollar';
 
     // ── CSV Export ────────────────────────────────────────────────────────────
     if (wantCsv) {
@@ -95,6 +97,11 @@ export async function GET(req: NextRequest) {
     }
 
     // ── Cache check ───────────────────────────────────────────────────────────
+    // Sort param always busts cache because sort mode affects the response shape
+    if (sortByDollar) {
+        cache = null;
+        cacheAt = 0;
+    }
     if (!bust && cache && Date.now() - cacheAt < CACHE_TTL) {
         return NextResponse.json(cache, { headers: { 'Cache-Control': 'no-store' } });
     }
@@ -108,18 +115,47 @@ export async function GET(req: NextRequest) {
     }
 
     try {
-        // ── Fetch invoices ordered newest-first ───────────────────────────────
-        const { data: invoicesRaw, error: invErr } = await db
+        // ── Fetch invoices ordered newest-first (default) or by total DESC ────
+        let query = db
             .from('invoices')
             .select(
                 'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, discrepancies, no_po_required'
-            )
-            .order('created_at', { ascending: false })
-            .limit(100);
+            );
+
+        if (sortByDollar) {
+            query = query.order('total', { ascending: false });
+        } else {
+            query = query.order('created_at', { ascending: false });
+        }
+
+        const { data: invoicesRaw, error: invErr } = await query.limit(100);
 
         if (invErr) throw new Error(invErr.message);
 
         const rows: any[] = invoicesRaw ?? [];
+
+        // ── Requires-PO filter: vendors flagged requires_po=false never
+        //    appear as unmatched (service vendors like AAA Cooper, Culligan,
+        //    Terminix — they don't need PO matching).
+        const { data: vendorProfiles } = await db
+            .from('vendor_profiles')
+            .select('vendor_name')
+            .eq('requires_po', false);
+        const noPoVendorNames: string[] = (vendorProfiles ?? []).map((vp: any) => vp.vendor_name);
+
+        // ── Source inbox lookup: vendor_invoices has source_inbox populated
+        //    for 116 rows (ap vs bill.selee). We join by invoice_number+vendor_name.
+        const { data: viRows } = await db
+            .from('vendor_invoices')
+            .select('vendor_name, invoice_number, source_inbox')
+            .not('source_inbox', 'is', null);
+        const sourceInboxByKey = new Map<string, string>();
+        for (const vi of viRows ?? []) {
+            const key = normalizeName(vi.vendor_name) + '|' + (vi.invoice_number ?? '');
+            if (!sourceInboxByKey.has(key)) {
+                sourceInboxByKey.set(key, vi.source_inbox);
+            }
+        }
 
         // ── Fetch the most recent ap_activity_log entry per invoice ───────────
         // We join by invoice_number matching email_subject (the reconciler logs
@@ -177,6 +213,11 @@ export async function GET(req: NextRequest) {
             if (row.no_po_required === true) {
                 return [];
             }
+            // Service vendors (requires_po=false) don't need PO matching —
+            // filter out their unmatched invoices from the queue
+            if (!row.po_number && isNoPoVendor(vendorName, noPoVendorNames)) {
+                return [];
+            }
             const invNum: string = row.invoice_number ?? '';
             const matchedLog = logByInvoiceNum.get(invNum) ?? null;
             const reviewedAction = (matchedLog?.reviewed_action ?? "").toLowerCase();
@@ -199,6 +240,10 @@ export async function GET(req: NextRequest) {
             }
 
             const processedAt: string = row.created_at ?? new Date().toISOString();
+
+            // Look up source_inbox from vendor_invoices (ap vs bill.selee)
+            const sourceInboxKey = normalizeName(vendorName) + '|' + invNum;
+            const sourceInbox = sourceInboxByKey.get(sourceInboxKey) ?? null;
 
             // Only count stats for items that actually appear in the queue
             if (new Date(processedAt) >= todayStart) totalToday++;
@@ -227,7 +272,18 @@ export async function GET(req: NextRequest) {
                             metadata: hasActivityLog ? (matchedLog?.metadata ?? null) : null,
                             classification: classResult.classification,
                             classificationReason: classResult.reason,
+                            sourceInbox,
                         }];
+        });
+
+        // ── Sort: ap@ unmatched first (real exceptions), then high-dollar first ──
+        invoices.sort((a, b) => {
+            // source_inbox='ap' comes before null/other
+            const aPriority = a.sourceInbox === 'ap' ? 0 : 1;
+            const bPriority = b.sourceInbox === 'ap' ? 0 : 1;
+            if (aPriority !== bPriority) return aPriority - bPriority;
+            // Within each group descending total
+            return b.total - a.total;
         });
 
         const needsEyes = {
@@ -369,4 +425,41 @@ function csvEscape(val: any): string {
         return '"' + s.replace(/"/g, '""') + '"';
     }
     return s;
+}
+
+// ── Vendor name helpers (requires_po filter) ──────────────────────────────────
+
+/**
+ * Normalize a vendor name for comparison: lowercase, collapse whitespace,
+ * strip unicode typographic symbols.
+ */
+function normalizeName(name: string): string {
+    return name
+        .toLowerCase()
+        .replace(/[\r\n]+/g, ' ')
+        .replace(/[™®©]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Check whether an invoice vendor name matches any of the known
+ * requires_po=false vendor profiles. Uses substring matching on
+ * normalized names so "AAA COOPER TRANSPORTATION" matches
+ * "aaa cooper", "AAA Cooper Transportation", etc.
+ */
+function isNoPoVendor(
+    invoiceVendorName: string,
+    noPoVendorNames: string[],
+): boolean {
+    const normInvoice = normalizeName(invoiceVendorName);
+    for (const vp of noPoVendorNames) {
+        const normVp = normalizeName(vp);
+        // Both directions: short profile name like "aaa cooper" is a substring
+        // of "aaa cooper transportation", but also handle exact/close matches
+        if (normInvoice.includes(normVp) || normVp.includes(normInvoice)) {
+            return true;
+        }
+    }
+    return false;
 }

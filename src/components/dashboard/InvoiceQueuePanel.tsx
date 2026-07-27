@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { Receipt, ChevronDown, ChevronRight, Check, X, AlertCircle, Loader2 } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
 
@@ -260,6 +260,18 @@ export default function InvoiceQueuePanel() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   // Per-invoice selected disregard reason for unmatched rows
   const [disregardReason, setDisregardReason] = useState<Record<string, string>>({});
+  // Sort toggle: false = chronological (default), true = by total DESC
+  const [sortByDollar, setSortByDollar] = useState(false);
+  const sortByDollarRef = useRef(sortByDollar);
+
+  // Keep ref in sync so fetchData (used in intervals) always reads latest sort
+  const toggleSort = useCallback(() => {
+    setSortByDollar(prev => {
+      const next = !prev;
+      sortByDollarRef.current = next;
+      return next;
+    });
+  }, []);
 
   // Handle approve/dismiss actions
   const handleAction = useCallback(async (id: string, action: "approve" | "dismiss") => {
@@ -304,6 +316,61 @@ export default function InvoiceQueuePanel() {
     fetchData(true);
   }, []);
 
+  // Handle "Approve" for matched_unreconciled invoices — confirms the PO match
+  // Keyed on invoice id (vendor_invoices.id UUID), NOT activityLogId, because
+  // matched_unreconciled invoices have no activity log entry.
+  const handleApproveUnreconciled = useCallback(async (invoiceId: string, poNumber: string) => {
+    setActingOn(invoiceId);
+    setToast(null);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "approve_unreconciled", invoiceId, poNumber, markedBy: "dashboard" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error || "Action failed", type: "error" });
+      } else {
+        setToast({ message: data.message || "Approved", type: "success" });
+        setExpandedId(null);
+      }
+    } catch (err) {
+      setToast({ message: "Network error", type: "error" });
+    } finally {
+      setActingOn(null);
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }, []);
+
+  // Handle "Disregard" for matched_unreconciled invoices — marks as not a PO purchase
+  // and updates vendor profile for learning. Same keying pattern as approve_unreconciled.
+  const handleDisregardUnreconciled = useCallback(async (invoiceId: string, poNumber: string) => {
+    setActingOn(invoiceId);
+    setToast(null);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disregard_unreconciled", invoiceId, poNumber, markedBy: "dashboard" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error || "Action failed", type: "error" });
+      } else {
+        setToast({ message: data.message || "Disregarded", type: "success" });
+        setExpandedId(null);
+      }
+    } catch (err) {
+      setToast({ message: "Network error", type: "error" });
+    } finally {
+      setActingOn(null);
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }, []);
+
   // Handle "not a PO purchase" disregard for unmatched invoices
   // Keyed on invoice id (vendor_invoices.id UUID), NOT activityLogId, because
   // unmatched invoices have no activity log entry.
@@ -332,6 +399,37 @@ export default function InvoiceQueuePanel() {
     }
   }, []);
 
+  // Bulk-disregard ALL unmatched invoices from a vendor at once
+  const handleDisregardVendor = useCallback(async (vendorName: string, alsoMarkVendor: boolean = false) => {
+    setActingOn(`vendor:${vendorName}`);
+    setToast(null);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "disregard_vendor",
+          vendorName,
+          reason: "vendor_no_po_required",
+          markedBy: "dashboard",
+          alsoMarkVendor,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error || "Action failed", type: "error" });
+      } else {
+        setToast({ message: data.message || "Disregarded all", type: "success" });
+      }
+    } catch (err) {
+      setToast({ message: "Network error", type: "error" });
+    } finally {
+      setActingOn(null);
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }, []);
+
   // Collapse state — persisted to localStorage
   const [isCollapsed, setIsCollapsed] = useState(false);
   useEffect(() => {
@@ -344,9 +442,11 @@ export default function InvoiceQueuePanel() {
 
   // Fetch from API route
   const fetchData = useCallback((bust = false) => {
-    const url = bust
-      ? "/api/dashboard/invoice-queue?bust=1"
-      : "/api/dashboard/invoice-queue";
+    const params = new URLSearchParams();
+    if (bust) params.set("bust", "1");
+    if (sortByDollarRef.current) params.set("sort", "dollar");
+    const qs = params.toString();
+    const url = qs ? `/api/dashboard/invoice-queue?${qs}` : "/api/dashboard/invoice-queue";
     fetch(url)
       .then(r => r.ok ? r.json() : null)
       .then((data: InvoiceQueueResponse | null) => {
@@ -405,6 +505,21 @@ export default function InvoiceQueuePanel() {
             className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300 transition-colors mr-1"
           >
             export
+          </button>
+        )}
+
+        {/* Sort toggle — chronological (default) vs by dollar amount */}
+        {!isCollapsed && (
+          <button
+            onClick={() => { toggleSort(); fetchData(true); }}
+            className={`text-[10px] font-mono transition-colors mr-1 ${
+              sortByDollar
+                ? "text-amber-400 hover:text-amber-300"
+                : "text-zinc-500 hover:text-zinc-300"
+            }`}
+            title={sortByDollar ? "Sorted by $ — click for chronological" : "Sorted by time — click for by $"}
+          >
+            {sortByDollar ? "sort by time" : "sort by $"}
           </button>
         )}
 
@@ -543,6 +658,21 @@ export default function InvoiceQueuePanel() {
                       <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
                         {inv.vendorName}
                       </span>
+                      {/* source_inbox badge */}
+                      {(() => {
+                        const src = (inv as any).source_inbox as string | null | undefined;
+                        if (!src || src === 'default') return null;
+                        const isAp = src === 'ap';
+                        return (
+                          <span className={`text-[9px] font-mono font-semibold px-1 py-0.5 rounded shrink-0 ${
+                            isAp
+                              ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                              : 'bg-zinc-600/30 text-zinc-400 border border-zinc-600/40'
+                          }`}>
+                            @{isAp ? 'ap' : src.split('@')[0]}
+                          </span>
+                        );
+                      })()}
                       {inv.invoiceNumber && (
                         <span className="text-[10px] font-mono text-zinc-500 shrink-0">
                           #{inv.invoiceNumber}
@@ -566,6 +696,11 @@ export default function InvoiceQueuePanel() {
                         {timeAgo(inv.processedAt)}
                       </span>
                     </div>
+                    {inv.classificationReason && (
+                      <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
+                        {inv.classificationReason}
+                      </div>
+                    )}
                     <div className="flex items-center gap-2 mt-1">
                       {(() => {
                         const g = pendingGuidance(inv);
@@ -632,12 +767,178 @@ export default function InvoiceQueuePanel() {
                   {rest.filter(i => i.status === "unmatched").length} invoice{rest.filter(i => i.status === "unmatched").length !== 1 ? "s" : ""}
                 </span>
               </div>
-              {rest.filter(i => i.status === "unmatched").map(inv => {
+              {(() => {
+                // Group unmatched invoices by vendor name for bulk actions
+                const unmatched = rest.filter(i => i.status === "unmatched");
+                const byVendor = new Map<string, typeof unmatched>();
+                for (const inv of unmatched) {
+                  const key = inv.vendorName;
+                  if (!byVendor.has(key)) byVendor.set(key, []);
+                  byVendor.get(key)!.push(inv);
+                }
+                const vendorEntries = [...byVendor.entries()];
+                // Sort vendor groups by total dollar amount (descending) for priority
+                vendorEntries.sort((a, b) => {
+                  const sumA = a[1].reduce((s, i) => s + Number(i.total ?? 0), 0);
+                  const sumB = b[1].reduce((s, i) => s + Number(i.total ?? 0), 0);
+                  return sumB - sumA;
+                });
+                return vendorEntries.flatMap(([vendorName, vendorInvs]) => {
+                  const vendorTotal = vendorInvs.reduce((s, i) => s + Number(i.total ?? 0), 0);
+                  const isActingOnVendor = actingOn === `vendor:${vendorName}`;
+                  const isAlsoMarkingKey = `alsoMark:${vendorName}`;
+                  const alsoMarking = disregardReason[isAlsoMarkingKey] === "true";
+
+                  return [
+                    <div key={`vendor-group-${vendorName}`} className="border-t border-rose-500/20">
+                      {/* Vendor group header with bulk action */}
+                      <div className="px-4 py-1 flex items-center gap-2 bg-rose-500/[0.03]">
+                        <span className="text-[11px] font-mono font-semibold text-rose-300 truncate max-w-[200px]">
+                          {vendorName}
+                        </span>
+                        <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                          {vendorInvs.length} × ${vendorTotal.toFixed(2)}
+                        </span>
+                        <div className="flex-1" />
+                        {vendorInvs.length >= 2 && (
+                          <>
+                            <label className="flex items-center gap-1 text-[9px] font-mono text-zinc-500 cursor-pointer shrink-0">
+                              <input
+                                type="checkbox"
+                                checked={alsoMarking}
+                                onChange={() => setDisregardReason(prev => ({
+                                  ...prev,
+                                  [isAlsoMarkingKey]: alsoMarking ? "" : "true",
+                                }))}
+                                className="w-2.5 h-2.5 rounded border-zinc-600 bg-zinc-800 accent-rose-500"
+                              />
+                              Also mark vendor profile
+                            </label>
+                            <button
+                              onClick={() => handleDisregardVendor(vendorName, alsoMarking)}
+                              disabled={isActingOnVendor}
+                              className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30 hover:bg-rose-500/30 disabled:opacity-40 transition-colors shrink-0"
+                              title={`Disregard all ${vendorInvs.length} unmatched invoices from ${vendorName}`}
+                            >
+                              {isActingOnVendor ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
+                              {isActingOnVendor ? "..." : "This vendor never needs a PO"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>,
+                    ...vendorInvs.map(inv => {
+                      const isActing = actingOn === inv.id;
+                      const selReason = disregardReason[inv.id] || "";
+                      return (
+                        <div key={inv.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-rose-500/5 hover:bg-rose-500/[0.02] transition-colors">
+                          <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-rose-500" />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 min-w-0">
+                              {vendorInvs.length === 1 && (
+                                <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
+                                  {inv.vendorName}
+                                </span>
+                              )}
+                              {/* source_inbox badge */}
+                              {(() => {
+                                const src = (inv as any).source_inbox as string | null | undefined;
+                                if (!src || src === 'default') return null;
+                                const isAp = src === 'ap';
+                                return (
+                                  <span className={`text-[9px] font-mono font-semibold px-1 py-0.5 rounded shrink-0 ${
+                                    isAp
+                                      ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                                      : 'bg-zinc-600/30 text-zinc-400 border border-zinc-600/40'
+                                  }`}>
+                                    @{isAp ? 'ap' : src.split('@')[0]}
+                                  </span>
+                                );
+                              })()}
+                              {inv.invoiceNumber && (
+                                <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                  #{inv.invoiceNumber}
+                                </span>
+                              )}
+                              {inv.total !== 0 && (
+                                <span className="text-[10px] font-mono text-zinc-400 shrink-0">
+                                  ${Number(inv.total).toFixed(2)}
+                                </span>
+                              )}
+                              <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
+                                {timeAgo(inv.processedAt)}
+                              </span>
+                            </div>
+                            {inv.classificationReason && (
+                              <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
+                                {inv.classificationReason}
+                              </div>
+                            )}
+                            <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                              {/* Reason selector — compact inline buttons */}
+                              {(["credit_card", "service_no_po", "not_ours", "other"] as const).map(r => (
+                                <button
+                                  key={r}
+                                  onClick={() => setDisregardReason(prev => ({ ...prev, [inv.id]: selReason === r ? "" : r }))}
+                                  className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-medium border transition-colors ${
+                                    selReason === r
+                                      ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                                      : "bg-zinc-800/50 text-zinc-500 border-zinc-700/40 hover:text-zinc-300 hover:border-zinc-600/50"
+                                  }`}
+                                >
+                                  {r === "credit_card" ? "💳 Credit Card" : r === "service_no_po" ? "🔧 Service" : r === "not_ours" ? "✋ Not Ours" : "📋 Other"}
+                                </button>
+                              ))}
+                              <div className="flex-1" />
+                              {vendorInvs.length === 1 && (
+                                <button
+                                  onClick={() => handleDisregard(inv.id, selReason || undefined)}
+                                  disabled={isActing}
+                                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/25 hover:bg-rose-500/25 disabled:opacity-40 transition-colors"
+                                  title="Mark as not a PO purchase — removes from queue"
+                                >
+                                  {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
+                                  {isActing ? "..." : "Not a PO purchase"}
+                                </button>
+                              )}
+                              {vendorInvs.length >= 2 && (
+                                <button
+                                  onClick={() => handleDisregard(inv.id, selReason || undefined)}
+                                  disabled={isActing}
+                                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-800/50 text-zinc-500 border border-zinc-700/40 hover:text-zinc-300 hover:bg-zinc-700/50 disabled:opacity-40 transition-colors"
+                                  title="Disregard this single invoice"
+                                >
+                                  {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
+                                  {isActing ? "..." : "Single"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }),
+                  ];
+                });
+              })()}
+            </div>
+          )}
+
+          {/* Matched but unreconciled — has PO but no activity log; offer approve + disregard */}
+          {rest.filter(i => i.status === "matched_unreconciled").length > 0 && (
+            <div className="border-t border-cyan-500/10">
+              <div className="px-4 py-1.5 flex items-center gap-2 bg-cyan-500/5">
+                <span className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider font-semibold">
+                  Matched — Awaiting Confirmation
+                </span>
+                <span className="ml-auto text-[10px] font-mono text-cyan-400/60">
+                  {rest.filter(i => i.status === "matched_unreconciled").length} invoice{rest.filter(i => i.status === "matched_unreconciled").length !== 1 ? "s" : ""}
+                </span>
+              </div>
+              {rest.filter(i => i.status === "matched_unreconciled").map(inv => {
                 const isActing = actingOn === inv.id;
-                const selReason = disregardReason[inv.id] || "";
                 return (
-                  <div key={inv.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-rose-500/5 hover:bg-rose-500/[0.02] transition-colors">
-                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-rose-500" />
+                  <div key={inv.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-cyan-500/5 hover:bg-cyan-500/[0.02] transition-colors">
+                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-cyan-500" />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 min-w-0">
                         <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
@@ -646,6 +947,11 @@ export default function InvoiceQueuePanel() {
                         {inv.invoiceNumber && (
                           <span className="text-[10px] font-mono text-zinc-500 shrink-0">
                             #{inv.invoiceNumber}
+                          </span>
+                        )}
+                        {inv.poNumber && (
+                          <span className="text-xs font-mono text-blue-400 shrink-0">
+                            → PO {inv.poNumber}
                           </span>
                         )}
                         {inv.total !== 0 && (
@@ -658,29 +964,27 @@ export default function InvoiceQueuePanel() {
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                        {/* Reason selector — compact inline buttons */}
-                        {(["credit_card", "service_no_po", "not_ours", "other"] as const).map(r => (
-                          <button
-                            key={r}
-                            onClick={() => setDisregardReason(prev => ({ ...prev, [inv.id]: selReason === r ? "" : r }))}
-                            className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-medium border transition-colors ${
-                              selReason === r
-                                ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
-                                : "bg-zinc-800/50 text-zinc-500 border-zinc-700/40 hover:text-zinc-300 hover:border-zinc-600/50"
-                            }`}
-                          >
-                            {r === "credit_card" ? "💳 Credit Card" : r === "service_no_po" ? "🔧 Service" : r === "not_ours" ? "✋ Not Ours" : "📋 Other"}
-                          </button>
-                        ))}
+                        <span className="text-[10px] font-mono text-cyan-400/60 leading-tight">
+                          PO matched but awaiting confirmation. Approve to confirm and learn, or disregard as not a PO purchase.
+                        </span>
                         <div className="flex-1" />
                         <button
-                          onClick={() => handleDisregard(inv.id, selReason || undefined)}
-                          disabled={isActing}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/25 hover:bg-rose-500/25 disabled:opacity-40 transition-colors"
+                          onClick={() => handleApproveUnreconciled(inv.id, inv.poNumber || "")}
+                          disabled={isActing || !inv.poNumber}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40 transition-colors"
+                          title={`Confirm PO ${inv.poNumber} match — removes from queue and learns for future`}
+                        >
+                          {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                          {isActing ? "..." : "Approve"}
+                        </button>
+                        <button
+                          onClick={() => handleDisregardUnreconciled(inv.id, inv.poNumber || "")}
+                          disabled={isActing || !inv.poNumber}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700 hover:text-zinc-300 disabled:opacity-40 transition-colors"
                           title="Mark as not a PO purchase — removes from queue"
                         >
                           {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
-                          {isActing ? "..." : "Not a PO purchase"}
+                          {isActing ? "..." : "Dismiss"}
                         </button>
                       </div>
                     </div>

@@ -28,7 +28,7 @@ import {
 const supabase = createClient();
 
 type ActionRequest = {
-    action: "approve" | "pause" | "dismiss" | "rematch" | "disregard";
+    action: "approve" | "pause" | "dismiss" | "rematch" | "disregard" | "approve_unreconciled" | "disregard_unreconciled";
     activityLogId: string;
     dismissReason?: "already_handled" | "duplicate" | "credit_memo" | "statement" | "not_ours";
     rematchPoNumber?: string;
@@ -36,6 +36,9 @@ type ActionRequest = {
      *  invoices have no activity log row. The existing dismiss path is unusable
      *  for these — disregard is a separate action for the same reason. */
     invoiceId?: string;
+    /** PO number for matched_unreconciled action — required when approving/disregarding
+     *  a matched_unreconciled invoice so the confirmed_po_matches entry is recorded. */
+    poNumber?: string;
     reason?: string;
     markedBy?: string;
 };
@@ -50,11 +53,11 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "Supabase not configured" }, { status: 500 });
         }
 
-        // 1. Fetch the original activity log entry (skipped for disregard — unmatched invoices have no activity log)
+        // 1. Fetch the original activity log entry (skipped for disregard and unreconciled actions — those invoices have no activity log)
         let logEntry: any = null;
         let fetchError: any = null;
 
-        if (action !== "disregard") {
+        if (action !== "disregard" && action !== "approve_unreconciled" && action !== "disregard_unreconciled" && action !== "disregard_vendor") {
             const result = await supabase
                 .from("ap_activity_log")
                 .select("*")
@@ -459,6 +462,281 @@ export async function POST(req: Request) {
             return NextResponse.json({
                 success: true,
                 message: `🚫 Invoice ${invoice.invoice_number || ''} marked as not a PO purchase.`,
+            });
+        }
+
+        // ── DISREGARD VENDOR: Bulk-disregard ALL unmatched invoices from a vendor ──
+        // Sets no_po_required=true on every unmatched vendor_invoice from this vendor
+        // at once. Optionally sets requires_po=false on vendor_profiles so future
+        // invoices never surface.
+        if (action === "disregard_vendor") {
+            const vendorName = body.vendorName;
+            if (!vendorName || typeof vendorName !== "string" || vendorName.trim() === "") {
+                return NextResponse.json(
+                    { error: "vendorName is required" },
+                    { status: 400 }
+                );
+            }
+
+            const now = new Date().toISOString();
+            const reason = body.reason || "vendor_no_po_required";
+            const markedBy = body.markedBy || "dashboard";
+
+            // Step 1: Find all unmatched vendor_invoices for this vendor
+            const { data: vendorInvoices, error: viFetchErr } = await db
+                .from("vendor_invoices")
+                .select("id, invoice_number")
+                .eq("vendor_name", vendorName)
+                .or("no_po_required.is.null,no_po_required.eq.false");
+
+            if (viFetchErr) {
+                return NextResponse.json(
+                    { error: `Failed to fetch vendor invoices: ${viFetchErr.message}` },
+                    { status: 500 }
+                );
+            }
+
+            const invoiceIds = (vendorInvoices ?? []).map((vi: any) => vi.id);
+            const invoiceNumbers = (vendorInvoices ?? []).map((vi: any) => vi.invoice_number).filter(Boolean);
+
+            // Step 2: Aggregate total disregard value if we can
+            const { data: totals } = await db
+                .from("vendor_invoices")
+                .select("total")
+                .in("id", invoiceIds.length > 0 ? invoiceIds : ["00000000-0000-0000-0000-000000000000"]);
+
+            const totalValue = (totals ?? []).reduce((sum: number, r: any) => sum + Number(r.total ?? 0), 0);
+
+            // Step 3: Update vendor_invoices — bulk disregard
+            if (invoiceIds.length > 0) {
+                await db
+                    .from("vendor_invoices")
+                    .update({
+                        no_po_required: true,
+                        no_po_reason: reason,
+                        no_po_marked_by: markedBy,
+                        no_po_marked_at: now,
+                        action_required: true,
+                    })
+                    .in("id", invoiceIds);
+
+                // Step 4: Also update the invoices table so the queue filter catches them
+                if (invoiceNumbers.length > 0) {
+                    await db
+                        .from("invoices")
+                        .update({
+                            no_po_required: true,
+                            no_po_reason: reason,
+                            no_po_marked_by: markedBy,
+                            no_po_marked_at: now,
+                            action_required: true,
+                        })
+                        .in("invoice_number", invoiceNumbers);
+                }
+            }
+
+            // Step 5: Optionally mark vendor profile as requires_po=false
+            if (body.alsoMarkVendor) {
+                await db.from("vendor_profiles").upsert({
+                    vendor_name: vendorName,
+                    requires_po: false,
+                    updated_at: now,
+                    last_reconciliation_at: now,
+                }, { onConflict: "vendor_name", ignoreDuplicates: false });
+            }
+
+            // Step 6: Close any open issues for these invoices (best-effort)
+            for (const invNum of invoiceNumbers) {
+                try {
+                    const issueId = await apIssue.findApIssue({
+                        vendorName: vendorName,
+                        invoiceNumber: invNum,
+                        poNumber: "",
+                        orderId: "",
+                    });
+                    if (issueId) {
+                        await apIssue.unblockApIssue(issueId, "working");
+                        await apIssue.completeApIssue(issueId, {
+                            resolution: "disregarded",
+                            dismissed_by: markedBy,
+                            dismiss_reason: reason,
+                        });
+                    }
+                } catch { /* non-blocking */ }
+            }
+
+            const count = invoiceIds.length;
+            const dollarFmt = totalValue !== 0
+                ? ` ($${Math.abs(totalValue).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} total)`
+                : "";
+
+            const vendorNote = body.alsoMarkVendor
+                ? " Vendor profile updated — future invoices will not appear."
+                : "";
+
+            return NextResponse.json({
+                success: true,
+                message: `🚫 ${count} invoice${count !== 1 ? "s" : ""} from ${vendorName} disregarded.${dollarFmt}${vendorNote}`,
+                count,
+                vendorName,
+                totalDisregardedValue: totalValue,
+                alsoMarkedVendor: !!body.alsoMarkVendor,
+            });
+        }
+
+        // ── APPROVE UNRECONCILED: Confirm a PO match for a matched_unreconciled invoice ──
+        // matched_unreconciled invoices have a poNumber set but no activity log entry.
+        // This action writes a confirmed_po_matches row so the matcher learns, and inserts
+        // an ap_activity_log stub so the invoice leaves the queue permanently.
+        if (action === "approve_unreconciled") {
+            if (!body.invoiceId || typeof body.invoiceId !== "string" || body.invoiceId.trim() === "") {
+                return NextResponse.json(
+                    { error: "invoiceId is required" },
+                    { status: 400 }
+                );
+            }
+            if (!body.poNumber || typeof body.poNumber !== "string" || body.poNumber.trim() === "") {
+                return NextResponse.json(
+                    { error: "poNumber is required" },
+                    { status: 400 }
+                );
+            }
+
+            // Verify the invoice exists
+            const { data: invoice, error: fetchError } = await db
+                .from("vendor_invoices")
+                .select("id, invoice_number, vendor_name")
+                .eq("id", body.invoiceId)
+                .single();
+
+            if (fetchError || !invoice) {
+                return NextResponse.json(
+                    { error: "Invoice not found" },
+                    { status: 404 }
+                );
+            }
+
+            // Write confirmed_po_matches entry — the matcher reads this to boost scores
+            await db.from("confirmed_po_matches").upsert({
+                vendor_name: invoice.vendor_name || "Unknown",
+                po_number: body.poNumber.trim(),
+                invoice_id: invoice.id,
+                invoice_number: invoice.invoice_number || "",
+                confirmed_by: body.markedBy || "dashboard",
+                confirmed_at: now,
+            }, { onConflict: "vendor_name, po_number", ignoreDuplicates: false });
+
+            // Insert an ap_activity_log stub so the queue filters this invoice out
+            // (reviewed_action='approved' causes the queue to skip it)
+            await db.from("ap_activity_log").insert({
+                email_from: invoice.vendor_name || "Unknown",
+                email_subject: `Approved matched_unreconciled: Invoice ${invoice.invoice_number || ''} → PO ${body.poNumber.trim()}`,
+                intent: "RECONCILIATION",
+                action_taken: "Matched unreconciled approved by user",
+                reviewed_at: now,
+                reviewed_action: "approved",
+                metadata: {
+                    invoiceNumber: invoice.invoice_number || "",
+                    vendorName: invoice.vendor_name || "",
+                    orderId: body.poNumber.trim(),
+                    source: "dashboard_approve_unreconciled",
+                },
+            });
+
+            // Learn: update vendor_profiles approval stats
+            updateVendorProfile(
+                supabase, invoice.vendor_name || "Unknown",
+                "approved", 0
+            );
+
+            return NextResponse.json({
+                success: true,
+                message: `✅ Confirmed PO ${body.poNumber.trim()} for ${invoice.vendor_name || 'vendor'} (invoice ${invoice.invoice_number || ''}). Learned for future matches.`,
+            });
+        }
+
+        // ── DISREGARD UNRECONCILED: Mark a matched_unreconciled invoice as not a PO purchase ──
+        // Same basic approach as the unmatched disregard, but also updates vendor_profiles
+        // disregard_count so after N dismissals the system suggests auto-dismiss for this vendor.
+        if (action === "disregard_unreconciled") {
+            if (!body.invoiceId || typeof body.invoiceId !== "string" || body.invoiceId.trim() === "") {
+                return NextResponse.json(
+                    { error: "invoiceId is required" },
+                    { status: 400 }
+                );
+            }
+
+            // Verify the invoice exists
+            const { data: invoice, error: fetchError } = await db
+                .from("vendor_invoices")
+                .select("id, invoice_number, vendor_name")
+                .eq("id", body.invoiceId)
+                .single();
+
+            if (fetchError || !invoice) {
+                return NextResponse.json(
+                    { error: "Invoice not found" },
+                    { status: 404 }
+                );
+            }
+
+            // Set disregard columns on vendor_invoices — same as unmatched disregard
+            await db
+                .from("vendor_invoices")
+                .update({
+                    no_po_required: true,
+                    no_po_reason: body.reason || null,
+                    no_po_marked_by: body.markedBy || null,
+                    no_po_marked_at: now,
+                    action_required: true,
+                })
+                .eq("id", body.invoiceId);
+
+            // Learn: increment disregard_count on vendor_profiles for this vendor
+            // When disregard_count >= 3, auto_suggest_no_po is set to true to
+            // suggest future invoices from this vendor auto-dismiss.
+            try {
+                const vendorName = invoice.vendor_name || "Unknown";
+                const { data: existingProfile } = await supabase
+                    .from("vendor_profiles")
+                    .select("disregard_count, auto_suggest_no_po")
+                    .eq("vendor_name", vendorName)
+                    .single();
+
+                const currentDisregardCount = (existingProfile?.disregard_count ?? 0) + 1;
+                const shouldSuggest = currentDisregardCount >= 3;
+
+                await supabase.from("vendor_profiles").upsert({
+                    vendor_name: vendorName,
+                    disregard_count: currentDisregardCount,
+                    auto_suggest_no_po: shouldSuggest,
+                    dismiss_count: currentDisregardCount, // Also sync dismiss_count for consistency
+                    updated_at: now,
+                    last_reconciliation_at: now,
+                }, { onConflict: "vendor_name", ignoreDuplicates: false });
+            } catch { /* non-blocking — vendor profile update must never fail the action */ }
+
+            // Phase 2 issue ledger: best-effort close any open issue
+            try {
+                const issueId = await apIssue.findApIssue({
+                    vendorName: invoice.vendor_name || "Unknown",
+                    invoiceNumber: invoice.invoice_number || "",
+                    poNumber: "",
+                    orderId: "",
+                });
+                if (issueId) {
+                    await apIssue.unblockApIssue(issueId, "working");
+                    await apIssue.completeApIssue(issueId, {
+                        resolution: "disregarded",
+                        dismissed_by: body.markedBy || "dashboard",
+                        dismiss_reason: body.reason || "not_a_po_purchase",
+                    });
+                }
+            } catch { /* non-blocking */ }
+
+            return NextResponse.json({
+                success: true,
+                message: `🚫 Invoice ${invoice.invoice_number || ''} (${invoice.vendor_name || 'vendor'}) marked as not a PO purchase. Vendor disregard count updated.`,
             });
         }
 
