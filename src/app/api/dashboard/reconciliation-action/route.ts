@@ -424,6 +424,9 @@ export async function POST(req: Request) {
             }
 
             // Set disregard columns — idempotent (setting again is not an error)
+            // action_required = true signifies this is a DELIBERATE human decision,
+            // not a systemic dropship classification. The owning team uses this to
+            // distinguish invoices needing periodic review from systemic no-PO items.
             await db
                 .from("vendor_invoices")
                 .update({
@@ -431,6 +434,7 @@ export async function POST(req: Request) {
                     no_po_reason: body.reason || null,
                     no_po_marked_by: body.markedBy || null,
                     no_po_marked_at: new Date().toISOString(),
+                    action_required: true,
                 })
                 .eq("id", body.invoiceId);
 

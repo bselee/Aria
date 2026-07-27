@@ -166,6 +166,7 @@ export async function GET(req: NextRequest) {
                 vendorName,
                 fromEmail,
                 subject,
+                poNumber: row.po_number,
             });
 
             // Dropship flow-through invoices never appear in the queue

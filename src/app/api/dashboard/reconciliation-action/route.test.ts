@@ -192,6 +192,7 @@ describe("POST /api/dashboard/reconciliation-action — disregard", () => {
         // Verify the update call carried the correct fields
         expect(qb.update).toHaveBeenCalledWith({
             no_po_required: true,
+            action_required: true,
             no_po_reason: "credit_card",
             no_po_marked_by: "Will",
             no_po_marked_at: expect.any(String),

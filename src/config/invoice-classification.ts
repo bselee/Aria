@@ -117,6 +117,15 @@ export interface ClassificationInput {
     filename?: string | null;
     /** Whether this came via the AP inbox (true) or default inbox (false) */
     fromApInbox?: boolean;
+    /**
+     * Purchase order number. PO-pattern detection is STRONGER than
+     * vendor-name keyword matching because the PO number is an
+     * authoritative system identifier — if the PO ends with
+     * "-DropshipPO" or "-S-DropshipPO", the transaction IS a
+     * dropship regardless of vendor name. Keeping both signals
+     * ensures coverage even when one is missing.
+     */
+    poNumber?: string | null;
 }
 
 /**
@@ -127,8 +136,18 @@ export interface ClassificationInput {
  *
  * Resolution order:
  *   1. REAL_INVOICE_OVERRIDES — explicit override wins everything
- *   2. DROPSHIP_RULES — known dropship vendors
- *   3. Unknown — can't determine, needs human classification
+ *   2. PO NUMBER dropship pattern — stronger than vendor name because the PO is
+ *      an authoritative system identifier. If the PO ends with "-DropshipPO" or
+ *      "-S-DropshipPO", it IS a dropship regardless of vendor name.
+ *   3. DROPSHIP_RULES — known dropship vendors (keyword fallback)
+ *   4. Unknown — can't determine, needs human classification
+ *
+ * NOTE: PO-pattern detection is deliberately placed before vendor-name keyword
+ * matching because a dropship-suffixed PO number is an unambiguous signal from
+ * the purchasing system — it doesn't depend on OCR quality, vendor name
+ * variations, or the keyword registry being kept up to date. Removing this as
+ * "duplicate of keyword matching" would create a regression for any dropship
+ * vendor whose name is not in KNOWN_DROPSHIP_KEYWORDS.
  */
 export function classifyInvoice(input: ClassificationInput): ClassificationResult {
     const vendor = (input.vendorName || '').toLowerCase().trim();
@@ -155,7 +174,20 @@ export function classifyInvoice(input: ClassificationInput): ClassificationResul
         }
     }
 
-    // ── Step 2: Check dropship rules ────────────────────────────────────────
+    // ── Step 2: PO-number dropship pattern (stronger than vendor name) ──────
+    // The PO number is an authoritative system identifier — if it ends with
+    // "-DropshipPO" or "-S-DropshipPO", the transaction IS a dropship regardless
+    // of vendor name, OCR accuracy, or keyword registry completeness.
+    const po = (input.poNumber || '').trim();
+    if (po && /^\d+(-S)?-DropshipPO$/i.test(po)) {
+        return {
+            classification: 'dropship_flow_through',
+            reason: `Dropship PO number: ${po}`,
+            matchedRule: 'PO Pattern: DropshipPO suffix',
+        };
+    }
+
+    // ── Step 3: Check dropship rules ────────────────────────────────────────
     for (const rule of DROPSHIP_RULES) {
         // If rule has a subject requirement, check it first
         if (rule.subjectRequired && !subject.includes(rule.subjectRequired.toLowerCase())) {
@@ -194,7 +226,7 @@ export function classifyInvoice(input: ClassificationInput): ClassificationResul
         }
     }
 
-    // ── Step 3: Unknown — can't determine from available data ──────────────
+    // ── Step 4: Unknown — can't determine from available data ──────────────
     // If we have enough data to make a real invoice guess, assume real
     if (vendor || email) {
         return {

@@ -354,7 +354,7 @@ describe("needsAnalysis", () => {
 // ─── Combined pipeline scenarios ──────────────────────────────────────────────
 
 describe("classifyInvoice — Full resolution order", () => {
-    // Verify the ordering: RealInvoiceOverrides > DropshipRules > Fallback > Unknown
+    // Verify the ordering: RealInvoiceOverrides > PO Pattern > DropshipRules > Fallback > Unknown
 
     it("Step 1: ULINE falls through to real_invoice (no override needed since 5186363 kaizen removed it)", () => {
         const r = classifyInvoice({ vendorName: "Uline" });
@@ -363,21 +363,122 @@ describe("classifyInvoice — Full resolution order", () => {
         expect(r.matchedRule).toBeUndefined();
     });
 
-    it("Step 2: DropshipRules match — AutoPot", () => {
+    it("Step 2: PO-pattern dropship fires before vendor keyword", () => {
+        const r = classifyInvoice({
+            vendorName: "Random Vendor",
+            poNumber: "99999999-DropshipPO",
+        });
+        expect(r.classification).toBe(dropship);
+        expect(r.matchedRule).toContain("DropshipPO suffix");
+    });
+
+    it("Step 3: DropshipRules match — AutoPot", () => {
         const r = classifyInvoice({ vendorName: "AutoPot" });
         expect(r.classification).toBe(dropship);
         expect(r.matchedRule).toContain("AutoPot");
     });
 
-    it("Step 3: Fallback with vendor/email → real_invoice", () => {
+    it("Step 4: Fallback with vendor/email → real_invoice", () => {
         const r = classifyInvoice({ vendorName: "Some Vendor" });
         expect(r.classification).toBe(real);
         expect(r.reason).toContain("No dropship rules matched");
     });
 
-    it("Step 4: No data → unknown", () => {
+    it("Step 5: No data → unknown", () => {
         const r = classifyInvoice({});
         expect(r.classification).toBe(unknown);
         expect(r.reason).toContain("Insufficient data");
+    });
+});
+
+// ─── PO-pattern dropship detection ──────────────────────────────────────────
+
+describe("classifyInvoice — PO-number dropship pattern", () => {
+    it("PO ending with '-DropshipPO' classifies as dropship_flow_through", () => {
+        const r = classifyInvoice({
+            vendorName: "Unknown Vendor",
+            poNumber: "23496707-DropshipPO",
+        });
+        expect(r.classification).toBe(dropship);
+        expect(r.reason).toContain("23496707-DropshipPO");
+        expect(r.matchedRule).toContain("DropshipPO suffix");
+    });
+
+    it("PO ending with '-S-DropshipPO' (sales order variant) classifies as dropship", () => {
+        const r = classifyInvoice({
+            vendorName: "Some Vendor",
+            poNumber: "23433887-S-DropshipPO",
+        });
+        expect(r.classification).toBe(dropship);
+        expect(r.reason).toContain("23433887-S-DropshipPO");
+    });
+
+    it("PO pattern wins over vendor-name keyword match (PO is stronger signal)", () => {
+        // Both signals present; PO pattern fires first
+        const r = classifyInvoice({
+            vendorName: "AutoPot",
+            poNumber: "99999999-DropshipPO",
+        });
+        expect(r.classification).toBe(dropship);
+        // Should be PO-based reason, not vendor-keyword reason
+        expect(r.matchedRule).toContain("DropshipPO suffix");
+    });
+
+    it("PO without dropship suffix does NOT match — falls through to vendor keyword", () => {
+        const r = classifyInvoice({
+            vendorName: "AutoPot",
+            poNumber: "124161",
+        });
+        expect(r.classification).toBe(dropship);
+        // Falls through PO check (no suffix) → vendor keyword matches
+        expect(r.matchedRule).toContain("AutoPot");
+    });
+
+    it("Unknown vendor with normal PO + no keyword match → real_invoice", () => {
+        const r = classifyInvoice({
+            vendorName: "Some Vendor Co",
+            poNumber: "124161",
+        });
+        expect(r.classification).toBe(real);
+        expect(r.reason).toContain("No dropship rules matched");
+    });
+
+    it("Null/undefined poNumber does not crash", () => {
+        const r1 = classifyInvoice({ vendorName: "Test", poNumber: null });
+        expect(r1.classification).toBe(real);
+
+        const r2 = classifyInvoice({ vendorName: "Test", poNumber: undefined });
+        expect(r2.classification).toBe(real);
+    });
+
+    it("Empty poNumber string does not crash or match", () => {
+        const r = classifyInvoice({ vendorName: "Test", poNumber: "" });
+        expect(r.classification).toBe(real);
+    });
+
+    it("Case insensitive: '-dropshippo' lowercase still matches", () => {
+        const r = classifyInvoice({
+            vendorName: "Unknown",
+            poNumber: "23496707-dropshippo",
+        });
+        expect(r.classification).toBe(dropship);
+    });
+
+    it("Case insensitive: '-s-dropshippo' mixed case matches", () => {
+        const r = classifyInvoice({
+            vendorName: "Unknown",
+            poNumber: "23496707-S-dropshippo",
+        });
+        expect(r.classification).toBe(dropship);
+    });
+
+    it("PO pattern catches a non-keyword vendor (future-proofing)", () => {
+        // Simulate a new dropship vendor NOT in KNOWN_DROPSHIP_KEYWORDS
+        const r = classifyInvoice({
+            vendorName: "Brand New Supplier Co",
+            poNumber: "55555555-S-DropshipPO",
+        });
+        expect(r.classification).toBe(dropship);
+        expect(r.matchedRule).toContain("DropshipPO suffix");
     });
 });
