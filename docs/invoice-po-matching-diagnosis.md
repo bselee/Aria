@@ -172,10 +172,42 @@ treatment (either `needs_approval` or a new badge).
 
 #### 5.4b Add the terminal "not a PO purchase" action
 
-Still genuinely missing. Without it the list can only grow — there is no way to record
-"this was a credit-card purchase, it will never have a PO". Combined with §5.2's
-`source_inbox`, a one-click "Not a PO purchase" on a `bill.selee@` invoice is the exact
-flow Bill described.
+**CONFIRMED BY BILL 2026-07-27:** "if it does not have a PO should be flagged and a way to
+add action to disregard."
+
+The flag already exists (rose "NO PO" badge). The **disregard does not**, and the reason is
+worse than "not built yet" — it is structurally impossible with the current plumbing:
+
+```
+unmatched rows: 64
+  WITH activityLogId (dismissable):    0
+  WITHOUT (cannot be actioned at all): 64
+```
+
+Every action in `reconciliation-action/route.ts` (`approve` / `pause` / `dismiss` /
+`rematch`) is keyed on `activityLogId`. But `ap_activity_log` rows are written by the
+reconciler *when it processes a match* — an invoice that never matched anything never gets
+one. `invoice-queue/route.ts:236` even demotes rows lacking an activity log.
+
+So **100% of unmatched invoices are a dead end**: displayed, un-clearable, permanent. That
+is why the list can only grow, and it is exactly what Bill is asking to fix.
+
+Fix shape:
+- New `disregard` action keyed on `vendor_invoices.id` (**not** `activityLogId`).
+- Persist the decision on the invoice row: `no_po_required`, `no_po_reason`,
+  `no_po_marked_by`, `no_po_marked_at`.
+- Reason picker: credit card / service — no PO / not ours / other. Bill's stated common
+  case is a credit-card purchase.
+- Filter `no_po_required = true` out of the queue and out of `stats.unmatched`.
+- Never set automatically. This is a deliberate human judgement and the column comments say
+  so.
+
+**Decision — per-invoice only, no auto-learning.** An earlier idea was to auto-set the
+vendor's `requires_po = false` after a couple of disregards. Rejected: it would silently
+silence a vendor that usually *does* need POs, and silent suppression of financial
+exceptions is the same class of failure as the fabricated-telemetry bug found earlier today.
+Vendor-level suppression stays an explicit action via §5.3.
+
 
 #### 5.4c Filter by `requires_po`
 
