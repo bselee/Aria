@@ -45,7 +45,7 @@ export async function GET(req: Request) {
         // Receivings today
         db.from("shipments").select("id", { count: "exact", head: true }).gte("delivered_at", today + "T00:00:00"),
         // Cron runs today
-        db.from("cron_runs").select("job_name, status, id").gte("ran_at", today + "T00:00:00").order("ran_at", { ascending: false }).limit(100),
+        db.from("cron_runs").select("task_name, status, id").gte("started_at", today + "T00:00:00").order("started_at", { ascending: false }).limit(100),
     ]);
 
     // AP activity breakdown
@@ -55,15 +55,35 @@ export async function GET(req: Request) {
         activityCounts[action] = (activityCounts[action] || 0) + 1;
     }
 
-    // Cron run summary
+    // ── Detect silent query failures ─────────────────────────────────────────
+    // PostgREST returns HTTP 4xx in the error field rather than throwing,
+    // so erroneous queries produce null data and are indistinguishable from
+    // an empty dataset. Surface the degraded state explicitly.
+    const degraded: string[] = [];
+    const results = { emailInbox, apQueue, apActivity, posCreated, posSent, receivings, cronRuns };
+    for (const [label, res] of Object.entries(results)) {
+        if (res.error) {
+            degraded.push(`${label}: ${res.error.message || res.error.hint || JSON.stringify(res.error)}`);
+        }
+    }
+
+    // ── Cron run summary ──────────────────────────────────────────────────────
+    // Status vocabulary: running, succeeded, failed, cancelled, skipped,
+    // plus legacy success/error, plus 'unknown' (fabricated telemetry from
+    // an old unfiltered-UPDATE bug — NOT a real failure).
     const cronFails: string[] = [];
     const cronSuccess = new Set<string>();
+    let cronUnknown = 0;
     for (const run of (cronRuns.data || []) as any[]) {
-        if (run.status === "failed" || run.status === "error") {
-            cronFails.push(run.job_name);
-        } else {
-            cronSuccess.add(run.job_name);
+        const s = run.status;
+        if (s === "failed" || s === "error") {
+            cronFails.push(run.task_name);
+        } else if (s === "succeeded" || s === "success") {
+            cronSuccess.add(run.task_name);
+        } else if (s === "unknown") {
+            cronUnknown++;
         }
+        // running, cancelled, skipped → excluded from totals
     }
 
     return NextResponse.json({
@@ -85,6 +105,8 @@ export async function GET(req: Request) {
             totalRuns: (cronRuns.data || []).length,
             failedJobs: [...new Set(cronFails)],
             successJobs: cronSuccess.size,
+            unknownRuns: cronUnknown,
         },
+        ...(degraded.length > 0 ? { degraded } : {}),
     }, { headers: { "Cache-Control": "public, max-age=60" } });
 }
