@@ -37,7 +37,7 @@ export async function GET(req: Request) {
         // AP queue activity
         db.from("ap_inbox_queue").select("id, status", { count: "exact" }).gte("created_at", today + "T00:00:00"),
         // AP activity log
-        db.from("ap_activity_log").select("action, id").gte("created_at", today + "T00:00:00").limit(500),
+        db.from("ap_activity_log").select("action_taken, id").gte("created_at", today + "T00:00:00").limit(500),
         // POs created today
         db.from("purchase_orders").select("po_number", { count: "exact", head: true }).gte("created_at", today + "T00:00:00"),
         // POs sent today
