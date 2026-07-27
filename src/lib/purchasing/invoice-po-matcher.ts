@@ -386,21 +386,52 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
     // ── Tier A: Exact OCR PO match ────────────────────────────────────────
     // If the invoice carries a raw OCR PO candidate (from raw_data.poNumber,
-    // orderRef, etc.), sanitize it and check if it exactly matches a PO in
-    // our candidate list. This beats all scoring — the OCR directly named
-    // the PO, so score = 100, autoApplyReady = true.
+    // orderRef, etc.), sanitize it and DIRECT-LOOKUP the PO by number first.
+    // Vendor-name search can miss when OCR vendor ≠ Finale supplier name —
+    // the PO number is the authoritative join. Never dropship.
     const sanitizedOcrPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
         || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
     if (sanitizedOcrPo && !isDropshipPo(sanitizedOcrPo)) {
-        const exactMatch = candidates.find(
+        // Prefer a candidate already in the list
+        let exactMatch = candidates.find(
             c => c.orderId.toUpperCase() === sanitizedOcrPo.toUpperCase() && !isDropshipPo(c.orderId)
         );
+        // If vendor search missed it, fetch by po_number directly
+        if (!exactMatch) {
+            try {
+                const { data: byPo } = await db
+                    .from("purchase_orders")
+                    .select("po_number, vendor_name, issue_date, total_amount, total, status")
+                    .eq("po_number", sanitizedOcrPo)
+                    .limit(1);
+                const row = (byPo || [])[0] as any;
+                if (row && row.po_number && !isDropshipPo(String(row.po_number))) {
+                    const poTotal = Number(row.total_amount || row.total || 0);
+                    exactMatch = {
+                        orderId: String(row.po_number),
+                        vendorName: row.vendor_name || "",
+                        orderDate: row.issue_date || "",
+                        total: poTotal,
+                        status: row.status || "unknown",
+                        score: 100,
+                        reasons: [`exact OCR PO match: ${sanitizedOcrPo}`, "direct po_number lookup"],
+                        isOpen: ["open", "partial", "committed", "locked"].includes(
+                            String(row.status || "").toLowerCase()
+                        ),
+                    };
+                    candidates.push(exactMatch);
+                }
+            } catch (e: any) {
+                console.warn(`[invoice-po-matcher] OCR direct PO lookup failed: ${e?.message || e}`);
+            }
+        }
         if (exactMatch) {
             exactMatch.score = 100;
-            exactMatch.reasons.push(`exact OCR PO match: ${sanitizedOcrPo}`);
-            // Promote to top of sorted list
+            if (!exactMatch.reasons.some((r) => r.includes("exact OCR PO match"))) {
+                exactMatch.reasons.push(`exact OCR PO match: ${sanitizedOcrPo}`);
+            }
             candidates.sort((a, b) => b.score - a.score);
-            autoApplyReady = candidates[0] === exactMatch && invoice.total > 0;
+            autoApplyReady = candidates[0] === exactMatch && invoice.total > 0 && !isDropshipPo(exactMatch.orderId);
         }
     }
 
