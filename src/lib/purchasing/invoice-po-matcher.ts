@@ -23,6 +23,11 @@ import { createClient } from "@/lib/db";
 import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
 import { FinaleClient } from "@/lib/finale/client";
 import { reconcileInvoiceToPO, applyReconciliation, buildReconciliationIdentityMetadata } from "@/lib/finale/reconciler";
+import {
+    normalizeVendorName,
+    resolveCanonicalVendor,
+    loadVendorAliases,
+} from "@/lib/purchasing/vendor-name-normalize";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -66,8 +71,9 @@ const MIN_SCORE_FOR_SUGGESTION = 50;
 // ── Scoring ────────────────────────────────────────────────────────────────
 
 function scoreVendorName(a: string, b: string): { score: number; reason: string } {
-    const al = a.toLowerCase().trim();
-    const bl = b.toLowerCase().trim();
+    const al = normalizeVendorName(a);
+    const bl = normalizeVendorName(b);
+    if (!al || !bl) return { score: 0, reason: "vendor name missing" };
     if (al === bl) return { score: 40, reason: "exact vendor match" };
     if (al.includes(bl) || bl.includes(al)) return { score: 30, reason: "vendor substring match" };
 
@@ -139,6 +145,40 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
     if (!db) return { invoice, candidates: [], bestMatch: null, autoApplyReady: false };
 
+    // Load vendor aliases and resolve the invoice vendor name to a canonical
+    // Finale supplier name. This bridges OCR-vs-Finale name mismatches.
+    const aliases = await loadVendorAliases();
+    const canonicalName = resolveCanonicalVendor(invoice.vendorName, aliases);
+
+    // Collect all alias values that map to this canonical vendor. These can be
+    // used as ilike search targets — the alias text (e.g. "AutoPot Watering
+    // Systems USA") may be a superset of the PO vendor name ("Autopot Watering
+    // Systems") and catch matches via substring ILIKE.
+    const canonicalAliasValues: string[] = canonicalName
+        ? aliases
+              .filter(a => a.finale_supplier_name === canonicalName)
+              .map(a => a.alias)
+        : [];
+
+    const canonicalDiffers =
+        canonicalName &&
+        normalizeVendorName(canonicalName) !== normalizeVendorName(invoice.vendorName);
+
+    // Build search targets for the alias-derived search: the canonical name
+    // itself (if different from original) and all matching alias values.
+    const aliasSearchTargets: string[] = [];
+    if (canonicalDiffers) aliasSearchTargets.push(canonicalName!);
+    // Also try searching by the alias value that matched (if the resolved
+    // alias differs from both the canonical and the original vendor name).
+    // This handles cases where the alias text is a closer match to the PO
+    // name than the canonical name is.
+    for (const av of canonicalAliasValues) {
+        const nav = normalizeVendorName(av);
+        if (nav && nav !== normalizeVendorName(invoice.vendorName) && nav !== normalizeVendorName(canonicalName!)) {
+            aliasSearchTargets.push(av);
+        }
+    }
+
     // Normalize vendor name: extract significant words for broader matching.
     // "Miles Filippelli" from OCR should match "Miles Nursery LLC" in purchase_orders.
     const searchTerms = extractSearchTerms(invoice.vendorName);
@@ -167,11 +207,81 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
+    // If the invoice vendor name resolves to a canonical name (via vendor_aliases),
+    // ALSO search for POs matching the canonical name or any of its alias values.
+    // This catches cases like invoice "AutoPot USA" → canonical "AutoPot USA" with
+    // alias "AutoPot Watering Systems USA" that substring-matches PO vendor name
+    // "Autopot Watering Systems" via ILIKE.
+    let canonicalPos: any[] | null = null;
+    const seenPoNumbers = new Set<string>((pos || []).map((p: any) => p.po_number));
+    for (const target of aliasSearchTargets) {
+        const { data: cPos } = await db
+            .from("purchase_orders")
+            .select("po_number, vendor_name, issue_date, total_amount, total, status")
+            .ilike("vendor_name", `%${target}%`)
+            .order("issue_date", { ascending: false })
+            .limit(20);
+        if (cPos && cPos.length > 0) {
+            for (const cp of cPos) {
+                if (!seenPoNumbers.has(cp.po_number)) {
+                    if (!canonicalPos) canonicalPos = [];
+                    canonicalPos.push(cp);
+                    seenPoNumbers.add(cp.po_number);
+                }
+            }
+        }
+    }
+
+    // If alias-derived search found new POs, dedup and merge them into the main list
+    if (canonicalPos) {
+        const merged = [...(pos || []), ...canonicalPos];
+        merged.sort((a: any, b: any) => (b.issue_date || "").localeCompare(a.issue_date || ""));
+        pos = merged;
+    }
+
     for (const po of (pos || []) as any[]) {
-        const vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
+        let vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
         const dateScore = scoreDateProximity(invoice.invoiceDate, po.issue_date || "");
         const poTotal = Number(po.total_amount || po.total || 0);
         const amountScore = scoreAmountProximity(invoice.total, poTotal);
+
+        // ── Alias-match detection ───────────────────────────────────────────
+        // When the invoice vendor name resolves to a canonical Finale supplier
+        // via vendor_aliases, check if this PO's vendor name matches that
+        // canonical name (or any of its associated aliases). If so, boost the
+        // vendor score to 40 (equivalent to exact match) with a descriptive
+        // reason so the dashboard shows why the match was made.
+        //
+        // This handles cases where:
+        //   Invoice: "AutoPot Watering Systems USA" (OCR)
+        //   Alias:   "Autopot Watering Systems USA" → "AutoPot USA"
+        //   PO:      "Autopot Watering Systems"
+        //   → "alias match: AutoPot USA via Autopot Watering Systems USA"
+        let aliasReason: string | null = null;
+        if (canonicalName && vendorScore.score < 40) {
+            const poVendorNorm = normalizeVendorName(po.vendor_name || "");
+            const canonNorm = normalizeVendorName(canonicalName);
+
+            // Exact normalized match between PO vendor name and canonical name
+            if (poVendorNorm === canonNorm) {
+                aliasReason = `alias match: ${invoice.vendorName} → ${canonicalName}`;
+            } else {
+                // Check if any alias value for this canonical vendor matches the
+                // PO vendor name (normalized). The PO name may be a substring of
+                // the alias (or vice versa).
+                for (const av of canonicalAliasValues) {
+                    const avNorm = normalizeVendorName(av);
+                    if (avNorm && (avNorm === poVendorNorm || avNorm.includes(poVendorNorm) || poVendorNorm.includes(avNorm))) {
+                        aliasReason = `alias match: ${invoice.vendorName} → ${canonicalName} (via ${av})`;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (aliasReason) {
+            vendorScore = { score: 40, reason: aliasReason };
+        }
 
         let total = vendorScore.score + dateScore.score + amountScore.score;
 
