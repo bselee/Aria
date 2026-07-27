@@ -311,17 +311,42 @@ class QueryBuilder {
       url.searchParams.set("on_conflict", this._onConflict);
     }
 
+    // CRITICAL(2026-07-27): Filters MUST be applied to EVERY method, not just GET.
+    // Previously this whole block was gated behind `if (this._method === "GET")`,
+    // so `.update({...}).eq("id", x)` and `.delete().eq("id", x)` shipped a PATCH /
+    // DELETE with NO query string — PostgREST then applied the write to EVERY ROW
+    // in the table. This silently corrupted ap_activity_log (1,654 rows collapsed
+    // to one identical payload) and purchase_orders.lifecycle_state (1,122 rows
+    // stamped RECEIVED). Filters are method-independent; only select/order/limit
+    // are GET-shaped.
+    for (const f of this._filters) {
+      const eqIndex = f.indexOf("=");
+      if (eqIndex === -1) continue;
+      const key = f.slice(0, eqIndex);
+      const val = f.slice(eqIndex + 1);
+      url.searchParams.append(key, val);
+    }
+
+    // Guard rail: refuse to send an unfiltered PATCH/DELETE. A write with no
+    // filter is virtually never intentional in Aria — it is the signature of a
+    // dropped predicate and it destroys the whole table. Fail loudly instead.
+    if (
+      (this._method === "PATCH" || this._method === "DELETE") &&
+      this._filters.length === 0
+    ) {
+      return {
+        data: null,
+        error: new Error(
+          `[db] BLOCKED unfiltered ${this._method} on "${this.table}" — ` +
+          `a write with no filter would affect every row. Add a filter ` +
+          `(e.g. .eq("id", value)), or use .rpc()/raw SQL for intentional bulk writes.`
+        ),
+      };
+    }
+
     // Build query params for GET
     if (this._method === "GET") {
       url.searchParams.set("select", this._select);
-
-      for (const f of this._filters) {
-        const eqIndex = f.indexOf("=");
-        if (eqIndex === -1) continue;
-        const key = f.slice(0, eqIndex);
-        const val = f.slice(eqIndex + 1);
-        url.searchParams.append(key, val);
-      }
 
       if (this._order) {
         const dir = this._orderDir === "desc" ? ".desc" : ".asc";

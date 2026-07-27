@@ -95,9 +95,14 @@ export async function batchLoadAriaPurchaseHistory(
     const targetSet = new Set(productIds);
 
     for (const po of pos) {
-        if (!po.line_items || !Array.isArray(po.line_items)) continue;
+        // DEFENSIVE(2026-07-27): line_items is jsonb but some historical rows hold a
+        // double-encoded JSON *string* (written via JSON.stringify before the
+        // po-cache fix). A bare Array.isArray() guard silently skipped those POs,
+        // under-reporting purchase history. Coerce the string form before use.
+        const lineItems = coerceLineItems(po.line_items);
+        if (lineItems.length === 0) continue;
 
-        for (const line of po.line_items) {
+        for (const line of lineItems) {
             const lineProductId = line.product_id || line.sku;
             if (!lineProductId || !targetSet.has(lineProductId)) continue;
 
@@ -139,6 +144,32 @@ export async function batchLoadAriaPurchaseHistory(
     });
 
     return result;
+}
+
+/**
+ * Normalize a `purchase_orders.line_items` jsonb value into a real array.
+ *
+ * The column is `jsonb`, but rows written before the 2026-07-27 po-cache fix
+ * used `JSON.stringify(items)`, which stores a JSON *string* (`"[{...}]"`)
+ * rather than a JSON array. Callers that guarded with a bare `Array.isArray()`
+ * silently dropped those POs from purchase-history aggregation.
+ *
+ * @param raw - Value as returned by PostgREST: an array, a JSON string, or null.
+ * @returns A line-item array; empty when the value is absent or unparseable.
+ */
+function coerceLineItems(raw: unknown): any[] {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === "string") {
+        const trimmed = raw.trim();
+        if (!trimmed) return [];
+        try {
+            const parsed = JSON.parse(trimmed);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
 }
 
 function parseLineQty(line: any): number {

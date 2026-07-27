@@ -58,7 +58,13 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             status: po.status || "unknown",
             total: po.total,
             total_amount: po.total,
-            line_items: JSON.stringify(po.items || []),
+            // BUGFIX(2026-07-27): do NOT JSON.stringify into a jsonb column.
+            // The db client already JSON-encodes the request body, so stringifying
+            // here stored a JSON *string* ("[{...}]") instead of a JSON array.
+            // 389 of 1123 POs were affected, and every reader that guards with
+            // Array.isArray(po.line_items) (e.g. finale/aria-purchase-history.ts)
+            // silently skipped them — purchase history under-reported real orders.
+            line_items: po.items || [],
             issue_date: po.orderDate || null,
             required_date: (po as any).expectedDate || (po as any).dueDate || null,
             updated_at: now,
