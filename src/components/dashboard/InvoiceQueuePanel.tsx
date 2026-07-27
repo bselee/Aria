@@ -23,6 +23,13 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+/** Compact date display: "Jun 14" or "" when null */
+function fmtShortDate(dateStr: string | null): string {
+  if (!dateStr) return "";
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
 type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched" | "short_shipment_hold" | "matched_unreconciled";
 
 const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
@@ -678,6 +685,11 @@ export default function InvoiceQueuePanel() {
                           #{inv.invoiceNumber}
                         </span>
                       )}
+                      {inv.lastMatchStatus && (
+                        <span className="text-[9px] font-mono text-zinc-600 shrink-0">
+                          last: {inv.lastMatchStatus}
+                        </span>
+                      )}
                       {inv.poNumber && (
                         <span className="text-xs font-mono text-blue-400 shrink-0">
                           → PO {inv.poNumber}
@@ -692,6 +704,11 @@ export default function InvoiceQueuePanel() {
                           {inv.balanceWarning && <span className="ml-0.5 text-amber-300">⚠</span>}
                         </span>
                       )}
+                      {inv.invoiceDate && (
+                        <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                          {fmtShortDate(inv.invoiceDate)}
+                        </span>
+                      )}
                       <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
                         {timeAgo(inv.processedAt)}
                       </span>
@@ -699,6 +716,20 @@ export default function InvoiceQueuePanel() {
                     {inv.classificationReason && (
                       <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
                         {inv.classificationReason}
+                      </div>
+                    )}
+                    {(inv.ocrPoCandidate || inv.ocrOrderCandidate) && (
+                      <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                        {inv.ocrPoCandidate && (
+                          <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+                            OCR: PO {inv.ocrPoCandidate}
+                          </span>
+                        )}
+                        {inv.ocrOrderCandidate && (
+                          <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+                            OCR: order {inv.ocrOrderCandidate}
+                          </span>
+                        )}
                       </div>
                     )}
                     <div className="flex items-center gap-2 mt-1">
@@ -796,6 +827,11 @@ export default function InvoiceQueuePanel() {
                         <span className="text-[11px] font-mono font-semibold text-rose-300 truncate max-w-[200px]">
                           {vendorName}
                         </span>
+                        {vendorInvs[0]?.lastMatchStatus && (
+                          <span className="text-[9px] font-mono text-zinc-500 shrink-0">
+                            last matched: {vendorInvs[0].lastMatchStatus}
+                          </span>
+                        )}
                         <span className="text-[10px] font-mono text-zinc-500 shrink-0">
                           {vendorInvs.length} × ${vendorTotal.toFixed(2)}
                         </span>
@@ -865,6 +901,11 @@ export default function InvoiceQueuePanel() {
                                   ${Number(inv.total).toFixed(2)}
                                 </span>
                               )}
+                              {inv.invoiceDate && (
+                                <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                  {fmtShortDate(inv.invoiceDate)}
+                                </span>
+                              )}
                               <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
                                 {timeAgo(inv.processedAt)}
                               </span>
@@ -872,6 +913,20 @@ export default function InvoiceQueuePanel() {
                             {inv.classificationReason && (
                               <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
                                 {inv.classificationReason}
+                              </div>
+                            )}
+                            {(inv.ocrPoCandidate || inv.ocrOrderCandidate) && (
+                              <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                                {inv.ocrPoCandidate && (
+                                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+                                    OCR: PO {inv.ocrPoCandidate}
+                                  </span>
+                                )}
+                                {inv.ocrOrderCandidate && (
+                                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+                                    OCR: order {inv.ocrOrderCandidate}
+                                  </span>
+                                )}
                               </div>
                             )}
                             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
@@ -957,6 +1012,11 @@ export default function InvoiceQueuePanel() {
                         {inv.total !== 0 && (
                           <span className="text-[10px] font-mono text-zinc-400 shrink-0">
                             ${Number(inv.total).toFixed(2)}
+                          </span>
+                        )}
+                        {inv.invoiceDate && (
+                          <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                            {fmtShortDate(inv.invoiceDate)}
                           </span>
                         )}
                         <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">

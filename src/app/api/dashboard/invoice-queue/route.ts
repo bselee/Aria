@@ -27,6 +27,11 @@ export type InvoiceQueueItem = {
     labor: number | null;
     status: string;
     poNumber: string | null;
+    invoiceDate: string | null;
+    dueDate: string | null;
+    ocrPoCandidate: string | null;
+    ocrOrderCandidate: string | null;
+    lastMatchStatus: string | null;
     processedAt: string;
     dollarImpact: number | null;
     balanceWarning: string | null;
@@ -119,7 +124,7 @@ export async function GET(req: NextRequest) {
         let query = db
             .from('invoices')
             .select(
-                'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, discrepancies, no_po_required'
+                'id, invoice_number, vendor_name, total, subtotal, freight, tax, tariff, labor, status, po_number, created_at, invoice_date, due_date, discrepancies, no_po_required'
             );
 
         if (sortByDollar) {
@@ -143,17 +148,55 @@ export async function GET(req: NextRequest) {
             .eq('requires_po', false);
         const noPoVendorNames: string[] = (vendorProfiles ?? []).map((vp: any) => vp.vendor_name);
 
-        // ── Source inbox lookup: vendor_invoices has source_inbox populated
-        //    for 116 rows (ap vs bill.selee). We join by invoice_number+vendor_name.
-        const { data: viRows } = await db
-            .from('vendor_invoices')
-            .select('vendor_name, invoice_number, source_inbox')
-            .not('source_inbox', 'is', null);
+        // ── Vendor invoices lookup: source_inbox + OCR PO candidates + last-match
+        //    We join by invoice_number+vendor_name across all vendor_invoices matching
+        //    the vendors in our result set.
+        const vendorNamesInSet = [...new Set(rows.map((r: any) => r.vendor_name).filter(Boolean))];
+        const { data: viRows } = vendorNamesInSet.length > 0
+            ? await db
+                .from('vendor_invoices')
+                .select('vendor_name, invoice_number, source_inbox, raw_data, reconciled_at, po_number')
+                .in('vendor_name', vendorNamesInSet)
+            : { data: [] };
         const sourceInboxByKey = new Map<string, string>();
+        const ocrPoByKey = new Map<string, string>();
+        const ocrOrderByKey = new Map<string, string>();
         for (const vi of viRows ?? []) {
             const key = normalizeName(vi.vendor_name) + '|' + (vi.invoice_number ?? '');
-            if (!sourceInboxByKey.has(key)) {
+            if (!sourceInboxByKey.has(key) && vi.source_inbox) {
                 sourceInboxByKey.set(key, vi.source_inbox);
+            }
+            // Extract OCR PO candidates from raw_data (poNumber / orderNumber)
+            const raw = vi.raw_data as Record<string, unknown> | null;
+            if (raw) {
+                const pn = raw.poNumber as string | undefined;
+                if (pn && !ocrPoByKey.has(key)) ocrPoByKey.set(key, String(pn));
+                const on = raw.orderNumber as string | undefined;
+                if (on && !ocrOrderByKey.has(key)) ocrOrderByKey.set(key, String(on));
+            }
+        }
+
+        // ── Last-matched per vendor (vendor confidence signal)
+        //    Fetch the most recent reconciled invoice per vendor where a PO was matched.
+        const { data: lastMatchedRows } = vendorNamesInSet.length > 0
+            ? await db
+                .from('vendor_invoices')
+                .select('vendor_name, reconciled_at')
+                .not('po_number', 'is', null)
+                .not('reconciled_at', 'is', null)
+                .in('vendor_name', vendorNamesInSet)
+                .order('reconciled_at', { ascending: false })
+            : { data: [] };
+        const lastMatchByVendor = new Map<string, string>();
+        for (const lm of lastMatchedRows ?? []) {
+            const normVendor = normalizeName(lm.vendor_name);
+            if (!lastMatchByVendor.has(normVendor)) {
+                // Format as compact date like "Jun 22" or store ISO — format in panel
+                const d = lm.reconciled_at ? new Date(lm.reconciled_at) : null;
+                lastMatchByVendor.set(
+                    normVendor,
+                    d ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'unknown'
+                );
             }
         }
 
@@ -244,6 +287,9 @@ export async function GET(req: NextRequest) {
             // Look up source_inbox from vendor_invoices (ap vs bill.selee)
             const sourceInboxKey = normalizeName(vendorName) + '|' + invNum;
             const sourceInbox = sourceInboxByKey.get(sourceInboxKey) ?? null;
+            const ocrPoCandidate = ocrPoByKey.get(sourceInboxKey) ?? null;
+            const ocrOrderCandidate = ocrOrderByKey.get(sourceInboxKey) ?? null;
+            const lastMatch = lastMatchByVendor.get(normalizeName(vendorName)) ?? null;
 
             // Only count stats for items that actually appear in the queue
             if (new Date(processedAt) >= todayStart) totalToday++;
@@ -266,6 +312,11 @@ export async function GET(req: NextRequest) {
                             labor: row.labor !== null ? Number(row.labor) : null,
                             status: resolvedStatus,
                             poNumber: row.po_number ?? null,
+                            invoiceDate: row.invoice_date ?? null,
+                            dueDate: row.due_date ?? null,
+                            ocrPoCandidate,
+                            ocrOrderCandidate,
+                            lastMatchStatus: lastMatch,
                             processedAt,
                             dollarImpact,
                             balanceWarning,
