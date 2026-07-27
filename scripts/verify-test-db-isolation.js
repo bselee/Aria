@@ -24,6 +24,11 @@
  * @deps pg, npx vitest
  * @env DATABASE_URL (defaults to the local aria DSN)
  * @usage node scripts/verify-test-db-isolation.js
+ *
+ *        RUN IN THE FOREGROUND. On this Windows/MSYS host the agent's background
+ *        shell has no controlling terminal and dies with "stdin is not a tty" before
+ *        ANY command executes — verified with a bare `node -e 'console.log(1)'`, so it
+ *        is a limitation of the background wrapper, not of this script or of npx.
  */
 const { execSync } = require('child_process');
 const { Pool } = require('pg');
@@ -50,10 +55,11 @@ async function snapshot() {
 
     console.log('running full vitest suite (this takes ~2-3 min)...');
     try {
-        // stdio must be fully detached from a TTY: when this script itself runs as a
-        // background process, inheriting stdin yields "stdin is not a tty" and vitest
-        // aborts before the post-run count check can execute.
-        execSync('npx vitest run --reporter=dot', {
+        // Invoke vitest's entrypoint DIRECTLY rather than via `npx`. Under a background
+        // shell wrapper (no controlling terminal) `npx` aborts with "stdin is not a tty"
+        // before vitest ever starts, which silently skipped the post-run check. Calling
+        // vitest.mjs with node works in both foreground and background contexts.
+        execSync('node node_modules/vitest/vitest.mjs run --reporter=dot', {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
             timeout: 600000,
