@@ -23,7 +23,7 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
-type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched" | "short_shipment_hold";
+type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched" | "short_shipment_hold" | "matched_unreconciled";
 
 const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
   auto_approved: { dot: "bg-emerald-500", label: "AUTO", pulse: false },
@@ -32,6 +32,7 @@ const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean
   duplicate: { dot: "bg-zinc-600", label: "DUP", pulse: false },
   unmatched: { dot: "bg-rose-500", label: "NO PO", pulse: false },
   short_shipment_hold: { dot: "bg-orange-500", label: "SHORT SHIP", pulse: true },
+  matched_unreconciled: { dot: "bg-cyan-500", label: "MATCHED", pulse: false },
 };
 
 function statusCfg(status: string) {
@@ -257,6 +258,8 @@ export default function InvoiceQueuePanel() {
   const [bulkDismissing, setBulkDismissing] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+  // Per-invoice selected disregard reason for unmatched rows
+  const [disregardReason, setDisregardReason] = useState<Record<string, string>>({});
 
   // Handle approve/dismiss actions
   const handleAction = useCallback(async (id: string, action: "approve" | "dismiss") => {
@@ -299,6 +302,34 @@ export default function InvoiceQueuePanel() {
     }
     setBulkDismissing(false);
     fetchData(true);
+  }, []);
+
+  // Handle "not a PO purchase" disregard for unmatched invoices
+  // Keyed on invoice id (vendor_invoices.id UUID), NOT activityLogId, because
+  // unmatched invoices have no activity log entry.
+  const handleDisregard = useCallback(async (invoiceId: string, reason?: string) => {
+    setActingOn(invoiceId);
+    setToast(null);
+    try {
+      const res = await fetch("/api/dashboard/reconciliation-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disregard", invoiceId, reason, markedBy: "dashboard" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error || "Action failed", type: "error" });
+      } else {
+        setToast({ message: data.message || "Disregarded", type: "success" });
+        setExpandedId(null);
+      }
+    } catch (err) {
+      setToast({ message: "Network error", type: "error" });
+    } finally {
+      setActingOn(null);
+      fetchData(true);
+      setTimeout(() => setToast(null), 4000);
+    }
   }, []);
 
   // Collapse state — persisted to localStorage
@@ -590,8 +621,76 @@ export default function InvoiceQueuePanel() {
             );
           })}
 
-           {/* Removed status-heavy log section for action-first focus */}
-           {/* Previously showed completed invoices with status labels; now focus on pending actions only */}
+          {/* Unmatched invoices — no PO match; offer disregard action */}
+          {rest.filter(i => i.status === "unmatched").length > 0 && (
+            <div className="border-t border-rose-500/10">
+              <div className="px-4 py-1.5 flex items-center gap-2 bg-rose-500/5">
+                <span className="text-[10px] font-mono text-rose-400 uppercase tracking-wider font-semibold">
+                  Unmatched — No PO
+                </span>
+                <span className="ml-auto text-[10px] font-mono text-rose-400/60">
+                  {rest.filter(i => i.status === "unmatched").length} invoice{rest.filter(i => i.status === "unmatched").length !== 1 ? "s" : ""}
+                </span>
+              </div>
+              {rest.filter(i => i.status === "unmatched").map(inv => {
+                const isActing = actingOn === inv.id;
+                const selReason = disregardReason[inv.id] || "";
+                return (
+                  <div key={inv.id} className="flex items-start gap-2.5 px-4 py-2 border-b border-rose-500/5 hover:bg-rose-500/[0.02] transition-colors">
+                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 bg-rose-500" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-sm font-mono font-semibold text-zinc-100 truncate">
+                          {inv.vendorName}
+                        </span>
+                        {inv.invoiceNumber && (
+                          <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                            #{inv.invoiceNumber}
+                          </span>
+                        )}
+                        {inv.total !== 0 && (
+                          <span className="text-[10px] font-mono text-zinc-400 shrink-0">
+                            ${Number(inv.total).toFixed(2)}
+                          </span>
+                        )}
+                        <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
+                          {timeAgo(inv.processedAt)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                        {/* Reason selector — compact inline buttons */}
+                        {(["credit_card", "service_no_po", "not_ours", "other"] as const).map(r => (
+                          <button
+                            key={r}
+                            onClick={() => setDisregardReason(prev => ({ ...prev, [inv.id]: selReason === r ? "" : r }))}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-medium border transition-colors ${
+                              selReason === r
+                                ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                                : "bg-zinc-800/50 text-zinc-500 border-zinc-700/40 hover:text-zinc-300 hover:border-zinc-600/50"
+                            }`}
+                          >
+                            {r === "credit_card" ? "💳 Credit Card" : r === "service_no_po" ? "🔧 Service" : r === "not_ours" ? "✋ Not Ours" : "📋 Other"}
+                          </button>
+                        ))}
+                        <div className="flex-1" />
+                        <button
+                          onClick={() => handleDisregard(inv.id, selReason || undefined)}
+                          disabled={isActing}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/25 hover:bg-rose-500/25 disabled:opacity-40 transition-colors"
+                          title="Mark as not a PO purchase — removes from queue"
+                        >
+                          {isActing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
+                          {isActing ? "..." : "Not a PO purchase"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Previously showed completed invoices with status labels; now focus on pending actions only */}
         </>
       )}
     </div>

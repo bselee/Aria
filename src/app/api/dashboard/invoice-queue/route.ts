@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/db';
 import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
+import { resolveStatus, isPendingStatus, type ResolvedStatus } from './resolve-status';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ export type InvoiceQueueStats = {
     autoApproved: number;
     needsApproval: number;
     unmatched: number;
+    matchedUnreconciled: number;
     totalDollarImpact: number;
 };
 
@@ -59,56 +61,6 @@ let cacheAt = 0;
 const CACHE_TTL = 60 * 1000; // 60 seconds
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Map raw invoice `status` + most recent activity log action_taken
- * to a canonical display status.
- */
-function resolveStatus(
-    invoiceStatus: string | null,
-    actionTaken: string | null,
-    metadata: any = null
-): string {
-    const verdict = metadata?.overallVerdict ?? metadata?.verdict ?? null;
-    if (verdict === 'short_shipment_hold') {
-        return 'short_shipment_hold';
-    }
-    if (verdict === 'needs_approval') {
-        return 'needs_approval';
-    }
-    if (verdict === 'auto_approve' || verdict === 'auto_approved') {
-        return 'auto_approved';
-    }
-    if (verdict === 'rejected') {
-        return 'rejected';
-    }
-    if (verdict === 'duplicate') {
-        return 'duplicate';
-    }
-
-    const a = (actionTaken ?? '').toLowerCase();
-    const s = (invoiceStatus ?? '').toLowerCase();
-
-    // Explicit invoice statuses from reconciler
-    if (s === 'matched_approved' || a.includes('applied') || a.includes('auto-approv')) {
-        return 'auto_approved';
-    }
-    if (s === 'matched_review' || a.includes('pending') || a.includes('flagged') || a.includes('approval')) {
-        return 'needs_approval';
-    }
-    if (a.includes('rejected') || a.includes('reject')) {
-        return 'rejected';
-    }
-    if (s === 'duplicate' || a.includes('duplicate') || a.includes('already processed')) {
-        return 'duplicate';
-    }
-    // Default: unmatched if no PO was found
-    if (s === 'unmatched' || a.includes('no match') || a.includes('unmatched') || a.includes('dropship')) {
-        return 'unmatched';
-    }
-    // Forwarded to Bill.com but no reconciliation result yet
-    return 'unmatched';
-}
 
 /**
  * Pull dollar impact from metadata JSONB — reconciler stores it under
@@ -201,6 +153,7 @@ export async function GET(req: NextRequest) {
         let autoApproved = 0;
         let needsApproval = 0;
         let unmatched = 0;
+        let matchedUnreconciled = 0;
         let totalDollarImpact = 0;
 
         const invoices: InvoiceQueueItem[] = rows.flatMap(row => {
@@ -227,16 +180,16 @@ export async function GET(req: NextRequest) {
                 return [];
             }
 
-            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null, matchedLog?.metadata);
+            const status = resolveStatus(row.status, matchedLog?.action_taken ?? null, matchedLog?.metadata, row.po_number);
             const dollarImpact = extractDollarImpact(matchedLog?.metadata ?? null);
             const balanceWarning = extractBalanceWarning(matchedLog?.metadata ?? null);
 
             const hasActivityLog = !!matchedLog?.id;
-            // Items with no activity log can't be acted on — demote to unmatched
-            const resolvedStatus = hasActivityLog ? status : (status === 'needs_approval' || status === 'short_shipment_hold' ? 'unmatched' : status);
+            // Items with no activity log can't be acted on — demote needs_approval/short_shipment to unmatched
+            const resolvedStatus = hasActivityLog ? status : (isPendingStatus(status) ? 'unmatched' : status);
 
             // Filter items that can't be acted on (no activityLogId for needs_approval or short_shipment_hold)
-            if ((resolvedStatus === 'needs_approval' || resolvedStatus === 'short_shipment_hold') && !hasActivityLog) {
+            if (isPendingStatus(resolvedStatus) && !hasActivityLog) {
                 return [];
             }
 
@@ -245,8 +198,9 @@ export async function GET(req: NextRequest) {
             // Only count stats for items that actually appear in the queue
             if (new Date(processedAt) >= todayStart) totalToday++;
             if (resolvedStatus === 'auto_approved') autoApproved++;
-            if (resolvedStatus === 'needs_approval' || resolvedStatus === 'short_shipment_hold') needsApproval++;
+            if (isPendingStatus(resolvedStatus)) needsApproval++;
             if (resolvedStatus === 'unmatched') unmatched++;
+            if (resolvedStatus === 'matched_unreconciled') matchedUnreconciled++;
             if (dollarImpact !== null) totalDollarImpact += dollarImpact;
 
             return [{
@@ -289,6 +243,7 @@ export async function GET(req: NextRequest) {
             autoApproved,
             needsApproval,
             unmatched,
+            matchedUnreconciled,
             totalDollarImpact,
           },
           needsEyes,
