@@ -24,6 +24,15 @@ vi.mock("@/lib/purchasing/calibration", () => ({
     recordReservations: vi.fn().mockResolvedValue(0),
     releaseReservations: vi.fn().mockResolvedValue(0),
     stampRecommendationsWithDraftPO: vi.fn().mockResolvedValue(0),
+    // Remaining exports are not currently reached from the Finale client path
+    // (verified 2026-07-27: zero references under src/lib/finale). They are stubbed
+    // anyway because a vi.mock factory throws if the code under test later imports a
+    // key the factory omits — so an unrelated future refactor would fail here with a
+    // confusing "No export named ..." rather than a clear signal.
+    cleanupExpiredReservations: vi.fn().mockResolvedValue(0),
+    upsertShipmentLegs: vi.fn().mockResolvedValue(undefined),
+    markLegReceived: vi.fn().mockResolvedValue(undefined),
+    loadDraftedPORecSummaries: vi.fn().mockResolvedValue(new Map()),
 }));
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
