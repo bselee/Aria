@@ -305,10 +305,21 @@ class QueryBuilder {
       Authorization: `Bearer ${getAuthToken()}`,
     };
 
+    // Prefer header — merge multiple directives when both are active
+    const preferValues: string[] = [];
     if (this._onConflict) {
-      headers["Prefer"] = `resolution=merge-duplicates`;
+      preferValues.push("resolution=merge-duplicates");
       // PostgREST uses ?on_conflict= query param for upsert
       url.searchParams.set("on_conflict", this._onConflict);
+    }
+    if (
+      (this._method === "POST" || this._method === "PATCH") &&
+      this._select !== "*"
+    ) {
+      preferValues.push("return=representation");
+    }
+    if (preferValues.length > 0) {
+      headers["Prefer"] = preferValues.join(",");
     }
 
     // CRITICAL(2026-07-27): Filters MUST be applied to EVERY method, not just GET.
@@ -344,10 +355,19 @@ class QueryBuilder {
       };
     }
 
-    // Build query params for GET
+    // Build query params — select applies to both GET (return shape) and
+    // POST/PATCH (paired with Prefer: return=representation)
     if (this._method === "GET") {
       url.searchParams.set("select", this._select);
+    } else if (
+      (this._method === "POST" || this._method === "PATCH") &&
+      this._select !== "*"
+    ) {
+      url.searchParams.set("select", this._select);
+    }
 
+    // Order/limit/offset only apply to GET (read shaping)
+    if (this._method === "GET") {
       if (this._order) {
         const dir = this._orderDir === "desc" ? ".desc" : ".asc";
         url.searchParams.set("order", `${this._order}${dir}`);

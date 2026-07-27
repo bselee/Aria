@@ -15,10 +15,14 @@ interface CapturedCall {
     url: string;
     method: string;
     body?: string;
+    prefer?: string;
 }
 
 let calls: CapturedCall[] = [];
 let originalFetch: typeof globalThis.fetch;
+
+/** Overridable per-test response body — set by tests that need custom data back. */
+let nextResponseBody: string | null = null;
 
 /** Extract the query string from a captured URL, or '' when absent. */
 function qs(call: CapturedCall): string {
@@ -29,10 +33,14 @@ beforeEach(() => {
     process.env.PGRST_URL = 'http://localhost:5434';
     process.env.PGRST_JWT_SECRET = 'test-secret-value-for-unit-tests-only-0000';
     calls = [];
+    nextResponseBody = null;
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (u: any, o: any) => {
-        calls.push({ url: String(u), method: o?.method ?? 'GET', body: o?.body });
-        return new Response('[]', {
+        calls.push({ url: String(u), method: o?.method ?? 'GET', body: o?.body, prefer: o?.headers?.Prefer });
+        // If a per-test response body was queued, use it (once), otherwise default empty array
+        const body = nextResponseBody ?? '[]';
+        nextResponseBody = null;
+        return new Response(body, {
             status: 200,
             headers: { 'content-type': 'application/json' },
         });
@@ -135,5 +143,66 @@ describe('db.ts query builder — unfiltered write guard', () => {
 
         expect(calls).toHaveLength(1);
         expect(calls[0].method).toBe('POST');
+    });
+});
+
+describe('db.ts PostgREST client — INSERT with .select() returning data', () => {
+    it('sends Prefer: return=representation and ?select= on insert+select', async () => {
+        const db = await freshClient();
+        nextResponseBody = '[{"id":42}]';
+        const { data, error } = await db!
+            .from('cron_runs')
+            .insert({ task_name: 'probe', status: 'running' })
+            .select('id')
+            .single();
+
+        expect(error).toBeNull();
+        expect(data).toEqual({ id: 42 });
+        expect(calls).toHaveLength(1);
+        expect(calls[0].method).toBe('POST');
+        expect(qs(calls[0])).toContain('select=id');
+        expect(calls[0].prefer).toContain('return=representation');
+    });
+
+    it('merges Prefer values when both onConflict and select are active', async () => {
+        const db = await freshClient();
+        nextResponseBody = '[{"id":7}]';
+        const { data, error } = await db!
+            .from('cron_runs')
+            .upsert({ id: 7, task_name: 'upsert-probe' }, { onConflict: 'id' })
+            .select('id')
+            .single();
+
+        expect(error).toBeNull();
+        expect(data).toEqual({ id: 7 });
+        expect(calls[0].prefer).toBe('resolution=merge-duplicates,return=representation');
+        expect(qs(calls[0])).toContain('select=id');
+        expect(qs(calls[0])).toContain('on_conflict=id');
+    });
+
+    it('does NOT send return=representation on insert without .select()', async () => {
+        const db = await freshClient();
+        await db!.from('cron_runs').insert({ task_name: 'lean' });
+
+        expect(calls).toHaveLength(1);
+        expect(calls[0].method).toBe('POST');
+        expect(calls[0].prefer).toBeUndefined();
+        expect(qs(calls[0])).not.toContain('select=');
+    });
+
+    it('also works on update+select — PATCH returns the updated row', async () => {
+        const db = await freshClient();
+        nextResponseBody = '[{"id":99,"status":"succeeded"}]';
+        const { data, error } = await db!
+            .from('cron_runs')
+            .update({ status: 'succeeded' })
+            .eq('id', 99)
+            .select('id,status')
+            .single();
+
+        expect(error).toBeNull();
+        expect(data).toEqual({ id: 99, status: 'succeeded' });
+        expect(calls[0].prefer).toContain('return=representation');
+        expect(decodeURIComponent(qs(calls[0]))).toContain('select=id,status');
     });
 });

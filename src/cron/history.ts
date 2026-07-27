@@ -15,7 +15,16 @@
 
 import { createClient } from "../lib/db";
 
-export type CronRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+/**
+ * Lifecycle status of a single cron run.
+ *
+ * `unknown` denotes a run whose true outcome is unrecoverable — used for rows whose
+ * telemetry was fabricated by the unfiltered-UPDATE bug in `src/lib/db.ts` (fixed
+ * 2026-07-27) and quarantined by migration 20260729. Such rows retain a valid
+ * `started_at` / `task_name` but carry no trustworthy outcome, so they must be
+ * EXCLUDED from failure-rate math rather than counted as failures.
+ */
+export type CronRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "unknown";
 
 export interface RecordStartArgs {
     jobName: string;
