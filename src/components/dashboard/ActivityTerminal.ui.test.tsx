@@ -74,8 +74,16 @@ const supabase = {
     from: vi.fn((table: string) => makeQuery(table === "ap_activity_log" ? apRows : cronRows)),
 };
 
-vi.mock("@/lib/supabase", () => ({
-    createBrowserClient: () => supabase,
+// ActivityTerminal.tsx does: import { createClient as createBrowserClient } from "@/lib/db"
+// TWO defects made this mock inert, so the component hung on "loading..." forever and
+// all 3 tests failed:
+//   1. WRONG SPECIFIER — mocked "@/lib/supabase", which is only a re-export shim of
+//      "@/lib/db". Vitest faithfully mocked a module nothing on this path imports.
+//   2. WRONG EXPORT — the aliasing happens at the IMPORT site, so the module must
+//      export `createClient`, not `createBrowserClient`.
+// Mock the specifier the component actually imports, with the name it actually exports.
+vi.mock("@/lib/db", () => ({
+    createClient: () => supabase,
 }));
 
 import ActivityTerminal from "./ActivityTerminal";

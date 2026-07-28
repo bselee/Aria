@@ -38,8 +38,13 @@ const browserClientMock = {
     }),
 };
 
-vi.mock("@/lib/supabase", () => ({
-    createBrowserClient: () => browserClientMock,
+// OversightPanel.tsx does: import { createClient as createBrowserClient } from "@/lib/db"
+// Same two defects as ActivityTerminal.ui.test.tsx: this mocked "@/lib/supabase" (a mere
+// re-export shim of "@/lib/db", so nothing on this path imports it) AND exported
+// `createBrowserClient` when the alias is applied at the import site, so the real module
+// must export `createClient`. The mock never engaged.
+vi.mock("@/lib/db", () => ({
+    createClient: () => browserClientMock,
 }));
 
 describe("OversightPanel", () => {
