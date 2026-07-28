@@ -2443,9 +2443,15 @@ export async function applyReconciliation(
                     { orderId: result.orderId },
                     () => client.getOrderDetails(result.orderId),
                 );
-                // shipmentUrlList removed from Finale GraphQL schema (2026-06-22).
-                // Use shipmentList IDs to construct URLs.
-                const shipUrls = (poDetails.shipmentList || []).map((s: any) => `/${client.accountPath}/api/shipment/${encodeURIComponent(String(s?.shipmentId || ""))}`).filter(Boolean);
+                // DECISION(2026-07-27): Use REST `shipmentUrlList` verbatim. Building
+                // URLs from `shipmentList[].shipmentId` is WRONG — shipmentId is the
+                // human-facing "<orderId>-<n>" label ("125127-1") while /api/shipment/
+                // is keyed by an internal numeric id (609070). Verified 2026-07-27:
+                // /api/shipment/125127-1 -> 404, and stripping the suffix returns an
+                // UNRELATED 2021 sales-order shipment. Since updateShipmentTracking
+                // does GET -> modify -> POST, a 404 on the GET meant every tracking
+                // write-back below silently failed.
+                const shipUrls = (poDetails.shipmentUrlList || []).map((u: any) => String(u)).filter(Boolean);
 
                 if (shipUrls.length > 0) {
                     const firstShipment = shipUrls[0];

@@ -207,6 +207,9 @@ export interface PurchasingGroup {
 export interface FullPO {
     orderId: string;
     vendorName: string;
+    /** Finale supplier party ID (numeric string like "10083"). Null when not resolved
+     *  (e.g. cached objects that predate the vendorPartyId field). */
+    vendorPartyId: string | null;
     orderDate: string;           // YYYY-MM-DD
     expectedDate: string | null; // Finale's dueDate field (quoted delivery date)
     receiveDate: string | null;  // null if not yet received

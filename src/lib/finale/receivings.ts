@@ -64,6 +64,29 @@ async function mapConcurrent<T, R>(
 const _shipmentDetailCache = new Map<string, { data: any; fetchedAt: number }>();
 const SHIPMENT_CACHE_TTL_MS = 5 * 60 * 1_000; // 5 minutes
 
+// ── Background warm-up controls ──────────────────────────────────────────
+// HARD CAP per invocation. With a process-wide 500ms serial queue
+// (REQUEST_INTERVAL_MS in core-client.ts), 24 × 0.5s ≈ 12s worst-case warm-up.
+// That runs DETACHED (never on the request path), so it costs the user nothing.
+// DECISION(2026-07-27): raised 8 → 24 once the shipment URL bug was fixed and
+// fetches actually succeed. At 8/poll a 63-shipment window needed ~8 polls
+// (~4min) to fully warm; at 24 it converges in ~3 polls while still staying far
+// below the 63-request storm that saturated the shared queue.
+const SHIPMENT_WARM_BATCH = 24;
+// Single-flight guard: prevents overlapping warm-ups when the 30s dashboard
+// poll fires before the previous warm-up completes, which was the mechanism
+// that made the 63-request storm self-sustaining.
+let _warmupInFlight = false;
+
+// ── Bounded concurrency for Finale REST calls ──────────────────────────
+// NOTE(2026-07-27): This cap is mostly theoretical for the request path
+// since cold fetches are NEVER issued on the request path anymore. It still
+// bounds the background warm-up. The real bottleneck is the process-wide
+// 500ms serial queue in core-client.ts, so CONCURRENCY > 1 does not
+// produce true parallelism — but keeping it at 8 matches the warm-up batch
+// size so one batch completes in one sweep.
+const CONCURRENCY = 8;
+
 export class FinaleReceivingsClient extends FinalePurchasingClient {
     constructor() {
         super();
@@ -110,6 +133,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                         receiveDate
                                         shipmentList {
                                             shipmentId
+                                            shipmentUrl
                                             status
                                             receiveDate
                                         }
@@ -143,6 +167,33 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             const received = deriveReceivedPurchaseOrders(edges, today, tomorrowStr, this.accountPath);
             if (received.length === 0) return received;
 
+            // ── Cache-only shipment enrichment on the request path ──────────────
+            // core-client.ts enforces a process-wide 500ms serial request interval
+            // (REQUEST_INTERVAL_MS = 500), so the local CONCURRENCY cap does NOT
+            // produce parallel requests — all Finale calls share one 500ms-spaced
+            // pipe. Therefore N shipments cost N × 500ms minimum (~31.5s for 63
+            // POs), which no page-load-acceptable timeout can absorb.
+            //
+            // DECISION(2026-07-27): Two separate defects were found and fixed here.
+            //   1) TRANSPORT: abandoned Promise.race work kept executing (a race
+            //      abandons the WAIT, not the WORK), producing 218 shipment 429s
+            //      that saturated the shared queue while latency climbed
+            //      9.8s -> 19.3s -> 25.5s across consecutive polls. Fixed by making
+            //      the request path cache-only with a bounded single-flight
+            //      background warm-up; measured 218 -> 0 rate-limit errors.
+            //   2) CORRECTNESS: every shipment URL was built from `shipmentId`
+            //      ("125127-1") instead of `shipmentUrl` (internal id 609070), so
+            //      all detail fetches 404'd. THAT is why receivedBy/receiptHistory
+            //      were 0/63 at every timeout value tried — not rate limiting.
+            //      With the correct URL, 5/5 sampled received shipments returned
+            //      SHIPMENT_DELIVERED history, a real receipt timestamp, and
+            //      per-line quantities.
+            // Base POs (orderId, supplier, receiveDate, ordered items) always
+            // render; receipt detail fills in as the warm-up populates the cache.
+            // NOTE(2026-07-27): `receivedBy` stays null — Finale's shipment payload
+            // carries no receiver-name field at all (no receivedByName/receiverName/
+            // lastUpdatedBy). Receipt time and per-line quantities DO resolve.
+
             const receivedOrderIds = new Set(received.map((po) => po.orderId));
             const shipmentDetailsByOrderId: Record<string, any[]> = {};
 
@@ -150,49 +201,87 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             // Flattening means we can apply a single concurrency cap across ALL
             // shipment fetches instead of per-PO caps, which is the actual fix for
             // the N-per-PO × M-POs = N*M simultaneous request storm (P0-3).
+            //
+            // DECISION(2026-07-27): Use `shipmentList[].shipmentUrl` from GraphQL,
+            // NOT a URL constructed from `shipmentId`. These are different
+            // namespaces: shipmentId is the human-facing "<orderId>-<n>" label
+            // (e.g. "125127-1"); /api/shipment/ is keyed by an internal numeric id
+            // (e.g. 609070, exposed as shipmentUrl). Verified 2026-07-27:
+            //   GET /api/shipment/125127-1 -> 404 (every enrichment fetch failed)
+            //   GET /api/shipment/125127   -> 200 but an UNRELATED 2021 sales-order
+            //                                 shipment — do NOT strip the suffix
+            //   GET /api/shipment/609070   -> 200, correct shipment
+            // This 404-on-every-call is why receivedBy/receiptHistory were 0/63 for
+            // months; it was never a rate-limit problem. Cache is keyed on the
+            // internal URL so it can never collide across namespaces.
             const shipmentTasks: Array<{ orderId: string; shipmentId: string; url: string }> = [];
             for (const edge of edges) {
                 const po = edge.node;
                 if (!receivedOrderIds.has(po?.orderId)) continue;
-                const allShipmentIds = (po.shipmentList || [])
-                    .map((shipment: any) => String(shipment?.shipmentId || ""))
-                    .filter(Boolean);
-                // shipmentUrlList was removed from Finale GraphQL schema (2026-06-22).
-                // Always construct URLs from shipmentList[].shipmentId.
-                for (const shipmentId of allShipmentIds) {
+                for (const shipment of po.shipmentList || []) {
+                    const url = String(shipment?.shipmentUrl || "");
+                    if (!url) continue; // no resolvable detail endpoint — skip
                     shipmentTasks.push({
                         orderId: po.orderId,
-                        shipmentId,
-                        url: `/${this.accountPath}/api/shipment/${encodeURIComponent(shipmentId)}`,
+                        shipmentId: url, // cache key: internal URL, collision-free
+                        url,
                     });
                 }
             }
 
-            // Fetch with concurrency cap (8 in-flight) + short-TTL cache (5 min).
-            // Before: unbounded Promise.all fired N simultaneous GET /api/shipment/{id}
-            // requests, triggering a 429 rate-limit storm on every dashboard poll.
-            const CONCURRENCY = 8;
-            const fetchedShipments = await mapConcurrent(shipmentTasks, CONCURRENCY, async (task) => {
+            // ── Split: WARM (cache hit) vs COLD (needs fetch) ────────────────
+            // Consulting _shipmentDetailCache via Map.get + TTL check is
+            // synchronous — costs nothing and bypasses the queue entirely.
+            // The request path enriches from WARM tasks only, with zero I/O.
+            const now_ts = Date.now();
+            const warmTasks: typeof shipmentTasks = [];
+            const coldTasks: typeof shipmentTasks = [];
+            for (const task of shipmentTasks) {
                 const cached = _shipmentDetailCache.get(task.shipmentId);
-                if (cached && Date.now() - cached.fetchedAt < SHIPMENT_CACHE_TTL_MS) {
-                    return { orderId: task.orderId, data: cached.data };
+                if (cached && now_ts - cached.fetchedAt < SHIPMENT_CACHE_TTL_MS) {
+                    warmTasks.push(task);
+                } else {
+                    coldTasks.push(task);
                 }
-                try {
-                    const data = await this.getShipmentDetails(task.url);
-                    _shipmentDetailCache.set(task.shipmentId, { data, fetchedAt: Date.now() });
-                    return { orderId: task.orderId, data };
-                } catch {
-                    return { orderId: task.orderId, data: null };
-                }
-            });
+            }
 
-            // Group by orderId — preserves the exact shape downstream code expects
-            for (const result of fetchedShipments) {
-                if (!result.data) continue;
-                if (!shipmentDetailsByOrderId[result.orderId]) {
-                    shipmentDetailsByOrderId[result.orderId] = [];
+            // ── Synchronous enrichment from cache (no I/O, cannot hang) ──────
+            for (const task of warmTasks) {
+                const cached = _shipmentDetailCache.get(task.shipmentId);
+                if (!cached) continue; // safety, should not happen
+                if (!shipmentDetailsByOrderId[task.orderId]) {
+                    shipmentDetailsByOrderId[task.orderId] = [];
                 }
-                shipmentDetailsByOrderId[result.orderId].push(result.data);
+                shipmentDetailsByOrderId[task.orderId].push(cached.data);
+            }
+
+            // ── Bounded single-flight background warm-up for cold tasks ───────
+            // Never await this — it runs detached. Cap at 8 per poll so it cannot
+            // saturate the shared queue. Single-flight guard prevents overlap when
+            // the 30s dashboard poll fires before the previous warm-up completes.
+            if (coldTasks.length > 0 && !_warmupInFlight) {
+                _warmupInFlight = true;
+                // NOTE(2026-07-27): Simply takes the first 8 cold tasks rather than
+                // recency-ordering by receiveDate. The coldTasks array is built in
+                // the same edge iteration order (descending orderDate from the
+                // GraphQL sort), so the first entries are already the most recently
+                // ordered POs, which is a reasonable proxy for recency.
+                const batch = coldTasks.slice(0, SHIPMENT_WARM_BATCH);
+                mapConcurrent(batch, CONCURRENCY, async (task) => {
+                    const cached = _shipmentDetailCache.get(task.shipmentId);
+                    if (cached && Date.now() - cached.fetchedAt < SHIPMENT_CACHE_TTL_MS) {
+                        return { orderId: task.orderId, data: cached.data };
+                    }
+                    try {
+                        const data = await this.getShipmentDetails(task.url);
+                        _shipmentDetailCache.set(task.shipmentId, { data, fetchedAt: Date.now() });
+                        return { orderId: task.orderId, data };
+                    } catch {
+                        return { orderId: task.orderId, data: null };
+                    }
+                })
+                    .catch(() => {}) // absorb late rejections — never unhandled
+                    .finally(() => { _warmupInFlight = false; });
             }
 
             return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId, today, tomorrowStr);
@@ -1415,9 +1504,20 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     description: adj.description || "",
                     amount: adj.amount || 0,
                 })),
-                // shipmentUrlList removed from Finale GraphQL schema (2026-06-22).
-                // Use shipmentList IDs to construct URLs.
-                shipmentUrls: (po.shipmentList || []).map((s: any) => `/${this.accountPath}/api/shipment/${encodeURIComponent(String(s?.shipmentId || ""))}`).filter(Boolean),
+                // DECISION(2026-07-27): Use the REST `shipmentUrlList` verbatim.
+                // A previous change replaced this with URLs built from
+                // `shipmentList[].shipmentId`, but those two fields are DIFFERENT
+                // namespaces: shipmentId is the human-facing "<orderId>-<n>" label
+                // (e.g. "125127-1") while /api/shipment/ is keyed by an internal
+                // numeric id (e.g. 609070). Verified 2026-07-27:
+                //   GET /api/shipment/125127-1 -> 404
+                //   GET /api/shipment/125127   -> 200 but returns an UNRELATED 2021
+                //                                 sales-order shipment (collision)
+                //   GET /api/shipment/609070   -> 200, correct shipment
+                // The 404 path made every downstream receipt lookup silently empty
+                // (reconciler received-qty math, OOS tracking codes). REST still
+                // returns shipmentUrlList with the correct internal URLs.
+                shipmentUrls: (po.shipmentUrlList || []).map((u: any) => String(u)).filter(Boolean),
                 orderUrl: po.orderUrl,
             };
         } catch (err: any) {
@@ -1543,7 +1643,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                     dueDate
                                     receiveDate
                                     total
-                                    supplier { name }
+                                    supplier { name partyUrl }
                                     shipmentList {
                                         shipmentId
                                         status
@@ -1588,6 +1688,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 return {
                     orderId: po.orderId,
                     vendorName: po.supplier?.name ?? '',
+                    vendorPartyId: (po.supplier?.partyUrl?.split('/').pop()) || null,
                     orderDate: toISODate(po.orderDate) ?? '',
                     expectedDate: toISODate(po.dueDate),
                     receiveDate: toISODate(po.receiveDate),
