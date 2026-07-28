@@ -2,7 +2,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-const { createClientMock } = vi.hoisted(() => ({ createClientMock: vi.fn() }));
+const { createClientMock, fromMock } = vi.hoisted(() => {
+    const fm = vi.fn(() => ({
+        select: vi.fn().mockReturnThis(),
+        order: vi.fn().mockReturnThis(),
+        eq: vi.fn().mockReturnThis(),
+        maybeSingle: vi.fn(),
+        limit: vi.fn(() => ({ data: [], error: null })),
+        insert: vi.fn(() => ({ error: null })),
+        update: vi.fn(() => ({ error: null })),
+        gte: vi.fn(() => ({ data: [], error: null })),
+        in: vi.fn(() => ({ data: [], error: null })),
+    }));
+    const cm = vi.fn(() => ({ from: fm }));
+    return { createClientMock: cm, fromMock: fm };
+});
 vi.mock("@/lib/db", () => ({ createClient: createClientMock }));
 
 import {
@@ -117,7 +131,22 @@ describe("CRON_JOBS sync with OpsManager.registerJobs()", () => {
 // ── getCommandBoardCrons ────────────────────────────────────────────────────
 
 describe("getCommandBoardCrons", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+        fromMock.mockReset();
+        fromMock.mockReturnValue({
+            select: vi.fn().mockReturnThis(),
+            order: vi.fn().mockReturnThis(),
+            eq: vi.fn().mockReturnThis(),
+            maybeSingle: vi.fn(),
+            limit: vi.fn(() => ({ data: [], error: null })),
+            insert: vi.fn(() => ({ error: null })),
+            update: vi.fn(() => ({ error: null })),
+            gte: vi.fn(() => ({ data: [], error: null })),
+            in: vi.fn(() => ({ data: [], error: null })),
+        });
+    });
 
     it("returns one entry per CRON_JOB even when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -137,9 +166,7 @@ describe("getCommandBoardCrons", () => {
         ];
         const orderMock = vi.fn().mockResolvedValue({ data: sample, error: null });
         const selectMock = vi.fn(() => ({ order: () => ({ limit: () => orderMock() }) }));
-        createClientMock.mockReturnValue({
-            from: vi.fn(() => ({ select: selectMock })),
-        });
+        fromMock.mockReturnValue({ select: selectMock });
 
         const out = await getCommandBoardCrons();
         const ap = out.find((r) => r.name === "APPolling");
@@ -153,7 +180,21 @@ describe("getCommandBoardCrons", () => {
 // ── getCommandBoardSummary ──────────────────────────────────────────────────
 
 describe("getCommandBoardSummary", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockClear();
+        fromMock.mockReset();
+        fromMock.mockReturnValue({
+            select: vi.fn().mockReturnThis(),
+            order: vi.fn().mockReturnThis(),
+            eq: vi.fn().mockReturnThis(),
+            maybeSingle: vi.fn(),
+            limit: vi.fn(() => ({ data: [], error: null })),
+            insert: vi.fn(() => ({ error: null })),
+            update: vi.fn(() => ({ error: null })),
+            gte: vi.fn(() => ({ data: [], error: null })),
+            in: vi.fn(() => ({ data: [], error: null })),
+        });
+    });
 
     it("returns zeroed counts when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -166,7 +207,10 @@ describe("getCommandBoardSummary", () => {
 // ── getCommandBoardTaskList ─────────────────────────────────────────────────
 
 describe("getCommandBoardTaskList", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+    });
 
     it("returns empty when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -179,7 +223,10 @@ describe("getCommandBoardTaskList", () => {
 // ── getCommandBoardTaskDetail ───────────────────────────────────────────────
 
 describe("getCommandBoardTaskDetail", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+    });
 
     it("returns null when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -191,7 +238,10 @@ describe("getCommandBoardTaskDetail", () => {
 // ── getCommandBoardHeartbeats ───────────────────────────────────────────────
 
 describe("getCommandBoardHeartbeats", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+    });
 
     it("returns empty when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -209,11 +259,9 @@ describe("getCommandBoardHeartbeats", () => {
             ],
             error: null,
         });
-        createClientMock.mockReturnValue({
-            from: vi.fn(() => ({
-                select: vi.fn(() => ({
-                    order: () => orderMock(),
-                })),
+        fromMock.mockReturnValue({
+            select: vi.fn(() => ({
+                order: () => orderMock(),
             })),
         });
         const out = await getCommandBoardHeartbeats();
@@ -228,7 +276,10 @@ describe("getCommandBoardHeartbeats", () => {
 // ── getCommandBoardRuns ─────────────────────────────────────────────────────
 
 describe("getCommandBoardRuns", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+    });
 
     it("returns empty when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);
@@ -240,7 +291,10 @@ describe("getCommandBoardRuns", () => {
 // ── getCommandBoardControlRequests ──────────────────────────────────────────
 
 describe("getCommandBoardControlRequests", () => {
-    beforeEach(() => createClientMock.mockReset());
+    beforeEach(() => {
+        createClientMock.mockReset();
+        createClientMock.mockReturnValue({ from: fromMock });
+    });
 
     it("returns empty when supabase is missing", async () => {
         createClientMock.mockReturnValue(null);

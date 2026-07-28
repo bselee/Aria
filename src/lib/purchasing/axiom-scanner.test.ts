@@ -149,6 +149,9 @@ describe('scanAxiomDemand', () => {
         const result = await scanAxiomDemand(mockFinale as any);
 
         expect(result.queuedCount).toBe(0);
-        expect(insertMock).not.toHaveBeenCalled();
+        // withToolAudit() calls insertMock for the audit event, so only
+        // assert that no SKU-shaped inserts happened.
+        const skuInserts = insertMock.mock.calls.filter(c => c[0]?.sku);
+        expect(skuInserts).toHaveLength(0);
     });
 });

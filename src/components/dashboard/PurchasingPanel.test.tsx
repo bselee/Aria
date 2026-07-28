@@ -227,107 +227,116 @@ describe("PurchasingPanel - vendor policy badges", () => {
         render(<PurchasingPanel />);
         await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        fireEvent.click(await screen.findByText(/Colorful Packaging Ltd/i));
+        // NOTE(2026-07-28): commit 5f1de32 replaced the vendor tab strip with
+        // a searchable combobox dropdown. Clicking the vendor name no longer
+        // expands items — must click the ▾ button instead.
+        fireEvent.click(await screen.findByText("▾"));
 
         await waitFor(() => expect(screen.getByText(/Colorful replenishment watch SKU/i)).toBeTruthy());
     });
 
     it("renders cover/lead/MOQ-warn/Review badges and review reasons block", async () => {
-        stubLocalStorage();
-        stubFetch();
+            stubLocalStorage();
+            stubFetch();
 
-        render(<PurchasingPanel />);
+            render(<PurchasingPanel />);
 
-        await waitFor(() => expect(fetch).toHaveBeenCalled());
+            await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        // Vendor groups render collapsed by default — click the vendor tab to expand items.
-        const vendorTab = await screen.findByText(/Colorful Packagi/i);
-        fireEvent.click(vendorTab);
+            // Vendor groups render collapsed by default — click ▾ to expand items.
+            // NOTE(2026-07-28): commit 5f1de32 replaced tab strip with dropdown;
+            // vendor name no longer toggles expansion.
+            fireEvent.click(await screen.findByText("▾"));
 
-        await waitFor(() => expect(screen.getByText("180d cover")).toBeTruthy());
+            await waitFor(() => expect(screen.getByText("180d cover")).toBeTruthy());
 
-        expect(screen.getByText("180d cover")).toBeTruthy();
-        expect(screen.getByText("45d lead")).toBeTruthy();
-        expect(screen.getByText("MOQ warn")).toBeTruthy();
-        expect(screen.getByText("Review")).toBeTruthy();
-        expect(screen.getByText("Draft only")).toBeTruthy();
-        expect(
-            screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
-        ).toBeTruthy();
-    });
+            expect(screen.getByText("180d cover")).toBeTruthy();
+            expect(screen.getByText("45d lead")).toBeTruthy();
+            expect(screen.getByText("MOQ warn")).toBeTruthy();
+            expect(screen.getByText("Review")).toBeTruthy();
+            expect(screen.getByText("Draft only")).toBeTruthy();
+            expect(
+                screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
+            ).toBeTruthy();
+        });
 
-    it("shows vendor-cycle lock state on the vendor header", async () => {
-        stubLocalStorage();
-        const payload = {
-            groups: [
-                {
-                    vendorName: "Colorful Packaging Ltd",
-                    vendorPartyId: "10918",
-                    urgency: "warning",
-                    vendorCycle: {
-                        decision: "routine_locked",
-                        cycleDays: 30,
-                        lockedUntil: "2026-06-18",
-                        blockingPO: {
-                            orderId: "124832",
-                            vendorName: "Colorful Packaging Ltd",
-                            vendorPartyId: "10918",
-                            status: "Committed",
-                            orderDate: "2026-05-19",
-                            receiveDate: null,
-                            skus: ["CP-LABEL-OLD"],
+        // NOTE(2026-07-28): vendorCycleBadge is still computed (PurchasingPanel.tsx:2120)
+        // and passed into the item flyout payload, but is no longer rendered on the
+        // vendor card header after the simplified-row refactor. Assert the group
+        // still loads under a routine_locked cycle instead of a header badge.
+        it("renders vendor group when vendor cycle is routine_locked", async () => {
+            stubLocalStorage();
+            const payload = {
+                groups: [
+                    {
+                        vendorName: "Colorful Packaging Ltd",
+                        vendorPartyId: "10918",
+                        urgency: "warning",
+                        vendorCycle: {
+                            decision: "routine_locked",
+                            cycleDays: 30,
+                            lockedUntil: "2026-06-18",
+                            blockingPO: {
+                                orderId: "124832",
+                                vendorName: "Colorful Packaging Ltd",
+                                vendorPartyId: "10918",
+                                status: "Committed",
+                                orderDate: "2026-05-19",
+                                receiveDate: null,
+                                skus: ["CP-LABEL-OLD"],
+                            },
+                            ignoredPOs: [],
+                            exceptionEvidence: [],
+                            summary: "Routine cycle locked by PO 124832 until 2026-06-18.",
                         },
-                        ignoredPOs: [],
-                        exceptionEvidence: [],
-                        summary: "Routine cycle locked by PO 124832 until 2026-06-18.",
+                        items: [makeFixtureItem()],
                     },
-                    items: [makeFixtureItem()],
-                },
-            ],
-            cachedAt: "2026-05-05T12:00:00.000Z",
-            vendorSummaries: [],
-        };
-        const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
-        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
-            const url = String(input);
-            let body: any = emptyPayload;
-            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
-                body = payload;
-            } else if (url.includes("/api/dashboard/active-purchases")) {
-                body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
-            }
-            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
-        }));
+                ],
+                cachedAt: "2026-05-05T12:00:00.000Z",
+                vendorSummaries: [],
+            };
+            const emptyPayload = { groups: [], cachedAt: "2026-05-05T12:00:00.000Z", vendorSummaries: [] };
+            vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+                const url = String(input);
+                let body: any = emptyPayload;
+                if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
+                    body = payload;
+                } else if (url.includes("/api/dashboard/active-purchases")) {
+                    body = { activePurchases: [], asOf: "2026-05-05T12:00:00.000Z" };
+                }
+                return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+            }));
 
-        render(<PurchasingPanel />);
+            render(<PurchasingPanel />);
 
-        expect(await screen.findByText(/cycle locked/i)).toBeTruthy();
-        expect(screen.getByText(/PO 124832/i)).toBeTruthy();
-    });
-});
-
-describe("PurchasingPanel - qty override dropdown", () => {
-    afterEach(() => {
-        vi.restoreAllMocks();
+            expect(await screen.findByText(/Colorful Packaging Ltd/i)).toBeTruthy();
+            fireEvent.click(await screen.findByText("▾"));
+            await waitFor(() => expect(screen.getByText(/Colorful printed label/i)).toBeTruthy());
+        });
     });
 
-    it("renders chevron when roundingAlternatives is non-empty", async () => {
-        stubLocalStorage();
+    describe("PurchasingPanel - qty override dropdown", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
 
-        const itemWithAlts = {
-            ...makeFixtureItem(),
-            roundingMethod: "historical" as const,
-            roundingAlternatives: [600, 1000],
-        };
-        const payload = {
-            groups: [
-                {
-                    vendorName: "Colorful Packaging Ltd",
-                    vendorPartyId: "10918",
-                    urgency: "critical",
-                    items: [itemWithAlts],
-                },
-            ],
+        it("renders chevron when roundingAlternatives is non-empty", async () => {
+            stubLocalStorage();
+
+            const itemWithAlts = {
+                ...makeFixtureItem(),
+                roundingMethod: "historical" as const,
+                roundingAlternatives: [600, 1000],
+            };
+            const payload = {
+                groups: [
+                    {
+                        vendorName: "Colorful Packaging Ltd",
+                        vendorPartyId: "10918",
+                        urgency: "critical",
+                        items: [itemWithAlts],
+                    },
+                ],
             cachedAt: "2026-05-05T12:00:00.000Z",
             vendorSummaries: [],
         };
@@ -345,9 +354,10 @@ describe("PurchasingPanel - qty override dropdown", () => {
 
         render(<PurchasingPanel />);
         await waitFor(() => expect(fetch).toHaveBeenCalled());
-
-        const vendorTab = await screen.findByText(/Colorful Packagi/i);
-        fireEvent.click(vendorTab);
+        // Vendor groups render collapsed by default — click ▾ to expand items.
+        // NOTE(2026-07-28): commit 5f1de32 replaced tab strip with dropdown;
+        // vendor name no longer toggles expansion.
+        fireEvent.click(await screen.findByText("▾"));
 
         await waitFor(() => {
             const chevron = document.querySelector('[title="Snap to a different clean number"]');
@@ -474,7 +484,7 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         render(<PurchasingPanel />);
         await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        fireEvent.click(await screen.findByText(/Sustainable Village/i));
+        fireEvent.click(await screen.findByText("▾")); // 5f1de32: expand via ▾, not vendor name
 
         expect(await screen.findByText(/Blumat Digital Moisture Meter/i)).toBeTruthy();
         expect(await screen.findByText(/Blumat 9 inch Pre-set Carrot/i)).toBeTruthy();
@@ -568,12 +578,20 @@ describe("PurchasingPanel - draft PO state", () => {
         render(<PurchasingPanel />);
         await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        fireEvent.click(await screen.findByText(/Colorful Packaging Ltd/i));
+        // Expand so the Order button is draft-only (inspected path).
+        // NOTE(2026-07-28): button label is "Order" (was "Draft PO (N)");
+        // commit modal / Keep Draft is no longer auto-opened after create
+        // (Bill rule 2026-06-23: one click → one draft). Completed vendors
+        // drop from the needing list after a 2s success flash.
+        fireEvent.click(await screen.findByText("▾"));
         await waitFor(() => expect(screen.getByText(/Colorful printed label/i)).toBeTruthy());
-        fireEvent.click(screen.getByText(/Draft PO \(1\)/i));
+        fireEvent.click(screen.getByText(/^Order$/i));
 
         await waitFor(() => expect(screen.getAllByText(/PO #124790/i).length).toBeGreaterThan(0));
-        fireEvent.click(screen.getByText(/Keep Draft/i));
-        expect(screen.queryByText(/Colorful printed label/i)).toBeNull();
+        // Vendor is marked completed after the 2s flash and leaves activeGroups.
+        await waitFor(
+            () => expect(screen.queryByText(/Colorful printed label/i)).toBeNull(),
+            { timeout: 4000 },
+        );
     });
 });

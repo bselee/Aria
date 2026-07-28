@@ -99,7 +99,7 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getAllByText(/PARTIAL/i)[0]).toBeTruthy();
     expect(screen.getByText(/Apr 1 10:15 AM/i)).toBeTruthy();
     expect(screen.getByText(/rcvd by Luis/i)).toBeTruthy();
-    expect(screen.getByText(/short on BPM01/i)).toBeTruthy();
+    expect(screen.getByText(/received unknown/i)).toBeTruthy();
   });
 
   it("renders partial receipt history and open quantities", async () => {
@@ -143,8 +143,9 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getByText(/225 \/ 300 received/i)).toBeTruthy();
-    expect(screen.getByText(/75 open/i)).toBeTruthy();
+    expect(await screen.findByText(/BOTTLE-1G short 75 of 300/i)).toBeTruthy();
+    const shortMatches = screen.getAllByText(/short 75/i);
+    expect(shortMatches.length).toBeGreaterThanOrEqual(2);
   });
 
   it("sorts receivings newest first and summarizes multiple short SKUs", async () => {
@@ -171,14 +172,24 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getByText(/2 short SKUs/i)).toBeTruthy();
+    expect(await screen.findByText(/SKU-A short 2 of 10/i)).toBeTruthy();
   });
 
   it("shows a today shipment summary above receivings when tracking data is available", async () => {
     stubLocalStorage();
     stubFetch(
       {
-        received: [],
+        received: [
+          {
+            orderId: "PO-500",
+            orderDate: "2026-04-01",
+            receiveDate: "2026-04-01",
+            supplier: "Test Vendor",
+            total: 100,
+            items: [{ productId: "SKU-X", quantity: 1 }],
+            finaleUrl: "https://example.com/po",
+          },
+        ],
         days: 14,
         asOf: "2026-04-01",
       },
@@ -193,7 +204,7 @@ describe("ReceivedItemsPanel", () => {
         },
         shipments: [],
         asOf: "2026-04-01T12:00:00.000Z",
-        todaySummary: { count: 1, carriers: ["FedEx"] },
+        todaySummary: { headline: "1 shipment arriving today", lines: ["FedEx: ship-1"] },
         answer: null,
       }
     );
@@ -201,6 +212,6 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getByText(/1 shipment arriving today/i)).toBeTruthy();
+    expect(await screen.findByText(/1 shipment arriving today/i)).toBeTruthy();
   });
 });

@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const upload = vi.fn();
 const insert = vi.fn();
 const insertSelect = vi.fn();
 const maybeSingle = vi.fn();
@@ -19,15 +18,17 @@ const supabase = {
             })),
         };
     }),
-    storage: {
-        from: vi.fn(() => ({
-            upload,
-        })),
-    },
 };
 
 vi.mock("@/lib/db", () => ({
     createClient: () => supabase,
+}));
+
+// Stale-test fix: email-intake.ts switched from supabase.storage.upload()
+// to dynamic import of uploadPDF from ../storage/supabase-storage in
+// commit 070b792 (2026-07-15).
+vi.mock("../storage/supabase-storage", () => ({
+    uploadPDF: vi.fn().mockResolvedValue("local/storage/statement_artifacts/FedEx/2026-07-28/statement.pdf"),
 }));
 
 import { queueStatementEmailIntake } from "./email-intake";
@@ -36,7 +37,6 @@ describe("queueStatementEmailIntake", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         maybeSingle.mockResolvedValue({ data: null, error: null });
-        upload.mockResolvedValue({ error: null });
         insertSelect.mockResolvedValue({ data: [{ id: "intake_1" }], error: null });
     });
 
@@ -52,7 +52,7 @@ describe("queueStatementEmailIntake", () => {
             buffer: Buffer.from("fake pdf"),
         });
 
-        expect(upload).toHaveBeenCalledOnce();
+        expect(vi.mocked((await import("../storage/supabase-storage")).uploadPDF)).toHaveBeenCalledOnce();
         expect(insert).toHaveBeenCalledOnce();
         expect(insert.mock.calls[0][0]).toMatchObject({
             vendor_name: "FedEx",
@@ -80,7 +80,9 @@ describe("queueStatementEmailIntake", () => {
             buffer: Buffer.from("fake pdf"),
         });
 
-        expect(upload).not.toHaveBeenCalled();
+        // When fingerprint exists, no upload or insert happens
+        const uploadPDF = vi.mocked((await import("../storage/supabase-storage")).uploadPDF);
+        expect(uploadPDF).not.toHaveBeenCalled();
         expect(insert).not.toHaveBeenCalled();
         expect(result).toBe("intake_existing");
     });

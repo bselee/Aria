@@ -167,6 +167,21 @@ function makeFetch(overrides: Record<string, unknown> = {}) {
             "/api/command-board/tasks": { tasks: baseTasks, total: baseTasks.length },
             "/api/command-board/heartbeats": { heartbeats: baseHeartbeats },
             "/api/command-board/crons": { crons: baseCrons },
+            "/api/dashboard/receivings": { received: [], days: 30, asOf: new Date().toISOString() },
+            "/api/dashboard/tracking": {
+                board: {
+                    arrivingToday: [],
+                    outForDelivery: [],
+                    deliveredAwaitingReceipt: [],
+                    exceptions: [],
+                    stale: [],
+                    recentlyDelivered: [],
+                },
+                shipments: [],
+                asOf: new Date().toISOString(),
+                todaySummary: null,
+                answer: null,
+            },
             ...overrides,
         };
         if (stripped.startsWith("/api/command-board/tasks/")) {
@@ -193,6 +208,7 @@ afterEach(() => {
     cleanup();
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
 });
 
 beforeEach(() => {
@@ -219,6 +235,7 @@ beforeEach(() => {
 describe("CommandBoardShell", () => {
     it("surfaces the purchasing lifecycle as a split workflow", async () => {
         const fetchImpl = makeFetch();
+        vi.stubGlobal("fetch", fetchImpl);
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
         const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
@@ -230,7 +247,7 @@ describe("CommandBoardShell", () => {
         expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
         expect(orderingPane.textContent).toContain("Ordering");
         expect(purchasesPane.textContent).toContain("Purchases");
-        expect(rcvPane.textContent).toContain("RCV");
+        expect(rcvPane.textContent).toContain("Receivings");
     });
 
     it("labels the shell Ops Board and removes redundant lifecycle drill-in tabs", async () => {

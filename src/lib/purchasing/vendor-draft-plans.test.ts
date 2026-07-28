@@ -266,7 +266,8 @@ describe("buildVendorDraftPlans", () => {
 
         expect(result[0].actionableItems).toHaveLength(0);
         expect(result[0].blockedLines).toHaveLength(1);
-        expect(result[0].blockedLines[0].assessment.explanation).toContain("Finished goods already have healthy coverage");
+        // Stale-test fix: explanation changed in 306068f (2026-07-10)
+        expect(result[0].blockedLines[0].assessment.explanation).toContain("Hold: finished goods have ≥30d coverage");
     });
 
     it("supports vendor filtering without rescanning unrelated vendors", () => {
