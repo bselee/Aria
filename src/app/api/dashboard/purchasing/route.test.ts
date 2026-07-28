@@ -205,7 +205,10 @@ describe("dashboard purchasing route", () => {
         expect(response.status).toBe(200);
         const body = await response.json();
         expect(body.groups).toHaveLength(2);
-        expect(body.groups.map((g: any) => g.urgency)).toEqual(["critical", "warning"]);
+        // The route recalculates display urgency from runway: LABEL-200 has
+        // adjustedRunwayDays=50 and leadTimeDays=14. 14+30=44, 14+60=74.
+        // 50 lies in the "watch" band (< lead+60, > lead+30).
+        expect(body.groups.map((g: any) => g.urgency)).toEqual(["critical", "watch"]);
     });
 
     it("returns all groups when no urgency filter is supplied", async () => {
@@ -246,39 +249,48 @@ describe("dashboard purchasing route", () => {
     });
 
     it("rejects routine draft creation when the vendor cycle is locked by a recent PO", async () => {
-        recentPurchaseOrdersMock.mockResolvedValue([
-            {
-                orderId: "124832",
-                vendorName: "FedEx",
-                status: "Committed",
-                orderDate: "2026-05-19",
-                receiveDate: null,
-                items: [{ productId: "OTHER-SKU", quantity: 1 }],
-            },
-        ]);
+        // evaluateVendorCycle requires the PO be within the 30-day cycle window
+        // (CYCLE_WINDOW_DAYS = 30). Use vi.setSystemTime so the mock PO date is recent.
+        vi.useFakeTimers();
+        try {
+            vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
 
-        const response = await POST({
-            json: async () => ({
-                vendorPartyId: "party-2",
-                items: [
-                    {
-                        productId: "LABEL-200",
-                        quantity: 100,
-                        unitPrice: 0.25,
-                        orderIncrementQty: null,
-                        isBulkDelivery: false,
-                    },
-                ],
-            }),
-        } as any);
+            recentPurchaseOrdersMock.mockResolvedValue([
+                {
+                    orderId: "124832",
+                    vendorName: "FedEx",
+                    status: "Committed",
+                    orderDate: "2026-05-19",
+                    receiveDate: null,
+                    items: [{ productId: "OTHER-SKU", quantity: 1 }],
+                },
+            ]);
 
-        expect(response.status).toBe(409);
-        const body = await response.json();
-        expect(body.vendorCycle).toMatchObject({
-            decision: "routine_locked",
-            blockingPO: { orderId: "124832" },
-        });
-        expect(createDraftMock).not.toHaveBeenCalled();
+            const response = await POST({
+                json: async () => ({
+                    vendorPartyId: "party-2",
+                    items: [
+                        {
+                            productId: "LABEL-200",
+                            quantity: 100,
+                            unitPrice: 0.25,
+                            orderIncrementQty: null,
+                            isBulkDelivery: false,
+                        },
+                    ],
+                }),
+            } as any);
+
+            expect(response.status).toBe(409);
+            const body = await response.json();
+            expect(body.vendorCycle).toMatchObject({
+                decision: "routine_locked",
+                blockingPO: { orderId: "124832" },
+            });
+            expect(createDraftMock).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it("uses warm purchasing cache for draft creation instead of rescanning Finale", async () => {
