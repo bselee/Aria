@@ -12,6 +12,30 @@ SNAPSHOT_FILE = CACHE_DIR / "latest-snapshot.json"
 PREV_FILE     = CACHE_DIR / "prev-snapshot.json"
 SEEN_FILE     = CACHE_DIR / "seen-request-ids.json"
 BASE_URL     = "https://basauto.vercel.app"
+ENV_FILES    = (".env.local", ".env")
+
+
+def load_env() -> None:
+    """Hydrate os.environ from .env.local / .env without clobbering real env vars.
+
+    basauto_poll.py runs under cron where the shell has no exported secrets, so
+    TELEGRAM_* previously resolved empty and every alert silently no-op'd.
+    """
+    for name in ENV_FILES:
+        f = PROJECT_DIR / name
+        if not f.exists():
+            continue
+        for raw in f.read_text("utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key and val and not os.environ.get(key):
+                os.environ[key] = val
+
+
+load_env()
 TG_BOT = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
