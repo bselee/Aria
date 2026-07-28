@@ -718,57 +718,40 @@ export default function ActivePurchasesPanel() {
                             </button>
                         </div>
                     )}
-                    {/* ── Aggregate Status Banner ── */}
-                                        {!loading && !error && purchases.length > 0 && (
-                                            <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-900/30 flex flex-wrap items-center gap-x-2 gap-y-1">
-                                                <StatusBadge label={`${purchases.length} Active`} tone="cyan" />
-                                                {purchases.filter(isOverdue).length > 0 && (
-                                                    <StatusBadge label={`${purchases.filter(isOverdue).length} Overdue`} tone="rose" />
-                                                )}
-                                                {purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length > 0 && (
-                                                    <StatusBadge label={`${purchases.filter(p => !p.vendorAcknowledgedAt && p.sentVerification?.verified).length} Unacknowledged`} tone="amber" />
-                                                )}
-                                                {purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length > 0 && (
-                                                    <StatusBadge label={`${purchases.filter(p => !p.trackingNumbers?.length && !p.shipments?.length && !p.isReceived).length} No Tracking`} tone="orange" />
-                                                )}
-                                                {purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length > 0 && (
-                                                    <StatusBadge label={`${purchases.filter(p => p.shipments?.length > 0 && !p.isReceived).length} In Transit`} tone="cyan" />
-                                                )}
-                                            </div>
-                                        )}
-                                        {/* ── Stage FilterChips Row ── */}
-                                        {!loading && !error && purchases.length > 0 && (
-                                            <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
-                                                <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 mr-1">Stage:</span>
-                                                {(["SENT", "IN_TRANSIT", "DELIVERED", "RECEIVED"] as const).map((stage) => {
-                                                    const count = purchases.filter((p) => deriveStage(p) === stage).length;
-                                                    if (count === 0) return null;
-                                                    const tone = stage === "RECEIVED" ? "emerald"
-                                                        : stage === "DELIVERED" ? "cyan"
-                                                        : stage === "IN_TRANSIT" ? "default"
-                                                        : "default";
-                                                    return (
-                                                        <FilterChip
-                                                            key={stage}
-                                                            label={stage}
-                                                            count={count}
-                                                            active={filterStage === stage}
-                                                            onClick={() => setFilterStage(filterStage === stage ? null : stage)}
-                                                            tone={tone as any}
-                                                            title={filterStage === stage ? "Show all stages" : `Filter to ${stage}`}
-                                                        />
-                                                    );
-                                                })}
-                                                {filterStage && (
-                                                    <button
-                                                        onClick={() => setFilterStage(null)}
-                                                        className="text-[9px] font-mono text-zinc-600 hover:text-zinc-300 transition-colors ml-1"
-                                                    >
-                                                        clear
-                                                    </button>
-                                                )}
-                                            </div>
-                                        )}
+                    {/* Aggregate status banner removed 2026-07-28 — duplicated Overdue chip + Stage filters below. */}
+                                                            {/* ── Stage FilterChips Row ── */}
+                                                            {!loading && !error && purchases.length > 0 && (
+                                                                <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
+                                                                    <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 mr-1">Stage:</span>
+                                                                    {(["SENT", "IN_TRANSIT", "DELIVERED", "RECEIVED"] as const).map((stage) => {
+                                                                        const count = purchases.filter((p) => deriveStage(p) === stage).length;
+                                                                        if (count === 0) return null;
+                                                                        const tone = stage === "RECEIVED" ? "emerald"
+                                                                            : stage === "DELIVERED" ? "cyan"
+                                                                            : stage === "IN_TRANSIT" ? "default"
+                                                                            : "default";
+                                                                        return (
+                                                                            <FilterChip
+                                                                                key={stage}
+                                                                                label={stage}
+                                                                                count={count}
+                                                                                active={filterStage === stage}
+                                                                                onClick={() => setFilterStage(filterStage === stage ? null : stage)}
+                                                                                tone={tone as any}
+                                                                                title={filterStage === stage ? "Show all stages" : `Filter to ${stage}`}
+                                                                            />
+                                                                        );
+                                                                    })}
+                                                                    {filterStage && (
+                                                                        <button
+                                                                            onClick={() => setFilterStage(null)}
+                                                                            className="text-[9px] font-mono text-zinc-600 hover:text-zinc-300 transition-colors ml-1"
+                                                                        >
+                                                                            clear
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            )}
                                         {loading ? (
                                             <div className="px-4 py-3 space-y-2.5">
                                                 <span className="block text-[10px] font-mono text-zinc-600 pb-1">Loading active purchases…</span>

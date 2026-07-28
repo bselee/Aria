@@ -259,53 +259,61 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
         : summaryCounts.crons.healthy > 0 ? "bg-emerald-500" : "bg-zinc-600";
 
     const needsWill = summaryCounts.lanes["needs-will"] ?? 0;
+        const agentsUnhealthy = summaryCounts.agents.stale > 0;
+        const cronsUnhealthy = summaryCounts.crons.error > 0;
 
-    return (
-        <div className="flex flex-col h-screen bg-[#09090b] text-zinc-100" data-testid="command-board-shell">
-            {/* Header */}
-            <header className="px-4 py-2 border-b border-zinc-800/80 flex items-center gap-3 bg-[#09090b]">
-                <div className="flex items-center gap-2">
-                    <h1 className="text-sm font-semibold text-zinc-100 tracking-tight">Ops Board</h1>
-                </div>
-                <div className="flex items-center gap-2 ml-2">
-                    <HealthChip
-                        label="needs you"
-                        value={needsWill}
-                        accent={needsWill > 0 ? "bg-amber-400" : "bg-emerald-500"}
-                    />
-                    <HealthChip
-                        label="agents"
-                        value={`${summaryCounts.agents.healthy}/${summaryCounts.agents.total}`}
-                        accent={summaryCounts.agents.stale > 0 ? "bg-amber-400" : "bg-emerald-500"}
-                    />
-                    <HealthChip
-                        label="crons"
-                        value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
-                        accent={cronAccent}
-                    />
-                </div>
-                <div className="flex-1" />
-                {lastError && (
-                    <span title={lastError} className="flex items-center gap-1 text-[10px] font-mono text-rose-400">
-                        <Bell className="w-3 h-3" /> error
-                    </span>
-                )}
-                {lastUpdated && (
-                    <span className="flex items-center gap-1 text-[10px] font-mono text-zinc-500">
-                        <Activity className="w-3 h-3" />
-                        {new Date(lastUpdated).toLocaleTimeString()}
-                    </span>
-                )}
-                <button
-                    type="button"
-                    onClick={() => fetchAll(true)}
-                    disabled={refreshing}
-                    className="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-300 border border-zinc-700 text-xs"
-                >
-                    <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
-                    Refresh
-                </button>
-            </header>
+        return (
+            <div className="flex flex-col h-screen bg-[#09090b] text-zinc-100" data-testid="command-board-shell">
+                {/* Header — only surface chips that need action. Healthy 0/N agents/crons is noise. */}
+                <header className="px-4 py-2 border-b border-zinc-800/80 flex items-center gap-3 bg-[#09090b]">
+                    <div className="flex items-center gap-2">
+                        <h1 className="text-sm font-semibold text-zinc-100 tracking-tight">Ops Board</h1>
+                    </div>
+                    <div className="flex items-center gap-2 ml-2">
+                        {needsWill > 0 && (
+                            <HealthChip
+                                label="needs you"
+                                value={needsWill}
+                                accent="bg-amber-400"
+                            />
+                        )}
+                        {agentsUnhealthy && (
+                            <HealthChip
+                                label="agents"
+                                value={`${summaryCounts.agents.healthy}/${summaryCounts.agents.total}`}
+                                accent="bg-amber-400"
+                            />
+                        )}
+                        {cronsUnhealthy && (
+                            <HealthChip
+                                label="crons"
+                                value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
+                                accent={cronAccent}
+                            />
+                        )}
+                    </div>
+                    <div className="flex-1" />
+                    {lastError && (
+                        <span title={lastError} className="flex items-center gap-1 text-[10px] font-mono text-rose-400">
+                            <Bell className="w-3 h-3" /> error
+                        </span>
+                    )}
+                    {lastUpdated && (
+                        <span className="flex items-center gap-1 text-[10px] font-mono text-zinc-500">
+                            <Activity className="w-3 h-3" />
+                            {new Date(lastUpdated).toLocaleTimeString()}
+                        </span>
+                    )}
+                    <button
+                        type="button"
+                        onClick={() => fetchAll(true)}
+                        disabled={refreshing}
+                        className="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-300 border border-zinc-700 text-xs"
+                    >
+                        <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+                        Refresh
+                    </button>
+                </header>
 
             {/* Module tab bar */}
             <nav

@@ -408,8 +408,11 @@ export default function PurchasingPanel() {
     // Default to "all" so every item is visible, sorted most-needed-first.
     // Will: "We just want items in ordering to be staged from most needed to least always."
     const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
-    const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
-    type ItemMode = 'all' | 'resale' | 'bom';
+        const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("need");
+        // HERMIA(2026-07-28): STATUS row (Need/Topping/On Order/Holds) is power-user.
+        // WINDOW row already answers "when". Collapse STATUS by default — less chrome.
+        const [showStatusFilters, setShowStatusFilters] = useState(false);
+        type ItemMode = 'all' | 'resale' | 'bom';
     // Both resale and BOM items visible together (no UI toggle — the BOM
     // treatment renders cleanly for BOM rows, resale rows show their own data).
     const [itemMode] = useState<ItemMode>('all');
@@ -1787,27 +1790,40 @@ export default function PurchasingPanel() {
                         </>
                     ) : (
                         <>
-                            {/* ── Lifecycle tabs ── segments rows by whether action is needed despite open POs */}
-                            <div className="flex items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                        <span className="text-[10px] font-mono text-dash-l3 tracking-wider shrink-0 mr-1">STATUS</span>
-                        {([
-                            { k: "need" as const, label: "Need Order", tone: "red" as const, title: "Need a fresh PO — nothing already on order" },
-                            { k: "topping" as const, label: "Topping Up", tone: "amber" as const, title: "Open PO exists but Aria sees additional need" },
-                            { k: "on_order" as const, label: "On Order", tone: "emerald" as const, title: "Open PO already covers near-term need — no action" },
-                            { k: "other" as const, label: "Other Holds", tone: "default" as const, title: "Other holds (FG covered, uneconomic, manual review)" },
-                            { k: "all" as const, label: "All", count: lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other, tone: "default" as const, title: "All buckets at once" },
-                        ]).map(t => (
-                            <FilterChip
-                                key={t.k}
-                                label={t.label}
-                                count={t.k === "all" ? t.count : lifecycleCounts[t.k]}
-                                active={lifecycleFilter === t.k}
-                                onClick={() => setLifecycleFilter(t.k)}
-                                tone={t.tone}
-                                title={t.title}
-                            />
-                        ))}
-                    </div>
+                            {/* ── Lifecycle tabs ── collapsed by default (noise). WINDOW filters stay primary. */}
+                                                        <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-800/60 bg-zinc-950/40 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setShowStatusFilters(s => !s)}
+                                                        className="text-[10px] font-mono text-dash-l3 tracking-wider shrink-0 mr-1 hover:text-zinc-300 transition-colors"
+                                                        title={showStatusFilters ? "Hide status buckets" : "Show Need / Topping / On Order / Holds"}
+                                                    >
+                                                        STATUS {showStatusFilters ? "▾" : "▸"}
+                                                        {!showStatusFilters && lifecycleFilter !== "all" && (
+                                                            <span className="ml-1 text-zinc-400 normal-case tracking-normal">
+                                                                · {lifecycleFilter === "need" ? "Need Order" : lifecycleFilter === "topping" ? "Topping Up" : lifecycleFilter === "on_order" ? "On Order" : "Other"}
+                                                                {" "}({lifecycleCounts[lifecycleFilter as keyof typeof lifecycleCounts] ?? 0})
+                                                            </span>
+                                                        )}
+                                                    </button>
+                                                    {showStatusFilters && ([
+                                                        { k: "need" as const, label: "Need Order", tone: "red" as const, title: "Need a fresh PO — nothing already on order" },
+                                                        { k: "topping" as const, label: "Topping Up", tone: "amber" as const, title: "Open PO exists but Aria sees additional need" },
+                                                        { k: "on_order" as const, label: "On Order", tone: "emerald" as const, title: "Open PO already covers near-term need — no action" },
+                                                        { k: "other" as const, label: "Other Holds", tone: "default" as const, title: "Other holds (FG covered, uneconomic, manual review)" },
+                                                        { k: "all" as const, label: "All", count: lifecycleCounts.need + lifecycleCounts.topping + lifecycleCounts.on_order + lifecycleCounts.other, tone: "default" as const, title: "All buckets at once" },
+                                                    ]).map(t => (
+                                                        <FilterChip
+                                                            key={t.k}
+                                                            label={t.label}
+                                                            count={t.k === "all" ? t.count : lifecycleCounts[t.k]}
+                                                            active={lifecycleFilter === t.k}
+                                                            onClick={() => setLifecycleFilter(t.k)}
+                                                            tone={t.tone}
+                                                            title={t.title}
+                                                        />
+                                                    ))}
+                                                </div>
 
                     {/* ── Vendor dropdown combobox ── replaces horizontal tab strip */}
                     {focusGroups.length > 0 && (
