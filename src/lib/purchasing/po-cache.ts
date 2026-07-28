@@ -55,6 +55,7 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
         chunks.push({
             po_number: po.orderId,
             vendor_name: po.vendorName,
+            vendor_party_id: po.vendorPartyId || null,
             status: po.status || "unknown",
             total: po.total,
             total_amount: po.total,
@@ -106,6 +107,7 @@ async function readCachedPos(): Promise<FullPO[]> {
             return {
                 orderId: row.po_number,
                 vendorName: row.vendor_name || "",
+                vendorPartyId: row.vendor_party_id || null,
                 orderDate: row.issue_date ? new Date(row.issue_date).toISOString().split("T")[0] : "",
                 status: row.status || "",
                 total: Number(row.total) || 0,
