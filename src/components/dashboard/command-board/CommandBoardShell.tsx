@@ -68,38 +68,47 @@ type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
 const TAB_STORAGE_KEY = "aria-dash-active-tab";
 
 function PurchasingLifecyclePanel() {
-    // HERMIA(2026-07-28): Single vertical scroll — Order → Active → Receivings.
-    // 3-column squeeze made every panel fight for height and felt like three apps.
+    // Flow left → right: Order → Active POs → Receivings.
+    // Always three columns (horizontal scroll on narrow screens). Each pane
+    // scrolls internally — never stack the whole workflow top-to-bottom.
     return (
         <PurchasingLifecycleProvider>
-            <div
-                className="flex flex-col h-full min-h-0 overflow-y-auto gap-2 p-2"
-                data-testid="purchasing-lifecycle-panel"
-            >
-                <section
-                    className="shrink-0 min-h-[480px] border border-zinc-800/70 bg-zinc-950/50"
-                    data-testid="lifecycle-pane-ordering"
+            <div className="flex flex-col h-full min-h-0 overflow-hidden">
+                <div
+                    className="flex-1 min-h-0 grid grid-cols-[minmax(480px,1.35fr)_minmax(420px,1fr)_minmax(380px,0.95fr)] gap-2 p-2 overflow-x-auto overflow-y-hidden"
+                    data-testid="purchasing-lifecycle-panel"
                 >
-                    <PanelErrorBoundary label="PurchasingPanel">
-                        <PurchasingPanel />
-                    </PanelErrorBoundary>
-                </section>
-                <section
-                    className="shrink-0 min-h-[380px] border border-zinc-800/70 bg-zinc-950/50"
-                    data-testid="lifecycle-pane-purchases"
-                >
-                    <PanelErrorBoundary label="ActivePurchasesPanel">
-                        <ActivePurchasesPanel />
-                    </PanelErrorBoundary>
-                </section>
-                <section
-                    className="shrink-0 min-h-[380px] border border-zinc-800/70 bg-zinc-950/50"
-                    data-testid="lifecycle-pane-rcv"
-                >
-                    <PanelErrorBoundary label="ReceivedItemsPanel">
-                        <ReceivedItemsPanel />
-                    </PanelErrorBoundary>
-                </section>
+                    <section
+                        className="min-w-0 min-h-0 h-full overflow-hidden border border-zinc-800/70 bg-zinc-950/50 flex flex-col"
+                        data-testid="lifecycle-pane-ordering"
+                    >
+                        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+                            <PanelErrorBoundary label="PurchasingPanel">
+                                <PurchasingPanel />
+                            </PanelErrorBoundary>
+                        </div>
+                    </section>
+                    <section
+                        className="min-w-0 min-h-0 h-full overflow-hidden border border-zinc-800/70 bg-zinc-950/50 flex flex-col"
+                        data-testid="lifecycle-pane-purchases"
+                    >
+                        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+                            <PanelErrorBoundary label="ActivePurchasesPanel">
+                                <ActivePurchasesPanel />
+                            </PanelErrorBoundary>
+                        </div>
+                    </section>
+                    <section
+                        className="min-w-0 min-h-0 h-full overflow-hidden border border-zinc-800/70 bg-zinc-950/50 flex flex-col"
+                        data-testid="lifecycle-pane-rcv"
+                    >
+                        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+                            <PanelErrorBoundary label="ReceivedItemsPanel">
+                                <ReceivedItemsPanel />
+                            </PanelErrorBoundary>
+                        </div>
+                    </section>
+                </div>
             </div>
         </PurchasingLifecycleProvider>
     );
