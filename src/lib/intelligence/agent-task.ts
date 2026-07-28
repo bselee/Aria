@@ -218,12 +218,12 @@ export async function upsertFromSource(args: UpsertFromSourceArgs): Promise<stri
 
     let query;
     if (existingId) {
-        query = supabase
+        query = db
             .from("agent_task")
             .update(row)
             .eq("id", existingId);
     } else {
-        query = supabase
+        query = db
             .from("agent_task")
             .insert(row);
     }
@@ -308,7 +308,7 @@ export async function incrementOrCreate(args: IncrementOrCreateArgs): Promise<Ag
         // Stuck-source guard: 6th+ duplicate AND original >1h old → meta-task.
         const ageMs = Date.now() - new Date(existing.created_at).getTime();
         if (newDedupCount > 5 && ageMs > 3600_000) {
-            await emitStuckSourceMetaTask(supabase, args, existing.id, newDedupCount);
+            await emitStuckSourceMetaTask(db, args, existing.id, newDedupCount);
         }
         await appendEvent(existing.id, "dedup_increment", {
             task_type: args.type,
@@ -623,7 +623,7 @@ export async function listTasks(filters: ListTasksFilters = {}): Promise<AgentTa
         throw new Error("Supabase not configured");
     }
 
-    let query = supabase
+    let query = db
         .from("agent_task")
         .select("*")
         .order("priority", { ascending: true })

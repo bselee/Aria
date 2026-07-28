@@ -18,8 +18,6 @@
 import { createClient } from "@/lib/db";
 import { getLocalDb } from "@/lib/storage/local-db";
 
-const supabase = createClient();
-
 // ── State ───────────────────────────────────────────────────────────────────
 
 export interface CognitiveState {
@@ -73,7 +71,7 @@ async function gatherState(): Promise<CognitiveState> {
     if (db) {
         try {
             // Agent heartbeats
-            const { data: heartbeats } = await supabase
+            const { data: heartbeats } = await db
                 .from("agent_heartbeats")
                 .select("agent_name, status, heartbeat_at")
                 .order("heartbeat_at", { ascending: false });
@@ -87,7 +85,7 @@ async function gatherState(): Promise<CognitiveState> {
 
             // Recent cron failures (last 1 hour)
             const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
-            const { data: failures } = await supabase
+            const { data: failures } = await db
                 .from("cron_runs")
                 .select("job_name, status, started_at, error_message")
                 .eq("status", "failed")
@@ -118,7 +116,7 @@ async function gatherState(): Promise<CognitiveState> {
             }
 
             // Pending approvals
-            const { count: approvalCount } = await supabase
+            const { count: approvalCount } = await db
                 .from("ap_pending_approvals")
                 .select("*", { count: "exact", head: true })
                 .is("applied_at", null);
