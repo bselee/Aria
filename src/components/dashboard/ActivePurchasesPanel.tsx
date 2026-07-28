@@ -205,7 +205,12 @@ function freshnessLabel(minutes: number | null | undefined): string {
     return `fresh ${Math.round(minutes / (24 * 60))}d ago`;
 }
 
-export default function ActivePurchasesPanel() {
+export type ActivePurchasesPanelProps = {
+    /** Lifecycle column mode: fill height, no card collapse/resize. */
+    embedded?: boolean;
+};
+
+export default function ActivePurchasesPanel({ embedded = false }: ActivePurchasesPanelProps = {}) {
     const lifecycle = usePurchasingLifecycle();
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
     const [cachedAt, setCachedAt] = useState("");
@@ -227,6 +232,7 @@ export default function ActivePurchasesPanel() {
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [filterOverdue, setFilterOverdue] = useState(false);
     const [filterStage, setFilterStage] = useState<LifecycleStage | null>(null);
+    const [showStageFilters, setShowStageFilters] = useState(false);
     const [editingEta, setEditingEta] = useState<string | null>(null);
     const [etaSaving, setEtaSaving] = useState<string | null>(null);
     const [expandedPOs, setExpandedPOs] = useState<Set<string>>(new Set());
@@ -306,6 +312,7 @@ export default function ActivePurchasesPanel() {
 
     // Collapse state
     const [isCollapsed, setIsCollapsed] = useState(false);
+    const effectivelyCollapsed = embedded ? false : isCollapsed;
     useEffect(() => {
         const s = localStorage.getItem("aria-dash-apch-collapsed");
         if (s === "true") setIsCollapsed(true);
@@ -651,7 +658,13 @@ export default function ActivePurchasesPanel() {
     ).length;
 
     return (
-        <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
+        <div
+            className={embedded
+                ? "h-full min-h-0 flex flex-col overflow-hidden"
+                : "border-b border-zinc-800 shrink-0"
+            }
+            ref={containerRef}
+        >
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <ListChecks className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Active Purchases</span>
@@ -665,6 +678,16 @@ export default function ActivePurchasesPanel() {
                     </span>
                 )}
 
+                {embedded && !loading && purchases.length > 0 && (
+                    <button
+                        type="button"
+                        onClick={() => setShowStageFilters(v => !v)}
+                        className="text-[10px] font-mono text-zinc-600 hover:text-zinc-300 px-1.5"
+                        title="Stage filters"
+                    >
+                        Stage{filterStage ? `:${filterStage}` : ""} {showStageFilters || filterStage ? "▾" : "▸"}
+                    </button>
+                )}
                 {!loading && purchases.filter(isOverdue).length > 0 && (
                     <FilterChip
                         label="Overdue"
@@ -695,14 +718,14 @@ export default function ActivePurchasesPanel() {
                 </button>
                 <button
                     onClick={() => setIsCollapsed(!isCollapsed)}
-                    className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
+                    className={`p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1 ${embedded ? "hidden" : ""}`}
                 >
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
 
-            {!isCollapsed && (
-                <>
+            {!effectivelyCollapsed && (
+                <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
                     {/* Draft notification: visual bridge from Ordering → Purchases */}
                     {draftFlash && (
                         <div className="px-4 py-1.5 bg-blue-500/10 border-b border-blue-500/30 flex items-center gap-2 animate-pulse">
@@ -720,7 +743,7 @@ export default function ActivePurchasesPanel() {
                     )}
                     {/* Aggregate status banner removed 2026-07-28 — duplicated Overdue chip + Stage filters below. */}
                                                             {/* ── Stage FilterChips Row ── */}
-                                                            {!loading && !error && purchases.length > 0 && (
+                                                            {!loading && !error && purchases.length > 0 && (!embedded || showStageFilters || filterStage) && (
                                                                 <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
                                                                     <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 mr-1">Stage:</span>
                                                                     {(["SENT", "IN_TRANSIT", "DELIVERED", "RECEIVED"] as const).map((stage) => {
@@ -766,7 +789,10 @@ export default function ActivePurchasesPanel() {
                     ) : visiblePurchases.length === 0 ? (
                         <div className="px-4 py-3 border-t border-zinc-800/60"><span className="text-xs font-mono text-zinc-500">No active POs — all sent orders are received or not yet in the 60d window</span></div>
                     ) : (
-                        <div className="overflow-y-auto border-t border-zinc-800/60 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50" style={{ height: bodyHeight }}>
+                        <div
+                            className={`overflow-y-auto border-t border-zinc-800/60 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 ${embedded ? "flex-1 min-h-0" : ""}`}
+                            style={embedded ? undefined : { height: bodyHeight }}
+                        >
                             {visiblePurchases.map(po => {
                                 const isReceived = po.isReceived;
                                 const isCancelled = po.status.toLowerCase() === "cancelled";
@@ -1569,11 +1595,11 @@ export default function ActivePurchasesPanel() {
                         </div>
                     )}
 
-                    {!loading && !error && visiblePurchases.length > 0 && (
+                    {!embedded && !loading && !error && visiblePurchases.length > 0 && (
                         <div onMouseDown={startResize}
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
-                </>
+                </div>
             )}
             {timelineOrderId && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setTimelineOrderId(null)}>

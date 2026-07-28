@@ -354,7 +354,12 @@ function sortItemsByNeed(items: PurchasingItem[]): PurchasingItem[] {
 }
 
 // ── component ──────────────────────────────────────────────────────────────
-export default function PurchasingPanel() {
+export type PurchasingPanelProps = {
+    /** Lifecycle column mode: fill height, no card collapse/resize. */
+    embedded?: boolean;
+};
+
+export default function PurchasingPanel({ embedded = false }: PurchasingPanelProps = {}) {
     const lifecycle = usePurchasingLifecycle();
     const [data, setData] = useState<AssessmentData | null>(null);
     const [loading, setLoading] = useState(true);
@@ -425,6 +430,7 @@ export default function PurchasingPanel() {
 
     // collapse + resize
     const [isCollapsed, setIsCollapsed] = useState(false);
+    const effectivelyCollapsed = embedded ? false : isCollapsed;
     useEffect(() => { if (localStorage.getItem("aria-dash-purchasing-collapsed") === "true") setIsCollapsed(true); }, []);
     useEffect(() => { localStorage.setItem("aria-dash-purchasing-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
@@ -1391,7 +1397,10 @@ export default function PurchasingPanel() {
 
     // ── render ─────────────────────────────────────────────────────────────
     return (
-        <div className="border-b border-zinc-800 shrink-0">
+        <div className={embedded
+            ? "h-full min-h-0 flex flex-col overflow-hidden"
+            : "border-b border-zinc-800 shrink-0"
+        }>
             {/* PO Quantity & Case Rounding Validation Loop Modal */}
             {validationModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md">
@@ -1748,19 +1757,21 @@ export default function PurchasingPanel() {
                     title="Re-scan Finale">
                     <RefreshCw className={`w-3 h-3 ${isLoading ? "animate-spin" : ""}`} />
                 </button>
+                {!embedded && (
                 <button onClick={() => setIsCollapsed(!isCollapsed)}
                     className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors">
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
+                )}
             </div>
 
-            {!isCollapsed && (
-                <>
+            {!effectivelyCollapsed && (
+                <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
                     {selectedItem ? (
                         <>
                             <div
-                                className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full font-mono"
-                                style={{ height: bodyHeight }}
+                                className={embedded ? "flex-1 min-h-0 overflow-y-auto" : "overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full font-mono"}
+                                style={embedded ? undefined : { height: bodyHeight }}
                             >
                                 <CrystalBallDetail 
                                     item={selectedItem} 
@@ -1769,9 +1780,11 @@ export default function PurchasingPanel() {
                                 />
                             </div>
 
+                            {!embedded && (
                             <div onMouseDown={startResize}
                                 className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"
                                 title="Drag to resize" />
+                            )}
                         </>
                     ) : (
                         <>
@@ -2043,8 +2056,8 @@ export default function PurchasingPanel() {
                     {data && visibleGroups.length > 0 && (
                         <>
                             <div
-                                className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full"
-                                style={{ height: bodyHeight }}
+                                className={embedded ? "flex-1 min-h-0 overflow-y-auto" : "overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-zinc-800/50 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700/80 [&::-webkit-scrollbar-thumb]:rounded-full"}
+                                style={embedded ? undefined : { height: bodyHeight }}
                                 onScroll={e => setListScrollTop(e.currentTarget.scrollTop)}
                             >
                                 <div style={{ height: measuredTop }} aria-hidden="true" />
@@ -2948,9 +2961,11 @@ export default function PurchasingPanel() {
                                 </div>
                             )}
 
+                            {!embedded && (
                             <div onMouseDown={startResize}
                                                                 className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60"
                                                                 title="Drag to resize" />
+                            )}
                         </>
                     )}
                         </>
@@ -2971,7 +2986,7 @@ export default function PurchasingPanel() {
                             </button>
                         </div>
                     )}
-                </>
+                </div>
             )}
 
             {/* ── Phase 2: Decision Dossier flyout ── agentic audit surface over Ordering column */}

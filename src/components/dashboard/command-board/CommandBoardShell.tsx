@@ -84,7 +84,7 @@ function PurchasingLifecyclePanel() {
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
                             <PanelErrorBoundary label="PurchasingPanel">
-                                <PurchasingPanel />
+                                <PurchasingPanel embedded />
                             </PanelErrorBoundary>
                         </div>
                     </section>
@@ -94,7 +94,7 @@ function PurchasingLifecyclePanel() {
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
                             <PanelErrorBoundary label="ActivePurchasesPanel">
-                                <ActivePurchasesPanel />
+                                <ActivePurchasesPanel embedded />
                             </PanelErrorBoundary>
                         </div>
                     </section>
@@ -104,7 +104,7 @@ function PurchasingLifecyclePanel() {
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
                             <PanelErrorBoundary label="ReceivedItemsPanel">
-                                <ReceivedItemsPanel />
+                                <ReceivedItemsPanel embedded />
                             </PanelErrorBoundary>
                         </div>
                     </section>

@@ -196,7 +196,12 @@ function receiptItemsText(items: Array<{ productId: string; quantity: number }>)
     return items.map(item => `${item.productId} ×${fmtQty(item.quantity)}`).join(", ");
 }
 
-export default function ReceivedItemsPanel() {
+export type ReceivedItemsPanelProps = {
+    /** Lifecycle column mode: fill height, no card collapse/resize. */
+    embedded?: boolean;
+};
+
+export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPanelProps = {}) {
     const lifecycle = usePurchasingLifecycle();
         const [pos, setPos] = useState<ReceivedPO[]>([]);
         const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
@@ -502,6 +507,7 @@ export default function ReceivedItemsPanel() {
 
     // Collapse state — persisted to localStorage
     const [isCollapsed, setIsCollapsed] = useState(false);
+    const effectivelyCollapsed = embedded ? false : isCollapsed;
     useEffect(() => {
         const s = localStorage.getItem("aria-dash-recv-collapsed");
         if (s === "true") setIsCollapsed(true);
@@ -642,7 +648,13 @@ export default function ReceivedItemsPanel() {
         }, [fetchReceivings]);
 
     return (
-        <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>
+        <div
+            className={embedded
+                ? "h-full min-h-0 flex flex-col overflow-hidden"
+                : "border-b border-zinc-800 shrink-0"
+            }
+            ref={containerRef}
+        >
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
@@ -662,14 +674,14 @@ export default function ReceivedItemsPanel() {
                 </button>
                 <button
                     onClick={() => setIsCollapsed(!isCollapsed)}
-                    className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1"
+                    className={`p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-zinc-300 transition-colors ml-1 ${embedded ? "hidden" : ""}`}
                 >
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
 
-            {!isCollapsed && (
-                <>
+            {!effectivelyCollapsed && (
+                <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
                     {modifySuccess && (
                         <div className="px-4 py-2 border-b border-emerald-500/30 bg-emerald-500/10 text-[11px] font-mono text-emerald-400 flex items-center gap-2">
                             <span>✅</span>
@@ -734,7 +746,10 @@ export default function ReceivedItemsPanel() {
                     ) : pos.length === 0 ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-500">No receipts in the last 30 days — all received POs have been processed</span></div>
                     ) : (
-                        <div className="overflow-y-auto border-t border-zinc-800/60" style={{ height: bodyHeight }}>
+                        <div
+                            className={`overflow-y-auto border-t border-zinc-800/60 ${embedded ? "flex-1 min-h-0" : ""}`}
+                            style={embedded ? undefined : { height: bodyHeight }}
+                        >
                             {todaySummary && (
                                 <div className="px-4 py-3 border-b border-cyan-500/20 bg-cyan-500/5">
                                     <div className="text-[11px] font-mono uppercase tracking-[0.18em] text-cyan-300/80">
@@ -1467,11 +1482,11 @@ export default function ReceivedItemsPanel() {
                         </div>
                     )}
 
-                    {!loading && !error && pos.length > 0 && (
+                    {!embedded && !loading && !error && pos.length > 0 && (
                         <div onMouseDown={startResize}
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
-                </>
+                </div>
             )}
         </div>
     );
