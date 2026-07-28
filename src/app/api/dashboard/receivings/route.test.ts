@@ -26,14 +26,16 @@ describe("dashboard receivings route", () => {
         const response = await GET(new Request("http://localhost/api/dashboard/receivings"));
 
         expect(response.status).toBe(200);
-        expect(getTodaysReceivedPOsMock).toHaveBeenCalledWith("2026-03-30", "2026-04-04");
+        // NOTE(2026-07-28): Product changed from week-to-date to rolling 30d window
+        // (commit that introduced DEFAULT_RECEIVINGS_DAYS). Test updated to match.
+        expect(getTodaysReceivedPOsMock).toHaveBeenCalledWith("2026-03-04", "2026-04-04");
 
         const body = await response.json();
         expect(body).toMatchObject({
             received: [],
-            days: null,
-            range: "week_to_date",
-            startDate: "2026-03-30",
+            days: 30,
+            range: "rolling_30d",
+            startDate: "2026-03-04",
             asOf: "2026-04-03",
         });
     });

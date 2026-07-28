@@ -254,7 +254,7 @@ describe("PO send actions", () => {
             orderDate: "2026-05-01",
         });
 
-        expect(email.subject).toBe("BuildASoil PO # 124790 - Clarke - 5/1/2026");
+        expect(email.subject).toBe("BuildASoil PO #124790 - Clarke - 5/1/2026");
         expect(email.body).toBe([
             "Hi Clarke,",
             "",
@@ -268,7 +268,7 @@ describe("PO send actions", () => {
         ].join("\n"));
     });
 
-    it("uses Finale native PO email so the PDF attachment is included", async () => {
+    it("sends via Gmail primary with self-rendered PDF attachment", async () => {
         const sendId = await storePendingPOSend("PO-1003", makeReview("PO-1003"), "vendor@example.com", "vendor_profiles", {
             channel: "dashboard",
         });
@@ -279,14 +279,13 @@ describe("PO send actions", () => {
         });
 
         expect(result.status).toBe("success");
-        expect(sendPurchaseOrderEmailMock).toHaveBeenCalledWith("PO-1003", expect.objectContaining({
-            toEmail: "vendor@example.com",
-            subject: "BuildASoil PO # PO-1003 - ULINE - 3/26/2026",
-            body: expect.stringContaining("Please see our attached PO."),
+        // Gmail is primary (365d88d); Finale native send is fallback only
+        expect(sendGmailPdfEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+            to: "vendor@example.com",
+            pdfFilename: "BuildASoil-PO-PO-1003.pdf",
         }));
-        expect(gmailSendMock).not.toHaveBeenCalled();
         expect(result.details).toMatchObject({
-            finaleEmailSent: true,
+            finaleEmailSent: false,
             pdfAttached: true,
             emailSkipped: false,
         });
@@ -297,7 +296,7 @@ describe("PO send actions", () => {
         );
     });
 
-    it("falls back to Gmail PDF send when the native PO email action is unavailable", async () => {
+    it("sends via Gmail PDF (primary) even when the native Finale PO email action is unavailable", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValueOnce(new Error("Finale native PO email action was not available"));
         const sendId = await storePendingPOSend("PO-1004", makeReview("PO-1004"), "vendor@example.com", "vendor_profiles", {
             channel: "dashboard",
@@ -316,7 +315,12 @@ describe("PO send actions", () => {
             pdfFilename: "BuildASoil-PO-PO-1004.pdf",
         }));
         expect((result.details as any)?.emailError).toBeUndefined();
-        expect((result.details as any)?.emailVia).toBe("gmail-fallback");
+        // Gmail-with-PDF is the PRIMARY path (po-sender.ts:611 sets emailVia='gmail');
+        // Finale-native is now the FALLBACK. The old 'gmail-fallback' value is only
+        // reachable in the inverted architecture that predates 365d88d, so making the
+        // Finale mock reject no longer forces a fallback at all — Gmail simply succeeds
+        // first. Asserting 'gmail' is asserting the contract that actually exists.
+        expect((result.details as any)?.emailVia).toBe("gmail");
         expect((result.details as any)?.retryable).toBe(false);
     });
 

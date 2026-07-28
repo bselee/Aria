@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ─────────────────────────────────────────────────────────────────────────────
 // Hoisted mocks — created before module vi.mock() is evaluated
 // ─────────────────────────────────────────────────────────────────────────────
-const { createClientMock, dbState, sendCriticalTelegramNotifyMock } = vi.hoisted(
+const { createClientMock, dbState, sendTelegramNotifyMock } = vi.hoisted(
     () => {
         const dbState = {
             data: null as any[] | null,
@@ -38,12 +38,12 @@ const { createClientMock, dbState, sendCriticalTelegramNotifyMock } = vi.hoisted
             };
         });
 
-        const sendCriticalTelegramNotifyMock = vi.fn();
+        const sendTelegramNotifyMock = vi.fn();
 
         return {
             createClientMock,
             dbState,
-            sendCriticalTelegramNotifyMock,
+            sendTelegramNotifyMock,
         };
     },
 );
@@ -56,7 +56,7 @@ vi.mock("../db", () => ({
 }));
 
 vi.mock("./telegram-notify", () => ({
-    sendCriticalTelegramNotify: sendCriticalTelegramNotifyMock,
+    sendTelegramNotify: sendTelegramNotifyMock,
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -443,7 +443,7 @@ describe("runForwardingEscalation", () => {
 
         await runForwardingEscalation();
 
-        expect(sendCriticalTelegramNotifyMock).not.toHaveBeenCalled();
+        expect(sendTelegramNotifyMock).not.toHaveBeenCalled();
         expect(consoleLog).toHaveBeenCalledWith(
             "[forwarding-alert] No stuck AP forwards.",
         );
@@ -471,9 +471,9 @@ describe("runForwardingEscalation", () => {
 
         await runForwardingEscalation();
 
-        expect(sendCriticalTelegramNotifyMock).toHaveBeenCalledOnce();
+        expect(sendTelegramNotifyMock).toHaveBeenCalledOnce();
 
-        const sentText = sendCriticalTelegramNotifyMock.mock.calls[0][0] as string;
+        const sentText = sendTelegramNotifyMock.mock.calls[0][0] as string;
         expect(sentText).toContain("🚨 *AP invoice stuck — never reached Bill.com*");
         expect(sentText).toContain("📩 *acme@acme.com*");
         expect(sentText).toContain("Invoice INV-042");
@@ -494,8 +494,8 @@ describe("runForwardingEscalation", () => {
 
         await runForwardingEscalation();
 
-        expect(sendCriticalTelegramNotifyMock).toHaveBeenCalledOnce();
-        const sentText = sendCriticalTelegramNotifyMock.mock.calls[0][0] as string;
+        expect(sendTelegramNotifyMock).toHaveBeenCalledOnce();
+        const sentText = sendTelegramNotifyMock.mock.calls[0][0] as string;
         expect(sentText).toContain("🚨 *2 AP invoices stuck — never reached Bill.com*");
     });
 
@@ -505,7 +505,7 @@ describe("runForwardingEscalation", () => {
 
         await runForwardingEscalation();
 
-        expect(sendCriticalTelegramNotifyMock).not.toHaveBeenCalled();
+        expect(sendTelegramNotifyMock).not.toHaveBeenCalled();
         expect(consoleLog).toHaveBeenCalledWith(
             "[forwarding-alert] No stuck AP forwards.",
         );

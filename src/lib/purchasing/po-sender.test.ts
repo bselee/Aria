@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // commitAndSendPO verification is now 1 quick round-trip (was 3 × 5s polling).
+// DECISION(2026-06-23, 365d88d): Gmail is now the primary email path; Finale-native
+// send is fallback only. All expectations updated to match Gmail-primary behavior.
 vi.setConfig({ testTimeout: 10000 });
 
 const {
@@ -118,7 +120,7 @@ describe("commitAndSendPO", () => {
         fromMock.mockImplementation((table: string) => makeTableMock(table));
     });
 
-    it("falls back to Gmail PDF when Finale-native email fails", async () => {
+    it("sends via Gmail primary and renders its own PDF", async () => {
         sendPurchaseOrderEmailMock.mockRejectedValue(new Error("Finale native PO email action was not available"));
         const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
             channel: "dashboard",
@@ -127,11 +129,10 @@ describe("commitAndSendPO", () => {
         const result = await commitAndSendPO(sendId, "dashboard", false);
 
         expect(commitDraftPOMock).toHaveBeenCalledWith("124790");
-        expect(sendPurchaseOrderEmailMock).toHaveBeenCalledOnce();
         expect(renderPurchaseOrderPdfMock).toHaveBeenCalledWith(makeReview());
         expect(sendGmailPdfEmailMock).toHaveBeenCalledWith(expect.objectContaining({
             to: "orders@example.com",
-            subject: "BuildASoil PO # 124790 - Colorful Packaging Ltd - 5/6/2026",
+            subject: "BuildASoil PO #124790 - Colorful Packaging Ltd - 5/6/2026",
             pdfFilename: "BuildASoil-PO-124790.pdf",
         }));
         expect(result).toMatchObject({
@@ -140,7 +141,7 @@ describe("commitAndSendPO", () => {
             gmailMessageId: "gmail-po-1",
             emailSent: true,
             finaleEmailSent: false,
-            emailVia: "gmail-fallback",
+            emailVia: "gmail",
             pdfAttached: true,
             emailSkipped: false,
             retryable: false,
@@ -148,13 +149,12 @@ describe("commitAndSendPO", () => {
         expect(result.emailError).toBeUndefined();
         expect(result.verification.issues).toEqual(
             expect.arrayContaining([
-                expect.stringMatching(/Finale native email unavailable/i),
-                expect.stringMatching(/Gmail fallback sent/i),
+                expect.stringMatching(/Gmail sent/i),
             ]),
         );
     });
 
-    it("returns success when Finale native send works", async () => {
+    it("sends via Gmail primary when email delivery works", async () => {
         const sendId = await storePendingPOSend("124790", makeReview(), "orders@example.com", "test", {
             channel: "dashboard",
         });
@@ -164,8 +164,8 @@ describe("commitAndSendPO", () => {
         expect(result).toMatchObject({
             orderId: "124790",
             emailSent: true,
-            finaleEmailSent: true,
-            emailVia: "finale-native",
+            finaleEmailSent: false,
+            emailVia: "gmail",
             pdfAttached: true,
             sentTo: "orders@example.com",
             emailSkipped: false,
@@ -192,14 +192,14 @@ describe("commitAndSendPO", () => {
             po_number: "124790",
             po_sent_at: expect.any(String),
             po_sent_verified_at: expect.any(String),
-            po_sent_verified_source: "finale-native",
+            po_sent_verified_source: "gmail",
             lifecycle_stage: "sent",
         });
         expect(poUpsert?.payload.po_sent_verified_evidence).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({
                     type: "po_send",
-                    detail: expect.stringContaining("finale-native"),
+                    detail: expect.stringContaining("gmail"),
                 }),
             ]),
         );

@@ -154,6 +154,7 @@ describe("loadPoRequirementMap (DB-backed, cached)", () => {
   });
 
   it("refreshes cache after TTL expires", async () => {
+    vi.useFakeTimers();
     // First load
     makeMockDb({
       data: [{ vendor_name: "FedEx", requires_po: false }],

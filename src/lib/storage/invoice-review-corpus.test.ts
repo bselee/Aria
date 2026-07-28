@@ -1,12 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { createClientMock, upsertMock } = vi.hoisted(() => ({
-    createClientMock: vi.fn(),
-    upsertMock: vi.fn(),
-}));
+// upsertInvoiceReviewSample now uses getLocalDb() (SQLite), not Supabase.
+// Commit bd9caa3 (2026-07-01) migrated from Supabase to local SQLite.
+const { getLocalDbMock, dbRunMock } = vi.hoisted(() => {
+    const dbRunMock = vi.fn();
+    const getLocalDbMock = vi.fn(() => ({
+        exec: vi.fn(),
+        prepare: vi.fn(() => ({
+            run: dbRunMock,
+        })),
+    }));
+    return { getLocalDbMock, dbRunMock };
+});
 
-vi.mock("../db", () => ({
-    createClient: createClientMock,
+vi.mock("./local-db", () => ({
+    getLocalDb: getLocalDbMock,
 }));
 
 import {
@@ -17,14 +25,11 @@ import {
 describe("invoice review corpus helpers", () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        upsertMock.mockResolvedValue({ data: { id: "sample-1" }, error: null });
-        createClientMock.mockReturnValue({
-            from: vi.fn(() => ({
-                upsert: upsertMock.mockReturnValue({
-                    select: vi.fn(() => ({
-                        single: vi.fn().mockResolvedValue({ data: { id: "sample-1" }, error: null }),
-                    })),
-                }),
+        dbRunMock.mockReturnValue(undefined);
+        getLocalDbMock.mockReturnValue({
+            exec: vi.fn(),
+            prepare: vi.fn(() => ({
+                run: dbRunMock,
             })),
         });
     });
@@ -85,7 +90,7 @@ describe("invoice review corpus helpers", () => {
         expect(payload.updated_at).toBeTruthy();
     });
 
-    it("writes a review sample to supabase", async () => {
+    it("writes a review sample to local SQLite and returns the vendorInvoiceId", async () => {
         const id = await upsertInvoiceReviewSample({
             vendorInvoiceId: "invoice-row-1",
             reviewStatus: "pending_review",
@@ -95,17 +100,10 @@ describe("invoice review corpus helpers", () => {
             },
         });
 
-        expect(id).toBe("sample-1");
-        expect(createClientMock).toHaveBeenCalledTimes(1);
-        expect(upsertMock).toHaveBeenCalledTimes(1);
-        expect(upsertMock).toHaveBeenCalledWith(
-            expect.objectContaining({
-                vendor_invoice_id: "invoice-row-1",
-                review_status: "pending_review",
-                expected_vendor_name: "Example Vendor",
-                expected_invoice_number: "INV-1",
-            }),
-            { onConflict: "vendor_invoice_id" },
-        );
+        // After migration to SQLite (bd9caa3), the function returns input.vendorInvoiceId directly
+        expect(id).toBe("invoice-row-1");
+        // Called once in ensureTable() and once in upsertInvoiceReviewSample()
+        expect(getLocalDbMock).toHaveBeenCalledTimes(2);
+        expect(dbRunMock).toHaveBeenCalledTimes(1);
     });
 });
