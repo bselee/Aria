@@ -978,7 +978,7 @@ describe("approvePendingReconciliation", () => {
         createClientMock.mockReturnValue(null);
     });
 
-    it("returns success and applied=[] for a no-op auto-approved entry (gate happy path)", async () => {
+    it("returns success and no Finale writes for a no-op auto-approved entry (gate happy path)", async () => {
         // No priceChanges with verdict==='needs_approval' → applyReconciliation
         // has nothing to push to Finale. We only verify the gate flips status
         // and signals success.
@@ -989,10 +989,21 @@ describe("approvePendingReconciliation", () => {
 
         expect(result.success).toBe(true);
         expect(result.errors).toEqual([]);
-        expect(result.applied).toEqual([]);
         expect(result.message).toContain("PO-APP-1");
-        // No price items → Finale price-update was never called.
+        // No price items → Finale price-update was never called. This, not the
+        // contents of `applied`, is the real assertion about the gate's blast radius.
         expect(client.updateOrderItemPrice).not.toHaveBeenCalled();
+
+        // `applied` is NOT empty: the residual-gap check (GAP 2, added in bd9caa3 —
+        // AFTER this test was written in 1a1d4ed) always reports. The fixture is a
+        // $500 invoice with zero applied line items, so a $500 unexplained gap is
+        // the CORRECT diagnostic — asserting applied===[] was asserting the absence
+        // of a feature that now exists. This file was killed at transform time by a
+        // broken orphan tsconfig (fixed in 3beb503), which is why the staleness went
+        // unnoticed for ~7 weeks.
+        expect(result.applied).toHaveLength(1);
+        expect(result.applied[0]).toContain("Residual gap");
+        expect(result.applied[0]).toContain("500.00");
     });
 
     it("applies an approved needs_approval price change to Finale (>1% threshold)", async () => {
