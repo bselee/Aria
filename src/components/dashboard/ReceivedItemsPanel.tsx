@@ -198,18 +198,29 @@ function receiptItemsText(items: Array<{ productId: string; quantity: number }>)
 
 export default function ReceivedItemsPanel() {
     const lifecycle = usePurchasingLifecycle();
-    const [pos, setPos] = useState<ReceivedPO[]>([]);
-    const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
-    const [freightClasses, setFreightClasses] = useState<Record<string, FreightClass>>({});
-    const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
-    const [cachedAt, setCachedAt] = useState<string | null>(null);
-    const [apMap, setApMap] = useState<ApStatusMap>({});
-    const [loading, setLoading] = useState(true);
-    const [refreshing, setRefreshing] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-    const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
-    /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
-    const knownReceiptIdsRef = useRef<Set<string>>(new Set());
+        const [pos, setPos] = useState<ReceivedPO[]>([]);
+        const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
+        const [freightClasses, setFreightClasses] = useState<Record<string, FreightClass>>({});
+        const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
+        const [cachedAt, setCachedAt] = useState<string | null>(null);
+        const [apMap, setApMap] = useState<ApStatusMap>({});
+        const [loading, setLoading] = useState(true);
+        const [refreshing, setRefreshing] = useState(false);
+        const [error, setError] = useState<string | null>(null);
+        const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
+        /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
+        const knownReceiptIdsRef = useRef<Set<string>>(new Set());
+        /** Keep last-painted rows so silent refresh never blanks the panel. */
+        const posRef = useRef<ReceivedPO[]>([]);
+        posRef.current = pos;
+        /**
+         * HERMIA(2026-07-28): lifecycle context value changes on every hover/focus
+         * event (focus is in the useMemo deps). If fetchReceivings closes over
+         * `lifecycle`, its identity churns → the mount effect re-fires →
+         * setLoading(true) → skeleton blank. Hold notifyReceipt in a ref instead.
+         */
+        const notifyReceiptRef = useRef(lifecycle.notifyReceipt);
+        notifyReceiptRef.current = lifecycle.notifyReceipt;
     /** PO modification state: orderId → expanded & diff data */
     const [modifyingPO, setModifyingPO] = useState<Map<string, {
         loading: boolean;
@@ -577,53 +588,58 @@ export default function ReceivedItemsPanel() {
     }, []);
 
     const fetchReceivings = useCallback(async (silent = false) => {
-        silent ? setRefreshing(true) : setLoading(true);
-        setError(null);
-        try {
-            const [receivingsRes, trackingRes] = await Promise.all([
-                fetch('/api/dashboard/receivings'),
-                fetch('/api/dashboard/tracking'),
-            ]);
+            // HERMIA(2026-07-28): Never blank painted rows. Skeleton only on first paint
+            // (no rows yet). Background / interval / post-action reloads use the spinner
+            // flag only — previous POs stay visible until the new payload lands.
+            const hasRows = posRef.current.length > 0;
+            if (silent || hasRows) setRefreshing(true);
+            else setLoading(true);
+            setError(null);
+            try {
+                const [receivingsRes, trackingRes] = await Promise.all([
+                    fetch('/api/dashboard/receivings'),
+                    fetch('/api/dashboard/tracking'),
+                ]);
 
-            if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
-            const data = await receivingsRes.json();
-            if (data.error) throw new Error(data.error);
-            const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+                if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
+                const data = await receivingsRes.json();
+                if (data.error) throw new Error(data.error);
+                const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
 
-            // Notify Ordering when new receipt IDs appear so purchasing cache busts.
-            const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
-            const prev = knownReceiptIdsRef.current;
-            if (prev.size > 0) {
-                const fresh = nextIds.filter((id: string) => !prev.has(id));
-                if (fresh.length > 0) {
-                    lifecycle.notifyReceipt(fresh);
+                // Notify Ordering when new receipt IDs appear so purchasing cache busts.
+                const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
+                const prev = knownReceiptIdsRef.current;
+                if (prev.size > 0) {
+                    const fresh = nextIds.filter((id: string) => !prev.has(id));
+                    if (fresh.length > 0) {
+                        notifyReceiptRef.current(fresh);
+                    }
                 }
-            }
-            knownReceiptIdsRef.current = new Set(nextIds);
-            setPos(sorted);
-            setMatchSuggestions(data.matchSuggestions || []);
-            setRecentAutoCompletions(data.recentAutoCompletions || []);
-            setFreightClasses(data.freightClasses || {});
+                knownReceiptIdsRef.current = new Set(nextIds);
+                setPos(sorted);
+                setMatchSuggestions(data.matchSuggestions || []);
+                setRecentAutoCompletions(data.recentAutoCompletions || []);
+                setFreightClasses(data.freightClasses || {});
 
-            if (trackingRes.ok) {
-                const trackingData = await trackingRes.json();
-                setTodaySummary(trackingData.todaySummary || null);
-            } else {
-                setTodaySummary(null);
+                if (trackingRes.ok) {
+                    const trackingData = await trackingRes.json();
+                    setTodaySummary(trackingData.todaySummary || null);
+                } else {
+                    setTodaySummary(null);
+                }
+            } catch (e: any) {
+                setError(e.message);
+            } finally {
+                setLoading(false);
+                setRefreshing(false);
             }
-        } catch (e: any) {
-            setError(e.message);
-        } finally {
-            setLoading(false);
-            setRefreshing(false);
-        }
-    }, [lifecycle]);
+        }, []);
 
-    useEffect(() => {
-        fetchReceivings();
-        const t = setInterval(() => fetchReceivings(true), 10 * 60 * 1000);
-        return () => clearInterval(t);
-    }, [fetchReceivings]);
+        useEffect(() => {
+            fetchReceivings();
+            const t = setInterval(() => fetchReceivings(true), 10 * 60 * 1000);
+            return () => clearInterval(t);
+        }, [fetchReceivings]);
 
     return (
         <div className="border-b border-zinc-800 shrink-0" ref={containerRef}>

@@ -703,75 +703,86 @@ export default function PurchasingPanel() {
     }
 
     // ── data load ──────────────────────────────────────────────────────────
-    // Single fetch — all tiers, sorted by need server-side then again client-side.
-    // SWR keeps this fast (warm cache returns in <100ms).
-    async function load(bust = false) {
-        setError(null);
-        if (!data) setLoading(true);
-        else if (bust) setScanning(true);
+        // Single fetch — all tiers, sorted by need server-side then again client-side.
+        // SWR keeps this fast (warm cache returns in <100ms).
+        async function load(bust = false) {
+            setError(null);
+            // Cold only: first paint with no data. Warm/SWR refreshes never flip
+            // the full-panel loading gate (that was locking the Re-scan button and
+            // making the green badge look like a stuck state).
+            if (!data) setLoading(true);
+            else if (bust) setScanning(true);
 
-        setLoadingTiers(new Set(['critical', 'warning', 'watch', 'ok']));
-        try {
-            const res = await fetch(`/api/dashboard/purchasing?mode=all${bust ? '&bust=1' : ''}`);
-            const json: AssessmentData = await res.json();
-            if (!res.ok) throw new Error(json.error || `Failed to load ordering`);
+            setLoadingTiers(new Set(['critical', 'warning', 'watch', 'ok']));
+            try {
+                const res = await fetch(`/api/dashboard/purchasing?mode=all${bust ? '&bust=1' : ''}`);
+                const json: AssessmentData = await res.json();
+                if (!res.ok) throw new Error(json.error || `Failed to load ordering`);
 
-            if (json.refreshing) setScanning(true);
-            else setScanning(false);
+                // HERMIA(2026-07-28): Server `refreshing` means SWR is revalidating in
+                                // the background (can run 12–15 min). Only spin while the list is
+                                // still empty (cold path). Warm cache — even with a background
+                                // refresh or after user Re-scan — keeps data painted and the
+                                // green badge off. (Old code set scanning on every refreshing
+                                // response + polled every 15s → perpetual spinner.)
+                                const hasGroups = (json.groups?.length ?? 0) > 0;
+                                setScanning(Boolean(json.refreshing && !hasGroups));
 
-            setData(json);
-            setLoading(false);
+                                setData(json);
+                                setLoading(false);
 
-            // Init checkboxes/qtys for new groups
-            setChecked(prev => {
-                const next: Record<string, Record<string, boolean>> = { ...prev };
-                for (const g of json.groups) {
-                    if (next[g.vendorPartyId]) continue;
-                    next[g.vendorPartyId] = {};
-                    for (const item of g.items) {
-                        next[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
+                // Init checkboxes/qtys for new groups
+                setChecked(prev => {
+                    const next: Record<string, Record<string, boolean>> = { ...prev };
+                    for (const g of json.groups) {
+                        if (next[g.vendorPartyId]) continue;
+                        next[g.vendorPartyId] = {};
+                        for (const item of g.items) {
+                            next[g.vendorPartyId][item.productId] = shouldAutoSelectItem(item);
+                        }
                     }
-                }
-                return next;
-            });
-            setQtys(prev => {
-                const next: Record<string, Record<string, number>> = { ...prev };
-                for (const g of json.groups) {
-                    if (next[g.vendorPartyId]) continue;
-                    next[g.vendorPartyId] = {};
-                    for (const item of g.items) {
-                        next[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
+                    return next;
+                });
+                setQtys(prev => {
+                    const next: Record<string, Record<string, number>> = { ...prev };
+                    for (const g of json.groups) {
+                        if (next[g.vendorPartyId]) continue;
+                        next[g.vendorPartyId] = {};
+                        for (const item of g.items) {
+                            next[g.vendorPartyId][item.productId] = item.assessment?.recommendedQty ?? item.suggestedQty;
+                        }
                     }
-                }
-                return next;
-            });
-        } catch (e: any) {
-            setError(e.message);
-        } finally {
-            setLoadingTiers(new Set());
+                    return next;
+                });
+            } catch (e: any) {
+                setError(e.message);
+            } finally {
+                setLoadingTiers(new Set());
+            }
         }
-    }
 
-    useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+        useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
-    // RCV receipt event → bust ordering cache so need drops same day
-    const prevReceiptAtRef = useRef<number>(0);
-    useEffect(() => {
-        const r = lifecycle.lastReceipt;
-        if (!r || r.at === prevReceiptAtRef.current) return;
-        prevReceiptAtRef.current = r.at;
-        load(true);
-        /* eslint-disable-next-line react-hooks/exhaustive-deps */
-    }, [lifecycle.lastReceipt]);
+        // RCV receipt event → bust ordering cache so need drops same day
+        const prevReceiptAtRef = useRef<number>(0);
+        useEffect(() => {
+            const r = lifecycle.lastReceipt;
+            if (!r || r.at === prevReceiptAtRef.current) return;
+            prevReceiptAtRef.current = r.at;
+            load(true);
+            /* eslint-disable-next-line react-hooks/exhaustive-deps */
+        }, [lifecycle.lastReceipt]);
 
-    // Auto-poll while the server reports a background scan in flight. Stops
-    // as soon as `refreshing` flips false (cache is warm).
-    useEffect(() => {
-        if (!data?.refreshing) return;
-        const t = setTimeout(() => { load(); }, 15_000);
-        return () => clearTimeout(t);
-        /* eslint-disable-next-line react-hooks/exhaustive-deps */
-    }, [data?.refreshing, data?.cachedAt]);
+        // Auto-poll ONLY while cold (empty list + server still refreshing).
+        // Warm SWR revalidation no longer triggers a 15s poll loop — that was the
+        // perpetual green "Refreshing…" badge (scan lasts 12–15 min every TTL miss).
+        useEffect(() => {
+            if (!data?.refreshing) return;
+            if ((data.groups?.length ?? 0) > 0) return;
+            const t = setTimeout(() => { load(); }, 15_000);
+            return () => clearTimeout(t);
+            /* eslint-disable-next-line react-hooks/exhaustive-deps */
+        }, [data?.refreshing, data?.cachedAt, data?.groups?.length]);
 
     // Register BOM relationships for Option C highlighting
     useEffect(() => {
