@@ -1332,3 +1332,41 @@ defineJob({
     budget: { durationMs: 120_000 },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DB Retention: Reclaim disk from email_inbox_queue and cron_runs nightly.
+// Runs at 3:00 AM MT (low-activity window). VACUUM FULL on a local dev DB
+// completes in < 1 second; on production replica it needs a maintenance window.
+// The script is idempotent — safe to run repeatedly.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "db-retention-prune",
+    schedule: "0 3 * * *",
+    onFail: "log",
+    description: "VACUUM FULL email_inbox_queue and cron_runs, prune old runs (nightly).",
+    handler: async () => {
+        const { execFileSync } = await import("child_process");
+        console.log("[db-retention-prune] Starting nightly retention prune ...");
+        // The script requires DATABASE_URL (no credential is baked into it).
+        // start-bot.ts loads .env.local via dotenv before the cron runner boots,
+        // so process.env is already hydrated and inherited by the child.
+        if (!process.env.DATABASE_URL) {
+            throw new Error("db-retention-prune: DATABASE_URL is not set — refusing to run prune-retention.js");
+        }
+        try {
+            const stdout = execFileSync(
+                process.execPath,
+                [`${process.cwd()}/scripts/prune-retention.js`],
+                { encoding: "utf8", timeout: 120_000, env: process.env },
+            );
+            console.log(stdout);
+            console.log("[db-retention-prune] Complete.");
+        } catch (err: any) {
+            console.error(`[db-retention-prune] Failed: ${err?.message ?? err}`);
+            if (err?.stdout) console.error(err.stdout);
+            if (err?.stderr) console.error(err.stderr);
+            throw err;
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
+
