@@ -144,3 +144,40 @@ backup/
 data/pg-health.log
 # Live bot state, changes every watch tick
 data/scans-watcher-state.json
+
+# ─── Local-only operational artifacts (2026-07-28 triage) ────────
+# PID sentinel written by src/lib/persistence/pid-guard.ts at every boot.
+logs/*.pid
+# Daily SQLite/PG backup dirs + ad-hoc pre-change file backups. Multi-GB.
+backups/
+.backups/
+*.bak
+# Vendored postgrest.exe + libpq DLLs — a 79 MB third-party binary drop.
+bin/
+# Generated purchasing/label report deliverables — regenerated on demand.
+reports/
+# Stray empty SQLite file; the real sidecar is aria-local.db (already ignored).
+local.db
+# Locally archived invoice/statement PDFs pulled from Gmail/Drive. Business
+# documents, not source. NOTE: one statement under
+# local/storage/statement_artifacts/FedEx/2026-07-15/ is already tracked from
+# before this rule and stays tracked — git ignores only untracked paths.
+local/storage/INVOICE/
+local/storage/ap_invoices/
+local/storage/statement_artifacts/
+# Label/credit-app PDFs and audit renders dropped in by the desktop UI.
+.hermes/desktop-attachments/*.pdf
+.hermes/desktop-attachments/*.png
+# Split-commit scratch dir
+.tmp-split/
+# One-off SKU/stock probe scripts from ad-hoc investigations. Kept on disk for
+# the author's convenience but deliberately untracked: they hardcode local paths
+# (e.g. C:\Users\...\Downloads\MyOrderHistory.csv) and duplicate the durable
+# probes already tracked under src/cli/ (check-uls455.ts, check-demand.ts, ...).
+# Promote one by `git add -f` if it ever earns a permanent home.
+_check_*.ts
+src/cli/check-S4551.ts
+src/cli/check-S4551-detail.ts
+src/cli/check-ULS455-stock.ts
+src/cli/forecast-ULS455-S12610.ts
+src/cli/surepack-all-range.ts
