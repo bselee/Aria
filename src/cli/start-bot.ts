@@ -379,6 +379,19 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 // ===========================================================================
 
 (async () => {
+    // ── KAIZEN(2026-07-27): Zombie-process reaper ─────────────────────────
+    // Must run before ANYTHING else in boot — before startCronRunner() in
+    // particular. Kills any prior generation's orphaned process (PM2 lost
+    // track of it after a SIGTERM that didn't fully land) so it can't keep
+    // running a duplicate cron scheduler alongside this one. See
+    // src/lib/persistence/pid-guard.ts for the full incident writeup.
+    try {
+        const { reapStaleInstanceAndClaimPid } = await import('../lib/persistence/pid-guard');
+        reapStaleInstanceAndClaimPid();
+    } catch (err: any) {
+        console.warn('[boot] pid-guard failed to run (non-fatal):', err.message);
+    }
+
     try {
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
         console.log('🔄 Cleared previous Telegram session');
@@ -713,6 +726,17 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
                     console.log('[shutdown-guard] BrowserBase sessions closed');
                 } catch {
                     // BrowserbaseManager may not be imported yet — that's fine
+                }
+            },
+            async () => {
+                // KAIZEN(2026-07-27): release the PID sentinel on a clean exit so
+                // the next boot has nothing to reap. Defense (B) against the
+                // reaper-induced restart loop — see lib/persistence/pid-guard.ts.
+                try {
+                    const { releaseSentinel } = await import('../lib/persistence/pid-guard');
+                    releaseSentinel();
+                } catch {
+                    // pid-guard may not have loaded — non-fatal
                 }
             },
         ],

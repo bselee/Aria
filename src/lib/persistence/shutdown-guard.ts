@@ -231,6 +231,30 @@ export function installShutdownGuard(
   const { timeoutSeconds = 8, cleanupHooks = [] } = options;
   let shuttingDown = false;
 
+  /**
+   * KAIZEN(2026-07-27): Hard-deadline wrapper around the async shutdown work.
+   *
+   * ROOT CAUSE FIXED: PM2 restarts (every ~6h via AriaPm2DailyHealth task +
+   * watchdog.ps1) send SIGTERM. If persistChatHistorySnapshot() or a cleanup
+   * hook ever hung (SQLite lock contention, a stuck network call in a hook),
+   * handleShutdown() never resolved, process.exit(0) never fired, and PM2
+   * had already spawned the replacement process. The result: the old
+   * process becomes an invisible orphan that PM2 no longer tracks but which
+   * keeps running its own live node-cron scheduler forever.
+   *
+   * Confirmed in production 2026-07-27: 16 orphaned aria-bot processes
+   * accumulated since 2026-07-22 (one per ~6h restart cycle), each firing
+   * the Monday Briefing cron independently at 8:00 AM — 11 duplicate emails
+   * landed in one minute. `pm2 list` showed a single healthy process the
+   * entire time; the zombies were only visible via
+   * `Get-CimInstance Win32_Process -Filter "Name='node.exe'"`.
+   *
+   * FIX: race the real shutdown work against a hard timeout. Whichever
+   * finishes first wins — we always call process.exit(0) within
+   * timeoutSeconds of receiving the signal, guaranteed. Losing the chat
+   * history snapshot on a rare hang is an acceptable tradeoff against
+   * leaking a process that duplicates every single cron job forever.
+   */
   async function handleShutdown(signal: string): Promise<void> {
     if (shuttingDown) {
       console.log(`[shutdown-guard] Already shutting down — ignoring duplicate ${signal}`);
@@ -240,17 +264,29 @@ export function installShutdownGuard(
 
     console.log(`[shutdown-guard] ${signal} received — persisting state before exit...`);
 
-    // Run cleanup hooks (BrowserBase sessions, etc.)
-    if (cleanupHooks.length > 0) {
-      await Promise.allSettled(
-        cleanupHooks.map(fn => fn().catch((err: unknown) => {
-          console.warn('[shutdown-guard] Cleanup hook failed:', err instanceof Error ? err.message : String(err));
-        })),
-      );
-    }
+    const work = (async () => {
+      // Run cleanup hooks (BrowserBase sessions, etc.)
+      if (cleanupHooks.length > 0) {
+        await Promise.allSettled(
+          cleanupHooks.map(fn => fn().catch((err: unknown) => {
+            console.warn('[shutdown-guard] Cleanup hook failed:', err instanceof Error ? err.message : String(err));
+          })),
+        );
+      }
 
-    // Persist chat history — this is the primary purpose
-    await persistChatHistorySnapshot(chatHistory, chatLastActive);
+      // Persist chat history — this is the primary purpose
+      await persistChatHistorySnapshot(chatHistory, chatLastActive);
+    })();
+
+    const deadlineMs = Math.max(1000, timeoutSeconds * 1000 - 500); // leave 500ms margin for the exit() call itself
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        console.warn(`[shutdown-guard] Hit ${deadlineMs}ms hard deadline — forcing exit without waiting for pending work`);
+        resolve();
+      }, deadlineMs);
+    });
+
+    await Promise.race([work, timeout]);
 
     console.log(`[shutdown-guard] Shutdown complete (${signal})`);
   }
