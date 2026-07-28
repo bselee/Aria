@@ -38,8 +38,7 @@ vi.mock("@/lib/db", () => ({
     }),
 }));
 
-// invoice-po-matcher imports Finale + reconciler; mock so vite never loads
-// the broken tracking/tsconfig chain under src/lib/finale.
+// invoice-po-matcher imports Finale + reconciler; mock to prevent live I/O
 vi.mock("@/lib/finale/client", () => ({ FinaleClient: class {} }));
 vi.mock("@/lib/finale/reconciler", () => ({
     reconcileInvoiceToPO: vi.fn(),
@@ -56,7 +55,7 @@ vi.mock("@/lib/purchasing/vendor-name-normalize", () => ({
 }));
 
 // Mock finale modules to prevent transitive loading of tracking modules
-// with broken tsconfig references.
+// with live I/O side effects.
 vi.mock("@/lib/finale/client", () => ({ FinaleClient: vi.fn() }));
 vi.mock("@/lib/finale/reconciler", () => ({
     reconcileInvoiceToPO: vi.fn(),
