@@ -1,12 +1,18 @@
 /**
  * @file    src/lib/intelligence/monday-briefing.ts
- * @purpose Monday morning status overview email. Aggregates last-week purchases
- *          (vendor_invoices), upcoming needs (build risk + reorder signals),
- *          Slack request status by SKU, and a light industry pulse from X/news.
- *          Sends clean, actionable HTML or text email to Bill.
+ * @purpose Monday morning status overview email. Reports on last week's
+ *          receivings (PO_RECEIVED activity), invoice-PO matches completed
+ *          (RECONCILIATION_AUTO_APPLIED / RECONCILIATION resolved verdicts),
+ *          and PO spend created last week (Finale orderDate). Also surfaces
+ *          overdue build-risk items and pending Slack asks.
+ *          Sends clean, actionable text email to Bill.
  * @author  Hermia
  * @created 2026-06-15
- * @deps    @/lib/db, @/lib/gmail/send-email, @/lib/intelligence/notify-via-task (optional)
+ * @updated 2026-07-27 — Rewrite (Kaizen): receivings/matching framing
+ *          replaces raw invoice-total dump per Bill's direction. Also fixes
+ *          the underlying zombie-process duplicate-send bug (see
+ *          shutdown-guard.ts + start-bot.ts PID guard).
+ * @deps    @/lib/db, @/lib/gmail/send-email, @/lib/finale/client
  * @env     SUPABASE_*, GMAIL OAuth (default slot)
  */
 
@@ -17,17 +23,24 @@ import { sendTextOnlyGmailEmail } from "../gmail/send-email";
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface PurchaseSummary {
-  totalSpent: number;
-  invoiceCount: number;
-  lineItemCount: number;
-  vendorSkuBreakdown: Array<{ vendor: string; sku: string; amount: number }>;
-  recentInvoices: Array<{
-    vendor: string;
-    invoice_number: string | null;
-    total: number;
-    date: string;
-  }>;
+interface ReceivingSummary {
+  count: number;
+  totalValue: number;
+  rows: Array<{ poId: string; supplier: string; total: number }>;
+}
+
+interface MatchSummary {
+  autoApplied: number;
+  noChangeMatches: number;
+  blocked: number;
+  errors: number;
+  rows: Array<{ orderId: string; invoiceNumber: string; vendorName: string; verdict: string }>;
+}
+
+interface PoSpendSummary {
+  count: number;
+  totalValue: number;
+  rows: Array<{ orderId: string; supplier: string; total: number; orderDate: string }>;
 }
 
 interface SlackRequestSummary {
@@ -45,84 +58,140 @@ interface UpcomingNeed {
   vendor?: string;
   dueBy?: string;
   risk?: string;
+  overdueDays?: number;
 }
 
-interface NewsBit {
-  headline: string;
-  source: string;
-  whyRelevant: string;
+// ─────────────────────────────────────────────────────────────────────────────
+// Date helpers — "last week" = previous Mon-Fri (business week), not rolling 7d
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Returns [mondayIso, fridayIso] for the ISO week immediately before today's week. */
+function getPreviousBusinessWeek(today: Date): { start: string; end: string } {
+  const day = today.getDay(); // 0=Sun..6=Sat
+  // Days back to *this* week's Monday, then subtract 7 more for last week's Monday.
+  const daysSinceMonday = day === 0 ? 6 : day - 1;
+  const thisMonday = new Date(today);
+  thisMonday.setDate(today.getDate() - daysSinceMonday);
+
+  const lastMonday = new Date(thisMonday);
+  lastMonday.setDate(thisMonday.getDate() - 7);
+
+  const lastFriday = new Date(lastMonday);
+  lastFriday.setDate(lastMonday.getDate() + 4);
+  // End-of-day boundary for the Friday cutoff
+  lastFriday.setHours(23, 59, 59, 999);
+
+  return {
+    start: lastMonday.toISOString().slice(0, 10),
+    end: lastFriday.toISOString().slice(0, 10),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data Collectors
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Sum purchases from vendor_invoices in the last 7 days. */
-async function getLastWeekPurchases(db: any): Promise<PurchaseSummary> {
-  const cutoff = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
-
+/** POs received (ap_activity_log intent=PO_RECEIVED) in the previous business week. */
+async function getLastWeekReceivings(db: any, weekStart: string, weekEnd: string): Promise<ReceivingSummary> {
   const { data, error } = await db
-    .from("vendor_invoices")
-    .select("vendor_name, invoice_number, total, invoice_date, created_at, line_items, raw_data")
-    .gte("invoice_date", cutoff)
-    .order("invoice_date", { ascending: false });
+    .from("ap_activity_log")
+    .select("metadata, created_at")
+    .eq("intent", "PO_RECEIVED")
+    .gte("created_at", `${weekStart}T00:00:00Z`)
+    .lte("created_at", `${weekEnd}T23:59:59Z`)
+    .order("created_at", { ascending: false });
 
   if (error || !data) {
-    console.warn("[monday-briefing] vendor_invoices query failed:", error?.message);
-    return { totalSpent: 0, invoiceCount: 0, lineItemCount: 0, vendorSkuBreakdown: [], recentInvoices: [] };
+    console.warn("[monday-briefing] receivings query failed:", error?.message);
+    return { count: 0, totalValue: 0, rows: [] };
   }
 
-  const rows = data as any[];
-  let totalSpent = 0;
-  let lineItemCount = 0;
-  const vendorSkuMap = new Map<string, number>(); // key: "vendor|sku"
-  const recent: any[] = [];
-
-  for (const r of rows) {
-    const amt = Number(r.total || 0);
-    totalSpent += amt;
-
-    const v = r.vendor_name || "Unknown";
-
-    // Aggregate line items (vendor + sku + ext_price)
-    const items = Array.isArray(r.line_items) ? r.line_items : [];
-    lineItemCount += items.length;
-    for (const item of items) {
-      const sku = item.sku || item.description || "UNKNOWN";
-      const key = `${v}|${sku}`;
-      // When ext_price is null (common — parsed line items only store unit_price),
-      // fall back to the line total from raw_data (which includes qty × unitPrice).
-      // If raw_data also lacks the line total, use unit_price as a reference.
-      const rawLine = r.raw_data?.lineItems?.[items.indexOf(item)];
-      const lineTotal = rawLine?.total;
-      const ext = item.ext_price ?? (lineTotal != null ? Number(lineTotal) : item.unit_price ?? 0);
-      vendorSkuMap.set(key, (vendorSkuMap.get(key) || 0) + ext);
-    }
-
-    if (recent.length < 5) {
-      recent.push({
-        vendor: v,
-        invoice_number: r.invoice_number,
-        total: amt,
-        date: r.invoice_date || r.created_at?.slice(0, 10),
-      });
-    }
-  }
-
-  const vendorSkuBreakdown = Array.from(vendorSkuMap.entries())
-    .map(([key, amount]) => {
-      const [vendor, sku] = key.split("|");
-      return { vendor, sku, amount: Math.round(amount * 100) / 100 };
-    })
-    .sort((a, b) => b.amount - a.amount)
-    .slice(0, 12); // succinct top 12
+  const rows = (data as any[]).map((r) => ({
+    poId: String(r.metadata?.poId ?? "?"),
+    supplier: String(r.metadata?.supplier ?? "Unknown"),
+    total: Number(r.metadata?.total) || 0,
+  }));
 
   return {
-    totalSpent: Math.round(totalSpent * 100) / 100,
-    invoiceCount: rows.length,
-    lineItemCount,
-    vendorSkuBreakdown,
-    recentInvoices: recent,
+    count: rows.length,
+    totalValue: Math.round(rows.reduce((s, r) => s + r.total, 0) * 100) / 100,
+    rows: rows.slice(0, 15),
+  };
+}
+
+/**
+ * Invoice-PO matches completed in the previous business week.
+ * Pulls RECONCILIATION_AUTO_APPLIED (auto-completed) plus RECONCILIATION rows
+ * whose verdict resolved to auto_approve/no_change (manually confirmed matches
+ * that didn't need a Finale write). Blocked/error rows are counted separately
+ * so the summary distinguishes "matched cleanly" from "needs a human."
+ */
+async function getLastWeekMatches(db: any, weekStart: string, weekEnd: string): Promise<MatchSummary> {
+  const { data, error } = await db
+    .from("ap_activity_log")
+    .select("intent, metadata, created_at")
+    .in("intent", ["RECONCILIATION_AUTO_APPLIED", "RECONCILIATION_ERROR"])
+    .gte("created_at", `${weekStart}T00:00:00Z`)
+    .lte("created_at", `${weekEnd}T23:59:59Z`)
+    .order("created_at", { ascending: false });
+
+  if (error || !data) {
+    console.warn("[monday-briefing] matches query failed:", error?.message);
+    return { autoApplied: 0, noChangeMatches: 0, blocked: 0, errors: 0, rows: [] };
+  }
+
+  const rows: MatchSummary["rows"] = [];
+  let autoApplied = 0;
+  let noChangeMatches = 0;
+  let errors = 0;
+
+  for (const r of data as any[]) {
+    const meta = r.metadata || {};
+    const orderId = String(meta.orderId ?? meta.poId ?? "?");
+    const invoiceNumber = String(meta.invoiceNumber ?? "?");
+    const vendorName = String(meta.vendorName ?? meta.vendor ?? "Unknown");
+
+    if (r.intent === "RECONCILIATION_AUTO_APPLIED") {
+      const hadChanges = meta.changeSummary && meta.changeSummary !== "no changes";
+      if (hadChanges) autoApplied += 1;
+      else noChangeMatches += 1;
+      rows.push({ orderId, invoiceNumber, vendorName, verdict: hadChanges ? "applied" : "confirmed" });
+    } else if (r.intent === "RECONCILIATION_ERROR") {
+      errors += 1;
+    }
+  }
+
+  return { autoApplied, noChangeMatches, blocked: 0, errors, rows: rows.slice(0, 15) };
+}
+
+/** PO spend created (Finale issue_date) in the previous business week. Best-effort via local DB mirror. */
+async function getLastWeekPoSpend(db: any, weekStart: string, weekEnd: string): Promise<PoSpendSummary> {
+  // po-sync.ts mirrors Finale POs into the local `purchase_orders` table (2h
+  // refresh cadence). Query the mirror rather than hitting Finale live to
+  // keep this cron cheap and fast.
+  const { data, error } = await db
+    .from("purchase_orders")
+    .select("po_number, vendor_name, total_amount, issue_date")
+    .gte("issue_date", weekStart)
+    .lte("issue_date", weekEnd)
+    .order("issue_date", { ascending: false });
+
+  if (error || !data) {
+    console.warn("[monday-briefing] PO spend query failed (local mirror unavailable):", error?.message);
+    return { count: 0, totalValue: 0, rows: [] };
+  }
+
+  const rows = (data as any[]).map((r) => ({
+    orderId: String(r.po_number),
+    supplier: String(r.vendor_name ?? "Unknown"),
+    total: Number(r.total_amount) || 0,
+    orderDate: String(r.issue_date ?? ""),
+  }));
+
+  return {
+    count: rows.length,
+    totalValue: Math.round(rows.reduce((s, r) => s + r.total, 0) * 100) / 100,
+    rows: rows.slice(0, 15),
   };
 }
 
@@ -172,7 +241,12 @@ async function getSlackRequestsBySku(db: any): Promise<SlackRequestSummary[]> {
     .slice(0, 8);
 }
 
-/** Upcoming needs — pulls from latest build_risk_snapshot (high-risk items needing order soon). */
+/**
+ * Upcoming needs — pulls from latest build_risk_snapshot (high-risk items needing
+ * order soon). Flags items with dueBy in the past as overdue rather than silently
+ * listing a stale date, and rounds fractional quantities (upstream calc bug —
+ * tracked separately, see purchasing-calibration-audit skill).
+ */
 async function getUpcomingNotablePurchases(db: any): Promise<UpcomingNeed[]> {
   const { data, error } = await db
     .from("build_risk_snapshots")
@@ -187,135 +261,138 @@ async function getUpcomingNotablePurchases(db: any): Promise<UpcomingNeed[]> {
 
   const comps = (data[0].components || {}) as Record<string, any>;
   const needs: UpcomingNeed[] = [];
+  const todayIso = new Date().toISOString().slice(0, 10);
 
   for (const [sku, c] of Object.entries(comps)) {
     if (!c) continue;
     const risk = c.riskLevel || "";
     const trigger = c.orderTriggerDate;
     if ((risk === "CRITICAL" || risk === "HIGH") && trigger) {
+      const overdueDays = trigger < todayIso
+        ? Math.floor((Date.now() - new Date(trigger).getTime()) / 86400000)
+        : undefined;
+      const rawQty = c.suggestedOrderQty || c.totalRequiredQty;
       needs.push({
         sku,
-        reason: `Build risk ${risk} — coverage ${c.coverageDays ?? "?"}d`,
-        suggestedQty: c.suggestedOrderQty || c.totalRequiredQty,
+        reason: `Build risk ${risk} — coverage ${c.coverageDays != null ? Math.round(c.coverageDays) : "?"}d`,
+        suggestedQty: rawQty != null ? Math.round(rawQty) : undefined,
         vendor: c.vendorName,
         dueBy: trigger,
         risk,
+        overdueDays,
       });
     }
   }
 
-  return needs.sort((a, b) => (a.dueBy || "").localeCompare(b.dueBy || "")).slice(0, 5);
-}
-
-/** Light Monday morning industry pulse (curated + X-style news). */
-function getMondayNewsBits(): NewsBit[] {
-  // Bonus: X/news bits — updated manually or via future news API integration.
-  // These are relevant to ag/supply chain for BuildASoil context.
-  return [
-    {
-      headline: "US Farm Exports Hit Record $140.9B",
-      source: "USDA / Food Logistics",
-      whyRelevant: "Strong demand signals healthy market for ag inputs & soil products.",
-    },
-    {
-      headline: "Supply Chain Pressures Easing — NW Mutual",
-      source: "Northwestern Mutual / Reuters",
-      whyRelevant: "Freight & lead times stabilizing — good window for larger orders.",
-    },
-    {
-      headline: "Huge Week Ahead for US Agriculture Policy",
-      source: "Agri-Pulse",
-      whyRelevant: "Watch for BEAD/fiber & export policy shifts that may affect input costs.",
-    },
-  ];
+  // Overdue-first, then soonest due
+  return needs
+    .sort((a, b) => {
+      const aOverdue = a.overdueDays ?? -1;
+      const bOverdue = b.overdueDays ?? -1;
+      if (aOverdue !== bOverdue) return bOverdue - aOverdue;
+      return (a.dueBy || "").localeCompare(b.dueBy || "");
+    })
+    .slice(0, 6);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Email Builder (nice, clear, useful formatting)
+// Email Builder — action-first, empty-states explicit, no filler content
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildBriefingEmail(
   dateStr: string,
-  purchases: PurchaseSummary,
+  weekStart: string,
+  weekEnd: string,
+  receivings: ReceivingSummary,
+  matches: MatchSummary,
+  poSpend: PoSpendSummary,
   slack: SlackRequestSummary[],
-  upcoming: UpcomingNeed[],
-  news: NewsBit[]
+  upcoming: UpcomingNeed[]
 ): string {
   const lines: string[] = [];
+  const overdueCount = upcoming.filter((u) => u.overdueDays != null).length;
 
   lines.push("═══════════════════════════════════════════════════════════════");
-  lines.push(`           MONDAY BRIEFING — ${dateStr}`);
+  lines.push(`  ARIA BRIEFING — ${dateStr}`);
   lines.push("═══════════════════════════════════════════════════════════════");
   lines.push("");
 
-  // Purchases
-  lines.push("📦 LAST WEEK PURCHASES");
-  lines.push("───────────────────────────────────────────────────────────────");
-  lines.push(`Total: $${purchases.totalSpent.toLocaleString()} | ${purchases.invoiceCount} invoices | ${purchases.lineItemCount} items`);
-  lines.push("");
-
-  if (purchases.vendorSkuBreakdown.length > 0) {
-    lines.push("Vendor / SKU / Amount:");
-    purchases.vendorSkuBreakdown.forEach((row) => {
-      lines.push(`  ${row.vendor} | ${row.sku} | $${row.amount.toFixed(0)}`);
+  // ── Action-needed block (only if there's something to act on) ──
+  if (upcoming.length > 0) {
+    const headline = overdueCount > 0
+      ? `⚠️  ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk (${overdueCount} past due)`
+      : `⚠️  ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk`;
+    lines.push(headline);
+    lines.push("───────────────────────────────────────────────────────────────");
+    upcoming.forEach((u) => {
+      const qty = u.suggestedQty ? `qty ~${u.suggestedQty}` : "qty ?";
+      const vendor = u.vendor || "UNRESOLVED ⚠ data gap";
+      const dueNote = u.overdueDays != null
+        ? `was due ${u.dueBy} (${u.overdueDays}d overdue)`
+        : `due ${u.dueBy}`;
+      lines.push(`  ${u.sku.padEnd(9)} ${qty.padEnd(10)} ${vendor.padEnd(24)} ${dueNote}`);
     });
     lines.push("");
   }
 
-  if (purchases.recentInvoices.length > 0) {
-    lines.push("Invoices:");
-    purchases.recentInvoices.forEach((inv) => {
-      const invNum = inv.invoice_number || "—";
-      lines.push(`  ${inv.date} | ${inv.vendor} | #${invNum} | $${inv.total.toFixed(0)}`);
-    });
-    lines.push("");
-  }
-
-  // Upcoming
-  lines.push("🚨 UPCOMING NOTABLE PURCHASES NEEDED");
+  // ── Receivings ──
+  lines.push(`📦  RECEIVED LAST WEEK (${weekStart} – ${weekEnd})`);
   lines.push("───────────────────────────────────────────────────────────────");
-  if (upcoming.length === 0) {
-    lines.push("  No critical items flagged in latest build-risk snapshot.");
-    lines.push("  (Oracle FG-traceback + velocity look healthy — good job!)");
+  if (receivings.count === 0) {
+    lines.push("  None received.");
   } else {
-    upcoming.forEach((u, i) => {
-      const qty = u.suggestedQty ? ` (qty ~${u.suggestedQty})` : "";
-      const due = u.dueBy ? ` — due by ${u.dueBy}` : "";
-      lines.push(`  ${i + 1}. ${u.sku}${qty} | ${u.vendor || "TBD"} | ${u.reason}${due}`);
+    lines.push(`  ${receivings.count} POs received · $${receivings.totalValue.toLocaleString()}`);
+    receivings.rows.forEach((r) => {
+      lines.push(`    PO ${r.poId.padEnd(8)} ${r.supplier.padEnd(28)} $${r.total.toFixed(0)}`);
     });
   }
   lines.push("");
 
-  // Slack
-  lines.push("💬 SLACK ASKS — SKU STATUS REVIEW (last 7 days)");
+  // ── Invoice-PO matches ──
+  lines.push("✅  INVOICE-PO MATCHING LAST WEEK");
+  lines.push("───────────────────────────────────────────────────────────────");
+  const totalMatched = matches.autoApplied + matches.noChangeMatches;
+  if (totalMatched === 0 && matches.errors === 0) {
+    lines.push("  No reconciliations processed.");
+  } else {
+    lines.push(`  ${totalMatched} matched (${matches.autoApplied} applied w/ changes, ${matches.noChangeMatches} confirmed no-change)`);
+    if (matches.errors > 0) {
+      lines.push(`  ${matches.errors} errored — needs review in dashboard > Active Purchases`);
+    }
+    matches.rows.forEach((m) => {
+      lines.push(`    PO ${m.orderId.padEnd(8)} inv ${m.invoiceNumber.padEnd(12)} ${m.vendorName.padEnd(22)} ${m.verdict}`);
+    });
+  }
+  lines.push("");
+
+  // ── PO spend created ──
+  lines.push(`🧾  POs CREATED LAST WEEK (${weekStart} – ${weekEnd})`);
+  lines.push("───────────────────────────────────────────────────────────────");
+  if (poSpend.count === 0) {
+    lines.push("  No POs created (or local Finale mirror unavailable — check dashboard).");
+  } else {
+    lines.push(`  ${poSpend.count} POs · $${poSpend.totalValue.toLocaleString()}`);
+    poSpend.rows.forEach((p) => {
+      lines.push(`    PO ${p.orderId.padEnd(8)} ${p.supplier.padEnd(28)} $${p.total.toFixed(0)}  (${p.orderDate})`);
+    });
+  }
+  lines.push("");
+
+  // ── Slack asks ──
+  lines.push("💬  SLACK — SKU STATUS REVIEW (last 7 days)");
   lines.push("───────────────────────────────────────────────────────────────");
   if (slack.length === 0) {
     lines.push("  No new Slack purchase requests recorded.");
   } else {
-    lines.push("SKU          | Statuses          | Count | Latest | Requesters");
-    lines.push("─────────────┼───────────────────┼───────┼────────┼────────────");
     slack.forEach((s) => {
-      const statuses = s.statuses.join(", ").padEnd(17);
-      const reqs = s.requesters.slice(0, 2).join(", ");
-      lines.push(`${s.sku.padEnd(12)} | ${statuses} | ${String(s.count).padStart(5)} | ${s.latestDate} | ${reqs}`);
+      const statuses = s.statuses.join(", ");
+      lines.push(`  ${s.sku.padEnd(12)} x${s.count}  ${statuses}  latest ${s.latestDate}`);
     });
   }
   lines.push("");
-  lines.push("  Tip: Pending items >24h trigger TG nudge via stale-request-watcher.");
 
-  // News
-  lines.push("");
-  lines.push("📰 MONDAY MORNING PULSE (Supply Chain / Ag)");
   lines.push("───────────────────────────────────────────────────────────────");
-  news.forEach((n, i) => {
-    lines.push(`${i + 1}. ${n.headline}`);
-    lines.push(`   ${n.source} — ${n.whyRelevant}`);
-    lines.push("");
-  });
-
-  // Footer
-  lines.push("═══════════════════════════════════════════════════════════════");
-  lines.push("Next briefing: Monday 8:00 AM MDT");
+  lines.push("Full detail: dashboard.buildasoil → Active Purchases");
   lines.push("═══════════════════════════════════════════════════════════════");
 
   return lines.join("\n");
@@ -345,20 +422,21 @@ export async function generateAndSendMondayBriefing(): Promise<void> {
   }
 
   const dateStr = today.toISOString().slice(0, 10);
+  const { start: weekStart, end: weekEnd } = getPreviousBusinessWeek(today);
 
-  console.log(`[monday-briefing] Collecting data for ${dateStr}...`);
+  console.log(`[monday-briefing] Collecting data for ${dateStr} (prior week ${weekStart}..${weekEnd})...`);
 
-  const [purchases, slack, upcoming] = await Promise.all([
-    getLastWeekPurchases(db),
+  const [receivings, matches, poSpend, slack, upcoming] = await Promise.all([
+    getLastWeekReceivings(db, weekStart, weekEnd),
+    getLastWeekMatches(db, weekStart, weekEnd),
+    getLastWeekPoSpend(db, weekStart, weekEnd),
     getSlackRequestsBySku(db),
     getUpcomingNotablePurchases(db),
   ]);
 
-  const news = getMondayNewsBits();
+  const body = buildBriefingEmail(dateStr, weekStart, weekEnd, receivings, matches, poSpend, slack, upcoming);
 
-  const body = buildBriefingEmail(dateStr, purchases, slack, upcoming, news);
-
-  const subject = `Monday Briefing — ${dateStr}`;
+  const subject = `Aria Briefing — ${dateStr}`;
 
   try {
     const result = await sendTextOnlyGmailEmail({

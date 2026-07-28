@@ -1078,7 +1078,8 @@ defineJob({
     name: "monday-briefing",
     schedule: "0 8 * * 1",
     onFail: "telegram-will",  // weekly overview — Bill reads these
-    description: "Monday morning status overview: last-week purchases, upcoming needs, Slack SKU status, industry pulse. Emails bill.selee@buildasoil.com.",
+    description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
+    enabled: false,
     handler: async () => {
         const { generateAndSendMondayBriefing } = await import(
             "@/lib/intelligence/monday-briefing"
