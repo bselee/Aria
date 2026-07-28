@@ -126,37 +126,60 @@ async function readCachedPos(): Promise<FullPO[]> {
 /**
  * Get POs using cache when PostgREST is healthy and fresh; otherwise Finale.
  * Cache write is best-effort after a Finale fetch.
+ *
+ * HERMIA(2026-07-28): Single-flight per (daysBack, force) key. Concurrent
+ * dashboard panels (Active Purchases, Ordering SWR warm, bust paths) used to
+ * stampede Finale with identical getRecentPurchaseOrders calls. One shared
+ * promise keeps accounting views on the same snapshot.
  */
+const _inflightByKey = new Map<string, Promise<{ pos: FullPO[]; fromCache: boolean }>>();
+
 export async function getCachedOrFresh(
     finale: FinaleClient,
     daysBack = 60,
     forceRefresh = false
 ): Promise<{ pos: FullPO[]; fromCache: boolean }> {
-    if (!forceRefresh) {
-        try {
-            const lastSync = await getCacheAge();
-            if (lastSync && isCacheFresh(lastSync)) {
-                const cached = await readCachedPos();
-                if (cached.length > 0) {
-                    console.log(`[po-cache] HIT — ${cached.length} POs (synced ${timeAgo(lastSync)})`);
-                    return { pos: cached, fromCache: true };
-                }
-            }
-        } catch (e: any) {
-            console.warn("[po-cache] cache read failed, using Finale:", e?.message || e);
-        }
+    const key = `${daysBack}:${forceRefresh ? "1" : "0"}`;
+    const existing = _inflightByKey.get(key);
+    if (existing) {
+        console.log(`[po-cache] JOIN inflight ${key}`);
+        return existing;
     }
 
-    console.log(`[po-cache] MISS — fetching from Finale`);
-    const pos = await finale.getRecentPurchaseOrders(daysBack);
+    const work = (async () => {
+        if (!forceRefresh) {
+            try {
+                const lastSync = await getCacheAge();
+                if (lastSync && isCacheFresh(lastSync)) {
+                    const cached = await readCachedPos();
+                    if (cached.length > 0) {
+                        console.log(`[po-cache] HIT — ${cached.length} POs (synced ${timeAgo(lastSync)})`);
+                        return { pos: cached, fromCache: true };
+                    }
+                }
+            } catch (e: any) {
+                console.warn("[po-cache] cache read failed, using Finale:", e?.message || e);
+            }
+        }
 
-    // Fire-and-forget cache write — never delay response
-    void cacheFinalePos(pos).catch((e) =>
-        console.warn("[po-cache] background cache write failed:", (e as Error).message)
-    );
-    console.log(`[po-cache] FRESH — ${pos.length} POs from Finale`);
+        console.log(`[po-cache] MISS — fetching from Finale`);
+        const pos = await finale.getRecentPurchaseOrders(daysBack);
 
-    return { pos, fromCache: false };
+        // Fire-and-forget cache write — never delay response
+        void cacheFinalePos(pos).catch((e) =>
+            console.warn("[po-cache] background cache write failed:", (e as Error).message)
+        );
+        console.log(`[po-cache] FRESH — ${pos.length} POs from Finale`);
+
+        return { pos, fromCache: false };
+    })();
+
+    _inflightByKey.set(key, work);
+    try {
+        return await work;
+    } finally {
+        _inflightByKey.delete(key);
+    }
 }
 
 function timeAgo(date: Date): string {

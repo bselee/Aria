@@ -647,6 +647,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             return () => clearInterval(t);
         }, [fetchReceivings]);
 
+    const matchDollars = matchSuggestions.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
+    const exceptionCount = pos.filter(po => {
+        const lbl = (apMap[po.orderId]?.label || "").toLowerCase();
+        if (lbl.includes("unmatched") || lbl.includes("review")) return true;
+        if ((po as any).receiptStatus === "partial") return true;
+        return false;
+    }).length;
+
     return (
         <div
             className={embedded
@@ -679,6 +687,31 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
+
+            {/* Accounting status — Receivings (separate from Ordering / Active) */}
+            {!effectivelyCollapsed && !loading && (
+                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
+                    <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
+                    {matchSuggestions.length > 0 ? (
+                        <>
+                            <span className="text-amber-300">{matchSuggestions.length} match{matchSuggestions.length === 1 ? "" : "es"}</span>
+                            {matchDollars > 0 && (
+                                <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
+                            )}
+                        </>
+                    ) : (
+                        <span className="text-emerald-400/80">0 open matches</span>
+                    )}
+                    <span className="text-zinc-700">·</span>
+                    <span>{pos.length} receipt{pos.length === 1 ? "" : "s"}</span>
+                    {exceptionCount > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-rose-300">{exceptionCount} need review</span>
+                        </>
+                    )}
+                </div>
+            )}
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>

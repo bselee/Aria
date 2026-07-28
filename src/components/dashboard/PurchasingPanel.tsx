@@ -410,9 +410,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [showSnoozed, setShowSnoozed] = useState(false);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
     const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
-    // Default to "all" so every item is visible, sorted most-needed-first.
-    // Will: "We just want items in ordering to be staged from most needed to least always."
-    const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
+    // Default TODAY (order_now). Sorted most-needed-first inside the window.
+    // localStorage may override after mount.
+    const [focusFilter, setFocusFilter] = useState<FocusFilter>("order_now");
         // STATUS filter UI removed — actionable filter is hardcoded in itemMatchesLifecycle.
         type ItemMode = 'all' | 'resale' | 'bom';
     // Both resale and BOM items visible together (no UI toggle — the BOM
@@ -1335,6 +1335,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             .filter(item => itemMatchesOrderingFocus(item, filter) && itemMatchesLifecycle(item))
             .length;
     const orderNowCount = focusCount("order_now");
+    const orderNowDollars = activeGroups
+        .flatMap(g => g.items)
+        .filter(i => itemMatchesOrderingFocus(i, "order_now") && itemMatchesLifecycle(i))
+        .reduce((sum, i) => sum + (i.suggestedQty || 0) * Math.max(0, i.unitPrice || 0), 0);
     const thirtyCount = focusCount("30");
     const sixtyCount = focusCount("60");
     const ninetyCount = focusCount("90");
@@ -1764,6 +1768,31 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 </button>
                 )}
             </div>
+
+            {/* Accounting status — Ordering (separate from Active / Receivings) */}
+            {!effectivelyCollapsed && data && (
+                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
+                    <span className="text-zinc-600 uppercase tracking-wider shrink-0">Buy</span>
+                    {orderNowCount > 0 ? (
+                        <>
+                            <span className="text-rose-300">{orderNowCount} SKU due</span>
+                            {orderNowDollars > 0 && (
+                                <span className="text-rose-200/90">${Math.round(orderNowDollars).toLocaleString()}</span>
+                            )}
+                        </>
+                    ) : (
+                        <span className="text-emerald-400/80">$0 due today</span>
+                    )}
+                    <span className="text-zinc-700">·</span>
+                    <span>{activeGroups.length} vendor{activeGroups.length === 1 ? "" : "s"}</span>
+                    {hiddenItemCount > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-zinc-500">{hiddenItemCount} snoozed</span>
+                        </>
+                    )}
+                </div>
+            )}
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>

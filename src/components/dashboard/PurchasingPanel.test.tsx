@@ -225,15 +225,19 @@ describe("PurchasingPanel - vendor policy badges", () => {
         }));
 
         render(<PurchasingPanel />);
-        await waitFor(() => expect(fetch).toHaveBeenCalled());
+                await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        // NOTE(2026-07-28): commit 5f1de32 replaced the vendor tab strip with
-        // a searchable combobox dropdown. Clicking the vendor name no longer
-        // expands items — must click the ▾ button instead.
-        fireEvent.click(await screen.findByText("▾"));
+                // Default window is TODAY (order_now) — watch SKUs live under ALL.
+                                const allChip = await screen.findByTitle("Every actionable item");
+                                fireEvent.click(allChip);
 
-        await waitFor(() => expect(screen.getByText(/Colorful replenishment watch SKU/i)).toBeTruthy());
-    });
+                // NOTE(2026-07-28): commit 5f1de32 replaced the vendor tab strip with
+                // a searchable combobox dropdown. Clicking the vendor name no longer
+                // expands items — must click the ▾ button instead.
+                fireEvent.click(await screen.findByText("▾"));
+
+                await waitFor(() => expect(screen.getByText(/Colorful replenishment watch SKU/i)).toBeTruthy());
+            });
 
     it("renders cover/lead/MOQ-warn/Review badges and review reasons block", async () => {
             stubLocalStorage();

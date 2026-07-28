@@ -643,6 +643,10 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
     // ── Aggregate stats for human-readable alert banner ──
     const aggTotal = visiblePurchases.length;
     const aggOverdue = purchases.filter(p => isOverdue(p) && !dismissed.has(p.orderId)).length;
+    const openPoDollars = visiblePurchases.reduce((sum, p) => sum + (Number((p as any).total) || 0), 0);
+    const overdueDollars = visiblePurchases
+        .filter(p => isOverdue(p))
+        .reduce((sum, p) => sum + (Number((p as any).total) || 0), 0);
     const aggUnacknowledged = purchases.filter(p =>
         !dismissed.has(p.orderId) && !p.isReceived &&
         p.sentVerification?.verified && !p.vendorAcknowledgedAt
@@ -723,6 +727,32 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
+
+            {/* Accounting status — Active Purchases (separate from Ordering / Receivings) */}
+            {!effectivelyCollapsed && !loading && purchases.length > 0 && (
+                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
+                    <span className="text-zinc-600 uppercase tracking-wider shrink-0">Open</span>
+                    <span className="text-cyan-300">{visiblePurchases.length} PO{visiblePurchases.length === 1 ? "" : "s"}</span>
+                    {openPoDollars > 0 && (
+                        <span className="text-zinc-300">${Math.round(openPoDollars).toLocaleString()}</span>
+                    )}
+                    {aggOverdue > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-rose-300">{aggOverdue} overdue</span>
+                            {overdueDollars > 0 && (
+                                <span className="text-rose-200/90">${Math.round(overdueDollars).toLocaleString()}</span>
+                            )}
+                        </>
+                    )}
+                    {aggNoTracking > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-amber-300/90">{aggNoTracking} no track</span>
+                        </>
+                    )}
+                </div>
+            )}
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
